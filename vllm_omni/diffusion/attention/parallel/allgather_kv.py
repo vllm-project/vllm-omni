@@ -43,6 +43,18 @@ class AllGatherKVParallelAttention:
     def name(self) -> str:
         return "allgather_kv"
 
+    @property
+    def paged_kv_asymmetric_layout(self) -> bool:
+        """Whether paged attention receives local Q with global gathered K/V."""
+
+        return True
+
+    @property
+    def paged_kv_sequence_parallel_degree(self) -> int:
+        """Number of input sequence shards represented by one Scheduler row."""
+
+        return self._sp_size
+
     def pre_attention(
         self,
         query: torch.Tensor,

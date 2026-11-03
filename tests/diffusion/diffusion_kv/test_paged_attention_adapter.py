@@ -386,9 +386,8 @@ def test_allgather_paged_context_separates_local_query_from_global_kv_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter, block_tables, layer, events = _make_adapter(monkeypatch, capacity=16)
-    # Exercise the important CUDA case: the native backend normally owns the
-    # fused cache update, but asymmetric AllGather-KV must force a separate
-    # global K/V prewrite before running the local query.
+    # Exercise the generic fused-update contract: an asymmetric AllGather-KV
+    # layout must force a separate global K/V prewrite before the local query.
     layer.attn_backend.forward_includes_kv_cache_update = True
     batch = adapter.prepare_batch(
         [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=8, seq_len=8)]
@@ -405,6 +404,7 @@ def test_allgather_paged_context_separates_local_query_from_global_kv_write(
             key,
             value,
             omni_attn_metadata=metadata,
+            asymmetric_layout=True,
         )
 
         assert context.requires_separate_kv_write is True
@@ -433,6 +433,98 @@ def test_allgather_paged_context_separates_local_query_from_global_kv_write(
     assert forwarded_key is None
     assert forwarded_value is None
     assert forwarded_metadata is context.native_metadata
+
+
+def test_allgather_query_metadata_is_cached_for_the_active_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, block_tables, _, events = _make_adapter(monkeypatch, capacity=16)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=8, seq_len=8)]
+    )
+    query = torch.randn(1, 4, 2, 4)
+    key = torch.randn(1, 8, 2, 4)
+    value = torch.randn_like(key)
+    metadata = AttentionMetadata(query_ranges=(QueryRange(0, 4, 4),))
+
+    with adapter.activate(batch):
+        first = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+            asymmetric_layout=True,
+        )
+        second = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+            asymmetric_layout=True,
+        )
+
+    assert first.native_metadata is second.native_metadata
+    assert len(events) == 2
+    assert len(block_tables.slot_calls) == 2
+
+    with adapter.activate(batch):
+        third = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+            asymmetric_layout=True,
+        )
+
+    assert third.native_metadata is not first.native_metadata
+    assert len(events) == 3
+    assert len(block_tables.slot_calls) == 3
+
+
+def test_query_ranges_do_not_implicitly_select_allgather_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch, capacity=16)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=8, seq_len=8)]
+    )
+    query = torch.randn(1, 4, 2, 4)
+    key = torch.randn(1, 8, 2, 4)
+    metadata = AttentionMetadata(query_ranges=(QueryRange(0, 4, 0),))
+
+    with (
+        adapter.activate(batch),
+        pytest.raises(NotImplementedError, match="explicit asymmetric local-Q/global-KV strategy layout"),
+    ):
+        adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            key,
+            omni_attn_metadata=metadata,
+        )
+
+
+def test_allgather_precollective_validation_rejects_padded_local_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch, capacity=32)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=15, seq_len=15)]
+    )
+    local_qkv = torch.randn(1, 8, 2, 4)
+
+    with (
+        adapter.activate(batch),
+        pytest.raises(ValueError, match="may have been padded"),
+    ):
+        adapter.validate_allgather_sp_before_collective(
+            "layer-0",
+            local_qkv,
+            local_qkv,
+            local_qkv,
+            omni_attn_metadata=AttentionMetadata(),
+            sequence_parallel_degree=2,
+        )
 
 
 def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -881,6 +973,7 @@ def test_forward_rejects_malformed_query_ranges_before_cache_write(monkeypatch: 
             qkv,
             qkv,
             omni_attn_metadata=metadata,
+            asymmetric_layout=True,
         )
 
     assert layer.native_events == []
@@ -1401,10 +1494,20 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
             return output + 4
 
     class Adapter:
-        def prepare_layer_context(self, layer_name, query, key, value, *, omni_attn_metadata):
+        def prepare_layer_context(
+            self,
+            layer_name,
+            query,
+            key,
+            value,
+            *,
+            omni_attn_metadata,
+            asymmetric_layout,
+        ):
             events.append("prepare")
             assert layer_name == "layer-0"
             assert omni_attn_metadata is None
+            assert asymmetric_layout is False
             assert torch.equal(key, original + 2)
             assert torch.equal(value, original + 3)
             return SimpleNamespace(query=query)
@@ -1440,6 +1543,8 @@ def test_omni_attention_paged_ulysses_allgather_creates_missing_metadata() -> No
 
     class Strategy:
         name = "ulysses_allgather_kv"
+        paged_kv_asymmetric_layout = True
+        paged_kv_sequence_parallel_degree = 2
 
         def pre_attention(self, query, key, value, metadata):
             events.append("pre")
@@ -1452,9 +1557,36 @@ def test_omni_attention_paged_ulysses_allgather_creates_missing_metadata() -> No
             return output
 
     class Adapter:
-        def prepare_layer_context(self, _layer_name, query, key, value, *, omni_attn_metadata):
+        def validate_allgather_sp_before_collective(
+            self,
+            _layer_name,
+            query,
+            key,
+            value,
+            *,
+            omni_attn_metadata,
+            sequence_parallel_degree,
+        ):
+            events.append("validate")
+            assert isinstance(omni_attn_metadata, AttentionMetadata)
+            assert sequence_parallel_degree == 2
+            assert torch.equal(query, tensor)
+            assert torch.equal(key, tensor)
+            assert torch.equal(value, tensor)
+
+        def prepare_layer_context(
+            self,
+            _layer_name,
+            query,
+            key,
+            value,
+            *,
+            omni_attn_metadata,
+            asymmetric_layout,
+        ):
             events.append("prepare")
             assert omni_attn_metadata.query_ranges == (QueryRange(0, 2, 0),)
+            assert asymmetric_layout is True
             return SimpleNamespace(query=query)
 
     class Backend:
@@ -1477,13 +1609,14 @@ def test_omni_attention_paged_ulysses_allgather_creates_missing_metadata() -> No
     with set_forward_context(), override_paged_kv_adapter(Adapter()):
         output = layer._forward_impl(tensor, tensor, tensor, attn_metadata=None)
 
-    assert events == ["pre", "prepare", "kernel", "post"]
+    assert events == ["validate", "pre", "prepare", "kernel", "post"]
     assert torch.equal(output, tensor)
 
 
-def test_omni_attention_rejects_paged_ulysses_allgather_padding_before_collectives() -> None:
+@pytest.mark.parametrize("strategy_name", ["allgather_kv", "ulysses_allgather_kv"])
+def test_omni_attention_rejects_paged_allgather_padding_before_collectives(strategy_name: str) -> None:
     class Strategy:
-        name = "ulysses_allgather_kv"
+        name = strategy_name
 
         def pre_attention(self, *_args, **_kwargs):
             raise AssertionError("padding must fail before sequence-parallel collectives")
@@ -1506,9 +1639,41 @@ def test_omni_attention_rejects_paged_ulysses_allgather_padding_before_collectiv
     with (
         set_forward_context(),
         override_paged_kv_adapter(Adapter()),
-        pytest.raises(NotImplementedError, match="divisible.*ulysses_degree \\* allgather_degree"),
+        pytest.raises(NotImplementedError, match="divisible by its effective sequence-parallel degree"),
     ):
         get_forward_context().sp_padding_size = 1
+        layer._forward_impl(tensor, tensor, tensor)
+
+
+def test_omni_attention_validates_paged_allgather_geometry_before_collectives() -> None:
+    class Strategy:
+        name = "allgather_kv"
+        paged_kv_asymmetric_layout = True
+        paged_kv_sequence_parallel_degree = 2
+
+        def pre_attention(self, *_args, **_kwargs):
+            raise AssertionError("geometry must fail before sequence-parallel collectives")
+
+    class Adapter:
+        def validate_allgather_sp_before_collective(self, *_args, **_kwargs):
+            raise ValueError("The sequence may have been padded")
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.use_ring = False
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.zeros(1, 8, 2, 4)
+
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(Adapter()),
+        pytest.raises(ValueError, match="may have been padded"),
+    ):
         layer._forward_impl(tensor, tensor, tensor)
 
 
@@ -1526,8 +1691,18 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
             return output
 
     class Adapter:
-        def prepare_layer_context(self, _layer_name, query, key, value, *, omni_attn_metadata):
+        def prepare_layer_context(
+            self,
+            _layer_name,
+            query,
+            key,
+            value,
+            *,
+            omni_attn_metadata,
+            asymmetric_layout,
+        ):
             assert omni_attn_metadata is None
+            assert asymmetric_layout is False
             events.append(("kernel_input", tuple(query.shape)))
             assert query[:, -1].tolist() == [[[3.0]]]
             assert torch.equal(query, key)

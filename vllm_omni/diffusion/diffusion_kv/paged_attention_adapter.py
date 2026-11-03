@@ -386,6 +386,7 @@ class DiffusionPagedAttentionAdapter:
         self._active_batch: PreparedDiffusionPagedAttentionBatch | None = None
         self._active_piecewise_plan: PagedPiecewisePlan | None = None
         self._active_piecewise_native_metadata: tuple[dict[str, Any], ...] | None = None
+        self._active_allgather_query_metadata: dict[tuple[QueryRange, ...], dict[str, Any]] | None = None
         self._causal_by_group = self._resolve_group_causality()
         self._reorder_batch_threshold = self._resolve_reorder_batch_threshold()
 
@@ -631,12 +632,14 @@ class DiffusionPagedAttentionAdapter:
         self._active_batch = batch
         self._active_piecewise_plan = None
         self._active_piecewise_native_metadata = None
+        self._active_allgather_query_metadata = {}
         try:
             with override_paged_kv_adapter(self), set_current_vllm_config(self.vllm_config):
                 yield self
         finally:
             self._active_piecewise_plan = None
             self._active_piecewise_native_metadata = None
+            self._active_allgather_query_metadata = None
             self._active_batch = None
 
     @staticmethod
@@ -801,6 +804,162 @@ class DiffusionPagedAttentionAdapter:
         self._active_piecewise_native_metadata = tuple(metadata_by_segment)
         return self._active_piecewise_native_metadata
 
+    def _get_allgather_query_native_metadata(
+        self,
+        query_ranges: tuple[QueryRange, ...],
+    ) -> dict[str, Any]:
+        """Build local-query metadata once for every layer in an active batch."""
+
+        if self._active_batch is None or self._active_allgather_query_metadata is None:
+            raise RuntimeError("Paged AllGather-KV metadata requires an active adapter batch")
+        cached = self._active_allgather_query_metadata.get(query_ranges)
+        if cached is not None:
+            return cached
+
+        if len(query_ranges) != 1:
+            raise NotImplementedError("Paged AllGather-KV MVP currently supports one contiguous query range")
+        query_range = query_ranges[0]
+        local_query_len = query_range.local_end - query_range.local_start
+        batch = self._active_batch
+
+        query_start_loc_cpu = torch.tensor(
+            [0, local_query_len],
+            dtype=torch.int32,
+        )
+        query_start_loc = query_start_loc_cpu.to(self.device)
+        query_positions = torch.arange(
+            query_range.global_start,
+            query_range.global_start + local_query_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        # Native BlockTables normally returns a view into its persistent batch
+        # slot-mapping buffer. Reusing that buffer here would overwrite the
+        # global K/V-write mapping with the rank-local query mapping.
+        query_slot_mappings_buffer = torch.empty(
+            (len(self.block_tables.block_sizes), local_query_len),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        query_slot_mappings = self.block_tables.compute_slot_mappings(
+            batch.row_indices,
+            query_start_loc,
+            query_positions,
+            num_tokens_padded=local_query_len,
+            out=query_slot_mappings_buffer,
+        )
+        seq_lens_cpu = torch.tensor(
+            [row.seq_len for row in batch.rows],
+            dtype=torch.int32,
+        )
+        metadata_by_layer = self._build_native_metadata(
+            query_lens=[local_query_len],
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=query_positions,
+            block_tables=batch.block_tables,
+            slot_mappings=query_slot_mappings,
+            causal=False,
+        )
+        self._active_allgather_query_metadata[query_ranges] = metadata_by_layer
+        return metadata_by_layer
+
+    def validate_allgather_sp_before_collective(
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        omni_attn_metadata: Any | None,
+        sequence_parallel_degree: int,
+    ) -> None:
+        """Fail every rank consistently before paged AllGather collectives.
+
+        The native paged adapter only supports a deliberately small
+        local-Q/global-KV MVP.  Validating that contract after AllGather would
+        allow a rank-local range check to fail on one peer while another peer
+        proceeds to a later collective.  Everything checked here is derived
+        from Scheduler-global state or equal-shaped pre-collective inputs, so
+        every rank takes the same branch.
+        """
+
+        if self._active_batch is None:
+            raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
+        try:
+            layer = self.layers[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
+
+        if type(sequence_parallel_degree) is not int or sequence_parallel_degree <= 1:
+            raise ValueError(
+                "Paged AllGather-KV requires a sequence-parallel degree greater than one; "
+                f"got {sequence_parallel_degree!r}"
+            )
+
+        batch = self._active_batch
+        if len(batch.rows) != 1:
+            raise NotImplementedError("Paged AllGather-KV MVP currently supports one row per forward")
+
+        full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
+        if full_attn_spans is not None:
+            raise NotImplementedError("Paged AllGather-KV MVP does not yet support piecewise attention")
+        if not bool(getattr(layer.spec, "non_causal", False)):
+            raise NotImplementedError("Paged AllGather-KV MVP currently supports only non-causal attention")
+
+        row = batch.rows[0]
+        if row.kv_start_pos != 0 or row.query_len != row.seq_len:
+            raise NotImplementedError("Paged AllGather-KV MVP currently supports only cold full-sequence KV writes")
+
+        for name, tensor in (("query", query), ("key", key), ("value", value)):
+            if tensor.ndim < 2:
+                raise ValueError(
+                    f"Paged AllGather-KV requires {name} to expose a sequence dimension; "
+                    f"got shape={tuple(tensor.shape)}"
+                )
+            if tensor.shape[0] != 1:
+                raise NotImplementedError(
+                    "Paged AllGather-KV MVP currently supports one tensor row per forward; "
+                    f"{name}.shape={tuple(tensor.shape)}"
+                )
+
+        local_query_len = int(query.shape[1])
+        if int(key.shape[1]) != local_query_len or int(value.shape[1]) != local_query_len:
+            raise ValueError(
+                "Paged AllGather-KV requires aligned local Q/K/V sequence lengths before collectives: "
+                f"query={query.shape[1]}, key={key.shape[1]}, value={value.shape[1]}"
+            )
+
+        joint_query = None if omni_attn_metadata is None else getattr(omni_attn_metadata, "joint_query", None)
+        joint_key = None if omni_attn_metadata is None else getattr(omni_attn_metadata, "joint_key", None)
+        joint_value = None if omni_attn_metadata is None else getattr(omni_attn_metadata, "joint_value", None)
+        if (joint_key is None) != (joint_value is None):
+            raise ValueError("Paged AllGather-KV requires joint_key and joint_value together")
+        if joint_key is not None and int(joint_key.shape[1]) != int(joint_value.shape[1]):
+            raise ValueError(
+                "Paged AllGather-KV requires matching joint K/V sequence lengths: "
+                f"joint_key={joint_key.shape[1]}, joint_value={joint_value.shape[1]}"
+            )
+
+        joint_kv_len = int(joint_key.shape[1]) if joint_key is not None else 0
+        expected_write_len = local_query_len * sequence_parallel_degree + joint_kv_len
+        if expected_write_len != row.query_len:
+            raise ValueError(
+                "Paged AllGather-KV local shard geometry does not match the Scheduler row: "
+                f"local_query_len={local_query_len}, sequence_parallel_degree={sequence_parallel_degree}, "
+                f"joint_kv_len={joint_kv_len}, expected_global_write_len={expected_write_len}, "
+                f"row.query_len={row.query_len}. The sequence may have been padded."
+            )
+
+        if joint_query is not None and int(joint_query.shape[1]) > 0:
+            raise NotImplementedError(
+                "Paged AllGather-KV MVP currently supports one contiguous query range; "
+                "a non-empty joint_query would produce multiple ranges"
+            )
+
     def prepare_layer_context(
         self,
         layer_name: str,
@@ -809,6 +968,7 @@ class DiffusionPagedAttentionAdapter:
         value: torch.Tensor,
         *,
         omni_attn_metadata: Any | None = None,
+        asymmetric_layout: bool = False,
     ) -> DiffusionPagedAttentionContext:
         if self._active_batch is None:
             raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
@@ -820,9 +980,16 @@ class DiffusionPagedAttentionAdapter:
         full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
         # Query ranges map rank-local Q rows onto the global logical sequence.
         query_ranges = None if omni_attn_metadata is None else getattr(omni_attn_metadata, "query_ranges", None)
-        # No SP/strict Ulysses use an aligned Q/KV-write layout. AllGather-KV
-        # publishes query_ranges because Q remains local while K/V are global.
-        asymmetric_layout = query_ranges is not None
+        # The strategy owns the Q/KV placement contract. Query ranges describe
+        # positions within that contract, but must not select it implicitly: a
+        # future producer (for example Ring) may publish ranges for another
+        # layout that this adapter cannot execute.
+        if asymmetric_layout and query_ranges is None:
+            raise RuntimeError("Paged asymmetric local-Q/global-KV layout requires query_ranges")
+        if not asymmetric_layout and query_ranges is not None:
+            raise NotImplementedError(
+                "Paged query_ranges require an explicit asymmetric local-Q/global-KV strategy layout"
+            )
 
         if asymmetric_layout:
             if len(batch.rows) != 1:
@@ -876,19 +1043,6 @@ class DiffusionPagedAttentionAdapter:
                     "query_ranges: "
                     f"query_tokens={query_flat.shape[0]}, "
                     f"query_range={query_range}"
-                )
-
-            row = batch.rows[0]
-            global_query_end = query_range.global_start + local_query_len
-            write_start = row.kv_start_pos
-            write_end = row.kv_start_pos + row.query_len
-
-            if not (write_start <= query_range.global_start and global_query_end <= write_end):
-                raise ValueError(
-                    "Paged AllGather-KV query range must lie inside the prepared "
-                    "global KV-write span: "
-                    f"query=[{query_range.global_start}, {global_query_end}), "
-                    f"write=[{write_start}, {write_end})"
                 )
 
             # K/V are global gathered write payloads. Validate and pack them
@@ -999,55 +1153,8 @@ class DiffusionPagedAttentionAdapter:
         # Asymmetric AllGather-KV uses local query metadata while preserving
         # the Scheduler-prepared global slot mapping for replicated KV writes.
         if asymmetric_layout:
-            query_range = query_ranges[0]
-            local_query_len = query_range.local_end - query_range.local_start
-
-            query_start_loc_cpu = torch.tensor(
-                [0, local_query_len],
-                dtype=torch.int32,
-            )
-            query_start_loc = query_start_loc_cpu.to(self.device)
-
-            query_positions = torch.arange(
-                query_range.global_start,
-                query_range.global_start + local_query_len,
-                dtype=torch.int64,
-                device=self.device,
-            )
-
-            # Native BlockTables normally returns a view into its persistent
-            # batch slot-mapping buffer. Reusing that buffer here would
-            # overwrite the global K/V-write mapping with the rank-local query
-            # mapping. Keep query metadata in a separate buffer instead.
-            query_slot_mappings_buffer = torch.empty(
-                (len(self.block_tables.block_sizes), local_query_len),
-                dtype=torch.int64,
-                device=self.device,
-            )
-            query_slot_mappings = self.block_tables.compute_slot_mappings(
-                batch.row_indices,
-                query_start_loc,
-                query_positions,
-                num_tokens_padded=local_query_len,
-                out=query_slot_mappings_buffer,
-            )
-
-            seq_lens_cpu = torch.tensor(
-                [row.seq_len for row in batch.rows],
-                dtype=torch.int32,
-            )
-
-            query_metadata_by_layer = self._build_native_metadata(
-                query_lens=[local_query_len],
-                query_start_loc=query_start_loc,
-                query_start_loc_cpu=query_start_loc_cpu,
-                seq_lens=batch.seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                positions=query_positions,
-                block_tables=batch.block_tables,
-                slot_mappings=query_slot_mappings,
-                causal=False,
-            )
+            assert query_ranges is not None
+            query_metadata_by_layer = self._get_allgather_query_native_metadata(query_ranges)
             try:
                 native_metadata = query_metadata_by_layer[layer_name]
             except KeyError as exc:

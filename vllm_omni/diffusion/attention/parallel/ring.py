@@ -115,6 +115,10 @@ class RingParallelAttention:
     def name(self) -> str:
         return "ring"
 
+    @property
+    def paged_kv_asymmetric_layout(self) -> bool:
+        return False
+
     def pre_attention(
         self,
         query: torch.Tensor,

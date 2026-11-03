@@ -566,6 +566,7 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        paged_kv_asymmetric_layout = False
 
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
@@ -582,14 +583,13 @@ class Attention(nn.Module):
                 )
             if strategy_name in ("ulysses", "ulysses_allgather_kv") and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
-            if strategy_name == "ulysses_allgather_kv":
+            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
                 forward_ctx = get_forward_context() if is_forward_context_available() else None
                 sp_padding_size = int(getattr(forward_ctx, "sp_padding_size", 0))
                 if sp_padding_size:
                     raise NotImplementedError(
-                        "Paged Ulysses + AllGather-KV currently requires the "
-                        "sequence length to be divisible by "
-                        "ulysses_degree * allgather_degree; "
+                        "Paged AllGather-KV currently requires the sequence length "
+                        "to be divisible by its effective sequence-parallel degree; "
                         f"got sp_padding_size={sp_padding_size}"
                     )
 
@@ -600,6 +600,32 @@ class Attention(nn.Module):
             and attn_metadata is None
         ):
             attn_metadata = AttentionMetadata()
+        if (
+            use_paged_attention
+            and strategy is not self._no_parallel_strategy
+            and strategy.name in ("allgather_kv", "ulysses_allgather_kv")
+        ):
+            paged_kv_asymmetric_layout = getattr(strategy, "paged_kv_asymmetric_layout", None)
+            if paged_kv_asymmetric_layout is not True:
+                raise RuntimeError(
+                    "Paged AllGather-KV strategy did not publish its asymmetric local-Q/global-KV layout: "
+                    f"strategy={strategy.name!r}, layout={paged_kv_asymmetric_layout!r}"
+                )
+            sequence_parallel_degree = getattr(strategy, "paged_kv_sequence_parallel_degree", None)
+            if type(sequence_parallel_degree) is not int or sequence_parallel_degree <= 1:
+                raise RuntimeError(
+                    "Paged AllGather-KV strategy did not publish a valid input sequence-sharding degree: "
+                    f"strategy={strategy.name!r}, degree={sequence_parallel_degree!r}"
+                )
+            assert paged_adapter is not None
+            paged_adapter.validate_allgather_sp_before_collective(
+                self.prefix,
+                query,
+                key,
+                value,
+                omni_attn_metadata=attn_metadata,
+                sequence_parallel_degree=sequence_parallel_degree,
+            )
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
@@ -670,6 +696,7 @@ class Attention(nn.Module):
                 key,
                 value,
                 omni_attn_metadata=attn_metadata,
+                asymmetric_layout=paged_kv_asymmetric_layout,
             )
             out = self.attention.forward_paged(paged_kv_context)
         else:
