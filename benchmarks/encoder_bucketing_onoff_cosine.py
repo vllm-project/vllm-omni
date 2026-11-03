@@ -75,7 +75,10 @@ _LENGTHS = {
 # (many short + one long) batch in ``_LENGTHS``.
 _REALISTIC_BATCHES = {
     "stepaudio2": [
-        ("realistic (LibriSpeech dist)", [400, 500, 650, 750, 800, 900, 1000, 1100, 1300, 1500, 1700, 2000, 2300, 2600, 2900, 3000]),
+        (
+            "realistic (LibriSpeech dist)",
+            [400, 500, 650, 750, 800, 900, 1000, 1100, 1300, 1500, 1700, 2000, 2300, 2600, 2900, 3000],
+        ),
     ],
 }
 
@@ -172,16 +175,16 @@ def _measure_speedup(encoder, model, has_length, lengths):
         for _ in range(3):
             call_off()
             call_on()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         t0 = time.perf_counter()
         for _ in range(N_ITERS):
             call_off()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         off_ms = (time.perf_counter() - t0) / N_ITERS * 1000
         t0 = time.perf_counter()
         for _ in range(N_ITERS):
             call_on()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         on_ms = (time.perf_counter() - t0) / N_ITERS * 1000
     return off_ms, on_ms
 
