@@ -1629,6 +1629,22 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
+    @pytest.mark.parametrize("qwen_duplex_server", ["qwen3_omni_duplex_kv.yaml"], indirect=True)
+    def test_resident_thinker_history_pruning(self, qwen_duplex_server, tmp_path: Path):
+        events_path = tmp_path / "events.json"
+        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, events_path))
+        events = json.loads(events_path.read_text())
+        session_id = next(event["session"]["id"] for event in events if event["type"] == "session.updated")
+        captures = [json.loads(path.read_text()) for path in qwen_duplex_server.artifacts.glob("*/input.json")]
+        requests = [
+            capture["request_id"]
+            for capture in captures
+            if duplex_resource_request_belongs_to_session(capture["request_id"], session_id)
+        ]
+        assert len(requests) == 6
+        assert len(set(requests)) == 1, "All six turns must use the same resident Thinker request"
+
+    @pytest.mark.advanced_model
     @pytest.mark.parametrize(
         "qwen_duplex_server",
         ["qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml"],

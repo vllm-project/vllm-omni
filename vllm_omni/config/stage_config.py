@@ -696,6 +696,7 @@ class StageDeployConfig:
 class DuplexSessionRuntimeConfig:
     """Server-owned lifecycle and per-session buffering limits."""
 
+    turn_kv_continuation: bool = False
     idle_ttl_s: float | None = 300.0
     disconnect_grace_s: float = 30.0
     reaper_interval_s: float = 5.0

@@ -17,6 +17,8 @@ stage.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import RequestStatus
@@ -84,7 +86,7 @@ def test_schedule_sweeps_kv_holding_waiting_before_upstream_selection(
     scheduler.get_finished_requests_needing_kv_transfer = lambda: {}
     scheduler._wrap_omni_scheduler_output = lambda output, **kwargs: output
 
-    sentinel = object()
+    sentinel = SimpleNamespace(scheduled_new_reqs=[])
 
     def upstream_schedule(_self, _throttle_prefills: bool = False):
         assert list(scheduler.kv_holding_waiting) == []

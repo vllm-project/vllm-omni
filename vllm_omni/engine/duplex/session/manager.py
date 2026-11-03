@@ -542,7 +542,9 @@ class DuplexSessionManager:
         if stage_id >= self.stage_port.stage_count:
             return None
         effective_fence = fence or session.fence
-        resumable = session.capabilities.supports_core_resumable_request
+        resumable = session.capabilities.supports_core_resumable_request or (
+            stage_id == 0 and session.capabilities.supports_turn_kv_continuation
+        )
         request_id = self.stage_request_id(effective_fence, stage_id=stage_id, resumable=resumable)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
         context = DuplexStageRequestContext(
@@ -624,6 +626,10 @@ class DuplexSessionManager:
             capabilities = apply_session_stats_capability(
                 self.plugin.capabilities(max_sessions=max_sessions), collect_stats
             )
+            if self.runtime_config.turn_kv_continuation:
+                if not self.plugin.supports_turn_kv_continuation:
+                    raise DuplexRuntimeConfigError("This model does not support turn KV continuation")
+                capabilities.supports_turn_kv_continuation = True
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,

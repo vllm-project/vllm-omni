@@ -342,7 +342,8 @@ class ModelChannel:
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
         stage_id = self._ctx.plugin.input_stage_id(payload)
-        resumable = session.capabilities.supports_core_resumable_request
+        turn_continuation = stage_id == 0 and session.capabilities.supports_turn_kv_continuation
+        resumable = session.capabilities.supports_core_resumable_request or turn_continuation
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
         # Bump turn_id and open a fresh ephemeral request instead.
@@ -404,6 +405,10 @@ class ModelChannel:
             # Freeze the request only after that wait and its close/epoch fence.
             reservation = session.prepare_append(fence)
             already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
+            if turn_continuation and already_submitted and not self._ctx.plugin.data_plane.is_terminal(request_id):
+                raise DuplexInputCapacityError(
+                    "Complete or cancel the current response before continuing its Thinker KV"
+                )
             request_context = self._ctx.manager.ensure_stage_request(
                 session,
                 stage_id=stage_id,
@@ -470,6 +475,7 @@ class ModelChannel:
                     prompt=prompt,
                     already_submitted=already_submitted,
                     resumable=resumable,
+                    resume_from_full_prompt=turn_continuation,
                 )
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input
@@ -701,6 +707,8 @@ class ModelChannel:
         # stays true for plugins; the projector object keeps the source finished flag.
         # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
         source_finished = bool(getattr(output, "finished", False))
+        if self._ctx.session.capabilities.supports_turn_kv_continuation and item.context.segment_finished:
+            source_finished = True
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
@@ -967,6 +975,12 @@ class ModelChannel:
             return
         session = self._ctx.session
         if session.capabilities.supports_core_resumable_request:
+            return
+        if session.capabilities.supports_turn_kv_continuation:
+            await self._ctx.stage_port.finish_turn(request_id)
+            for key in list(session.request_resources):
+                if key[0] != 0 and key[1] == request_id:
+                    session.request_resources.pop(key)
             return
         if session.is_draining_request(request_id):
             # A draining request is still feeding its TTS stages, so nothing it

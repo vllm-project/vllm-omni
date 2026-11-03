@@ -104,6 +104,7 @@ async def open_qwen(
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
+    turn_kv_continuation=False,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
@@ -112,6 +113,12 @@ async def open_qwen(
         plugin.data_plane.retain_history_audio = requires_audio
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
+    if turn_kv_continuation:
+
+        async def finish_turn(request_id):
+            port.cleanups.append(([request_id], False))
+
+        port.finish_turn = finish_turn
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
     output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
@@ -121,6 +128,7 @@ async def open_qwen(
         output_sink=output,
         result_sink=results,
         runtime_config=DuplexSessionRuntimeConfig(
+            turn_kv_continuation=turn_kv_continuation,
             history_calibration_timeout_ms=calibration_timeout_ms,
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
@@ -546,8 +554,9 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
 
 
 @pytest.mark.asyncio
-async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
-    h = await open_qwen()
+@pytest.mark.parametrize("turn_kv_continuation", [False, True])
+async def test_two_committed_turns_stream_text_and_audio_and_release_requests(turn_kv_continuation):
+    h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
     try:
         ids = []
         for i in range(2):
@@ -557,6 +566,8 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
             assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
             request_id = h.port.submissions[-1].context.request_id
             ids.append(request_id)
+            assert h.port.submissions[-1].resume_from_full_prompt is turn_kv_continuation
+            assert h.port.submissions[-1].already_submitted is (turn_kv_continuation and i > 0)
             assert h.session.active_request_id == request_id
             assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == i + 1
             text = OmniRequestOutput.from_stage_output(
@@ -573,7 +584,7 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
             await h.run(AckPlayback(response_id=response_id, played_ms=1000))
             assert h.session.active_response_id is None
             assert h.port.cleanups[-1][0] == [request_id]
-        assert len(set(ids)) == 2
+        assert len(set(ids)) == (1 if turn_kv_continuation else 2)
         assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
     finally:
         await h.manager.shutdown()
@@ -694,8 +705,9 @@ async def test_audio_without_transcript_accepts_playback_ack(cancel_command, nex
 
 
 @pytest.mark.asyncio
-async def test_cancel_drops_old_output_and_accepts_next_turn():
-    h = await open_qwen()
+@pytest.mark.parametrize("turn_kv_continuation", [False, True])
+async def test_cancel_drops_old_output_and_accepts_next_turn(turn_kv_continuation):
+    h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
     try:
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))
@@ -712,8 +724,9 @@ async def test_cancel_drops_old_output_and_accepts_next_turn():
 
 
 @pytest.mark.asyncio
-async def test_vad_commits_and_speech_interrupts_active_qwen_response():
-    h = await open_qwen()
+@pytest.mark.parametrize("turn_kv_continuation", [False, True])
+async def test_vad_commits_and_speech_interrupts_active_qwen_response(turn_kv_continuation):
+    h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
     try:
         h.runner.control._detector = _speech_then_stop()
         await h.run(append_audio())

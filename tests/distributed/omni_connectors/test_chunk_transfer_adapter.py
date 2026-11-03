@@ -1352,6 +1352,24 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter, prompt_to
     ]
 
 
+def test_resident_thinker_segment_terminates_downstream_without_finishing_thinker(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+    request = Request(
+        request_id="resident-thinker",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        resumable=True,
+    )
+    request.external_req_id = request.request_id
+    request.resume_from_full_prompt = True
+    adapter.save_async(request=request, is_segment_finished=True)
+    task = adapter._pending_save_reqs.popleft()
+    assert task["is_finished"] is True
+    assert task["request"].resumable is False
+    assert request.resumable is True
+
+
 def test_request_snapshot_preserves_embeddings_only_prompt():
     prompt_embeds = torch.zeros(2, 4)
     request = Request(

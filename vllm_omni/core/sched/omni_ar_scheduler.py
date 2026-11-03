@@ -884,6 +884,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             include_cached_payloads=True,
         )
+        for data in scheduler_output.scheduled_new_reqs:
+            request = self.requests[data.req_id]
+            if getattr(request, "_reset_turn_worker_state", False):
+                # Reset worker/hidden-state delivery bookkeeping, not the
+                # scheduler's resident KV blocks. Retirement precedes arrival
+                # in the worker and prefix-output cache protocols.
+                scheduler_output.finished_req_ids.add(data.req_id)
+                request._reset_turn_worker_state = False
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -1387,7 +1395,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         request.num_computed_tokens -= outstanding_async_tokens
                         request.num_output_placeholders = 0
                     request.spec_token_ids = []
-                    request._output_token_ids.clear()
+                    if not getattr(request, "resume_from_full_prompt", False):
+                        request._output_token_ids.clear()
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
@@ -1604,6 +1613,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
+        if getattr(update, "resume_from_full_prompt", False):
+            self._resume_from_full_prompt(session, update)
+            return
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Use the same confirmed span that upstream preserves when extending
@@ -1787,6 +1799,44 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _resume_from_full_prompt(self, session: Request, update: StreamingUpdate) -> None:
+        """Continue a committed turn on resident KV, or rebuild a changed history.
+
+        Full block hashes include multimodal identities and cache salt. Only
+        retain KV when every completed block matches the new prompt; otherwise
+        release the old allocation before writing a different continuation.
+        This avoids overwriting a cached/shared suffix block.
+        """
+        if self._streaming_update_overflows(session, update, projected_len=len(update.prompt_token_ids)):
+            return
+        block_size = self.cache_config.block_size
+        confirmed = session.num_computed_tokens - int(getattr(session, "num_output_placeholders", 0))
+        retained = confirmed // block_size * block_size
+        hash_count = retained // self.hash_block_size
+        hashes = getattr(update, "block_hashes", ())
+        can_continue = (
+            retained > 0
+            and len(update.prompt_token_ids) > retained
+            and len(session.block_hashes) >= hash_count
+            and len(hashes) >= hash_count
+            and tuple(session.block_hashes[:hash_count]) == tuple(hashes[:hash_count])
+        )
+        if not can_continue:
+            self._release_replaced_streaming_prompt_cache(session)
+            retained = 0
+        self._reset_streaming_session_replacement_state(session)
+        session._output_token_ids.clear()
+        session._all_token_ids[:] = update.prompt_token_ids
+        session.prompt_token_ids = list(update.prompt_token_ids)
+        session.num_prompt_tokens = len(session.prompt_token_ids)
+        session.num_computed_tokens = retained
+        session.mm_features = list(update.mm_features or ())
+        session.block_hashes[:] = hashes
+        session.max_tokens = update.max_tokens
+        session._reset_turn_worker_state = True
+        self._new_prompt_len_snapshot[session.request_id] = len(session.prompt_token_ids)
+        self._finish_streaming_session_update(session, update)
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
         """Delegate streaming prompt policy to the stage's payload processor."""
