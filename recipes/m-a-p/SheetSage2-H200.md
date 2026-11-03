@@ -201,8 +201,16 @@ curl --fail-with-body http://localhost:8092/v1/audio/transcriptions \
 Pass the score to YuE2 as `extra_params.abc`, with `cot=melody` for a
 melody-only score and `cot=full` otherwise. Requests run one at a time on the
 model's device; uploads and upstream annotations are deleted after each
-response. `response_format=text` returns the bare score. A recording FFmpeg
-cannot decode returns 400; a failed score export returns 500. `GET /health`
+response. `response_format=text` returns the bare score. Errors use the
+OpenAI error shape:
+
+- 400 for an invalid or missing form field, or a recording FFmpeg cannot decode.
+- 413 for a request body above `--max-upload-mb` (default 200). The limit
+  applies while the body arrives, before it is spooled to disk, including
+  chunked uploads.
+- 500 for a failed score export.
+
+Upstream error details go to the server log, not the response. `GET /health`
 and `GET /v1/models` support readiness checks.
 
 ## Verification

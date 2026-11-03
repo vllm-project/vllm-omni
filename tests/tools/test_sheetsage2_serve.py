@@ -12,6 +12,7 @@ from tools import sheetsage2_serve as serve
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SCORE = "X:1\nM:4/4\nK:C\nC4|\n"
+LIMIT = 4096
 
 
 @pytest.fixture
@@ -23,7 +24,7 @@ def model(mocker):
 
 @pytest.fixture
 def client(model):
-    return TestClient(serve.create_app(model, "m-a-p/SheetSage2", "bf16", max_upload_bytes=64))
+    return TestClient(serve.create_app(model, "m-a-p/SheetSage2", "bf16", max_upload_bytes=LIMIT))
 
 
 def upload(client, data=b"recording", **form):
@@ -50,40 +51,75 @@ def test_text_format_returns_the_bare_score(client):
     assert response.text == SCORE
 
 
+def assert_error(response, status, message=""):
+    assert response.status_code == status
+    error = response.json()["error"]
+    assert error["code"] == status
+    assert error["type"] == ("invalid_request_error" if status < 500 else "server_error")
+    assert message in error["message"]
+
+
 @pytest.mark.parametrize(
-    "form,status",
+    "form,status,message",
     [
-        ({"model": "m-a-p/YuE2-3B"}, 404),
-        ({"response_format": "srt"}, 400),
-        ({"max_seconds": "0"}, 400),
-        ({"max_seconds": "nan"}, 400),
+        ({"model": "m-a-p/YuE2-3B"}, 404, "does not exist"),
+        ({"response_format": "srt"}, 400, "response_format"),
+        ({"max_seconds": "0"}, 400, "max_seconds"),
+        ({"max_seconds": "nan"}, 400, "max_seconds"),
+        # FastAPI rejects these before the endpoint runs.
+        ({"max_seconds": "abc"}, 400, "max_seconds: "),
+        ({"melody_only": "invalid"}, 400, "melody_only: "),
     ],
 )
-def test_invalid_requests_fail_before_transcription(client, model, form, status):
-    response = upload(client, **form)
-    assert response.status_code == status
-    assert response.json()["error"]["code"] == status
+def test_invalid_requests_fail_before_transcription(client, model, form, status, message):
+    assert_error(upload(client, **form), status, message)
     model.transcribe.assert_not_called()
 
 
-@pytest.mark.parametrize("data,status", [(b"", 400), (b"x" * 65, 413)])
-def test_empty_and_oversized_uploads_are_rejected(client, model, data, status):
-    assert upload(client, data=data).status_code == status
+def test_missing_file_is_a_client_error(client, model):
+    response = client.post("/v1/audio/transcriptions", data={"melody_only": "true"})
+    assert_error(response, 400, "file: Field required")
     model.transcribe.assert_not_called()
 
 
-def test_undecodable_recording_is_a_client_error(client, model):
-    model.transcribe.side_effect = ValueError("Cannot decode audio")
+def test_empty_upload_is_rejected(client, model):
+    assert_error(upload(client, data=b""), 400, "file is empty")
+    model.transcribe.assert_not_called()
+
+
+def test_oversized_upload_is_rejected_while_received(client, model):
+    assert_error(upload(client, data=b"x" * LIMIT), 413, "Request body exceeds")
+    model.transcribe.assert_not_called()
+
+
+def test_oversized_chunked_upload_is_rejected_while_received(client, model):
+    def body():  # No Content-Length: the server counts what arrives.
+        for _ in range(8):
+            yield b"x" * (LIMIT // 2)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        content=body(),
+        headers={"content-type": "multipart/form-data; boundary=b"},
+    )
+    assert_error(response, 413, "Request body exceeds")
+    model.transcribe.assert_not_called()
+
+
+def test_undecodable_recording_is_a_client_error(client, model, caplog):
+    model.transcribe.side_effect = ValueError("Cannot decode audio /tmp/sheetsage2-x/input.m4a")
     response = upload(client)
-    assert response.status_code == 400
-    assert "Cannot decode audio" in response.json()["error"]["message"]
+    assert_error(response, 400, "cannot decode this recording")
+    assert "/tmp" not in response.text  # Upstream details stay in the server log.
+    assert "Cannot decode audio" in caplog.text
 
 
-def test_failed_score_export_is_a_server_error(client, model):
+def test_failed_score_export_is_a_server_error(client, model, caplog):
     model.transcribe.return_value = {"abc": "", "abc_error": "no beats", "midi": b"MThd"}
     response = upload(client)
-    assert response.status_code == 500
-    assert "no beats" in response.json()["error"]["message"]
+    assert_error(response, 500, "see the server log")
+    assert "no beats" not in response.text
+    assert "no beats" in caplog.text
 
 
 def test_server_requires_reviewed_remote_code():

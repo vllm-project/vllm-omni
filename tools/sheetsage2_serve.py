@@ -17,6 +17,7 @@ transcriber, not an Omni engine.
 # annotations at definition time, and they name locally imported types.
 import argparse
 import asyncio
+import logging
 import math
 import tempfile
 from pathlib import Path
@@ -27,6 +28,7 @@ except ModuleNotFoundError:  # Run as a script: tools/ itself is on sys.path.
     from sheetsage2_transcribe import add_model_arguments, checked_score, load_model
 
 UPLOAD_CHUNK = 1 << 20
+logger = logging.getLogger("sheetsage2_serve")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -35,7 +37,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--served-model-name", help="Model name clients send; defaults to --model")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--max-upload-mb", type=int, default=200, help="Largest accepted recording")
+    parser.add_argument(
+        "--max-upload-mb", type=int, default=200, help="Largest accepted request body, including the recording"
+    )
     return parser
 
 
@@ -50,17 +54,64 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-upload-mb must be positive")
 
 
+def limit_body(app, max_bytes: int):
+    """Reject a request body above ``max_bytes`` while it arrives.
+
+    Multipart parsing spools the whole upload to disk before the endpoint runs,
+    so the endpoint itself cannot bound it. The raised 413 surfaces through
+    FastAPI's body parsing.
+    """
+    from starlette.exceptions import HTTPException
+
+    too_large = HTTPException(413, f"Request body exceeds {max_bytes // (1 << 20)} MiB")
+
+    async def limited_app(scope, receive, send):
+        if scope["type"] != "http":
+            return await app(scope, receive, send)
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            # The server holds the body to its Content-Length, so a declared size is rejected before any read.
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise too_large
+            message = await receive()
+            received += len(message.get("body", b""))
+            if received > max_bytes:
+                raise too_large
+            return message
+
+        await app(scope, limited_receive, send)
+
+    return limited_app
+
+
 def create_app(model, served_model_name: str, dtype: str, max_upload_bytes: int):
     from fastapi import FastAPI, Form, UploadFile
+    from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse, PlainTextResponse
+    from starlette.exceptions import HTTPException
 
     app = FastAPI(title="SheetSage2")
+    app.add_middleware(limit_body, max_bytes=max_upload_bytes)
     # One model on one device: transcriptions queue instead of sharing it.
     lock = asyncio.Lock()
 
-    def error(status: int, message: str) -> JSONResponse:
+    def error(status: int, message: str, headers: dict[str, str] | None = None) -> JSONResponse:
         kind = "invalid_request_error" if status < 500 else "server_error"
-        return JSONResponse({"error": {"message": message, "type": kind, "code": status}}, status_code=status)
+        body = {"error": {"message": message, "type": kind, "code": status}}
+        return JSONResponse(body, status_code=status, headers=headers)
+
+    # Form validation and body parsing fail before the endpoint runs; keep the OpenAI error shape.
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request, exc: RequestValidationError) -> JSONResponse:
+        problems = (f"{'.'.join(map(str, e['loc'][1:])) or e['loc'][0]}: {e['msg']}" for e in exc.errors())
+        return error(400, "; ".join(problems))
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request, exc: HTTPException) -> JSONResponse:
+        return error(exc.status_code, str(exc.detail), exc.headers)
 
     @app.get("/health")
     async def health() -> PlainTextResponse:
@@ -91,8 +142,6 @@ def create_app(model, served_model_name: str, dtype: str, max_upload_bytes: int)
             with audio.open("wb") as out:
                 while chunk := await file.read(UPLOAD_CHUNK):
                     size += len(chunk)
-                    if size > max_upload_bytes:
-                        return error(413, f"Recording exceeds {max_upload_bytes // (1 << 20)} MiB")
                     out.write(chunk)
             if size == 0:
                 return error(400, "file is empty")
@@ -109,10 +158,13 @@ def create_app(model, served_model_name: str, dtype: str, max_upload_bytes: int)
                         max_seconds=max_seconds,
                     )
                 abc = checked_score(result)
-            except ValueError as exc:  # Upstream rejects recordings it cannot decode with ValueError.
-                return error(400, f"SheetSage2 cannot transcribe this recording: {exc}")
-            except Exception as exc:  # noqa: BLE001 - surface other upstream failures to the client
-                return error(500, f"SheetSage2 transcription failed: {exc}")
+            # Details stay in the server log: upstream messages can name server paths.
+            except ValueError:  # Upstream rejects recordings it cannot decode with ValueError.
+                logger.warning("Cannot transcribe %r", file.filename, exc_info=True)
+                return error(400, "SheetSage2 cannot decode this recording")
+            except Exception:  # noqa: BLE001 - report other upstream failures as server errors
+                logger.exception("Transcription of %r failed", file.filename)
+                return error(500, "SheetSage2 transcription failed; see the server log")
         if response_format == "text":
             return PlainTextResponse(abc)
         return {"text": abc}
