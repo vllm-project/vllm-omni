@@ -10,6 +10,8 @@ It has two explicit validation contracts:
    spoken response for each streamed user turn;
 2. ``response-required`` uses a known fixture and requires a complete audio
    response with an independent transcript for every requested turn.
+   Native-turn fixtures may opt into ``allow_extra_responses``: additional
+   responses, including audio-only output, must still finish and be acknowledged.
 
 Explicit serving-side barge-in is intentionally not part of this smoke test.
 MiniCPM-o native duplex currently exposes model-owned listen/speak switching,
@@ -554,6 +556,28 @@ class DemoState:
                 return True
         return False
 
+    def response_playback_settled(self, response_id: str) -> bool:
+        if self.response_playback_history_committed(response_id):
+            return True
+        # An audio-only response has no answer text to commit. The server
+        # acknowledges its playback with history_committed=False.
+        if not self.response_done(response_id) or self.response_transcript_delta(response_id):
+            return False
+        sent_ms = self.response_playback_sent_ms(response_id)
+        if sent_ms <= 0:
+            return False
+        for event in self.events:
+            if event.get("type") != "playback.acknowledged":
+                continue
+            payload = event.get("event")
+            if not isinstance(payload, dict) or payload.get("item_id") != f"item_{response_id}":
+                continue
+            playback = payload.get("playback")
+            committed_ms = playback.get("committed_ms") if isinstance(playback, dict) else None
+            if isinstance(committed_ms, int | float) and committed_ms >= sent_ms:
+                return True
+        return False
+
     def response_transcript_delta(self, response_id: str) -> str:
         return "".join(
             str(event.get("delta", ""))
@@ -789,9 +813,9 @@ def _all_audio_responses_have_transcript(state: DemoState, response_ids: list[st
     )
 
 
-def _all_response_playback_history_committed(state: DemoState, response_ids: list[str]) -> bool:
+def _all_response_playback_settled(state: DemoState, response_ids: list[str]) -> bool:
     return all(
-        state.response_playback_history_committed(response_id)
+        state.response_playback_settled(response_id)
         for response_id in response_ids
         if state.response_playback_sent_ms(response_id) > 0
     )
@@ -802,8 +826,11 @@ def _response_cardinality_ok(
     *,
     expected_turns: int,
     validation_mode: str,
+    allow_extra_responses: bool = False,
 ) -> bool:
     if validation_mode == "response-required":
+        if allow_extra_responses:
+            return len(completed_response_ids) >= expected_turns
         return len(completed_response_ids) == expected_turns
     return True
 
@@ -1081,6 +1108,24 @@ async def _send_clean_turn(
         stacked_frames_b64=stacked_frames_b64,
     )
     if commit_input:
+        # Native duplex can answer while the input is still streaming. Reserve
+        # those replies' history positions before commit advances the input
+        # sequence, otherwise the full playback ACK below is rejected as late.
+        # A zero ACK checkpoints ownership without claiming any audio was heard.
+        for early_response_id in state.response_ids[before_created:]:
+            if state.response_done(early_response_id) and state.response_audio_delta_count(early_response_id) == 0:
+                continue
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "playback.ack",
+                        "response_id": early_response_id,
+                        "item_id": f"item_{early_response_id}",
+                        "played_ms": 0,
+                        "committed_ms": 0,
+                    }
+                )
+            )
         state.input_commit_sent_at_s.append(time.monotonic())
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
     if validation_mode == "model-policy":
@@ -1160,11 +1205,18 @@ async def _ack_response_playback(
             }
         )
     )
+
+    def playback_settled() -> bool:
+        errors = _unexpected_error_events(state)
+        if errors:
+            raise RuntimeError(f"{label} playback failed for {response_id}: {json.dumps(errors, ensure_ascii=False)}")
+        return state.playback_ack_count > before_ack and state.response_playback_settled(response_id)
+
     await _wait_for(
         state,
-        lambda: state.playback_ack_count > before_ack and state.response_playback_history_committed(response_id),
+        playback_settled,
         timeout_s=timeout_s,
-        label=f"{label} playback history committed",
+        label=f"{label} playback settled",
     )
 
 
@@ -1177,7 +1229,7 @@ async def _ack_all_completed_response_playback(
     for response_id in state.completed_response_ids():
         if state.response_playback_sent_ms(response_id) <= 0:
             continue
-        if state.response_playback_history_committed(response_id):
+        if state.response_playback_settled(response_id):
             continue
         await _ack_response_playback(
             ws,
@@ -1538,6 +1590,16 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
 
+                    if getattr(args, "allow_extra_responses", False):
+                        # Finish and ACK every model response before committing
+                        # another input; one input can produce several replies.
+                        await _drain_model_policy_responses(
+                            ws,
+                            state,
+                            timeout_s=args.timeout_s,
+                            settle_s=max(0.0, args.model_policy_settle_ms / 1000),
+                        )
+
             if validation_mode == "model-policy":
                 await _drain_model_policy_responses(
                     ws,
@@ -1622,6 +1684,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
             completed_response_ids,
             expected_turns=expected_turns,
             validation_mode=validation_mode,
+            allow_extra_responses=getattr(args, "allow_extra_responses", False),
         )
     )
     turn_outcomes_ok = len(turn_outcomes) == expected_turns and (
@@ -1632,7 +1695,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         for response_id in observed_turn_response_ids
         if response_id not in expected_empty_response_ids
     )
-    playback_history_committed_ok = _all_response_playback_history_committed(
+    playback_settled_ok = _all_response_playback_settled(
         state,
         completed_response_ids,
     )
@@ -1692,7 +1755,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         "model_speak_delta_count": state.model_speak_delta_count,
         "playback_ack_count": state.playback_ack_count,
         "playback_history_committed_count": state.playback_history_committed_count,
-        "playback_history_committed_ok": playback_history_committed_ok,
+        "playback_settled_ok": playback_settled_ok,
         "truncate_count": state.truncate_count,
         "input_transcription_count": state.input_transcription_count,
         "audio_marks_seen": state.audio_marks_seen,
@@ -1750,8 +1813,8 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         and transcript_integrity["empty_turns_ok"]
         and transcript_integrity["nonempty_audio_has_transcript_ok"]
         and transcript_integrity["terminal_punctuation_ok"]
-        and all_audio_responses_have_transcript
-        and playback_history_committed_ok
+        and (all_audio_responses_have_transcript or getattr(args, "allow_extra_responses", False))
+        and playback_settled_ok
         and listen_only_overlap_ok
         and not unexpected_error_events
         and response_speak_contract["response_speak_contract_ok"]

@@ -14,13 +14,14 @@ measurements.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers.adalayernorm import (
     _FAILED_ADALN_KEYS,
     AdaLayerNorm,
     _adaln_fused_forward,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def _make(bs=2, seq=512, hidden=3072, dtype=torch.bfloat16, seed=0, framewise=False):

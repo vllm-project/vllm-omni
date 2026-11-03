@@ -83,6 +83,9 @@ Startup / model-loading benchmark for the two-stage MammothModa2 (AR → DiT) de
 
 See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wrapper and `vllm_omni/benchmarks/metrics/` for Omni metric definitions.
 
+The [Qwen3-Omni Seed-TTS Realtime comparison](../docs/cli/bench/serve.md#seed-tts-reference-speech-as-real-audio-input)
+uses this framework to compare explicit-commit and server-VAD turns.
+
 ## Adding a new benchmark
 
 1. Create a subfolder under `benchmarks/<name>/` with scripts, configs if needed, and a `README.md`.

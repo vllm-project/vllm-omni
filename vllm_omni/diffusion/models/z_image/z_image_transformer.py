@@ -50,6 +50,12 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
@@ -328,6 +334,7 @@ class ZImageAttention(nn.Module):
         attention_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ):
         qkv, _ = self.to_qkv(hidden_states)
         qkv = _restore_linear_output_shape(qkv, hidden_states)
@@ -339,10 +346,35 @@ class ZImageAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # The forward packs a table only for BF16 D=128 inputs; the fused op
+        # then reproduces the CUDA RMSNorm reduction of norm_q/norm_k, so in
+        # eager mode it is bit-identical to the chain below. Compiled graphs
+        # use the same custom op; their reference is Inductor's RMSNorm, which
+        # reduces in a different order.
+        if (
+            qk_norm_rope_table is not None
+            and self.norm_q.weight.dtype == self.norm_k.weight.dtype == query.dtype
+            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        ):
+            batch_size, seq_len, num_heads, head_dim = query.shape
+            num_kv_heads = key.shape[2]
+            query, key = fused_qk_norm_rope(
+                query.reshape(batch_size * seq_len, num_heads, head_dim),
+                key.reshape(batch_size * seq_len, num_kv_heads, head_dim),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.norm_q.variance_epsilon,
+                interleaved=True,
+                cuda_rms_norm=True,
+            )
+            query = query.view(batch_size, seq_len, num_heads, head_dim)
+            key = key.view(batch_size, seq_len, num_kv_heads, head_dim)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
-        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+            query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -468,6 +500,7 @@ class ZImageTransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         adaln_input: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -481,6 +514,7 @@ class ZImageTransformerBlock(nn.Module):
                 attention_mask=attn_mask,
                 cos=cos,
                 sin=sin,
+                qk_norm_rope_table=qk_norm_rope_table,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
 
@@ -497,6 +531,7 @@ class ZImageTransformerBlock(nn.Module):
                 attention_mask=attn_mask,
                 cos=cos,
                 sin=sin,
+                qk_norm_rope_table=qk_norm_rope_table,
             )
             x = x + self.attention_norm2(attn_out)
 
@@ -593,6 +628,18 @@ class RopeEmbedder:
             sin_result.append(self.sin_cached[i][index])
 
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
+
+
+def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
+    """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
+
+    Sequence-parallel inputs already contain this rank's shard. ``None``
+    below the token threshold or outside the CUDA-matching contract (BF16,
+    D=128). The default threshold of zero preserves fusion for all sizes.
+    """
+    if cos.shape[0] * cos.shape[1] < fused_qk_norm_rope_min_tokens(0):
+        return None
+    return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, cuda_rms_norm=True)
 
 
 class ZImageTransformer2DModel(CachedTransformer):
@@ -1030,8 +1077,9 @@ class ZImageTransformer2DModel(CachedTransformer):
             if self.alignment_padding_mode == ZERO_MASKED_PADDING:
                 x_attn_mask[i, :seq_len].masked_fill_(x_inner_pad_mask[i], False)
 
+        x_qk_norm_rope_table = _packed_qk_norm_rope_table(x_cos, x_sin, x.dtype)
         for layer in self.noise_refiner:
-            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
+            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input, qk_norm_rope_table=x_qk_norm_rope_table)
 
         # cap embed & refine
         cap_item_seqlens = [len(_) for _ in cap_feats]
@@ -1073,8 +1121,9 @@ class ZImageTransformer2DModel(CachedTransformer):
             if self.alignment_padding_mode == ZERO_MASKED_PADDING:
                 cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
 
+        cap_qk_norm_rope_table = _packed_qk_norm_rope_table(cap_cos, cap_sin, cap_feats.dtype)
         for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
+            cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin, qk_norm_rope_table=cap_qk_norm_rope_table)
 
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
@@ -1091,8 +1140,16 @@ class ZImageTransformer2DModel(CachedTransformer):
             cap_attn_mask,
         )
         # Main transformer blocks
+        unified_qk_norm_rope_table = _packed_qk_norm_rope_table(unified_cos, unified_sin, unified.dtype)
         for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
+            unified = layer(
+                unified,
+                unified_attn_mask,
+                unified_cos,
+                unified_sin,
+                adaln_input,
+                qk_norm_rope_table=unified_qk_norm_rope_table,
+            )
 
         # Final layer
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)

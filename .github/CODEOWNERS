@@ -24,7 +24,10 @@
 /tests/ @yenuo26 @NickCao
 
 # CI
-/.buildkite/ @yenuo26 @congw729 @NickCao
+/.buildkite/ @yenuo26 @congw729 @NickCao @haic0
+# Ascend NPU CI. Repeats the CI owners and appends the NPU owner.
+# Last-match-wins, so this must stay after /.buildkite/.
+/.buildkite/npu/ @yenuo26 @congw729 @NickCao @haic0 @FayeSpica
 
 # ComfyUI / external apps
 /apps/ @fhfuih @alex-jw-brooks
@@ -43,8 +46,8 @@
 # =====================================================================
 
 # Autoregressive runtime — docs/design/module/ar_runtime.md
-/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan @Sy0307 @Gaohan123
-/vllm_omni/worker/ @tzhouam @yinpeiqi @fake0fan @Sy0307 @Gaohan123
+/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan @Sy0307 @Gaohan123 @ZhengWG
+/vllm_omni/worker/ @tzhouam @yinpeiqi @fake0fan @Sy0307 @Gaohan123 @ZhengWG
 
 # Engine orchestration & stage runtime — docs/design/module/engine_orchestration.md, stage_runtime.md
 /vllm_omni/engine/ @tzhouam @fake0fan
@@ -87,6 +90,10 @@
 
 # Execution platforms (hardware backends) — docs/design/module/execution_platforms.md
 /vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi
+# Vendor subtrees repeat the platform owners and append the additional owner from
+# primary_code_path_owners. Last-match-wins, so these must stay after /platforms/.
+/vllm_omni/platforms/npu/ @gcanlin @tjtanaa @xuechendi @FayeSpica
+/vllm_omni/platforms/rocm/ @gcanlin @tjtanaa @xuechendi @haic0
 /vllm_omni/attention/ @gcanlin @tjtanaa @xuechendi @david6666666 @lishunyang12
 
 # Configuration & deploy — docs/design/module/vllm_omni_config.md
@@ -137,9 +144,9 @@
 
 # Diffusion model integration (pipelines, registration, checkpoint loading)
 # — docs/design/module/diffusion/diffusion_model_integration.md
-/vllm_omni/diffusion/models/ @fhfuih @Bounty-hunter @wtomin
+/vllm_omni/diffusion/models/ @fhfuih @Bounty-hunter @wtomin @timzsu
 /vllm_omni/diffusion/model_loader/ @fhfuih @Bounty-hunter @wtomin @RuixiangMa
-/vllm_omni/diffusion/lora/ @fhfuih @Bounty-hunter @wtomin @RuixiangMa
+/vllm_omni/diffusion/lora/ @fhfuih @Bounty-hunter @wtomin @RuixiangMa @timzsu
 
 # Diffusion parallelism (rank topology, TP/SP/PP/VAE patch)
 # — docs/design/module/diffusion/parallelism.md

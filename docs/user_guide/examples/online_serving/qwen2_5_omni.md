@@ -20,6 +20,13 @@ To use a custom deploy config, launch the server with the command below:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```
 
+Omni keeps soundfile as the first automatic audio decoder to preserve input
+waveforms when upgrading to vLLM 0.32. Switching decoders can change BF16 audio
+features and mixed-media answers. Formats unsupported by soundfile continue
+through upstream's torchcodec/PyAV fallback. To explicitly select a decoder,
+use `--media-io-kwargs '{"audio":{"audio_backend":"torchcodec"}}'` (or
+`soundfile` / `pyav`); explicit selections retain upstream behavior.
+
 ### Send Multi-modal Request
 
 Get into the example folder

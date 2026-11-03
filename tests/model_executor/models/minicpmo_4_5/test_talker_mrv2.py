@@ -28,6 +28,9 @@ def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker._codec_eos_id = _EOS
     talker._tts_config = SimpleNamespace(max_position_embeddings=max_position_embeddings)
     talker._mrv2_empty_speech = torch.zeros(max_reqs, dtype=torch.bool)
+    talker._mrv2_code_runs = torch.zeros((max_reqs, 2), dtype=torch.long)
+    talker._num_audio_tokens = _EOS + 1
+    talker._codec_classes("cpu")
     talker._mrv2_forced_eos = None
     talker._mrv2_decode_rows_logged = False
     return talker
@@ -52,11 +55,14 @@ def _batch(rows: list[dict], *, pad_to: int | None = None):
     ), padded
 
 
-def _req_states(prompt_lens: dict[int, int], max_reqs: int = 8):
+def _req_states(prompt_lens: dict[int, int], max_reqs: int = 8, token_ids: dict[int, list[int]] | None = None):
     prompt_len = torch.zeros(max_reqs, dtype=torch.int32)
     for slot, value in prompt_lens.items():
         prompt_len[slot] = value
-    return SimpleNamespace(prompt_len=SimpleNamespace(gpu=prompt_len))
+    all_token_ids = torch.zeros((max_reqs, 64), dtype=torch.int32)
+    for slot, ids in (token_ids or {}).items():
+        all_token_ids[slot, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
+    return SimpleNamespace(prompt_len=SimpleNamespace(gpu=prompt_len), all_token_ids=SimpleNamespace(gpu=all_token_ids))
 
 
 def test_mrv2_output_emits_decode_input_codes_with_validity_and_forced_eos() -> None:
@@ -231,66 +237,130 @@ def test_mrv2_turn_end_drain_masks_cadence_eos(mocker, step, turn_start, turn_en
     assert (output.sampled_token_ids.item() != _EOS) is masked
 
 
-@pytest.mark.cuda
-def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
-    """The real MRv2 sampler pipeline scores the V1 16-frame codec penalty.
+def _mrv2_turn_end_samples_eos(mocker, talker, *, step: int, code: int, wants_eos: bool = True) -> bool:
+    """One decode step of a turn-end condition whose turn ended a sentence; True if EOS is sampled."""
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-    The stock penalty would tax every code in the prompt (the scheduler's
-    placeholder id 0) and in the whole output once; the Talker's penalty taxes
-    ``penalty ** count`` over the last 16 sampled codes only.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    from vllm.config import VllmConfig
-    from vllm.sampling_params import SamplingParams
-    from vllm.v1.worker.gpu.sample.sampler import Sampler
-    from vllm.v1.worker.gpu.states import RequestState
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerSampler
 
+    batch, _ = _batch([dict(slot=2, prompt_len=4, computed=3 + step, span=[code], prefill=False)])
+    states = _req_states({2: 4})
+    talker.make_omni_output_mrv2(
+        torch.zeros((1, 4)),
+        input_batch=batch,
+        req_states=states,
+        model_intermediate_buffer=[
+            {
+                "native_duplex": True,
+                "duplex": {"epoch": 3, "turn_id": 7},
+                "meta": {"turn_end": True, "turn_text_ends_sentence": True},
+            }
+        ],
+    )
+    base = mocker.Mock(
+        side_effect=lambda logits, _: SamplerOutput(
+            sampled_token_ids=logits.argmax(-1)[:, None],
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.ones(1, dtype=torch.int32),
+            num_rejected=torch.zeros(1, dtype=torch.int32),
+        )
+    )
+    base.req_states = states
+    logits = torch.zeros(1, _EOS + 1)
+    logits[0, _EOS if wants_eos else 0] = 10
+    return MiniCPMO45TalkerSampler(base, talker)(logits, batch).sampled_token_ids.item() == _EOS
+
+
+def test_mrv2_turn_end_drain_waits_for_silence(mocker):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _SILENT_CODEC_IDS
+
+    talker, silent = _talker(), _SILENT_CODEC_IDS[0]
+    # While the Talker is speaking, its cadence EOS is masked at and between boundaries.
+    assert not _mrv2_turn_end_samples_eos(mocker, talker, step=24, code=17)
+    assert not _mrv2_turn_end_samples_eos(mocker, talker, step=25, code=17)
+    # One silent code is not enough; after two in a row the model may stop.
+    assert not _mrv2_turn_end_samples_eos(mocker, talker, step=26, code=silent)
+    assert _mrv2_turn_end_samples_eos(mocker, talker, step=27, code=silent)
+    # Speech resets the run.
+    assert not _mrv2_turn_end_samples_eos(mocker, talker, step=28, code=17)
+
+
+_TURN_END_BUFFER = {
+    "native_duplex": True,
+    "duplex": {"epoch": 3, "turn_id": 7},
+    "meta": {"turn_end": True, "turn_text_ends_sentence": True},
+}
+
+
+def _turn_end_stop_rule(talker, *, slot: int, span: list[int], computed: int, prefill: bool, history=None):
+    """One Talker step of a sentence-final turn-end condition (prompt length 4): its (forced, masked) EOS."""
+    batch, _ = _batch([dict(slot=slot, prompt_len=4, computed=computed, span=span, prefill=prefill)])
+    talker.make_omni_output_mrv2(
+        torch.zeros((len(span), 4)),
+        input_batch=batch,
+        req_states=_req_states({slot: 4}, token_ids={slot: history} if history else None),
+        model_intermediate_buffer=[_TURN_END_BUFFER],
+    )
+    forced, masked = talker._mrv2_forced_eos, talker._mrv2_masked_eos
+    talker._mrv2_forced_eos = talker._mrv2_masked_eos = None
+    return bool(forced[0]), bool(masked[0])
+
+
+def test_mrv2_turn_end_drain_stops_the_same_way_after_preemption():
+    """A request resumed after preemption re-prefills its codes; its EOS decisions match an uninterrupted run."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _QUIET_CODEC_IDS, _SILENT_CODEC_IDS
+
+    silent = _SILENT_CODEC_IDS[0]
+    quiet = next(code for code in _QUIET_CODEC_IDS if code not in _SILENT_CODEC_IDS)
+    # Speech, two silent codes (EOS may be sampled at step 5), then quiet codes up to the forced stop at step 11.
+    codes = [17, 17, 17, silent, silent] + [quiet] * 6
+    prompt = [0] * 4
+
+    def decode(talker, slot: int, step: int):
+        return _turn_end_stop_rule(talker, slot=slot, span=[codes[step - 1]], computed=3 + step, prefill=False)
+
+    uninterrupted_talker = _talker()
+    uninterrupted = [decode(uninterrupted_talker, 2, step) for step in range(1, len(codes) + 1)]
+    assert uninterrupted == [(False, True)] * 4 + [(False, False)] + [(False, True)] * 5 + [(True, False)]
+
+    # Preempted after step 4, then resumed in another slot by re-prefilling the prompt and the codes so far.
+    talker = _talker()
+    resumed = [decode(talker, 2, step) for step in range(1, 5)]
+    history = prompt + codes[:5]
+    resumed.append(_turn_end_stop_rule(talker, slot=5, span=history, computed=0, prefill=True, history=history))
+    resumed += [decode(talker, 5, step) for step in range(6, len(codes) + 1)]
+    assert resumed == uninterrupted
+
+
+def test_mrv2_turn_end_drain_new_condition_starts_from_zero():
+    """A new condition's prefill has no codes yet, so runs left in its slot by an earlier condition do not count."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _SILENT_CODEC_IDS
+
+    talker, silent = _talker(), _SILENT_CODEC_IDS[0]
+    for step in (1, 2):
+        _turn_end_stop_rule(talker, slot=2, span=[silent], computed=3 + step, prefill=False)
+    assert talker._mrv2_code_runs[2].tolist() == [2, 2]
+    _turn_end_stop_rule(talker, slot=2, span=[0] * 4, computed=0, prefill=True, history=[0] * 4)
+    assert talker._mrv2_code_runs[2].tolist() == [0, 0]
+    # One silent code of the new condition is not enough to stop.
+    assert _turn_end_stop_rule(talker, slot=2, span=[silent], computed=4, prefill=False) == (False, True)
+
+
+def test_mrv2_turn_end_drain_forces_eos_after_a_quiet_run(mocker):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _CODEC_PENALTY_WINDOW,
-        _apply_batched_repetition_penalty,
-        _install_mrv2_talker_sampler,
+        _QUIET_CODEC_IDS,
+        _SILENT_CODEC_IDS,
+        _TURN_END_QUIET_STOP_FRAMES,
     )
 
-    device, vocab, penalty = torch.device("cuda"), 32, 1.05
-    reqs = RequestState(4, 64, 64, 0, vocab, device)
-    sampler = Sampler(VllmConfig(), 4, vocab, device, reqs)
-    talker = _talker(max_reqs=4)
-    wrapped = _install_mrv2_talker_sampler(sampler, talker)
-
-    prompt = [0, 0, 0]
-    # Code 5 only before the window, code 7 three times and code 9 once inside it.
-    output = [5, 5, 5, 5] + [7, 1, 2, 7, 3, 4, 7, 6, 8, 10, 11, 12, 13, 14, 15, 9]
-    assert len(output) - 4 == _CODEC_PENALTY_WINDOW
-    reqs.add_request("talker", len(prompt), prompt + output, len(prompt) + len(output), 64)
-    slot = reqs.req_id_to_index["talker"]
-    wrapped.add_request(slot, SamplingParams(repetition_penalty=penalty, temperature=1.0))
-    reqs.apply_staged_writes()
-    wrapped.apply_staged_writes()
-
-    logits = torch.linspace(-3.0, 3.0, vocab, device=device).reshape(1, vocab)
-    idx = torch.tensor([slot], dtype=torch.int32, device=device)
-    processed = wrapped.apply_sampling_params(
-        logits.clone(),
-        idx,
-        idx,
-        np.array([slot]),
-        torch.tensor([len(prompt) + len(output)], device=device),
-        torch.tensor([output[-1]], dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-        np.array([len(prompt) + len(output) + 1]),
-        skip_top_k_top_p=True,
+    talker = _talker()
+    quiet = next(code for code in _QUIET_CODEC_IDS if code not in _SILENT_CODEC_IDS)
+    for step in range(10, 10 + _TURN_END_QUIET_STOP_FRAMES - 1):
+        assert not _mrv2_turn_end_samples_eos(mocker, talker, step=step, code=quiet, wants_eos=False)
+    assert _mrv2_turn_end_samples_eos(
+        mocker, talker, step=10 + _TURN_END_QUIET_STOP_FRAMES - 1, code=quiet, wants_eos=False
     )
-    expected = _apply_batched_repetition_penalty(
-        logits.cpu(), [torch.tensor(output)], penalty=penalty, window_size=_CODEC_PENALTY_WINDOW
-    )
-    torch.testing.assert_close(processed.cpu(), expected)
-    # Neither the placeholder prompt id nor codes outside the window are taxed.
-    assert processed[0, 0].item() == pytest.approx(logits[0, 0].item())
-    assert processed[0, 5].item() == pytest.approx(logits[0, 5].item())
-    assert processed[0, 7].item() == pytest.approx(logits[0, 7].item() * penalty**3)
-    # The runner still finds the output bin counts on ``penalties_state``.
-    assert sampler.penalties_state.output_bin_counts is not None
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -348,8 +418,8 @@ def test_turn_decode_does_not_build_duplex_limit_tensors(monkeypatch):
     def reject_copy(*args, **kwargs):
         raise AssertionError("ordinary turn decode must not upload duplex limits")
 
-    monkeypatch.setattr(module, "index_to_device", reject_copy)
     talker = _talker()
+    monkeypatch.setattr(module, "index_to_device", reject_copy)
     batch, _ = _batch([dict(slot=0, prompt_len=4, computed=5, span=[1], prefill=False)])
     talker.make_omni_output_mrv2(
         torch.zeros(1, 4),

@@ -144,7 +144,8 @@ class InteractionCoordinator:
             fps = media.fps
             num_latent_frames = media.num_latent_frames
 
-        boundary_at = synchronized_monotonic_time()
+        context = state.interaction_boundary
+        boundary_at = context.boundary_at if context is not None else synchronized_monotonic_time()
         chunk_index = state.chunk_index
         metas: list[InteractionChunkMetadata] = []
         for handler in self._handlers_in_apply_order():
@@ -175,6 +176,8 @@ class InteractionCoordinator:
         """Fan out chunk-boundary apply to handlers in stable order (prompt first)."""
         if chunk_index is None:
             chunk_index = state.chunk_index
+        if state.interaction_boundary is not None:
+            boundary_at = state.interaction_boundary.boundary_at
         metas: list[InteractionChunkMetadata] = []
         for handler in self._handlers_in_apply_order():
             if handler.lazy_initialize_session and handler.modality not in state.interaction_sessions:

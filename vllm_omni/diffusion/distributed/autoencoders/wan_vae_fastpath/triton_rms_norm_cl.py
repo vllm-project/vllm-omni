@@ -7,7 +7,7 @@ With channels-last activations every spatial position owns a contiguous vector
 of ``C`` channels, so one program can load a ``(BLOCK_P, C)`` tile, reduce over
 the channels in registers and write the normalized (and optionally SiLU'd)
 result: the activation is read once and written once instead of the two-pass
-scheme :mod:`.triton_rms_norm` needs for channels-first layouts.
+scheme :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue` needs for channels-first layouts.
 
 This kernel is only dispatched at the tolerance-based ``channels_last`` level,
 so for FP16/FP32 it uses fast math: one reciprocal per position, ``scale`` folded into
@@ -34,6 +34,10 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+
+from ._utils import on_kernel_device
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_CHANNELS = 1024
 # Positions x channels per program. Autotuning on the first call picked one
@@ -51,12 +55,12 @@ if HAS_TRITON:
     ):
         denom = tl.maximum(tl.sqrt(tl.sum(x * x, axis=1)), eps)
         if EXACT_BF16 and DTYPE == tl.bfloat16:
-            v = tl.math.div_rn(x, denom[:, None]).to(DTYPE).to(tl.float32)
+            v = rn.div_rn(x, denom[:, None]).to(DTYPE).to(tl.float32)
             v = (v * scale).to(DTYPE).to(tl.float32)
             v = (v * gamma[None, :]).to(DTYPE).to(tl.float32)
             v = (v + 0.0).to(DTYPE).to(tl.float32)
             if SILU:
-                v = tl.math.div_rn(v, 1.0 + tldevice.exp(-v))
+                v = rn.div_rn(v, 1.0 + tldevice.exp(-v))
         else:
             inv_norm = 1.0 / denom
             v = x * inv_norm[:, None] * (gamma * scale)[None, :]
@@ -132,7 +136,7 @@ def rms_norm_channels_last(
     convolution that produced ``x``); ``None`` skips the add. ``exact_bf16``
     keeps the reference epilogue's roundings for BF16 (encoder only).
     """
-    if not HAS_TRITON or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if not HAS_TRITON or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     channels = x.shape[1]
     if channels < 2 or channels > _MAX_CHANNELS or x.numel() == 0:

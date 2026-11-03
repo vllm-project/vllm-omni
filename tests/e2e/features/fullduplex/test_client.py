@@ -248,6 +248,27 @@ async def test_realtime_client_configure_disables_auto_response_without_obsolete
     assert extra_body == {"ref_audio": "data:audio/wav;base64,AAAA", "native_duplex": False}
 
 
+@pytest.mark.asyncio
+async def test_realtime_client_stamps_append_after_send():
+    class _FakeWs:
+        async def send(self, raw: str) -> None:
+            del raw
+
+    client = RealtimeDuplexClient("ws://unused")
+    client._ws = _FakeWs()
+    await client.send(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": "xx",
+            "video_frames": ["frame"],
+        }
+    )
+    await client.send({"type": "input_audio_buffer.commit"})
+    assert len(client.events.client_appends) == 1
+    assert client.events.client_appends[0].keys() == {"sent_at_s", "event_id"}
+    assert client.events.client_appends[0]["event_id"] == ""
+
+
 def test_realtime_event_collector_partitions_audio_by_response():
     collector = RealtimeEventCollector()
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})
@@ -337,3 +358,54 @@ def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
     # A composite belongs to the unit it was captured in, so it rides the same
     # append as that unit's base frame; a unit without one sends the base alone.
     assert [event["video_frames"] for event in sent if "video_frames" in event] == [["f0", "s0"], ["f1"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unit_ms", [32, 1000])
+@pytest.mark.parametrize("send_cost_s", [0.001, 0.040])
+async def test_stream_av_units_pacing_absorbs_send_frame_cost_and_sleep_overshoot(monkeypatch, unit_ms, send_cost_s):
+    from vllm_omni.experimental.fullduplex import client as client_module
+
+    class Clock:
+        now = 7.0
+
+        def monotonic(self):
+            return self.now
+
+        async def sleep(self, delay):
+            assert delay >= 0
+            # Model scheduling overshoot without relying on host load.
+            self.now += delay + (0.002 if delay else 0.0)
+
+    clock = Clock()
+    sent, frames = [], []
+
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            clock.now += send_cost_s
+            sent.append(event)
+
+    async def frame_sink(items):
+        clock.now += 0.005
+        frames.extend(items)
+
+    monkeypatch.setattr(client_module, "time", clock)
+    monkeypatch.setattr(client_module, "asyncio", clock)
+    client = Client("ws://unused")
+    chunk = b"\x01\x00" * (16 * unit_ms)
+    count = 60_000 // unit_ms
+    started = clock.now
+
+    frame_count = await client.stream_av_units(
+        ((chunk, [f"frame-{index}"]) for index in range(count)), frame_sink=frame_sink
+    )
+
+    # Slow sends may overrun the media clock, but must not add another full
+    # chunk's sleep. Ordinary send/frame work and overshoot must not accumulate.
+    processing_s = count * (send_cost_s + 0.005)
+    expected_s = max(60.0, processing_s) + (0.002 if processing_s < 60.0 else 0.0)
+    assert clock.now - started == pytest.approx(expected_s)
+    assert frame_count == count and frames == [f"frame-{index}" for index in range(count)]
+    assert b"".join(base64.b64decode(event["audio"]) for event in sent) == chunk * count
+    assert sent[-1]["audio_end_ms"] == client._media_clock_ms == 60_000
+    assert not any("video_frames" in event for event in sent)

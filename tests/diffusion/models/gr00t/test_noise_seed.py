@@ -82,7 +82,7 @@ def test_seed_without_generator_builds_one_on_the_pipeline_device(pipeline):
     generator = pipeline.policy.seen_options["generator"]
     assert isinstance(generator, torch.Generator)
     assert generator.initial_seed() == 1234
-    assert generator.device.type == pipeline.device
+    assert generator.device.type == pipeline.device.type
 
 
 def test_auto_assigned_seed_reaches_the_head(pipeline):

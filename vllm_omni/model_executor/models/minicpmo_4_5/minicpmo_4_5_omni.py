@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
@@ -124,7 +124,7 @@ def _generator_rewind(generator: torch.Generator) -> Callable[[], None]:
     info=MiniCPMO45OmniLLMProcessingInfo,
     dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
-class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
+class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, SupportsEagle3):
     """MiniCPM-o 4.5 Omni model for conditional generation.
 
     Three-stage pipeline:
@@ -135,6 +135,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     """
 
     requires_raw_input_tokens = True
+    # Set when a drafter (EAGLE-3, DFlash, DSpark) reads Thinker layers.
+    _returns_aux_hidden_states = False
+    _num_aux_hidden_states = 0
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -277,6 +280,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Neither AR stage has a postprocess, so step outputs can use the
         # runner's async snapshot instead of a blocking per-step D2H.
         self.use_async_omni_output = self.model_stage in {"llm", "tts"}
+        # Code2Wav consumes codec codes and metadata, not Talker hidden states.
+        # Keep the Thinker hidden-state handoff, but avoid snapshotting and
+        # transporting an unused hidden tensor on every Talker decode step.
+        self.omni_pooler_payload_include_hidden = self.model_stage != "tts"
 
         if self.model_stage == "llm" and is_duplex and self._use_v2_model_runner:
             # Only the duplex Thinker exposes the MRv2 batch-preprocess hook.
@@ -629,6 +636,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         takes the staged results and builds or reports anything skipped here.
         """
         del device
+        if self.model_stage == "tts":
+            # Full device-graph replay skips Talker.forward's Python cleanup.
+            # Release finished requests before preprocessing can reuse slots.
+            self.talker._flush_deferred_cleanup()
+            return
         if self.model_stage != "llm":
             return
         infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]
@@ -742,6 +754,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_data_plane_helper = helper
         return helper
 
+    def get_language_model(self) -> torch.nn.Module:
+        """The Thinker's text decoder; drafters share its embedding and lm_head."""
+        if self.thinker is not None:
+            return self.thinker.get_language_model()
+        return self.model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Only the MRv2 Thinker forward hands target layers to the drafter.
+        if self.model_stage != "llm" or not self._use_v2_model_runner:
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 drafters that read target hidden layers (EAGLE-3, DFlash, DSpark) "
+                "need the Thinker stage on model_runner: v2"
+            )
+        super().set_aux_hidden_state_layers(layers)
+        language_model = self.get_language_model()
+        decoder = getattr(language_model, "model", language_model)
+        stored = getattr(decoder, "aux_hidden_state_layers", None)
+        if stored is None:
+            raise RuntimeError(
+                f"MiniCPM-o Thinker decoder {type(decoder).__name__} keeps no aux_hidden_state_layers "
+                "for the drafter's target layers"
+            )
+        self._returns_aux_hidden_states = True
+        # The decoder returns one tensor per layer it stored (vLLM dedupes them).
+        self._num_aux_hidden_states = len(stored)
+
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.
         mm_fn = getattr(self.model, "get_multimodal_embeddings", None)
@@ -824,7 +862,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 **kwargs,
             )
 
-            if isinstance(thinker_output, tuple):
+            aux_hidden_states = None
+            if self._returns_aux_hidden_states:
+                text_hidden_states, aux_hidden_states = thinker_output
+                if not isinstance(aux_hidden_states, (list, tuple)) or len(aux_hidden_states) != (
+                    self._num_aux_hidden_states
+                ):
+                    raise RuntimeError(
+                        f"MiniCPM-o Thinker returned {type(aux_hidden_states).__name__} for the drafter's "
+                        f"{self._num_aux_hidden_states} target layers"
+                    )
+            elif isinstance(thinker_output, tuple):
                 _, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
@@ -838,6 +886,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 # FULL graphs return tensors. The row ledger is reconstructed
                 # from this step's live input batch after replay, never from
                 # Python values or token buffers captured during warmup.
+                if aux_hidden_states is not None:
+                    return text_hidden_states, aux_hidden_states
                 return text_hidden_states
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
@@ -908,7 +958,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
         return self.model_stage == "tts" and self._use_v2_model_runner
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
         if self.model_stage == "tts":
             return self.talker.mrv2_custom_sampler(sampler)
         if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
@@ -917,12 +967,76 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
             return MiniCPMO45DuplexSampler(sampler, self), None
-        return sampler, None
+        # Keep the runner's defaults, including the rejection sampler that
+        # verifies draft tokens.
+        return None
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
+
+    @property
+    def requires_request_sample_eligibility(self) -> bool:
+        """Forward the Talker's sampling-eligibility contract to the runner.
+
+        The runner only supplies ``request_sample_eligible`` when the model it
+        sees declares the flag, and it always sees this wrapper -- never the
+        inner Talker (the same resolution rule as talker_multiframe.applies
+        below). Without the forward, the Talker's K-step branch falls back to
+        treating every request as eligible, so an incomplete prefill chunk
+        advances codec history and RNG state and the generated audio starts
+        depending on prefill chunking.
+        """
+        talker = getattr(self, "talker", None)
+        return talker is not None and bool(getattr(talker, "requires_request_sample_eligibility", False))
+
+    # Runner-side forwards for multi-frame decode. The baseline declares these
+    # four methods on this outer wrapper class; the runner only ever sees the
+    # wrapper (talker_multiframe.applies / is_multi_token_decode /
+    # ensure_stop_token_vocab all resolve through getattr(model, ...)), so
+    # without them:
+    #   * missing supports_multi_frame_decode -> the check silently reads False,
+    #     the multi-frame loop never runs and no reason is logged;
+    #   * missing take/set_batch_stop_logits -> per-frame stop rows unavailable;
+    #   * missing batch_stop_logits -> the runner's gate probe reads None and
+    #     always falls back to text_hidden_states;
+    #   * missing merge_frame_outputs -> multi-frame results cannot be merged.
+    # The speculative config alone is not enough: the runner-side loop and its
+    # vocab-width correction (ensure_stop_token_vocab) stay dormant, the
+    # rejection sampler consumes width-0 rows, AIV goes out of bounds (507035)
+    # and the stage-1 engine dies with empty audio.
+    @property
+    def supports_multi_frame_decode(self) -> bool:
+        # "This wrapper implements the multi-frame path", not "the loop is
+        # running": the Talker (tts) stage has it, the Thinker does not. Whether
+        # a step actually runs it is decided per deployment by stage 1's
+        # speculative_config (the runner checks its num_spec_tokens for that).
+        return self.model_stage == "tts"
+
+    @property
+    def batch_stop_logits(self):
+        # The runner probes this attribute on the registered architecture
+        # (getattr in npu_model_runner); without the forward it reads None and
+        # the gate always falls back to text_hidden_states.
+        if self.model_stage != "tts":
+            return None
+        return self.talker.batch_stop_logits
+
+    def take_batch_stop_logits(self):
+        if self.model_stage != "tts":
+            return None
+        return self.talker.take_batch_stop_logits()
+
+    def set_batch_stop_logits(self, logits) -> None:
+        if self.model_stage != "tts":
+            return
+        self.talker.set_batch_stop_logits(logits)
+
+    def merge_frame_outputs(self, frame_outputs, frame_stop_logits):
+        if self.model_stage != "tts":
+            return frame_outputs
+        return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type

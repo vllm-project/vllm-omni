@@ -9,6 +9,10 @@ Self-review your branch before creating a PR against `vllm-project/vllm-omni`. T
 
 ## Contributor intent gate
 
+Before self-checking, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current change; apply only relevant checks.
+
 Run this gate before implementing a contribution and again before submission
 if its intent or scope has changed. It applies to contributor self-review,
 not independent review of somebody else's PR or automated review selection.
@@ -108,6 +112,15 @@ If multiple rows apply (e.g., a diffusion model is also a new model), union the 
 ### Step 4: Run Checklist
 
 Ask: "Quick mode or full mode?" Then walk the checklist for the detected PR type from [references/checklists.md](references/checklists.md). Each item produces ✓, ✗, or ⚠.
+
+**Also resolve affected design contracts** using the canonical review
+[design-contract resolver](../review-pr/references/process/design-contracts.md).
+Use the candidate head's existing module and feature pages; update an affected
+active contract in the same PR. Check user guides and examples when public
+configuration, defaults, or supported behavior changes. Treat draft invariants
+as review questions, not automatic blockers. In the PR description, summarize
+before/after behavior, the affected documentation (or why it is unchanged),
+and the supporting regression evidence. Report checks not run explicitly.
 
 **Also run the Code-Quality sweep on every PR**, regardless of type or mode: the five diff-scoped checks in [references/code-quality.md](references/code-quality.md) — kwargs fragility, broad-except swallow, `Any`/wrong type hints, hot-path `.clone()`/`deepcopy`, and event-loop blocking — plus the advisory conventions (log level, structured logging, synchronization, cleanup, dependencies, naming) in [checklists.md](references/checklists.md). These count only lines the PR *adds* — the pre-existing backlog across the repo is out of scope.
 
