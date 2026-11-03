@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.experimental.ar_diffusion.cell_executor import (
     ARDiffusionCellContext,
     CellAdapter,
@@ -35,6 +34,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     prior_history_in_pool,
 )
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
