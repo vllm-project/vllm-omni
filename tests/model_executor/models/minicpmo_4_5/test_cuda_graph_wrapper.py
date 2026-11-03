@@ -1255,7 +1255,7 @@ def test_whole_euler_multibatch_remainder_replay(
     )
     assert out_mel.shape == (batch_size, 4, w)
     assert out_cnn.shape[2] == 2 * batch_size
-    assert out_att.shape[2] == 2 * batch_size
+    assert out_att.shape[3] == 2 * batch_size
     assert {key[1] for key in wrapper._cache} == graph_batches
 
     eager_x, eager_cnn, eager_att = _eager_solve_euler(
@@ -1296,7 +1296,7 @@ def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.Monke
     assert out_mel4 is not None
     assert out_mel4.shape == (4, 4, w)
     assert out_cnn4.shape[2] == 8
-    assert out_att4.shape[2] == 8
+    assert out_att4.shape[3] == 8
     assert any(key[1] == 4 for key in wrapper._cache)
 
     # 2. B=8 partitions into [4, 4], reusing the native B=4 graph
@@ -1317,7 +1317,7 @@ def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.Monke
     assert out_mel8 is not None
     assert out_mel8.shape == (8, 4, w)
     assert out_cnn8.shape[2] == 16
-    assert out_att8.shape[2] == 16
+    assert out_att8.shape[3] == 16
 
     # 3. B=5 partitions into [4, 1], capturing B=1 graph as well
     batch_size = 5
@@ -1337,7 +1337,7 @@ def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.Monke
     assert out_mel5 is not None
     assert out_mel5.shape == (5, 4, w)
     assert out_cnn5.shape[2] == 10
-    assert out_att5.shape[2] == 10
+    assert out_att5.shape[3] == 10
     cached_batches = {key[1] for key in wrapper._cache}
     assert 4 in cached_batches
     assert 1 in cached_batches
@@ -1361,7 +1361,7 @@ def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.Monke
     assert out_mel16 is not None
     assert out_mel16.shape == (16, 4, w)
     assert out_cnn16.shape[2] == 32
-    assert out_att16.shape[2] == 32
+    assert out_att16.shape[3] == 32
 
     # B > 16 returns None (eager fallback)
     x17 = torch.randn(17, 4, w, device="cuda")
@@ -1765,7 +1765,7 @@ def test_whole_euler_graphs_share_one_attention_storage(monkeypatch: pytest.Monk
     assert {(key[1], key[3]) for key in wrapper._cache} == {(1, 0), (1, w), (1, 2 * w), (2, 0), (2, w)}
     storage = wrapper.arena._att
     assert storage is not None
-    assert int(storage.shape[2]) == 2 * wrapper.micro_batch_size
+    assert int(storage.shape[3]) == 2 * wrapper.micro_batch_size
     for statics, _final_x, _out_cnn, out_att, _graph in wrapper._cache.values():
         assert statics.att_cache.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
         assert out_att.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
