@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -176,6 +176,29 @@ _TURN_END_SILENT_FRAMES = 2
 _TURN_END_QUIET_STOP_FRAMES = 8
 # Both V1 paths count runs inside the codec penalty window.
 assert _TURN_END_QUIET_STOP_FRAMES <= _CODEC_PENALTY_WINDOW
+
+
+class _KStepPendingRow(NamedTuple):
+    """A sampled row awaiting the single host readback in flush_kstep_pending.
+
+    ``delta_slot`` is the row's placeholder position in ``deltas``; ``stop_slot``
+    is its position in ``stop_rows``/``terminal_flags``. The flush rewrites the
+    provisional stop row in place (with ``row_stop``/``flag_true``) when the
+    host readback turns the frame into a repetition or quiet-drain stop, so
+    the stop id reaches vLLM's sampler in the detecting step.
+    """
+
+    packed: torch.Tensor  # device row [sampled_id, finished, emit]
+    request_id: str
+    state: dict[str, Any]
+    info: dict[str, Any] | None
+    deltas: list[torch.Tensor] | None
+    delta_slot: int
+    stop_rows: list[torch.Tensor]
+    terminal_flags: list[torch.Tensor]
+    stop_slot: int
+    row_stop: torch.Tensor
+    flag_true: torch.Tensor
 #: Bits of the per-codec-id class table (``_codec_classes``).
 _CODEC_CLASS_SILENT = 1
 _CODEC_CLASS_QUIET = 2
@@ -2357,18 +2380,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # waiting for a next frame that a duplex turn-boundary request may
             # never get scheduled.
             pending.append(
-                (
-                    packed,
-                    request_id,
-                    state,
-                    info,
-                    codec_deltas,
-                    len(codec_deltas),
-                    stop_rows,
-                    terminal_flags,
-                    len(stop_rows),
-                    row_stop,
-                    flag_true,
+                _KStepPendingRow(
+                    packed=packed,
+                    request_id=request_id,
+                    state=state,
+                    info=info,
+                    deltas=codec_deltas,
+                    delta_slot=len(codec_deltas),
+                    stop_rows=stop_rows,
+                    terminal_flags=terminal_flags,
+                    stop_slot=len(stop_rows),
+                    row_stop=row_stop,
+                    flag_true=flag_true,
                 )
             )
             codec_deltas.append(empty_delta)
@@ -2890,7 +2913,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_state.release(request_id)
         pending = getattr(self, "_kstep_pending_packed", None)
         if pending:
-            self._kstep_pending_packed = [item for item in pending if item[1] not in self._deferred_cleanup_ids]
+            self._kstep_pending_packed = [
+                item for item in pending if item.request_id not in self._deferred_cleanup_ids
+            ]
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(
@@ -2941,21 +2966,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not pending:
             return
         self._kstep_pending_packed = []
-        packed_host = torch.stack([item[0] for item in pending]).cpu().tolist()
+        packed_host = torch.stack([item.packed for item in pending]).cpu().tolist()
         for item, (sampled_id, finished, emit) in zip(pending, packed_host):
-            (
-                _,
-                request_id,
-                state,
-                info,
-                deltas,
-                index,
-                stop_rows,
-                terminal_flags,
-                stop_slot,
-                row_stop,
-                flag_true,
-            ) = item
+            request_id = item.request_id
+            state = item.state
+            info = item.info
+            deltas = item.deltas
+            index = item.delta_slot
+            stop_rows = item.stop_rows
+            terminal_flags = item.terminal_flags
+            stop_slot = item.stop_slot
+            row_stop = item.row_stop
+            flag_true = item.flag_true
             if (
                 request_id in getattr(self, "_deferred_cleanup_ids", ())
                 or self._request_audio_states.get(request_id) is not state

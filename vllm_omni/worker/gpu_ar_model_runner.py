@@ -670,7 +670,7 @@ class GPUARModelRunner(
           filters are the two-wide continue/stop logits, so the codec vocabulary
           alone is not enough;
         * the workspace-bound codec prelude and the seeded exponential fill,
-        which the model compiles on first use inside ``prepare_cuda_kstep``.
+          which the model compiles on first use inside ``prepare_cuda_kstep``.
         """
         try:
             from vllm.v1.sample.ops.topk_topp_triton import (
