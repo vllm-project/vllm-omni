@@ -9,6 +9,9 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "EasyMagpieTTS": ("easymagpie", "easymagpie", "EasyMagpieTTSForConditionalGeneration"),
+    "EasyMagpieTTSForConditionalGeneration": ("easymagpie", "easymagpie", "EasyMagpieTTSForConditionalGeneration"),
+    "EasyMagpieCodecForConditionalGeneration": ("easymagpie", "codec.model", "EasyMagpieCodecForConditionalGeneration"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (

@@ -925,6 +925,24 @@ The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch
 
 The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only the first audio chunk early for lower TTFA, then returns to the normal `codec_chunk_frames` window so Code2Wav does not repeatedly decode tiny overlapping chunks.
 
+## EasyMagpie
+
+A converted EasyMagpie checkpoint supports complete text in `input`, bundled
+speaker names in `voice`, and optional `extra_params.context_text`. Native
+output is 22,050 Hz mono. Use `stream=true`, `stream_format="audio"`, and
+`response_format="pcm"` for audio chunks, or `response_format="wav"` for a
+complete file. `max_new_tokens` bounds AR generation. The local transformer's
+captured sampling path retains temperature 0.7 and top-k 80, as in the
+reference deployment. Request overrides and `seed` do not guarantee greedy
+or bitwise-reproducible acoustic codes.
+
+Raw reference audio requires both encoders to be bundled during conversion.
+Preset-voice qualification does not cover cloning or incremental text input.
+See the [A4500 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/EasyMagpie-A4500.md)
+for assets and precision settings, and the
+[H100 C256 configuration](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/EasyMagpie-H100.md)
+for the unqualified larger deployment profile.
+
 ## Supported Models
 
 ### Qwen3-TTS

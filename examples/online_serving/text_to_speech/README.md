@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| EasyMagpie | converted checkpoint bundle | requires bundled encoders; unqualified | ✓ (PCM stream) | bundled `speaker_embeddings/<voice>.pt` | — |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -31,6 +32,14 @@ For the full list of supported architectures across all modalities, see
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
+
+## EasyMagpie
+
+See the [A4500 recipe](../../../recipes/NVIDIA/EasyMagpie-A4500.md) for the
+checkpoint layout, launch command, speaker/context selection, and 22,050 Hz
+PCM playback. The [H100 C256 profile](../../../recipes/NVIDIA/EasyMagpie-H100.md)
+is configuration-only until separately benchmarked on H100. Use the shared
+HTTP clients below; no plugin or vLLM runtime patch is required.
 
 ## Common Quick Start
 

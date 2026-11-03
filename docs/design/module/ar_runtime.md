@@ -51,7 +51,12 @@ ownership of chunk transfer and request updates.
 
 Model schedulers may specialize that adapter through
 `OmniSchedulerMixin.chunk_transfer_adapter_cls`; the default remains
-`OmniChunkTransferAdapter`.
+`OmniChunkTransferAdapter`. EasyMagpie uses this hook to append codec frame
+placeholders while preserving recurrent cache positions, and to defer chunk
+replacement until in-flight PCM output has completed. Its sender snapshots
+only the fields consumed by its chunk processor, under the adapter's existing
+generation and cleanup fences. The integration tests cover preserved cache
+positions, output fencing, and terminal chunk flushing.
 
 ## Candidate invariants
 

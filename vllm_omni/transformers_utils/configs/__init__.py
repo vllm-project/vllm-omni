@@ -100,6 +100,7 @@ def __dir__():
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import easymagpie as _easymagpie  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_omni as _fish_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402

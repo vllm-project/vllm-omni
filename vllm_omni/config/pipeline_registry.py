@@ -58,6 +58,7 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
+from vllm_omni.model_executor.models.easymagpie.pipeline import EASYMAGPIE_PIPELINE
 from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
@@ -172,6 +173,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    "easymagpie": EASYMAGPIE_PIPELINE,
     "fish_omni": FISH_OMNI_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
     "gepard": GEPARD_PIPELINE,

@@ -82,6 +82,7 @@ th {
 | `CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `AuKForConditionalGeneration` | AuK / AuK-Flash (instruction-driven speech generation and editing) | `tencent/AuK`, `tencent/AuK-Flash` (with `Qwen/Qwen2.5-Omni-3B`; assemble with `tools/prepare_auk_checkpoint.py`) | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/AuK-H100.md) |
 | `OmniVoiceModel` | OmniVoice | `k2-fsa/OmniVoice` | ✅︎ | | | ✅︎ | — |
+| `EasyMagpieTTSForConditionalGeneration` | EasyMagpie / Nemotron-TTS | converted checkpoint bundle | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/EasyMagpie-A4500.md) |
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | ✅︎ | — |
 | `BreezeForConditionalGeneration` | Breeze-TTS-2 (voice design, voice clone, voice direction, CFG) | `BreezeBlue/Breeze-TTS-2` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md) |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` | ✅︎ | ✅︎ | | ✅︎ | — |

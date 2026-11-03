@@ -153,6 +153,8 @@ _PIPELINE_STAGES = [
     "gepard",
     "glm_tts",
     "glm_tts_dit",
+    "easymagpie",
+    "easymagpie_codec",
     "higgs_audio_v2",
     "higgs_audio_v3",
     "indextts2_5_talker",

@@ -10,6 +10,11 @@ For online serving, see [`examples/online_serving/text_to_speech/`](../../online
 list of supported architectures across all modalities, see
 [Supported Models](../../../docs/models/supported_models.md).
 
+EasyMagpie supports offline `Omni.generate` with a speaker-conditioned token
+prompt and the shared HTTP speech API. See its
+[recipe](../../../recipes/NVIDIA/EasyMagpie-A4500.md) for the converted
+checkpoint contract and deployment profiles.
+
 ## Supported Models
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
