@@ -16,6 +16,7 @@ from vllm import SamplingParams
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -326,8 +327,10 @@ class _Output:
             assert self.gate.wait(timeout=3)
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(
+        return OmniModelRunnerOutput(
             req_ids=[self.rid],
+            req_id_to_index={self.rid: 0},
+            prompt_logprobs_dict={},
             inter_stage_outputs=[self.payload] if self.payload is not None else None,
             sampled_token_ids=[[self.token]],
         )
@@ -639,6 +642,84 @@ def test_native_worker_capacity_error_cache_and_tp_gates():
     assert OmniGPUModelRunner._uses_native_output_materializer(runner) is False  # TP>1 keeps TP consumers
     runner.vllm_config.parallel_config.tensor_parallel_size = 1
     assert OmniGPUModelRunner._uses_native_output_materializer(runner) is True
+
+
+@pytest.mark.parametrize(
+    "publication,can_send",
+    [("worker", True), ("worker", False), ("inline", True), ("inline", False), ("legacy", False)],
+)
+@pytest.mark.parametrize("duplicate_pooler", [True, False])
+def test_native_publication_omits_only_transported_pooler_payload(
+    plane, monkeypatch, publication, can_send, duplicate_pooler
+):
+    from vllm.v1.request import Request
+
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    plane._async_chunk = False
+    plane._can_send = can_send
+    plane._full_payload_replace_keys_cached = frozenset()
+    plane._start_output_worker(max_pending_batches=2)
+    plane.register_request(_new_request())
+    plane.reserve_outputs(["internal"])
+    hidden = torch.arange(12).reshape(3, 4)
+    payloads = [{"hidden": hidden}]
+    pooler = payloads if duplicate_pooler else [{"embedding": torch.ones(1, 4)}]
+    client = [{"audio": torch.tensor([0.25])}]
+    output = OmniModelRunnerOutput(
+        req_ids=["internal"],
+        req_id_to_index={"internal": 0},
+        sampled_token_ids=[[21]],
+        prompt_logprobs_dict={},
+        pooler_output=pooler,
+        inter_stage_outputs=payloads,
+        multimodal_outputs=client,
+        sampled_token_ids_materialized=True,
+    )
+    if publication == "worker":
+        source = _Output()
+        monkeypatch.setattr(source, "get_output", lambda: output)
+        worker = NativeOutputWorker(1)
+        try:
+            result = worker.submit(source, plane).get_output()
+        finally:
+            worker.close()
+    else:
+        runner = object.__new__(OmniGPUModelRunner)
+        runner._omni_data_plane = None if publication == "legacy" else plane
+        result = runner._finalize_native_data_plane_output(output)
+
+    assert result is output
+    assert result.sampled_token_ids == [[21]]
+    assert result.multimodal_outputs is client
+    if publication != "legacy":
+        plane.drain_outputs()
+        plane.request_terminal({"internal"})
+        assert result.inter_stage_outputs is None
+        if can_send:
+            [(snapshot, delivered)] = plane.record.batches[0]
+            assert snapshot.is_finished()
+            torch.testing.assert_close(delivered["hidden"], hidden)
+    else:
+        assert result.inter_stage_outputs is payloads
+
+    # Exercise the scheduler's real serialization boundary: transported tensors
+    # must not become a second bytes payload alongside the first text token.
+    request = Request("internal", [10, 11], SamplingParams(max_tokens=4), pooling_params=None)
+    scheduler = object.__new__(OmniSchedulerMixin)
+    engine_output = scheduler._make_omni_engine_output(
+        request,
+        new_token_ids=result.sampled_token_ids[0],
+        pooling_output=result.pooler_output[0] if result.pooler_output else None,
+        multimodal_output=result.multimodal_outputs[0],
+    )
+    omitted = publication != "legacy" and can_send and duplicate_pooler
+    assert (engine_output.pooling_output_payload is None) == omitted
+    if not omitted:
+        assert result.pooler_output is pooler
+    assert engine_output.new_token_ids == [21]
+    assert engine_output.multimodal_output is client[0]
 
 
 def test_abort_before_first_chunk_cleans_receiver_state():
