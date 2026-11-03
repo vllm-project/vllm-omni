@@ -2238,9 +2238,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ),
             )
             if state.get("finished"):
+                # Keep the terminal flag high for every row this finished
+                # request still occupies (until vLLM's sampler finishes it and
+                # the row disappears): the stop frame first raises it in
+                # flush_kstep_pending, and a consumer that only sees a later
+                # frame must still learn the audio stream ended.
                 stop_rows.append(row_stop)
                 codec_deltas.append(empty_delta)
-                terminal_flags.append(flag_false)
+                terminal_flags.append(flag_true)
                 continue
             if not sample_eligible[index]:
                 # vLLM computes a logit row for incomplete chunked prefills but
@@ -2345,7 +2350,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             pending = getattr(self, "_kstep_pending_packed", None)
             if pending is None:
                 pending = self._kstep_pending_packed = []
-            pending.append((packed, request_id, state, info, codec_deltas, len(codec_deltas)))
+            # The stop row below is provisional: it only knows the device
+            # finished flag. flush_kstep_pending rewrites it in this same step
+            # when the host readback adds a repetition or quiet-drain stop, so
+            # the stop id reaches vLLM's sampler immediately instead of
+            # waiting for a next frame that a duplex turn-boundary request may
+            # never get scheduled.
+            pending.append(
+                (
+                    packed,
+                    request_id,
+                    state,
+                    info,
+                    codec_deltas,
+                    len(codec_deltas),
+                    stop_rows,
+                    terminal_flags,
+                    len(stop_rows),
+                    row_stop,
+                    flag_true,
+                )
+            )
             codec_deltas.append(empty_delta)
             state["step"] = _codec_int_param(state, "step", 0) + 1
             finished = sample_result.state.finished.reshape(()).to(torch.bool)
@@ -2357,6 +2382,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             terminal_flags.append(torch.where(finished, flag_true, flag_false))
             stop_rows.append(torch.where(finished, row_stop, row_continue))
 
+        # Flush before the stop rows freeze into batch_stop_logits: a
+        # repetition/quiet-drain stop revealed by the host readback must
+        # rewrite this step's stop row, not the next frame's.
+        self.flush_kstep_pending()
         self.batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
@@ -2376,7 +2405,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
-        self.flush_kstep_pending()
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,
@@ -2914,7 +2942,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return
         self._kstep_pending_packed = []
         packed_host = torch.stack([item[0] for item in pending]).cpu().tolist()
-        for (_, request_id, state, info, deltas, index), (sampled_id, finished, emit) in zip(pending, packed_host):
+        for item, (sampled_id, finished, emit) in zip(pending, packed_host):
+            (
+                _,
+                request_id,
+                state,
+                info,
+                deltas,
+                index,
+                stop_rows,
+                terminal_flags,
+                stop_slot,
+                row_stop,
+                flag_true,
+            ) = item
             if (
                 request_id in getattr(self, "_deferred_cleanup_ids", ())
                 or self._request_audio_states.get(request_id) is not state
@@ -2968,6 +3009,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_history = []
                 histories[request_id] = codec_history
             codec_history.append(sampled_id)
+            # The frame-loop drain check above reads the confirmed-frame
+            # history as of the *previous* flush, so a turn-end chunk whose
+            # quiet run only completes with this frame would sample a full
+            # extra frame -- and at a duplex turn boundary the next row may
+            # never be scheduled, leaving the request unfinished. Re-check
+            # with this frame's code committed and rewrite this step's stop
+            # row so the stop id reaches vLLM's sampler in the same step.
+            if not stop and int(state.get("turn_end_drain") or _DRAIN_NONE) == _DRAIN_UNTIL_SILENT:
+                step = _codec_int_param(state, "step", 0)
+                _, quiet_run = _trailing_code_runs(
+                    step,
+                    codec_history[-step:] if step > 0 else [],
+                    self.silent_codec_ids,
+                    self.quiet_codec_ids,
+                )
+                if quiet_run >= _TURN_END_QUIET_STOP_FRAMES:
+                    stop = True
+                    state["finished"] = True
+            if stop:
+                stop_rows[stop_slot] = row_stop
+                terminal_flags[stop_slot] = flag_true
 
     def _make_omni_output_single_frame(
         self,
