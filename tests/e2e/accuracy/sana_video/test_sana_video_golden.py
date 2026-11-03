@@ -202,6 +202,7 @@ def test_sana_video_transformer_matches_frozen_golden(
     variant: str,
     _hardware,
     accuracy_artifact_root: Path,
+    sana_model_parallel,
 ) -> None:
     del _hardware
     from vllm.config import LoadConfig

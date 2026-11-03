@@ -130,6 +130,19 @@ class LTXTextConditioningMixin:
 
     connector_batches_cfg = False
 
+    def _run_text_connectors(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        *,
+        padding_side: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.connectors(
+            prompt_embeds,
+            prompt_attention_mask,
+            padding_side=padding_side,
+        )
+
     def _get_gemma_prompt_embeds(
         self,
         prompt: str | list[str],
@@ -341,7 +354,7 @@ class LTXTextConditioningMixin:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
-        video_context, audio_context, attention_mask = self.connectors(
+        video_context, audio_context, attention_mask = self._run_text_connectors(
             prompt_embeds,
             prompt_attention_mask,
             padding_side=padding_side,
@@ -362,7 +375,7 @@ class LTXTextConditioningMixin:
             negative_attention_mask = attention_mask[:split_batch]
             positive_attention_mask = attention_mask[split_batch:]
         elif self.do_classifier_free_guidance:
-            negative_video_context, negative_audio_context, negative_attention_mask = self.connectors(
+            negative_video_context, negative_audio_context, negative_attention_mask = self._run_text_connectors(
                 negative_prompt_embeds,
                 negative_prompt_attention_mask,
                 padding_side=padding_side,

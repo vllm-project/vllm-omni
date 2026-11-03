@@ -55,6 +55,9 @@ stages:
   # shapes on first use. Buckets, tile size and the
   # plain-graph cache are tunable through model_config:
   #   model_config: {auk_vae_compile_shapes: [...], auk_vae_tile_frames: <frames>, auk_vae_max_graphs: 32}
+  # Opt-in on Ada and Hopper GPUs: `diffusion_quantization_config: fp8` runs the
+  # token-wise linears of the DiT blocks as FP8 GEMMs (see the AuK recipe for
+  # the measured latency and quality).
   - stage_id: 1
     devices: "0"
     max_num_seqs: 1

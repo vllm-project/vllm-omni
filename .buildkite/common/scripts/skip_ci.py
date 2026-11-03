@@ -23,30 +23,16 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from ci_conditions import (
+    L2_YAML_FILES,
+    L3_YAML_FILES,
+    L23_LEVELS,
+    L45_YAML_FILES,
+    PLATFORMS,
+    is_release_line_branch,
+)
+
 LOG = "[skip-ci]"
-ROOT = Path(__file__).resolve().parent.parent.parent.parent
-
-PLATFORMS = ("cuda", "amd", "intel", "npu")
-L23_LEVELS = frozenset({"l2", "l3"})
-
-L2_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-ready.yml": "cuda",
-    ".buildkite/npu/test-npu-ready.yml": "npu",
-    ".buildkite/amd/test-amd-ready.yml": "amd",
-    ".buildkite/intel/pipeline-intel.yml": "intel",
-}
-
-L3_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-merge.yml": "cuda",
-    ".buildkite/amd/test-amd-merge.yml": "amd",
-}
-
-L45_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-nightly.yml": "cuda",
-    ".buildkite/cuda/test-weekly.yml": "cuda",
-    ".buildkite/amd/test-amd-nightly.yml": "amd",
-    ".buildkite/npu/test-npu-nightly.yml": "npu",
-}
 
 
 def _empty_platform_buckets() -> dict[str, list[str]]:
@@ -277,7 +263,7 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _resolve_diff_range() -> str | None:
-    """Return a git diff range for PR or main builds, or None when unavailable."""
+    """Return a git diff range for PR or release-line builds, or None when unavailable."""
     is_pr = os.environ.get("BUILDKITE_PULL_REQUEST", "false") != "false" and os.environ.get(
         "BUILDKITE_PULL_REQUEST", ""
     )
@@ -297,13 +283,13 @@ def _resolve_diff_range() -> str | None:
                 return None
         return f"{base_ref}...{commit}"
 
-    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
+    if is_release_line_branch():
         if _git("rev-parse", "--verify", f"{commit}^").returncode != 0:
-            _log("main commit has no parent; using safe defaults")
+            _log("release-line commit has no parent; using safe defaults")
             return None
         return f"{commit}^..{commit}"
 
-    _log("not PR/main build; using safe defaults")
+    _log("not PR/release-line build; using safe defaults")
     return None
 
 

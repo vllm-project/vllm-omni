@@ -7,8 +7,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine import FinishReason
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import EngineCoreRequest, FinishReason
+from vllm.v1.engine.logprobs import LogprobsProcessor
 
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.output_modality import OutputModality
@@ -16,6 +17,7 @@ from vllm_omni.engine.output_processor import (
     MultimodalOutputProcessor,
     OmniRequestState,
 )
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -91,15 +93,19 @@ def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
     )
 
 
-def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
+@pytest.mark.parametrize("dual_carrier", [False, True])
+def test_ar_pooling_fallback_keeps_text_and_accumulates_payload_once(dual_carrier):
     detokenizer = _Detokenizer()
     processor, state = _make_processor(OutputModality.LATENT, detokenizer)
 
     # StagePool has already rehydrated the MRv2 carrier.  Use a structural
     # output here because upstream EngineCoreOutput strictly validates
     # pooling_output as torch.Tensor | None on construction.
-    output = _rehydrated_output(pooling_output={"hidden": torch.ones(1, 4)})
+    codes = torch.tensor([[1, 2], [3, 4]])
+    output = _rehydrated_output(pooling_output={"codes": {"audio": codes}})
 
+    if dual_carrier:
+        output.multimodal_output = {"codes": {"audio": codes.clone()}}
     processed = processor.process_outputs([output])
 
     assert detokenizer.update_calls == [([42], True)]
@@ -107,6 +113,38 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     assert list(completion.token_ids) == [42]
     assert completion.text == "X"
     assert not state.mm_accumulated.is_empty
+    torch.testing.assert_close(completion.multimodal_output["codes"]["audio"], codes)
+
+
+def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
+    processor, state = _make_processor(OutputModality.TEXT, _Detokenizer())
+    request = EngineCoreRequest(
+        request_id="r",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        sampling_params=SamplingParams(prompt_logprob_token_ids=[4, 5]),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    state.logprobs_processor = LogprobsProcessor.from_new_request(None, request)
+    scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id="r",
+                new_token_ids=[42],
+                prompt_token_id_logprobs=scores,
+                finish_reason=FinishReason.STOP,
+            )
+        ]
+    )
+
+    (raw_output,) = processed.request_outputs
+    final_output = OmniRequestOutput.from_stage_output(raw_output, stage_id=0)
+    torch.testing.assert_close(torch.from_numpy(final_output.prompt_token_id_logprobs), scores)
 
 
 @pytest.mark.parametrize("streaming", [False, True])

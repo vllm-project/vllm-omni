@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.data_entry_keys import serialize_payload
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
@@ -14,6 +15,7 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     text2flow_token_only,
 )
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
+from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -374,6 +376,61 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
     assert payload_final is not None
     assert payload_final.meta.finished.item() is True
     assert payload_final.codes.audio.tolist() == []
+
+
+def test_interleaved_token_only_requests_keep_conditioning_and_eof_separate():
+    transfer_manager = _transfer_manager()
+    requests = [
+        OmniRequest(
+            request_id=f"token-only-{index}",
+            external_req_id=f"token-only-{index}",
+            prompt_token_ids=[1],
+            sampling_params=SamplingParams(max_tokens=16),
+            pooling_params=None,
+            arrival_time=0.0,
+            block_hasher=None,
+        )
+        for index in range(2)
+    ]
+    conditioning = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[101 + index, 201 + index]]),
+                "speech_feat": torch.arange(8, dtype=torch.float32).reshape(1, 4, 2) + index,
+                "embedding": torch.tensor([[0.1 + index, 0.2 + index]]),
+            }
+        }
+        for index in range(2)
+    ]
+
+    requests[0].append_output_token_ids([8, 9])
+    requests[1].append_output_token_ids([18, 19])
+    first_chunks = [
+        talker2code2wav_async_chunk(transfer_manager, payload, request)
+        for request, payload in zip(requests, conditioning)
+    ]
+    for index, chunk in enumerate(first_chunks):
+        assert chunk is not None
+        assert chunk.codes.audio.tolist() == ([8, 9] if index == 0 else [18, 19])
+        torch.testing.assert_close(chunk.embed.embedding, conditioning[index]["embed"]["embedding"])
+
+    requests[0].append_output_token_ids([10, 11])
+    final_a = talker2code2wav_async_chunk(transfer_manager, None, requests[0], is_finished=True)
+    requests[1].append_output_token_ids([20])
+    pending_b = talker2code2wav_async_chunk(transfer_manager, None, requests[1])
+    final_b = talker2code2wav_async_chunk(transfer_manager, None, requests[1], is_finished=True)
+
+    assert final_a.codes.audio.tolist() == [8, 9, 10, 11]
+    assert final_a.meta.left_context_size == 2
+    assert final_a.meta.finished.item() is True
+    assert final_a.embed is None
+    assert pending_b is None
+    assert final_b.codes.audio.tolist() == [18, 19, 20]
+    assert final_b.meta.left_context_size == 2
+    assert final_b.meta.finished.item() is True
+    assert final_b.embed is None
+    for request in requests:
+        assert talker2code2wav_async_chunk(transfer_manager, None, request, is_finished=True) is None
 
 
 def test_full_payload_retains_true_length_for_padded_conditioning():

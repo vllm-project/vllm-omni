@@ -794,6 +794,64 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
+def test_multistage_generate_forwards_layers(async_omni_test_client):
+    """Regression: multi-stage /v1/images/generations must forward ``layers``.
+
+    The multi-stage generations path builds ``extra_body`` by hand and used to
+    drop the requested layer count, so layered models kept their default layer
+    count. The single-stage generations path and the multi-stage edits path
+    both forward it.
+    """
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "layers": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == 7
+
+
+def test_multistage_generate_without_layers_keeps_default(async_omni_test_client):
+    """Omitting ``layers`` must leave the stage default layer count untouched."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat"},
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == OmniDiffusionSamplingParams().layers
+
+
+def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion):
+    """The single-stage path also has to carry the requested layer count.
+
+    Sibling of ``test_multistage_generate_forwards_layers``: the two
+    ``/v1/images/generations`` branches build their sampling params
+    differently, so each one needs its own guard.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "layers": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].layers == 7
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
@@ -933,7 +991,7 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
     assert payloads[0]["index"] == 0
     assert payloads[1]["delta"] == " done"
     assert payloads[2]["output_format"] == "png"
-    assert payloads[2]["size"] == "16x16"
+    assert payloads[2]["size"] == "32x24"
 
     image_payload = payloads[2]["data"][0]
     img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
@@ -2290,8 +2348,8 @@ def test_extract_images_from_result():
     class EmptyResult:
         pass
 
-    result = EmptyResult()
-    images = _extract_images_from_result(result)
+    empty_result = EmptyResult()
+    images = _extract_images_from_result(empty_result)
     assert images == []
 
     # Test nested batch: [np.array(shape=(3, 64, 64, 3))]
@@ -2301,8 +2359,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [batch]
 
-    result = BatchResult()
-    images = _extract_images_from_result(result)
+    batch_result = BatchResult()
+    images = _extract_images_from_result(batch_result)
     assert len(images) == 3
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
@@ -2312,8 +2370,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
-    result = DictRequestOutput()
-    images = _extract_images_from_result(result)
+    dict_result = DictRequestOutput()
+    images = _extract_images_from_result(dict_result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
@@ -2322,8 +2380,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
-    result = AttrRequestOutput()
-    images = _extract_images_from_result(result)
+    attr_result = AttrRequestOutput()
+    images = _extract_images_from_result(attr_result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)

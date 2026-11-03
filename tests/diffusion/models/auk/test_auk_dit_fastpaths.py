@@ -10,11 +10,12 @@ under the per-step CUDA graph.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.auk import auk_transformer as T
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, build_time_grid
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 def _make_dit(device: str = "cpu") -> AuKTransformer:
@@ -48,6 +49,7 @@ def _reference_conv_pos_embed(module: T.ConvPosEmbedding, x: torch.Tensor, mask:
     return x.transpose(1, 2)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_grouped_conv_as_batched_gemm_matches_conv1d() -> None:
     torch.manual_seed(0)
@@ -57,6 +59,7 @@ def test_grouped_conv_as_batched_gemm_matches_conv1d() -> None:
     torch.testing.assert_close(T._grouped_conv1d_btc(x, conv), expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("masked", [False, True])
 def test_conv_pos_embedding_matches_the_channels_first_stack(masked: bool) -> None:
@@ -70,6 +73,7 @@ def test_conv_pos_embedding_matches_the_channels_first_stack(masked: bool) -> No
     torch.testing.assert_close(module(x, mask), _reference_conv_pos_embed(module, x, mask), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_infer", [False, True])
 def test_modulation_table_matches_per_step_modulation(cfg_infer: bool) -> None:
@@ -103,7 +107,7 @@ def _padded_inputs(device: str) -> dict[str, torch.Tensor]:
     return {name: value.to(device) for name, value in inputs.items()}
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])

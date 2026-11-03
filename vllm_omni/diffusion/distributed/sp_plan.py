@@ -68,12 +68,17 @@ class SequenceParallelConfig:
         ring_degree: Number of devices for Ring attention. Sequence is split
             across devices, with K/V passed in a ring topology. Best for long
             sequences with limited memory/bandwidth.
+        allgather_degree: Number of devices for AllGather-KV attention. Sequence is
+            split across devices and K/V are gathered in an orthogonal group, so
+            every rank runs local-Q/global-KV attention.
         convert_to_fp32: Whether to convert output and LSE to float32 for
             numerical stability in ring attention.
 
     Note:
-        ulysses_degree * ring_degree = sequence_parallel_size
-        vLLM-Omni supports hybrid Ulysses-Ring attention (both > 1).
+        ulysses_degree * ring_degree * allgather_degree = sequence_parallel_size
+        vLLM-Omni supports hybrid Ulysses-Ring attention (both > 1) and the
+        orthogonal Ulysses x AllGather-KV topology (ulysses_degree and
+        allgather_degree > 1 with ring_degree == 1).
     """
 
     ulysses_degree: int = 1
@@ -90,15 +95,18 @@ class SequenceParallelConfig:
         if self.ulysses_degree < 1 or self.ring_degree < 1 or self.allgather_degree < 1:
             raise ValueError("SP degrees must be >= 1.")
 
-        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
-            raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring.")
+        if self.allgather_degree > 1 and self.ring_degree > 1:
+            raise ValueError(
+                "AllGather-KV cannot be composed with Ring; the supported two-dimensional "
+                "topology is Ulysses x AllGather-KV (ulysses_degree > 1 with ring_degree == 1)."
+            )
         if self.ulysses_degree == self.ring_degree == self.allgather_degree == 1:
             raise ValueError("At least one SP degree must be > 1.")
 
     @property
     def sequence_parallel_size(self) -> int:
         """Total sequence parallel world size."""
-        return self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        return self.ulysses_degree * self.ring_degree * self.allgather_degree
 
     def get_world_size(self) -> int:
         """Get the sequence parallel world size from parallel state.
@@ -225,6 +233,11 @@ class SequenceParallelInput:
             ForwardContext so models can construct attention masks when needed.
             Note: Ring attention does not support attention mask, so auto_pad
             should only be used with Ulysses SP.
+        clone_shard: If True, give a sharded tensor its own contiguous storage
+            so it does not retain the full input allocation. Applies to both
+            padded and unpadded splits; a single-rank input is returned unchanged.
+            Memory savings require the caller to drop its reference to the full
+            tensor; any other references to its storage also keep it allocated.
         shard_group: Optional key shared by tensors representing the same global
             sequence. Keyed groups track independent padding metadata; omitting
             it preserves the legacy single-sequence padding behavior.
@@ -244,13 +257,15 @@ class SequenceParallelInput:
     expected_dims: int | None = None
     split_output: bool = False
     auto_pad: bool = False
+    clone_shard: bool = False
     shard_group: str | None = None
 
     def __repr__(self) -> str:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
-            f"auto_pad={self.auto_pad}, shard_group={self.shard_group!r})"
+            f"auto_pad={self.auto_pad}, clone_shard={self.clone_shard}, "
+            f"shard_group={self.shard_group!r})"
         )
 
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HSDP/FSDP2 compatibility for online FP8 quantization.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""HSDP/FSDP2 compatibility for transposed FP8 weights, including ModelOpt MAPS.
 
 vllm's ``Fp8LinearMethod.process_weights_after_loading`` ends with
 ``layer.weight = qweight.t()`` so that the Cutlass FP8 GEMM kernel sees its
@@ -30,12 +30,15 @@ from __future__ import annotations
 
 import types
 
-from torch import nn
+from torch import Tensor, nn
+from vllm.config.quantization import QuantSpec
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
 
 logger = init_logger(__name__)
 
@@ -43,25 +46,37 @@ _FP8_TRANSPOSED_WEIGHT_METHODS = (
     Fp8LinearMethod,
     Fp8PerTensorOnlineLinearMethod,
 )
+_MODELOPT_FP8_SPEC = QuantSpec(weight=kFp8StaticTensorSym, activation=kFp8StaticTensorSym)
+
+
+def _unwrap_quant_method(method: object | None) -> object | None:
+    """Unwrap one explicitly opted-in wrapper; leave ordinary methods unchanged.
+
+    Wrappers expose ``get_base_quant_method()`` for storage/backend inspection.
+    Execution must continue through the original layer's ``quant_method``.
+    """
+    get_base = getattr(method, "get_base_quant_method", None)
+    return get_base() if callable(get_base) else method
+
+
+def fp8_kernel_weight_view(weight: Tensor, *, row_major: bool) -> Tensor:
+    """Read the live (K, N) view without retaining an FSDP-gathered tensor."""
+    return weight.t() if row_major else weight
 
 
 def _build_transposed_get_layer_params(original_bound_method):
-    """Return a ``_get_layer_params`` replacement that transposes ``w``.
-
-    ``original_bound_method`` is the kernel instance's existing
-    ``_get_layer_params`` (already bound to ``self``); we close over it and
-    apply ``.t()`` to the returned weight, leaving scales untouched.
-    """
+    """Adapt only converted layers, including when a kernel instance is shared."""
 
     def _get_layer_params(self, layer):
         w, w_s, x_s, x_s_ub = original_bound_method(layer)
-        return w.t(), w_s, x_s, x_s_ub
+        row_major = getattr(layer, "_omni_fp8_fsdp_row_major", False)
+        return fp8_kernel_weight_view(w, row_major=row_major), w_s, x_s, x_s_ub
 
     return _get_layer_params
 
 
 def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
-    """Make online-FP8 linear layers in ``model`` FSDP2-compatible.
+    """Make supported FP8 linear layers in ``model`` FSDP2-compatible.
 
     For every layer whose quantization method stores FP8 weights as a
     non-contiguous transpose view, this function:
@@ -80,15 +95,21 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
         Number of layers rewritten.
     """
     n_patched = 0
-    patched_kernel_ids: set[int] = set()
     for module in model.modules():
-        qm = getattr(module, "quant_method", None)
-        if not isinstance(qm, _FP8_TRANSPOSED_WEIGHT_METHODS):
+        qm = _unwrap_quant_method(getattr(module, "quant_method", None))
+        is_modelopt_fp8 = isinstance(qm, ModelOptLinearMethod) and qm.spec == _MODELOPT_FP8_SPEC
+        if not is_modelopt_fp8 and not isinstance(qm, _FP8_TRANSPOSED_WEIGHT_METHODS):
             continue
 
         weight = getattr(module, "weight", None)
         if weight is None or weight.is_contiguous():
             continue
+
+        kernel = qm.kernel if is_modelopt_fp8 else qm.fp8_linear
+        if not callable(getattr(kernel, "_get_layer_params", None)):
+            raise ValueError(f"FP8 HSDP requires a kernel weight accessor, got {type(kernel).__name__}")
+        if weight.ndim != 2:
+            raise ValueError(f"FP8 HSDP requires a matrix weight, got {tuple(weight.shape)}")
 
         # ``weight`` here is ``qweight.t()`` (a non-contiguous (in, out) view
         # of an (out, in) row-major qweight storage). ``weight.t()`` recovers
@@ -98,15 +119,15 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
         contig = weight.data.t().contiguous()
         new_param = nn.Parameter(contig, requires_grad=False)
         module.weight = new_param
+        module._omni_fp8_fsdp_row_major = True
 
-        kernel = qm.fp8_linear
         # Each linear layer is expected to have its own kernel instance, but
         # guard against shared instances to avoid stacking multiple ``.t()``
         # patches on the same object (which would compose into identity).
-        if id(kernel) not in patched_kernel_ids:
+        if not getattr(kernel, "_omni_fp8_fsdp_layout_adapter", False):
             original_get = kernel._get_layer_params
             kernel._get_layer_params = types.MethodType(_build_transposed_get_layer_params(original_get), kernel)
-            patched_kernel_ids.add(id(kernel))
+            kernel._omni_fp8_fsdp_layout_adapter = True
 
         n_patched += 1
 

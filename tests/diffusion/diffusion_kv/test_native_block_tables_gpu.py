@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from importlib import import_module, util
 import pytest
 import torch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def test_native_block_tables_slot_mapping_handles_non_aligned_tail() -> None:
@@ -27,6 +29,7 @@ def test_native_block_tables_slot_mapping_handles_non_aligned_tail() -> None:
     block_tables_cls = getattr(block_table_module, "BlockTables", None)
     if block_tables_cls is None or not hasattr(block_tables_cls, "compute_slot_mappings"):
         pytest.skip("installed vLLM does not provide the required BlockTables API")
+    assert block_tables_cls is not None
 
     device = torch.device("cuda", torch.accelerator.current_device_index())
     block_tables = block_tables_cls(
@@ -35,7 +38,6 @@ def test_native_block_tables_slot_mapping_handles_non_aligned_tail() -> None:
         max_num_batched_tokens=16,
         max_num_blocks_per_group=[4],
         device=device,
-        kernel_block_sizes=[4],
     )
     block_tables.append_block_ids(0, ([1, 2, 3],), overwrite=True)
     block_tables.apply_staged_writes()
