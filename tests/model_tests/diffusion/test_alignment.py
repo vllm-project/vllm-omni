@@ -121,6 +121,10 @@ EXCLUDED_MODELS = [
     # /v1/images/segmentations endpoint tests.
     "Sam3Model",
     "Sam3VideoModel",
+    # Depth estimation, not generation. Covered by
+    # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
+    # endpoint tests.
+    "VideoDepthAnythingPipeline",
 ]
 
 
