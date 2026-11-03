@@ -75,6 +75,7 @@ class StageDiffusionProc:
 
     DIFFUSION_PROC_DEAD = b"DIFFUSION_PROC_DEAD"
     _DEAD_SENTINEL_SEND_TIMEOUT_S = 5.0
+    _sharing_quiesced = False
 
     def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
         self._model = model
@@ -82,6 +83,7 @@ class StageDiffusionProc:
         self._engine: DiffusionEngine | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
+        self._sharing_quiesced = False
         # Set by ``_run_loop`` to the live dispatch task dict so
         # :attr:`queue_length` can report in-flight requests for the
         # OmniCoordinator heartbeat hook.
@@ -254,6 +256,12 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
+        if method == "weight_sharing_quiesce":
+            self._sharing_quiesced = True
+            active = list((self._active_tasks or {}).values())
+            if active:
+                await asyncio.gather(*active)
+            return True
         # Feedback only changes condition-protected host state and must not
         # wait behind an executor RPC for the current GPU chunk.
         if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
@@ -584,6 +592,8 @@ class StageDiffusionProc:
                 msg_type = msg.get("type")
 
                 if msg_type == "add_request":
+                    if self._sharing_quiesced:
+                        raise RuntimeError("request received after sharing stage quiescence")
                     request_id = msg["request_id"]
                     task = asyncio.create_task(
                         _dispatch_request(

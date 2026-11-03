@@ -31,6 +31,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.distributed.weight_sharing.runtime import SharingPlan, SharingRuntime
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.cuda_mps import (
     CudaMPSServer,
@@ -169,6 +170,30 @@ class StageRuntime:
     directly and creates StagePool with static clients.
     """
 
+    sharing: SharingRuntime | None = None
+    _init_visible_devices_baseline: str | None = None
+
+    async def initialize_shared(self, plan: SharingPlan) -> None:
+        """Internal stage-3 entry; stage-2 loaders consume the bootstrap contract."""
+        from vllm_omni.engine.weight_sharing_runtime import StageSharingHost
+
+        if isinstance(self, DistStageRuntime):
+            raise ValueError("weight sharing currently requires local stage ownership")
+        self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
+        stage_plans = self._prepare_stage_plans()
+        host = StageSharingHost(self, plan, stage_plans)
+        self.sharing = SharingRuntime(plan, host)
+        try:
+            await self.sharing.start()
+            initialized = {stage.stage_idx: [host.clients[stage.stage_id]] for stage in stage_plans}
+            self._finalize_initialized_stages(stage_plans, initialized)
+        except BaseException as exc:
+            if self.sharing.state != "FAILED":
+                self.sharing.fail(f"stage client assembly failed: {exc}")
+            await self.sharing.terminate()
+            self._cleanup_after_initialize_failure()
+            raise
+
     def __init__(
         self,
         stage_configs: list[Any],
@@ -216,7 +241,7 @@ class StageRuntime:
         # Readiness waits use per-device initialization protection so different
         # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
-        self._init_visible_devices_baseline: str | None = None
+        self._init_visible_devices_baseline = None
         self._mps_servers: dict[str, CudaMPSServer] = {}
         # GPU UUID -> operator pipe (None = private) whose MPS startup failed.
         self._mps_unavailable_gpus: dict[str, str | None] = {}
@@ -675,6 +700,14 @@ class StageRuntime:
 
     def shutdown(self) -> None:
         self._init_cancelled.set()
+        if self.sharing is not None:
+            # The orchestrator must finish async, consumer-first teardown.
+            # In particular, never bypass an unconfirmed consumer exit here.
+            if not self.sharing.termination_complete:
+                logger.error("Sharing teardown incomplete; retaining stage processes")
+                return
+            self._close_mps_servers()
+            return
         for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):

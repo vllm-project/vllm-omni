@@ -262,6 +262,11 @@ class DiffusionWorker:
     delegated to DiffusionModelRunner.
     """
 
+    def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
+        from vllm_omni.distributed.weight_sharing.worker_session import control_runner
+
+        return control_runner(self.model_runner, operation, messages)
+
     def __init__(
         self,
         local_rank: int,
@@ -463,7 +468,10 @@ class DiffusionWorker:
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
+        from vllm_omni.distributed.weight_sharing.worker_session import require_sharing_loader
+
         assert self.model_runner is not None, "Model runner not initialized"
+        require_sharing_loader(self.model_runner, self.od_config.additional_config)
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
         cutlass_fp8_context = (
@@ -1660,8 +1668,14 @@ class WorkerProc:
             status["bool_result"] = result
 
         if collect_rank_status:
+            from vllm_omni.distributed.weight_sharing.runtime import CONTROL_METHOD, RANK_RESULTS_KEY
+
+            if method == CONTROL_METHOD:
+                status[RANK_RESULTS_KEY] = result
             rank_statuses = self._gather_rpc_rank_statuses(status)
             if should_reply:
+                if method == CONTROL_METHOD:
+                    result = {RANK_RESULTS_KEY: [item[RANK_RESULTS_KEY] for item in rank_statuses]}
                 return (
                     {
                         "type": DIFFUSION_RPC_RESULT_ENVELOPE,

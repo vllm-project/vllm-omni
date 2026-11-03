@@ -35,6 +35,11 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     model_runner_cls = GPUARModelRunner
 
+    def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
+        from vllm_omni.distributed.weight_sharing.worker_session import control_runner
+
+        return control_runner(self.model_runner, operation, messages)
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type in ("cuda", "musa"):
@@ -135,6 +140,10 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         else:
             self.use_v2_model_runner = False
             self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+
+        from vllm_omni.distributed.weight_sharing.worker_session import require_sharing_loader
+
+        require_sharing_loader(self.model_runner, self.vllm_config.additional_config)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
