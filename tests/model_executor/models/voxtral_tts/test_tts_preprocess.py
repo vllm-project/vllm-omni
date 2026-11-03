@@ -301,6 +301,48 @@ def test_make_omni_output_keeps_feedback_request_local():
     assert not hasattr(model, "post_process_idx")
 
 
+@pytest.mark.parametrize("keep_history_on_device", [False, True])
+def test_store_feedback_frames_keeps_latest_audio_paired_with_history(keep_history_on_device):
+    model = _make_voxtral_tts_model()
+    request_info: dict[str, Any] = {"codes": {"audio_history": []}}
+
+    for frame_index, value in enumerate((1.0, 2.0)):
+        frame = torch.full((1, 1, 4), value)
+        model._store_feedback_frames(
+            {"codes": {"audio": [frame]}},
+            [request_info],
+            keep_history_on_device=keep_history_on_device,
+        )
+
+        codes: dict[str, Any] = request_info["codes"]
+        history = codes["audio_history"]
+        assert isinstance(history, list)
+        assert len(history) == frame_index + 1
+        assert isinstance(history[-1], torch.Tensor)
+        torch.testing.assert_close(codes["audio"], frame)
+        torch.testing.assert_close(codes["audio"].cpu(), history[-1].cpu())
+
+        _, output_embeds, _ = model.tts_preprocess(
+            torch.tensor([model._audio_token_id]),
+            torch.zeros((1, 4)),
+            _omni_prompt_len=4,
+            _omni_num_computed_tokens=4 + frame_index,
+            **request_info,
+        )
+        torch.testing.assert_close(output_embeds, torch.full((1, 4), value))
+
+    # Replaying the earlier generated position must use its historical frame,
+    # while the newest frame remains paired with codes.audio.
+    _, replay_embeds, _ = model.tts_preprocess(
+        torch.tensor([model._audio_token_id]),
+        torch.zeros((1, 4)),
+        _omni_prompt_len=4,
+        _omni_num_computed_tokens=4,
+        **request_info,
+    )
+    torch.testing.assert_close(replay_embeds, torch.ones((1, 4)))
+
+
 def test_make_omni_output_mrv2_uses_request_slots_and_sampling_cfg():
     model = _make_voxtral_tts_model()
     request_infos = [

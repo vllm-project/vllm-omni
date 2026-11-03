@@ -502,6 +502,9 @@ class VoxtralTTSForConditionalGeneration(
                 history_frame = (
                     latest_frame if keep_history_on_device else frame.detach().to(device="cpu", copy=True).contiguous()
                 )
+                # Generation output writes both views from this same frame:
+                # tts_preprocess may use `audio` as `audio_history[-1]` when
+                # positions align. Any update to one must update the other too.
                 request_codes["audio"] = latest_frame
                 history = request_codes.setdefault("audio_history", [])
                 if isinstance(history, list):
