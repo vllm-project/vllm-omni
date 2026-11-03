@@ -831,15 +831,16 @@ class LTX2Attention(torch.nn.Module):
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
-        unused_kwargs = [k for k, _ in kwargs.items() if k not in attn_parameters]
-        if len(unused_kwargs) > 0:
-            logger.warning(
-                "attention_kwargs %s are not expected by %s and will be ignored.",
-                unused_kwargs,
-                self.processor.__class__.__name__,
-            )
-        kwargs = {k: w for k, w in kwargs.items() if k in attn_parameters}
+        if kwargs:
+            attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
+            unused_kwargs = [k for k, _ in kwargs.items() if k not in attn_parameters]
+            if len(unused_kwargs) > 0:
+                logger.warning(
+                    "attention_kwargs %s are not expected by %s and will be ignored.",
+                    unused_kwargs,
+                    self.processor.__class__.__name__,
+                )
+            kwargs = {k: w for k, w in kwargs.items() if k in attn_parameters}
         hidden_states = self.processor(
             self, hidden_states, encoder_hidden_states, attention_mask, query_rotary_emb, key_rotary_emb, **kwargs
         )

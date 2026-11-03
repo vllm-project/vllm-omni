@@ -76,7 +76,10 @@ def _activation_edges(
                 if block + 1 < plan.schedule.num_blocks:
                     next_step, next_block = step, block + 1
                 elif step + 1 < plan.schedule.num_denoise_steps or (
-                    chunk == 0 and plan.schedule.chunks > 1 and step < plan.schedule.num_denoise_steps
+                    chunk == 0
+                    and plan.schedule.chunks > 1
+                    and not plan.schedule.external_sink
+                    and step < plan.schedule.num_denoise_steps
                 ):
                     next_step, next_block = step + 1, 0
                 else:
@@ -384,6 +387,7 @@ def run_cell_pipeline(
                     schedule is not None
                     and schedule.ordering is Ordering.SAME_STEP
                     and schedule.chunks > 1
+                    and not schedule.external_sink
                     and rank_of_block(schedule.num_denoise_steps, 0, schedule) == spec.rank
                     and tasks[0][1] == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
                 )

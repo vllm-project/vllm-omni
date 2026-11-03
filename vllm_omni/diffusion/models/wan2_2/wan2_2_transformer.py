@@ -781,6 +781,16 @@ class WanTransformerBlock(nn.Module):
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
+        return self._post_self_attention(hidden_states, encoder_hidden_states, c_scale_msa, c_shift_msa, c_gate_msa)
+
+    def _post_self_attention(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        c_scale_msa: torch.Tensor,
+        c_shift_msa: torch.Tensor,
+        c_gate_msa: torch.Tensor,
+    ) -> torch.Tensor:
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None)

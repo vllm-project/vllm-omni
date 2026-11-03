@@ -82,6 +82,7 @@ class CellSchedule:
     blocks: int | None = None
     #: Blocks per rank in a replica (default ``1``).
     blocks_per_rank: int | None = None
+    external_sink: bool = False
 
     def __post_init__(self) -> None:
         if self.chunks < 1:
@@ -138,7 +139,9 @@ class CellSchedule:
     @property
     def num_schedule_steps(self) -> int:
         """Step-ID bound; with a Same-Step sink, only chunk 0 uses step ``D``."""
-        return self.num_denoise_steps + int(self.ordering is not Ordering.SAME_STEP or self.chunks > 1)
+        return self.num_denoise_steps + int(
+            self.ordering is not Ordering.SAME_STEP or (self.chunks > 1 and not self.external_sink)
+        )
 
 
 @dataclass(frozen=True)
@@ -363,7 +366,7 @@ def _history_step(
 ) -> int | None:
     """Pick history step for ``prev`` at ``task``'s block, or ``None`` if unread."""
     _chunk, step, block = task
-    if schedule.ordering is Ordering.SAME_STEP and prev == 0:
+    if schedule.ordering is Ordering.SAME_STEP and not schedule.external_sink and prev == 0:
         return schedule.num_denoise_steps
     if schedule.ordering is Ordering.SAME_STEP:
         # Matching step only; producer shares the consumer rank (no KV P2P).
@@ -400,7 +403,12 @@ def _sources_and_transfers(
             chunk, _step, block = task
             found: list[KVSource] = []
             history = list(range(max(0, chunk - h), chunk))
-            if schedule.ordering is Ordering.SAME_STEP and chunk > 0 and 0 not in history:
+            if (
+                schedule.ordering is Ordering.SAME_STEP
+                and not schedule.external_sink
+                and chunk > 0
+                and 0 not in history
+            ):
                 history.insert(0, 0)
             for prev in history:
                 s_star = _history_step(schedule, task, prev, completions, t)
@@ -502,7 +510,7 @@ def _assert_invariants(plan: CellPlan) -> None:
 
 
 def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
-    if schedule.ordering is Ordering.SAME_STEP:
+    if schedule.ordering is Ordering.SAME_STEP and not schedule.external_sink:
         head = _base_cell_slots(replace(schedule, chunks=1))
         if schedule.chunks == 1:
             return head
