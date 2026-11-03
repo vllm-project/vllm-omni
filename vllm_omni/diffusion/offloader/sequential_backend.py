@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
@@ -13,9 +13,8 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
-from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT
-from .module_collector import ModuleDiscovery
-from .offload_plan import get_offload_plan
+from .module_residency import PinnedModuleStager
+from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
 
@@ -62,6 +61,7 @@ class SequentialOffloadHook(ModelHook):
         pin_memory: bool = True,
         use_hsdp: bool = False,
         offload_after_context: bool = True,
+        persistent_staging: bool = False,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
@@ -69,6 +69,21 @@ class SequentialOffloadHook(ModelHook):
         self.pin_memory = pin_memory
         self.use_hsdp = use_hsdp
         self.offload_after_context = offload_after_context
+        self.persistent_staging = persistent_staging
+        self._stager: PinnedModuleStager | None = None
+
+    def initialize_hook(self, module: nn.Module) -> nn.Module:
+        if self.persistent_staging and not self.use_hsdp:
+            # Fixed staging storage keeps CUDA-graph-captured weight pointers
+            # valid across offload/load swaps. HSDP keeps the plain move
+            # semantics (decode graphs refuse HSDP anyway).
+            self._stager = PinnedModuleStager(
+                module,
+                self.device,
+                pin_memory=self.pin_memory,
+                retain_device_storage=True,
+            )
+        return module
 
     @staticmethod
     def _move_params(
@@ -103,7 +118,23 @@ class SequentialOffloadHook(ModelHook):
                 moved = True
         return moved
 
+    @staticmethod
+    def _module_stager(module: nn.Module) -> PinnedModuleStager | None:
+        """The persistent stager owned by ``module``'s own sequential hook, if any.
+
+        Cross-module swaps call ``_to_cpu(target)`` through the *running*
+        module's hook, so staging state must be resolved on the target's hook
+        to keep its ``loaded`` bookkeeping consistent.
+        """
+        registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+        hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
+        return hook._stager if isinstance(hook, SequentialOffloadHook) else None
+
     def _to_cpu(self, module: nn.Module) -> None:
+        stager = self._module_stager(module)
+        if stager is not None:
+            stager.offload()
+            return
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
@@ -118,6 +149,10 @@ class SequentialOffloadHook(ModelHook):
             current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
+        stager = self._module_stager(module)
+        if stager is not None:
+            stager.load()
+            return
         self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
@@ -149,6 +184,7 @@ def apply_sequential_offload(
     offload_initial_dits: bool = False,
     offload_dit_modules: Collection[nn.Module] | None = None,
     offload_encoder_modules: Collection[nn.Module] | None = None,
+    persistent_dit_staging: bool = False,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -167,6 +203,10 @@ def apply_sequential_offload(
             every DiT for backward compatibility.
         offload_encoder_modules: Encoder/stage modules allowed to move to CPU.
             None selects every supplied module for backward compatibility.
+        persistent_dit_staging: Keep DiT weights on fixed device staging
+            storage across swaps, so CUDA-graph-captured weight pointers stay
+            valid. Encoders keep plain move semantics so their memory is
+            actually freed while the DiT runs.
 
     Example:
         >>> apply_sequential_offload(
@@ -195,6 +235,7 @@ def apply_sequential_offload(
                 pin_memory=pin_memory,
                 use_hsdp=use_hsdp,
                 offload_after_context=id(dit_mod) in selected_dit_ids,
+                persistent_staging=persistent_dit_staging,
             )
             registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
             logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
@@ -263,6 +304,15 @@ def _get_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook:
     return hook
 
 
+def sequential_offload_staging_active(module: nn.Module) -> bool:
+    """True when the module's sequential offload hook serves fixed device storage.
+
+    Fixed staging storage keeps CUDA-graph-captured weight pointers valid
+    across offload/load swaps.
+    """
+    return SequentialOffloadHook._module_stager(module) is not None
+
+
 @contextmanager
 def sequential_offload_component(module: nn.Module) -> Iterator[None]:
     """Activate and release a hooked component called outside ``forward``."""
@@ -329,59 +379,53 @@ class ModelLevelOffloadBackend(OffloadBackend):
             )
             return
 
-        modules = ModuleDiscovery.discover(pipeline)
-        plan = get_offload_plan(pipeline)
-        selected_encoders = [
-            encoder
-            for encoder, name in zip(modules.encoders, modules.encoder_names)
-            if self.config.should_offload_encoder(name, plan)
-        ]
-        if self.config.components is not None:
-            if not modules.dits:
-                raise ValueError("Component-selective model offload requires a DiT/transformer module")
-            if not modules.encoders:
-                raise ValueError("Component-selective model offload requires an encoder execution stage")
-            if self.config.offloads(TEXT_ENCODER_COMPONENT) and not selected_encoders:
-                raise ValueError("No text encoder modules found for selected text_encoder module offload")
+        resolved = resolve_offload_plan(pipeline, self.config)
+        dits = [component.module for component in resolved.dits]
+        encoders = [component.module for component in resolved.encoders]
+        vaes = [component.module for component in resolved.vaes]
+        residents = [component.module for component in resolved.residents]
+        selected_dits = [component.module for component in resolved.dits if component.selected]
+        selected_encoders = [component.module for component in resolved.encoders if component.selected]
 
-        all_modules = [
-            *modules.dits,
-            *modules.encoders,
-            *modules.vaes,
-            *modules.resident_modules,
-        ]
+        all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
         try:
-            for encoder in modules.encoders:
+            for encoder in encoders:
                 encoder.to(self.device)
-            for vae in modules.vaes:
+            for vae in vaes:
                 vae.to(self.device, non_blocking=True)
-            for resident in modules.resident_modules:
+            for resident in residents:
                 resident.to(self.device)
 
-            if not modules.dits:
+            if not dits:
                 logger.warning("No DiT/transformer modules found, skipping model-level offloading")
                 return
-            if not modules.encoders:
-                for dit in modules.dits:
+            if not encoders:
+                for dit in dits:
                     dit.to(self.device)
                 logger.warning("No encoder modules found, skipping model-level offloading")
                 return
 
             apply_sequential_offload(
-                dit_modules=modules.dits,
-                encoder_modules=modules.encoders,
+                dit_modules=dits,
+                encoder_modules=encoders,
                 device=self.device,
                 pin_memory=self.config.pin_cpu_memory,
                 use_hsdp=self.config.use_hsdp,
-                offload_dit_modules=(
-                    modules.dits if self.config.components is None or self.config.offloads(DIT_COMPONENT) else ()
-                ),
+                offload_dit_modules=selected_dits,
                 offload_encoder_modules=selected_encoders,
+                # Fixed DiT staging keeps decode-graph weight pointers valid;
+                # only models that capture weight pointers (Qwen-Image-2.1's
+                # CUDA-graph decode) pay for it — every other model keeps
+                # plain move semantics so offloading actually frees DiT VRAM
+                # while the encoders run.
+                persistent_dit_staging=(
+                    self.device.type == "cuda" and any(getattr(dit, "enable_cuda_graph_decode", False) for dit in dits)
+                ),
             )
         except BaseException:
             try:
-                remove_sequential_offload([*modules.dits, *modules.encoders])
+                remove_sequential_offload([*dits, *encoders])
             except BaseException:
                 logger.exception("Failed to remove every model-level hook during rollback")
             try:
@@ -391,15 +435,19 @@ class ModelLevelOffloadBackend(OffloadBackend):
             raise
 
         # Track modules for cleanup
-        self._offload_modules = [*modules.dits, *modules.encoders]
+        self._offload_modules = [*dits, *encoders]
 
         self.enabled = True
 
         logger.info(
             "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
-            ", ".join(modules.dit_names),
-            ", ".join(modules.encoder_names),
-            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
+            ", ".join(component.path for component in resolved.dits),
+            ", ".join(component.path for component in resolved.encoders),
+            (
+                f"; resident on GPU: {', '.join(component.path for component in resolved.residents)}"
+                if resolved.residents
+                else ""
+            ),
         )
 
     def disable(self) -> None:

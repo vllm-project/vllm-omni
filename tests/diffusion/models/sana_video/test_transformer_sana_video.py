@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-import os
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -20,12 +18,13 @@ def _init_distributed(monkeypatch):
     )
     from vllm.model_executor.layers.utils import default_unquantized_gemm
 
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29501")
+    assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
     initialize_model_parallel()
     yield

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import functools
 import importlib.util
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,6 +24,51 @@ def _load_text_to_video():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["--quantization", "mxfp4"], {"quantization": "mxfp4"}),
+        (
+            ["--quantization-config", '{"method":"mxfp4","w4a8_fallback_steps":[0,2]}'],
+            {"quantization_config": {"method": "mxfp4", "w4a8_fallback_steps": [0, 2]}},
+        ),
+    ],
+)
+def test_quantization_cli_reaches_omni(arguments, expected, monkeypatch):
+    mod = _load_text_to_video()
+    captured = {}
+
+    class StopBeforeModelLoadError(Exception):
+        pass
+
+    def capture_omni(**kwargs):
+        captured.update(kwargs)
+        raise StopBeforeModelLoadError
+
+    monkeypatch.setattr(sys, "argv", ["text_to_video.py", "--model", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", *arguments])
+    monkeypatch.setattr(mod, "current_omni_platform", SimpleNamespace(device_type="cpu"))
+    monkeypatch.setattr(mod, "Omni", capture_omni)
+
+    with pytest.raises(StopBeforeModelLoadError):
+        mod.main()
+
+    assert {key: captured[key] for key in ("quantization", "quantization_config") if key in captured} == expected
+
+
+def test_quantization_cli_options_are_mutually_exclusive(monkeypatch):
+    mod = _load_text_to_video()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["text_to_video.py", "--quantization", "mxfp4", "--quantization-config", '{"method":"mxfp4"}'],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        mod.parse_args()
+
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize(

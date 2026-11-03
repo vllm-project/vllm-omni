@@ -16,6 +16,7 @@ from tests.diffusion.quantization.test_quantization_quality import (
     _maybe_save_output,
 )
 from tests.helpers.mark import hardware_marks
+from tests.helpers.mock import patch_hf_snapshot_download
 
 _MINIMAX_H3_REPO = "MiniMaxAI/MiniMax-H3"
 _MINIMAX_H3_REVISION = "48d93ede732756e404a3b1b2f3b3a9b5a22f6cfc"
@@ -42,10 +43,10 @@ _QUALITY_CONFIG = QualityTestConfig(
 
 
 def _resolve_fl2va_model_ref() -> str:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     repo_root = Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=_MINIMAX_H3_REPO,
             revision=_MINIMAX_H3_REVISION,
             allow_patterns=["FL2VA/**"],
@@ -175,7 +176,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
         pytest.param(
             _QUALITY_CONFIG,
             id=_QUALITY_CONFIG.id,
-            marks=hardware_marks(res={"cuda": _QUALITY_CONFIG.gpu}, num_cards=2),
+            marks=hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
         )
     ],
 )
@@ -186,10 +187,15 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
     common_kwargs = {
         "model": model_ref,
         "enforce_eager": True,
-        "tensor_parallel_size": 2,
         # The fused BF16 baseline only fits on H100-80GB with encoder TP.
+        # This test loads the direct FL2VA diffusion pipeline (not the
+        # disaggregated two-stage MiniMax-H3 pipeline), so configure both the
+        # DiT world and the Qwen3-VL encoder TP explicitly.
+        "tensor_parallel_size": 2,
         "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
+        # MiniMax H3's VAE is implemented by code shipped with the checkpoint.
+        "trust_remote_code": True,
     }
 
     omni_bl = Omni(**common_kwargs)
@@ -259,7 +265,7 @@ def test_resolve_fl2va_model_ref(tmp_path, monkeypatch):
         assert allow_patterns == ["FL2VA/**"]
         return str(tmp_path)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
     assert _resolve_fl2va_model_ref() == str(fl2va_root)
 
 

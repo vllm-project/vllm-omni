@@ -3,7 +3,8 @@
    Last synced: 2026-08-04
    Modifications: Use the shared MI300 queues and Omni command-passing contract
 #}
-{% set docker_image_amd = "rocm/vllm-omni:$BUILDKITE_COMMIT" %}
+{% set docker_registry_amd = "rocm/vllm-omni" %}
+{% set docker_image_amd = docker_registry_amd ~ ":$BUILDKITE_COMMIT" %}
 {% set default_working_dir = "/app/vllm-omni" %}
 
 {# MI300 runs tests natively in Kubernetes; Docker-in-Docker is unavailable. #}
@@ -74,11 +75,12 @@ steps:
         depends_on: ~
         soft_fail: false
         commands:
-          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target test --build-arg ARG_PYTORCH_ROCM_ARCH=gfx942 --progress plain ."
-          - "docker push {{ docker_image_amd }}"
+          - "bash .buildkite/amd/scripts/build-ci-image.sh"
         key: "amd-build"
         env:
           DOCKER_BUILDKIT: "1"
+          PYTORCH_ROCM_ARCH: "gfx942"
+          ROCM_CI_IMAGE_REGISTRY: "{{ docker_registry_amd }}"
         retry:
           automatic:
             - exit_status: -1  # Agent was lost
@@ -102,7 +104,14 @@ steps:
 {% for step in step_group.steps %}
 {% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}
       - label: "{{ step.agent_pool }}: {{ step.label }}"
+{% if step.key %}
+        key: {{ step.key }}
+{% endif %}
+{% if step.depends_on %}
+        depends_on: {{ step.depends_on }}
+{% else %}
         depends_on: amd-build
+{% endif %}
         agents:
           {% if step.agent_pool %}
           queue: amd_{{ step.agent_pool }}
@@ -126,6 +135,7 @@ steps:
           MIOPEN_DEBUG_CONV_GEMM: "0"
           VLLM_ROCM_USE_AITER: "0"
           PYTORCH_ROCM_ARCH: ""
+          VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT: "{{ vllm_aiter_mha_trusted_commit }}"
 {% if step.env %}
 {% for name in step.env %}
           {{ name }}: "{{ step.env[name] }}"
@@ -157,6 +167,14 @@ steps:
           - "{{ path }}"
 {% endfor %}
 {% endif %}
+{% if step.retry %}
+        retry:
+          automatic:
+{% for retry_rule in step.retry.automatic %}
+            - exit_status: {{ retry_rule.exit_status }}
+              limit: {{ retry_rule.limit }}
+{% endfor %}
+{% endif %}
         {% if step.timeout_in_minutes %}
         timeout_in_minutes: {{ step.timeout_in_minutes }}
         {% endif %}
@@ -170,7 +188,14 @@ steps:
 {% elif step_group.mirror_hardwares and mirror_hw in step_group.mirror_hardwares %}
 {% set step = step_group %}
   - label: "{{ step.agent_pool }}: {{ step.label }}"
+{% if step.key %}
+    key: {{ step.key }}
+{% endif %}
+{% if step.depends_on %}
+    depends_on: {{ step.depends_on }}
+{% else %}
     depends_on: amd-build
+{% endif %}
     agents:
       {% if step.agent_pool %}
       queue: amd_{{ step.agent_pool }}
@@ -194,6 +219,7 @@ steps:
       MIOPEN_DEBUG_CONV_GEMM: "0"
       VLLM_ROCM_USE_AITER: "0"
       PYTORCH_ROCM_ARCH: ""
+      VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT: "{{ vllm_aiter_mha_trusted_commit }}"
 {% if step.env %}
 {% for name in step.env %}
       {{ name }}: "{{ step.env[name] }}"
@@ -223,6 +249,14 @@ steps:
     artifact_paths:
 {% for path in step.artifact_paths %}
       - "{{ path }}"
+{% endfor %}
+{% endif %}
+{% if step.retry %}
+    retry:
+      automatic:
+{% for retry_rule in step.retry.automatic %}
+        - exit_status: {{ retry_rule.exit_status }}
+          limit: {{ retry_rule.limit }}
 {% endfor %}
 {% endif %}
     {% if step.timeout_in_minutes %}

@@ -178,6 +178,7 @@ def test_code2wav_runtime_rejects_launch_blocking(monkeypatch):
     ("enabled", "max_graphs", "expected_prepared"),
     [
         (True, 7, 1),
+        (None, 7, 1),  # No NPU override: honor the shared CFM graph config.
         (False, 7, 0),
         (True, 0, 0),
     ],
@@ -197,6 +198,7 @@ def test_code2wav_patch_reads_stage_additional_config(
     model = SimpleNamespace(
         backend=None,
         _extra_config=lambda: {},
+        _cfm_graph_config={"enabled": True, "max_graphs": 32, "enable_whole_euler": True},
         vllm_config=SimpleNamespace(
             additional_config={
                 "code2wav_enable_npu_graph": enabled,
@@ -217,6 +219,11 @@ def test_code2wav_patch_reads_stage_additional_config(
     code2wav_patch._patched_build_backend(model)
 
     assert prepared == expected_prepared
+    assert model._cfm_graph_config == {
+        "enabled": bool(expected_prepared),
+        "max_graphs": max_graphs,
+        "enable_whole_euler": True,
+    }
     if expected_prepared:
         graph_runner = code2wav_patch._backend_graph_runners[model.backend]
         assert isinstance(graph_runner, NPUExactGraphRunner)
@@ -274,6 +281,9 @@ def test_code2wav_estimator_graph_dispatch_is_platform_owned(monkeypatch, with_c
         _trt_stepper = None
         _cfm_graph_wrapper = None
 
+        def _time_embedding(self, estimator, time):
+            return estimator.t_embedder(time)
+
     class _Runner:
         def run(self, operation, inputs, constants, compute):
             calls.append((operation, inputs, constants))
@@ -317,7 +327,7 @@ def test_code2wav_estimator_graph_dispatch_is_platform_owned(monkeypatch, with_c
     )
 
     assert calls[0][0] == "cfm_estimator"
-    assert calls[0][2] == (with_cache,)
+    assert calls[0][2] == (with_cache, None)
     assert len(calls[0][1]) == (7 if with_cache else 5)
     torch.testing.assert_close(calls[0][1][2], torch.tensor([[3.0]]))
     torch.testing.assert_close(outputs[0], torch.tensor([4.0]))
@@ -373,3 +383,114 @@ def test_code2wav_platform_wraps_flow_execution_context(monkeypatch):
         last_chunk=True,
     ) == ("decode", True, False)
     assert entered == [(torch.device("cpu"), True), (torch.device("cpu"), True)]
+
+
+@pytest.mark.parametrize("with_cache", [False, True])
+def test_code2wav_pad_mask_replays_as_a_graph_input(monkeypatch, with_cache):
+    """A bucketing pad mask is shape-stable, so it replays inside the graph."""
+    calls = []
+    seen = []
+
+    class _Backend:
+        _trt_stepper = None
+        _cfm_graph_wrapper = None
+
+        def _time_embedding(self, estimator, time):
+            return estimator.t_embedder(time)
+
+    class _Runner:
+        def run(self, operation, inputs, constants, compute):
+            calls.append((operation, inputs, constants))
+            return compute(*inputs)
+
+    backend = _Backend()
+    code2wav_patch._backend_graph_runners[backend] = _Runner()
+
+    def graphable_estimator_step(
+        instance,
+        estimator,
+        *,
+        x,
+        mu,
+        time_embedding,
+        speakers,
+        cond,
+        cnn_cache,
+        att_cache,
+        attn_mask=None,
+    ):
+        del instance, estimator, time_embedding, speakers, cond, cnn_cache, att_cache
+        seen.append(attn_mask)
+        return x + mu, x.clone(), x.clone()
+
+    monkeypatch.setattr(code2wav_patch, "_original_estimator_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr(code2wav_patch, "_graphable_estimator_step", graphable_estimator_step)
+    value = torch.tensor([2.0])
+    mask = torch.tensor([1.0, 0.0])
+    estimator = SimpleNamespace(t_embedder=lambda time: time + 1)
+
+    code2wav_patch._patched_estimator_step(
+        backend,
+        estimator,
+        x=value,
+        mu=value,
+        time=value,
+        speakers=value,
+        cond=value,
+        attn_mask=mask,
+        cnn_cache=value if with_cache else None,
+        att_cache=value if with_cache else None,
+    )
+
+    assert calls[0][0] == "cfm_estimator"
+    assert calls[0][2] == (with_cache, None)
+    assert any(item is mask for item in calls[0][1])
+    assert seen[0] is mask
+
+
+@pytest.mark.parametrize("with_cache", [False, True])
+def test_estimator_graph_distinguishes_padding_and_reuses_embedding(monkeypatch, with_cache):
+    class Backend:
+        _trt_stepper = None
+        _cfm_graph_wrapper = None
+
+        def _time_embedding(self, estimator, time):
+            return time + 7
+
+    backend = Backend()
+    runner = NPUExactGraphRunner(max_graphs=4)
+    code2wav_patch._backend_graph_runners[backend] = runner
+    monkeypatch.setattr(runner, "_eligible", lambda inputs: True)
+
+    class Captured:
+        def __init__(self, compute):
+            self.compute = compute
+
+        def replay(self, inputs):
+            return self.compute(*inputs)
+
+    monkeypatch.setattr(runner, "capture", lambda inputs, compute: Captured(compute))
+    monkeypatch.setattr(code2wav_patch, "_original_estimator_step", lambda *args, **kwargs: None)
+
+    def body(backend, estimator, *, x, mu, time_embedding, speakers, cond, cnn_cache, att_cache, valid_frames=None):
+        output = speakers.unsqueeze(-1).expand_as(x).clone()
+        if valid_frames is not None:
+            output[..., valid_frames:] = 0
+        return output, time_embedding, x
+
+    monkeypatch.setattr(code2wav_patch, "_graphable_estimator_step", body)
+    x = torch.ones(1, 1, 6)
+    cache = x if with_cache else None
+    kwargs = dict(x=x, mu=x, time=torch.ones(1), speakers=torch.ones(1, 1), cond=x, cnn_cache=cache, att_cache=cache)
+    for frames in (4, 2, 4):
+        output, embedding, _ = code2wav_patch._patched_estimator_step(backend, object(), **kwargs, valid_frames=frames)
+        expected = x.clone()
+        expected[..., frames:] = 0
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(embedding, torch.tensor([[8.0]]))
+    supplied = torch.tensor([[19.0]])
+    _, embedding, _ = code2wav_patch._patched_estimator_step(
+        backend, object(), **kwargs, valid_frames=4, time_embedding=supplied
+    )
+    torch.testing.assert_close(embedding, supplied)
+    assert runner.stats == {"captures": 2, "failed": 0, "hits": 2}

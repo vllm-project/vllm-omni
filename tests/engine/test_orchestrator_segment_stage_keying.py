@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Streaming segment-boundary state must be keyed by stage.
 
-``Orchestrator._orchestration_loop`` polls every stage into the same
+``OrchestratorBase._orchestration_loop`` polls every stage into the same
 ``OrchestratorRequestState``. While the segment-boundary fields lived in a single
 flat slot per request, whichever stage polled most recently overwrote the others,
 and the per-stage consumers then read back a different stage's boundary.
+
+The duplex consumer of the per-stage segment (``DuplexOrchestrator``'s output
+context) is covered in ``test_duplex_orchestrator.py``.
 """
 
 from __future__ import annotations
@@ -15,8 +18,6 @@ from dataclasses import dataclass, field
 import pytest
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.duplex.contracts import DuplexRequestIdentity
-from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
@@ -54,22 +55,19 @@ class _RecordingPool:
         return _StageMetrics()
 
 
-def _duplex_req_state(request_id: str = "req-duplex") -> OrchestratorRequestState:
+def _streaming_req_state(request_id: str = "req-streaming") -> OrchestratorRequestState:
     req_state = OrchestratorRequestState(
         request_id=request_id,
         sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
         final_stage_id=TALKER_STAGE,
+        session_owned=True,
     )
     req_state.streaming.enabled = True
-    req_state.duplex_identity = DuplexRequestIdentity(
-        session_id="session-1",
-        fence=DuplexFence(session_id="session-1"),
-    )
     return req_state
 
 
-def test_duplex_output_context_reads_only_its_own_stage_segment() -> None:
-    req_state = _duplex_req_state()
+def test_segment_accessor_reads_only_its_own_stage() -> None:
+    req_state = _streaming_req_state()
     req_state.streaming.segments[THINKER_STAGE] = StreamingSegmentState(
         finished=True,
         token_ids=[11, 22],
@@ -78,26 +76,28 @@ def test_duplex_output_context_reads_only_its_own_stage_segment() -> None:
     # The talker polls after the thinker and is still mid-segment.
     req_state.streaming.segments[TALKER_STAGE] = StreamingSegmentState(finished=False)
 
-    thinker = Orchestrator._duplex_output_context(req_state, stage_id=THINKER_STAGE)
-    talker = Orchestrator._duplex_output_context(req_state, stage_id=TALKER_STAGE)
-
-    assert thinker is not None
-    assert talker is not None
+    thinker = req_state.streaming.segment(THINKER_STAGE)
+    talker = req_state.streaming.segment(TALKER_STAGE)
 
     # These are the assertions that fail on the flat field: the talker is written
     # second, so the thinker loses its boundary to whichever stage polled last.
-    assert thinker.segment_finished is True
-    assert thinker.segment_token_ids == (11, 22)
-    assert thinker.segment_output_metadata == {"stage": "thinker"}
+    assert thinker.finished is True
+    assert thinker.token_ids == [11, 22]
+    assert thinker.output_metadata == {"stage": "thinker"}
 
-    assert talker.segment_finished is False
-    assert talker.segment_token_ids == ()
-    assert talker.segment_output_metadata == {}
+    assert talker.finished is False
+    assert talker.token_ids == []
+    assert talker.output_metadata == {}
+
+    # A stage that never reported a boundary gets a fresh, unshared segment.
+    unreported = req_state.streaming.segment(2)
+    unreported.output_metadata["poisoned"] = True
+    assert req_state.streaming.segment(2).output_metadata == {}
 
 
 @pytest.mark.asyncio
 async def test_segment_boundary_on_one_stage_does_not_build_metrics_on_another() -> None:
-    req_state = _duplex_req_state()
+    req_state = _streaming_req_state()
     req_state.streaming.segments[THINKER_STAGE] = StreamingSegmentState(finished=True)
 
     talker_pool = _RecordingPool()

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Text-only WebSocket client for `/v1/realtime/video`.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""WebSocket client for `/v1/realtime/video`.
 
 The client prints a line for every binary video chunk it receives and writes
 the received bytes to disk when the session finishes or is interrupted.
-Image/reference input is intentionally not supported in this example yet.
+``--image-reference`` sends a first frame for image-conditioned models such as
+LingBot-World 2.0; text-only models need no image.
 
 Requirements:
     pip install av websockets
@@ -13,9 +14,11 @@ Requirements:
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import io
 import json
+import mimetypes
 import os
 import time
 from dataclasses import dataclass
@@ -23,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import av
+from camera_utils import wasd_to_camera_payload
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -51,6 +55,27 @@ class ScheduledPromptUpdate:
     at: float
     prompt: str
     transition_chunks: int
+
+
+@dataclass(frozen=True)
+class ScheduledCameraUpdate:
+    """Client-side schedule entry for a midway camera ``session.interaction``."""
+
+    at: float
+    camera: dict[str, Any]
+    transition_chunks: int | None
+
+
+def _image_reference(value: str) -> dict[str, Any]:
+    """Accept an http(s) URL as-is, or inline a local image as a data URL."""
+    if value.startswith(("http://", "https://", "data:")):
+        return {"image_url": value}
+    path = Path(value)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"--image-reference is neither a URL nor a readable file: {value}")
+    media_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode()
+    return {"image_url": f"data:{media_type};base64,{encoded}"}
 
 
 def _parse_extra_params(value: str) -> dict[str, Any]:
@@ -104,6 +129,61 @@ def _parse_prompt_updates(value: str) -> list[ScheduledPromptUpdate]:
     return sorted(updates, key=lambda update: update.at)
 
 
+def _parse_camera_updates(value: str) -> list[ScheduledCameraUpdate]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--camera-updates must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise argparse.ArgumentTypeError("--camera-updates must be a JSON array")
+
+    updates: list[ScheduledCameraUpdate] = []
+    for index, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}] must be a JSON object")
+        try:
+            at = float(item["at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}] must have a valid 'at' field") from exc
+        if at < 0:
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}].at must be >= 0")
+
+        if "camera" in item:
+            camera = item["camera"]
+            if not isinstance(camera, dict):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].camera must be an object")
+        elif "actions" in item:
+            actions = item["actions"]
+            if not isinstance(actions, list):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].actions must be a list of WASD/IJKL keys")
+            mode = item.get("mode", "velocity")
+            if mode not in ("target", "velocity"):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].mode must be target or velocity")
+            camera = wasd_to_camera_payload(actions, mode=mode)
+        else:
+            raise argparse.ArgumentTypeError(
+                f"--camera-updates[{index}] must provide 'camera' (structural SE3) "
+                "or 'actions' (client-side WASD helper)"
+            )
+
+        transition_chunks: int | None
+        if "transition_chunks" not in item:
+            transition_chunks = None if camera.get("mode") == "velocity" else DEFAULT_TRANSITION_CHUNKS
+        else:
+            try:
+                transition_chunks = int(item["transition_chunks"])
+            except (TypeError, ValueError) as exc:
+                raise argparse.ArgumentTypeError(
+                    f"--camera-updates[{index}].transition_chunks must be an integer"
+                ) from exc
+            if transition_chunks < 0:
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].transition_chunks must be >= 0")
+
+        updates.append(ScheduledCameraUpdate(at=at, camera=camera, transition_chunks=transition_chunks))
+
+    return sorted(updates, key=lambda update: update.at)
+
+
 def _maybe_set(payload: dict[str, Any], key: str, value: Any) -> None:
     if value is not None:
         payload[key] = value
@@ -116,6 +196,7 @@ def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
         "prompt": args.prompt,
     }
 
+    _maybe_set(payload, "image_reference", args.image_reference)
     _maybe_set(payload, "negative_prompt", args.negative_prompt)
     _maybe_set(payload, "width", args.width)
     _maybe_set(payload, "height", args.height)
@@ -157,11 +238,35 @@ async def _run_prompt_update_scheduler(
         payload = {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"scheduled-{update.at:.3f}",
+                "event_id": f"scheduled-prompt-{update.at:.3f}",
                 "event": {"prompt": update.prompt},
                 "transition_chunks": update.transition_chunks,
             },
         }
+        async with send_lock:
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+        print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
+
+
+async def _run_camera_update_scheduler(
+    websocket: Any,
+    updates: list[ScheduledCameraUpdate],
+    *,
+    video_started_at: float,
+    send_lock: asyncio.Lock,
+) -> None:
+    for update in updates:
+        delay = (video_started_at + update.at) - time.perf_counter()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        interaction: dict[str, Any] = {
+            "event_id": f"scheduled-camera-{update.at:.3f}",
+            "event": {"multi_modal_data": {"camera": update.camera}},
+        }
+        if update.transition_chunks is not None:
+            interaction["transition_chunks"] = update.transition_chunks
+        payload = {"type": "session.interaction", "interaction": interaction}
         async with send_lock:
             await websocket.send(json.dumps(payload, ensure_ascii=False))
         print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
@@ -225,6 +330,7 @@ async def stream_video(args: argparse.Namespace) -> None:
     ws = None
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
+    camera_update_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
@@ -279,12 +385,21 @@ async def stream_video(args: argparse.Namespace) -> None:
                 if msg_type == "video.start":
                     stream_format = msg.get("format") or stream_format
                     print(f"Video session started: request_id={msg.get('request_id')} format={msg.get('format')}")
+                    video_started_at = time.perf_counter()
                     if args.prompt_updates and prompt_update_task is None:
-                        video_started_at = time.perf_counter()
                         prompt_update_task = asyncio.create_task(
                             _run_prompt_update_scheduler(
                                 websocket,
                                 args.prompt_updates,
+                                video_started_at=video_started_at,
+                                send_lock=send_lock,
+                            )
+                        )
+                    if args.camera_updates and camera_update_task is None:
+                        camera_update_task = asyncio.create_task(
+                            _run_camera_update_scheduler(
+                                websocket,
+                                args.camera_updates,
                                 video_started_at=video_started_at,
                                 send_lock=send_lock,
                             )
@@ -299,6 +414,8 @@ async def stream_video(args: argparse.Namespace) -> None:
                     done = True
                     if prompt_update_task is not None:
                         prompt_update_task.cancel()
+                    if camera_update_task is not None:
+                        camera_update_task.cancel()
                     break
                 elif msg_type == "error":
                     print(f"ERROR: {msg.get('message', msg)}")
@@ -319,6 +436,10 @@ async def stream_video(args: argparse.Namespace) -> None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await prompt_update_task
+        if camera_update_task is not None:
+            camera_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await camera_update_task
         print(
             "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"
         )
@@ -362,6 +483,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=16, help="Frames per second")
     parser.add_argument("--num-frames", type=int, default=429, help="Number of generated frames")
 
+    parser.add_argument(
+        "--image-reference",
+        type=_image_reference,
+        default=None,
+        help="First frame for image-conditioned models: a local image path or an http(s) URL.",
+    )
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt")
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Number of diffusion steps")
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Classifier-free guidance scale")
@@ -383,38 +510,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON object merged into extra_params; overrides preset keys on conflict.",
     )
+    # Midway interactions are pipeline-specific: unsupported modalities reject
+    # the update (and may leave the session running). Nothing is scheduled unless
+    # the caller asks for it.
     parser.add_argument(
         "--prompt-updates",
         type=_parse_prompt_updates,
-        default=json.dumps(
-            [
-                {
-                    "at": 4,
-                    "prompt": (
-                        "An underwater tornado appears and affects the ocean floor in a dramatic and chaotic scene. "
-                        "The water is murky, swirling violently, carrying debris and marine life into the vortex. "
-                        "The tropical fish on the scene all swim in panic, trying to avoid the powerful currents. "
-                        "The camera remains stationary, capturing the intensity of the underwater tornado as it disrupts the serene ocean floor. "
-                        "Close-up shot emphasizing the turbulent motion and destruction."
-                    ),
-                },
-                {
-                    "at": 11,
-                    "prompt": (
-                        "The swirling underwater vortex now seizes a heavy, encrusted treasure chest, its lid flapping open as it is smashed onto the ocean floor. "
-                        "Gold coins and silver trinkets spill out, glittering briefly in the murky water before being swept instantly into the violent funnel. "
-                        "The heavy wooden box tumbles end over end, colliding with floating rocks and adding to the debris field. "
-                        "Swirling sediment and bubbles surround the spilling fortune, highlighting the chaotic power of the storm as it ravages the seabed. "
-                        "Close-up shot emphasizing the turbulent motion and destruction."
-                    ),
-                    # "transition_chunks": 3,
-                },
-            ]
-        ),
+        default=[],
         help=(
-            "JSON array of scheduled prompt updates. Each object requires "
+            "JSON array of scheduled prompt updates; none are sent by default. "
+            "Each object requires "
             "'at' (seconds after video.start) and 'prompt'. Optional "
             f"'transition_chunks' defaults to {DEFAULT_TRANSITION_CHUNKS}."
+        ),
+    )
+    parser.add_argument(
+        "--camera-updates",
+        type=_parse_camera_updates,
+        default=[],
+        help=(
+            "JSON array of scheduled camera updates for models that register the "
+            "camera modality (e.g. LingBot-World). Each object needs 'at' and either "
+            "'camera' (structural SE3: mode + translation/rotation) or "
+            "'actions' (client-side WASD/IJKL helper converted before send). "
+            "Optional 'transition_chunks' defaults to None for velocity and "
+            f"{DEFAULT_TRANSITION_CHUNKS} for target."
         ),
     )
     return parser.parse_args()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -14,6 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def test_attention_uses_compile_boundary_for_hsdp(monkeypatch):
     attention = object.__new__(Attention)
+    attention._hsdp_compile_boundary_enabled = False
     calls = []
 
     def _boundary(query, key, value, attn_metadata=None):
@@ -38,6 +39,7 @@ def test_attention_uses_compile_boundary_for_hsdp(monkeypatch):
 
 def test_attention_keeps_compiled_impl_without_hsdp(monkeypatch):
     attention = object.__new__(Attention)
+    attention._hsdp_compile_boundary_enabled = False
     calls = []
 
     def _boundary(query, key, value, attn_metadata=None):
@@ -60,8 +62,10 @@ def test_attention_keeps_compiled_impl_without_hsdp(monkeypatch):
     assert calls == ["impl"]
 
 
-def test_attention_keeps_compiled_impl_without_diffusion_config(monkeypatch):
+@pytest.mark.parametrize("initialized_with_hsdp", [False, True])
+def test_attention_compile_boundary_without_diffusion_config(monkeypatch, initialized_with_hsdp):
     attention = object.__new__(Attention)
+    attention._hsdp_compile_boundary_enabled = initialized_with_hsdp
     calls = []
 
     def _boundary(query, key, value, attn_metadata=None):
@@ -80,4 +84,4 @@ def test_attention_keeps_compiled_impl_without_diffusion_config(monkeypatch):
     with set_forward_context(vllm_config=None):
         assert Attention.forward(attention, query, query, query) is query
 
-    assert calls == ["impl"]
+    assert calls == (["boundary"] if initialized_with_hsdp else ["impl"])

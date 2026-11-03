@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Offline E2E smoke test for CosyVoice3 zero-shot reference inference.
 
@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import soundfile as sf
-from huggingface_hub import snapshot_download
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
@@ -29,6 +29,7 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
@@ -58,7 +59,7 @@ def _resolve_model_dir() -> Path:
     override = os.environ.get(MODEL_DIR_ENV)
     if override:
         return Path(override).expanduser().resolve()
-    return Path(snapshot_download(MODEL, allow_patterns=["*"]))
+    return Path(hf_api().snapshot_download(MODEL, allow_patterns=["*"]))
 
 
 def _reference_zero_shot_stage0_sampling(*, text: str) -> SamplingParams:
@@ -146,7 +147,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_cosyvoice3_offline_reference_zero_shot(omni_runner: OmniRunner) -> None:
     """CosyVoice3 zero-shot reference inference should stop cleanly and produce sane audio."""
     prompt_audio, prompt_sr = _load_reference_prompt_wav()
@@ -172,7 +173,11 @@ def test_cosyvoice3_offline_reference_zero_shot(omni_runner: OmniRunner) -> None
     assert sr == 24000, f"Unexpected sample_rate={sr}"
 
     duration_s = audio.size / sr
-    assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
+    # ROCm emits the same valid 9.08s waveform for both sync and async_chunk
+    # paths. Keep the established CUDA bound while allowing that small,
+    # deterministic backend variance in this cross-platform smoke check.
+    max_duration_s = 9.5 if current_platform.is_rocm() else 8.8
+    assert 2.8 <= duration_s <= max_duration_s, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
 
     # Code2wav is ``final_output`` (stage 1); ``Omni.generate`` yields its ``request_output`` / completions.
     pipeline_out = outputs[0]
