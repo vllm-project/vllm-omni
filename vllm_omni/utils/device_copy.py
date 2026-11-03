@@ -10,7 +10,12 @@ path under async scheduling that removes the CPU/GPU overlap the batch queue
 exists for. Staging the data in
 pinned memory and copying with ``non_blocking`` keeps the host running ahead;
 the caching host allocator keeps the pinned source alive until the copy's
-stream event completes.
+stream event completes. That is a property of the device's caching host
+allocator, not of these helpers; on XPU it is checked with torch 2.14.0+xpu
+by ``tests/platforms/xpu/test_xpu_device_copy.py``.
+
+A source that is already pinned is copied from in place, so the caller must
+not overwrite it until the copy has completed on the stream.
 """
 
 from __future__ import annotations

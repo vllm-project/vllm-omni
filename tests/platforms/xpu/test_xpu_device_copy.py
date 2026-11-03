@@ -26,7 +26,9 @@ def test_xpu_copies_use_a_pinned_nonblocking_transfer(monkeypatch):
 
     def recording_to(self, *args, **kwargs):
         if self.device.type == "cpu":
-            transfers.append((self.is_pinned(), kwargs.get("non_blocking", False)))
+            # Tensor.to(device, dtype, non_blocking, copy): the first positional bool is non_blocking.
+            positional = next((a for a in args if isinstance(a, bool)), False)
+            transfers.append((self.is_pinned(), kwargs.get("non_blocking", positional)))
         return original(self, *args, **kwargs)
 
     with monkeypatch.context() as patch:
