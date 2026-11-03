@@ -57,11 +57,7 @@ def _generate_short_sa3_clip(
     )
 
     assert outputs is not None
-    first_output = outputs[0]
-    assert first_output.final_output_type == "audio"
-    assert hasattr(first_output, "request_output") and first_output.request_output
-
-    req_out = first_output.request_output
+    req_out = outputs[0]
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
@@ -77,19 +73,22 @@ def test_stable_audio_3_short_clip_smoke() -> None:
     # factory reads it from ``kwargs`` when deciding ``final_output_type``
     # (#2077), before ``model_index.json`` auto-resolution runs.
     omni = Omni(model=_MODEL_REPO, model_class_name="StableAudio3Pipeline")
-    audio = _generate_short_sa3_clip(omni)
+    try:
+        audio = _generate_short_sa3_clip(omni)
 
-    # Shape: SA3 outputs stereo at 44.1 kHz.
-    expected_samples = int(_SHORT_CLIP_DURATION_S * _SAMPLE_RATE)
-    assert audio.shape[-2] == 2, f"expected stereo (2 channels), got shape {audio.shape}"
-    assert abs(audio.shape[-1] - expected_samples) < _SAMPLE_RATE, (
-        f"expected ~{expected_samples} samples for {_SHORT_CLIP_DURATION_S}s, got {audio.shape[-1]}"
-    )
-    assert_audio_valid(audio, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_SHORT_CLIP_DURATION_S)
+        # Shape: SA3 outputs stereo at 44.1 kHz.
+        expected_samples = int(_SHORT_CLIP_DURATION_S * _SAMPLE_RATE)
+        assert audio.shape[-2] == 2, f"expected stereo (2 channels), got shape {audio.shape}"
+        assert abs(audio.shape[-1] - expected_samples) < _SAMPLE_RATE, (
+            f"expected ~{expected_samples} samples for {_SHORT_CLIP_DURATION_S}s, got {audio.shape[-1]}"
+        )
+        assert_audio_valid(audio, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_SHORT_CLIP_DURATION_S)
 
-    # The request generator must drive the initial noise: same seed -> same audio.
-    assert np.array_equal(audio, _generate_short_sa3_clip(omni))
-    assert not np.array_equal(audio, _generate_short_sa3_clip(omni, seed=43))
+        # The request generator must drive the initial noise: same seed -> same audio.
+        assert np.array_equal(audio, _generate_short_sa3_clip(omni))
+        assert not np.array_equal(audio, _generate_short_sa3_clip(omni, seed=43))
+    finally:
+        omni.close()
 
 
 @hardware_test(res={"cuda": "L4"})
@@ -99,15 +98,17 @@ def test_stable_audio_3_variable_length() -> None:
     This is SA3-distinctive vs SA Open 1.0 (which has fixed sample_size).
     """
     omni = Omni(model=_MODEL_REPO, model_class_name="StableAudio3Pipeline")
+    try:
+        short = _generate_short_sa3_clip(omni, audio_end_in_s=5.0, num_inference_steps=4)
+        long_ = _generate_short_sa3_clip(omni, audio_end_in_s=_LONG_CLIP_DURATION_S, num_inference_steps=4)
 
-    short = _generate_short_sa3_clip(omni, audio_end_in_s=5.0, num_inference_steps=4)
-    long_ = _generate_short_sa3_clip(omni, audio_end_in_s=_LONG_CLIP_DURATION_S, num_inference_steps=4)
-
-    # Longer requested duration → more samples (not the same trimmed window).
-    assert long_.shape[-1] > short.shape[-1] * 5, (
-        f"variable-length latents not engaged: short={short.shape}, long={long_.shape}"
-    )
-    assert_audio_valid(long_, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_LONG_CLIP_DURATION_S)
+        # Longer requested duration → more samples (not the same trimmed window).
+        assert long_.shape[-1] > short.shape[-1] * 5, (
+            f"variable-length latents not engaged: short={short.shape}, long={long_.shape}"
+        )
+        assert_audio_valid(long_, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_LONG_CLIP_DURATION_S)
+    finally:
+        omni.close()
 
 
 # TODO(stable-audio-3): once port is done, add:
