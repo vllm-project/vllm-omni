@@ -141,6 +141,34 @@ def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_run
     retention.release_if_needed.assert_called_once_with(force=False)
 
 
+def test_pack_by_dtype_keeps_module_boundaries_and_values(patched_runtime, mocker):
+    left = nn.Linear(4, 2)
+    right = nn.Linear(4, 2)
+    left.register_buffer("position_ids", torch.arange(4, dtype=torch.int64))
+    expected = [
+        tensor.detach().clone() for module in (left, right) for tensor in (*module.parameters(), *module.buffers())
+    ]
+    retention = mocker.Mock(spec=BoundedAllocatorCache)
+
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=False,
+        cache_retention=retention,
+        pack_by_dtype=True,
+    )
+
+    # left float, left int64, and right float are separate transfer groups.
+    assert len(stager._groups) == 3
+    assert sorted(len(group.bindings) for group in stager._groups) == [1, 2, 2]
+    stager.load()
+    stager.offload()
+
+    actual = [tensor for module in (left, right) for tensor in (*module.parameters(), *module.buffers())]
+    assert all(torch.equal(value, reference) for value, reference in zip(actual, expected, strict=True))
+    retention.release_if_needed.assert_called_once_with(force=False)
+
+
 def test_staging_transitions_are_idempotent_and_reuse_one_event(patched_runtime, mocker):
     module = nn.Linear(2, 2)
     retention = mocker.Mock(spec=BoundedAllocatorCache)
