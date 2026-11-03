@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -54,6 +55,15 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+
+def validate_stage_admission(before_accept: Callable[[object], None], request: object) -> None:
+    """Run a local synchronous guard; it must never cross a worker boundary."""
+    result = cast(Callable[[object], object], before_accept)(request)
+    if result is not None:
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError("stage admission guard must be synchronous and return None")
 
 
 class StageUnavailableError(RuntimeError):
@@ -412,9 +422,9 @@ class StagePool:
             if candidates:
                 # LB chose an index *into our candidates list*.
                 lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
-                replica_info, replica_id = candidates[lb_idx]
+                replica_info, selected_replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
-                return replica_id
+                return selected_replica_id
 
             now = _time.monotonic()
             if now >= deadline:
@@ -1088,6 +1098,7 @@ class StagePool:
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
         expected_replica_id: int | None = None,
+        before_accept: Callable[[object], None] | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
@@ -1112,6 +1123,8 @@ class StagePool:
                     affinity_request_id=affinity_request_id,
                 )
             client = self._diffusion_client(replica_id)
+            if before_accept is not None:
+                validate_stage_admission(before_accept, request)
             self.maybe_update_watermarking_state(request_id, params)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
@@ -1133,6 +1146,8 @@ class StagePool:
             )
         if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        if before_accept is not None:
+            validate_stage_admission(before_accept, request)
         self.maybe_update_watermarking_state(request_id, params)
         try:
             self.output_processor.add_request(
@@ -1187,6 +1202,7 @@ class StagePool:
         prompt_text: Any = None,
         pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
+        before_accept: Callable[[object], None] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         submit_kwargs = submit_kwargs or {}
@@ -1206,6 +1222,8 @@ class StagePool:
         if client is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
+        if before_accept is not None:
+            validate_stage_admission(before_accept, request)
         self.maybe_update_watermarking_state(request_id, params)
         if self.stage_type == "diffusion":
             if isinstance(request, list):

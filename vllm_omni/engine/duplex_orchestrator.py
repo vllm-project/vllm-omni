@@ -46,7 +46,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     build_engine_core_request_from_tokens,
 )
-from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.engine.stage_pool import StageUnavailableError, validate_stage_admission
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -561,7 +561,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             kwargs["replica_id"] = replica_id
         return await super()._build_next_stage_request(req_id, next_stage_id, next_input, params, **kwargs)
 
-    async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+    async def submit(self, submission: DuplexStageSubmission, *, before_accept=None) -> DuplexStageSubmissionResult:
         context = submission.context
         input_guard = nullcontext() if submission.resumable else self._stage_input_submission(context.stage_id)
         async with input_guard as mark_submitting:
@@ -603,7 +603,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             if mm_features is not None:
                 request_state.mm_features = mm_features
             pool = self.stage_pools[context.stage_id]
-            if mark_submitting is not None:
+            if before_accept is not None:
+
+                def accept(request: object) -> None:
+                    if self.request_states.get(context.request_id) is not request_state:
+                        raise RuntimeError("duplex request cancelled before stage acceptance")
+                    validate_stage_admission(before_accept, request)
+                    if mark_submitting is not None:
+                        mark_submitting()
+
+                route_kwargs["before_accept"] = accept
+            elif mark_submitting is not None:
                 mark_submitting()
             try:
                 if submission.already_submitted:

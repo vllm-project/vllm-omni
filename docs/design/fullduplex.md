@@ -444,6 +444,16 @@ range. Resizing neither admits nodes nor advances coverage. Every new range
 receives a fresh descriptor and the usual admission fences. If even the minimum
 range cannot fit, that work parks without a model forward or a repeating retry.
 
+Prompt preparation can obtain session-scoped card candidates and retain a
+selection receipt on the owner. Validation checks active heads, transitive
+source validity, execution/settings fences, and pending correction or recovery.
+Explicit recovery blocks retrieval before its next extraction capture. The
+stage port supports a local synchronous acceptance guard after input
+preprocessing and replica selection, before registration and transport handoff.
+Removed or replaced requests are rejected at that point. Changes after local
+acceptance follow the existing cancellation lifecycle. This interface does not
+provide remote execution atomicity; the Qwen card consumer remains unconnected.
+
 Progress covers text fragments and bounded catalogue pages. A successful empty
 result advances only its coverage unit. Own card admissions retain the current
 page pass; external catalogue changes discard it. New keys require extension

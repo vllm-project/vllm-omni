@@ -97,12 +97,16 @@ class RecordingStagePort(DuplexStagePort):
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
         self.ensured.append(context)
 
-    async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+    async def submit(self, submission: DuplexStageSubmission, *, before_accept=None) -> DuplexStageSubmissionResult:
         if self.fail_submit is not None:
             raise self.fail_submit
         if self.submit_gate is not None:
             self.submit_started.set()
             await self.submit_gate.wait()
+        if before_accept is not None:
+            from vllm_omni.engine.stage_pool import validate_stage_admission
+
+            validate_stage_admission(before_accept, submission.prompt)
         self.submissions.append(submission)
         return DuplexStageSubmissionResult(
             request_id=submission.context.request_id,
@@ -409,10 +413,12 @@ async def test_spans_reported_while_the_append_submit_awaits_are_kept() -> None:
         assert ledger is not None
         submit = h.port.submit
 
-        async def submit_and_report(submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+        async def submit_and_report(
+            submission: DuplexStageSubmission, *, before_accept=None
+        ) -> DuplexStageSubmissionResult:
             # A live resumable request steps on the update before submit returns.
             h.runner.on_stage_work([(0, 0, 1, ledger.now_ns(), 1_000_000)])
-            return await submit(submission)
+            return await submit(submission, before_accept=before_accept)
 
         h.port.submit = submit_and_report  # type: ignore[method-assign]
         await h.run(append_audio())

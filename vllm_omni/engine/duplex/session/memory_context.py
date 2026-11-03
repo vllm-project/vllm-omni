@@ -104,6 +104,11 @@ class DuplexMemoryContextState:
         self._catalog_width = 16
         self._adaptive_chars = 8192
 
+    @property
+    def retrieval_blocked(self) -> bool:
+        """An explicit restart blocks old cards before the next capture."""
+        return self._force_recovery or self._recovery is not None
+
     def note_change(self, slot_order: int) -> None:
         if self._recovery is not None and slot_order < self._recovery.target:
             self._recovery.rewrite_pending = True

@@ -56,6 +56,7 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseState,
 )
 from vllm_omni.engine.duplex.session.memory_context import DuplexMemoryContextState
+from vllm_omni.engine.duplex.session.memory_prompt import DuplexMemoryPromptCapture, DuplexMemoryPromptState
 from vllm_omni.engine.duplex.session.memory_retrieval import DuplexMemorySuppression
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.metrics.stats import (
@@ -259,6 +260,7 @@ class DuplexEngineSession:
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
     _memory_suppression: DuplexMemorySuppression = field(default_factory=DuplexMemorySuppression, repr=False)
     _memory_context: DuplexMemoryContextState | None = field(default=None, repr=False)
+    _memory_prompt_state: DuplexMemoryPromptState | None = field(default=None, repr=False)
     _memory_compute_budget: DuplexAuxiliaryBudget | None = field(default=None, repr=False)
     _memory_compute_limits: DuplexAuxiliaryBudgetLimits | None = field(default=None, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
@@ -574,6 +576,14 @@ class DuplexEngineSession:
 
     def memory_context_matches(self, context: DuplexContextAuxiliaryInput) -> bool:
         return self._memory_context is not None and self._memory_context.matches(self, context)
+
+    def capture_memory_prompt(self, *, query: str, max_candidates: int = 16) -> DuplexMemoryPromptCapture:
+        if self._memory_prompt_state is None:
+            self._memory_prompt_state = DuplexMemoryPromptState()
+        return self._memory_prompt_state.capture(self, query=query, max_candidates=max_candidates)
+
+    def memory_prompt_matches(self, capture: DuplexMemoryPromptCapture, node_ids: tuple[int, ...]) -> bool:
+        return self._memory_prompt_state is not None and self._memory_prompt_state.matches(self, capture, node_ids)
 
     def rechunk_memory_context(self, context: DuplexContextAuxiliaryInput) -> bool:
         return self._memory_context is not None and self._memory_context.rechunk(self, context)
