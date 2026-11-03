@@ -251,6 +251,25 @@ def test_unhandled_decoder_error_still_reclaims_request_state():
     with pytest.raises(RuntimeError, match="simulated decoder failure"):
         model(runtime_additional_information=[payload(states(4), chunk_size=4)], request_ids=["failure"])
     assert not model._streams
+    assert model._failed_streams == {"failure"}
+
+    # A device/runtime failure propagates, but late chunks still cannot restart
+    # the failed synthesis unit, including a terminal chunk.
+    late = model(
+        runtime_additional_information=[payload(states(8), chunk_size=8, finished=True)], request_ids=["failure"]
+    ).multimodal_outputs
+    assert bool(late["audio_synthesis_error"][0])
+    assert late["model_outputs"][0].numel() == 0
+    assert model._failed_streams == {"failure"}
+
+    model.on_requests_finished(["failure"])
+    assert not model._streams and not model._failed_streams
+    model.decoder = IntervalDecoder()
+    recovered = model(
+        runtime_additional_information=[payload(states(8), chunk_size=8, finished=True)], request_ids=["failure"]
+    ).multimodal_outputs
+    assert not bool(recovered["audio_synthesis_error"][0])
+    assert torch.equal(recovered["model_outputs"][0], states(8)[:-1, 0].repeat_interleave(2048))
 
 
 def test_pending_state_remains_bounded_after_a_handoff_error():
