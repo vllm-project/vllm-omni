@@ -96,6 +96,13 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
     )
 
 
+# Devices whose fused interleaved RoPE reproduces the reference rotation. MUSA has no
+# complex-tensor kernel, so the reference path there is the native multiply/add
+# sequence; the fused kernel keeps that arithmetic (unfused products) and matches it
+# bit for bit.
+_FUSED_ROPE_DEVICE_TYPES = ("cuda", "musa")
+
+
 def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Rotate interleaved pairs with complex FP32 multiplication.
 
@@ -550,7 +557,7 @@ class QwenImage21Attention(nn.Module):
         )
 
     def _apply_rotary_emb(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "cuda":
+        if x.device.type in _FUSED_ROPE_DEVICE_TYPES:
             return _apply_qwen_image21_rotary_emb(x, freqs)
         if x.device.type == "npu":
             return _apply_qwen_image21_rotary_emb_npu(x, freqs)
