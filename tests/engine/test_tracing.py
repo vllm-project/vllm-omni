@@ -121,6 +121,7 @@ async def test_orchestrator_closes_diffusion_request_and_stage(recording, outcom
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=_build_stage_pools([[client]]),
+        stage_metadata=[client],
         tracer=tracer,
     )
     for index in range(2):
@@ -232,6 +233,7 @@ async def test_stage_error_preserves_trace_error_type(recording, error_type):
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=_build_stage_pools([[FakeStageClient(final_output=True)]]),
+        stage_metadata=[FakeStageClient(final_output=True)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "failed", HEADERS)
@@ -257,6 +259,7 @@ async def test_client_error_trace_uses_default_for_missing_type(recording, error
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=_build_stage_pools([[FakeStageClient(final_output=True)]]),
+        stage_metadata=[FakeStageClient(final_output=True)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "failed", HEADERS)
@@ -285,6 +288,7 @@ async def test_first_output_check_stops_after_nonempty_output(recording, mocker)
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[pool.stage_client],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "stream", HEADERS)
@@ -525,6 +529,7 @@ async def test_raw_terminal_stage_trace_survives_downstream_failure(recording, s
             [[FakeStageClient()], [FakeStageClient(final_output=True)]],
             output_processors=[FakeOutputProcessor(request_outputs=processed), FakeOutputProcessor()],
         ),
+        stage_metadata=[FakeStageClient(), FakeStageClient(final_output=True)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, request_id, HEADERS)

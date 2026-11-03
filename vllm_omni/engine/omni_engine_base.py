@@ -482,6 +482,7 @@ class OmniEngineBase:
                 output_async_queue=self._output_sink,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
+                stage_metadata=self._runtime.stage_metadata,
                 async_chunk=self.async_chunk,
                 pd_config=pd_config,
                 membership_controller=membership_controller,

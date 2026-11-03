@@ -98,6 +98,7 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_queue,
         stage_pools=[],
+        stage_metadata=[],
     )
 
     async def wait_for_requests() -> None:
@@ -496,6 +497,7 @@ def _build_harness(
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
+                stage_metadata=[pool.stage_client for pool in stage_pools],
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
@@ -2026,6 +2028,7 @@ async def test_abort_marks_only_last_final_stage_output_finished() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=pools,
+        stage_metadata=[pool.stage_client for pool in pools],
     )
     orchestrator.request_states["req-two"] = OrchestratorRequestState(
         request_id="req-two",
@@ -2047,6 +2050,7 @@ async def test_handle_abort_emits_error_result_on_failure() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_queue,
         stage_pools=[],
+        stage_metadata=[],
     )
 
     async def boom(_request_ids, *, abort=False):
@@ -2956,6 +2960,7 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[source, target],
+        stage_metadata=[source.stage_client, target.stage_client],
     )
 
     async def check_dispatch(request_id, req_state, request, **kwargs):
@@ -3172,6 +3177,7 @@ async def test_disabled_stage_metrics_drain_native_cache_on_completion(mocker) -
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[pool.stage_client],
         log_stats=False,
         collect_stage_metrics=False,
     )
@@ -3285,6 +3291,7 @@ def test_orchestrator_rejects_logging_without_stage_metrics() -> None:
             output_async_queue=None,
             rpc_async_queue=None,
             stage_pools=[],
+            stage_metadata=[],
             log_stats=True,
             collect_stage_metrics=False,
         )
@@ -3571,6 +3578,7 @@ async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_on
         output_async_queue=output,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[pool.stage_client],
         running_counter=counter,
     )
 
@@ -4073,6 +4081,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     orchestrator.stage_pools = pools
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
@@ -4115,6 +4124,7 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     duplex_state = OrchestratorRequestState(request_id="duplex-req", session_owned=True)
     plain_state = OrchestratorRequestState(request_id="plain-req")
@@ -4247,6 +4257,7 @@ async def test_interaction_wait_does_not_block_playback_or_abort(monkeypatch: py
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -4304,6 +4315,7 @@ async def test_interaction_worker_shutdown_cancels_inflight_rpc(monkeypatch: pyt
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -4336,6 +4348,7 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
         output_async_queue=errors,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     for index in range(65):
         await orchestrator._dispatch_message(

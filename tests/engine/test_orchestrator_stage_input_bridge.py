@@ -188,6 +188,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         output_async_queue=output_q.async_q,
         rpc_async_queue=rpc_q.async_q,
         stage_pools=stage_pools,
+        stage_metadata=[pool.stage_client for pool in stage_pools],
         async_chunk=False,
     )
     input_processor = FakeInputProcessor()

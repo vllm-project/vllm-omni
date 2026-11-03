@@ -742,6 +742,7 @@ async def test_orchestrator_records_stats_from_late_replica(stats_config, initia
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[pool.stage_client],
         log_stats=True,
     )
     raw = EngineCoreOutputs(outputs=[], scheduler_stats=SchedulerStats(num_running_reqs=5))

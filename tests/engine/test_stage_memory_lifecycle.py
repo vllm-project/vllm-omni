@@ -93,6 +93,7 @@ def lifecycle(monkeypatch):
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[pool.stage_client],
         membership_controller=controller,
     )
 
