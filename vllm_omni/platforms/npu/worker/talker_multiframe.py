@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Several codec frames inside one stage-1 ``execute_model``.
 
 One MiniCPM-o Talker decode step is almost all vLLM host work wrapped around a
@@ -85,12 +88,12 @@ def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
     masked and ``finished_reason`` can only be ``length`` (observed on stage 1:
     all length, zero stop).
 
-    The real minimum-length guard lives elsewhere:
-    ``talker_codec_sample.greedy_codec_sample`` masks the codec EOS itself via
-    ``state.step < min_tokens``, using the model's own frame counter. This vLLM
-    layer is therefore redundant and, under multi-frame decode, also swallows
-    the stop signal -- clear its list and leave the minimum to the model-side
-    guard.
+    The real minimum-length guard lives elsewhere: the K-step host sampler
+    (``_sample_audio_code_host``) masks the codec EOS itself via
+    ``state["step"] < min_tokens``, using the model's own frame counter. This
+    vLLM layer is therefore redundant and, under multi-frame decode, also
+    swallows the stop signal -- clear its list and leave the minimum to the
+    model-side guard.
 
     ``min_toks`` is re-registered by ``update_state`` every step, so this must
     be called every step (the caller places it right before sampling). Never

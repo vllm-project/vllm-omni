@@ -2792,3 +2792,40 @@ def test_pack_att_cache_names_the_row_that_broke_the_pack() -> None:
     # The offender is the tensor row, not the leading None placeholder.
     assert "Tensor" in message
     assert "NoneType" not in message
+
+
+def test_pack_att_cache_rejects_a_non_tensor_payload() -> None:
+    with pytest.raises(TypeError, match="expects a tensor or None, got str"):
+        wrapper_module._pack_att_cache("att")
+
+
+class _TinyHiFT(nn.Module):
+    """The HiFT surface HiFTGraphWrapper binds at construction; nothing runs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+        self.conv_pre = SimpleNamespace(in_channels=80)
+        self.inference = lambda *args, **kwargs: None
+        self._inference_pre_istft = lambda *args, **kwargs: None
+        self._finalize_decode = lambda *args, **kwargs: None
+
+
+def test_hift_wrapper_exact_batch_sizes_empty_list_disables_exact_graphs() -> None:
+    """An explicit empty ``hift_graph_exact_batch_sizes`` reaches the wrapper as ``[]``."""
+    token2wav = SimpleNamespace(
+        hift=_TinyHiFT(),
+        flow=SimpleNamespace(encoder=SimpleNamespace()),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+    wrapper = HiFTGraphWrapper(
+        token2wav,
+        connector_config={
+            "codec_chunk_frames": 2,
+            "codec_left_context_frames": 3,
+            "hift_graph_exact_batch_sizes": [],
+        },
+        capture_batch_sizes=[1],
+    )
+    assert wrapper.exact_batch_sizes == []

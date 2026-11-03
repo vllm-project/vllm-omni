@@ -1783,9 +1783,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # lands on steps 25-29 / 50-54 / 75-79 / 100-104). _DRAIN_UNTIL_SILENT
             # masks it until this condition ends in two silent codes and stops
             # the chunk after a run of quiet ones. The EOS masking lives in the
-            # sampling core (talker_codec_sample.prepare_codec_logits /
-            # greedy_codec_sample), so it rides along as the eos_window_masked
-            # flag below.
+            # sampler (_sample_audio_code_host on this path; the kept device
+            # chain in talker_codec_sample implements it too), so it rides
+            # along as the eos_window_masked flag below.
             min_tokens = _codec_int_param(state, "min_tokens", self._codec_min_tokens)
             max_tokens = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             drain = int(state.get("turn_end_drain") or _DRAIN_NONE)
@@ -2181,6 +2181,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         step: int,
         eos_window_masked: bool = False,
     ) -> TalkerCodecSampleResult:
+        """Sample one codec frame with the device-side multinomial chain.
+
+        No production caller: the K-step path samples through
+        ``_sample_audio_code_host`` and the single-frame path is sampled by
+        vLLM itself. Kept as the reference device chain; the K-step tests
+        still call it directly.
+        """
         request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
         device_state, device_inputs, device_states = self._codec_sample_setup(
             request_id,
@@ -2246,6 +2253,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         device-side finished/emit decision instead of recomputing it. The host
         still reads ``sampled.item()`` for the connector payload; removing that
         sync requires a runner/connector state refactor and is not hidden here.
+
+        No production caller: the K-step path samples through
+        ``_sample_audio_code_host`` and the single-frame path is sampled by
+        vLLM itself. Kept as the parity oracle for
+        ``test_host_greedy_matches_device_greedy_frame_by_frame``.
         """
         request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
         device_state, device_inputs, device_states = self._codec_sample_setup(
