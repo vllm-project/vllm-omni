@@ -3227,6 +3227,22 @@ class TestPlatformOverrides:
             # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "fish_qwen3_omni.yaml",
+            "fish_qwen3_omni_2gpu.yaml",
+            "fish_qwen3_omni_high_concurrency_single_gpu.yaml",
+            "fish_qwen3_omni_high_concurrency_dual_gpu.yaml",
+        ],
+    )
+    def test_fish_speech_profiles_disable_prefix_caching(self, filename):
+        # The Slow AR rebuilds its prompt embeddings from the first prompt
+        # token, so a prefix-cache hit would feed it the wrong rows.
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+
+        assert [stage.engine_extras.get("enable_prefix_caching") for stage in deploy.stages] == [False, False]
+
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):
         deploy_path = Path(get_deploy_config_path("fish_qwen3_omni.yaml"))
 
