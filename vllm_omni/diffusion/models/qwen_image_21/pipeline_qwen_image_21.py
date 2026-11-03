@@ -157,6 +157,11 @@ def _should_encode_negative_prompt(true_cfg_scale: float | None, negative_prompt
     An absent negative prompt does not imply an empty/default negative prompt.
     Explicit empty strings do request negative conditioning when CFG is enabled.
     """
+    if isinstance(negative_prompt, list):
+        if not negative_prompt or any(not isinstance(prompt, str) for prompt in negative_prompt):
+            raise ValueError("negative_prompt must be a string, a non-empty list of strings, or None.")
+    elif negative_prompt is not None and not isinstance(negative_prompt, str):
+        raise ValueError("negative_prompt must be a string, a non-empty list of strings, or None.")
     return true_cfg_scale is not None and true_cfg_scale > 1 and negative_prompt is not None
 
 
@@ -1052,6 +1057,9 @@ class QwenImage21Pipeline(
         self, prompt, negative_prompt, per_request_images, true_cfg_scale, max_sequence_length, *, generator=None
     ):
         """Encode one row per prompt, keeping condition latents in BCTHW VAE layout."""
+        encode_negative = _should_encode_negative_prompt(true_cfg_scale, negative_prompt)
+        if isinstance(negative_prompt, list) and len(negative_prompt) != len(prompt):
+            raise ValueError("negative_prompt must contain one string per prompt.")
         images_per_prompt = [entry["prompt_images"] for entry in per_request_images]
         has_images = any(images_per_prompt)
         if has_images and not all(images_per_prompt):
@@ -1062,7 +1070,7 @@ class QwenImage21Pipeline(
             max_sequence_length=max_sequence_length,
         )
         negative_prompt_embeds = negative_prompt_embeds_mask = negative_image_pad_mask = None
-        if _should_encode_negative_prompt(true_cfg_scale, negative_prompt):
+        if encode_negative:
             negative_prompt_embeds, negative_prompt_embeds_mask, negative_image_pad_mask = self.encode_prompt(
                 prompt=negative_prompt,
                 images_per_prompt=images_per_prompt if has_images else None,
@@ -1392,13 +1400,20 @@ class QwenImage21Pipeline(
                 value, reference = getattr(sampling, field), getattr(first, field)
                 if field == "sigmas":
                     # Direct callers may supply tensors/arrays despite the
-                    # public list annotation. Compare schedule values without
-                    # truth-testing an elementwise equality result.
-                    if isinstance(value, torch.Tensor):
-                        value = value.tolist()
-                    if isinstance(reference, torch.Tensor):
-                        reference = reference.tolist()
-                    matches = np.array_equal(value, reference)
+                    # public list annotation. Preserve the input precision
+                    # when comparing schedules across these representations.
+                    if value is None or reference is None:
+                        matches = value is reference
+                    elif isinstance(value, torch.Tensor) or isinstance(reference, torch.Tensor):
+                        value = value if isinstance(value, torch.Tensor) else torch.from_numpy(np.asarray(value))
+                        reference = (
+                            reference
+                            if isinstance(reference, torch.Tensor)
+                            else torch.from_numpy(np.asarray(reference))
+                        )
+                        matches = torch.equal(value, reference.to(device=value.device))
+                    else:
+                        matches = np.array_equal(value, reference)
                 else:
                     matches = value == reference
                 if not matches:

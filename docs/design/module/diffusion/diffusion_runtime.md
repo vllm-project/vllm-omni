@@ -339,6 +339,26 @@ requests with shorter text. This also applies to native FULL batching; output
 differences across batch compositions can include position changes as well as
 floating-point rounding.
 
+### Follow-up: per-request Qwen RoPE positions
+
+The desired contract is that padding introduced for batching does not change
+the positional inputs of an individual request. This remains unresolved.
+Derive per-request text offsets from `prompt_embeds_mask` (and
+`negative_prompt_embeds_mask` for CFG), excluding invalid padding positions.
+Map those offsets through the interleaved text/condition-image layout before
+positioning the target image. The current shared one-dimensional RoPE table
+must support row-specific positions, including prefix-cache reuse and step
+execution; changing the attention mask alone is insufficient.
+
+`test_batched_rope_preserves_positions_from_each_requests_text_mask` in
+`tests/diffusion/models/qwen_image_21/test_transformer_numerics.py` derives
+standalone reference offsets from each request's mask. Its strict expected
+failures for padded rows track this gap; unpadded controls must pass. A repair
+must satisfy those positional checks and cover condition-image layouts,
+positive/negative branches, request/step execution, and cache reuse before
+claiming that padding preserves standalone semantics. BF16 numerical
+equivalence requires separate validation even once positions agree.
+
 ## Request state and identity
 
 The scheduler is the source of truth for an admitted request. Its normal state

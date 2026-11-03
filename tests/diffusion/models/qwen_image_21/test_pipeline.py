@@ -5,6 +5,7 @@
 order, KV-cache assembly across step phases, and the post-process func."""
 
 import json
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +17,7 @@ from torch import nn
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
+    _should_encode_negative_prompt,
     get_qwen_image_21_post_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -519,8 +521,12 @@ def test_encode_rejects_incompatible_direct_batch_before_encoding(mocker, field,
     encode.assert_not_called()
 
 
-@pytest.mark.parametrize("first_type", [list, tuple, np.array, torch.tensor])
-@pytest.mark.parametrize("second_type", [list, tuple, np.array, torch.tensor])
+@pytest.mark.parametrize(
+    "first_type", [list, tuple, np.array, torch.tensor, partial(torch.tensor, dtype=torch.bfloat16)]
+)
+@pytest.mark.parametrize(
+    "second_type", [list, tuple, np.array, torch.tensor, partial(torch.tensor, dtype=torch.bfloat16)]
+)
 @pytest.mark.parametrize("compatible", [False, True])
 def test_diffuse_compares_custom_sigma_values_before_generation(mocker, first_type, second_type, compatible):
     pipeline = _toy_pipeline()
@@ -545,6 +551,57 @@ def test_diffuse_compares_custom_sigma_values_before_generation(mocker, first_ty
             pipeline.diffuse_batch(batch)
         collate.assert_not_called()
         generate.assert_not_called()
+
+
+@pytest.mark.parametrize("sigma_type", [list, np.array, torch.tensor])
+@pytest.mark.parametrize("missing_index", [0, 1])
+def test_diffuse_rejects_missing_custom_sigmas(mocker, sigma_type, missing_index):
+    pipeline = _toy_pipeline()
+    requests = [
+        OmniDiffusionRequest(request_id=str(i), prompt="text", sampling_params=OmniDiffusionSamplingParams())
+        for i in range(2)
+    ]
+    requests[1 - missing_index].sampling_params.sigmas = sigma_type([0.75, 0.5])
+    with pytest.raises(ValueError, match="requires matching sigmas"):
+        pipeline.diffuse_batch(DiffusionRequestBatch(requests=requests))
+
+
+def test_sigma_comparison_does_not_round_reference_values_to_tensor_dtype():
+    requests = [
+        OmniDiffusionRequest(request_id=str(i), prompt="text", sampling_params=OmniDiffusionSamplingParams())
+        for i in range(2)
+    ]
+    requests[0].sampling_params.sigmas = torch.tensor([0.1], dtype=torch.float32)
+    requests[1].sampling_params.sigmas = [0.1]
+    with pytest.raises(ValueError, match="requires matching sigmas"):
+        QwenImage21Pipeline._validate_stage_batch_settings(DiffusionRequestBatch(requests=requests), ("sigmas",))
+
+
+@pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])
+@pytest.mark.parametrize("negative_prompt", [None, "", "blurry", [""], ["blurry", ""]])
+def test_negative_conditioning_presence_accepts_explicit_string_batches(true_cfg_scale, negative_prompt):
+    assert _should_encode_negative_prompt(true_cfg_scale, negative_prompt) is (
+        true_cfg_scale == 3.0 and negative_prompt is not None
+    )
+
+
+@pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])
+@pytest.mark.parametrize("negative_prompt", [[], [None], ["blurry", 1], ("blurry",), 1])
+def test_encode_conditioning_rejects_invalid_negative_prompts_before_encoding(mocker, true_cfg_scale, negative_prompt):
+    pipeline = _toy_pipeline()
+    encoder = mocker.patch.object(pipeline, "encode_prompt")
+    with pytest.raises(ValueError, match="non-empty list of strings"):
+        pipeline._encode_conditioning(["prompt"], negative_prompt, [], true_cfg_scale, 128)
+    encoder.assert_not_called()
+
+
+@pytest.mark.parametrize("true_cfg_scale", [1.0, 3.0])
+def test_encode_conditioning_requires_one_negative_per_positive_prompt(mocker, true_cfg_scale):
+    pipeline = _toy_pipeline()
+    encoder = mocker.patch.object(pipeline, "encode_prompt")
+    with pytest.raises(ValueError, match="one string per prompt"):
+        pipeline._encode_conditioning(["one", "two"], ["blurry"], [], true_cfg_scale, 128)
+    encoder.assert_not_called()
 
 
 @pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])

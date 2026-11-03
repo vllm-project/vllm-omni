@@ -225,7 +225,11 @@ condition-image latents. The generator consumes these values and samples the
 target noise using the request's seed and sampling schedule. Geometry remains
 inline for downstream scheduling; tensors use the shared-memory connector.
 The generator's step mode reuses the existing per-request scheduler and prefix
-KV cache. Encoder and decoder workers execute once per request in either mode.
+KV cache. Encoder and decoder workers execute once per compatible scheduled
+batch in either mode. G batching has a
+[position-encoding limitation](#stage-batching-and-position-encoding): a fixed
+seed does not guarantee the same output when other requests change the padded
+text length.
 
 These deployment paths have not yet been validated with model weights on
 accelerator hardware.
@@ -244,7 +248,9 @@ pipeline tags every request with a `batch_compatibility_key` (conditioning
 mode plus condition-image layout), so a newly arriving request that would
 otherwise join a batch already past its first denoising step is isolated by
 the scheduler and deferred until the in-flight batch drains — it no longer
-fails the whole batch. `--max-num-seqs` controls batch capacity.
+fails the whole batch. `--max-num-seqs` controls batch capacity. The
+[position-encoding limitation](#stage-batching-and-position-encoding) also
+applies when mixed text lengths are padded for step batches.
 
 ### CUDA Graph decode
 
@@ -319,6 +325,8 @@ The Qwen-Image 2.1 preprocessor accepts condition images under either
 the single-reference form used by the multistage OpenAI image-edit path;
 both forms must produce the same VLM and VAE conditioning before stage handoff.
 
+### Stage batching and position encoding
+
 Stage batches must share output geometry, CFG scale, maximum text length,
 output count and the operation's other shared sampling settings. Request-mode
 scheduling already compares the public sampling fields; Qwen's condition key
@@ -332,8 +340,21 @@ native DiT path once for the compatible batch; DECODE concatenates packed
 latents and calls the VAE once, then splits outputs in request order. Atomic
 E/D stages under step scheduling also preserve the scheduled batch. This
 supports batch execution when the scheduler actually admits multiple compatible
-requests; `max_num_seqs` alone does not guarantee a full batch. BF16 results can
-still depend on actual batch composition.
+requests; `max_num_seqs` alone does not guarantee a full batch.
+
+**Known limitation:** mixed text lengths share a padded sequence layout. The
+current Transformer counts those padding slots when positioning image tokens
+with RoPE. A shorter request can therefore receive different image-token
+positions when batched with a longer request, even with the same seed and
+valid conditioning. Attention masks exclude padding keys but do not restore
+the positions from standalone execution. This is a change in positional
+inputs, beyond floating-point rounding, and also affects native FULL batching.
+Batch composition can therefore change an individual request's output.
+
+The [per-request RoPE follow-up](../../docs/design/module/diffusion/diffusion_runtime.md#follow-up-per-request-qwen-rope-positions)
+tracks deriving row-specific positions from `prompt_embeds_mask`, including
+the equivalent negative mask. This limitation remains unresolved; mixed-length
+batching is not claimed to preserve standalone position semantics.
 
 A generator-only worker has no encoder during its local warmup. Its dummy
 conditioning intentionally uses the configured `max_sequence_length` (or the
