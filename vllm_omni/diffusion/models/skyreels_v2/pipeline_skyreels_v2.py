@@ -25,10 +25,20 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_pre_process_func,
     load_wan_weights_with_optional_gate,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 # SkyReels Diffusers docs: flow_shift=8.0 for T2V.
-# Recommended sampling guidance_scale is 6.0 (set via OmniDiffusionSamplingParams).
 SKYREELS_V2_DEFAULT_FLOW_SHIFT = 8.0
+SKYREELS_V2_DEFAULT_GUIDANCE_SCALE = 6.0
+SKYREELS_V2_DEFAULT_NUM_INFERENCE_STEPS = 50
+# Per-checkpoint geometry from the SkyReels V2 model cards.
+SKYREELS_V2_540P_DEFAULTS = {"height": 544, "width": 960, "num_frames": 97}
+SKYREELS_V2_720P_DEFAULTS = {"height": 720, "width": 1280, "num_frames": 121}
+
+
+def get_skyreels_v2_resolution_defaults(model: str | None) -> dict[str, int]:
+    """540P and 720P checkpoints share one architecture; pick geometry by name."""
+    return SKYREELS_V2_720P_DEFAULTS if "720p" in str(model or "").lower() else SKYREELS_V2_540P_DEFAULTS
 
 
 def get_skyreels_v2_post_process_func(od_config: OmniDiffusionConfig):
@@ -36,7 +46,28 @@ def get_skyreels_v2_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_skyreels_v2_pre_process_func(od_config: OmniDiffusionConfig):
-    return get_wan22_pre_process_func(od_config)
+    """Fill omitted sampling fields with SkyReels defaults instead of Wan's.
+
+    Wan resolves omitted fields to 480x832, 81 frames, 40 steps and CFG 4.0.
+    Applying SkyReels values here covers every entrypoint (offline, online,
+    disaggregated stages) before the inherited Wan pipeline reads them.
+    """
+    wan_pre_process_func = get_wan22_pre_process_func(od_config)
+    resolution_defaults = get_skyreels_v2_resolution_defaults(getattr(od_config, "model", None))
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        sampling_params = request.sampling_params
+        for field, value in resolution_defaults.items():
+            if getattr(sampling_params, field) is None:
+                setattr(sampling_params, field, value)
+        if sampling_params.num_inference_steps is None:
+            sampling_params.num_inference_steps = SKYREELS_V2_DEFAULT_NUM_INFERENCE_STEPS
+        if not sampling_params.guidance_scale_provided:
+            sampling_params.guidance_scale = SKYREELS_V2_DEFAULT_GUIDANCE_SCALE
+            sampling_params.guidance_scale_provided = True
+        return wan_pre_process_func(request)
+
+    return pre_process_func
 
 
 class SkyReelsV2Pipeline(Wan22Pipeline):
@@ -47,6 +78,7 @@ class SkyReelsV2Pipeline(Wan22Pipeline):
     """
 
     supports_request_batch = True
+    default_num_inference_steps: int = SKYREELS_V2_DEFAULT_NUM_INFERENCE_STEPS
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -82,4 +114,7 @@ __all__ = [
     "get_skyreels_v2_post_process_func",
     "get_skyreels_v2_pre_process_func",
     "SKYREELS_V2_DEFAULT_FLOW_SHIFT",
+    "SKYREELS_V2_DEFAULT_GUIDANCE_SCALE",
+    "SKYREELS_V2_DEFAULT_NUM_INFERENCE_STEPS",
+    "get_skyreels_v2_resolution_defaults",
 ]

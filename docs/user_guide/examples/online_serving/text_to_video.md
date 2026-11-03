@@ -44,7 +44,7 @@ The script allows overriding:
 
 ## SkyReels V2 T2V
 
-Single-DiT Diffusers T2V (no MoE `transformer_2`). Recommended defaults: `flow_shift=8.0`, `guidance_scale=6.0`.
+Single-DiT Diffusers T2V (no MoE `transformer_2`). Omitted fields default to `flow_shift=8.0`, `guidance_scale=6.0`, 50 steps, and 544x960 / 97 frames (540P) or 720x1280 / 121 frames (720P).
 
 ```bash
 vllm serve Skywork/SkyReels-V2-T2V-14B-540P-Diffusers --omni --port 8091 \

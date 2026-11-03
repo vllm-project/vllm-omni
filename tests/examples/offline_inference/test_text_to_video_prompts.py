@@ -103,6 +103,7 @@ def test_text_to_video_builds_canonical_prompt(
         ("/models/cosmos-edge", "Cosmos3EdgeVFMTransformer", "cosmos3_edge"),
         ("/models/vace", "WanVACEPipeline", "vace"),
         ("Skywork/SkyReels-V2-T2V-14B-540P-Diffusers", None, "skyreels_v2"),
+        ("Skywork/SkyReels-V2-T2V-14B-720P-Diffusers", None, "skyreels_v2_720p"),
         ("/models/skyreels", "SkyReelsV2Pipeline", "skyreels_v2"),
     ],
 )
@@ -136,6 +137,20 @@ def test_skyreels_v2_preset_matches_skyreels_defaults() -> None:
         "height": 544,
         "width": 960,
         "num_frames": 97,
+        "num_inference_steps": 50,
+        "guidance_scale": 6.0,
+        "fps": 24,
+        "flow_shift": 8.0,
+        "output": "skyreels_v2_output.mp4",
+    }
+
+
+def test_skyreels_v2_720p_preset_matches_skyreels_defaults() -> None:
+    mod = _load_text_to_video()
+    assert mod._MODEL_PRESETS["skyreels_v2_720p"] == {
+        "height": 720,
+        "width": 1280,
+        "num_frames": 121,
         "num_inference_steps": 50,
         "guidance_scale": 6.0,
         "fps": 24,

@@ -168,6 +168,16 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · SkyReels-V2 Test"
+        source_file_dependencies: diffusion_skyreels_v2_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/offline_inference/test_skyreels_v2_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            "
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · HunyuanVideo-1.5 Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         commands:

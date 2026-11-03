@@ -21,6 +21,7 @@ from vllm_omni.diffusion.registry import (
     _DIFFUSION_POST_PROCESS_FUNCS,
     _DIFFUSION_PRE_PROCESS_FUNCS,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -44,20 +45,53 @@ def test_skyreels_v2_component_discovery_declarations() -> None:
     assert SkyReelsV2Pipeline.supports_request_batch is True
 
 
-def test_skyreels_v2_process_hooks_reuse_wan22(monkeypatch) -> None:
+def test_skyreels_v2_post_process_reuses_wan22(monkeypatch) -> None:
     od_config = SimpleNamespace()
     sentinel_post = object()
-    sentinel_pre = object()
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.skyreels_v2.pipeline_skyreels_v2.get_wan22_post_process_func",
         lambda config: sentinel_post,
     )
+    assert get_skyreels_v2_post_process_func(od_config) is sentinel_post
+
+
+def _run_skyreels_pre_process(monkeypatch, model: str, sampling: OmniDiffusionSamplingParams):
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.skyreels_v2.pipeline_skyreels_v2.get_wan22_pre_process_func",
-        lambda config: sentinel_pre,
+        lambda config: lambda request: request,
     )
-    assert get_skyreels_v2_post_process_func(od_config) is sentinel_post
-    assert get_skyreels_v2_pre_process_func(od_config) is sentinel_pre
+    request = SimpleNamespace(sampling_params=sampling)
+    return get_skyreels_v2_pre_process_func(SimpleNamespace(model=model))(request).sampling_params
+
+
+@pytest.mark.parametrize(
+    ("model", "height", "width", "num_frames"),
+    [
+        ("Skywork/SkyReels-V2-T2V-14B-540P-Diffusers", 544, 960, 97),
+        ("Skywork/SkyReels-V2-T2V-14B-720P-Diffusers", 720, 1280, 121),
+    ],
+)
+def test_skyreels_v2_pre_process_fills_skyreels_defaults(monkeypatch, model, height, width, num_frames) -> None:
+    sampling = _run_skyreels_pre_process(monkeypatch, model, OmniDiffusionSamplingParams())
+    assert (sampling.height, sampling.width, sampling.num_frames) == (height, width, num_frames)
+    assert sampling.num_inference_steps == 50
+    assert sampling.guidance_scale == 6.0
+    assert sampling.guidance_scale_provided is True
+
+
+def test_skyreels_v2_pre_process_preserves_explicit_values(monkeypatch) -> None:
+    sampling = OmniDiffusionSamplingParams(
+        height=480,
+        width=832,
+        num_frames=33,
+        num_inference_steps=20,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    sampling = _run_skyreels_pre_process(monkeypatch, "Skywork/SkyReels-V2-T2V-14B-720P-Diffusers", sampling)
+    assert (sampling.height, sampling.width, sampling.num_frames) == (480, 832, 33)
+    assert sampling.num_inference_steps == 20
+    assert sampling.guidance_scale == 1.0
 
 
 def test_skyreels_v2_metadata_declares_video_output() -> None:

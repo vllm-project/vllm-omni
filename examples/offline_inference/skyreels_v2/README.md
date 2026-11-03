@@ -1,12 +1,13 @@
 # SkyReels V2 T2V (vLLM-Omni)
 
-Use the shared text-to-video runner. The `skyreels_v2` preset is selected
-automatically from the model ID (`SkyReelsV2Pipeline` / `skyreels` in the name).
+Use the shared text-to-video runner. The SkyReels preset is selected
+automatically from the model ID (`SkyReelsV2Pipeline` / `skyreels` in the name);
+IDs containing `720P` use the 720P preset.
 
 ## Models
 
 - `Skywork/SkyReels-V2-T2V-14B-540P-Diffusers` (preset: 544x960, 97 frames)
-- `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` (override with `--height 720 --width 1280`)
+- `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` (preset: 720x1280, 121 frames)
 
 ## Run
 

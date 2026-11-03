@@ -54,6 +54,16 @@ _MODEL_PRESETS = {
         "flow_shift": 8.0,
         "output": "skyreels_v2_output.mp4",
     },
+    "skyreels_v2_720p": {
+        "height": 720,
+        "width": 1280,
+        "num_frames": 121,
+        "num_inference_steps": 50,
+        "guidance_scale": 6.0,
+        "fps": 24,
+        "flow_shift": 8.0,
+        "output": "skyreels_v2_output.mp4",
+    },
     "hunyuan": {
         "height": 480,
         "width": 832,
@@ -185,7 +195,7 @@ def _detect_preset(
     if "helios" in model_lower or "helios" in class_lower:
         return _MODEL_PRESETS["helios"]
     if "skyreels" in model_lower or "skyreels" in class_lower:
-        return _MODEL_PRESETS["skyreels_v2"]
+        return _MODEL_PRESETS["skyreels_v2_720p" if "720p" in model_lower else "skyreels_v2"]
     return _MODEL_PRESETS["wan"]
 
 
