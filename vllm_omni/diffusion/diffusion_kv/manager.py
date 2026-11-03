@@ -276,6 +276,13 @@ class DiffusionKVCacheManager:
             for request, result in zip(requests, hit_results, strict=True)
         ]
         cached_prefix_len = min(safe_hit_lens)
+        # A boundary safe for one CFG row can bisect another row's atomic
+        # span. Roll back until the shared boundary is safe for every row.
+        while True:
+            common_safe_len = min(self._safe_cached_prefix_len(request, cached_prefix_len) for request in requests)
+            if common_safe_len == cached_prefix_len:
+                break
+            cached_prefix_len = common_safe_len
         computed_blocks = [
             self._clip_computed_blocks(
                 result[0],
@@ -380,6 +387,9 @@ class DiffusionKVCacheManager:
                 for boundary in span
                 if 0 < boundary <= publishable_prefix_len
             }
+            # vLLM 0.32 publishes the native prompt tail at prompt_len - 1
+            # for AR decode. Diffusion may reuse its entire stable prefix.
+            | {publishable_prefix_len}
         )
         if not boundaries:
             return

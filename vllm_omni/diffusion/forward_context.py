@@ -30,12 +30,18 @@ def vllm_batch_invariant_scope(enabled: bool):
     if not enabled:
         yield
         return
-    previous = bool(vllm_envs.VLLM_BATCH_INVARIANT)
+    had_override = "VLLM_BATCH_INVARIANT" in vars(vllm_envs)
+    previous = vars(vllm_envs).get("VLLM_BATCH_INVARIANT")
     vllm_envs.VLLM_BATCH_INVARIANT = True
     try:
         yield
     finally:
-        vllm_envs.VLLM_BATCH_INVARIANT = previous
+        if had_override:
+            vllm_envs.VLLM_BATCH_INVARIANT = previous
+        else:
+            # vLLM resolves environment options lazily through __getattr__.
+            # Leaving a module attribute would permanently bypass that lookup.
+            del vllm_envs.VLLM_BATCH_INVARIANT
 
 
 @dataclass

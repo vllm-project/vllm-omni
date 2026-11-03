@@ -98,6 +98,67 @@ def test_successful_request_publishes_prefix_for_a_warm_hit() -> None:
     assert warm.shared_prefix_boundary == 0
 
 
+def test_full_prefix_hit_reaches_unaligned_prefix_end() -> None:
+    manager = _manager(16, enable_prefix_caching=True, cache_granularity=1)
+    cold = _request("cold", 0, prefix_len=10, seq_len=14, cache_token_ids=range(10))
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request("warm", 0, prefix_len=10, seq_len=14, cache_token_ids=range(10))
+    metadata = manager.reserve_request("warm", (warm,))
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == 10
+    assert metadata.block_copies
+    manager.free_request("warm")
+
+
+def test_fine_grained_manager_rewires_coordinator_derived_state() -> None:
+    manager = _manager(16, enable_prefix_caching=True, cache_granularity=1)
+    native = manager.native_manager
+    coordinator = native.coordinator
+    assert coordinator.enable_partial_hash_hits
+    assert native.block_pool is coordinator.block_pool
+    assert all(item.block_pool is coordinator.block_pool for item in coordinator.single_type_managers)
+    assert all(item.cache_hit_alignment_tokens == 1 for item in coordinator.single_type_managers)
+    assert native.retained_hit_group_ids == tuple(
+        item.kv_cache_group_id for item in coordinator.single_type_managers if item.retains_longer_hit
+    )
+    assert not native.mamba_shared_prefix_checkpoint
+
+
+def test_common_cfg_hit_is_safe_for_different_atomic_spans() -> None:
+    manager = _manager(32, enable_prefix_caching=True, cache_granularity=1)
+
+    def rows(public_id, changed=False):
+        return (
+            _request(
+                public_id,
+                0,
+                prefix_len=10,
+                seq_len=14,
+                cache_token_ids=range(10),
+                atomic_cache_spans=((1, 5), (7, 10)),
+            ),
+            _request(
+                public_id,
+                1,
+                prefix_len=10,
+                seq_len=14,
+                cache_token_ids=[100, 101, 102, 103, 999 if changed else 104, 105, 106, 107, 108, 109],
+                atomic_cache_spans=((1, 4), (6, 10)),
+            ),
+        )
+
+    assert manager.reserve_request("cold", rows("cold")) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+    metadata = manager.reserve_request("warm", rows("warm", changed=True))
+    assert metadata is not None
+    assert all(sequence.cached_prefix_len == 1 for sequence in metadata.sequences)
+    manager.free_request("warm")
+
+
 def test_prefix_hash_root_is_stable_across_manager_instances() -> None:
     first_manager = _manager(8, enable_prefix_caching=True)
     second_manager = _manager(8, enable_prefix_caching=True)

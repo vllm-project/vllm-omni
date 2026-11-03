@@ -509,7 +509,9 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     meta_same = prefix_cache_manager.reserve_request("same-diff-seed", same_seed_diff.diffusion_kv_requests)
     assert meta_same is not None
     image_prefix_end = cold_req.prepared_layout.branches[0].image_prefix_end
-    assert meta_same.sequences[0].cached_prefix_len >= image_prefix_end
+    assert meta_same.sequences[0].cached_prefix_len == min(
+        branch.prefix_len for branch in same_seed_diff.prepared_layout.branches
+    )
     assert native_kv_covers_cond_images(same_seed_diff.prepared_layout, meta_same.sequences[0].cached_prefix_len)
     prefix_cache_manager.free_request("same-diff-seed")
 
