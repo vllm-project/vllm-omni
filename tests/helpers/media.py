@@ -556,8 +556,19 @@ def generate_synthetic_image(
         border_width = random.randint(1, 5)
         draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
 
-    image.save(str(cache_path), format="JPEG", quality=85, optimize=True)
-    image_bytes = cache_path.read_bytes()
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85, optimize=True)
+    image_bytes = buffer.getvalue()
+
+    temp_cache_path = root / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+    # Match video cache publication so concurrent readers only see complete files.
+    temp_cache = temp_cache_path.open("xb")
+    try:
+        with temp_cache:
+            temp_cache.write(image_bytes)
+        os.replace(temp_cache_path, cache_path)
+    finally:
+        temp_cache_path.unlink(missing_ok=True)
 
     return {
         "np_array": np.array(image).copy(),
