@@ -205,7 +205,11 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
-        - pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
+        # Stable Audio Open 1.0 GPU-hung while loading weights on AMD build
+        # 15266 (exit 134). Nightly owns that full_model node.
+        - >-
+          pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
+          --deselect='tests/diffusion/offloader/test_diffusion_cpu_offload.py::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
         - >-
           pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
           --deselect='tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'

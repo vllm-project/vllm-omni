@@ -1245,8 +1245,13 @@ def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
     _assert_build_scoped_aiter_mha_cache(step, STABLE_AUDIO_LAYERWISE_NODE, publishes=False)
 
     blocking = _find_step("Diffusion Model CPU offloading Test")
+    blocking_commands = "\n".join(blocking["commands"])
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in blocking["commands"]
     assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
+    assert (
+        "--deselect='tests/diffusion/offloader/test_diffusion_cpu_offload.py"
+        "::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'" in blocking_commands
+    )
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
