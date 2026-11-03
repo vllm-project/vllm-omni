@@ -810,7 +810,9 @@ What a plugin must guarantee before it opts in:
   output, as real-time operation emits it; the lag is model-specific and
   each model documents its own in its model entry. The
   acknowledgement waits for a response continuation the output handler
-  spawned (e.g. the `response.done` a non-resumable model sends from it).
+  spawned (e.g. the `response.done` a non-resumable model sends from it);
+  the wait is bounded (one second), so a continuation that blocks is logged
+  and acknowledged around rather than stalling the session.
 
 Every cancel that calls off appends of an input-clocked session advances the
 epoch (an overlap barge-in does so too, where a session without the clock
