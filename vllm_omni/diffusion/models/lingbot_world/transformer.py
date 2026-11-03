@@ -208,6 +208,7 @@ class LingBotSelfAttention(nn.Module):
             )
         self.num_sp_heads = self.num_local_heads // self.ulysses_world_size
         self.tp_inner_dim = self.num_local_heads * self.head_dim
+        self.npu_host_lengths = False
         self.o = RowParallelLinear(
             dim,
             dim,
@@ -411,6 +412,9 @@ class LingBotSelfAttention(nn.Module):
                     max_query_len=query.shape[1],
                     max_seq_len=visible_key.shape[1],
                     softmax_scale=self.head_dim**-0.5,
+                    npu_lengths=(query.shape[1], visible_key.shape[1])
+                    if self.npu_host_lengths and query.device.type == "npu"
+                    else None,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
@@ -978,6 +982,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             ]
         )
         self.head = _LingBotHead(dim, out_channels, patch_size, eps)
+        self.npu_host_lengths = False
 
         temporal_dim = attention_head_dim - 4 * (attention_head_dim // 6)
         height_dim = width_dim = 2 * (attention_head_dim // 6)
@@ -1006,6 +1011,14 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             self._timestep_projection_buffers[key] = buffer
         buffer.copy_(projection)
         return buffer
+
+    def configure_npu_optimizations(self, *, host_lengths: bool = False) -> None:
+        """Enable singleton NPU host metadata before capture or compilation."""
+        if type(host_lengths) is not bool:
+            raise ValueError("LingBot NPU optimization options must be booleans")
+        self.npu_host_lengths = host_lengths
+        for block in self.blocks:
+            block.self_attn.npu_host_lengths = host_lengths
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1331,6 +1344,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            if self.npu_host_lengths and hidden_states.device.type == "npu":
+                # prepare() already owns these exact valid lengths on the CPU.
+                # Keep them forward-local: max_seq_len includes padded capacity.
+                lengths = (int(forward_context.query_len), int(forward_context.kv_len))
+                cache.self_attention = [entry._replace(npu_lengths=lengths) for entry in cache.self_attention]
         sp_size = self.blocks[0].self_attn.ulysses_world_size
         global_tokens = patched_frames * tokens_per_frame
         hidden_dim = hidden_states.shape[-1]

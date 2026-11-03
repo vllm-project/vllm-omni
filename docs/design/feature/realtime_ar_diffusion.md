@@ -208,6 +208,17 @@ uses each shard's global token offset, including shards that split a frame. Only
 `ulysses_mode="strict"` is supported; `advanced_uaa`, Ring, and AllGather-KV modes
 remain unsupported for this model.
 
+## Optional NPU host lengths
+
+LingBot's default-disabled `lingbot_npu_host_lengths` option carries the
+singleton forward's CPU-owned valid query/KV lengths into its paged layer
+inputs. The values are rebuilt from each forward context after `prepare()`;
+they are not process-global or inferred from padded block-table capacity.
+NPU dispatch uses a separate custom op with explicit mutable KV pools, while
+the CUDA/ROCm custom-op schema remains unchanged. Direct replay derives the
+same lengths from its visible tensor shapes. The option changes neither KV
+ownership nor clean/noisy commit, sliding-window, or session semantics.
+
 ## Non-goals
 
 This contract does not currently provide:

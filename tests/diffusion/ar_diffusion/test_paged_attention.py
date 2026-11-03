@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from importlib.util import find_spec
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +38,110 @@ N_HEADS = 4
 HEAD_DIM = 64
 POS = "positive"
 NEG = "negative"
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("batched", [False, True])
+def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, batched):
+    torch.manual_seed(0)
+    query = torch.randn(3, N_HEADS, HEAD_DIM)
+    if batched:
+        query = query.unsqueeze(0)
+    keys = torch.randn(3, 4, N_HEADS, HEAD_DIM)
+    values = torch.randn_like(keys)
+    table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+    expected_k = keys[[2, 0, 1]].flatten(0, 1)[:5]
+    expected_v = values[[2, 0, 1]].flatten(0, 1)[:5]
+    seen = []
+    provider = ModuleType("torch_npu")
+
+    def attention(q, k, v, **kwargs):
+        seen.append(kwargs)
+        torch.testing.assert_close(k, expected_k)
+        torch.testing.assert_close(v, expected_v)
+        return (_dense_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))[0],)
+
+    provider.npu_fusion_attention = attention
+    monkeypatch.setitem(sys.modules, "torch_npu", provider)
+    kwargs = dict(
+        block_table=table,
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([5], dtype=torch.int32),
+        max_seq_len=12,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    reference = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs)
+
+    def readback(*args, **kwargs):
+        raise AssertionError("host-length fast path must not read metadata from the device")
+
+    with monkeypatch.context() as guard:
+        for name in ("item", "cpu", "tolist"):
+            guard.setattr(torch.Tensor, name, readback)
+        actual = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs, host_lengths=(3, 5))
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    assert seen[0] == seen[1]
+    assert seen[1]["actual_seq_qlen"] == [3]
+    assert seen[1]["actual_seq_kvlen"] == [5]  # valid length, not padded capacity 12
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("lengths", [(2, 5), (3, 0), (3, 13)])
+def test_npu_host_lengths_reject_invalid_singleton_metadata(monkeypatch, lengths):
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    with pytest.raises(ValueError, match="matching singleton"):
+        paged_attention_module._npu_paged_attention(
+            torch.zeros(3, N_HEADS, HEAD_DIM),
+            torch.zeros(3, 4, N_HEADS, HEAD_DIM),
+            torch.zeros(3, 4, N_HEADS, HEAD_DIM),
+            block_table=torch.tensor([[0, 1, 2]]),
+            query_start_loc=torch.tensor([0, 3]),
+            seq_lens=torch.tensor([5]),
+            max_seq_len=12,
+            softmax_scale=HEAD_DIM**-0.5,
+            host_lengths=lengths,
+        )
+
+
+@pytest.mark.cpu
+def test_npu_host_lengths_custom_op_preserves_mutation_and_valid_lengths(monkeypatch):
+    query = torch.randn(3, N_HEADS, HEAD_DIM)
+    keys, values = torch.randn_like(query), torch.randn_like(query)
+    key_pool = torch.zeros(12, N_HEADS, HEAD_DIM)
+    value_pool = torch.zeros_like(key_pool)
+    slots = torch.tensor([2, 3, 4])
+    seen = []
+
+    def attention(q, kc, vc, **kwargs):
+        seen.append(kwargs["npu_lengths"])
+        # Return independent storage, as required by the custom-op contract.
+        return q + kc.flatten(0, 1)[slots] + vc.flatten(0, 1)[slots]
+
+    monkeypatch.setattr(paged_attention_module, "ar_diffusion_paged_attention", attention)
+    output = torch.ops.vllm_omni.ar_diffusion_npu_paged_write_attn(
+        query,
+        keys,
+        values,
+        None,
+        None,
+        key_pool,
+        value_pool,
+        4,
+        slots,
+        torch.empty(0, dtype=torch.long),
+        torch.tensor([[0, 1, 2]]),
+        torch.tensor([0, 3]),
+        torch.tensor([5]),
+        3,
+        12,
+        HEAD_DIM**-0.5,
+        3,
+        5,
+    )
+    assert seen == [(3, 5)]
+    torch.testing.assert_close(key_pool[slots], keys)
+    torch.testing.assert_close(value_pool[slots], values)
+    torch.testing.assert_close(output, query + keys + values)
 
 
 def make_state(

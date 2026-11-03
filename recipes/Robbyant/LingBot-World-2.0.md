@@ -73,6 +73,14 @@ This experimental mode stores the final noisy probe's KV rather than clean
 `x0` KV, so generated outputs can differ. The four denoising steps, chunk
 boundaries, and paged-context finalization remain the same.
 
+## Experimental NPU host lengths
+
+Set `model_config.lingbot_npu_host_lengths: true` to pass the singleton
+forward's CPU-owned valid query/KV lengths to NPU paged attention without
+per-layer device reads. The default is `false`. Padded block-table capacity
+must not be used as the valid length. This option does not require a compile
+backend; NPU correctness and performance validation remain necessary.
+
 ## Experimental Ascend SP8 output paths
 
 Two independent, default-disabled options are available for the eight-rank
