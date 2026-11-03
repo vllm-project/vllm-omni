@@ -3465,8 +3465,9 @@ _CUSTOMVOICE_MERGE_NODES = (
 def test_customvoice_merge_restores_async_chunk_to_the_blocking_shard() -> None:
     """The async_chunk speech node is the fourth blocking MERGE shard.
 
-    Timeouts stay at the previous shard values. The speech helper still
-    transcribes at advanced_model.
+    The command leaves five minutes for Buildkite cleanup and fails closed if
+    the selected node does not execute. The speech helper still transcribes at
+    advanced_model.
     """
     step = _find_step(_CUSTOMVOICE_MERGE_LABEL, AMD_MERGE_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3485,11 +3486,15 @@ def test_customvoice_merge_restores_async_chunk_to_the_blocking_shard() -> None:
     assert step["grade"] == "Blocking"
     assert step["parallelism"] == 4
     assert step["timeout_in_minutes"] == 80
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-tts-customvoice-merge/**/*"]
     assert "retry" not in step
-    assert "timeout --signal=TERM --kill-after=2m 80m" in command
-    assert "75m" not in command
+    assert "timeout --signal=TERM --kill-after=2m 75m" in command
+    assert "timeout --signal=TERM --kill-after=2m 80m" not in command
     assert _marker_expressions(step) == ["advanced_model"]
     assert command.count('--run-level "advanced_model"') == 1
+    assert "--junitxml=" in command
+    assert "pytest-summary.txt" in command
+    assert "Expected exactly one executed Qwen3-TTS CustomVoice MERGE test" in command
     assert quoted == _CUSTOMVOICE_MERGE_NODES
     for node in _CUSTOMVOICE_MERGE_NODES:
         assert command.count(node) == 1
@@ -3500,6 +3505,42 @@ def test_customvoice_merge_restores_async_chunk_to_the_blocking_shard() -> None:
     assert "pytest.skip" not in function
     assert 'run_level in {"advanced_model", "full_model"}' in speech
     assert "_assert_transcript_matches" in speech
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_customvoice_merge_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_MERGE_PIPELINE,
+        step_label=_CUSTOMVOICE_MERGE_LABEL,
+        command_fragment='pytest -s -v -ra "$$TEST"',
+        expected_message="Expected exactly one executed Qwen3-TTS CustomVoice MERGE test",
+        artifact_env="ROCM_QWEN3_TTS_CUSTOMVOICE_MERGE_ARTIFACT_DIR",
+        job_id_prefix="customvoice-merge-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env={"BUILDKITE_PARALLEL_JOB": "3"},
+    )
 
 
 _WORKER_ONE_CARD_MARKER = "core_model and rocm and MI325 and cards_1"
