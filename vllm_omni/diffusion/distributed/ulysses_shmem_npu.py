@@ -31,6 +31,41 @@ _WORKSPACE = None
 _WORKSPACE_GROUP = None
 
 
+def _resolve_soc_version() -> str:
+    """Return the exact Ascend target used by the AscendC compiler.
+
+    ``ASCENDC_SOC_VERSION`` is an explicit cross-compile override. Runtime
+    builds otherwise use the active device name so a cached binary cannot be
+    silently compiled for a different SoC family or variant.
+    """
+    override = os.environ.get("ASCENDC_SOC_VERSION")
+    if override and override.strip():
+        return override.strip()
+    try:
+        soc_version = torch.npu.get_device_name(torch.npu.current_device())
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to determine the active Ascend SoC; set ASCENDC_SOC_VERSION "
+            "only when intentionally cross-compiling"
+        ) from exc
+    if not isinstance(soc_version, str) or not soc_version.strip():
+        raise RuntimeError(f"Ascend returned an invalid SoC name: {soc_version!r}")
+    return soc_version.strip()
+
+
+def _update_version_metadata(fingerprint: "hashlib._Hash", root: Path) -> None:
+    """Include installed toolchain metadata so upgrades cannot reuse a build."""
+    for relative in (
+        "version.info",
+        "opp/version.info",
+        "aarch64-linux/ascend_toolkit_install.info",
+    ):
+        metadata = root / relative
+        if metadata.is_file():
+            fingerprint.update(relative.encode())
+            fingerprint.update(metadata.read_bytes())
+
+
 @cache
 def ensure_a2a_permute_available() -> None:
     """Compile/load once per process; serialize builds across worker ranks."""
@@ -38,6 +73,7 @@ def ensure_a2a_permute_available() -> None:
     from torch.utils.cpp_extension import get_default_build_root, load
 
     source = Path(__file__).parent / "csrc/ulysses_shmem_fused"
+    soc_version = _resolve_soc_version()
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")).resolve()
     shmem_spec = importlib.util.find_spec("shmem")
     shmem_path = os.environ.get("SHMEM_ROOT")
@@ -50,10 +86,17 @@ def ensure_a2a_permute_available() -> None:
     if not (shmem / "include/device/gm2gm/shmem_device_cc.h").is_file():
         raise RuntimeError(f"CANN SHMEM device headers not found under {shmem}")
     fingerprint = hashlib.sha256()
-    for name in ("CMakeLists.txt", "kernel.cpp", "compat_signals.h"):
-        fingerprint.update((source / name).read_bytes())
+    for path in sorted(source.iterdir()):
+        if path.is_file() and path.suffix in {".cmake", ".cpp", ".h"}:
+            fingerprint.update(path.name.encode())
+            fingerprint.update(path.read_bytes())
+    fingerprint.update(soc_version.encode())
     fingerprint.update(str(cann).encode())
     fingerprint.update(str(shmem).encode())
+    _update_version_metadata(fingerprint, cann)
+    _update_version_metadata(fingerprint, shmem)
+    fingerprint.update(str(torch.__version__).encode())
+    fingerprint.update(str(getattr(torch_npu, "__version__", "unknown")).encode())
     build_fingerprint = fingerprint.hexdigest()[:16]
     cache_dir = Path(get_default_build_root()) / "omni_ulysses_shmem_fused" / build_fingerprint
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -78,6 +121,7 @@ def ensure_a2a_permute_available() -> None:
                             str(build),
                             "-DCMAKE_BUILD_TYPE=Release",
                             f"-DSHMEM_ROOT={shmem}",
+                            f"-DSOC_VERSION={soc_version}",
                         ],
                         env=env,
                         stdout=log,
