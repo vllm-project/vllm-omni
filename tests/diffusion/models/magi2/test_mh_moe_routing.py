@@ -19,13 +19,15 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.magi2.fused_moe_kernels import (
+from vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels import (
     _reference_global_sort_routes,
     global_sort_routes,
-    torch_mh_moe_forward,
 )
 from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import compute_topk_probs_and_indices
-from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import _reference_topk_probs_and_indices
+from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import (
+    _reference_topk_probs_and_indices,
+    torch_mh_moe_forward,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -390,6 +392,9 @@ def test_routing_rejects_malformed_inputs() -> None:
 # in-process would pass no matter what, because Triton is loaded for real by
 # then.
 _STUBBED_TRITON_IMPORT = """
+import importlib
+import sys
+
 import vllm.triton_utils as triton_utils
 from vllm.triton_utils.importing import TritonLanguagePlaceholder, TritonPlaceholder
 
@@ -397,19 +402,32 @@ triton_utils.HAS_TRITON = False
 triton_utils.triton = TritonPlaceholder()
 triton_utils.tl = TritonLanguagePlaceholder()
 
+for module_name in sys.argv[1:]:
+    importlib.import_module(module_name)
+
 import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe  # noqa: F401
+
+kernels = importlib.import_module("vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels")
+native = importlib.import_module("vllm_omni.diffusion.models.magi2.layers.native.mh_moe")
+musa = importlib.import_module("vllm_omni.diffusion.models.magi2.layers.musa.mh_moe")
+assert kernels.torch_mh_moe_forward is native.torch_mh_moe_forward
+assert musa.triton_mh_moe_forward is kernels.triton_mh_moe_forward
 """
 
 
 @pytest.mark.cpu
-def test_module_imports_without_an_active_triton_driver() -> None:
-    """``mh_moe`` must load on the vLLM Triton placeholder, not just on a GPU."""
+@pytest.mark.parametrize("import_order", ["kernel-first", "layers-first"])
+def test_module_imports_without_an_active_triton_driver(import_order: str) -> None:
+    """Both entry orders must load with placeholders and share native/MUSA owners."""
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["HIP_VISIBLE_DEVICES"] = ""
+    layers = "vllm_omni.diffusion.models.magi2.layers"
+    kernel = layers + ".cuda.fused_moe_kernels"
+    modules = (kernel, layers) if import_order == "kernel-first" else (layers, kernel)
     result = subprocess.run(
-        [sys.executable, "-c", _STUBBED_TRITON_IMPORT],
+        [sys.executable, "-c", _STUBBED_TRITON_IMPORT, *modules],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,

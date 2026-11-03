@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,6 +47,15 @@ def _plain(value: Any) -> dict[str, Any]:
 def get_ming3_backbone_config(vllm_config: VllmConfig) -> VllmConfig:
     hf_config = vllm_config.model_config.hf_config
     return vllm_config.with_hf_config(getattr(hf_config, "llm_config", hf_config))
+
+
+def resolve_latent_chunk_sizes(options: Mapping[str, Any]) -> tuple[int, int]:
+    """Validate streaming chunk sizes; zero initial size uses the regular size."""
+    chunk = int(options.get("latent_chunk_size", LATENT_CHUNK_SIZE))
+    initial = int(options.get("initial_latent_chunk_size", INITIAL_LATENT_CHUNK_SIZE))
+    if chunk <= 0 or initial < 0 or initial > chunk:
+        raise ValueError(f"Invalid Ming3 chunk sizes: initial={initial}, chunk={chunk}")
+    return chunk, initial or chunk
 
 
 class BailingMoeV3Config(PretrainedConfig):

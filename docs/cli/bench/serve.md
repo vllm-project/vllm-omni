@@ -827,25 +827,6 @@ timestamp stays exact even when the clip length is not a multiple of 200 ms. `re
 - `vad` — the client streams the speech *and* the tail, and server VAD ends the turn on its own, without a client commit
   or `response.create`. Its 800 ms silence threshold must stay shorter than the one-second tail or the turn never ends.
 
-#### Run the matched nightly workload
-
-The [performance configuration](gh-file:tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json) runs both triggers using the
-first 32 English Seed-TTS entries in fixed order, concurrency 1, temperature 0, and a 256-token output limit. It asks
-the model to read the target text rather than answer or transcribe the accompanying audio. Each trigger runs two
-unmeasured warmup requests before its 32 measured requests. The CUDA nightly job runs this configuration on two H100/B200 GPUs.
-
-Run from the repository environment after reserving two GPUs according to your host's scheduling rules:
-
-```bash
-uv run --no-sync pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
-  --run-level full_model
-```
-
-`BENCHMARK_DIR` selects the result directory (default `tests/dfx/perf/results`). For cached local weights or data, copy the
-JSON and replace `server_params.model` and each `benchmark_params[].dataset_path` with local paths. Preserve sample
-count, order, system prompt, and generation settings across the two cases.
-
 #### Read the reported metrics
 
 TTFT, audio TTFP, E2EL, and audio RTF share one client-side origin: the end of reference-speech capture, immediately before

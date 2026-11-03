@@ -69,6 +69,9 @@ def pack_output_snapshot(
 
     No CUDA synchronization is introduced here. The caller must select the
     producer stream and wait for the previous consumer before reusing a slot.
+    Each cached dtype/device group retains only its largest capacity, not one
+    allocation per payload length. Variable-length prefills must not accumulate
+    historical GPU snapshots after their host copies finish.
     """
     leaves, spec = tree_flatten(payload)
     grouped: dict[tuple[Any, ...], list[int]] = defaultdict(list)
@@ -106,12 +109,15 @@ def pack_output_snapshot(
                     offset += value.numel()
                 groups.append((indices, slab))
                 continue
-        key = ("packed-output", dtype, device, size)
+        key = ("packed-output", dtype, device)
         slab = slot.get(key)
-        if slab is None:
+        if slab is None or slab.numel() < size:
             slab = torch.empty(size, dtype=dtype, device=device)
-            if len(slot) < max_buckets:
+            if key in slot or len(slot) < max_buckets:
                 slot[key] = slab
+        # Copy only the live prefix; unused capacity is neither published nor
+        # transferred to the host on shorter prefills and decode steps.
+        slab = slab[:size]
         if len(values) == 1:
             slab.copy_(values[0])
         else:

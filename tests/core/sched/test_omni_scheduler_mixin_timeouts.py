@@ -43,6 +43,7 @@ class _FakeScheduler(OmniSchedulerMixin):
         self.requests = requests
         self.input_coordinator = coordinator
         self.finish_calls = []
+        self._outputs_awaiting_stage_payload = {}
 
     def finish_requests(self, req_ids, status):
         self.finish_calls.append((set(req_ids), status))
@@ -127,6 +128,7 @@ class _FakeChunkScheduler(OmniSchedulerMixin):
         self.requests = requests
         self.chunk_transfer_adapter = adapter
         self.finish_calls = []
+        self._outputs_awaiting_stage_payload = {}
 
     def finish_requests(self, req_ids, status):
         self.finish_calls.append((set(req_ids), status))

@@ -7,7 +7,7 @@ import pytest
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -27,6 +27,7 @@ def setup_sp_groups(mocker):
     yield
 
 
+@pytest.mark.cpu
 def test_glm_image_sp_plan_defined():
     """Test that _sp_plan is properly defined on GlmImageTransformer2DModel."""
     from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
@@ -42,6 +43,7 @@ def test_glm_image_sp_plan_defined():
     assert "proj_out" in plan
 
 
+@pytest.mark.cpu
 def test_glm_image_sp_plan_valid():
     """Validate _sp_plan structure."""
     from vllm_omni.diffusion.distributed.sp_plan import validate_sp_plan
@@ -53,6 +55,7 @@ def test_glm_image_sp_plan_valid():
     validate_sp_plan(plan)
 
 
+@pytest.mark.cpu
 def test_glm_image_prepare_module_exists():
     """Test that GlmImagePrepare module exists."""
     from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
@@ -62,6 +65,7 @@ def test_glm_image_prepare_module_exists():
     assert GlmImagePrepare is not None
 
 
+@pytest.mark.cpu
 def test_glm_image_attention_accepts_parallel_config():
     """Test that GlmImageAttention accepts parallel_config parameter."""
     from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
@@ -86,6 +90,7 @@ def test_glm_image_attention_accepts_parallel_config():
     assert attn.parallel_config.sequence_parallel_size == 4
 
 
+@pytest.mark.cpu
 def test_glm_image_transformer_block_accepts_parallel_config():
     """Test that GlmImageTransformerBlock accepts parallel_config parameter."""
     from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
@@ -111,6 +116,7 @@ def test_glm_image_transformer_block_accepts_parallel_config():
     assert block.attn1.parallel_config.sequence_parallel_size == 4
 
 
+@pytest.mark.cpu
 def test_glm_image_has_sp_support():
     """Test that GLM-Image has SP support implemented."""
     from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
