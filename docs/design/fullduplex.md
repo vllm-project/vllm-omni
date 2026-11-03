@@ -1158,3 +1158,21 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+Memory-card fixture replay lives in
+`vllm_omni/benchmarks/duplex/memory_card_replay.py`, with CPU coverage in
+`tests/benchmarks/duplex/test_memory_card_replay.py`. Its bounded synthetic
+JSONL input describes committed messages, authoritative edits/deletion,
+fixed idle windows and live resume. Each query/timing variant opens a fresh
+owner; fixture labels are traced to native item IDs and source revisions.
+The immediate-query variant omits only the final idle window. Gold answers
+remain separate from the execution plan and query callback.
+
+The owner adapter takes session lifetime, idle, resume and query services
+from its caller; it does not start another server or judge. Calibrated text
+playback fixtures require explicit opt-in and use the session's heard-prefix
+path. A declared interruption also records its permanent cutoff, so a later
+playback ACK cannot restore unheard content. These fixtures do not establish
+real audio, serving or model-quality coverage.
+Those measurements still require integration with the existing evaluation
+runner, actual media and a model-backed query path.
