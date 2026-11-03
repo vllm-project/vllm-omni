@@ -424,6 +424,30 @@ def test_reference_content_is_hashed_once_across_cfg_rows(monkeypatch) -> None:
     )
 
 
+def test_prompt_cache_salt_isolates_qwen_prefix_hits(prefix_cache_manager):
+    tokenizer = _layout_tokenizer()
+
+    def build(request_id, salt):
+        request = _make_request(prompt="edit the reference", num_images=1, request_id=request_id)
+        request.prompt["cache_salt"] = salt
+        layout = prepare_qwen_image_21_layout(request, layout_tokenizer=tokenizer, vae_scale_factor=16)
+        request.prepared_layout = layout
+        request.diffusion_kv_requests = build_qwen_image_21_diffusion_kv_requests(request, layout)
+        prepare_qwen_image_21_prefix_cache(request)
+        return request
+
+    first = build("first", "tenant-a")
+    assert prefix_cache_manager.reserve_request("first", first.diffusion_kv_requests) is not None
+    prefix_cache_manager.publish_request("first")
+    prefix_cache_manager.free_request("first")
+    for request_id, salt, expect_hit in [("other", "tenant-b", False), ("same", "tenant-a", True)]:
+        request = build(request_id, salt)
+        metadata = prefix_cache_manager.reserve_request(request_id, request.diffusion_kv_requests)
+        assert metadata is not None
+        assert all((sequence.cached_prefix_len > 0) == expect_hit for sequence in metadata.sequences)
+        prefix_cache_manager.free_request(request_id)
+
+
 @pytest.mark.parametrize("changed_num_images", [1, 4])
 def test_reference_image_count_change_isolates_prefix_namespace(
     prefix_cache_manager: DiffusionKVCacheManager,

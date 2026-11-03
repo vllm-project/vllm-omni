@@ -117,6 +117,9 @@ class ImageGenerationRequest(BaseModel):
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
+    cache_salt: str | None = Field(
+        default=None, description="Application-defined isolation key for Qwen-Image 2.1 prefix caching."
+    )
     system_prompt: str | None = Field(
         default=None, description="Custom system prompt. Used when --use_system_prompt is custom"
     )
@@ -222,7 +225,7 @@ class ImageGenerationResponse(BaseModel):
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str | None = Field(None, description="The output format of the image generation")
-    size: str = Field(None, description="The size of the image generated")
+    size: str | None = Field(None, description="The size of the image generated")
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "

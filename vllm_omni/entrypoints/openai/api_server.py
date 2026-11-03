@@ -2278,6 +2278,8 @@ async def generate_images(
                 extra_body["size"] = request.size
             if request.negative_prompt is not None:
                 extra_body["negative_prompt"] = request.negative_prompt
+            if request.cache_salt is not None:
+                extra_body["cache_salt"] = request.cache_salt
             if request.num_inference_steps is not None:
                 extra_body["num_inference_steps"] = request.num_inference_steps
             if request.guidance_scale is not None:
@@ -2333,6 +2335,8 @@ async def generate_images(
 
         # Build params - pass through user values directly
         prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
+        if request.cache_salt is not None:
+            prompt["cache_salt"] = request.cache_salt
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
@@ -2477,6 +2481,7 @@ async def edit_images(
     reference_image: str | UploadFile | None = None,
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Form(None),
+    cache_salt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
     guidance_scale: float | None = Form(None),
     guidance_scale_2: float | None = Form(None),
@@ -2525,6 +2530,8 @@ async def edit_images(
         # 2. Build prompt & images params
         cot_output = None
         omni_prompt = OmniTextPrompt(prompt=prompt, modalities=["image"])
+        if cache_salt is not None:
+            omni_prompt["cache_salt"] = cache_salt
         if negative_prompt is not None:
             omni_prompt["negative_prompt"] = negative_prompt
         input_images_list = []
@@ -2713,6 +2720,8 @@ async def edit_images(
                     extra_body["height"] = height
             if negative_prompt is not None:
                 extra_body["negative_prompt"] = negative_prompt
+            if cache_salt is not None:
+                extra_body["cache_salt"] = cache_salt
             if num_inference_steps is not None:
                 extra_body["num_inference_steps"] = num_inference_steps
             if guidance_scale is not None:

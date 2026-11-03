@@ -477,6 +477,7 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
         branch_namespace = get_cache_namespace(
             f"qwen-image-21-primary-v1-{branch.cache_branch}-{layout_digest}",
             request.sampling_params,
+            cache_salt=request.prompt.get("cache_salt") if isinstance(request.prompt, dict) else None,
         )
         prepared.append(
             (
