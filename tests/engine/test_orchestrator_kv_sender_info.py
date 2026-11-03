@@ -10,6 +10,7 @@ import pytest
 from vllm import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -17,6 +18,7 @@ from vllm_omni.engine.stage_engine_core_client import (
     DPLBStageEngineCoreClient,
     StageEngineCoreClient,
 )
+from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -58,6 +60,16 @@ class _DummyDiffusionStage:
                 "payload_sender_info": payload_sender_info,
             }
         )
+
+
+def _diffusion_metadata(stage_id: int, stage: _DummyDiffusionStage) -> StageMetadata:
+    return make_stage_metadata(
+        stage_id=stage_id,
+        stage_type="diffusion",
+        final_output=True,
+        engine_input_source=stage.engine_input_source,
+        custom_process_input_func=stage.custom_process_input_func,
+    )
 
 
 def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePool:
@@ -358,6 +370,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator.stage_metadata = [make_stage_metadata(), _diffusion_metadata(1, diffusion_stage)]
     orchestrator._cfg_tracker = CfgCompanionTracker()
 
     params = OmniDiffusionSamplingParams()
@@ -387,6 +400,7 @@ def test_diffusion_resubmission_preserves_sender_endpoints():
     diffusion_pool = StagePool(1, diffusion_stage)
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator.stage_metadata = [make_stage_metadata(), _diffusion_metadata(1, diffusion_stage)]
     orchestrator._cfg_tracker = CfgCompanionTracker()
     state = OrchestratorRequestState(
         request_id="streaming",
@@ -417,6 +431,11 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 
     orchestrator.num_stages = 3
     orchestrator.stage_pools = [source_pool, previous_pool, diffusion_pool]
+    orchestrator.stage_metadata = [
+        make_stage_metadata(),
+        make_stage_metadata(stage_id=1),
+        _diffusion_metadata(2, diffusion_stage),
+    ]
     orchestrator._cfg_tracker = CfgCompanionTracker()
 
     params = OmniDiffusionSamplingParams()
@@ -451,6 +470,7 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator.stage_metadata = [make_stage_metadata(), _diffusion_metadata(1, diffusion_stage)]
     orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.output_async_queue = _AsyncQueue()
     orchestrator.request_states = {}
@@ -487,6 +507,7 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     diffusion_pool = StagePool(1, diffusion_stage)
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator.stage_metadata = [make_stage_metadata(), _diffusion_metadata(1, diffusion_stage)]
     orchestrator.num_stages = 2
 
     req_state = OrchestratorRequestState(

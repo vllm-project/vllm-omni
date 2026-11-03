@@ -3,10 +3,12 @@
 """CPU regressions for MammothModa2's completed-AR to diffusion bridge."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     MammothModa2DiTPipeline,
 )
@@ -190,11 +192,11 @@ def test_mammoth_pipeline_uses_standard_completed_ar_forwarding() -> None:
 
 def test_stage_client_forwards_completed_ar_output_to_mammoth_adapter() -> None:
     source = _source_output()
-    client = object.__new__(StageEngineCoreClient)
-    client.custom_process_input_func = ar2diffusion
-    client.requires_multimodal_data = False
+    metadata = make_stage_metadata(stage_type="diffusion", custom_process_input_func=ar2diffusion)
 
-    diffusion_input = client.process_engine_inputs(
+    diffusion_input = StageEngineCoreClient.process_engine_inputs(
+        metadata,
+        SimpleNamespace(model_config=None),
         [source],
         {"mm_processor_kwargs": {"target_h": 512, "target_w": 768}},
     )

@@ -9,6 +9,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from tests.helpers.stage_metadata import stage_metadata_for_client
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import (
     ReplicaInfo,
@@ -149,6 +151,7 @@ class FakeStageClient:
         is_comprehension: bool = False,
         model_stage: str | None = None,
         kv_sender_info: dict[str, Any] | None = None,
+        custom_process_input_func: Callable[..., list[dict]] | None = None,
     ) -> None:
         self.stage_id = 0
         self.replica_id = 0
@@ -162,7 +165,9 @@ class FakeStageClient:
         self.is_comprehension = is_comprehension
         self.model_stage = model_stage
         self.next_inputs = list(next_inputs or [])
-        self.custom_process_input_func = None
+        if custom_process_input_func is None and stage_type != "diffusion":
+            custom_process_input_func = self._return_next_inputs
+        self.custom_process_input_func = custom_process_input_func
         self._kv_sender_info = dict(kv_sender_info) if kv_sender_info is not None else None
         self.add_request_calls: list[tuple] = []
         self.abort_calls: list[list[str]] = []
@@ -190,7 +195,7 @@ class FakeStageClient:
     def set_engine_outputs(self, outputs) -> None:
         return None
 
-    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+    def _return_next_inputs(self, *_args, **_kwargs) -> list[dict]:
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -497,7 +502,9 @@ def _build_harness(
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
-                stage_metadata=[pool.stage_client for pool in stage_pools],
+                stage_metadata=[
+                    stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(stage_pools)
+                ],
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
@@ -2028,7 +2035,7 @@ async def test_abort_marks_only_last_final_stage_output_finished() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=pools,
-        stage_metadata=[pool.stage_client for pool in pools],
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
     )
     orchestrator.request_states["req-two"] = OrchestratorRequestState(
         request_id="req-two",
@@ -2960,7 +2967,10 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[source, target],
-        stage_metadata=[source.stage_client, target.stage_client],
+        stage_metadata=[
+            stage_metadata_for_client(0, source.stage_client),
+            stage_metadata_for_client(1, target.stage_client),
+        ],
     )
 
     async def check_dispatch(request_id, req_state, request, **kwargs):
@@ -3177,7 +3187,7 @@ async def test_disabled_stage_metrics_drain_native_cache_on_completion(mocker) -
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
-        stage_metadata=[pool.stage_client],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         log_stats=False,
         collect_stage_metrics=False,
     )
@@ -3578,7 +3588,7 @@ async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_on
         output_async_queue=output,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
-        stage_metadata=[pool.stage_client],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         running_counter=counter,
     )
 

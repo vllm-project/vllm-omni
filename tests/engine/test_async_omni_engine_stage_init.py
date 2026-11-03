@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from tests.helpers.mock import patch_hf_snapshot_download
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.config.omni_config import OmniStageRuntimeConfig, VllmOmniARStageConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.config.watermarking import WatermarkConfig
@@ -259,17 +260,12 @@ def _make_llm_metadata(
     final_output_type: str | None = None,
     is_comprehension: bool = False,
 ):
-    return types.SimpleNamespace(
+    return make_stage_metadata(
         stage_id=stage_id,
-        stage_type="llm",
         runtime_cfg={},
-        prompt_transform_func=None,
-        prompt_expand_func=None,
         final_output=final_output,
         final_output_type=final_output_type,
-        model_stage=None,
         default_sampling_params=types.SimpleNamespace(name=f"sp-{stage_id}-{replica_id}"),
-        custom_process_input_func=None,
         engine_input_source=[] if stage_id == 0 else [stage_id - 1],
         engine_output_type="text",
         replica_id=replica_id,
@@ -278,17 +274,13 @@ def _make_llm_metadata(
 
 
 def _make_diffusion_metadata(stage_id: int, *, replica_id: int = 0, final_output_type: str = "image"):
-    return types.SimpleNamespace(
+    return make_stage_metadata(
         stage_id=stage_id,
         stage_type="diffusion",
         runtime_cfg={"devices": str(replica_id)},
-        prompt_expand_func=None,
         final_output=True,
         final_output_type=final_output_type,
         default_sampling_params=types.SimpleNamespace(name=f"dsp-{stage_id}-{replica_id}"),
-        custom_process_input_func=None,
-        engine_input_source=[],
-        cfg_kv_collect_func=None,
         replica_id=replica_id,
     )
 
@@ -428,7 +420,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
-    runtime = types.SimpleNamespace(stage_pools=[], stage_metadata=[_make_llm_metadata(0)], initialize=lambda: None)
+    runtime = types.SimpleNamespace(stage_pools=[], stage_metadata=[make_stage_metadata()], initialize=lambda: None)
 
     def _capture_create_stage_runtime(**kwargs):
         captured.update(kwargs)
@@ -480,7 +472,11 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
         stage_vllm_config=None,
         output_processor=None,
     )
-    runtime = types.SimpleNamespace(stage_pools=[pool], stage_metadata=[client], initialize=lambda: None)
+    runtime = types.SimpleNamespace(
+        stage_pools=[pool],
+        stage_metadata=[make_stage_metadata(prompt_transform_func=prompt_transform)],
+        initialize=lambda: None,
+    )
     monkeypatch.setattr(engine_mod, "create_stage_runtime", lambda **_kwargs: runtime)
 
     engine._initialize_stages(stage_init_timeout=7)

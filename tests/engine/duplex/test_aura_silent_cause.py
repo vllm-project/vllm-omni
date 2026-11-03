@@ -236,7 +236,7 @@ async def test_finished_stage1_handoff_submit_path(monkeypatch: pytest.MonkeyPat
         return [{"prompt_token_ids": [11, 22, 33], "additional_information": {"text": SPOKEN}}]
 
     clients[2].custom_process_input_func = aura2tts
-    clients[2].process_engine_inputs = aura2tts
+    orchestrator.stage_metadata[2].custom_process_input_func = aura2tts
     pool = orchestrator.stage_pools[2]
     original_initial = pool.submit_initial
     original_update = pool.submit_update
@@ -301,8 +301,8 @@ async def test_empty_remainder_close_only_forwards_once(monkeypatch: pytest.Monk
     orchestrator.async_chunk = True
     close_only_forwards: list[bool] = []
 
-    def aura2tts(source_outputs, prompt=None, **kwargs):
-        del source_outputs, kwargs
+    def aura2tts(source_outputs, prompt, requires_multimodal_data, **kwargs):
+        del source_outputs, requires_multimodal_data, kwargs
         info = prompt.get("additional_information") if isinstance(prompt, dict) else {}
         if not isinstance(info, dict):
             info = {}
@@ -313,7 +313,7 @@ async def test_empty_remainder_close_only_forwards_once(monkeypatch: pytest.Monk
         return [{"prompt_token_ids": [11, 22, 33], "additional_information": {"text": SPOKEN}}]
 
     clients[2].custom_process_input_func = aura2tts
-    clients[2].process_engine_inputs = aura2tts
+    orchestrator.stage_metadata[2].custom_process_input_func = aura2tts
 
     request_id = "duplex-s.cause.e.0.r.stage0-turn0"
     req_state = DuplexOrchestratorRequestState(
@@ -358,7 +358,7 @@ async def test_sentence_tts_handoff_does_not_abort_before_stage2_bind(monkeypatc
         return [{"prompt_token_ids": [11, 22, 33], "additional_information": {"text": SPOKEN}}]
 
     clients[2].custom_process_input_func = aura2tts
-    clients[2].process_engine_inputs = aura2tts
+    orchestrator.stage_metadata[2].custom_process_input_func = aura2tts
 
     session = _ephemeral_session()
     request_id = _bind_stage0(session)
@@ -416,7 +416,7 @@ async def test_sentence_tts_off_still_submits_full_text(monkeypatch: pytest.Monk
         return [{"prompt_token_ids": [11, 22, 33], "additional_information": {"text": SPOKEN}}]
 
     clients[2].custom_process_input_func = aura2tts
-    clients[2].process_engine_inputs = aura2tts
+    orchestrator.stage_metadata[2].custom_process_input_func = aura2tts
     pool = orchestrator.stage_pools[2]
     original_initial = pool.submit_initial
 

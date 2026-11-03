@@ -17,6 +17,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -342,6 +343,16 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
     diffusion_stage = RecordingDiffusionStage()
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [StagePool(0, source_stage), StagePool(1, diffusion_stage)]
+    orchestrator.stage_metadata = [
+        make_stage_metadata(),
+        make_stage_metadata(
+            stage_id=1,
+            stage_type="diffusion",
+            final_output=True,
+            engine_input_source=diffusion_stage.engine_input_source,
+            custom_process_input_func=diffusion_stage.custom_process_input_func,
+        ),
+    ]
     orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.duplex_control_plane = None
     orchestrator._running_counter = None
