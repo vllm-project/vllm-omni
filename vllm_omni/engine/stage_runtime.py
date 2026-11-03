@@ -747,8 +747,10 @@ class StageRuntime:
         """Reject unsupported native AR->DiT graphs before launching any Worker."""
         if not any(plan.metadata.stage_type == "diffusion" for plan in plans):
             return  # Native LLM prefill/decode is outside this path.
+        # Only stages with replicas on this server have a config to read here.
+        local_plans = [plan for plan in plans if plan.replicas]
         roles = {}
-        for plan in plans:
+        for plan in local_plans:
             replica = plan.replicas[0]
             if replica.stage_vllm_config is not None:
                 config = getattr(replica.stage_vllm_config, "kv_transfer_config", None)
@@ -768,6 +770,13 @@ class StageRuntime:
                 roles[plan.stage_id] = config.get("kv_role") if isinstance(config, Mapping) else config.kv_role
         if not roles:
             return
+        # The producer needs a known receiver for its KV, but if we are running a subset of the
+        # pipeline to run inference through /v1/run, downstream calls may go to any server.
+        if len(local_plans) < len(plans):
+            raise ValueError(
+                "Native AR-to-DiT KV transfer needs every stage in one deployment, "
+                "so it cannot run with --stage-id and no master"
+            )
         if (
             self._async_chunk
             or len(plans) != 2

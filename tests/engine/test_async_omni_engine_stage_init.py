@@ -68,6 +68,18 @@ class _FakeStageConfig:
     runtime: _FakeRuntimeConfig
 
 
+_NATIVE_KV_PRODUCER = types.SimpleNamespace(
+    metadata=make_stage_metadata(stage_id=0, stage_type="llm"),
+    stage_vllm_config=types.SimpleNamespace(kv_transfer_config=types.SimpleNamespace(kv_role="kv_producer")),
+    stage_cfg=types.SimpleNamespace(engine_args={}),
+)
+_NATIVE_KV_CONSUMER = types.SimpleNamespace(
+    metadata=make_stage_metadata(stage_id=1, stage_type="diffusion", engine_input_source=[0]),
+    stage_vllm_config=None,
+    stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": types.SimpleNamespace(kv_role="kv_consumer")}),
+)
+
+
 def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
     env_key = "VLLM_OMNI_TEST_TYPED_STAGE_ENV"
     monkeypatch.delenv(env_key, raising=False)
@@ -2832,6 +2844,32 @@ def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async
     else:
         with pytest.raises(ValueError, match="two-stage"):
             runtime._validate_native_kv_topology(plans)
+
+
+@pytest.mark.parametrize(
+    ("producer_replicas", "consumer_replicas"),
+    [([_NATIVE_KV_PRODUCER], []), ([], [_NATIVE_KV_CONSUMER])],
+    ids=["consumer-on-another-server", "producer-on-another-server"],
+)
+def test_native_kv_topology_rejects_server_without_every_stage(producer_replicas, consumer_replicas):
+    """Ensure native AR-to-DiT KV cannot run when another server holds a stage, since the KV has no known receiver."""
+    plans = [
+        LogicalStageInitPlan(
+            stage_idx=0, stage_id=0, replicas=producer_replicas, metadata=_NATIVE_KV_PRODUCER.metadata
+        ),
+        LogicalStageInitPlan(
+            stage_idx=1, stage_id=1, replicas=consumer_replicas, metadata=_NATIVE_KV_CONSUMER.metadata
+        ),
+    ]
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace(), types.SimpleNamespace()],
+        model="dummy-model",
+        config_path=None,
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    with pytest.raises(ValueError, match="needs every stage in one deployment"):
+        runtime._validate_native_kv_topology(plans)
 
 
 @pytest.mark.parametrize("explicit", [None, "1"])
