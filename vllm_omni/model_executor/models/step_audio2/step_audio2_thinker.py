@@ -498,7 +498,7 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
 
         return dict(
             audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", lens_tensor),
-            audio_lens=MultiModalFieldConfig.batched("audio"),
+            audio_lens=MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
@@ -738,10 +738,12 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_mels = audio_input["audio_mels"]
         audio_lens = audio_input["audio_lens"]
         if not isinstance(audio_lens, torch.Tensor):
-            # Host-side length: the length-bucketed encoder wrapper reads it
-            # without a D2H sync; AudioEncoder.forward moves it to the device.
             audio_lens = torch.tensor(audio_lens, dtype=torch.long)
         else:
+            # The field config marks audio_lens keep_on_cpu=True, so this is
+            # already host-side and `.cpu()` is a no-op (no D2H sync). The
+            # length-bucketed encoder wrapper reads it here without a sync, and
+            # AudioEncoder.forward moves it to the feature device.
             audio_lens = audio_lens.cpu()
 
         audio_features, audio_lens = self.encoder(audio_mels, audio_lens)

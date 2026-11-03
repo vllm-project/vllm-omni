@@ -42,7 +42,8 @@ Prerequisites
 * Deploy configs shipped in the repo:
   - ``vllm_omni/deploy/step_audio_2_asr.yaml`` (2-GPU; for a single GPU set
     ``devices: "0"`` and ``tensor_parallel_size: 1``).
-  - ``vllm_omni/deploy/covo_audio_thinker_only.yaml`` (single GPU).
+  - ``benchmarks/covo_audio_thinker_only.yaml`` (single GPU; evaluation-only,
+    registered at runtime via ``register_pipeline``).
 * Reference transcript ``ref.tsv`` in LibriSpeech ``.trans.txt`` style
   (``idx<TAB>UPPERCASE``), using the same clip identifiers as the audio
   filenames (the stem of each clip filename is the row key).
@@ -69,7 +70,7 @@ Usage (StepAudio2):
 Usage (Covo — add ``--thinker-only`` to skip the code2wav vocoder):
     python benchmarks/encoder_bucketing_wer.py \
         --model-type covo --thinker-only --model-name /path/to/Covo-Audio-Chat \
-        --deploy-config vllm_omni/deploy/covo_audio_thinker_only.yaml \
+        --deploy-config benchmarks/covo_audio_thinker_only.yaml \
         --audio-dir /path/to/clips --ref ref.tsv --max-seconds 29 \
         --prompt "Please transcribe the audio content."
 """
@@ -231,6 +232,15 @@ def transcribe(args, clips: list[str], on: bool) -> dict[str, str]:
 
 
 def main(args) -> None:
+    if args.model_type == "covo" and args.thinker_only:
+        # The thinker-only Covo topology is evaluation-only, so it is not in the
+        # production pipeline_registry; register it here so the deploy YAML's
+        # ``pipeline: covo_audio_thinker_only`` key resolves.
+        from vllm_omni.config.pipeline_registry import register_pipeline
+        from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_THINKER_ONLY_PIPELINE
+
+        register_pipeline(COVO_AUDIO_THINKER_ONLY_PIPELINE)
+
     clips = sorted(glob.glob(os.path.join(args.audio_dir, "*.wav")))
     if args.max_seconds > 0:
         clips = [c for c in clips if sf.info(c).duration <= args.max_seconds]
@@ -275,7 +285,9 @@ def main(args) -> None:
 def parse_args():
     parser = FlexibleArgumentParser(description="End-to-end WER for encoder bucketing")
     parser.add_argument("--model-type", choices=("covo", "stepaudio2"), required=True)
-    parser.add_argument("--thinker-only", action="store_true", help="Single-stage text-only pipeline (skip code2wav for covo).")
+    parser.add_argument(
+        "--thinker-only", action="store_true", help="Single-stage text-only pipeline (skip code2wav for covo)."
+    )
     parser.add_argument("--model-name", "-m", type=str, required=True)
     parser.add_argument("--deploy-config", type=str, required=True)
     parser.add_argument("--audio-dir", type=str, required=True)
@@ -287,8 +299,18 @@ def parse_args():
     parser.add_argument("--bucket-seconds", type=str, default="2,4,8,16,30")
     parser.add_argument("--bucket-modules", type=str, default="encoder")
     parser.add_argument("--bucket-time-axis", type=str, default="2")
-    parser.add_argument("--max-extra", type=int, default=15, help="Allowable extra hypothesis words before a clip is dropped as over-generated.")
-    parser.add_argument("--min-ratio", type=float, default=0.3, help="Minimum hypothesis/reference word ratio before a clip is dropped as truncated.")
+    parser.add_argument(
+        "--max-extra",
+        type=int,
+        default=15,
+        help="Allowable extra hypothesis words before a clip is dropped as over-generated.",
+    )
+    parser.add_argument(
+        "--min-ratio",
+        type=float,
+        default=0.3,
+        help="Minimum hypothesis/reference word ratio before a clip is dropped as truncated.",
+    )
     parser.add_argument("--stage-init-timeout", type=int, default=900)
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--init-timeout", type=int, default=900)

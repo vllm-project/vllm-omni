@@ -91,6 +91,10 @@ _FORWARD_SHIMS = {
     "WhisperEncoder": _whisper_varlen_shim,
 }
 
+# Emit the fixed-window lossiness warning at most once per process, not once
+# per wrapped module.
+_SHIM_WARNED = False
+
 
 # --------------------------------------------------------------------- ladder
 
@@ -390,6 +394,13 @@ class _BucketedEncoder:
         if self._aux_spec is not None and self._aux_spec[0] == "lengths":
             # The encoder returned (features, per-item lengths); carry the
             # lengths through so _bucketed can re-order them to the item order.
+            # The fixed-window shim (when present) produces a dataclass, not a
+            # tuple, so a length-carrying _aux_spec learned from the prime call
+            # would otherwise make output[1] raise on the bucketed path.
+            if not (isinstance(output, tuple) and len(output) > 1):
+                raise TypeError(
+                    f"encoder {self.name!r} returned {type(output).__name__}, expected a (features, lengths) tuple"
+                )
             aux = output[1][: features.size(0)]
         return features, aux
 
@@ -503,6 +514,18 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
                 # the shim is only used for bucketed windows via _tensor_forward.
                 encoder._shim = (lambda s, m: lambda *a, **k: s(m, *a, **k))(shim, module)
                 break
+        if encoder._shim is not None:
+            global _SHIM_WARNED
+            if not _SHIM_WARNED:
+                _SHIM_WARNED = True
+                logger.warning(
+                    "Bucketed encoder %r is a fixed-window class: bucketed windows "
+                    "use the built-in variable-length recipe, which is lossy "
+                    "(outputs may differ from the un-bucketed forward). Exclude it "
+                    "via %s for bit-identical output.",
+                    name,
+                    _ENV_MODULES,
+                )
         module.forward = encoder
         wrapped.append(name)
         encoders.append(encoder)

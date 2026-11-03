@@ -226,7 +226,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._install_bucketed_encoders(model)
 
     def _install_bucketed_encoders(self, model: Any) -> None:
-        """Enable length bucketing + graph pooling when the env asks for it."""
+        """Enable length bucketing when the env asks for it."""
         from vllm_omni.worker.bucketed_encoder import install_bucketed_encoders
 
         install_bucketed_encoders(model, vllm_config=self.vllm_config)
