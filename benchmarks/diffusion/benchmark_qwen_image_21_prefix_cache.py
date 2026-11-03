@@ -90,6 +90,10 @@ def main():
         config.update(
             diffusion_kv_max_rows_per_request=2,
             kv_cache_memory_bytes=int(args.kv_cache_gib * 1024**3),
+            # Native admission validates this bound against one rank's pool.
+            # 24k covers the four-image/512-text/4k-target profile while
+            # fitting the benchmark's 14 GiB single-GPU pool.
+            max_model_len=24576,
         )
     if args.layout == "hsdp8":
         config.update(
