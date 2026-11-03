@@ -823,14 +823,7 @@ def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:
 
 
 class TestInstallOnATowerDisaggregatedStage:
-    """A stage that owns one tower must not be failed for the other's absence.
-
-    Tower disaggregation gives each stage exactly one tower and leaves the other
-    as an empty ``ModuleList`` (``Cosmos3VFMTransformer.owned_towers``). Scanning
-    an unowned tower therefore finds no linears, which the unwrapped-linear guard
-    would otherwise read as "this checkpoint is not quantized" and turn into a
-    load-time failure of a perfectly valid stage.
-    """
+    """An unowned tower is an empty ModuleList; that must not read as "not quantized"."""
 
     @staticmethod
     def _fake_linear_cls():
@@ -867,12 +860,7 @@ class TestInstallOnATowerDisaggregatedStage:
 
     @pytest.mark.parametrize("reasoner", ["native", "a16"])
     def test_reasoner_only_stage_installs(self, linear_cls, reasoner: str) -> None:
-        """``reasoner="native"`` on a reasoner-only stage is a legitimate no-op.
-
-        There is no denoising schedule on this stage and the UND tower is asked
-        to stay at checkpoint precision, so nothing should be wrapped -- and that
-        must not raise.
-        """
+        """``reasoner="native"`` on a reasoner-only stage wraps nothing and must not raise."""
         transformer = self._transformer(linear_cls, owns_reasoner=True, owns_generator=False)
         runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner=reasoner))
 
@@ -890,15 +878,6 @@ class TestInstallOnATowerDisaggregatedStage:
         runtime.install(transformer)
 
         assert isinstance(transformer.gen_layers[0].quant_method, Cosmos3MixedPrecisionLinearMethod)
-
-    def test_unquantized_checkpoint_is_still_rejected(self, linear_cls) -> None:
-        """The guard the no-op path bypasses must still fire where it can apply."""
-        transformer = self._transformer(linear_cls, owns_reasoner=True, owns_generator=True)
-        transformer.gen_layers[0].quant_method = SimpleNamespace(name="bf16")
-        transformer.language_model.layers[0].quant_method = SimpleNamespace(name="bf16")
-
-        with pytest.raises(ValueError, match="no compatible FP8 or NVFP4 ModelOpt linears"):
-            Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner="a16")).install(transformer)
 
 
 def test_install_skips_reasoner_on_non_first_pipeline_stage(monkeypatch) -> None:

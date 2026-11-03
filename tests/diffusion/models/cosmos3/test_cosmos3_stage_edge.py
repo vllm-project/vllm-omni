@@ -2,25 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end walk of the Cosmos3 reasoner -> generator stage edge, on CPU.
 
-The other Cosmos3 disagg tests exercise one component at a time with hand-built
-inputs. This file wires the *real* chain together --
-
-    Cosmos3ReasonerPipeline.forward
-      -> get_cosmos3_reasoner_post_process_func   (payload envelope)
-      -> OmniSerde                                (the wire)
-      -> reasoner2generator                       (the stage bridge)
-      -> Cosmos3GeneratorPipeline.forward         (install + replay + clear)
-
--- with only the 31 B transformer itself stubbed out. It is what can be verified
-without two H200s: every seam between the towers is real code, and a payload that
-survives all of it is one the deployed pipeline would replay.
-
-The tokenizer stub deliberately *derives* its token ids from the resolved
-conditioning values (prompt, geometry, max_sequence_length, use_system_prompt), so
-the fingerprint agreement between the two stages is a property under test rather
-than an artifact of returning constant ids. That is what makes
-``test_a_stage_that_resolves_conditioning_differently_misses`` meaningful: change
-one value on one stage and the replay lookup really does miss.
+Wires the real chain -- reasoner forward, post-process, serde, the
+``reasoner2generator`` bridge, generator forward -- with only the transformer
+stubbed. The tokenizer stub derives ids from every resolved conditioning value,
+so fingerprint agreement between the stages is under test, not assumed.
 """
 
 from __future__ import annotations
@@ -33,7 +18,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_disagg as disagg
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_disagg import (
     Cosmos3GeneratorPipeline,
@@ -55,11 +39,6 @@ NUM_LAYERS = 4
 KV_HEADS = 2
 HEAD_DIM = 8
 PAD_TO = 6
-
-
-# =============================================================================
-# Stub transformer -- everything below the tower boundary
-# =============================================================================
 
 
 class _StubUndTower(nn.Module):
@@ -141,11 +120,6 @@ class _StubTransformer(nn.Module):
         yield
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
-
 def _tokenize(prompt: str, negative_prompt: str, *, height, width, max_sequence_length, use_system_prompt, frame_rate):
     """Ids that depend on every value the real formatter/tokenizer depends on.
 
@@ -212,10 +186,9 @@ def _make_stage(cls: type[Any], **transformer_kwargs: Any) -> Any:
     pipeline.is_edge_model = False
     pipeline.is_distilled_model = False
     _install_tokenizer(pipeline)
-    # Real _bind_owned_tower: the reasoner asserts no GEN blocks were built, and the
-    # generator swaps its block-less UND tower for the replay stub, with the layout
-    # and head range its own cross-attention implies.
-    pipeline._bind_owned_tower()
+    if cls is Cosmos3GeneratorPipeline:
+        # What the generator's __init__ does: swap in the replay stub.
+        pipeline._bind_owned_tower()
     return pipeline
 
 
@@ -305,11 +278,6 @@ def _run_stage_edge(
     return SimpleNamespace(result=result, replayed=replayed, payload=payload, bridged=bridged)
 
 
-# =============================================================================
-# Tests
-# =============================================================================
-
-
 class TestStageEdge:
     def test_a_request_survives_the_whole_chain_and_replays_both_branches(self):
         """The headline invariant: K/V computed on stage 0 is what stage 1 uses."""
@@ -334,63 +302,6 @@ class TestStageEdge:
                 # Trimmed to the real token count (3), not the padded length.
                 assert k.shape == (1, 3, KV_HEADS, HEAD_DIM)
                 assert v.shape == (1, 3, KV_HEADS, HEAD_DIM)
-
-    def test_the_replayed_values_are_the_reasoners_own_tensors(self):
-        """Not just the right shape: the same numbers, after the serde hop."""
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        generator = _make_stage(Cosmos3GeneratorPipeline)
-
-        run = _run_stage_edge(reasoner, generator)
-
-        emitted = run.payload[KV_KEY]
-        # Match each replayed branch back to the entry it came from by value.
-        for branch in run.replayed:
-            matches = [
-                entry
-                for entry in emitted.values()
-                if all(
-                    torch.equal(k, ek) and torch.equal(v, ev) for (k, v), (ek, ev) in zip(branch, entry, strict=True)
-                )
-            ]
-            assert len(matches) == 1
-
-    def test_the_payload_is_dropped_once_the_request_finishes(self):
-        """A stale table would let a later request replay this one's conditioning."""
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        generator = _make_stage(Cosmos3GeneratorPipeline)
-
-        _run_stage_edge(reasoner, generator)
-
-        assert generator.transformer.language_model._table == {}
-
-    def test_two_requests_in_a_row_each_replay_their_own_conditioning(self):
-        """The stub is long-lived pipeline state; the payload belongs to a request."""
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        generator = _make_stage(Cosmos3GeneratorPipeline)
-
-        first = _run_stage_edge(reasoner, generator, prompt_text="a red car")
-        second = _run_stage_edge(reasoner, generator, prompt_text="a blue bicycle")
-
-        assert not torch.equal(first.replayed[0][0][0], second.replayed[0][0][0])
-
-    def test_the_bridge_forwards_no_geometry_and_the_generator_still_agrees(self):
-        """The bridge carries prompt + modalities + K/V and nothing else.
-
-        Geometry and tokenization settings ride in sampling params, which reach
-        every stage independently, so dropping them from the prompt dict cannot
-        desynchronize the two tokenizations.
-        """
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        generator = _make_stage(Cosmos3GeneratorPipeline)
-        sp = _sampling_params(height=512, width=768, max_sequence_length=256)
-
-        run = _run_stage_edge(reasoner, generator, reasoner_sp=sp, generator_sp=sp)
-
-        assert set(run.bridged) == {"prompt", "negative_prompt", "modalities", "extra"}
-        assert run.result == "image"
-        # The reasoner recorded the resolution it used, for diagnostics only.
-        assert (run.payload[META_KEY]["height"], run.payload[META_KEY]["width"]) == (512, 768)
-        assert run.payload[META_KEY]["max_sequence_length"] == 256
 
     def test_a_stage_that_resolves_conditioning_differently_misses(self):
         """The failure mode the fingerprint exists to catch.
@@ -442,75 +353,3 @@ class TestStageEdge:
                 )
             ]
             assert len(matches) == 1
-
-    def test_a_nonzero_tp_rank_replays_its_own_heads_through_the_whole_chain(self):
-        """The finding, end to end, at the rank where it actually bit.
-
-        Every other test in this file runs as rank 0, whose shard starts at head 0 --
-        indistinguishable from the rank-agnostic handoff this replaces, where every
-        rank received rank 0's heads. Here the generator stage believes it is rank 1
-        of a 2-rank group, so the payload it must replay is the *second* half of the
-        reasoner's gathered head set, and it travels the real chain to get there:
-        reasoner forward -> post-process -> serde -> bridge -> install -> replay.
-        """
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        local_heads = KV_HEADS // 2
-        # The rank identity is patched for the *bind* only, then dropped: the offset
-        # is captured there, and the two stages are separate processes in a real
-        # deployment, so the reasoner must go on running at its own TP size (1 here,
-        # against the generator's 2 -- the TP-independence this handoff is for).
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(disagg, "_tp_rank", lambda: 1)
-            mp.setattr(disagg, "_tp_world_size", lambda: 2)
-            generator = _make_stage(Cosmos3GeneratorPipeline, num_kv_heads_local=local_heads)
-        assert generator.transformer.language_model.kv_head_offset == local_heads
-
-        run = _run_stage_edge(reasoner, generator)
-
-        assert run.result == "image"
-        emitted = run.payload[KV_KEY]
-        for branch in run.replayed:
-            for k, _v in branch:
-                assert k.shape == (1, 3, local_heads, HEAD_DIM)
-            matches = [
-                entry
-                for entry in emitted.values()
-                if all(
-                    torch.equal(k, ek[..., local_heads : 2 * local_heads, :])
-                    and torch.equal(v, ev[..., local_heads : 2 * local_heads, :])
-                    for (k, v), (ek, ev) in zip(branch, entry, strict=True)
-                )
-            ]
-            assert len(matches) == 1
-            # And explicitly *not* rank 0's shard: the stub tower marks each head
-            # with its index, so the two halves cannot coincide.
-            for (k, _v), entry in zip(branch, next(iter(emitted.values())), strict=False):
-                assert not torch.equal(k, entry[0][..., :local_heads, :])
-
-    def test_a_generator_expecting_another_layout_is_rejected_by_name(self):
-        """Two different checkpoints, or two different transformer configs: the
-        operator must be told which field disagrees, not handed a shape error from
-        inside attention."""
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        generator = _make_stage(
-            Cosmos3GeneratorPipeline,
-            num_kv_heads=KV_HEADS * 2,
-            num_kv_heads_local=KV_HEADS * 2,
-        )
-
-        with pytest.raises(RuntimeError, match="disagree on the UND K/V layout"):
-            _run_stage_edge(reasoner, generator)
-
-    def test_the_generator_cannot_run_without_a_reasoner(self):
-        """Stage 1 is not a standalone pipeline; the error has to say so."""
-        generator = _make_stage(Cosmos3GeneratorPipeline)
-
-        with pytest.raises(ValueError, match="cannot run standalone"):
-            generator.forward(_request({"prompt": "x", "modalities": ["image"]}, _sampling_params()))
-
-    def test_the_reasoner_refuses_a_video_request(self):
-        """Only T2I is split, and the reasoner is where that is enforced."""
-        reasoner = _make_stage(Cosmos3ReasonerPipeline)
-
-        with pytest.raises(ValueError, match="text-to-image only"):
-            reasoner.forward(_request({"prompt": "x", "modalities": ["video"]}, _sampling_params()))

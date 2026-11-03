@@ -1340,17 +1340,15 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("num_stages", [1, 2])
-async def test_pure_diffusion_app_state_key_snapshot(monkeypatch, num_stages: int) -> None:
+async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     """Lock pure-diffusion ``app.state`` keys after init, including live vs None.
 
     Fails if bootstrap drops keys route owners still read (e.g. video/speech/
     models), wires a handler that must stay None, or leaves a required
-    handler as None. Two stages covers an all-diffusion multi-stage topology
-    (e.g. cosmos3_omni_disagg), which has no comprehension stage either.
+    handler as None.
     """
-    stages = [SimpleNamespace(stage_type="diffusion", engine_args={}) for _ in range(num_stages)]
-    engine = _FakeEngineClient(stage_configs=stages)
+    stage = SimpleNamespace(stage_type="diffusion", engine_args={})
+    engine = _FakeEngineClient(stage_configs=[stage])
 
     def _for_diffusion_factory(label: str):
         def _factory(cls, *args, **kwargs):

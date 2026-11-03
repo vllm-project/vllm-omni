@@ -2,41 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processor for the Cosmos3 reasoner -> generator handoff.
 
-The Cosmos3 analogue of ``glm_image.ar2diffusion``: it turns stage 0's output
-into stage 1's prompt. GLM-Image passes ``prior_token_ids``; Cosmos3 passes the
-UND tower's per-layer K/V, which travels in ``extra`` and is installed on the
-generator's replay stub.
-
-The signature follows the ``(source_outputs, prompt, requires_multimodal_data)``
-convention the orchestrator dispatches on for a ``diffusion`` next stage, the same
-one ``glm_image.ar2diffusion`` uses.
-
-The payload keys are imported from ``diffusion.models.cosmos3_pipeline_config``,
-not from the tower pipelines: this module runs in the orchestrator process, which
-must not pay for a diffusion-pipeline import just to read two strings.
-
-WHAT THIS DOES *NOT* FORWARD
-----------------------------
-Generation knobs -- seed, ``num_inference_steps``, ``guidance_scale``,
-``flow_shift`` -- are deliberately absent. Those ride to every stage in
-``sampling_params_list``, threaded through unchanged from the original request;
-re-copying them into the prompt dict would create a second, competing source of
-truth.
-
-The reasoner's geometry and tokenization settings are not forwarded either, for
-the same reason: the generator resolves them from those same sampling params,
-through the very helpers the reasoner used (``_resolve_t2i_geometry`` /
-``_resolve_text_encode_params``), so a prompt-dict copy would be a second source
-of truth for values the generator does not read from the prompt dict anyway. They
-travel in ``META_KEY`` instead, which is the declared half of the conditioning
-contract (``Cosmos3TextConditioning``): it names the schema the payload
-implements and the K/V layout it carries, so the generator can reject a
-mismatched payload -- or report a stage-config mismatch in the two stages' own
-terms -- instead of hitting a bare shape error inside attention. Forward it
-verbatim; a payload that arrives without it is refused.
-
-So what this forwards is exactly three things: the prompt text, the
-``modalities`` marker the generator's own T2I check keys off, and the K/V.
+Like ``glm_image.ar2diffusion``, but the payload is the UND tower's per-layer K/V,
+carried in ``extra`` for the generator's replay stub. It forwards only the prompt
+text, the negative prompt, the ``modalities`` marker, and the K/V plus its
+metadata. Generation knobs, geometry, and tokenization settings reach every stage
+through ``sampling_params_list``, so they are not copied here.
 """
 
 from __future__ import annotations
@@ -71,19 +41,9 @@ def _as_dict(prompt: Any) -> dict[str, Any]:
 
 
 def _find_und_payload(source_outputs: list[Any]) -> dict[str, Any] | None:
-    """Locate the reasoner payload in whatever envelope stage 0 produced.
+    """Return ``multimodal_output["trajectory"]`` holding the K/V.
 
-    The reasoner's postprocessor parks the K/V under the ``trajectory`` payload
-    key, and ``output_formatter._build_multimodal_output`` copies ``trajectory``
-    verbatim into ``multimodal_output`` -- so the payload is at
-    ``multimodal_output["trajectory"][KV_KEY]``.
-
-    Both the ``RequestOutput`` and the inner ``CompletionOutput`` are probed
-    because ``multimodal_output`` is a dynamic attribute on both: the connector
-    serde restores it wherever it was set (``_decode_request_output`` /
-    ``_decode_completion_output`` in
-    ``vllm_omni/distributed/omni_connectors/utils/serialization.py``), so which
-    holder carries it depends on the transport.
+    It is on either the request or its completion output, depending on the transport.
     """
     for output in source_outputs:
         for holder in (output, *(getattr(output, "outputs", None) or [])):
@@ -118,21 +78,16 @@ def reasoner2generator(
 
     generator_input: dict[str, Any] = {
         "prompt": original.get("prompt", ""),
-        # The generator stage re-runs _is_t2i_request, which keys purely off this
-        # list, so it has to be restated here.
+        # The generator's _is_t2i_request keys off this.
         "modalities": ["image"],
-        # Stage-handoff only: the diffusion output formatter drops ``extra`` from
-        # the prompt it echoes on ``OmniRequestOutput``, so the K/V does not reach
-        # the caller.
+        # The output formatter strips ``extra`` before echoing the prompt.
         "extra": {
             KV_KEY: payload[KV_KEY],
             META_KEY: meta,
         },
     }
 
-    # The negative prompt must match too: with guidance active the reasoner
-    # encoded an unconditional branch from it, and the generator re-tokenizes
-    # that same text to look the branch up.
+    # The generator re-tokenizes it to look up the unconditional branch.
     if original.get("negative_prompt") is not None:
         generator_input["negative_prompt"] = original["negative_prompt"]
 

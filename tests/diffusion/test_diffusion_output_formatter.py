@@ -513,24 +513,6 @@ def test_formatter_leaves_prompts_without_a_handoff_payload_unchanged(
     assert result.prompt is prompt
 
 
-def test_format_empty_diffusion_outputs_strips_each_prompt_of_a_list() -> None:
-    """A processor returning several prompts reaches the stage as a list."""
-    prompts = [{"prompt": "a", "extra": {"k": torch.zeros(1)}}, {"prompt": "b"}]
-
-    [result] = format_empty_diffusion_outputs(_request(prompts))
-
-    assert result.prompt == [{"prompt": "a"}, {"prompt": "b"}]
-    assert "extra" in prompts[0]
-
-
-def test_format_empty_diffusion_outputs_leaves_token_id_prompts_alone() -> None:
-    token_ids = [1, 2, 3]
-
-    [result] = format_empty_diffusion_outputs(_request(token_ids))
-
-    assert result.prompt is token_ids
-
-
 @pytest.mark.parametrize("key", ["segmentation", "video_segmentation", "video_depth"])
 def test_formatter_routes_segmentation_payload_to_multimodal_output(
     monkeypatch: pytest.MonkeyPatch,

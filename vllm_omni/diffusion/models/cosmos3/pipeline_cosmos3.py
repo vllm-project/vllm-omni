@@ -1706,7 +1706,7 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Shared text-conditioning parameter resolution -----------------------
     #
-    # ``forward`` below and ``Cosmos3ReasonerPipeline.encode_prompt_to_kv`` in
+    # ``forward`` below and ``Cosmos3ReasonerPipeline.encode_text_conditioning`` in
     # ``pipeline_cosmos3_disagg`` must resolve these identically. The
     # disaggregated topology tokenizes the prompt on *both* stages -- the
     # reasoner to compute the UND K/V, the generator to look that K/V up by a
