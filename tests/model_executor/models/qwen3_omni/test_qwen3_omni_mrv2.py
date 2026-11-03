@@ -104,6 +104,52 @@ def test_make_omni_output_without_spans_keeps_v1_concat():
     assert out.text_hidden_states.shape[0] == 2
 
 
+def test_talker_mtp_feeds_precomputed_sampling_noise_to_one_decode_step():
+    """Residual-codebook noise must enter the predictor as a tensor.
+
+    MRv2 captures ``talker_mtp`` in one CUDA graph. Drawing Gumbel noise
+    inside that capture replays the graph RNG. The runner fills a static
+    uniform buffer each step and the predictor has to consume it.
+    """
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    recorded: dict = {}
+
+    class _Predictor:
+        def code_predictor_forward(self, input_ids, inputs_embeds, *, last_talker_hidden=None, **kwargs):
+            recorded["seq"] = int(input_ids.shape[-1])
+            recorded["kwargs"] = kwargs
+            hidden = inputs_embeds.shape[-1]
+            codes = torch.zeros(input_ids.shape[0], _Q, input_ids.shape[-1], dtype=torch.long)
+            summed = torch.zeros(input_ids.shape[0], input_ids.shape[-1], hidden)
+            return codes, summed
+
+    model.talker = _Predictor()
+    model.talker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=_H))
+    uniforms = torch.rand(2, _Q - 1, 8)
+    model.talker_mtp(
+        torch.zeros(2, 1, dtype=torch.long),
+        torch.zeros(2, _H),
+        torch.zeros(2, 1, _H),
+        torch.zeros(2, _H),
+        sample_uniforms=uniforms,
+        generator=object(),
+    )
+    assert recorded["seq"] == 1
+    assert recorded["kwargs"]["sample_uniforms"] is uniforms
+    assert recorded["kwargs"]["generator"] is None
+    assert recorded["kwargs"]["generators"] is None
+
+    model.talker_mtp(
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(3, _H),
+        torch.zeros(1, 1, _H),
+        torch.zeros(3, _H),
+        sample_uniforms=uniforms[:1],
+    )
+    assert recorded["seq"] == 3
+    assert recorded["kwargs"]["sample_uniforms"] is None
+
+
 def test_eager_output_is_token_major_with_invalid_rows():
     model = _talker()
     model.eager_frames_active = True
