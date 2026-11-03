@@ -260,6 +260,57 @@ def test_native_prelude_launch_failure_is_not_retried_eager(monkeypatch):
         state.sample_native(scores, 0, VOCAB_SIZE - 1, ((0.0, 0, 1.0, ()),), (None,))
 
 
+def test_commit_cuda_kstep_invalidates_width1_sampler_caches():
+    """A fused commit drops the width-1 sampler caches for its rows.
+
+    Review follow-up (PR #9733): the commit advances the workspace and the
+    host mirrors but never the width-1 sampler, so a new prefill forcing a
+    width-1 step reused a pre-fused step counter and penalty window -- EOS
+    masked with the stale step, repetition penalty working from pre-fused
+    codes. The commit now invalidates the caches; the next setup rebuilds
+    them from the host state.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    device_states = {"a": object(), "b": object()}
+    device_inputs = {"a": object(), "b": object()}
+    device_budgets = {"a": object(), "b": object()}
+    model = SimpleNamespace(
+        _request_audio_states={},
+        _request_codec_history={},
+        _request_generators={},
+        _request_codec_device_states=device_states,
+        _request_codec_device_inputs=device_inputs,
+        _request_codec_device_budgets=device_budgets,
+        _codec_min_tokens=0,
+        _codec_max_tokens=10,
+        _codec_temperature=0,
+        _codec_repetition_penalty=1,
+        _codec_top_k=0,
+        _codec_top_p=1,
+        _codec_seed=7,
+        _codec_eos_id=VOCAB_SIZE - 1,
+        _codec_fused_prelude=True,
+        _merge_request_codec_params=lambda *args, **kwargs: None,
+    )
+    hidden = torch.zeros(2, 4)
+    infos = [{"request_id": "a"}, {"request_id": "b"}]
+    kwargs = {"model_intermediate_buffer": infos, "request_token_spans": [(0, 1), (1, 2)]}
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(model, hidden, 2, **kwargs)
+    state.sample(logits([3, 4]), 0, VOCAB_SIZE - 1)
+    state.sample(logits([5, 6]), 1, VOCAB_SIZE - 1)
+
+    MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+
+    assert "a" not in device_states and "b" not in device_states
+    assert "a" not in device_inputs and "b" not in device_inputs
+    assert "a" not in device_budgets and "b" not in device_budgets
+
+
 def test_model_binding_commit_and_batch_compaction():
     from types import SimpleNamespace
 

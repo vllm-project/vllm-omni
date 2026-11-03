@@ -2048,7 +2048,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """
         workspace, infos, states, request_ids = self._cuda_kstep_binding
         bank = getattr(self, "_cuda_kstep_request_bank", {})
+        # Invalidate the width-1 sampler caches for these rows: this commit
+        # advances the workspace and the host mirrors but not the sampler, so
+        # a following width-1 step must rebuild it from the host state
+        # instead of reusing a pre-fused step counter and penalty window
+        # (which would mask EOS with the stale step and penalize pre-fused
+        # codes). Fused steps never read these caches, so fusion pays
+        # nothing for the invalidation.
+        device_states = getattr(self, "_request_codec_device_states", None)
+        device_inputs = getattr(self, "_request_codec_device_inputs", None)
+        device_budgets = getattr(self, "_request_codec_device_budgets", None)
         for row, (request_id, state) in enumerate(zip(request_ids, states)):
+            if device_states is not None:
+                device_states.pop(request_id, None)
+            if device_inputs is not None:
+                device_inputs.pop(request_id, None)
+            if device_budgets is not None:
+                device_budgets.pop(request_id, None)
             entry = bank.get(request_id)
             if entry is not None and entry["state"] is state:
                 for name in _CUDA_KSTEP_STATE_FIELDS:
