@@ -49,7 +49,7 @@ cache, TeaCache and Cache-DiT.
 | Model / combination | Scope |
 |---------------------|-------|
 | HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
-| Qwen-Image 2.1 (`QwenImage21Pipeline`) | Block-causal reference-image and text prefix reuse across requests; skips condition-image VAE encoding on covering hits. GPU validation is configuration-specific; see the [recipe](../../recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler) for GPU, precision, and parallelism details |
+| Qwen-Image 2.1 (`QwenImage21Pipeline`) | Block-causal reference-image and text prefix reuse across requests; skips condition-image VAE encoding on covering hits. GPU validation is configuration-specific; see the [recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler) for GPU, precision, and parallelism details |
 | TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits (HunyuanImage3) |
 | TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
 | Other HunyuanImage3 SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |

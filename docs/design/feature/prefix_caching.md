@@ -202,7 +202,7 @@ The current scope is local DiT reuse, not AR-imported KV or missing-page-only
 cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
 TP2/SP2 (Ulysses), both with EP and CFGP1, for HunyuanImage3. Qwen's
 configuration-specific numerical and memory constraints are described in its
-[recipe](../../../recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler).
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler).
 Qwen keys may additionally include an application-supplied request `cache_salt`;
 different salts are isolated before any native block lookup. The model keeps
 CFG rows and whole reference layouts separate as conservative numerical guards.
