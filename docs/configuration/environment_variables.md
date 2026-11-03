@@ -93,6 +93,7 @@ environment variables.
 | `SPEAKER_MAX_UPLOADED` | Integer; default `1000` | Speech server; read when speaker storage initializes | Environment-only setting. A non-integer logs a warning and uses `1000`; range is not otherwise validated. | Stable |
 | `VLLM_OMNI_ABORT_TIMEOUT` | Float seconds; default `2` | Engine abort wait for Videos DELETE and `generate()` cancel/error cleanup; read when `async_omni` imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
 | `VLLM_OMNI_API_SERVER_TORCH_THREADS` | Non-negative integer; default `4`; `0` disables the cap | Process-wide Torch intra-op pool; read at API worker startup, including inline diffusion stages | Caps the existing count without increasing a lower count (e.g. from `OMP_NUM_THREADS`). Set a higher cap for CPU-heavy preprocessing or postprocessing; `0` preserves the existing count. A non-integer or negative value raises `ValueError` at startup. Separate stage processes are unaffected. | Stable operational control |
+| `VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS` | `1` enables; default `0` (off) | `AsyncOmni.sleep(level=2)` on AR stages; read on each sleep call | Only the exact value `1` lets AR stages wake after a level-2 sleep. The weights are discarded, not offloaded to host memory, so the caller must rewrite every parameter (an RL full-weight sync) before generating. Buffers and other non-parameter tensors are restored on wake. Diffusion stages still raise on wake after level 2. | Experimental |
 | `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` | Float seconds; default `600` | Diffusion engine async-output wait in `step_streaming`; resolved per call on the request path, not at import | Environment-only setting. A non-float or `<=0` value warns once and uses the default. | Experimental |
 | `VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S` | Positive finite seconds; unset or `<=0` disables | MiniCPM-o 4.5 Code2Wav stage; read when each Code2Wav model instance initializes | Reports the current phase, bounded request details, and the blocked owner-thread Python stack once per operation without interrupting it. Invalid or non-finite values raise `ValueError` at model startup. | Diagnostic |
 | `VLLM_OMNI_ENABLE_RUN_ENDPOINT` | `1` to enable; default off | Read when the server initializes its endpoints | Indicates that `POST /v1/run` should be enabled for independent stage execution; this should only be used by trusted callers. | Experimental |
@@ -218,7 +219,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 95 variables read by a single model or pipeline family. They are
+The inventory includes 97 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -227,10 +228,10 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 67 | Move a stable setting into typed stage or model configuration. |
+| Promote | 70 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 16 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Internalize | 15 | Keep a debug or diagnostic switch out of public documentation and configuration. |
 | Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing

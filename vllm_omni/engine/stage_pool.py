@@ -1138,6 +1138,8 @@ class StagePool:
                     request_id,
                     affinity_request_id=affinity_request_id,
                 )
+            if req_state.trace is not None:
+                req_state.trace.start_stage(self.stage_id, replica_id, self.stage_type)
             client = self._diffusion_client(replica_id)
             self.maybe_update_watermarking_state(request_id, params)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
@@ -1160,6 +1162,8 @@ class StagePool:
             )
         if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        if req_state.trace is not None:
+            req_state.trace.start_stage(self.stage_id, replica_id, "llm")
         self.maybe_update_watermarking_state(request_id, params)
         try:
             self.output_processor.add_request(
