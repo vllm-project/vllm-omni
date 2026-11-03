@@ -27,6 +27,7 @@ is covered by ``tests/diffusion/hooks``.
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -53,6 +54,7 @@ from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import (
     PositionPlan,
     QwenImageMixFusionAdapter,
 )
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
     QwenImageTransformer2DModel,
@@ -179,7 +181,8 @@ def _packed_input_batch():
         # The driver aggregates per-request thresholds; lowering the minimum
         # lets this tiny fixture stay packable.
         request_extras=[{"mixfusion_min_chunk_tokens": 1}],
-        timesteps=torch.tensor([500.0]),
+        # ``InputBatch`` expands the step timestep to one entry per latent row.
+        timesteps=torch.tensor([500.0, 500.0]),
         guidance=None,
         prompt_embeds=torch.zeros(2, 4, 8),
         prompt_embeds_mask=None,
@@ -190,6 +193,36 @@ def _packed_input_batch():
 
 def _dense_step(batch, **kwargs):
     return "dense"
+
+
+def _denoise_kwargs(batch):
+    """The kwargs the pipeline's dense step builds for ``batch``."""
+    return QwenImagePipeline._build_denoise_kwargs(
+        None,
+        latents=batch.latents,
+        timestep=batch.timesteps,
+        guidance=batch.guidance,
+        prompt_embeds=batch.prompt_embeds,
+        prompt_embeds_mask=batch.prompt_embeds_mask,
+        img_shapes=batch.img_shapes,
+        txt_seq_lens=batch.txt_seq_lens,
+        do_true_cfg=batch.do_true_cfg,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        negative_txt_seq_lens=None,
+        image_latents=batch.image_latents,
+        extra_transformer_kwargs={"attention_kwargs": None, "return_dict": False},
+    )
+
+
+def _delegated_dense_step(transformer):
+    """Stand-in for ``pipeline.denoise_step`` on the no-CFG path."""
+
+    def dense_step(batch, **kwargs):
+        positive_kwargs, _, _ = _denoise_kwargs(batch)
+        return transformer(**positive_kwargs)
+
+    return dense_step
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +334,7 @@ def test_driver_packs_when_blocks_are_not_hooked():
     input_batch = _packed_input_batch()
 
     with override_forward_context(ForwardContext()):
-        assert driver.run(input_batch, states=[], dense_step=_dense_step) == "packed"
+        assert driver.run(input_batch, states=[], dense_step=_delegated_dense_step(transformer)) == "packed"
     assert transformer.packed_calls == 1
     assert serial_inputs == []
 
@@ -385,19 +418,58 @@ def test_driver_arms_step_and_forwards_layout_kwargs():
     input_batch = _packed_input_batch()
 
     with override_forward_context(ForwardContext()):
-        assert driver.run(input_batch, states=[], dense_step=_dense_step) == "packed"
+        assert driver.run(input_batch, states=[], dense_step=_delegated_dense_step(transformer)) == "packed"
         # Restored by the try/finally so later calls see no armed step.
         assert get_forward_context().mixfusion_step is None
 
     assert transformer.packed_calls == 1
     assert transformer.armed_at_call is True
     call = transformer.calls[0]
-    # The root hook packs the list itself; the adapter forwards the layout
-    # arguments it needs instead of a pre-built bundle.
+    # The driver delegates to the pipeline's dense step; its keyword builder
+    # passes the per-request list through and the root hook packs it.
     assert call["hidden_states"] is input_batch.latents
     assert call["img_shapes"] == input_batch.img_shapes
     assert call["txt_seq_lens"] == input_batch.txt_seq_lens
     assert call["return_dict"] is False
+    # The packed list has two rows, so the timestep is broadcast per row.
+    assert call["timestep"].shape == (2,)
+
+
+def test_delegated_denoise_kwargs_match_the_packed_call():
+    """P2-3a parity: pipeline kwargs == the adapter's pre-delegation call."""
+    batch = _packed_input_batch()
+    positive, negative, output_slice = _denoise_kwargs(batch)
+    packed = QwenImageMixFusionAdapter().build_packed_call(batch)
+
+    assert negative is None
+    # Every request owns its whole output; the token-axis slice only applies
+    # to image-conditioned editing, which the driver rejects for packing.
+    assert output_slice is None
+
+    signature = inspect.signature(QwenImageTransformer2DModel.forward)
+    bound_pipeline = signature.bind(None, **positive)
+    bound_pipeline.apply_defaults()
+    bound_adapter = signature.bind(None, **packed)
+    bound_adapter.apply_defaults()
+    from_pipeline = bound_pipeline.arguments
+    from_adapter = bound_adapter.arguments
+    from_pipeline.pop("self")
+    from_adapter.pop("self")
+    assert from_pipeline.keys() == from_adapter.keys()
+    for name, expected in from_adapter.items():
+        actual = from_pipeline[name]
+        if isinstance(expected, torch.Tensor):
+            assert torch.equal(actual, expected), name
+        else:
+            assert actual == expected, name
+
+
+def test_predict_noise_keeps_a_packed_list_intact():
+    """The base mixin's ``result[0]`` would keep only request 0."""
+    packed = [torch.zeros(1, 8, 16), torch.ones(1, 8, 16)]
+    pipeline = SimpleNamespace(transformer=lambda **kwargs: packed)
+
+    assert QwenImagePipeline.predict_noise(pipeline, hidden_states=None) is packed
 
 
 # ---------------------------------------------------------------------------

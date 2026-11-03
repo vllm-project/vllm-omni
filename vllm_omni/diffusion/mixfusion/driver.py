@@ -62,9 +62,10 @@ class MixFusionDriver:
 
         Dense batches (tensor latents) go straight to ``dense_step``. Ragged
         batches (list latents) either pack or fall back to one dense call per
-        compatible group of requests. The packed branch must not call
-        ``dense_step``: the dense keyword builder only accepts a tensor of
-        latents.
+        compatible group of requests. The packed branch still calls
+        ``dense_step`` inside the armed step: the pipeline's keyword builder
+        accepts list latents and the adapter's root hook rewrites the call
+        into the packed layout, so packed and serial steps share one path.
 
         Admission preflights ``adapter.can_pack``, so the armed root hook
         normally has nothing to refuse. If it nevertheless declines (an
@@ -77,9 +78,9 @@ class MixFusionDriver:
 
         if self.pipeline.interrupt:
             return None
-        # The packed branch calls the transformer directly, bypassing the
-        # pipeline's dense wrapper that records the current timestep for model
-        # code reading ``pipeline._current_timestep``.
+        # Model code reads ``pipeline._current_timestep``. The delegated dense
+        # step publishes it too, but set it before dispatch so a serial
+        # fallback that rebuilds sub-batches never observes a stale step.
         self.pipeline._current_timestep = input_batch.timesteps
 
         min_chunk_tokens, max_chunks = self._chunk_policy(input_batch)
@@ -93,7 +94,7 @@ class MixFusionDriver:
 
         try:
             with self.armed(min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks):
-                return self.transformer(**self.adapter.build_packed_call(input_batch))
+                return dense_step(input_batch, states=states)
         except MixFusionPackingError as exc:
             logger.warning(
                 "MixFusion packing failed after admission: %s. Falling back to per-request denoise.",

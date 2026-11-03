@@ -148,6 +148,17 @@ def _record_dense(calls: list, result: str = "dense"):
     return dense_step
 
 
+def _packed_dense_step(transformer: _FakeTransformer, calls: list | None = None):
+    """Stand-in for the pipeline's dense step: forwards the packed list."""
+
+    def dense_step(batch, **kwargs):
+        if calls is not None:
+            calls.append((batch, kwargs))
+        return transformer(hidden_states=batch.latents)
+
+    return dense_step
+
+
 def _state(
     request_id: str,
     latents: torch.Tensor,
@@ -197,17 +208,22 @@ def test_run_packs_an_admissible_ragged_batch():
     driver, transformer = _driver()
     batch = _ragged_batch()
     ctx = ForwardContext()
+    dense_calls: list = []
 
     with override_forward_context(ctx):
-        result = driver.run(batch, states=(), dense_step=_record_dense([]))
+        # The packed branch delegates to the pipeline's dense step inside the
+        # armed context; the fake step forwards the list to the model.
+        result = driver.run(batch, states=("s0", "s1"), dense_step=_packed_dense_step(transformer, dense_calls))
 
         assert result == PACKED_OUTPUT
+        assert dense_calls == [(batch, {"states": ("s0", "s1")})]
         assert transformer.calls == [{"hidden_states": batch.latents}]
         step = transformer.armed_at_call
         assert isinstance(step, MixFusionStep)
         assert step.adapter is driver.adapter
         assert (step.min_chunk_tokens, step.max_chunks) == (1, DEFAULT_MAX_CHUNKS)
-        # The packed branch bypasses the dense wrapper that publishes it.
+        # The delegated dense step publishes it; the driver also sets it
+        # before dispatch so a serial fallback never sees a stale step.
         assert driver.pipeline._current_timestep is batch.timesteps
         # The armed step covers exactly the packed call.
         assert ctx.mixfusion_step is None
@@ -243,7 +259,7 @@ def test_run_falls_back_to_serial_ragged_when_the_armed_hook_declines():
     driver.serial_ragged = lambda input_batch, states, dense_step: serial_batches.append(input_batch) or "serial"
 
     with override_forward_context(ForwardContext()):
-        result = driver.run(batch, states=(), dense_step=_record_dense([]))
+        result = driver.run(batch, states=(), dense_step=_packed_dense_step(transformer))
 
     assert result == "serial"
     assert serial_batches == [batch]
