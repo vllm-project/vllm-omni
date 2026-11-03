@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 import vllm_omni.diffusion.diffusion_kv.initialization as initialization
@@ -248,24 +249,27 @@ def test_diffusion_config_enables_moe_backend_lora_selection_before_model_load(
 
 
 @pytest.mark.parametrize(
-    ("is_cuda", "is_xpu", "lora_path", "expects_lora"),
+    ("is_cuda", "is_xpu", "lora_path", "native_mxfp4", "expects_lora"),
     [
-        (True, False, None, False),
-        (True, False, "/adapter", True),
-        (False, True, None, False),
-        (False, True, "/adapter", True),
-        (False, False, None, True),
+        (True, False, None, True, False),
+        (True, False, None, False, True),
+        (True, False, "/adapter", True, True),
+        (False, True, None, True, False),
+        (False, True, "/adapter", True, True),
+        (False, False, None, False, True),
     ],
 )
 def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
     is_cuda,
     is_xpu,
     lora_path,
+    native_mxfp4,
     expects_lora,
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: is_cuda)
     monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: is_xpu)
+    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: native_mxfp4)
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
@@ -279,6 +283,87 @@ def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
     )
 
     assert (config.lora_config is not None) is expects_lora
+
+
+@pytest.mark.parametrize(
+    ("is_cuda", "is_xpu", "capability", "quant_supported", "expected"),
+    [
+        (True, False, DeviceCapability(10, 0), True, True),
+        (True, False, DeviceCapability(12, 0), False, False),
+        (True, False, DeviceCapability(9, 0), False, False),
+        (True, False, None, False, False),
+        (False, True, None, False, True),
+        (False, False, None, False, False),
+    ],
+)
+def test_online_mxfp4_native_backend_device_gate(
+    is_cuda,
+    is_xpu,
+    capability,
+    quant_supported,
+    expected,
+    monkeypatch,
+) -> None:
+    import vllm._custom_ops as vllm_ops
+
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: is_cuda)
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: is_xpu)
+    monkeypatch.setattr(
+        diffusion_vllm_config.current_omni_platform,
+        "get_device_capability",
+        lambda: capability,
+    )
+    queried_capabilities: list[int] = []
+
+    def _quant_supported(device_capability: int) -> bool:
+        queried_capabilities.append(device_capability)
+        return quant_supported
+
+    monkeypatch.setattr(vllm_ops, "mxfp4_experts_quant_supported", _quant_supported)
+
+    assert diffusion_vllm_config._supports_native_online_mxfp4_moe() is expected
+    if is_cuda and capability is not None:
+        assert queried_capabilities == [capability.to_int()]
+    else:
+        assert queried_capabilities == []
+
+
+def test_online_non_mxfp4_moe_lora_is_preserved(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: True)
+
+    config = diffusion_vllm_config.create_diffusion_vllm_config(
+        torch.device("cpu"),
+        _od_config(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            is_moe=True,
+            lora_backend="peft",
+            lora_path=None,
+            quantization_config=build_quant_config({"method": "online", "moe": "fp8_per_tensor_dynamic"}),
+        ),
+    )
+
+    assert config.lora_config is not None
+
+
+def test_online_mxfp4_moe_lora_gate_is_scoped_to_moe(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: True)
+
+    config = diffusion_vllm_config.create_diffusion_vllm_config(
+        torch.device("cpu"),
+        _od_config(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            is_moe=False,
+            lora_backend="peft",
+            lora_path=None,
+            quantization_config=build_quant_config({"method": "online", "moe": "mxfp4"}),
+        ),
+    )
+
+    assert config.lora_config is None
 
 
 @pytest.mark.parametrize(

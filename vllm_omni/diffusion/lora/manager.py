@@ -26,6 +26,7 @@ from vllm.lora.utils import (
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
 from vllm_omni.diffusion.lora.utils import (
+    MOE_LORA_UNAVAILABLE_ERROR,
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
     from_layer_diffusion,
@@ -549,6 +550,19 @@ class DiffusionLoRAManager:
             if target_modules_list is None:
                 return True
             return _match_target_modules(module_name, target_modules_list)
+
+        if self._max_num_batched_tokens is None:
+            from vllm.model_executor.layers.fused_moe import MoERunner
+
+            for component_name, component in self._iter_lora_components():
+                for module_name, module in component.named_modules(remove_duplicate=False):
+                    if not isinstance(module, MoERunner):
+                        continue
+                    full_module_name = f"{component_name}.{module_name}"
+                    if _matches_target(full_module_name) or any(
+                        _matches_target(name) for name in _moe_lora_target_names(full_module_name, module)
+                    ):
+                        raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
 
         # dummy lora config
         lora_config = LoRAConfig(
@@ -1115,7 +1129,7 @@ class DiffusionLoRAManager:
         """
         max_tokens = self._max_num_batched_tokens
         if max_tokens is None:
-            raise RuntimeError("MoE LoRA token capacity was not configured")
+            raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         slot = 1 if self._active_adapter_id is not None else 0
         mapping = LoRAMapping(
             index_mapping=(slot,) * max_tokens,
@@ -1133,7 +1147,7 @@ class DiffusionLoRAManager:
 
         max_tokens = self._max_num_batched_tokens
         if max_tokens is None:
-            raise RuntimeError("MoE LoRA token capacity was not configured")
+            raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         # GPU Punica requires LoRAConfig; also pass it to NPU.
         lora_config = LoRAConfig(
             max_lora_rank=self._max_lora_rank,

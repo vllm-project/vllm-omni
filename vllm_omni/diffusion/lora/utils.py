@@ -20,6 +20,13 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionRowParallelLinearWithLoRA,
 )
 
+MOE_LORA_UNAVAILABLE_ERROR = (
+    "MoE LoRA is unavailable because its token capacity was not configured. "
+    "Online MXFP4 disables MoE LoRA when no startup `lora_path` is set so it can "
+    "use the native expert kernel. Set `lora_path` at startup to enable MoE "
+    "adapters; request-time MoE adapters cannot use the native MXFP4 path."
+)
+
 
 def _select_moe_lora_wrapper_cls() -> type:
     """Select the vLLM or Ascend MoE LoRA wrapper for the current platform."""
@@ -131,7 +138,7 @@ def from_layer_diffusion(
     # MoE wrappers own the whole runner and do not use dense packed-layer mapping.
     if isinstance(layer, MoERunner):
         if max_num_batched_tokens is None:
-            raise RuntimeError("MoE LoRA token capacity was not configured")
+            raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         wrapper_cls = _select_moe_lora_wrapper_cls()
         instance = wrapper_cls(layer)
         buffer_device: list[torch.device | None] = [None]

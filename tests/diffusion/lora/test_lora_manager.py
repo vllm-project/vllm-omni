@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -244,6 +245,7 @@ def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
     )
 
     peft_helper = type(
@@ -255,6 +257,95 @@ def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
 
     assert "transformer.experts" in manager._lora_modules
     assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+
+
+def test_moe_adapter_fails_before_dense_layers_are_wrapped_without_token_capacity(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    from_layer = Mock(side_effect=AssertionError("preflight must run before wrapping"))
+    monkeypatch.setattr(manager_mod, "from_layer_diffusion", from_layer)
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {"r": 1, "target_modules": ["gate_proj"]},
+    )()
+    with pytest.raises(
+        RuntimeError,
+        match="request-time MoE adapters cannot use the native MXFP4 path",
+    ):
+        manager._replace_layers_with_lora(peft_helper)
+
+    from_layer.assert_not_called()
+    assert manager._lora_modules == {}
+
+
+def test_dense_only_adapter_still_wraps_without_moe_token_capacity(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    wrapped_names: list[str] = []
+
+    def _fake_from_layer_diffusion(*, layer: torch.nn.Module, **_kwargs):
+        wrapped_names.append(type(layer).__name__)
+        return _DummyBaseLayerWithLoRA(layer)
+
+    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {"r": 1, "target_modules": ["foo"]},
+    )()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert wrapped_names == ["FakeLinearBase"]
+    assert isinstance(pipeline.transformer.foo, _DummyBaseLayerWithLoRA)
+    assert isinstance(pipeline.transformer.experts, _TargetMoERunner)
 
 
 def test_moe_punica_initializes_public_mapping_metadata(monkeypatch):

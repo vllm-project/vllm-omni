@@ -218,9 +218,25 @@ def resolve_diffusion_moe_lora_token_capacity(
     return capacity
 
 
+def _supports_native_online_mxfp4_moe() -> bool:
+    """Return whether this device has a native online-MXFP4 MoE backend."""
+    if current_omni_platform.is_xpu():
+        return True
+    if not current_omni_platform.is_cuda():
+        return False
+
+    capability = current_omni_platform.get_device_capability()
+    if capability is None:
+        return False
+
+    from vllm import _custom_ops as ops
+
+    return ops.mxfp4_experts_quant_supported(capability.to_int())
+
+
 def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
-    """Return whether the model uses vLLM's online MXFP4 MoE quantization."""
-    if not od_config.is_moe or not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
+    """Return whether the model uses online MXFP4 MoE on a native backend."""
+    if not od_config.is_moe:
         return False
 
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
@@ -230,7 +246,9 @@ def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
     if not isinstance(quant_config, OnlineQuantizationConfig):
         return False
     moe_spec = getattr(getattr(quant_config, "args", None), "moe", None)
-    return moe_spec is not None and moe_spec.weight == kMxfp4Static
+    if moe_spec is None or moe_spec.weight != kMxfp4Static:
+        return False
+    return _supports_native_online_mxfp4_moe()
 
 
 def create_base_diffusion_vllm_config(
@@ -270,7 +288,8 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         # Keep the baseline on those kernels. Startup adapters keep LoRA enabled;
         # CUDA can fall back to W4A16 MARLIN, while XPU has no LoRA MXFP4 backend.
         logger.info(
-            "Disabling MoE LoRA for online MXFP4 on CUDA/XPU without a startup adapter; "
+            "Disabling MoE LoRA for online MXFP4 on a native-capable CUDA/XPU device "
+            "without a startup adapter; "
             "this enables the native MXFP4 MoE backend."
         )
         moe_lora_enabled = False
