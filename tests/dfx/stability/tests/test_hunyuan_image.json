@@ -7,7 +7,7 @@
                     "res": {
                         "cuda": "H800"
                     },
-                    "num_cards": 2
+                    "num_cards": 4
                 }
             },
             "local_model",
@@ -21,6 +21,53 @@
                 "quantization": "fp8",
                 "distributed-executor-backend": "mp",
                 "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2i",
+                "backend": "vllm-omni",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "width": {
+                    "min": 512,
+                    "max": 1024
+                },
+                "height": {
+                    "min": 512,
+                    "max": 1024
+                },
+                "num_inference_steps": 50,
+                "enable_negative_prompt": true
+            }
+        ]
+    },
+    {
+        "test_name": "test_hunyuan_image_stability_tp2_sp2_a3",
+        "description": "A3: same as perf test_hunyuan_image_tp2_sp2 — DiT-only, TP=2 USP=2, 4 dies, no fp8",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "npu": "A3"
+                    },
+                    "num_cards": 4
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "tencent/HunyuanImage-3.0-Instruct",
+            "serve_args": {
+                "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml",
+                "tensor-parallel-size": 2,
+                "ulysses-degree": 2,
+                "vae-patch-parallel-size": 4,
+                "vae-use-tiling": true,
                 "enable-diffusion-pipeline-profiler": true
             }
         },

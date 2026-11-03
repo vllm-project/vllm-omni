@@ -107,8 +107,8 @@ def test_endpoint_decisions_match_the_serving_side_policy(
 # --------------------------------------------------------------------------- #
 
 
-def test_a_loud_frame_does_not_restart_the_silence_timer() -> None:
-    """Silero v6.2 hysteresis: once silence is running, a loud frame only delays it.
+def test_hysteresis_band_does_not_restart_the_silence_timer() -> None:
+    """Scores between the negative and activation thresholds preserve the timer.
 
     The frame at 0.45 sits above the negative threshold (0.35) but below the
     activation threshold. It must not cancel the pending endpoint, or a speaker
@@ -164,9 +164,14 @@ def _pcm16_b64(samples: np.ndarray) -> str:
 
 def test_pcm16_input_is_accepted_alongside_float32() -> None:
     config = SileroVADConfig(threshold=0.5)
-    tone = np.zeros(FRAME * 2, dtype=np.float32)
+    tone: np.ndarray = np.zeros(FRAME * 2, dtype=np.float32)
     seen: list[int] = []
-    vad = SileroStreamingVAD(config, frame_scorer=lambda frame: seen.append(frame.size) or 0.0)
+
+    def _score_frame(frame: np.ndarray) -> float:
+        seen.append(frame.size)
+        return 0.0
+
+    vad = SileroStreamingVAD(config, frame_scorer=_score_frame)
     vad.process_base64(_pcm16_b64(tone), fmt="pcm16", sample_rate_hz=SAMPLE_RATE_HZ)
     assert seen == [FRAME, FRAME]
 
@@ -272,7 +277,7 @@ def test_the_onnx_backend_holds_the_upstream_silero_v62_contract(monkeypatch, tm
         intra_op_num_threads = 0
 
     class FakeInferenceSession:
-        def __init__(self, path: str, *, providers: list[str], sess_options: object) -> None:
+        def __init__(self, path: str, *, providers: list[str], sess_options: FakeSessionOptions) -> None:
             self.providers = providers
             self.sess_options = sess_options
             self.calls: list[dict[str, np.ndarray]] = []
@@ -313,7 +318,7 @@ def test_the_onnx_backend_holds_the_upstream_silero_v62_contract(monkeypatch, tm
     assert session.calls[0]["sr"].item() == SAMPLE_RATE_HZ
 
     state = backend.new_state()
-    first_frame = np.arange(backend.frame_samples, dtype=np.float32)
+    first_frame: np.ndarray = np.arange(backend.frame_samples, dtype=np.float32)
     probability, state = backend.infer(first_frame, state)
     first_call = session.calls[1]
 
@@ -377,3 +382,17 @@ def test_the_documented_server_vad_fields_are_all_accepted() -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize("speech_probability", [0.5, 0.9])
+def test_resumed_speech_cancels_pending_silence(speech_probability):
+    config = SileroVADConfig(threshold=0.5, prefix_padding_ms=0, silence_duration_ms=96, min_speech_duration_ms=32)
+    # 32 ms pause, resumed speech, then a full 96 ms pause: one utterance.
+    scores = [0.9, 0.1, speech_probability, speech_probability, 0.1, 0.1, 0.1]
+    assert _drive(config, scores) == [("start", 0), ("stop", 224)]
+
+
+def test_short_pauses_do_not_split_continuous_speech_into_repeated_turns():
+    config = SileroVADConfig(threshold=0.5, prefix_padding_ms=0, silence_duration_ms=500, min_speech_duration_ms=32)
+    scores = [0.9] + [0.1, 0.9, 0.9, 0.9] * 20
+    assert _drive(config, scores) == [("start", 0)]

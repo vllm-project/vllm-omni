@@ -198,6 +198,14 @@ def test_response_metrics_include_engine_tpot_and_stream_window():
         "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
+        # Without server request metrics, TTFT already starts at response.created.
+        "client_ttft_ms": {"count": 2, "mean": 100.0, "p50": 100.0, "p99": 100.0},
+        "stages": {
+            "0": {
+                "ttft_ms": {"count": 2, "mean": 0.0, "p50": 0.0, "p99": 0.0},
+                "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
+            }
+        },
         "stream_ttft_ms": 200.0,
         "stream_ttfp_ms": 300.0,
         "stream_rtf": 8.333333,
@@ -241,6 +249,252 @@ def test_dataset_discovers_official_layouts_and_total_selection(tmp_path: Path):
     assert [case.subset for case in all_cases] == ["1q1a", "1q1a_math", "1qna"]
     assert all_cases[-1].video_rel == "videos_bench/nested/guide.mp4"
     assert [case.subset for case in selected] == ["1q1a", "1q1a_math"]
+
+
+def _write_scenario_dataset(root: Path) -> Path:
+    data_root = root / "data"
+    one_q1a = data_root / "1q1a"
+    (one_q1a / "videos").mkdir(parents=True)
+    (one_q1a / "annotations").mkdir()
+    entries = []
+    specs = [
+        ("realtime", "multi_turn", [{"question_time": 0.0, "answer_time": 1.0, "question_type": "realtime"}]),
+        ("proactive", "multi_turn", [{"question_time": 0.0, "answer_time": 1.0, "question_type": "proactive"}]),
+        (
+            "nested",
+            "nested",
+            [
+                {
+                    "question_time": 0.0,
+                    "answer_time": 4.0,
+                    "question_type": "proactive",
+                    "question_text": "outer",
+                    "answer_text": "outer",
+                },
+                {
+                    "question_time": 1.0,
+                    "answer_time": 2.0,
+                    "question_type": "realtime",
+                    "question_text": "inner",
+                    "answer_text": "inner",
+                },
+            ],
+        ),
+        (
+            "interrupted",
+            "multi_turn",
+            [
+                {
+                    "question_time": 0.0,
+                    "answer_time": 1.0,
+                    "question_type": "realtime",
+                    "is_interrupted": True,
+                }
+            ],
+        ),
+    ]
+    for name, scene, annotation in specs:
+        video = one_q1a / "videos" / f"{name}.mp4"
+        ann = one_q1a / "annotations" / f"{name}.json"
+        video.touch()
+        ann.write_text(json.dumps(annotation))
+        entries.append(
+            {
+                "video": f"videos/{name}.mp4",
+                "annotation": f"annotations/{name}.json",
+                "scene_type": scene,
+            }
+        )
+    (one_q1a / "video_json_map.json").write_text(json.dumps({"entries": entries}))
+
+    one_qna = data_root / "1qna"
+    (one_qna / "videos_bench").mkdir(parents=True)
+    (one_qna / "annotations").mkdir(parents=True)
+    (one_qna / "videos_bench" / "guide.mp4").touch()
+    (one_qna / "annotations" / "guide.json").write_text(
+        json.dumps(
+            {
+                "question_time": 0.0,
+                "question_text": "q",
+                "answers": [{"answer_time": 1.0, "answer_text": "a", "label": "step"}],
+            }
+        )
+    )
+    math_root = data_root / "1q1a_math"
+    (math_root / "videos").mkdir(parents=True)
+    (math_root / "annotations").mkdir()
+    (math_root / "videos" / "math.mp4").touch()
+    (math_root / "annotations" / "math.json").write_text(
+        json.dumps([{"question_time": 0.0, "answer_time": 1.0, "question_type": "realtime"}])
+    )
+    (math_root / "video_json_map.json").write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "video": "videos/math.mp4",
+                        "annotation": "annotations/math.json",
+                        "scene_type": "multi_turn",
+                    }
+                ]
+            }
+        )
+    )
+    return data_root
+
+
+def test_scenario_cover_and_focus_sampling(tmp_path: Path) -> None:
+    root = _write_scenario_dataset(tmp_path)
+    covered = data.discover_omniinteract_cases(
+        root,
+        ("1q1a", "1q1a_math", "1qna"),
+        num_prompts=5,
+        disable_shuffle=True,
+        scenario_tags=("realtime", "proactive", "nested", "interrupted", "1qna"),
+    )
+    assert len(covered) == 5
+    covered_tags = set().union(*(data.case_scenario_tags(case) for case in covered))
+    assert {"realtime", "proactive", "nested", "interrupted", "1qna"} <= covered_tags
+
+    focused = data.discover_omniinteract_cases(
+        root,
+        ("1q1a", "1q1a_math", "1qna"),
+        num_prompts=0,
+        disable_shuffle=True,
+        scenario_tags=("nested", "1qna"),
+        scenario_focus=True,
+    )
+    assert {case.scene_type for case in focused} == {"nested", "1qna"}
+
+
+def test_load_cases_from_video_list_preserves_order_and_caps(tmp_path: Path) -> None:
+    root = _write_dataset(tmp_path)
+    all_cases = data.discover_omniinteract_cases(root, data.OMNIINTERACT_SUBSETS, num_prompts=0, disable_shuffle=True)
+    ordered = list(reversed(all_cases))
+    video_list = tmp_path / "sampled_cases.jsonl"
+    video_list.write_text("".join(json.dumps(data.sampled_case_row(case)) + "\n" for case in ordered))
+
+    capped = data.load_omniinteract_cases_from_video_list(video_list, num_prompts=2)
+    assert [case.video_path for case in capped] == [case.video_path for case in ordered[:2]]
+
+    full = data.load_omniinteract_cases_from_video_list(video_list, num_prompts=0)
+    assert [case.video_path for case in full] == [case.video_path for case in ordered]
+    oversized = data.load_omniinteract_cases_from_video_list(video_list, num_prompts=99)
+    assert [case.video_path for case in oversized] == [case.video_path for case in ordered]
+
+
+def test_load_cases_from_video_list_requires_existing_video(tmp_path: Path) -> None:
+    root = _write_dataset(tmp_path)
+    case = data.discover_omniinteract_cases(root, ("1q1a",), num_prompts=1, disable_shuffle=True)[0]
+    row = data.sampled_case_row(case)
+    row["video_path"] = str(tmp_path / "missing.mp4")
+    video_list = tmp_path / "bad.jsonl"
+    video_list.write_text(json.dumps(row) + "\n")
+    with pytest.raises(FileNotFoundError, match="video missing"):
+        data.load_omniinteract_cases_from_video_list(video_list, num_prompts=0)
+
+
+def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _write_dataset(tmp_path)
+    cases = data.discover_omniinteract_cases(root, data.OMNIINTERACT_SUBSETS, num_prompts=0, disable_shuffle=True)
+    video_list = tmp_path / "sampled_cases.jsonl"
+    video_list.write_text("".join(json.dumps(data.sampled_case_row(case)) + "\n" for case in cases))
+    ref = tmp_path / "ref.wav"
+    ref.touch()
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--backend",
+            "openai-realtime-duplex",
+            "--dataset-name",
+            "omniinteract",
+            "--model",
+            MODEL,
+            "--endpoint",
+            "/v1/realtime",
+            "--num-prompts",
+            "2",
+            "--omniinteract-ref-audio",
+            str(ref),
+            "--omniinteract-video-list",
+            str(video_list),
+        ]
+    )
+    preprocess_serve_args(args)
+    monkeypatch.setattr(
+        "vllm_omni.clients.duplex.reference_audio_data_url",
+        lambda _: "data:audio/wav;base64,ref",
+    )
+    monkeypatch.setattr(benchmark_patch, "prepare_media", lambda *a, **k: (1.0, b"pcm", ["frame"]))
+    samples = benchmark_patch.get_samples(args, None)
+    assert len(samples) == 2
+    assert [sample.omniinteract_case.video_path for sample in samples] == [case.video_path for case in cases[:2]]
+
+
+def _write_overlapping_cover_dataset(root: Path) -> Path:
+    data_root = root / "data"
+    one_q1a = data_root / "1q1a"
+    (one_q1a / "videos").mkdir(parents=True)
+    (one_q1a / "annotations").mkdir()
+    entries = []
+    specs = [
+        (
+            "pair_a",
+            [
+                {
+                    "question_time": 0.0,
+                    "answer_time": 1.0,
+                    "question_type": "realtime",
+                    "is_interrupted": True,
+                }
+            ],
+        ),
+        (
+            "pair_b",
+            [
+                {
+                    "question_time": 0.0,
+                    "answer_time": 1.0,
+                    "question_type": "realtime",
+                    "is_interrupted": True,
+                }
+            ],
+        ),
+        (
+            "proactive_only",
+            [{"question_time": 0.0, "answer_time": 1.0, "question_type": "proactive"}],
+        ),
+    ]
+    for name, annotation in specs:
+        video = one_q1a / "videos" / f"{name}.mp4"
+        ann = one_q1a / "annotations" / f"{name}.json"
+        video.touch()
+        ann.write_text(json.dumps(annotation))
+        entries.append(
+            {
+                "video": f"videos/{name}.mp4",
+                "annotation": f"annotations/{name}.json",
+                "scene_type": "multi_turn",
+            }
+        )
+    (one_q1a / "video_json_map.json").write_text(json.dumps({"entries": entries}))
+    return data_root
+
+
+def test_cover_sampling_skips_tags_already_covered(tmp_path: Path) -> None:
+    root = _write_overlapping_cover_dataset(tmp_path)
+    selected = data.discover_omniinteract_cases(
+        root,
+        ("1q1a",),
+        num_prompts=2,
+        disable_shuffle=True,
+        scenario_tags=("realtime", "interrupted", "proactive"),
+    )
+    names = [case.video_path.stem for case in selected]
+    assert names == ["pair_a", "proactive_only"]
+    selected_tags = set().union(*(data.case_scenario_tags(case) for case in selected))
+    assert {"realtime", "interrupted", "proactive"} <= selected_tags
 
 
 def _archive(path: Path, member: str) -> None:
@@ -352,7 +606,8 @@ def test_response_ledger_rejects_identity_errors(events, match: str):
 
 class _CompletionClient:
     def __init__(self, collector: EventCollector):
-        self.events, self.acks = collector, []
+        self.events = collector
+        self.acks: list[tuple[str, int]] = []
 
     def raise_if_reader_stopped(self) -> None:
         return None
@@ -448,19 +703,20 @@ async def test_acks_continue_after_committed_input():
     assert playback.completion_acked == {"r1"}
 
 
-def test_tolerated_playback_ack_rejection_is_a_warning_not_a_failure():
+@pytest.mark.parametrize("code", ["playback_ack_too_late", "playback_item_not_found"])
+def test_tolerated_playback_ack_rejection_is_a_warning_not_a_failure(code: str):
     collector = _collector(
         (
             {
                 "type": "error",
-                "error": {"type": "invalid_request_error", "code": "playback_ack_too_late"},
+                "error": {"type": "invalid_request_error", "code": code},
             },
             1.0,
         ),
     )
     warnings: list[str] = []
     oi._raise_if_session_terminated(collector, 0, warnings=warnings)
-    assert warnings == ["tolerated in-flight server rejection: playback_ack_too_late"]
+    assert warnings == [f"tolerated in-flight server rejection: {code}"]
 
     collector.add({"type": "error", "error": {"code": "bad_event", "message": "boom"}}, received_at_s=1.1)
     with pytest.raises(RuntimeError, match="bad_event"):
@@ -536,6 +792,110 @@ def test_ineligible_outputs_are_excluded_from_manifest(tmp_path: Path, audio_tim
     assert reason in result.official_eval_ineligible_reasons
     oi.write_batch_artifacts(tmp_path / "out", [case], [result])
     assert (tmp_path / "out" / "official_eval_manifest.jsonl").read_text() == ""
+    sampled = [
+        json.loads(line) for line in (tmp_path / "out" / "sampled_cases.jsonl").read_text().splitlines() if line.strip()
+    ]
+    assert sampled == [
+        {
+            "video_path": str(case.video_path.resolve()),
+            "output_name": data.official_output_name(case),
+            "subset": case.subset,
+        }
+    ]
+
+
+def test_cleared_response_leaves_the_playback_clock_and_the_manifest(tmp_path: Path):
+    # r1 queues 2 s of audio at t=10; the user barges in at t=10.5, so the
+    # server clears r1. A live client flushes its queue: r1 keeps 0.5 s, its
+    # later delta never plays, and r2 starts at once instead of after r1.
+    case = _case(tmp_path)
+    collector = _collector(
+        (_created("r1"), 9.9),
+        (_audio("r1", samples=24_000), 10.0),
+        (_audio("r1", samples=24_000), 10.01),
+        (_text("r1", "first"), 10.02),
+        ({"type": "output_audio_buffer.cleared", "response_id": "r1"}, 10.5),
+        (_audio("r1", samples=2400), 10.51),
+        (_done("r1"), 10.52),
+        (_created("r2"), 10.6),
+        (_audio("r2", samples=2400), 10.7),
+        (_text("r2", "second"), 10.71),
+        (_done("r2"), 10.72),
+    )
+    result = oi.OmniInteractCaseResult(case.subset, str(case.video_path), "")
+    playback = oi._Playback()
+    playback.ingest(collector)
+    assert playback.cleared == playback.truncated == {"r1"}
+    assert [(s.response_id, round(s.start_s, 3), round(s.end_s, 3)) for s in playback.segments] == [
+        ("r1", 10.0, 10.5),
+        ("r2", 10.7, 10.8),
+    ]
+    assert len(playback.segments[0].pcm16) == 12_000 * 2
+    context = oi._collect_output(
+        collector,
+        playback,
+        stream_start=0.0,
+        video_duration_s=11.0,
+        require_response=False,
+        retain_events=True,
+        result=result,
+    )
+    assert result.official_eval_ineligible_reasons == ["cleared_response"]
+    assert [chunk["timestamp"] for chunk in context.chunks] == [[10.0, 10.5], [10.7, 10.8]]
+    flushed = [event for event in context.events if event["type"] == "response.output_audio.delta"]
+    assert [event["audio_bytes"] for event in flushed] == [24_000, 0, 0, 4800]
+
+
+def test_clear_after_full_playback_keeps_the_case_eligible(tmp_path: Path):
+    case, collector, result = _successful_output(tmp_path)
+    collector.add({"type": "output_audio_buffer.cleared", "response_id": "r1"}, received_at_s=10.5)
+    context_playback = oi._Playback()
+    oi._collect_output(
+        collector,
+        context_playback,
+        stream_start=0.0,
+        video_duration_s=11.0,
+        require_response=False,
+        retain_events=False,
+        result=result,
+    )
+    assert context_playback.cleared == {"r1"} and not context_playback.truncated
+    assert result.eligible_for_official_eval
+
+
+def test_official_output_name_matches_minicpmo_batch_layout(tmp_path: Path):
+    one_q1a = _case(tmp_path, subset="1q1a", name="videos/clip_a.mp4")
+    one_qna = _case(tmp_path, subset="1qna", name="videos_bench/nested/guide.mp4")
+    assert data.official_output_name(one_q1a) == "1q1a/videos__clip_a"
+    assert data.official_output_name(one_qna) == "1qna/nested__guide"
+    row = data.sampled_case_row(one_q1a)
+    assert row["video_path"] == str(one_q1a.video_path.resolve())
+    assert row["output_name"] == "1q1a/videos__clip_a"
+    assert row["subset"] == "1q1a"
+
+
+def test_sampled_cases_jsonl_lists_every_case_including_failures(tmp_path: Path):
+    ok_case = _case(tmp_path, name="videos/ok.mp4")
+    bad_case = _case(tmp_path, name="videos/bad.mp4")
+    ok_result = oi.OmniInteractCaseResult(
+        ok_case.subset, str(ok_case.video_path), str(oi._output_dir(tmp_path / "out", ok_case)), success=True
+    )
+    ok_result.eligible_for_official_eval = True
+    bad_result = oi.OmniInteractCaseResult(
+        bad_case.subset, str(bad_case.video_path), str(oi._output_dir(tmp_path / "out", bad_case)), success=False
+    )
+    oi.write_batch_artifacts(tmp_path / "out", [ok_case, bad_case], [ok_result, bad_result])
+    sampled = [
+        json.loads(line) for line in (tmp_path / "out" / "sampled_cases.jsonl").read_text().splitlines() if line.strip()
+    ]
+    assert [row["output_name"] for row in sampled] == ["1q1a/videos__ok", "1q1a/videos__bad"]
+    manifest = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "official_eval_manifest.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(manifest) == 1
+    assert manifest[0]["sample_id"].startswith("1q1a__")
 
 
 def test_artifacts_require_complete_audio_and_transcript_response(tmp_path: Path):
@@ -637,7 +997,7 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
         request_index=0,
         prepared_input=prepared,
     )
-    assert result.success and result.transcript == "answer" and result._artifact_context is not None
+    assert result.success and result.transcript == "answer" and result._artifact_context is not None, result.error
     assert not config.output_root.exists()
     assert "autostart=0" in _RealtimeClient.instances[-1].url
     session_config = _RealtimeClient.instances[-1].session_config
@@ -649,6 +1009,133 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
     # moment its audio arrived, then the exact total once drained.
     assert acks[-1] == ("r1", 1)
     assert acks in ([("r1", 1)], [("r1", 0), ("r1", 1)])
+
+
+class _ServerVadClient(_RealtimeClient):
+    """A turn-based session: frames only as image items, the server VAD answers."""
+
+    async def __aenter__(self):
+        self.sent: list[dict[str, object]] = []
+        caps = {
+            "chunk_period_ms": 1000,
+            "required_input_modalities": ["audio"],
+            "optional_input_modalities": [],
+            "supports_image_input": True,
+        }
+        self.events.add({"type": "session.created", "session": {"capabilities": caps}})
+        return self
+
+    async def send(self, event: dict[str, object]) -> None:
+        self.sent.append(event)
+        if event["type"] != "input_audio_buffer.append" or any(
+            e["type"] == "response.created" for e in self.events.events
+        ):
+            return
+        now = time.monotonic()
+        for index, turn_event in enumerate(
+            (
+                {"type": "input_audio_buffer.speech_started"},
+                {"type": "input_audio_buffer.speech_stopped"},
+                {"type": "input_audio_buffer.committed"},
+                _created(),
+                _audio(samples=24),
+                _text(value="answer"),
+                _done(),
+            )
+        ):
+            self.events.add(turn_event, received_at_s=now + index * 0.001)
+
+    async def commit(self) -> None:
+        raise AssertionError("server_vad sessions must not send a client commit")
+
+
+@pytest.mark.asyncio
+async def test_server_vad_runner_sends_frames_as_image_items_and_never_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    case = _case(tmp_path)
+    config = oi.OmniInteractBenchmarkConfig(
+        model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        output_root=tmp_path / "out",
+        require_response=True,
+        turn_detection="server_vad",
+        instructions="Answer briefly.",
+    )
+    frame = base64.b64encode(b"jpeg").decode()
+    prepared = data.OmniInteractPreparedInput(1.0, b"\0\0" * 16_000, (frame,), None)
+    monkeypatch.setattr(oi, "_RealtimeSession", _ServerVadClient)
+    monkeypatch.setattr(oi, "_COMPLETION_SETTLE_S", 0.0)
+    monkeypatch.setattr(oi, "SERVER_VAD_TAIL_S", 0.2)
+    result = await oi.run_omniinteract_case(case, config, request_index=0, prepared_input=prepared)
+
+    assert result.success and result.transcript == "answer", result.error
+    client = _ServerVadClient.instances[-1]
+    session_config = client.session_config
+    assert session_config.turn_detection == {"type": "server_vad"}
+    assert session_config.instructions == "Answer briefly."
+    assert session_config.auto_response is False and session_config.overlap_policy is None
+    assert session_config.ref_audio is None and "force_listen_count" not in session_config.extra_body
+    appends = [event for event in client.sent if event["type"] == "input_audio_buffer.append"]
+    assert appends and not any("video_frames" in event for event in appends)
+    # Keep the complete clip and tail while sending at most one VAD frame.
+    chunks = [base64.b64decode(event["audio"]) for event in appends]
+    assert max(map(len, chunks)) <= 512 * 2
+    assert b"".join(chunks) == bytes(16_000 * 2 + 3_200 * 2)
+    images = [event for event in client.sent if event["type"] == "conversation.item.create"]
+    assert [event["item"]["content"][0]["image_url"] for event in images] == ["data:image/jpeg;base64," + frame]
+    assert result.input_video_frames == 1
+
+
+@pytest.mark.asyncio
+async def test_server_vad_runner_preserves_adjacent_turn_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import numpy as np
+
+    from vllm_omni.engine.duplex.turn_detection import ServerTurnDetector, TurnDetectionConfig
+
+    # An endpoint at 1664 ms and the next onset at 1760 ms fall in the same
+    # 200 ms append. Only replace the probability scorer, not the state machine.
+    pcm = np.concatenate([np.ones(36 * 512), np.zeros(16 * 512), np.ones(21 * 512)]).astype("<i2").tobytes()
+    detector = ServerTurnDetector(TurnDetectionConfig())
+    monkeypatch.setattr(detector.vad, "_frame_scorer", lambda frame: 0.99 if np.any(frame) else 0.01)
+    commits = []
+
+    class BoundaryClient(_ServerVadClient):
+        async def send(self, event: dict[str, object]) -> None:
+            self.sent.append(event)
+            if event["type"] != "input_audio_buffer.append":
+                return
+            detected = detector.process(str(event["audio"]), fmt="pcm16", sample_rate_hz=16_000)
+            if detected.speech_started:
+                self.events.add({"type": "input_audio_buffer.speech_started"})
+            if detected.speech_stopped:
+                self.events.add({"type": "input_audio_buffer.speech_stopped"})
+            if detected.should_commit:
+                commits.append(event["audio_end_ms"])
+                response_id = f"r{len(commits)}"
+                for response in (
+                    _created(response_id),
+                    _audio(response_id, samples=24),
+                    _text(response_id, value="answer"),
+                    _done(response_id),
+                ):
+                    self.events.add(response)
+
+    monkeypatch.setattr(oi, "_RealtimeSession", BoundaryClient)
+    monkeypatch.setattr(oi, "_COMPLETION_SETTLE_S", 0.0)
+    config = oi.OmniInteractBenchmarkConfig(
+        model="mock", output_root=tmp_path / "out", require_response=True, turn_detection="server_vad"
+    )
+    frame = base64.b64encode(b"jpeg").decode()
+    prepared = data.OmniInteractPreparedInput(len(pcm) / 32_000, pcm, (frame, frame), None)
+    result = await oi.run_omniinteract_case(_case(tmp_path), config, request_index=0, prepared_input=prepared)
+
+    assert commits == [1664, 2848]
+    assert result.success and result.responses == 2, result.error
+    client = BoundaryClient.instances[-1]
+    chunks = [base64.b64decode(event["audio"]) for event in client.sent if event["type"] == "input_audio_buffer.append"]
+    assert max(map(len, chunks)) <= 512 * 2
+    assert b"".join(chunks) == pcm + bytes(24_000 * 2)
+    assert result.input_video_frames == 2
 
 
 def test_standard_sample_loading_prepares_media_before_timing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -900,7 +1387,6 @@ def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monk
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
-        ("omniinteract_ref_audio", None, "ref-audio"),
         ("endpoint", "/v1/completions", "v1/realtime"),
         ("max_concurrency", 0, "positive"),
         ("skip_tokenizer_init", True, "skip-tokenizer-init"),
@@ -918,6 +1404,28 @@ def test_cli_rejects_incompatible_omniinteract_options(field: str, value, match:
     setattr(args, field, value)
     with pytest.raises(ValueError, match=match):
         preprocess_serve_args(args)
+
+
+def test_cli_accepts_a_turn_based_session_without_reference_audio():
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--backend",
+            "openai-realtime-duplex",
+            "--endpoint",
+            "/v1/realtime",
+            "--dataset-name",
+            "omniinteract",
+            "--model",
+            "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "--omniinteract-turn-detection",
+            "server_vad",
+        ]
+    )
+    preprocess_serve_args(args)
+    assert args.omniinteract_turn_detection == "server_vad"
+    assert args.omniinteract_ref_audio is None
 
 
 def test_whole_benchmark_lock_serializes_a_shared_output_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

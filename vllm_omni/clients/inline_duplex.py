@@ -32,8 +32,8 @@ from typing import TYPE_CHECKING
 from vllm_omni.clients.duplex import DuplexClientBase, DuplexConnectionError, SessionConfig
 
 if TYPE_CHECKING:
-    from vllm_omni.engine.duplex.realtime_commands import RealtimeInputDefaults
     from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
+    from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 __all__ = ["InlineDuplexClient"]
 
@@ -71,7 +71,7 @@ class InlineDuplexClient(DuplexClientBase):
 
     def _input_defaults(self) -> RealtimeInputDefaults:
         """Audio format / sample-rate / VAD defaults declared by this session's object."""
-        from vllm_omni.engine.duplex.realtime_commands import RealtimeInputDefaults
+        from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
         session_payload = self.session_info or self.config.to_session_payload(model=self.model)
         return RealtimeInputDefaults().with_session_payload(session_payload)

@@ -27,6 +27,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     HostWeightPlanResult,
     TensorBinding,
+    build_checkpoint_binding_plan,
 )
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
@@ -169,15 +170,17 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
-    torchao_config = SimpleNamespace(
-        get_name=lambda: "torchao",
-        is_checkpoint_torchao_serialized=True,
-    )
+@pytest.mark.parametrize(
+    ("torchao_serialized", "suffix"),
+    [(True, ".bin"), (False, ".pth")],  # torchao checkpoints, and plain state dicts such as Video Depth Anything's
+)
+def test_pytorch_checkpoints_use_pytorch_iterator(mocker, torchao_serialized, suffix):
     loader = _make_loader_with_weights([])
-    loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
+    if torchao_serialized:
+        torchao_config = SimpleNamespace(get_name=lambda: "torchao", is_checkpoint_torchao_serialized=True)
+        loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
     loader.load_config.pt_load_map_location = "cpu"
-    files = ["/weights/model-10.bin", "/weights/model-2.bin"]
+    files = [f"/weights/model-10{suffix}", f"/weights/model-2{suffix}"]
     mocker.patch.object(loader, "_prepare_weights", return_value=("/weights", files, False))
     pt_iterator = mocker.patch.object(
         loader_module,
@@ -196,7 +199,7 @@ def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
     weights = list(loader._get_weights_iterator(source))
 
     pt_iterator.assert_called_once_with(
-        ["/weights/model-2.bin", "/weights/model-10.bin"],
+        [f"/weights/model-2{suffix}", f"/weights/model-10{suffix}"],
         loader.load_config.use_tqdm_on_load,
         "cpu",
     )
@@ -628,6 +631,44 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
+def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "diffusion_pytorch_model.safetensors"
+    save_file(
+        {
+            "proj_in.weight": torch.zeros(2, 2),
+            "audio_proj_in.weight": torch.ones(2, 2),
+            "transformer_blocks.0.audio_ff.weight": torch.full((2, 2), 2.0),
+            "transformer_blocks.0.audio_to_video_attn.weight": torch.full((2, 2), 3.0),
+        },
+        checkpoint,
+    )
+    od_config = SimpleNamespace(
+        enable_multithread_weight_load=True,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *_args, **_kwargs: (tmp_path, [str(checkpoint)], True),
+    )
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+        weight_name_patterns=("audio_*", "transformer_blocks.*.audio_ff.*"),
+    )
+
+    weights = list(loader._get_weights_iterator(source))
+
+    assert [name for name, _tensor in weights] == [
+        "transformer.audio_proj_in.weight",
+        "transformer.transformer_blocks.0.audio_ff.weight",
+    ]
+
+
 def test_stream_online_quant_weights_offloads_layers_after_processing():
     from vllm.model_executor.model_loader.reload.layerwise import (
         get_layerwise_info,
@@ -675,6 +716,82 @@ def test_stream_online_quant_weights_offloads_layers_after_processing():
     assert events == ["first", "second"]
 
 
+def test_online_quant_finalizes_padded_layers_without_accumulating(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    resident: set[nn.Module] = set()
+    finalized: set[nn.Module] = set()
+
+    class _OnlineQuantMethod:
+        uses_meta_device = True
+
+    class _PaddedLayer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 3, bias=False)
+            self.quant_method = _OnlineQuantMethod()
+            info = layerwise.get_layerwise_info(self)
+            info.load_numel_total = self.weight.numel()
+            info.load_numel = 4  # The checkpoint omits two padding elements.
+
+        def to(self, device):
+            assert device == "cpu"
+            assert self in finalized
+            resident.remove(self)
+            return super().to(device)
+
+    model = nn.Sequential(_PaddedLayer(), _PaddedLayer(), _PaddedLayer())
+
+    def finalize(module, model_config):
+        assert model_config is None
+        assert not resident, "previous deferred layer must be offloaded before the next"
+        resident.add(module)
+        finalized.add(module)
+        layerwise.get_layerwise_info(module).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    DiffusersPipelineLoader._finalize_online_quant_weights_to_cpu(model)
+    assert finalized == set(model)
+    assert not resident
+
+
+def test_online_quant_finalization_waits_for_buffered_weight_consumer(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    class _BufferedModel(nn.Module):
+        consumed = False
+
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2, bias=False)
+            self.layer.quant_method = SimpleNamespace(uses_meta_device=True)
+            layerwise.get_layerwise_info(self.layer).load_numel_total = 6
+
+        def load_weights(self, weights):
+            buffered = list(weights)
+            assert not self.consumed
+            assert len(buffered) == 1
+            self.layer.weight.data.copy_(buffered[0][1])
+            layerwise.get_layerwise_info(self.layer).load_numel = 4
+            self.consumed = True
+            return None
+
+    model = _BufferedModel()
+    loader = _make_loader_with_weights(["weight"])
+    finalized = []
+
+    def finalize(layer, model_config):
+        assert layer is model.layer and model_config is None
+        assert model.consumed, "iterator exhaustion does not mean the consumer finished"
+        finalized.append(layer)
+        layerwise.get_layerwise_info(layer).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    loader.load_weights(model, stream_online_quant_to_cpu=True)
+    assert finalized == [model.layer]
+
+
 def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
     from unittest.mock import Mock
 
@@ -720,7 +837,7 @@ def test_initialize_model_sets_current_diffusion_config_during_model_constructio
 
     od_config = SimpleNamespace(
         model_class_name="DummyPipeline",
-        parallel_config=SimpleNamespace(vae_patch_parallel_size=1, sequence_parallel_size=1),
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=1, sequence_parallel_size=1),
         vae_use_slicing=False,
         vae_use_tiling=False,
     )
@@ -756,6 +873,7 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
+        weight_transfer_config=None,
     )
 
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
@@ -1239,6 +1357,169 @@ def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
 
     with pytest.raises(ValueError, match="per-tensor FP8, INT8, and MXFP8 linears"):
         loader.load_model(load_device="cpu")
+
+
+def test_dlo_allgather_allows_unquantized_host_fallback():
+    """Host-loaded unquantized fallback layers are plain contiguous bf16 —
+    the same runtime layout DLO already shards on the ordinary path — so the
+    allowlist must not reject them."""
+    from vllm_omni.quantization.int8_config import UnquantizedHostLinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(UnquantizedHostLinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
+
+
+def test_dlo_load_model_keeps_host_fallback_on_cpu_through_post_load_sweep(monkeypatch, mocker):
+    """Through load_model(): DLO + online quant must build the model inside
+    load_unquantizable_fallback_on_cpu(), and the over-wide fallback weight
+    must survive the post-load sweep (the _process_weights_after_loading pass
+    plus model.to("cpu")) as the same host tensor it was loaded into — never
+    bounced to the accelerator."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.quantization import int8_config
+    from vllm_omni.quantization.int8_config import (
+        NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+        DiffusionInt8Config,
+        NPUInt8OnlineLinearMethod,
+        UnquantizedHostLinearMethod,
+    )
+
+    # Same stand-in as TestHostFallbackLoading: the eager fallback delegates to
+    # UnquantizedLinearMethod, which reads the TP group.
+    mock_group = mocker.Mock()
+    mock_group.rank_in_group = 0
+    mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+    mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+    od_config = _make_dlo_online_quant_config()
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+
+    out_features = NPU_QUANT_MATMUL_MAX_OUT_FEATURES + 1
+    built_with_ctx: list[bool] = []
+
+    def copy_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    def build_model(*_args, **_kwargs):
+        built_with_ctx.append(int8_config._LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get())
+        quant_config = DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="dynamic")
+        method = NPUInt8OnlineLinearMethod(quant_config)
+        layer = nn.Module()
+        layer.quant_method = method
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=[out_features],
+            input_size=8,
+            output_size=out_features,
+            params_dtype=torch.bfloat16,
+            weight_loader=copy_loader,
+        )
+        model = nn.Module()
+        model.transformer = layer
+        return model
+
+    def load_weights(_model, **_kwargs):
+        layer = _model.transformer
+        loaded = torch.arange(out_features * 8, dtype=torch.float32).reshape(out_features, 8).to(torch.bfloat16)
+        layer.weight.weight_loader(layer.weight, loaded)
+
+    loader._init_from_load_format = build_model  # type: ignore[method-assign]
+    loader.load_weights = load_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(
+            None,
+            "online quantization requires the ordinary loader",
+        ),
+    )
+    # Diffusion DiT models have no vLLM Attention layers, so the upstream
+    # layerwise finalize is a no-op here; stub it to keep the real
+    # _process_weights_after_loading sweep CPU-only.
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.layerwise.finalize_layerwise_processing",
+        lambda *_args, **_kwargs: None,
+    )
+
+    model = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    # Construction ran inside load_unquantizable_fallback_on_cpu(), so the
+    # over-wide layer took the host-loading fallback...
+    assert built_with_ctx == [True]
+    assert type(model.transformer.quant_method) is UnquantizedHostLinearMethod
+    # ...and the real post-load sweep skipped it via the fully-loaded flag and
+    # model.to("cpu") left the loaded host tensor untouched.
+    assert model.transformer._already_called_process_weights_after_loading
+    assert model.transformer.weight.device.type == "cpu"
+    expected = torch.arange(out_features * 8, dtype=torch.float32).reshape(out_features, 8).to(torch.bfloat16)
+    assert torch.equal(model.transformer.weight, expected)
+
+
+@pytest.mark.parametrize(("offload_after_quant", "ctx_expected"), [(True, True), (False, False)])
+def test_hsdp_enters_host_fallback_context_only_when_offloading_after_quant(mocker, offload_after_quant, ctx_expected):
+    """The HSDP path must apply the same host-fallback bound as the ordinary
+    path: with a quant config it initializes on the accelerator, so the
+    load_unquantizable_fallback_on_cpu() context is what keeps over-wide
+    fallback weights off the device before sharding."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+    from vllm_omni.quantization import int8_config
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.quant_config = object()
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    ctx_seen: list[bool] = []
+
+    def build_model(*_args, **_kwargs):
+        ctx_seen.append(int8_config._LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get())
+        return model
+
+    loader._init_from_load_format = build_model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: None  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: None  # type: ignore[method-assign]
+    mocker.patch.object(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        return_value=PipelineModules(
+            dits=[model.transformer],
+            dit_names=["transformer"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.quantization.hsdp_fp8.prepare_fp8_layers_for_fsdp",
+        side_effect=lambda _model: None,
+    )
+    mocker.patch.object(
+        loader_mod,
+        "apply_hsdp_to_model",
+        side_effect=lambda *_args, **_kwargs: None,
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"), offload_after_quant=offload_after_quant)
+
+    assert ctx_seen == [ctx_expected]
 
 
 def test_dlo_allgather_online_mxfp8_uses_ordinary_loader(monkeypatch):
@@ -1926,3 +2207,206 @@ def test_hsdp_broadcast_weight_load_online_quant_multiprocess():
             )
         assert os.path.exists(os.path.join(temp_dir, "rank_0_success.flag"))
         assert os.path.exists(os.path.join(temp_dir, "rank_1_success.flag"))
+
+
+def test_pre_sharded_hsdp_rejects_quantization_before_loading():
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        hsdp_weight_load_strategy="pre_sharded",
+        lora_path=None,
+        quantization_config=object(),
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    with pytest.raises(ValueError, match="does not support quantization"):
+        loader._load_model_with_hsdp(torch.device("cpu"))
+
+
+def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        hsdp_weight_load_strategy="pre_sharded",
+        lora_path=None,
+        quantization_config=None,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    discovered = PipelineModules(
+        dits=[model.transformer],
+        dit_names=["transformer"],
+        vaes=[],
+        encoders=[],
+        encoder_names=[],
+        resident_modules=[],
+        resident_names=[],
+    )
+    loader._init_from_load_format = mocker.Mock(return_value=model)  # type: ignore[method-assign]
+    loader.load_weights = mocker.Mock(side_effect=AssertionError("full loader must not run"))  # type: ignore[method-assign]
+    mocker.patch.object(loader_mod.ModuleDiscovery, "discover", return_value=discovered)
+    pre_sharded_load = mocker.patch.object(
+        loader,
+        "_load_model_with_pre_sharded_hsdp",
+        return_value=model,
+    )
+
+    assert loader._load_model_with_hsdp(torch.device("cpu")) is model
+    pre_sharded_load.assert_called_once()
+
+
+def test_pre_sharded_hsdp_rejects_tensor_transform():
+    def transform(tensor):
+        return tensor.transpose(-2, -1)
+
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="weight",
+                file_path="model.safetensors",
+                transform=transform,
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="tensor transforms are unsupported"):
+        DiffusersPipelineLoader._validate_pre_sharded_hsdp_bindings(load_plan)
+
+
+def test_pre_sharded_hsdp_accepts_direct_safetensors_binding():
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="weight",
+                file_path="model.safetensors",
+            )
+        }
+    )
+
+    DiffusersPipelineLoader._validate_pre_sharded_hsdp_bindings(load_plan)
+
+
+def test_pre_sharded_hsdp_uses_fsdp_destination_directly():
+    target = torch.empty(8, 4, 3)
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="source_weight",
+                file_path="transformer/model.safetensors",
+            )
+        }
+    )
+
+    checkpoint_states, local_bytes = DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
+        load_plan,
+        {"transformer.weight": target},
+    )
+    checkpoint_target = checkpoint_states[Path("transformer")]["source_weight"]
+
+    assert checkpoint_target is target
+    assert checkpoint_target.shape == (8, 4, 3)
+    assert checkpoint_target.device.type == "cpu"
+    assert checkpoint_target.untyped_storage().data_ptr() == target.untyped_storage().data_ptr()
+    assert local_bytes == target.numel() * target.element_size()
+
+
+def test_pre_sharded_hsdp_checkpoint_writes_runtime_storage_directly():
+    runtime_target = torch.empty(2, 3)
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="source_weight",
+                file_path="transformer/model.safetensors",
+            )
+        }
+    )
+    checkpoint_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    checkpoint_states, _ = DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
+        load_plan,
+        {"transformer.weight": runtime_target},
+    )
+    checkpoint_states[Path("transformer")]["source_weight"].copy_(checkpoint_tensor)
+
+    assert torch.equal(runtime_target, checkpoint_tensor)
+
+
+def test_pre_sharded_hsdp_rejects_duplicate_checkpoint_destinations():
+    binding = TensorBinding(checkpoint_key="weight", file_path="transformer/model.safetensors")
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.first": binding,
+            "transformer.second": binding,
+        }
+    )
+
+    with pytest.raises(ValueError, match="multiple runtime tensors"):
+        DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
+            load_plan,
+            {"transformer.first": torch.empty(2, 3), "transformer.second": torch.empty(2, 3)},
+        )
+
+
+def test_pre_sharded_hsdp_managed_module_traversal_is_child_first_and_skips_nested_roots():
+    root = nn.Module()
+    root.left = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+    root.right = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+
+    names = {module: name or "root" for name, module in root.named_modules()}
+    modules = DiffusersPipelineLoader._hsdp_managed_modules_post_order(
+        root,
+        nested_hsdp_roots={root.left},
+    )
+
+    assert [names[module] for module in modules] == ["right.0", "right.1", "right", "root"]
+
+
+@pytest.mark.parametrize("checkpoint_key", ["renamed", "unexpected"])
+def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpoint_key, monkeypatch):
+    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_mod
+
+    monkeypatch.setattr(plan_mod, "get_direct_mmap_adapter", lambda _model: None)
+
+    class Pipeline(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Linear(2, 2, bias=False)
+
+        @staticmethod
+        def remap_checkpoint_key(name):
+            return "transformer.weight" if name == "transformer.renamed" else name
+
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({checkpoint_key: torch.ones(2, 2)}, str(checkpoint))
+    source = SimpleNamespace(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+    )
+    model = Pipeline()
+    result = build_checkpoint_binding_plan(
+        model,
+        dit_modules=(("transformer", model.transformer),),
+        sources=(source,),
+        model_path=None,
+        tensor_parallel_size=1,
+        online_quantization=False,
+    )
+
+    if checkpoint_key == "renamed":
+        assert result.plan is not None
+        assert result.plan.bindings["transformer.weight"].checkpoint_key == "renamed"
+    else:
+        assert result.plan is None
+        assert "no checkpoint binding" in result.fallback_reason

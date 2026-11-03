@@ -5,7 +5,9 @@
 
 Everything that needed session state now lives engine-side
 (``vllm_omni.engine.duplex.realtime_commands`` for the command mapping,
-``vllm_omni.engine.duplex.realtime_events`` for the projection state). What is
+``vllm_omni.engine.duplex.realtime_events`` for the projection state), and the
+model-agnostic parsing both of those build on lives in
+``vllm_omni.protocol.realtime``. What is
 left here is the per-connection handshake policy (query-param defaults,
 autostart / resume-only rules, ``session.resume`` parsing), the wire defaults
 used to translate appends, and error rendering through the typed
@@ -20,10 +22,8 @@ from typing import TYPE_CHECKING
 
 from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError
 from vllm_omni.engine.duplex.events import error_event
-from vllm_omni.engine.duplex.realtime_commands import (
-    RealtimeInputDefaults,
-    translate_realtime_command,
-)
+from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 if TYPE_CHECKING:
     from starlette.websockets import WebSocket
@@ -145,7 +145,7 @@ class RealtimeEnvelope:
         )
 
     def note_session_payload(self, session_payload: Mapping[str, object]) -> None:
-        """Track wire defaults declared by a session object (open or session.update)."""
+        """Track wire defaults declared by an *accepted* session object (open or session.updated)."""
         self.defaults = self.defaults.with_session_payload(session_payload)
 
     # ---- commands ----
@@ -154,12 +154,20 @@ class RealtimeEnvelope:
         return payload.get("type") in ENVELOPE_EVENT_TYPES
 
     def translate(self, payload: Mapping[str, object]) -> DuplexCommand:
-        """Wire event -> command (raises :class:`DuplexCommandError`)."""
-        if payload.get("type") == "session.update":
-            session = payload.get("session")
-            if isinstance(session, dict):
-                self.note_session_payload(session)
+        """Wire event -> command (raises :class:`DuplexCommandError`).
+
+        Mid-session ``session.update`` must not mutate ``defaults`` here: the
+        engine may reject the update (``ErrorEvent``) after translate returns.
+        A following append waits until that update is accepted or rejected.
+        Defaults are applied from the accepted ``session.updated`` once it is
+        enqueued, including while the pump is still sending an earlier event
+        (:meth:`apply_accepted_session`).
+        """
         return translate_realtime_command(payload, defaults=self.defaults)
+
+    def apply_accepted_session(self, session_payload: Mapping[str, object]) -> None:
+        """Apply wire defaults from a successful ``session.updated`` (or open)."""
+        self.note_session_payload(session_payload)
 
     # ---- outbound helpers ----
 
@@ -170,9 +178,11 @@ class RealtimeEnvelope:
         *,
         event_id: object | None = None,
         param: object | None = None,
+        retryable: bool | None = None,
     ) -> dict[str, object]:
         """Wire JSON of a transport-level error (derived from the typed ``ErrorEvent``)."""
-        return error_event(code, message, event_id=event_id, param=param).to_realtime()
+        extra = {"retryable": retryable} if retryable is not None else None
+        return error_event(code, message, event_id=event_id, param=param, extra=extra).to_realtime()
 
     @staticmethod
     def command_error_payload(exc: DuplexCommandError) -> dict[str, object]:

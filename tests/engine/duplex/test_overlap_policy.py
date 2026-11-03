@@ -79,6 +79,39 @@ def test_an_explicit_client_overlap_action_requests_barge_in() -> None:
     assert decision["reason"] == "client_overlap_action"
 
 
+def test_turn_mode_keeps_silent_vision_follow_during_overlap() -> None:
+    """Vision-follow is is_speech=False + a frame; must not drop while TTS plays."""
+    session = _session()
+    session.capabilities = type(session.capabilities)(
+        required_input_modalities=frozenset({"video"}),
+        optional_input_modalities=frozenset({"audio"}),
+    )
+    payload = {"format": "pcm16", "audio": _pcm16(0.0), "video_frames": ["frame"], "is_speech": False}
+    decision = overlap_policy.decide(session, {"is_speech": False}, payload, auto_responds=False)
+    assert decision["action"] == "listen"
+    assert decision["reason"] == "vision_follow"
+    assert decision["buffer_audio"] is True
+    assert decision["defer_runtime_append"] is False
+    assert decision["force_listen"] is False
+
+
+def test_turn_mode_drops_silent_vision_without_capability() -> None:
+    session = _session()
+    assert session.capabilities.allows_video_without_audio() is False
+    payload = {"format": "pcm16", "audio": _pcm16(0.0), "video_frames": ["frame"], "is_speech": False}
+    decision = overlap_policy.decide(session, {"is_speech": False}, payload, auto_responds=False)
+    assert decision["action"] == "drop"
+    assert decision["reason"] == "silence_or_noise"
+
+
+def test_turn_mode_still_drops_silent_overlap_without_vision() -> None:
+    session = _session()
+    payload = {"format": "pcm16", "audio": _pcm16(0.0), "is_speech": False}
+    decision = overlap_policy.decide(session, {"is_speech": False}, payload, auto_responds=False)
+    assert decision["action"] == "drop"
+    assert decision["reason"] == "silence_or_noise"
+
+
 def test_barge_in_is_deferred_when_the_session_cannot_support_it() -> None:
     session = _session()
     session.capabilities = type(session.capabilities)(supports_barge_in=False)

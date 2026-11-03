@@ -24,18 +24,22 @@ import torch.nn as nn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 
-from .attention import Magi2PackedAttentionKernel, VarlenHandler, apply_rotary_emb
-from .configuration_magi2 import Magi2PreviewConfig
-from .layers import (
+from .attention import Magi2PackedAttentionKernel, VarlenHandler
+from .common_layers import (
     ElementWiseFourierEmbed,
-    MHCHandler,
     MHCTensorTuple,
     ModalityDispatcher,
-    MultiModalityRMSNorm,
     make_grouped_linear,
     swiglu7,
 )
-from .mh_moe import Magi2MultiHeadMoE, Magi2MultiHeadMoEConfig
+from .configuration_magi2 import Magi2PreviewConfig
+from .layers import (
+    Magi2MultiHeadMoE,
+    Magi2MultiHeadMoEConfig,
+    MHCHandler,
+    MultiModalityRMSNorm,
+    apply_rotary_emb,
+)
 from .parallel import Magi2SequenceDispatcher
 
 
@@ -188,6 +192,11 @@ class Magi2Attention(nn.Module):
         gates: torch.Tensor,
         modality_dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
+        # Only the token count varies between calls; pinning the head count
+        # and head size lets a dynamic-shape compile index the attention output
+        # with constants.
+        torch._check(attention.shape[1:-1].numel() == self.num_heads_q)
+        torch._check(attention.shape[-1] == self.head_dim)
         output = modality_dispatcher.permute(attention)
         output = output * torch.sigmoid(gates)
         output = output.reshape(-1, self.q_size).to(self.config.params_dtype)
@@ -296,28 +305,17 @@ class Magi2MultiHeadMoELayer(nn.Module):
             dtype=config.params_dtype,
             parallel_mode="row",
         )
-        tp_size = self.split_linear.tp_group.world_size
-        self.local_shared_expert_intermediate_size = moe.shared_expert_intermediate_size // tp_size
-        self.local_modality_shared_expert_intermediate_size = moe.modality_shared_expert_intermediate_size // tp_size
 
     def _shared_experts(
         self,
         normalized: torch.Tensor,
         dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
-        shared = self.shared_expert_fc1(normalized)
-        modality = self.modality_specific_shared_expert_fc1(normalized, dispatcher)
-        activated = swiglu7(torch.cat((shared, modality), dim=-1))
-        shared, modality = activated.split(
-            (
-                self.local_shared_expert_intermediate_size,
-                self.local_modality_shared_expert_intermediate_size,
-            ),
-            dim=-1,
-        )
-        return self.shared_expert_fc2(shared) + self.modality_specific_shared_expert_fc2(
-            modality.contiguous(), dispatcher
-        )
+        # SwiGLU7 acts on adjacent column pairs, so activating each projection
+        # separately keeps both GEMM outputs and the down-projection inputs dense.
+        shared = swiglu7(self.shared_expert_fc1(normalized))
+        modality = swiglu7(self.modality_specific_shared_expert_fc1(normalized, dispatcher))
+        return self.shared_expert_fc2(shared) + self.modality_specific_shared_expert_fc2(modality, dispatcher)
 
     def route_input(
         self,
@@ -670,11 +668,9 @@ def _is_magi2_transformer_layer(_name: str, module: nn.Module) -> bool:
 class Magi2PreviewTransformer(nn.Module):
     """Native preview DiT with the released checkpoint hierarchy."""
 
-    # ``block`` must remain the registered child name because it is part of the
-    # released checkpoint hierarchy.  The ``layers`` property below exposes its
-    # ModuleList through the standard layerwise-offload contract without
-    # changing the registered module names.
-    _layerwise_offload_blocks_attrs = ["layers"]
+    # ``block`` is the registered child module containing the repeated
+    # layers, exposed as the streamable blocks container for layerwise offload.
+    _layerwise_offload_blocks_attrs = ["block"]
     _hsdp_shard_conditions = [_is_magi2_transformer_layer]
     _hsdp_preserve_parameter_dtypes = True
     _EP_SHARDED_SUFFIXES = (
@@ -704,7 +700,7 @@ class Magi2PreviewTransformer(nn.Module):
 
     @property
     def layers(self) -> nn.ModuleList:
-        """Expose Preview layers to the shared offload block discovery API."""
+        """Expose Preview layers for direct access and compatibility."""
 
         return self.block.layers
 
@@ -807,6 +803,10 @@ class Magi2PreviewTransformer(nn.Module):
                     continue
                 module.router.expert_bias.copy_(module.router.expert_bias_ema)
                 loaded.add(f"{module_name}.router.expert_bias")
+
+        for module in self.modules():
+            if isinstance(module, Magi2MultiHeadMoE):
+                module.prepare_bf16_weights()
 
         missing = set(targets) - loaded
         if missing:

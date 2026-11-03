@@ -4,11 +4,15 @@
 import importlib
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
+from vllm_omni.config.stage_config import DiffusionStageRole
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -20,9 +24,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @pytest.fixture(autouse=True)
-def _cpu_platform(monkeypatch):
+def _cpu_pipeline_runtime(monkeypatch):
+    # These lightweight pipelines have no accelerator or distributed groups.
     module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2")
     monkeypatch.setattr(module.current_omni_platform, "is_available", lambda: False)
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.parallel_state._PP", SimpleNamespace(world_size=1))
 
 
 class _StubTransformer(nn.Module):
@@ -94,6 +100,7 @@ def _stub_encode_prompt(
 def _make_pipeline() -> Wan22Pipeline:
     pipeline = object.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.stage_role = DiffusionStageRole.FULL
     pipeline.device = torch.device("cpu")
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
@@ -477,6 +484,155 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
     assert torch.equal(result, torch.full_like(latents, 10.0))
 
 
+def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
+    """Each expert's refreshed Cache-DiT budget must equal the steps diffuse() routes to it.
+
+    Consecutive requests on one server with no pinned boundary omit
+    num_inference_steps and change the boundary, sample solver and flow shift;
+    the budgets must follow each request's own schedule, not the previous one.
+    """
+    pipeline = _make_pipeline()
+    pipeline.transformer_2 = _StubTransformer()
+    for expert in (pipeline.transformer, pipeline.transformer_2):
+        expert.blocks = nn.ModuleList()
+    pipeline.boundary_ratio = None
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+
+    refreshed: dict[str, list[int]] = {"transformer": [], "transformer_2": []}
+
+    def _fake_build_refresh(cache_config, get_pipeline_transformer=None):
+        name = "transformer" if get_pipeline_transformer is None else "transformer_2"
+        return lambda pipeline, num_inference_steps, verbose=True: refreshed[name].append(num_inference_steps)
+
+    monkeypatch.setattr(cd_model_specific, "_build_cache_context_refresh", _fake_build_refresh)
+    monkeypatch.setattr(cd_model_specific, "cache_dit", Mock())
+    monkeypatch.setattr(cd_model_specific, "BlockAdapter", Mock())
+    cd_model_specific.enable_cache_for_wan22(pipeline, DiffusionCacheConfig())
+
+    routed: list[str] = []
+
+    def _fake_predict_noise_maybe_with_cfg(**kwargs):
+        current_model = kwargs["positive_kwargs"]["current_model"]
+        routed.append("transformer_2" if current_model is pipeline.transformer_2 else "transformer")
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, latents, do_true_cfg: latents  # type: ignore[method-assign]
+
+    for overrides in (
+        {},
+        {"boundary_ratio": 0.9},
+        {"extra_args": {"sample_solver": "euler", "flow_shift": 12.0}},
+        {"boundary_ratio": 0.5, "extra_args": {"sample_solver": "unipc", "flow_shift": 3.0}},
+    ):
+        routed.clear()
+        for counts in refreshed.values():
+            counts.clear()
+        sampling = _make_sampling(num_inference_steps=None, **overrides)
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+        assert len(routed) == pipeline.default_num_inference_steps
+        for name in ("transformer", "transformer_2"):
+            expected = routed.count(name)
+            assert refreshed[name] == ([expected] if expected else []), (overrides, name)
+
+
+@pytest.mark.parametrize("fail_first_request", [False, True])
+def test_runner_publishes_wan_step_context_across_requests(fail_first_request, monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.forward_context import (
+        ForwardContext,
+        get_forward_context,
+        is_forward_context_available,
+        override_forward_context,
+    )
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.quantization.mxfp4_config import _is_w4a8_fallback_step
+
+    contexts: list[ForwardContext] = []
+    events = []
+
+    class InjectedPredictionError(Exception):
+        pass
+
+    class RecordingTransformer(_StubTransformer):
+        def __init__(self, expert):
+            super().__init__()
+            self.expert = expert
+
+        def forward(self, hidden_states, encoder_hidden_states, **kwargs):
+            context = get_forward_context()
+            assert context is contexts[-1]
+            request_index = len(contexts) - 1
+            step = context.denoise_step_idx
+            positive = bool(encoder_hidden_states[0, 0, 0] > 0)
+            events.append((request_index, step, self.expert, positive, _is_w4a8_fallback_step([0, 2])))
+            if fail_first_request and request_index == 0 and step == 1 and not positive:
+                raise InjectedPredictionError
+            return (torch.ones_like(hidden_states) * (1 if positive else -1),)
+
+    def encode_prompt(**kwargs):
+        context = get_forward_context()
+        assert context.denoise_step_idx is None
+        contexts.append(context)
+        embeds = torch.ones(1, 8, 8)
+        return embeds, -embeds
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = RecordingTransformer("high")
+    pipeline.transformer_2 = RecordingTransformer("low")
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", lambda pred, t, latents, cfg: latents)
+
+    # Use the real runner context manager, Wan forward/diffuse, and CFG
+    # dispatch. Only model computation, scheduler math and unrelated KV I/O
+    # are replaced; no test code publishes a denoise step.
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.od_config = OmniDiffusionConfig(model="", dtype=torch.float32)
+    runner.vllm_config = None
+    runner.cache_backend = None
+    monkeypatch.setattr(runner, "_prepare_request_for_forward", lambda *args, **kwargs: None)
+    with override_forward_context(None):
+        for request_index in range(2):
+            request = OmniDiffusionRequest(
+                prompt="a fox walks",
+                request_id=f"request-{request_index}",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1, num_inference_steps=3, guidance_scale=2.0, output_type="latent"
+                ),
+            )
+
+            def execute():
+                return runner._execute_request_list(
+                    [request],
+                    od_config=runner.od_config,
+                    allow_single_output=True,
+                    require_request_batch_support=False,
+                    record_name="test_wan_step_context",
+                    record_output_peak_memory=False,
+                )
+
+            if fail_first_request and request_index == 0:
+                with pytest.raises(InjectedPredictionError):
+                    execute()
+            else:
+                execute()
+            assert not is_forward_context_available()
+
+    assert len(contexts) == 2 and contexts[0] is not contexts[1]
+    expected = [
+        (request, step, "high" if step == 0 else "low", positive, step in (0, 2))
+        for request in range(2)
+        for step in range(2 if fail_first_request and request == 0 else 3)
+        for positive in (True, False)
+    ]
+    assert events == expected
+
+
 class _StubDMDScheduler:
     def __init__(self) -> None:
         self.predict_clean_calls: list[tuple[float, float, float]] = []
@@ -532,6 +688,7 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
 def _make_gate_loading_pipeline():
     pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.encode_only = False
     gate = WanSelfAttention.__new__(WanSelfAttention)
     nn.Module.__init__(gate)
     gate.to_gate_compress = nn.Linear(1, 1)
@@ -552,6 +709,8 @@ def test_wan_pipeline_loaders_share_optional_gate_cleanup(monkeypatch, module_na
     module = importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}")
     pipeline_cls = getattr(module, class_name)
     pipeline = pipeline_cls.__new__(pipeline_cls)
+    if class_name == "Wan22Pipeline":
+        pipeline.encode_only = False
     expected = {"loaded"}
 
     def fake_loader(model, weights):

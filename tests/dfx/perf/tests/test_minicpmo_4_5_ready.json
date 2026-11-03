@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_ready",
+    "description": "The sweep is c1/c8/c16 with 10/80/160 seed-tts prompts. The previous H100 baseline was two points (c1/c4, 10/40 prompts) and cannot be indexed against this sweep. No c1/c8/c16 baseline is recorded for this prompt schedule; the empty baseline is intentional until those points are measured. test_minicpmo_4_5.json thresholds are a different prompt count and are not reused here.",
     "mark": [
       {
         "hardware_marks": {
@@ -26,21 +27,34 @@
       {
         "dataset_name": "seed-tts",
         "dataset_path": "zhaochenyang20/seed-tts-eval",
-        "backend": "openai-realtime-tts",
-        "endpoint": "/v1/realtime",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
         "num_prompts": [
           10,
-          40
+          80,
+          160
         ],
         "max_concurrency": [
           1,
-          4
+          8,
+          16
         ],
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
       }
     ]
   }

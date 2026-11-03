@@ -8,6 +8,7 @@ import sys
 import types
 from dataclasses import fields, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic.fields import FieldInfo
@@ -19,6 +20,7 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.models.utils import extract_layer_index
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
@@ -29,6 +31,7 @@ from vllm_omni.config.omni_config import (
     OmniStageSchedulerConfig,
     VllmOmniARStageConfig,
     VllmOmniConfig,
+    extract_diffusion_stage_config_kwargs,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
@@ -60,9 +63,14 @@ _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, object]:
     backend_fields = fields(config_cls)
     backend_field_names = {backend_field.name for backend_field in backend_fields}
-    backend_config = config_cls(
-        **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
-    )
+    # This is a schema/normalization comparison, not a Hub download test.
+    with (
+        patch("vllm.engine.arg_utils.get_model_path", side_effect=lambda model, *_: model),
+        patch("vllm_omni.diffusion.data.get_model_path", side_effect=lambda model, *_: model),
+    ):
+        backend_config = config_cls(
+            **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
+        )
     effective_values: dict[str, object] = {}
     for backend_field in backend_fields:
         value = getattr(backend_config, backend_field.name)
@@ -77,6 +85,9 @@ _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusi
 _TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
+        "final_output",
+        "use_v2_model_runner",
+        "supports_native_mrv2_data_plane",
         "active_stream_window",
         "codec_frame_rate_hz",
         "custom_voice_dir",
@@ -86,7 +97,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "enable_multithread_weight_load",
         "env",
         "has_sampling_extra_args",
-        "log_level",
         "log_stats",
         "model_arch",
         "model_subdir",
@@ -95,6 +105,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "num_weight_load_threads",
         "omni_kv_config",
         "parallel_config",
+        "pooling_output_decoder",
         "silence_ban_frames",
         "subtalker_sampling_params",
         "task_type",
@@ -215,7 +226,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 execution_type=StageExecutionType.LLM_AR,
                 requires_multimodal_data=True,
                 hf_config_name="thinker_config",
-                engine_output_type="hidden_states",
+                engine_output_type="latent",
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_subdir="ar-model",
                 tokenizer_subdir="ar-tokenizer",
@@ -227,7 +238,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 model_stage="talker",
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
-                engine_output_type="audio_tokens",
+                engine_output_type="latent",
             ),
             StagePipelineConfig(
                 stage_id=2,
@@ -366,6 +377,21 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
     assert inherited_defaults.isdisjoint(engine_args)
 
 
+def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    assert {
+        "enable_multithread_weight_load",
+        "num_weight_load_threads",
+        "disable_autocast",
+        "log_level",
+    }.isdisjoint(engine_args)
+
+
 def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 
@@ -378,7 +404,9 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     )
 
     assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
+    assert deploy.stages[0].engine_extras["kv_cache_dtype_skip_layers"] == ["0"]
     assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
+    assert "kv_cache_dtype_skip_layers" not in deploy.stages[1].engine_extras
 
     legacy_args = [build_legacy_engine_args_dict(stage, "test-model") for stage in legacy_stages]
     typed_args = [
@@ -394,14 +422,22 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
 
     assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
     assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert legacy_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
+    assert ar_stage.cache_config.kv_cache_dtype_skip_layers == ["0"]
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
     assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert typed_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
+    # vLLM matches the list against the index it parses from each attention prefix.
+    assert str(extract_layer_index("ar.language_model.layers.0.self_attn.attn")) == "0"
 
     assert "kv_cache_dtype" not in legacy_args[1]
+    assert "kv_cache_dtype_skip_layers" not in legacy_args[1]
     assert dit_stage.cache_config.cache_dtype == "auto"
+    assert dit_stage.cache_config.kv_cache_dtype_skip_layers == []
     assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
     assert "kv_cache_dtype" not in typed_args[1]
+    assert "kv_cache_dtype_skip_layers" not in typed_args[1]
 
 
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
@@ -444,8 +480,16 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     assert typed_args["profiler_config"].profiler == "cuda"
 
 
-def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
+@pytest.mark.parametrize("adapter_path", [None, "pipeline.CustomSchedulingMetadataAdapter"])
+def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path, adapter_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    pipeline = replace(
+        pipeline,
+        stages=tuple(
+            replace(stage, scheduling_metadata_adapter=adapter_path) if stage.stage_id == 1 else stage
+            for stage in pipeline.stages
+        ),
+    )
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
     connector_spec = {"name": "SharedMemoryConnector", "extra": {"mode": "test"}}
     cli_tokenizer = "/external/tokenizer"
@@ -469,6 +513,9 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         expected_args = {name: value for name, value in legacy_args.items() if name not in _TOPOLOGY_ONLY_ENGINE_ARGS}
         assert {name: typed_args[name] for name in expected_args} == expected_args
         assert _TOPOLOGY_ONLY_ENGINE_ARGS.isdisjoint(typed_args)
+        expected_adapter = adapter_path if stage_id == 1 else None
+        assert legacy_args["scheduling_metadata_adapter"] == expected_adapter
+        assert typed_args["scheduling_metadata_adapter"] == expected_adapter
 
     thinker_args = typed_args_by_stage[0]
     inherited_vllm_fields = {
@@ -506,8 +553,16 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert talker_args["enable_prefix_caching"] is False
 
 
-def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
+@pytest.mark.parametrize("adapter_path", [None, "pipeline.CustomSchedulingMetadataAdapter"])
+def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path, adapter_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    pipeline = replace(
+        pipeline,
+        stages=tuple(
+            replace(stage, scheduling_metadata_adapter=adapter_path) if stage.stage_id == 2 else stage
+            for stage in pipeline.stages
+        ),
+    )
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
 
     legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
@@ -530,6 +585,15 @@ def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
     assert typed_args["diffusion_attention_config"].default.backend == "FLASH_ATTN"
     assert typed_args["diffusion_attention_config"].per_role["cross"].backend == "TORCH_SDPA"
 
+    for engine_args in (legacy_args, typed_args):
+        diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+            engine_args, stage_id=2, include_engine_adapter_metadata=True
+        )
+        assert "scheduling_metadata_adapter" not in diffusion_kwargs
+        assert engine_args["scheduling_metadata_adapter"] == adapter_path
+        with pytest.raises(ValueError, match="scheduling_metadata_adapter"):
+            extract_diffusion_stage_config_kwargs(engine_args, stage_id=2)
+
 
 def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
     """A stage-level ``diffusion_attention_backend`` shorthand is folded into the structured config."""
@@ -551,7 +615,9 @@ def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
         assert engine_args.get("diffusion_attention_backend") is None
         assert isinstance(engine_args["diffusion_attention_config"], AttentionConfig)
         assert engine_args["diffusion_attention_config"].default.backend == "TORCH_SDPA"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
@@ -584,7 +650,9 @@ def test_engine_args_apply_cli_attention_shorthand_over_yaml_config(tmp_path, ya
         attention_config = engine_args["diffusion_attention_config"]
         assert attention_config.default.backend == "TORCH_SDPA"
         assert attention_config.per_role["cross"].backend == "SAGE_ATTN"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
@@ -803,7 +871,13 @@ def _fake_model_root(pipeline, tmp_path):
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path):
+def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path, monkeypatch):
+    # Compare argument schemas without materializing model-specific checkpoints.
+    def _resolve_test_model_path(model, engine_args):
+        engine_args.pop("model_path_resolver", None)
+        return model
+
+    monkeypatch.setattr(stage_init_utils, "_resolve_model_path", _resolve_test_model_path)
     pipeline = resolve_pipeline_config(model_type)
     if pipeline is None:
         pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")

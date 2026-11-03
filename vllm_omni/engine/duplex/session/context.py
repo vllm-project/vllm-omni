@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
@@ -32,7 +32,9 @@ if TYPE_CHECKING:
     )
     from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallLedger
     from vllm_omni.metrics.stats import StageRequestStats
 
 _OffloadT = TypeVar("_OffloadT")
@@ -58,13 +60,17 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
+    #: Plugin signaled that the next user commit may start while the current
+    #: assistant audio is still draining. Cleared on barge-in/cancel, or when
+    #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
+    concurrent_turn_requests_released: bool = False
 
 
 class RunnerServices(Protocol):
     """The only things a component may ask the runner for.
 
-    Deliberately two methods. A component that needs more than task scheduling
-    from the runner is reaching for orchestration that belongs in the runner.
+    Scheduling and terminal bookkeeping stay in the runner; components do not
+    acquire their own delivery queue or call-lifecycle authority.
     """
 
     def spawn(self, coro: Awaitable[None], *, name: str) -> None:
@@ -73,6 +79,10 @@ class RunnerServices(Protocol):
 
     async def offload(self, fn: Callable[..., _OffloadT], *args: object, **kwargs: object) -> _OffloadT:
         """Run a blocking call off the orchestrator loop."""
+        ...
+
+    def finalize_tool_call(self, call_id: str) -> bool:
+        """Finalize terminal plugin bookkeeping before acknowledging a result."""
         ...
 
 
@@ -92,6 +102,11 @@ class DuplexSessionContext:
     tasks: DuplexSessionTasks
     run: DuplexRunState
     services: RunnerServices
+    #: Admission authority for ``function_call_output`` items (see
+    #: ``session.tool_calls``): the calls this session exposed and their one
+    #: terminal state each.
+    tool_calls: ToolCallLedger
+    history_calibration: HistoryCalibration | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +128,10 @@ class DuplexSessionTasks:
     append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
     append_tail: asyncio.Task[bool] | None = None
     active_response_task: asyncio.Task[None] | None = None
+    #: Appends the runner cancelled on purpose (a cancel, barge-in or close).
+    #: The runner ends the response such an append precreated, so the append
+    #: leaves it alone on its way out instead of failing it.
+    runner_cancelled: set[asyncio.Task[bool]] = field(default_factory=set)
 
     def track_append_task(
         self,
@@ -123,21 +142,38 @@ class DuplexSessionTasks:
         response_bound: bool,
     ) -> None:
         self.append_tasks[task] = DuplexAppendTaskMeta(epoch, final, response_bound)
-        task.add_done_callback(self.append_tasks.pop)
+        task.add_done_callback(self._forget_append_task)
+
+    def _forget_append_task(self, task: asyncio.Task[bool]) -> None:
+        self.append_tasks.pop(task, None)
+        self.runner_cancelled.discard(task)
+
+    def cancelled_by_runner(self, task: asyncio.Task[Any] | None) -> bool:
+        """Whether ``task`` is an append the runner cancelled through ``cancel_append_tasks``."""
+        return task is not None and task in self.runner_cancelled
 
     def has_response_bound_append_tasks(self) -> bool:
-        return any(meta.response_bound for meta in self.append_tasks.values())
+        # A finished task can remain tracked until its done callback runs.
+        return any(meta.response_bound and not task.done() for task, meta in self.append_tasks.items())
 
     async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
+        """Cancel the tracked appends; the caller owns their responses from here on.
+
+        Every caller ends the active response itself right after (with the
+        cancel status, or silently as part of a close), so the cancelled
+        appends are told not to fail the response they precreated.
+        """
         tasks = [task for task, meta in self.append_tasks.items() if not response_bound_only or meta.response_bound]
         if not tasks:
             return False
         cancelled_tail = self.append_tail if self.append_tail in tasks else None
+        self.runner_cancelled.update(tasks)
         for task in tasks:
             task.cancel()
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except TimeoutError:
+        # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
+        except (TimeoutError, asyncio.TimeoutError):
             pass
         if cancelled_tail is not None and self.append_tail is cancelled_tail:
             self.append_tail = None
@@ -150,6 +186,14 @@ class DuplexSessionTasks:
 
 
 @dataclass(frozen=True, slots=True)
+class CommittedInputContinuation:
+    """Server-owned remainder of a batch, fenced to its original audio parts."""
+
+    payload: dict[str, object]
+    audio_parts: dict[str, dict[str, object] | None]
+
+
+@dataclass(frozen=True, slots=True)
 class StageOutput:
     """One stage result, queued for the session that owns the request."""
 
@@ -159,3 +203,6 @@ class StageOutput:
     request_id: str
     context: DuplexOutputContext
     decision: DuplexOutputDecision | None
+    input_transcript: str | None = None
+    input_item_id: str | None = None
+    project_output: bool = True

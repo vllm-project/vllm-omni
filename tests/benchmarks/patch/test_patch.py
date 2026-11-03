@@ -20,22 +20,30 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
 )
+from vllm_omni.benchmarks.patch import patch
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _add_combined_video_form_references,
     _add_video_extra_body_to_form,
     _add_video_reference_to_form,
+    _apply_image_metrics_from_payload,
     _apply_stage0_token_timings,
     _apply_video_metrics_from_payload,
     _attach_seed_tts_to_request_func_input,
     _build_benchmark_session,
+    _extract_stage_durations_from_payload,
+    _gather_request_outputs,
+    _iter_image_reference_inputs,
+    _iter_video_reference_inputs,
     _omni_request_timeout_s,
+    async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
     async_request_openai_image_generations_omni,
     async_request_openai_realtime_duplex,
     should_request_stage_metrics,
 )
-from vllm_omni.clients.duplex import EventCollector
+from vllm_omni.clients.duplex import DuplexProtocolError, DuplexSessionClosedError, EventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -173,6 +181,11 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             if event["type"] != "response.create":
                 return
             self._emit_response()
+
+        async def turn_session_stats(self, response_id):
+            # A server without duplex_session.collect_stats adds no server-side fields.
+            del response_id
+            return {}
 
         def _emit_response(self):
             self.response_count += 1
@@ -427,6 +440,230 @@ async def test_bundled_first_text_chunk_uses_stage0_token_timings(mocker: Mocker
     assert output.itl == pytest.approx([0.010, 0.011, 0.012])
     assert output.text_latency - output.ttft == pytest.approx(0.033)
     assert output.tpot_measured is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 503], ids=["sse", "http"])
+async def test_retryable_cache_error_retries_before_output(mocker: MockerFixture, status):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    error = {"error": {"message": "Multi-modal processor cache miss.", "type": "ServiceUnavailableError", "code": 503}}
+    failed = MockResponse(
+        status,
+        [
+            create_sse_chunk({"modality": "text", "choices": [{"delta": {"role": "assistant", "content": ""}}]}),
+            create_sse_chunk(error),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    mocker.patch.object(failed, "json", new=mocker.AsyncMock(return_value=error), create=True)
+    success = MockResponse(
+        200,
+        [
+            create_sse_chunk({"modality": "text", "choices": [{"delta": {"content": "recovered"}}]}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    session = mocker.Mock()
+    session.post.side_effect = [failed, success]
+    sleep = mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
+    mocker.patch.object(patch.time, "perf_counter", side_effect=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is True
+    assert output.generated_text == "recovered"
+    assert session.post.call_count == 2
+    assert session.post.call_args_list[0] == session.post.call_args_list[1]
+    sleep.assert_awaited_once_with(0.1)
+    assert output.start_time == 1.0
+    assert output.ttft >= 2.0  # Includes the failed attempt rather than resetting its clock.
+
+
+@pytest.mark.asyncio
+async def test_retryable_cache_errors_exhaust_bounded_retry_budget(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    error = {"error": {"message": "cache miss", "type": "ServiceUnavailableError", "code": 503}}
+    response = MockResponse(200, [create_sse_chunk(error), b"data: [DONE]\n\n"])
+    session = mocker.Mock()
+    session.post.return_value = response
+    sleep = mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is False
+    assert output.error == "cache miss"
+    assert session.post.call_count == 4
+    assert sleep.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice_index", [0, 1])
+@pytest.mark.parametrize(
+    "delta, modality",
+    [
+        ({"content": "partial"}, "text"),
+        ({"reasoning_content": "reasoning"}, "text"),
+        ({"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}, "text"),
+        ({"audio": {"data": "AAAA"}}, "audio"),
+        ({"content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}, "image"),
+    ],
+)
+async def test_retryable_cache_error_never_replays_partial_output(mocker: MockerFixture, delta, modality, choice_index):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    response = MockResponse(
+        200,
+        [
+            create_sse_chunk({"modality": modality, "choices": [{"delta": {}}] * choice_index + [{"delta": delta}]}),
+            create_sse_chunk({"error": {"message": "cache miss", "type": "ServiceUnavailableError", "code": 503}}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    session = mocker.Mock()
+    session.post.return_value = response
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is False
+    assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_output", [False, True])
+async def test_chat_transport_retry_never_replays_partial_output(mocker: MockerFixture, partial_output):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+
+    async def interrupted_stream():
+        if partial_output:
+            yield create_sse_chunk({"modality": "text", "choices": [{"delta": {"content": "partial"}}]})
+        raise patch.aiohttp.ClientPayloadError("connection dropped")
+
+    failed = MockResponse(200, [])
+    mocker.patch.object(failed, "iter_any", new=interrupted_stream)
+    recovered = MockResponse(
+        200,
+        [create_sse_chunk({"modality": "text", "choices": [{"delta": {"content": "complete"}}]})],
+    )
+    session = mocker.Mock()
+    session.post.side_effect = [failed, recovered]
+    mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is not partial_output
+    assert session.post.call_count == (1 if partial_output else 2)
+    assert output.latency > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"type": "InternalServerError", "code": 503},
+        {"type": "ServiceUnavailableError", "code": 500},
+        {"type": "ServiceUnavailableError", "code": "503"},
+        "Unknown failure",
+    ],
+)
+async def test_chat_unknown_error_is_not_retryable(mocker: MockerFixture, error):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    session = mocker.Mock()
+    session.post.return_value = MockResponse(200, [create_sse_chunk({"error": error})])
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is False
+    assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture):
+    """HTTP 200 streams can still terminate with an OpenAI error event."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "partial response"}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "error": {
+                    "message": "EngineCore encountered an issue",
+                    "type": "BadRequestError",
+                    "code": 400,
+                }
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is False
+    assert output.error == "EngineCore encountered an issue"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "env", "expected_duration_s"),
+    [
+        # Server-stated format wins over the env fallback.
+        ({"X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2"}, {}, 1.0),
+        ({"X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2"}, {"rate": "24000", "channels": "1"}, 1.0),
+        # Older servers send no headers: the env (default 24 kHz mono) applies.
+        ({}, {}, 4.0),
+        ({}, {"rate": "48000", "channels": "2"}, 1.0),
+    ],
+)
+async def test_audio_speech_stream_uses_server_pcm_format(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, headers, env, expected_duration_s
+):
+    from vllm_omni.metrics import definitions as defs
+
+    for key, var in (("rate", defs.AUDIO_SAMPLE_RATE_ENV), ("channels", defs.AUDIO_CHANNELS_ENV)):
+        if key in env:
+            monkeypatch.setenv(var, env[key])
+        else:
+            monkeypatch.delenv(var, raising=False)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=10,
+        output_len=20,
+    )
+    # 1 s of 48 kHz stereo s16le = 192000 bytes.
+    mock_response = MockResponse(200, [b"\x00" * 96000, b"\x00" * 96000])
+    mocker.patch.object(mock_response, "headers", new=headers, create=True)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(request_input, mock_session)
+
+    assert output.success is True
+    assert output.audio_duration == pytest.approx(expected_duration_s)
 
 
 @pytest.mark.asyncio
@@ -1280,11 +1517,88 @@ class TestOmniRequestTimeout:
             request_input.api_url = f"http://127.0.0.1:{port}/v1/chat/completions"
             output = await async_request_openai_chat_omni_completions(request_input, session)
             assert output.success is False
+            assert output.timed_out is True
             assert output.error
         finally:
             await session.close()
             server.close()
             await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chat_timeout_is_structurally_marked(mocker: MockerFixture) -> None:
+    session = mocker.Mock()
+    session.post.side_effect = TimeoutError("request deadline expired")
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.timed_out is True
+    assert output.cancelled_after_timeout is False
+    assert "TimeoutError" in output.error
+
+
+@pytest.mark.asyncio
+async def test_chat_aiohttp_server_timeout_is_structurally_marked(mocker: MockerFixture) -> None:
+    session = mocker.Mock()
+    session.post.side_effect = patch.aiohttp.ServerTimeoutError("request deadline expired")
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.timed_out is True
+    assert output.cancelled_after_timeout is False
+    assert "ServerTimeoutError" in output.error
+
+
+@pytest.mark.asyncio
+async def test_timeout_gather_cancels_pending_tasks_and_retains_order(mocker: MockerFixture) -> None:
+    pending_started = [asyncio.Event(), asyncio.Event()]
+    cancellation_finished = [asyncio.Event(), asyncio.Event()]
+    completed_output = MixRequestFuncOutput(success=True, prompt_len=22)
+    timeout_output = MixRequestFuncOutput(success=False, prompt_len=33, timed_out=True, error="timed out")
+
+    async def pending(index: int) -> MixRequestFuncOutput:
+        pending_started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cancellation_finished[index].set()
+
+    async def completed() -> MixRequestFuncOutput:
+        return completed_output
+
+    async def timed_out() -> MixRequestFuncOutput:
+        await pending_started[0].wait()
+        await pending_started[1].wait()
+        await asyncio.sleep(0)
+        return timeout_output
+
+    request_inputs = []
+    for prompt_len in (11, 22, 33, 44):
+        request = _seed_tts_request_func_input()
+        request.prompt_len = prompt_len
+        request_inputs.append(request)
+    tasks = [
+        asyncio.create_task(pending(0)),
+        asyncio.create_task(completed()),
+        asyncio.create_task(timed_out()),
+        asyncio.create_task(pending(1)),
+    ]
+    pbar = mocker.Mock()
+
+    outputs = await _gather_request_outputs(tasks, request_inputs, pbar=pbar)
+
+    assert outputs[0].cancelled_after_timeout is True
+    assert outputs[0].prompt_len == 11
+    assert outputs[1] is completed_output
+    assert outputs[2] is timeout_output
+    assert outputs[3].cancelled_after_timeout is True
+    assert outputs[3].prompt_len == 44
+    assert all(event.is_set() for event in cancellation_finished)
+    assert all(task.done() for task in tasks)
+    assert pbar.update.call_count == 2
 
 
 def test_video_rtf_prefers_generation_time_over_poll_latency():
@@ -1359,16 +1673,15 @@ async def test_image_edits_defaults_to_non_streaming_json(mocker: MockerFixture)
             return None
 
     captured_stream: list[str] = []
-    real_add_field = None
+    import aiohttp
+
+    real_add_field = aiohttp.FormData.add_field
 
     def tracking_add_field(self, name, value=None, **kwargs):
         if name == "stream":
             captured_stream.append(str(value))
         return real_add_field(self, name, value, **kwargs)
 
-    import aiohttp
-
-    real_add_field = aiohttp.FormData.add_field
     mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
 
     mock_session = mocker.AsyncMock()
@@ -1431,6 +1744,42 @@ async def test_image_edits_stream_true_uses_sse_path(mocker: MockerFixture) -> N
     assert captured_stream == ["true"]
     assert output.success is True
     assert output.image_count == 1
+
+
+@pytest.mark.asyncio
+async def test_image_edits_stream_error_marks_request_failed(mocker: MockerFixture) -> None:
+    """HTTP 200 image-edit streams can terminate with an error event."""
+    sse_chunk = (
+        b'data: {"object":"image.edit.chunk","type":"ar_delta","delta":"partial"}\n\n'
+        b'data: {"object":"error","error":{"message":"image generation failed",'
+        b'"type":"server_error","code":500}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    mock_response = MockResponse(200, [sse_chunk])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    request = RequestFuncInput(
+        model="multi-stage-edit",
+        model_name="multi-stage-edit",
+        prompt="edit",
+        api_url="http://test.com/v1/images/edits",
+        prompt_len=2,
+        output_len=1,
+        multi_modal_content=[
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_MIN_PNG_B64}"},
+            }
+        ],
+        extra_body={"stream": True},
+    )
+
+    output = await async_request_openai_image_edits_omni(request, mock_session, pbar=None)
+
+    assert output.success is False
+    assert output.error == "image generation failed"
+    assert output.generated_text == "partial"
 
 
 @pytest.mark.asyncio
@@ -1512,8 +1861,7 @@ def test_video_local_image_reference_not_forwarded_as_raw_extra_field(tmp_path, 
     "reference",
     [
         {"image_url": "https://example.com/ref.png"},
-        {"file_id": "file-abc"},
-        [{"image_url": "https://example.com/a.png"}, {"file_id": "file-xyz"}],
+        [{"image_url": "https://example.com/a.png"}, {"image_url": "https://example.com/b.png"}],
     ],
 )
 def test_video_structured_image_reference_serialized_to_form(reference: object, mocker: MockerFixture) -> None:
@@ -1541,18 +1889,597 @@ def test_video_structured_image_reference_serialized_to_form(reference: object, 
     assert field_names.count("image_reference") == 1
     assert "input_reference" not in field_names
     payload = next(value for name, value in captured if name == "image_reference")
+    assert isinstance(payload, (str, bytes, bytearray))
     assert json.loads(payload) == reference
+
+
+def test_video_file_id_reference_is_rejected() -> None:
+    """file_id is unsupported on the server and must not be sent as image_reference."""
+    import aiohttp
+
+    form = aiohttp.FormData()
+    with pytest.raises(ValueError, match="file_id is not supported yet"):
+        _add_video_reference_to_form(form, {"file_id": "file-abc"})
+    with pytest.raises(ValueError, match="file_id is not supported yet"):
+        _add_video_reference_to_form(form, [{"image_url": "https://example.com/a.png"}, {"file_id": "file-xyz"}])
+    with pytest.raises(ValueError, match="file_id is not supported yet"):
+        _add_combined_video_form_references(form, None, {"video_reference": {"file_id": "file-vid"}})
+
+
+def test_image_reference_urls_from_random_mm_content(mocker: MockerFixture) -> None:
+    """random-mm image_url parts keep an explicit image_reference type."""
+    import aiohttp
+
+    content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/ref.png"},
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_MIN_PNG_B64}"},
+        },
+    ]
+    refs = list(_iter_image_reference_inputs(content))
+    assert refs == [
+        {"image_url": "https://example.com/ref.png"},
+        {"image_url": f"data:image/png;base64,{_MIN_PNG_B64}"},
+    ]
+
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    assert _add_video_reference_to_form(form, refs[0]) is True
+    assert _add_video_reference_to_form(form, refs[1]) is True
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 2
+    assert "video_reference" not in field_names
+    payloads = []
+    for name, value in captured:
+        if name != "image_reference":
+            continue
+        assert isinstance(value, (str, bytes, bytearray))
+        payloads.append(json.loads(value))
+    assert payloads == refs
+
+
+def test_video_reference_urls_from_random_mm_content(mocker: MockerFixture) -> None:
+    """random-mm data:video_url parts stay on video_reference."""
+    import aiohttp
+
+    content = [
+        {
+            "type": "video_url",
+            "video_url": {"url": "data:video/mp4;base64,AAAA"},
+        }
+    ]
+    refs = list(_iter_video_reference_inputs(content))
+    assert refs == [{"video_url": "data:video/mp4;base64,AAAA"}]
+
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    assert _add_video_reference_to_form(form, refs[0]) is True
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("video_reference") == 1
+    assert "input_references" not in field_names
+    assert "input_reference" not in field_names
+    assert "image_reference" not in field_names
+    payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(payload, (str, bytes, bytearray))
+    assert json.loads(payload) == {"video_url": "data:video/mp4;base64,AAAA"}
+
+
+def test_video_reference_https_url_from_random_mm_content(mocker: MockerFixture) -> None:
+    """HTTP(S) video_url parts must stay on video_reference, not image_reference."""
+    import aiohttp
+
+    content = [
+        {
+            "type": "video_url",
+            "video_url": {"url": "https://example.com/ref.mp4"},
+        }
+    ]
+    refs = list(_iter_video_reference_inputs(content))
+    assert refs == [{"video_url": "https://example.com/ref.mp4"}]
+
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    assert _add_video_reference_to_form(form, refs[0]) is True
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("video_reference") == 1
+    assert "image_reference" not in field_names
+    assert "input_references" not in field_names
+    payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(payload, (str, bytes, bytearray))
+    assert json.loads(payload) == {"video_url": "https://example.com/ref.mp4"}
+
+
+@pytest.mark.parametrize(
+    ("reference", "field_name", "expected"),
+    [
+        ("data:image/png;base64,AAAA", "image_reference", {"image_url": "data:image/png;base64,AAAA"}),
+        ("data:video/mp4;base64,AAAA", "video_reference", {"video_url": "data:video/mp4;base64,AAAA"}),
+        ("https://example.com/ref.png", "image_reference", {"image_url": "https://example.com/ref.png"}),
+        ("https://example.com/ref.mp4", "video_reference", {"video_url": "https://example.com/ref.mp4"}),
+    ],
+)
+def test_bare_reference_string_uses_matching_json_field(
+    reference: str,
+    field_name: str,
+    expected: dict[str, str],
+    mocker: MockerFixture,
+) -> None:
+    """Image and video URLs use matching JSON fields; neither is a file upload."""
+    import aiohttp
+
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    assert _add_video_reference_to_form(aiohttp.FormData(), reference) is True
+    assert [name for name, _ in captured] == [field_name]
+    payload = captured[0][1]
+    assert isinstance(payload, (str, bytes, bytearray))
+    assert json.loads(payload) == expected
+
+
+def test_bare_video_string_is_not_collected_as_image() -> None:
+    content = ["https://example.com/ref.mp4", "data:video/mp4;base64,AAAA"]
+    assert list(_iter_image_reference_inputs(content)) == []
+    assert list(_iter_video_reference_inputs(content)) == [
+        {"video_url": "https://example.com/ref.mp4"},
+        {"video_url": "data:video/mp4;base64,AAAA"},
+    ]
+
+
+def test_bare_http_without_media_extension_is_rejected() -> None:
+    import aiohttp
+
+    with pytest.raises(ValueError, match="image or video extension"):
+        _add_video_reference_to_form(aiohttp.FormData(), "https://example.com/ref")
+
+
+def test_image_and_inline_video_use_combined_reference_fields(mocker: MockerFixture) -> None:
+    """Image plus data:video must be image_reference + video_reference, not input_references."""
+    import aiohttp
+
+    content = [
+        {"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}},
+        {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}},
+    ]
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    _add_combined_video_form_references(form, content)
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 1
+    assert field_names.count("video_reference") == 1
+    assert "input_references" not in field_names
+    assert "input_reference" not in field_names
+    image_payload = next(value for name, value in captured if name == "image_reference")
+    video_payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(image_payload, (str, bytes, bytearray))
+    assert isinstance(video_payload, (str, bytes, bytearray))
+    assert json.loads(image_payload) == {"image_url": "https://example.com/ref.png"}
+    assert json.loads(video_payload) == {"video_url": "data:video/mp4;base64,AAAA"}
+
+
+def test_image_url_and_bare_data_video_string_use_json_fields(mocker: MockerFixture) -> None:
+    """Image URL plus a bare data:video string must not upload input_references."""
+    import aiohttp
+
+    content = [{"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}}]
+    extra_body = {"video_reference": "data:video/mp4;base64,AAAA"}
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    _add_combined_video_form_references(form, content, extra_body)
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 1
+    assert field_names.count("video_reference") == 1
+    assert "input_references" not in field_names
+    assert "input_reference" not in field_names
+    image_payload = next(value for name, value in captured if name == "image_reference")
+    video_payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(image_payload, (str, bytes, bytearray))
+    assert isinstance(video_payload, (str, bytes, bytearray))
+    assert json.loads(image_payload) == {"image_url": "https://example.com/ref.png"}
+    assert json.loads(video_payload) == {"video_url": "data:video/mp4;base64,AAAA"}
+
+    captured.clear()
+    assert _add_video_reference_to_form(form, "data:video/mp4;base64,AAAA") is True
+    assert [name for name, _ in captured] == ["video_reference"]
+
+
+def _oversized_data_video_url() -> str:
+    """data:video whose JSON text part is larger than 1MB."""
+    return "data:video/mp4;base64," + ("A" * (1024 * 1024))
+
+
+def test_oversized_data_video_uploads_as_input_references(mocker: MockerFixture) -> None:
+    """A lone data:video over the 1MB text limit is uploaded, not sent as JSON."""
+    import aiohttp
+
+    video_url = _oversized_data_video_url()
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    assert _add_video_reference_to_form(aiohttp.FormData(), {"video_url": video_url}) is True
+    uploaded = next(value for name, value in captured if name == "input_references")
+    assert uploaded == base64.b64decode("A" * (1024 * 1024))
+    field_names = [name for name, _ in captured]
+    assert "video_reference" not in field_names
+    assert "image_reference" not in field_names
+
+
+def test_oversized_data_video_with_image_stays_json(mocker: MockerFixture) -> None:
+    """input_references cannot be combined with image_reference, even for a large video."""
+    import aiohttp
+
+    content = [{"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}}]
+    extra_body = {"video_reference": _oversized_data_video_url()}
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    _add_combined_video_form_references(aiohttp.FormData(), content, extra_body)
+    field_names = [name for name, _ in captured]
+    assert "image_reference" in field_names
+    assert "video_reference" in field_names
+    assert "input_references" not in field_names
+
+
+def test_image_upload_bytes_and_structured_video_use_json_fields(mocker: MockerFixture) -> None:
+    """Image upload bytes plus a video URL must not use singular input_reference."""
+    import aiohttp
+
+    image_bytes = base64.b64decode(_MIN_PNG_B64)
+    extra_body = {
+        "image_reference": {"bytes": image_bytes, "content_type": "image/png"},
+        "video_reference": {"video_url": "https://example.com/ref.mp4"},
+    }
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    _add_combined_video_form_references(form, None, extra_body)
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 1
+    assert field_names.count("video_reference") == 1
+    assert "input_reference" not in field_names
+    assert "input_references" not in field_names
+    image_payload = next(value for name, value in captured if name == "image_reference")
+    video_payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(image_payload, (str, bytes, bytearray))
+    assert isinstance(video_payload, (str, bytes, bytearray))
+    assert json.loads(image_payload) == {"image_url": f"data:image/png;base64,{_MIN_PNG_B64}"}
+    assert json.loads(video_payload) == {"video_url": "https://example.com/ref.mp4"}
 
 
 def test_video_unsupported_image_reference_raises() -> None:
     import aiohttp
 
     form = aiohttp.FormData()
-    with pytest.raises(ValueError, match="Unsupported image_reference"):
+    with pytest.raises(ValueError, match="Unsupported reference"):
         _add_video_reference_to_form(form, {"not_a_supported_key": "x"})
-    with pytest.raises(ValueError, match="Unsupported image_reference"):
+    with pytest.raises(ValueError, match="Unsupported reference"):
         _add_video_reference_to_form(form, "/tmp/does-not-exist-ref.png")
+
+
+def test_extract_stage_durations_from_video_and_image_shapes() -> None:
+    video_payload = {
+        "stage_durations": {
+            "diffuse": 1.5,
+            "text_encoder.forward": 0.2,
+            "vae.decode": 0.1,
+            "stage_0_gen_ms": 4000.0,
+        }
+    }
+    assert _extract_stage_durations_from_payload(video_payload) == video_payload["stage_durations"]
+
+    image_stage_durations = {
+        "diffuse": 2.0,
+        "vae.decode": 0.3,
+    }
+    image_payload = {
+        "metrics": {"stage_durations": image_stage_durations},
+        "data": [{"b64_json": "x"}],
+    }
+    assert _extract_stage_durations_from_payload(image_payload) == image_stage_durations
+
+
+def test_video_metrics_persist_full_stage_durations() -> None:
+    output = MixRequestFuncOutput()
+    output.latency = 4.2
+    stage_durations = {
+        "diffuse": 1.5,
+        "vae.decode": 0.25,
+        "stage_0_gen_ms": 4000.0,
+    }
+    payload = {
+        "duration_s": 2.0,
+        "num_frames": 48,
+        "fps": 24.0,
+        "stage_durations": stage_durations,
+    }
+    _apply_video_metrics_from_payload(output, payload, {})
+    assert output.stage_durations == stage_durations
+    assert output.video_generation_time_ms == pytest.approx(4000.0)
+
+
+def test_image_metrics_persist_stage_durations_from_metrics() -> None:
+    output = MixRequestFuncOutput()
+    stage_durations = {
+        "diffuse": 1.1,
+        "text_encoder.forward": 0.4,
+        "vae.decode": 0.2,
+    }
+    payload = {
+        "created": 1,
+        "data": [{"b64_json": _MIN_PNG_B64}],
+        "metrics": {"stage_durations": stage_durations},
+    }
+    assert _apply_image_metrics_from_payload(output, payload) == 1
+    assert output.stage_durations == stage_durations
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+def test_get_samples_forwards_upstream_multimodal_backends_kwarg(mocker: MockerFixture) -> None:
+    """The patched ``datasets.get_samples`` must stay call-compatible upstream.
+
+    Upstream ``vllm.benchmarks.datasets.get_samples`` takes a keyword-only
+    ``multimodal_backends`` (``vllm/benchmarks/throughput.py`` passes it) and
+    ``patch.py`` rebinds that symbol module-wide, so a non-omni request must
+    forward the keyword to the original implementation instead of raising
+    ``TypeError`` or silently dropping it.
+    """
+    calls: list[tuple[Namespace, object, dict]] = []
+
+    def fake_get_samples_old(args, tokenizer, **kwargs):
+        calls.append((args, tokenizer, kwargs))
+        return ["delegated"]
+
+    mocker.patch.object(patch, "get_samples_old", fake_get_samples_old)
+
+    args = Namespace(
+        dataset_name="random",
+        backend="vllm-chat",
+        dataset_path=None,
+        hf_name=None,
+    )
+    sentinel = object()
+    mm_backends = ("openai-chat", "openai-audio")
+
+    assert patch.get_samples(args, sentinel, multimodal_backends=mm_backends) == ["delegated"]
+    assert calls == [(args, sentinel, {"multimodal_backends": mm_backends})]
+    # No upstream kwargs: unchanged legacy delegate call.
+    assert patch.get_samples(args, sentinel) == ["delegated"]
+    assert calls[-1] == (args, sentinel, {})
+
+
+@pytest.mark.asyncio
+async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snapshots(monkeypatch):
+    """Persist compact formal-request snapshots in input order, excluding warmups and retaining gaps."""
+    second_finished = asyncio.Event()
+    completion_order = []
+    # Request 1 carries the empty dict that openai-chat-omni initializes before any SSE merge.
+    snapshots = [
+        {"1": {"num_tokens_out": 1536, "finish_reason": "length", "vllm_itls_ms": [8.0, 9.0]}},
+        {},
+        {"1": {"num_tokens_out": 486, "finish_reason": "stop"}, "2": {"audio_frames": 24000, "audio_duration_s": 1.0}},
+    ]
+    expected = [
+        {"1": {"num_tokens_out": 1536, "finish_reason": "length"}},
+        None,
+        {"1": {"num_tokens_out": 486, "finish_reason": "stop"}, "2": {"audio_frames": 24000, "audio_duration_s": 1.0}},
+    ]
+
+    async def request_func(request_func_input, session, pbar=None):
+        request_id = request_func_input.request_id
+        if not request_id:
+            return MixRequestFuncOutput(success=True, stage_metrics={"1": {"num_tokens_out": 999}})
+        index = int(request_id)
+        if index == 0:
+            await second_finished.wait()
+        elif index == 1:
+            second_finished.set()
+        completion_order.append(index)
+        return MixRequestFuncOutput(
+            success=index != 1,
+            stage_metrics=snapshots[index],
+            prompt_len=1,
+            output_tokens=900,
+            ttft=0.01,
+            text_latency=0.1,
+            latency=0.1,
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "test-stage-metrics", request_func)
+    result = await patch.benchmark(
+        task_type=patch.TaskType.GENERATION,
+        endpoint_type="test-stage-metrics",
+        api_url="http://unused/v1/chat/completions",
+        base_url="http://unused",
+        model_id="test-model",
+        model_name="test-model",
+        tokenizer=None,
+        input_requests=[
+            patch.SampleRequest(prompt="hello", prompt_len=1, expected_output_len=900, request_id=str(i))
+            for i in range(3)
+        ],
+        logprobs=None,
+        request_rate=float("inf"),
+        burstiness=1.0,
+        disable_tqdm=True,
+        num_warmups=2,
+        profile=False,
+        selected_percentile_metrics=[],
+        selected_percentiles=[],
+        ignore_eos=True,
+        goodput_config_dict={},
+        max_concurrency=3,
+        lora_modules=None,
+        extra_headers=None,
+        extra_body={"return_stage_metrics": True},
+        ready_check_timeout_sec=0,
+    )
+    assert completion_order.index(1) < completion_order.index(0)
+    assert result["request_stage_metrics"] == expected
+
+
+@pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict"])
+def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
+    """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""
+    assert patch._compact_request_stage_metrics(snapshot) is None
+
+
+# --------------------------------------------------------------------------- #
+# Server-side session stats in the Seed-TTS probe (RFC #8325)                 #
+# --------------------------------------------------------------------------- #
+
+
+def _stats_turn(response_id: str, *, final: bool = True) -> dict:
+    return {
+        "response_ids": [response_id],
+        "final": final,
+        "status": "done",
+        "chunks": [
+            {"submitted_ns": 0, "done_ns": 20_000_000, "stage_work": [{"stage_id": 0, "spans": [[0, 10_000_000]]}]}
+        ],
+        "audio": [{"duration_ms": 100.0}],
+    }
+
+
+class _StatsClient:
+    """Answers ``get_session_stats`` from a script of replies, exceptions or delays."""
+
+    def __init__(self, replies):
+        self.session_info = {"capabilities": {"supports_session_stats": True}}
+        self.replies = list(replies)
+        self.timeouts: list[float] = []
+
+    async def get_session_stats(self, *, timeout_s: float):
+        self.timeouts.append(timeout_s)
+        reply = self.replies.pop(0) if self.replies else {"turns": [_stats_turn("r1", final=False)]}
+        if isinstance(reply, BaseException):
+            raise reply
+        if isinstance(reply, float):
+            # Like the real client: a reply slower than the timeout is a timeout.
+            await asyncio.sleep(min(reply, timeout_s))
+            if reply > timeout_s:
+                raise asyncio.TimeoutError("timed out waiting for session.stats")
+            return {"turns": [_stats_turn("r1", final=False)]}
+        return reply
+
+
+def _probe(client) -> patch._RealtimeTTSProbe:
+    probe = patch._RealtimeTTSProbe("ws://unused")
+    probe._client = client
+    return probe
+
+
+@pytest.mark.asyncio
+async def test_turn_session_stats_polls_until_final_and_reports_the_stages() -> None:
+    client = _StatsClient([{"turns": [_stats_turn("r1", final=False)]}, {"turns": [_stats_turn("r1")]}])
+    stats = await _probe(client).turn_session_stats("r1", timeout_s=2.0)
+    assert stats["server_stats_final"] is True
+    assert stats["busy_rtf"] == 0.1
+    assert stats["server_stage_ids"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_turn_session_stats_stops_without_numbers_when_a_stage_reported_no_work() -> None:
+    reply = {"stages": [{"stage_id": stage_id} for stage_id in (0, 1, 2)], "turns": [_stats_turn("r1")]}
+    client = _StatsClient([reply])
+    stats = await _probe(client).turn_session_stats("r1", timeout_s=2.0)
+    assert (stats["server_stats_final"], stats["busy_rtf"]) == (False, None)
+    assert stats["server_missing_stage_ids"] == [1, 2]
+    # The turn is already final, so polling stops at once.
+    assert len(client.timeouts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        asyncio.TimeoutError("no reply"),
+        DuplexSessionClosedError("closed"),
+        DuplexProtocolError("stats disabled", code="session_stats_disabled"),
+    ],
+)
+async def test_a_failed_stats_query_leaves_the_turn_without_server_numbers(failure: Exception) -> None:
+    stats = await _probe(_StatsClient([failure])).turn_session_stats("r1", timeout_s=2.0)
+    assert stats["server_stats_final"] is False
+    assert stats["busy_rtf"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_late_non_final_reply_stops_at_the_overall_deadline() -> None:
+    client = _StatsClient([0.15, 0.15, 0.15])
+    started = time.monotonic()
+    stats = await _probe(client).turn_session_stats("r1", timeout_s=0.3)
+    elapsed = time.monotonic() - started
+    assert stats["server_stats_final"] is False
+    assert elapsed < 0.45
+    # Each query gets only the time left, never a fresh full timeout.
+    assert client.timeouts[0] == pytest.approx(0.3, abs=0.02)
+    assert all(later < client.timeouts[0] for later in client.timeouts[1:])

@@ -24,3 +24,11 @@ stages:
     devices: "0"
     default_sampling_params:
       seed: 52
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # Stock pins devices "0", which fails the device-count check at TP=2.
+        devices: "0,1"
+        tensor_parallel_size: 2

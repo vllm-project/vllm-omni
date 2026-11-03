@@ -39,7 +39,6 @@ connectors:
       enable_hift_graph: true
       enable_cfm_graph: true
       cfm_max_graphs: 32
-      cfm_graph_bucket_frames: 16
 
 stages:
   - stage_id: 0
@@ -102,4 +101,9 @@ stages:
       max_tokens: 65536
       detokenize: true
 
-platforms: {}
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Match the default CUDA Thinker backend for full reference audio.
+        attention_backend: TRITON_ATTN

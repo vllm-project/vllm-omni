@@ -5,13 +5,15 @@ A pipeline only declares the modalities that it supports.
 And a pipeline can choose which handler for each modality (there can be more than one handler for a modality).
 
 Outer key: pipeline architecture name (``od_config.model_class_name``).
-Inner key: modality name (e.g. ``\"prompt\"``).
+Inner key: modality name (e.g. ``\"camera\"``).
 """
 
 from __future__ import annotations
 
 from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHandler
+from vllm_omni.diffusion.interaction.modality_handlers.camera import SE3DeltaCameraHandler
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler
+from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import TaoMateH3PromptInteractionHandler
 
 STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     # Pipeline class name -> modality -> handler class.
@@ -20,5 +22,13 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     },
     "HeliosPyramidPipeline": {
         "prompt": PromptInteractionHandler,
+    },
+    "LingBotWorldCausalDMDPipeline": {
+        "camera": SE3DeltaCameraHandler,
+    },
+    # TaoMate-H3 re-reads the prompt at every five-second request boundary; the
+    # handler switches embeddings immediately (no cross-length interpolation).
+    "TaoMateH3Pipeline": {
+        "prompt": TaoMateH3PromptInteractionHandler,
     },
 }

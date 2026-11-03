@@ -1,0 +1,142 @@
+meta:
+  title: "GLM-TTS"
+  slug: "glm-tts"
+  provider: "GLM (Z-AI)"
+  description: "Z-AI's two-stage (AR + DiT flow-matching) zero-shot voice-cloning TTS for Chinese and English, served via vLLM-Omni through the OpenAI /v1/audio/speech API. Every request is conditioned on reference audio + its transcript."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - OpenMOSS-Team/MOSS-TTS
+    - bosonai/higgs-audio-v3-tts-4b
+
+model:
+  model_id: "zai-org/GLM-TTS"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "3B"
+  active_parameters: "3B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--trust-remote-code"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "GLM-TTS zero-shot voice clone via /v1/audio/speech (requires ref_audio + ref_text)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "zai-org/GLM-TTS",
+            "input": "你好，这是一个语音合成测试。",
+            "response_format": "wav",
+            "ref_audio": "file:///path/to/ref.wav",
+            "ref_text": "这是参考音频的文本内容。"
+          }' --output test.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "BF16 weights — single GPU; ~18-20 GB total (AR ~10 GB + DiT ~8 GB), ~16.6 GiB peak on a 1x A40 48 GB reference run; fits 24 GB cards"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [GLM-TTS](https://huggingface.co/zai-org/GLM-TTS) is Z-AI's two-stage
+  text-to-speech system — an LLM that generates speech tokens (AR) followed by a
+  Flow-Matching DiT that produces mel-spectrograms, vocoded by HiFT — served
+  through **vLLM-Omni** with the OpenAI-compatible `/v1/audio/speech` API. It
+  targets **Chinese and English**, and **every request is conditioned on
+  reference audio + its transcript** (zero-shot voice cloning).
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU. Reference run: 1x A40 48 GB — ~18-20 GB
+    total (AR ~10 GB + DiT ~8 GB), ~16.6 GiB peak; fits 24 GB cards. Both stages
+    share GPU 0 by default; split them across GPUs for higher concurrency.
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+  - `--trust-remote-code` is required for the GLM-TTS phoneme tokenizer.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  The deploy config (`vllm_omni/deploy/glm_tts.yaml`) is auto-discovered. Async
+  chunking (streaming) is on by default:
+
+  ```bash
+  vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8000
+  ```
+
+  For the synchronous (non-streaming) path:
+
+  ```bash
+  vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8000 --no-async-chunk
+  ```
+
+  ## Client usage
+
+  ### Zero-shot voice clone (curl)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "zai-org/GLM-TTS",
+      "input": "你好，这是一个语音合成测试。",
+      "response_format": "wav",
+      "ref_audio": "file:///path/to/ref.wav",
+      "ref_text": "这是参考音频的文本内容。"
+    }' --output test.wav
+  ```
+
+  ### Python client
+
+  ```bash
+  python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "你好，这是语音克隆测试。" \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "这是参考音频的文本内容。"
+  ```
+
+  ## Known limitations
+
+  - Output is **24 kHz mono** WAV via the HiFT vocoder (Vocos2D 32 kHz fallback
+    with resampling).
+  - Voice cloning requires `ref_audio` **and** `ref_text` together; the
+    reference clip should be **3-10 seconds**. Feature extraction (WhisperVQ
+    tokenizer, CampPlus ONNX, mel) runs model-side.
+  - The first request may be slow due to lazy model loading (WhisperVQ, CampPlus
+    ONNX). Warm-cache RTF is ~0.6-0.7x on an A40.
+
+  ## References
+
+  - [Model card](https://huggingface.co/zai-org/GLM-TTS)
+  - [GLM-TTS GitHub](https://github.com/zai-org/GLM-TTS)
+  - [vLLM-Omni GLM-TTS example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/glm_tts)

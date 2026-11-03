@@ -49,7 +49,7 @@ def test_cache_context_selects_executed_branch(monkeypatch, world_size, rank):
     )
     pipeline = _Pipeline()
 
-    negative_kwargs = None if rank == 0 else {"value": 1.0}
+    negative_kwargs = {"value": 1.0} if world_size > 1 else None
     pipeline.predict_noise_maybe_with_cfg(world_size > 1, 3.0, {"value": 2.0}, negative_kwargs, False)
 
     assert pipeline.contexts == [["cond"], ["uncond"]][rank]
@@ -57,19 +57,87 @@ def test_cache_context_selects_executed_branch(monkeypatch, world_size, rank):
     assert pipeline.context is None
 
 
+@pytest.mark.parametrize(
+    "world_size,rank,do_true_cfg,expected",
+    [
+        (1, 0, False, [("cond", "positive", False)]),
+        (1, 0, True, [("cond", "positive", True), ("uncond", "negative", True)]),
+        (2, 0, True, [("cond", "positive", True)]),
+        (2, 1, True, [("uncond", "negative", True)]),
+    ],
+)
+def test_cache_context_and_transformer_branch_match(monkeypatch, world_size, rank, do_true_cfg, expected):
+    monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: world_size)
+    monkeypatch.setattr(cfg_parallel, "get_classifier_free_guidance_rank", lambda: rank)
+    monkeypatch.setattr(
+        cfg_parallel,
+        "get_cfg_group",
+        lambda: SimpleNamespace(all_gather=lambda prediction, **_: [prediction, prediction]),
+    )
+    pipeline = _Pipeline()
+    pipeline.transformer = SimpleNamespace(cfg_branch="outer")
+    observations = []
+
+    def predict_noise(*, value):
+        observations.append((pipeline.context, pipeline.transformer.cfg_branch, pipeline.transformer.do_true_cfg))
+        return torch.full((1, 2, 3), value)
+
+    monkeypatch.setattr(pipeline, "predict_noise", predict_noise)
+    pipeline.predict_noise_maybe_with_cfg(do_true_cfg, 3.0, {"value": 2.0}, {"value": 1.0}, False)
+
+    assert observations == expected
+    assert pipeline.context is None
+    assert pipeline.transformer.cfg_branch == "outer"
+
+
+def test_cache_context_and_transformer_branch_restore_on_failure(monkeypatch):
+    monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: 1)
+    pipeline = _Pipeline()
+    pipeline.context = "outer-cache"
+    pipeline.transformer = SimpleNamespace(cfg_branch="outer")
+    observations = []
+
+    def predict_noise(*, value):
+        observations.append((pipeline.context, pipeline.transformer.cfg_branch, pipeline.transformer.do_true_cfg))
+        raise RuntimeError("transformer failed")
+
+    monkeypatch.setattr(pipeline, "predict_noise", predict_noise)
+    with pytest.raises(RuntimeError, match="transformer failed"):
+        pipeline.predict_noise_maybe_with_cfg(True, 3.0, {"value": 2.0}, {"value": 1.0}, False)
+
+    assert observations == [("cond", "positive", True)]
+    assert pipeline.context == "outer-cache"
+    assert pipeline.transformer.cfg_branch == "outer"
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_missing_negative_arguments_fail_before_entering_cache_context(monkeypatch, world_size):
+    monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: world_size)
+    pipeline = _Pipeline()
+
+    with pytest.raises(ValueError, match="CFG requires negative prediction arguments"):
+        pipeline.predict_noise_maybe_with_cfg(True, 3.0, {"value": 2.0}, None, False)
+
+    assert pipeline.contexts == []
+    assert pipeline.calls == []
+
+
 def test_pipeline_owned_explicit_context_is_preserved():
     class ExplicitContextPipeline(_Pipeline):
         def predict_noise(self, *, value, fail=False, _cache_context="cond"):
             # Cosmos3 handles this key itself, including cond_no_control.
+            assert self.transformer.cfg_branch == "positive"
             with self._cache_context_factory(_cache_context):
                 return super().predict_noise(value=value, fail=fail)
 
     pipeline = ExplicitContextPipeline()
+    pipeline.transformer = SimpleNamespace(cfg_branch="outer")
     pipeline.predict_noise_maybe_with_cfg(False, 1.0, {"_cache_context": "cond_no_control", "value": 2.0}, None)
 
     assert pipeline.contexts == ["cond_no_control"]
     assert pipeline.calls == [("cond_no_control", 2.0)]
     assert pipeline.context is None
+    assert pipeline.transformer.cfg_branch == "outer"
 
 
 def test_without_cache_factory_no_metadata_or_new_model_arguments_are_required():

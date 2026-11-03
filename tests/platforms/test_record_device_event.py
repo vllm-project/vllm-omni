@@ -6,12 +6,13 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 class TestOmniPlatformRecordDeviceEventInterface:
     """Test that the base OmniPlatform returns None (safe no-op fallback)."""
 
+    @pytest.mark.cpu
     def test_base_class_returns_none(self):
         from vllm_omni.platforms.interface import OmniPlatform
 
@@ -21,6 +22,7 @@ class TestOmniPlatformRecordDeviceEventInterface:
 class TestCudaOmniPlatformRecordDeviceEvent:
     """Test CudaOmniPlatform.record_device_event with mocked torch.Event."""
 
+    @pytest.mark.cpu
     def test_records_event_successfully(self, mocker):
         from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
@@ -31,6 +33,7 @@ class TestCudaOmniPlatformRecordDeviceEvent:
         assert result is mock_event
         mock_event.record.assert_called_once()
 
+    @pytest.mark.cpu
     def test_returns_none_on_failure(self, mocker):
         from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
@@ -50,6 +53,7 @@ class TestXPUOmniPlatformRecordDeviceEvent:
     (garbage rows at the bottom of the image).
     """
 
+    @pytest.mark.cpu
     def test_records_device_agnostic_torch_event(self, mocker):
         # vLLM's XPUPlatform imports vllm_xpu_kernels at module scope, and that
         # package is absent on non-XPU images.
@@ -108,6 +112,7 @@ class TestXPUOmniPlatformRecordDeviceEvent:
 class TestNPUOmniPlatformRecordDeviceEvent:
     """Test NPUOmniPlatform.record_device_event with mocked torch.npu."""
 
+    @pytest.mark.cpu
     def test_returns_none_on_failure(self, mocker):
         """When torch.npu.current_stream().synchronize() fails, return None."""
         try:
@@ -122,6 +127,7 @@ class TestNPUOmniPlatformRecordDeviceEvent:
         result = NPUOmniPlatform.record_device_event()
         assert result is None
 
+    @pytest.mark.cpu
     def test_synchronizes_stream_then_records_generic_event(self, mocker):
         """NPU should return an event consumable by the generic torch.Stream."""
         try:

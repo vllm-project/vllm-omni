@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SANA-WM Stage-1 transformer.
 
 Native vLLM-Omni port of the NVlabs SANA-WM DiT. Modules are built eagerly at
@@ -563,7 +563,8 @@ class SanaWmPatchEmbedMS3D(nn.Module):
     def project_with_shape(self, latents: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
         hidden_states = self.norm(self.proj(latents))
         _, _, frames, height, width = hidden_states.shape
-        return hidden_states.flatten(2).transpose(1, 2), (frames, height, width)
+        # Use a contiguous token/channel layout for framewise AdaLayerNorm.
+        return hidden_states.flatten(2).transpose(1, 2).contiguous(), (frames, height, width)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         return self.project_with_shape(latents)[0]

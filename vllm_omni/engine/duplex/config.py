@@ -11,10 +11,23 @@ accepts a ``DuplexSessionConfig`` (or the equivalent OpenAI Realtime
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, cast
+
+
+def _normalized_voice(value: object) -> str | None:
+    """Return the canonical form used to decide whether a voice update is a change.
+
+    A blank string and ``None`` both mean "no voice"; treating them as
+    different values would reject a client's null clear for a blank voice.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
 
 
 class DuplexConfigError(ValueError):
@@ -94,6 +107,13 @@ class DuplexCapabilities:
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
     supports_core_resumable_request: bool = False
+    # Prior assistant TTS may keep draining while a new user commit is admitted.
+    # Not barge-in (which aborts prior TTS).
+    supports_concurrent_turn_requests: bool = False
+    #: Input modality contract. Defaults match audio-primary duplex (e.g. MiniCPM):
+    #: audio required, video optional when attached to an audio unit.
+    required_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"audio"}))
+    optional_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"video"}))
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False
     supports_realtime_endpoint: bool = False
@@ -111,6 +131,8 @@ class DuplexCapabilities:
     #: seeding a text prompt has no representation and the turn never
     #: completes. ``text_turn_priming_units`` is how many silence units such a
     #: seeded turn must be given to generate on -- it still speaks per unit.
+    supports_image_input: bool = False
+    supports_text_only_turn: bool = False
     supports_chat_completions: bool = False
     text_turn_priming_units: int = 0
     requires_model_runner_kv: bool = False
@@ -120,6 +142,10 @@ class DuplexCapabilities:
     stage_handoff_transport: str | None = None
     chunk_period_ms: int | None = 1000
     target_barge_in_latency_ms: int | None = 1000
+    #: The deployment collects per-turn stage work and answers ``session.stats.get``
+    #: (RFC #8325). Set by the engine from ``duplex_session.collect_stats``, never by
+    #: a plugin; see :func:`apply_session_stats_capability`.
+    supports_session_stats: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -140,6 +166,9 @@ class DuplexCapabilities:
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
             "supports_core_resumable_request": self.supports_core_resumable_request,
+            "supports_concurrent_turn_requests": self.supports_concurrent_turn_requests,
+            "required_input_modalities": sorted(self.required_input_modalities),
+            "optional_input_modalities": sorted(self.optional_input_modalities),
             "supports_stage_connector_handoff": self.supports_stage_connector_handoff,
             "supports_independent_io_streams": self.supports_independent_io_streams,
             "supports_realtime_endpoint": self.supports_realtime_endpoint,
@@ -149,18 +178,56 @@ class DuplexCapabilities:
             "supports_session_resume": self.supports_session_resume,
             "session_admission_mode": self.session_admission_mode,
             "supports_audio_truncate": self.supports_audio_truncate,
+            "supports_image_input": self.supports_image_input,
+            "supports_text_only_turn": self.supports_text_only_turn,
             "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,
-            # Every duplex model is model-native and appends audio chunks (§7 D4);
-            # kept on the wire as constants for clients that still read them.
-            "implementation_level": "model_native_duplex",
+            "implementation_level": (
+                "model_native_duplex" if self.supports_model_native_turn_policy else "turn_based_duplex"
+            ),
             "adapter_patterns": self.adapter_patterns,
             "input_modes": ["append_audio_chunk"],
             "signal_sources": self.signal_sources,
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
+            "supports_session_stats": self.supports_session_stats,
         }
+
+    def accepts_input_modality(self, modality: str) -> bool:
+        return modality in self.required_input_modalities or modality in self.optional_input_modalities
+
+    def allows_video_without_audio(self) -> bool:
+        """Whether video without speech/audio is legal turn content (AURA video-compulsory)."""
+        return self.accepts_input_modality("video") and "audio" not in self.required_input_modalities
+
+    def validate_append_modalities(self, *, has_audio: bool, has_video: bool) -> str | None:
+        """Return an error message when the append modalities violate this contract."""
+        if not has_audio and not has_video:
+            return "input_audio_buffer.append requires audio and/or video_frames"
+        if has_audio and not self.accepts_input_modality("audio"):
+            return "This duplex model does not accept audio input"
+        if has_video and not self.accepts_input_modality("video"):
+            return "This duplex model does not accept video_frames"
+        if "audio" in self.required_input_modalities and not has_audio:
+            return "This duplex model requires audio on input_audio_buffer.append"
+        if "video" in self.required_input_modalities and not has_video:
+            return "This duplex model requires video_frames on input_audio_buffer.append"
+        if has_video and not has_audio and not self.allows_video_without_audio():
+            return "This duplex model requires audio; video-only append is not allowed"
+        return None
+
+
+def apply_session_stats_capability(capabilities: DuplexCapabilities, collect_stats: bool) -> DuplexCapabilities:
+    """Advertise ``supports_session_stats`` exactly when the deployment collects stats.
+
+    The plugin builds its capabilities without seeing the deploy flag, so every
+    caller of ``plugin.capabilities()`` passes the result through here; the
+    advertised value and the runner's check then cannot disagree.
+    """
+    if capabilities.supports_session_stats == bool(collect_stats):
+        return capabilities
+    return replace(capabilities, supports_session_stats=bool(collect_stats))
 
 
 @dataclass
@@ -169,6 +236,8 @@ class DuplexPlaybackCursor:
     sent_ms: int = 0
     played_ms: int = 0
     committed_ms: int = 0
+    text_requires_complete_audio: bool = False
+    audio_complete: bool = False
 
     def acknowledge(self, played_ms: int, committed_ms: int | None = None) -> None:
         self.played_ms = max(self.played_ms, max(0, int(played_ms)))
@@ -188,7 +257,11 @@ class DuplexPlaybackCursor:
         }
 
     def snapshot(self) -> DuplexPlaybackView:
-        return DuplexPlaybackView(**self.as_dict())
+        return DuplexPlaybackView(
+            **self.as_dict(),
+            text_requires_complete_audio=self.text_requires_complete_audio,
+            audio_complete=self.audio_complete,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +270,8 @@ class DuplexPlaybackView:
     sent_ms: int = 0
     played_ms: int = 0
     committed_ms: int = 0
+    text_requires_complete_audio: bool = False
+    audio_complete: bool = False
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -207,11 +282,38 @@ class DuplexPlaybackView:
         }
 
 
-@dataclass
-class DuplexAudioChunk:
-    data: str
-    format: str = "wav"
-    sample_rate_hz: int | None = None
+#: ``extra_body`` key of the optional session-wide tool-result deadline. It sits
+#: in ``extra_body`` rather than in a typed field because a session's
+#: server-side behaviour switches (``auto_response``, ``realtime_tools``,
+#: ``realtime_turn_detection``) already travel there, and because the key is set
+#: once when the session opens -- see :meth:`DuplexSessionConfig.apply_realtime_update`.
+TOOL_RESULT_TIMEOUT_KEY = "tool_result_timeout_s"
+
+
+def resolve_tool_result_timeout_s(extra_body: Mapping[str, object] | None) -> float | None:
+    """Read the optional tool-result deadline in seconds; ``None`` disables it.
+
+    Rejects ``bool`` (``True`` is an ``int`` in Python and would otherwise read
+    as a one-second deadline), non-finite and non-positive values: the deadline
+    only ever makes a pending call *unanswerable*, so an accidental value must
+    not be able to silently expire every call of a session.
+    """
+    if not extra_body:
+        return None
+    value = extra_body.get(TOOL_RESULT_TIMEOUT_KEY)
+    if value is None:
+        return None
+    try:
+        timeout = float(value) if isinstance(value, int | float) and not isinstance(value, bool) else math.nan
+    except OverflowError:
+        timeout = math.nan
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise DuplexConfigError(
+            f"tool_result_timeout_s must be a finite positive number of seconds, got {value!r}",
+            code="invalid_tool_result_timeout",
+            param=TOOL_RESULT_TIMEOUT_KEY,
+        )
+    return timeout
 
 
 @dataclass
@@ -236,7 +338,14 @@ class DuplexSessionConfig:
     overlap_barge_in_ms: int = 1200
     overlap_silence_rms: float = 0.003
     playback_commit_policy: str = DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
+    watermarking: bool = True
     extra_body: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # A caller that builds the config directly (the Python API, a test) is
+        # validated here; the Realtime path assigns ``extra_body`` after
+        # construction and re-validates in ``from_event``.
+        resolve_tool_result_timeout_s(self.extra_body)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -257,6 +366,7 @@ class DuplexSessionConfig:
             "overlap_barge_in_ms": self.overlap_barge_in_ms,
             "overlap_silence_rms": self.overlap_silence_rms,
             "playback_commit_policy": self.playback_commit_policy,
+            "watermarking": self.watermarking,
             "extra_body": dict(self.extra_body),
         }
 
@@ -305,21 +415,29 @@ class DuplexSessionConfig:
             config.overlap_silence_rms = max(0.0, float(source["overlap_silence_rms"]))
         if isinstance(source.get("playback_commit_policy"), str):
             config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
+        if isinstance(source.get("watermarking"), bool):
+            config.watermarking = source["watermarking"]
         if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
             config.modalities = list(source["modalities"])
         if isinstance(source.get("extra_body"), dict):
             config.extra_body = dict(source["extra_body"])
             extra = config.extra_body
-            if isinstance(extra.get("overlap_policy"), str):
-                config.overlap_policy = cls._normalize_overlap_policy(extra["overlap_policy"])
-            if isinstance(extra.get("overlap_short_ack_ms"), int | float):
-                config.overlap_short_ack_ms = max(0, int(extra["overlap_short_ack_ms"]))
-            if isinstance(extra.get("overlap_barge_in_ms"), int | float):
-                config.overlap_barge_in_ms = max(0, int(extra["overlap_barge_in_ms"]))
-            if isinstance(extra.get("overlap_silence_rms"), int | float):
-                config.overlap_silence_rms = max(0.0, float(extra["overlap_silence_rms"]))
-            if isinstance(extra.get("playback_commit_policy"), str):
-                config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
+            overlap_policy = extra.get("overlap_policy")
+            if isinstance(overlap_policy, str):
+                config.overlap_policy = cls._normalize_overlap_policy(overlap_policy)
+            short_ack_ms = extra.get("overlap_short_ack_ms")
+            if isinstance(short_ack_ms, int | float):
+                config.overlap_short_ack_ms = max(0, int(short_ack_ms))
+            barge_in_ms = extra.get("overlap_barge_in_ms")
+            if isinstance(barge_in_ms, int | float):
+                config.overlap_barge_in_ms = max(0, int(barge_in_ms))
+            silence_rms = extra.get("overlap_silence_rms")
+            if isinstance(silence_rms, int | float):
+                config.overlap_silence_rms = max(0.0, float(silence_rms))
+            playback_commit_policy = extra.get("playback_commit_policy")
+            if isinstance(playback_commit_policy, str):
+                config.playback_commit_policy = cls._normalize_playback_commit_policy(playback_commit_policy)
+        resolve_tool_result_timeout_s(config.extra_body)
         return config
 
     @classmethod
@@ -339,26 +457,26 @@ class DuplexSessionConfig:
         ``_session_create_from_realtime``.
         """
         from vllm_omni.engine.duplex.realtime_commands import (
-            RealtimeInputDefaults,
+            DUPLEX_REALTIME_CAPABILITIES,
             duplex_response_format,
+        )
+        from vllm_omni.engine.duplex.turn_detection import normalize_turn_detection_session_payload
+        from vllm_omni.protocol.duplex import (
+            RealtimeInputDefaults,
             input_audio_transcription_config,
             json_safe_realtime_payload,
             realtime_max_output_tokens,
             realtime_overlap_fields,
-            validate_realtime_session_audio_formats,
-        )
-        from vllm_omni.engine.duplex.turn_detection import (
-            normalize_turn_detection_session_payload,
-            validate_realtime_turn_detection,
+            validate_session_payload,
         )
 
         payload: dict[str, object] = dict(session_payload)
-        format_error = validate_realtime_session_audio_formats(payload)
-        if format_error is not None:
-            raise DuplexConfigError(format_error, code="unsupported_audio_format")
-        turn_detection_error = validate_realtime_turn_detection(payload)
-        if turn_detection_error is not None:
-            raise DuplexConfigError(turn_detection_error, code="unsupported_turn_detection", param="turn_detection")
+        # One session check for every consumer (ENTRY-INV-002): the same
+        # capability object ``translate_realtime_command`` uses, so a session
+        # object is accepted or refused identically whichever door it came in.
+        rejection = validate_session_payload(payload, capabilities=DUPLEX_REALTIME_CAPABILITIES)
+        if rejection is not None:
+            raise DuplexConfigError(rejection.message, code=rejection.code, param=rejection.param)
         normalize_turn_detection_session_payload(payload)
         defaults = RealtimeInputDefaults().with_session_payload(payload)
         payload.update(realtime_overlap_fields(payload))
@@ -368,6 +486,10 @@ class DuplexSessionConfig:
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
         extra_body_payload = payload.get("extra_body")
         extra_body: dict[str, object] = dict(extra_body_payload) if isinstance(extra_body_payload, dict) else {}
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            # Accepted at the top level like ``idle_timeout_s``; an invalid value
+            # is rejected by ``resolve_tool_result_timeout_s``, never ignored.
+            extra_body[TOOL_RESULT_TIMEOUT_KEY] = payload[TOOL_RESULT_TIMEOUT_KEY]
         extra_body["realtime_session_payload"] = json_safe_realtime_payload(payload)
         if isinstance(payload.get("tools"), list):
             extra_body["realtime_tools"] = payload["tools"]
@@ -427,6 +549,7 @@ class DuplexSessionConfig:
             ),
             "speed": speed,
             "idle_timeout_s": payload.get("idle_timeout_s") or 300.0,
+            "watermarking": payload.get("watermarking"),
             **realtime_overlap_fields(payload),
             "extra_body": extra_body,
         }
@@ -442,13 +565,14 @@ class DuplexSessionConfig:
         """Apply a Realtime ``session.update`` patch in place.
 
         Raises :class:`DuplexConfigError` (``code`` in ``model_update_unsupported``,
-        ``voice_update_after_audio_unsupported``, ``ref_audio_update_unsupported``)
+        ``voice_update_after_audio_unsupported``, ``ref_audio_update_unsupported``,
+        ``watermarking_update_unsupported``)
         when the patch changes something a live session cannot change.
         ``audio_started`` is ``playback.generated_ms > 0 or playback.sent_ms > 0``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
+        from vllm_omni.protocol.duplex import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
-            duplex_response_format,
             input_audio_transcription_config,
             json_safe_realtime_payload,
             parse_realtime_audio_format,
@@ -463,8 +587,15 @@ class DuplexSessionConfig:
         audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
         voice = payload.get("voice")
-        if not isinstance(voice, str) and isinstance(audio_output, dict):
-            voice = audio_output.get("voice")
+        # An explicit ``voice`` — string or null, at the top level or nested in
+        # ``audio.output`` — requests a voice change. Clearing matters as much as
+        # setting once downstream stages key behavior off the voice. Realtime
+        # clients resend the whole session object, so an echo of the current
+        # value is not a change.
+        voice_requested = "voice" in payload
+        if not isinstance(voice, str) and isinstance(audio_output, dict) and "voice" in audio_output:
+            voice = audio_output["voice"]
+            voice_requested = True
         if isinstance(model, str) and self.model is not None and model != self.model:
             raise DuplexConfigError(
                 "session.update cannot change model for an open realtime duplex session",
@@ -472,11 +603,29 @@ class DuplexSessionConfig:
             )
         if isinstance(model, str) and self.model is None:
             self.model = model
-        if isinstance(voice, str) and audio_started:
+        voice_is_echo = False
+        if voice_requested:
+            # The echo check is playback-independent: SessionControl re-runs
+            # the plugin's runtime_config_for_update on every session.update,
+            # and exact-comparing plugins must see the stored spelling even
+            # before any audio output.
+            requested = _normalized_voice(voice)
+            current = _normalized_voice(self.voice)
+            voice_is_echo = requested == current
+            if audio_started and not voice_is_echo:
+                raise DuplexConfigError(
+                    "session.update cannot change voice after audio output has started",
+                    code="voice_update_after_audio_unsupported",
+                )
+
+        # Async-chunk stages are submitted once per epoch, so watermarking is fixed when the session opens
+        watermarking = payload.get("watermarking")
+        if isinstance(watermarking, bool) and watermarking != self.watermarking:
             raise DuplexConfigError(
-                "session.update cannot change voice after audio output has started",
-                code="voice_update_after_audio_unsupported",
+                "session.update cannot change watermarking after the session is open",
+                code="watermarking_update_unsupported",
             )
+
         if isinstance(payload.get("ref_audio"), str):
             raise DuplexConfigError(
                 "session.update cannot change ref_audio after the session is open", code="ref_audio_update_unsupported"
@@ -485,9 +634,15 @@ class DuplexSessionConfig:
             self.instructions = str(payload["instructions"])
         elif "instructions" in payload and payload.get("instructions") is None:
             self.instructions = None
-        if isinstance(voice, str):
-            self.voice = str(voice)
-        elif "voice" in payload and payload.get("voice") is None:
+        if isinstance(voice, str) and not voice_is_echo:
+            # An echo keeps the stored spelling: this config is shared across
+            # plugins, and some (PersonaPlex) compare the stored voice exactly,
+            # so a case or whitespace variant must not overwrite it. A blank
+            # value is a clear, the same as an explicit null.
+            self.voice = None if _normalized_voice(voice) is None else str(voice)
+        elif voice_requested and voice is None:
+            # Includes a nested audio.output.voice null, which the guard above
+            # already counts as a change request.
             self.voice = None
         response_format = payload.get("output_audio_format") or payload.get("response_format")
         if response_format is None and isinstance(audio_output, dict):
@@ -524,6 +679,30 @@ class DuplexSessionConfig:
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             self.modalities = list(modalities)
+        # A realtime client resends the whole session. Resolve the deadline the
+        # same way ``from_realtime`` does: a top-level key wins over ``extra_body``.
+        # Reject only a real change, including set versus unset. Calls may already
+        # be pending under the old deadline; a live change would leave "is this
+        # result in time?" undecidable.
+        extra_body_patch = payload.get("extra_body")
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            timeout_patch: object = payload[TOOL_RESULT_TIMEOUT_KEY]
+            timeout_present = True
+        elif isinstance(extra_body_patch, dict) and TOOL_RESULT_TIMEOUT_KEY in extra_body_patch:
+            timeout_patch = extra_body_patch[TOOL_RESULT_TIMEOUT_KEY]
+            timeout_present = True
+        else:
+            timeout_patch = None
+            timeout_present = False
+        if timeout_present:
+            proposed_timeout = resolve_tool_result_timeout_s({TOOL_RESULT_TIMEOUT_KEY: timeout_patch})
+            current_timeout = resolve_tool_result_timeout_s(self.extra_body)
+            if proposed_timeout != current_timeout:
+                raise DuplexConfigError(
+                    "session.update cannot change tool_result_timeout_s after the session is open",
+                    code="tool_result_timeout_update_unsupported",
+                    param=TOOL_RESULT_TIMEOUT_KEY,
+                )
         if isinstance(payload.get("extra_body"), dict):
             self.extra_body.update(payload["extra_body"])
             extra = payload["extra_body"]
@@ -533,6 +712,10 @@ class DuplexSessionConfig:
                 self.playback_commit_policy = self._normalize_playback_commit_policy(
                     str(extra["playback_commit_policy"])
                 )
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            # ``extra_body.update`` above would otherwise store the nested value
+            # and change a deadline the top-level key just confirmed.
+            self.extra_body[TOOL_RESULT_TIMEOUT_KEY] = payload[TOOL_RESULT_TIMEOUT_KEY]
         if isinstance(payload.get("tools"), list):
             self.extra_body["realtime_tools"] = payload["tools"]
         elif "tools" in payload and payload.get("tools") is None:
@@ -629,11 +812,10 @@ class ResponseCreateOptions:
         for options a model-native duplex session cannot apply per response.
         Private runtime keys in ``extra_body`` are dropped.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
+        from vllm_omni.protocol.duplex import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
-            duplex_response_format,
             parse_realtime_audio_format,
-            realtime_max_output_tokens,
         )
 
         payload: dict[str, object] = dict(response_payload)
@@ -665,11 +847,12 @@ class ResponseCreateOptions:
         response_format = payload.get("output_audio_format") or payload.get("response_format")
         if response_format is None and isinstance(audio_output, dict):
             response_format = audio_output.get("format")
-        response_format, _ = parse_realtime_audio_format(response_format)
-        if isinstance(response_format, str) and response_format.lower() in REALTIME_OUTPUT_AUDIO_FORMATS:
-            response_format = duplex_response_format(response_format)
+        parsed_format, _ = parse_realtime_audio_format(response_format)
+        output_audio_format: str | None
+        if isinstance(parsed_format, str) and parsed_format.lower() in REALTIME_OUTPUT_AUDIO_FORMATS:
+            output_audio_format = str(duplex_response_format(parsed_format))
         else:
-            response_format = None
+            output_audio_format = None
         temperature = (
             float(cast("int | float", payload["temperature"]))
             if isinstance(payload.get("temperature"), int | float)
@@ -687,9 +870,9 @@ class ResponseCreateOptions:
             else payload.get("max_tokens")
         )
         if "max_response_output_tokens" in payload or "max_output_tokens" in payload or "max_tokens" in payload:
-            max_tokens = realtime_max_output_tokens(max_tokens)
+            token_limit = realtime_max_output_tokens(max_tokens)
         else:
-            max_tokens = None
+            token_limit = None
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             modalities = tuple(modalities)
@@ -717,9 +900,9 @@ class ResponseCreateOptions:
         return cls(
             instructions=instructions,
             voice=voice,
-            response_format=response_format,
+            response_format=output_audio_format,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=token_limit,
             speed=speed,
             modalities=modalities,
             extra_body=response_extra,
@@ -761,6 +944,8 @@ def realtime_item_to_history_message(item: object) -> dict[str, object] | None:
         part_type = part.get("type")
         if part_type in {"input_text", "text", "output_text"} and isinstance(part.get("text"), str):
             text_chunks.append(str(part["text"]))
+        elif part_type == "input_image" and isinstance(part.get("image_url"), str):
+            audio_chunks.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
         elif part_type in {"input_audio", "audio"}:
             audio = part.get("audio") or part.get("data")
             fmt = part.get("format") if isinstance(part.get("format"), str) else "wav"
@@ -782,21 +967,20 @@ def realtime_item_to_history_message(item: object) -> dict[str, object] | None:
 
 def realtime_max_output_tokens(value: object) -> int | None:
     """Normalize Realtime max output tokens (``"inf"`` -> ``None``)."""
-    from vllm_omni.engine.duplex.realtime_commands import realtime_max_output_tokens as _impl
+    from vllm_omni.protocol.duplex import realtime_max_output_tokens as _impl
 
     return _impl(value)
 
 
 def input_audio_transcription_config(session_payload: Mapping[str, object]) -> dict[str, object] | None:
     """Return the ``input_audio_transcription`` object of a Realtime session payload."""
-    from vllm_omni.engine.duplex.realtime_commands import input_audio_transcription_config as _impl
+    from vllm_omni.protocol.duplex import input_audio_transcription_config as _impl
 
     return _impl(session_payload)
 
 
 __all__ = [
     "DuplexAssistantAudioTextMark",
-    "DuplexAudioChunk",
     "DuplexCapabilities",
     "DuplexCommittedInput",
     "DuplexConfigError",

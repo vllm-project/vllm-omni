@@ -6,61 +6,69 @@ steps:
     commands:
       - "bash .buildkite/cuda/scripts/build-ci-image.sh"
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
-  # L2 Test — PR ready label (diff-aware) or main+WEEKLY=1 (--e2e, full E2E group)
+  # L2 Test — PR ready label (diff-aware) or release-line+WEEKLY=1 (--e2e, full E2E group)
   - label: "Upload Ready Pipeline"
     depends_on: image-build
     key: upload-ready-pipeline
     commands:
       - |
+        # shellcheck disable=SC1091
+        source .buildkite/common/scripts/release_line_branch.sh
         EXTRA=""
-        if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+        if [ "${WEEKLY:-}" = "1" ] && is_release_line_push; then
           EXTRA="--e2e"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
-  # L3 Test — PR merge-test label or post-merge on main (both diff-aware);
-  # main+WEEKLY=1 uploads the E2E group only (--e2e).
+  # L3 Test — PR merge-test label or post-merge on a release line (both diff-aware);
+  # release-line+WEEKLY=1 uploads the E2E group only (--e2e).
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
     commands:
       - |
+        # shellcheck disable=SC1091
+        source .buildkite/common/scripts/release_line_branch.sh
         EXTRA=""
-        if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+        if [ "${WEEKLY:-}" = "1" ] && is_release_line_push; then
           EXTRA="--e2e"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
-  # L4 Test — main+NIGHTLY=1 (full pipeline), or PR nightly-test label (diff-aware)
+  # L4 Test — release-line+NIGHTLY=1 (full pipeline), or PR nightly-test label (diff-aware)
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
     commands:
       - |
+        # shellcheck disable=SC1091
+        source .buildkite/common/scripts/release_line_branch.sh
         EXTRA=""
-        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+        if [ "${NIGHTLY:-}" = "1" ] && is_release_line_push; then
           EXTRA="--all"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-nightly.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
-  # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (full pipeline), or PR weekly-test label (diff-aware)
+  # L5 Test — release-line+WEEKLY=1 / NON_CRITICAL=1 (full pipeline), or PR weekly-test label (diff-aware)
   - label: "Upload Weekly Pipeline"
     depends_on: image-build
     key: upload-weekly-pipeline
     commands:
       - |
+        # shellcheck disable=SC1091
+        source .buildkite/common/scripts/release_line_branch.sh
         EXTRA=""
-        if [ "${BUILDKITE_BRANCH}" = "main" ]; then
+        if is_release_line_push; then
           EXTRA="--all"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-weekly.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"

@@ -10,6 +10,10 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from vllm_omni.engine.duplex.pcm_reservation import (
+    commit_ordered_reservation,
+    rollback_ordered_reservation,
+)
 from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
 
 
@@ -18,6 +22,48 @@ class _PcmSpan:
     byte_count: int
     force_listen: bool
     is_speech: bool
+
+
+def _frame_group_bytes(frames: object) -> int:
+    if not isinstance(frames, list):
+        return 0
+    return sum(len(frame) for frame in frames if isinstance(frame, str))
+
+
+class _QueuedVisionHold(PcmAppendReservation):
+    """Undo one frame-only append that the pending-byte limit rejected.
+
+    The frame stays queued when the hold is committed. It is not an ordered
+    PCM reservation: committing it must not block the later unit that emits it.
+    """
+
+    payload = None
+
+    def __init__(self, owner: MiniCPMO45PcmAppendBuffer, entry: dict[str, object]) -> None:
+        self._owner = owner
+        self._entry = entry
+        self.operation_id = "vision-hold"
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def byte_count(self) -> int:
+        return 0
+
+    def commit(self) -> None:
+        self._active = False
+
+    def rollback(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        try:
+            self._owner._vision_queue.remove(self._entry)
+        except ValueError:
+            return
 
 
 class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
@@ -48,6 +94,7 @@ class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
         spans: list[_PcmSpan] | None = None,
         turn_had_speech: bool = False,
         video_frames: list[str] | None = None,
+        account_image_bytes: bool = False,
     ) -> None:
         self._owner = owner
         self.operation_id = operation_id
@@ -59,6 +106,7 @@ class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
         self._spans = list(spans or [])
         self._turn_had_speech = turn_had_speech
         self._video_frames = list(video_frames or [])
+        self._account_image_bytes = account_image_bytes
         self._active = True
 
     @property
@@ -67,7 +115,10 @@ class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
 
     @property
     def byte_count(self) -> int:
-        return len(self._raw)
+        # A VISION unit that waited in the queue was already charged through
+        # ``pending_byte_count``. Its reservation carries that charge out.
+        images = _frame_group_bytes(self._video_frames) if self._account_image_bytes else 0
+        return len(self._raw) + images
 
     def commit(self) -> None:
         self._owner._commit_reservation(self)
@@ -124,14 +175,23 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         # wire contract allows at most 2 images per append); both must ride
         # the same unit, mirroring official ``frame_list``.
         self._frame_queue: list[list[str]] = []
+        # Independent VISION units must not wait for a partial microphone chunk.
+        self._vision_queue: list[dict[str, object]] = []
+        # The mel processor's first window is independent of how many VISION
+        # units preceded it. Set once an audio payload is committed, or once a
+        # silence continuation is accepted outside this buffer.
+        self._audio_window_started = False
+        self._audio_window_reserved = False
 
     def clear(self) -> None:
         for reservation in self._reservations:
             reservation._active = False
         self._reservations.clear()
+        self._audio_window_reserved = False
         self._buffer.clear()
         self._spans.clear()
         self._frame_queue.clear()
+        self._vision_queue.clear()
         self._sample_rate_hz = None
         self._turn_had_speech = False
 
@@ -139,14 +199,16 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         self._spans = [_PcmSpan(span.byte_count, False, span.is_speech) for span in self._spans]
 
     def has_pending(self) -> bool:
-        return bool(self._buffer)
+        return bool(self._buffer or self._vision_queue)
 
     def has_reserved(self) -> bool:
         return bool(self._reservations)
 
     @property
     def pending_byte_count(self) -> int:
-        return len(self._buffer)
+        # Frame-only units carry no PCM, so the byte limit has to see the
+        # base64 that is actually retained.
+        return len(self._buffer) + sum(_frame_group_bytes(item.get("video_frames")) for item in self._vision_queue)
 
     def _append_span(self, span: _PcmSpan) -> None:
         if span.byte_count <= 0:
@@ -230,10 +292,10 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         chunk_period_ms: int,
         flush: bool = False,
         allow_emit: bool = True,
-    ) -> MiniCPMO45PcmAppendReservation | None:
+    ) -> PcmAppendReservation | None:
         fmt = payload.get("format")
         sample_rate_hz = payload.get("sample_rate_hz")
-        audio = payload.get("audio")
+        audio = payload.get("audio", "")
         if fmt != "pcm_f32le" or not isinstance(sample_rate_hz, int) or not isinstance(audio, str):
             return self._reserve_passthrough(payload, operation_id=operation_id)
         try:
@@ -255,13 +317,43 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
             )
         )
         frames_in = payload.get("video_frames")
+        just_queued: dict[str, object] | None = None
         if isinstance(frames_in, list):
             frame_group = [frame for frame in frames_in if isinstance(frame, str) and frame]
             if frame_group:
-                self._frame_queue.append(frame_group)
+                if raw:
+                    self._frame_queue.append(frame_group)
+                else:
+                    just_queued = dict(payload, audio="", video_frames=frame_group)
+                    self._vision_queue.append(just_queued)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
+            # A rejected frame-only append has to be able to leave the queue.
+            # Audio-only buffering still has no reservation of its own.
+            if just_queued is not None:
+                return _QueuedVisionHold(self, just_queued)
             return None
+
+        # A frame group is a complete VISION unit; no synthetic audio is needed.
+        if self._vision_queue:
+            out = self._vision_queue.pop(0)
+            frames = out["video_frames"]
+            reservation = MiniCPMO45PcmAppendReservation(
+                owner=self,
+                operation_id=operation_id,
+                payload=out,
+                raw=b"",
+                sample_rate_hz=sample_rate_hz,
+                force_listen=bool(out.get("force_listen", False)),
+                is_speech=False,
+                turn_had_speech=self._turn_had_speech,
+                video_frames=frames if isinstance(frames, list) else [],
+                # A frame popped in the same call was never charged. One that
+                # waited in the queue was, and commit has to release it.
+                account_image_bytes=out is not just_queued,
+            )
+            self._reservations.append(reservation)
+            return reservation
 
         min_samples = max(1, int(sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
         buffered_samples = len(self._buffer) // 4
@@ -305,6 +397,9 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
             out["video_frames"] = attached_frames
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
+        if out.get("audio") and not self._audio_window_started and not self._audio_window_reserved:
+            out["first_audio_window"] = True
+            self._audio_window_reserved = True
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
             operation_id=operation_id,
@@ -320,6 +415,31 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         self._reservations.append(reservation)
         return reservation
 
+    def note_audio_window_started(self) -> None:
+        """The first mel window was encoded outside this buffer.
+
+        A silence continuation is submitted directly to Stage0. Once that
+        append is accepted, later speech is a normal chunk, not the 1035 ms
+        first window.
+        """
+        self._audio_window_started = True
+
+    def retains_separate_vision_units(self) -> bool:
+        return True
+
+    def prepare_commit_prefix(
+        self, *, operation_id: str, chunk_period_ms: int
+    ) -> MiniCPMO45PcmAppendReservation | None:
+        # Keep the final VISION unit for the terminal reservation, unless a
+        # speech tail still needs to follow it. Never merge frame groups.
+        if not self._vision_queue or (len(self._vision_queue) == 1 and not (self._turn_had_speech and self._buffer)):
+            return None
+        return self.prepare_append(
+            {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz or 16000},
+            operation_id=operation_id,
+            chunk_period_ms=chunk_period_ms,
+        )
+
     def prepare_commit(
         self,
         *,
@@ -329,7 +449,7 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         """Reserve the terminal payload without invalidating prior appends."""
         had_speech = self._turn_had_speech
         reservation: MiniCPMO45PcmAppendReservation | None = None
-        if had_speech and self._buffer:
+        if (had_speech and self._buffer) or self._vision_queue:
             payload: dict[str, object] = {
                 "type": "audio",
                 "audio": "",
@@ -389,36 +509,38 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         return reservation.payload
 
     def _commit_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
-        if not reservation._active:
-            return
-        if not self._reservations or self._reservations[0] is not reservation:
-            raise RuntimeError("PCM append reservations must commit in wire order")
-        self._reservations.pop(0)
-        reservation._active = False
+        commit_ordered_reservation(self._reservations, reservation, head_only=True)
+        payload = reservation.payload
+        if isinstance(payload, dict) and payload.get("first_audio_window"):
+            self._audio_window_started = True
+            self._audio_window_reserved = False
 
     def _rollback_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
-        if not reservation._active:
+        rolled_back = rollback_ordered_reservation(
+            self._reservations,
+            reservation,
+            self._buffer,
+            active_only=False,
+        )
+        if not rolled_back:
             return
-        try:
-            index = self._reservations.index(reservation)
-        except ValueError:
-            reservation._active = False
-            return
-        rolled_back = self._reservations[index:]
-        restored = b"".join(item._raw for item in rolled_back)
-        self._buffer[:0] = restored
         self._prepend_spans([span for item in rolled_back for span in item._spans])
-        restored_groups = [list(item._video_frames) for item in rolled_back if item._video_frames]
+        restored_vision = [
+            dict(item.payload)
+            for item in rolled_back
+            if not item._raw and item._video_frames and item.payload is not None
+        ]
+        self._vision_queue[:0] = restored_vision
+        restored_groups = [list(item._video_frames) for item in rolled_back if item._raw and item._video_frames]
         if restored_groups:
             self._frame_queue[:0] = restored_groups
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
-        for item in rolled_back:
-            item._active = False
-        del self._reservations[index:]
+        if any(isinstance(item.payload, dict) and item.payload.get("first_audio_window") for item in rolled_back):
+            self._audio_window_reserved = False
 
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
-        if not self._buffer:
+        if not self.has_pending():
             return None
         payload: dict[str, object] = {
             "type": "audio",

@@ -1,10 +1,10 @@
-# Target vLLM version: v0.29.0 (tag @ 98dff2a81d74).
-# Use the matching release image and its coherent CUDA/PyTorch/FlashInfer
-# runtime. Do not reinstall a commit wheel or repair dependencies on top of
-# an older base image at a release boundary. For a future unreleased target,
-# restore an explicit wheel pin and validate its complete runtime stack.
+# Align the CUDA base and commit-index wheel with the final v0.32.0 release.
+# Pin the published multi-platform image digest so CI uses the same release
+# stack even if the upstream tag is updated.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=5df63a7203cdb9328d824a27b682e77c7b9928be
+ARG VLLM_VERSION=0.32.0
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.29.0
+ARG VLLM_BASE_TAG=v${VLLM_VERSION}@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents
@@ -12,6 +12,8 @@ ARG VLLM_BASE_TAG=v0.29.0
 # everything except the actual project dir, since that should not
 # change much across branches.
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT
+ARG VLLM_VERSION
 # Keep APP_DIR outside /workspace so k8s Buildkite workspace mounts cannot
 # shadow the editable install target (#5364). Docker WORKDIR creates /opt if
 # needed.
@@ -36,12 +38,19 @@ RUN apt-get update && \
 # for CI
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+# Scope the override to Omni; dependency source builds need their own versions.
+ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Editable install: deps + project metadata are cached in this layer, while
 # the package itself is linked to APP_DIR (populated later by COPY --link).
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
-RUN uv pip install --system -e ".[dev]"
+RUN uv pip install --system \
+    "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+    -e ".[dev]"
+# Fail the image build if dependency resolution replaced the selected vLLM.
+# The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
+# of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.
+RUN python3 -c "from vllm._version import __commit_id__; commit = (__commit_id__ or '').removeprefix('g'); assert len(commit) >= 8 and '${VLLM_PRECOMPILED_WHEEL_COMMIT}'.startswith(commit), __commit_id__"
 
 # The final stage just copies the working dir on top of the
 # dependencies image. This uses --link so that we can skip
