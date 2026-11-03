@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VAE class selection of the Wan-family VAE benchmark, for local checkpoints and Hub repo ids (no downloads)."""
 
 import json
