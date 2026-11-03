@@ -665,6 +665,7 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
     async def handler(socket):
         nonlocal closed_before_tail
         pending = None
+        responded = False
 
         async def finish_tail():
             await asyncio.sleep(0.05)
@@ -682,7 +683,10 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
                 event = json.loads(raw)
                 if event["type"] == "session.update":
                     await socket.send(json.dumps({"type": "session.created"}))
-                elif event["type"] == "input_audio_buffer.append":
+                elif event["type"] == "input_audio_buffer.append" and not responded:
+                    # The streamed clip's reply fires once; the drain padding
+                    # appended after the commit is silence and gets no reply.
+                    responded = True
                     for response in [
                         {"type": "response.created", "response": {"id": "r1"}},
                         {"type": "response.output_text.delta", "response_id": "r1", "delta": "Earlier."},
@@ -928,6 +932,7 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
 
     async def handler(socket):
         responded = False
+        committed = False
         async for raw in socket:
             event = json.loads(raw)
             received_types.append(event["type"])
@@ -943,12 +948,9 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
                     else {}
                 )
                 await socket.send(json.dumps({"type": "session.created", "session": {"capabilities": capabilities}}))
-            elif not responded and event["type"] == (
-                "input_audio_buffer.append" if turn_detection == "server_vad" else "input_audio_buffer.commit"
-            ):
+            elif not responded and event["type"] == "input_audio_buffer.append" and turn_detection == "server_vad":
                 responded = True
                 for response in [
-                    *([] if turn_detection == "server_vad" else [{"type": "input_audio_buffer.committed"}]),
                     {"type": "response.created", "response": {"id": "r1"}},
                     {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
                     {
@@ -960,6 +962,26 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
                     {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
                 ]:
                     await socket.send(json.dumps(response))
+            elif not responded and committed and event["type"] == "input_audio_buffer.append":
+                # turn_detection == "none": the committed clip's reply drains
+                # on the padding the client appends next, so its transcript
+                # lands after the first padding unit.
+                responded = True
+                for response in [
+                    {"type": "input_audio_buffer.committed"},
+                    {"type": "response.created", "response": {"id": "r1"}},
+                    {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
+                    {
+                        "type": "response.output_audio.delta",
+                        "response_id": "r1",
+                        "sample_rate_hz": 24000,
+                        "delta": base64.b64encode(b"\0\0" * 240).decode(),
+                    },
+                    {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                ]:
+                    await socket.send(json.dumps(response))
+            elif event["type"] == "input_audio_buffer.commit" and turn_detection != "server_vad":
+                committed = True
             elif event["type"] == "session.close":
                 await socket.send(json.dumps({"type": "session.closed"}))
                 return
@@ -1013,7 +1035,11 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
     response = json.loads((root / "PR_correction/0.json").read_text())
     sentence = response["sentences"][0]
     assert sentence["sentence"] == "Done."
-    assert sentence["start"] == sentence["end"] == pytest.approx(0.03 if turn_detection == "server_vad" else 0.01)
+    # server_vad: clip end (0.01) plus the streamed tail silence (0.02).
+    # none: clip end (0.01) plus the first padding unit (1.0s) the committed
+    # clip's reply drains on — the padding advances the media clock.
+    expected_start = 0.03 if turn_detection == "server_vad" else 0.01 + 1.0
+    assert sentence["start"] == sentence["end"] == pytest.approx(expected_start)
     assert response["chunks"] == [{"text": "Done.", "current_time": sentence["start"]}]
     report = json.loads((root / "duplex_metrics.json").read_text())
     assert len(report["duplex_session_metrics"]) == 2
