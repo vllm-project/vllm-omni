@@ -25,6 +25,8 @@ Set ``VLLM_OMNI_VAE_LEGACY_TEMPORAL=1`` to keep the checkpoint's methods.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from functools import partial
 from types import MethodType
 
 import torch
@@ -112,7 +114,17 @@ def _encode_temporal_tail_pad(self, x):
     return z
 
 
-def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype):
+def _decode_temporal_streaming_uint8(
+    self,
+    z,
+    z_head,
+    z_tail,
+    num_chunks,
+    pad_tokens,
+    temporal_cat_dtype,
+    *,
+    pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+):
     """Drop-in fork of the checkpoint's ``_decode_temporal_streaming``.
 
     The chunk loop, overlap blending, frame plan, and assertions are
@@ -162,9 +174,12 @@ def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_to
         # quantizer then runs in FP32 because the legacy adapter returned
         # ``frames.float()`` before the pipeline multiplied and rounded —
         # rounding fp16/bf16 directly flips borderline pixels by one.
-        mean_t, std_t = norm
-        part.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
-        part = part.float()
+        if pixel_transform is None:
+            mean_t, std_t = norm
+            part.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
+            part = part.float()
+        else:
+            part = pixel_transform(part)
         part.mul_(255.0).round_()
 
         remaining = int(dec.shape[2]) - write_pos
@@ -246,12 +261,16 @@ def _processor_denorm_available(model) -> bool:
     return mean is not None and std is not None and len(mean) == 3 and len(std) == 3
 
 
-def install_temporal_stream_patches(model) -> None:
+def install_temporal_stream_patches(
+    model, *, pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+) -> None:
     """Install the memory-optimized temporal forks on the checkpoint model.
 
     Each fork is installed only when the checkpoint contract it mirrors is
     discoverable; otherwise the checkpoint's own method keeps running (the
-    adapter's post-decode revert already covers that path).
+    adapter's post-decode revert already covers that path). A replacement
+    decoder can supply its released pixel normalization without changing
+    the native checkpoint's default arithmetic.
     """
     if _legacy_temporal_enabled():
         logger.info("MiniMax-H3 VAE temporal stream patches disabled by %s", _LEGACY_TEMPORAL_ENV)
@@ -262,7 +281,11 @@ def install_temporal_stream_patches(model) -> None:
     else:
         logger.warning("MiniMax-H3 VAE encode_temporal contract not found; keeping checkpoint method")
     if callable(getattr(model, "_decode_temporal_streaming", None)) and _processor_denorm_available(model):
-        model._decode_temporal_streaming = MethodType(_decode_temporal_streaming_uint8, model)
+        if pixel_transform is None:
+            stream_decode = _decode_temporal_streaming_uint8
+        else:
+            stream_decode = partial(_decode_temporal_streaming_uint8, pixel_transform=pixel_transform)
+        model._decode_temporal_streaming = MethodType(stream_decode, model)
         logger.info("MiniMax-H3 VAE streaming uint8 decode patch installed")
     else:
         logger.warning("MiniMax-H3 VAE streaming decode contract not found; keeping checkpoint method")

@@ -73,8 +73,13 @@ def _looks_like_magi2(model_name: str) -> bool:
 
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
+    from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
 
-    return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
+    if _looks_like_magi2(model_name):
+        return "Magi2Pipeline"
+    if resolve_checkpoint(model_name) is not None:
+        return "VideoDepthAnythingPipeline"
+    return None
 
 
 def _looks_like_dreamzero(model_name: str) -> bool:

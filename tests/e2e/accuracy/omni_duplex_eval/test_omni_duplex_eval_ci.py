@@ -28,7 +28,7 @@ def result(tmp_path, config):
     score_root = tmp_path / "evaluation"
     for split, ids in config["sample_ids_per_split"].items():
         for sid in ids:
-            row = {"id": sid, "protocol_pin": PROTOCOL_PIN}
+            row = {"id": sid, "protocol_pin": PROTOCOL_PIN, "response_meta": {"mix": config["mix"]}}
             if split.startswith("RTD_"):
                 row.update(
                     family="rtd",
@@ -104,6 +104,34 @@ def test_fixed_quality_thresholds(result, config, section, field, value, passes)
 
 
 @pytest.mark.parametrize(
+    "section,field",
+    [("rtd", "mean_content_score"), ("rtd", "mean_avg_temporal_score"), ("pr", "mean_all_success")],
+)
+def test_record_only_hardware_keeps_full_validation_without_cuda_score_floors(result, config, section, field):
+    result["omni_duplex_eval"]["accuracy"][section][field] = 0.0
+    assert_accuracy_result(result, config, enforce_score_floors=False)
+
+
+@pytest.mark.parametrize(
+    "section,field,maximum",
+    [
+        ("rtd", "mean_content_score", 3.0),
+        ("rtd", "mean_avg_temporal_score", 3.0),
+        ("pr", "mean_all_success", 1.0),
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [None, True, float("nan"), float("inf"), -0.0001, pytest.param("above_maximum", id="above-domain")],
+)
+def test_record_only_hardware_rejects_invalid_scores(result, config, section, field, maximum, invalid_value):
+    value = maximum + 0.0001 if invalid_value == "above_maximum" else invalid_value
+    result["omni_duplex_eval"]["accuracy"][section][field] = value
+    with pytest.raises(AssertionError, match="outside"):
+        assert_accuracy_result(result, config, enforce_score_floors=False)
+
+
+@pytest.mark.parametrize(
     "section,field,value,message",
     [
         ("benchmark", "completed", 65, "completed requests"),
@@ -141,7 +169,14 @@ def test_invalid_quality_fails(result, config, section, field, value):
 
 
 @pytest.mark.parametrize(
-    "mutation,message", [("missing", "score files"), ("id", "sample IDs"), ("pin", "protocol_pin")]
+    "mutation,message",
+    [
+        ("missing", "score files"),
+        ("id", "sample IDs"),
+        ("pin", "protocol_pin"),
+        ("mix", "mix 'question'"),
+        ("no_mix", "mix 'question'"),
+    ],
 )
 def test_score_file_integrity(result, config, mutation, message):
     path = Path(result["omni_duplex_eval"]["accuracy"]["score_root"]) / "RTD_world_knowledge/360.json"
@@ -151,7 +186,13 @@ def test_score_file_integrity(result, config, mutation, message):
         path.rename(path.with_name("wrong.json"))
     else:
         row = json.loads(path.read_text())
-        row["protocol_pin"] = "old"
+        if mutation == "pin":
+            row["protocol_pin"] = "old"
+        elif mutation == "mix":
+            row["response_meta"]["mix"] = "question"
+        else:
+            # Metadata written before mix was recorded counts as question.
+            del row["response_meta"]["mix"]
         path.write_text(json.dumps(row))
     with pytest.raises(AssertionError, match=message):
         assert_accuracy_result(result, config)
@@ -175,6 +216,7 @@ def test_dfx_invokes_full_accuracy_contract(result):
     test_root = Path(__file__).resolve().parents[3]
     dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     params = dfx["benchmark_params"][0]
+    result["Hardware"] = "H100"
     assert_result(result, params, 66)
     result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0
     with pytest.raises(AssertionError, match="PR success rate"):
@@ -187,6 +229,7 @@ def test_dfx_accuracy_requires_batch_audio(result, audio_sessions):
 
     test_root = Path(__file__).resolve().parents[3]
     dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    result["Hardware"] = "H100"
     for session in result["duplex_session_metrics"][audio_sessions:]:
         session["client_ttfp_ms"] = {"count": 0, "mean": None}
     if audio_sessions:
@@ -196,14 +239,32 @@ def test_dfx_accuracy_requires_batch_audio(result, audio_sessions):
             assert_result(result, dfx["benchmark_params"][0], 66)
 
 
+def test_nightly_workload_matches_ci_config():
+    test_root = Path(__file__).resolve().parents[3]
+    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    params = dfx["benchmark_params"][0]
+    assert params["duplex_eval_mix"] == "soundtrack"
+    assert load_accuracy_config(str(_CONFIG_PATH), params)["mix"] == "soundtrack"
+
+
 @pytest.mark.parametrize(
-    "field,value", [("duplex_eval_ids", ["0"]), ("num_prompts", [3]), ("duplex_eval_evaluate", False)]
+    "field,value",
+    [
+        ("duplex_eval_ids", ["0"]),
+        ("num_prompts", [3]),
+        ("duplex_eval_evaluate", False),
+        ("duplex_eval_mix", "question"),
+        ("duplex_eval_mix", None),
+    ],
 )
 def test_wrong_workload_is_rejected(field, value):
     test_root = Path(__file__).resolve().parents[3]
     dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     params = dfx["benchmark_params"][0]
-    params[field] = value
+    if value is None:
+        del params[field]
+    else:
+        params[field] = value
     with pytest.raises(AssertionError):
         load_accuracy_config(str(_CONFIG_PATH), params)
 
@@ -249,6 +310,7 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     test_root = Path(__file__).resolve().parents[3]
     dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
+    enforce_score_floors = resource_label in dfx_config["benchmark_params"][0]["duplex_eval_score_floor_hardware"]
     if benchmark_params_name is not None:
         dfx_config["benchmark_params"][0]["name"] = benchmark_params_name
     result["model_id"] = "/models/MiniCPM-o-4_5"
@@ -309,7 +371,10 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
 
     monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
     case = {"test_name": dfx_config["test_name"], "params": dfx_config["benchmark_params"][0]}
-    if failure and failure not in ("npu_exit", "silence", "boundary"):
+    expect_failure = failure and failure not in ("npu_exit", "silence", "boundary")
+    if failure == "quality" and not enforce_score_floors:
+        expect_failure = False
+    if expect_failure:
         message = "benchmark exited with unexpected code" if returncode else ""
         with pytest.raises(AssertionError, match=message):
             runner.test_performance_benchmark(ServerEndpoint(), case)
@@ -336,7 +401,7 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     assert saved["num_prompts"] == dfx_config["benchmark_params"][0]["num_prompts"][0] == 66
     assert saved["branch"] == "test-branch"
     assert saved["max_concurrency"] == 8
-    assert saved["baseline"] == config["baseline"]
+    assert saved["baseline"] == (config["baseline"] if enforce_score_floors else {})
     assert saved["benchmark_exit_code"] == returncode
     if failure == "cli":
         assert saved["accuracy"]["status"] == "failed"

@@ -310,6 +310,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
+    parser.add_argument(
+        "--diffusion-attention-config",
+        type=json.loads,
+        default=None,
+        help="Per-role diffusion attention backend configuration as a JSON object.",
+    )
     parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
     parser.add_argument("--fps", type=float, default=None, help="Frames per second for the output video.")
     parser.add_argument(
@@ -326,6 +332,18 @@ def parse_args() -> argparse.Namespace:
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Total timeout for orchestrator startup in seconds (default: 600s).",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300s).",
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -570,6 +588,8 @@ def main():
         enable_distributed_layerwise_offload=args.enable_distributed_layerwise_offload,
         dlo_use_allgather=args.dlo_use_allgather,
         dlo_resident_layers=args.dlo_resident_layers,
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.stage_init_timeout,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
@@ -581,6 +601,8 @@ def main():
         omni_kwargs["quantization"] = args.quantization
     if args.quantization_config is not None:
         omni_kwargs["quantization_config"] = args.quantization_config
+    if args.diffusion_attention_config is not None:
+        omni_kwargs["diffusion_attention_config"] = args.diffusion_attention_config
     if args.cache_backend is not None:
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config

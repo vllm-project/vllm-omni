@@ -1742,6 +1742,12 @@ def extract_cosmos3_context(
     **kwargs: Any,
 ) -> CacheContext:
     """Build the shared cache execution context for Cosmos3's GEN pathway."""
+    if "intermediate_tensors" in kwargs:
+        # Only the pipeline-parallel driver passes this; the pipeline rejects
+        # cache backends under PP at init, so this is a defensive backstop.
+        raise NotImplementedError(
+            "Cosmos3 TeaCache/SeaCache is not supported together with pipeline parallelism; disable one of them."
+        )
     if kwargs:
         raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
 
