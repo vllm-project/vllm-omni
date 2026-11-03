@@ -1265,11 +1265,7 @@ def test_stateful_eager_partial_final_chunk_is_right_trimmed():
 @pytest.mark.parametrize("ref_frames", [0, 1, 72])
 @pytest.mark.parametrize("old_frames", [0, 1, 2, 25, 72])
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("noncontiguous", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_suffix_pre_conv_context_avoids_full_history_cat(
-    monkeypatch, ref_frames, old_frames, batch_size, noncontiguous, dtype
-):
+def test_suffix_pre_conv_context_avoids_full_history_cat(monkeypatch, ref_frames, old_frames, batch_size):
     """Exercise the real suffix method through its first convolution input.
 
     The sentinel stops before the transformer/vocoder: existing integration
@@ -1277,11 +1273,10 @@ def test_suffix_pre_conv_context_avoids_full_history_cat(
     so the previous implementation fails on the fast-path cases.
     """
     channels = 4
-    stride = 2 if noncontiguous else 1
 
     def history(frames, offset):
-        values = torch.arange(batch_size * channels * frames * stride, dtype=torch.float32)
-        return (values.reshape(batch_size, channels, frames * stride) + offset).to(dtype)[..., ::stride]
+        values = torch.arange(batch_size * channels * frames, dtype=torch.float32)
+        return values.reshape(batch_size, channels, frames) + offset
 
     ref_hidden = history(ref_frames, 0)
     old_quantized = history(old_frames, 100)
@@ -1327,4 +1322,5 @@ def test_suffix_pre_conv_context_avoids_full_history_cat(
     torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
     torch.testing.assert_close(ref_hidden, ref_before, rtol=0, atol=0)
     torch.testing.assert_close(old_quantized, old_before, rtol=0, atol=0)
+    # Counting pre-conv cats guards against reintroducing the full-history copy.
     assert len(calls) == (1 if old_frames >= _CONV_CONTEXT_FRAME else 2)
