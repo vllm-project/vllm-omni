@@ -134,11 +134,12 @@ one reachable layout. Repeated CFG/solver evaluations at the same index reuse th
 same layout. A static `layout` needs no denoising progress. The policy is resolved
 before transformer execution, so local attention does not read the step index.
 
-Distributed modes other than strict Ulysses, cache acceleration, paged/quantized
+Distributed modes other than strict Ulysses, caches other than SeaCache, paged/quantized
 KV, step serving and MiniMax integration are outside this PoC.
-Attention layout transitions do not reset residual-cache history. This PR adds no
-SeaCache hooks or cache invalidation; the existing runtime validation rejects
-combining strategies with cache acceleration.
+SeaCache supports eager execution and regional compilation. Its normal cache hits
+reuse residual history across attention layout transitions, without resetting it.
+Cache misses execute the scheduled layout at the Cosmos3 cacheable stack boundary.
+Full-model compilation is rejected because the cache hook bypasses those compiled forwards.
 
 ## Validation
 
