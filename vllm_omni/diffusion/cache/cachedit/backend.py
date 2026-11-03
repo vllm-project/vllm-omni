@@ -128,10 +128,12 @@ def set_separate_cfg(transformer: nn.Module, do_true_cfg: bool) -> None:
     forwards the request makes on this rank: two per step for sequential CFG,
     one without CFG, and one under CFG parallel, where each rank runs a single
     branch (see ``resolve_has_separate_cfg``). A pipeline whose CFG mode is only
-    known per request calls this after the runner's step refresh. Only this
-    field of the installed cache context changes, and it stays until the next
-    call, so call it for every request. Does nothing when Cache-DiT is not
-    enabled on ``transformer``.
+    known per request calls this after the runner's step refresh and before the
+    denoise loop. It rebuilds the installed cache context, which drops any
+    cached residuals, so it must not be called inside the loop. Only
+    ``enable_separate_cfg`` changes in the rebuilt context, and it stays until
+    the next call, so call it for every request. Does nothing when Cache-DiT is
+    not enabled on ``transformer``.
     """
     if not BlockAdapter.is_cached(transformer):
         return
