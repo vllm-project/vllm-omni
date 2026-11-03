@@ -11,14 +11,12 @@ frames. Peak memory is per GPU (first GPU / others).
 
 Distributed layerwise offload keeps the DiT and text encoder in pinned host
 memory, so the server needs a large amount of system RAM, and each CFG-parallel
-branch adds its own copy. Raising `--dlo-resident-layers` keeps more DiT blocks
-on the GPU, which reduces host-to-GPU traffic, but uses more GPU memory;
-re-measure before raising it.
+branch adds its own copy. System RAM is the server's peak host memory.
 
-| GPUs | Peak memory (481 frames) |
-| --- | ---: |
-| 1 GPU | 40.1 GiB |
-| 4 GPUs | 35.3 / 34.7 GiB |
+| GPUs | Peak memory (481 frames) | System RAM |
+| --- | ---: | ---: |
+| 1 GPU | 43.4 GiB | 145 GiB |
+| 4 GPUs | 35.5 / 35.0 GiB | 364 GiB |
 
 ## 1 GPU
 
