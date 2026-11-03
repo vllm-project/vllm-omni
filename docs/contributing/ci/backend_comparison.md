@@ -18,7 +18,7 @@ flowchart LR
 ## Administrator setup
 
 Use the existing `vllm/vllm-omni` pipeline. This document and the checked-in
-bootstrap prepare the configuration; they do not modify Buildkite settings,
+entry prepare the configuration; they do not modify Buildkite settings,
 create a schedule or start a build.
 
 | Setting | Value |
@@ -26,15 +26,21 @@ create a schedule or start a build.
 | Pipeline slug | `vllm-omni` (existing) |
 | Repository | Keep `https://github.com/vllm-project/vllm-omni.git` |
 | Default branch / GitHub triggers | Keep existing settings |
-| Initial steps | Copy the complete bootstrap file linked below |
+| Initial steps | Keep the existing Steps unchanged |
 
-In **Settings > Steps**, save the current YAML as a rollback copy, then install
-the complete contents of
-[bootstrap-backend-comparison.yml](../../../.buildkite/cuda/bootstrap-backend-comparison.yml).
-The file preserves the existing init queue and regular generator commands.
-Its comparison route runs first, including when `.buildkite/.pipeline_gen_v2`
-exists. The initial step must be updated in Buildkite: editing only the PR's
-`.buildkite/cuda/pipeline.yml` cannot intercept that earlier generator.
+The existing initial step checks for `.buildkite/.pipeline_gen_v2` and otherwise
+uploads `.buildkite/cuda/pipeline.yml` from the checked-out revision. This PR
+does not contain the v2 marker, so its
+[CUDA entry](../../../.buildkite/cuda/pipeline.yml) owns the comparison route.
+No Settings > Steps change is needed. A regression test checks the marker's
+absence; if a future main rebase introduces it, adapt the new generator before
+using the schedule. Do not assume the CUDA entry still controls that path.
+
+The entry makes regular and comparison uploads mutually exclusive. A native
+comparison request is selected by the dedicated environment flag or PR ref;
+invalid combinations stop within that selected route. Existing label-selected
+PR comparisons still use the comparison path, and ordinary builds preserve
+their original upload command.
 
 The schedule uses GitHub's upstream `refs/pull/1994/head` ref to fetch the
 fork's PR head. Do not use `ci/separate-image`, which belongs to the fork,
@@ -46,7 +52,8 @@ checkout against it before executing work. Image tags use the same SHA.
 The uploaded YAML contains only `image-build-sglang-omni` and
 `nightly-sglang-omni-qwen3-omni`. It directly selects the comparison image and
 two-GPU H100 pod. Scheduled builds do not require PR labels. This route does
-not upload the regular CUDA entry, hardware mirrors or any NPU pipeline.
+not upload the regular CUDA bootstrap/test pipelines, hardware mirrors or any
+NPU pipeline.
 Do not change labels to test the schedule: that would create a separate event.
 
 After the branch contains the reviewed producer changes, create a disabled
@@ -58,13 +65,13 @@ Buildkite native schedule in **Settings > Schedules**:
 | Message | `Scheduled backend comparison` |
 | Branch | `refs/pull/1994/head` |
 | Commit | `HEAD` |
-| Cron interval | `0 3 * * 2 UTC` (Tuesday 11:00 Asia/Hong_Kong) |
+| Cron interval | `0 3 * * 3` (Wednesday 11:00 Asia/Hong_Kong; default UTC) |
 | Environment variables | `BACKEND_COMPARISON_ONLY=1` |
 | Enabled | No, until the acceptance run below passes |
 
 Do not copy `NIGHTLY`, `WEEKLY`, `NON_CRITICAL` or `MIRROR_HW` from another
 schedule. A comparison request with any of these variables fails before any
-pipeline upload. The PR ref without the comparison flag, a wrong flag value,
+test pipeline upload. The PR ref without the comparison flag, a wrong flag value,
 a wrong repository/pipeline/ref, or a non-schedule source also fails without
 falling through to ordinary CI. Normal builds without the flag or PR ref
 retain the existing entry behavior. Schedule management requires
@@ -84,19 +91,19 @@ After the source configuration and version pins are ready, use Buildkite's
 **Run now** action for one acceptance build; this consumes two H100 GPUs.
 Use **Run now**, which retains source `schedule`; **Run with edits** creates
 source `ui` and this entry rejects it. Confirm the resolved PR commit and
-that the build contains only init, image, and target benchmark jobs. Confirm
+that the executed jobs contain only init, the comparison uploader, image and
+target benchmark. The regular uploader is condition-skipped. Confirm
 no NPU or ordinary CUDA tasks, all 10 requests succeed, JSON is uploaded,
 kanban imports it and repeat discovery adds no duplicate. Enable the recurring
 schedule after that run passes and its artifact passes the consumer checks.
 
-To pause these weekly tests, disable this new schedule. Keep existing schedules
-and triggers unchanged. To remove the integration, disable it first, then
-restore the saved Settings > Steps YAML.
+To pause or remove these weekly tests, disable this schedule. Existing schedules,
+Steps and triggers remain unchanged. Routing changes are versioned in PR #1994.
 
 ## CPU validation
 
 Requires Python 3.12, pytest, PyYAML, Bash and Git; no GPU or model weights.
-The bootstrap tests execute commands with local stubs and never contact
+The entry tests execute commands with local stubs and never contact
 Buildkite. From the repository root:
 
 ```bash

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Execute the installed bootstrap with local command stubs; never submit jobs."""
+"""Exercise PR-owned comparison routing with local stubs; never submit jobs."""
 
 from __future__ import annotations
 
@@ -14,27 +14,25 @@ import yaml
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAP = ROOT / ".buildkite/cuda/bootstrap-backend-comparison.yml"
+ENTRY = ROOT / ".buildkite/cuda/pipeline.yml"
 COMMIT = "a" * 40
 
 
 @pytest.fixture
-def bootstrap_runner(tmp_path: Path):
+def comparison_runner(tmp_path: Path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     calls = tmp_path / "calls"
-    for name in ("buildkite-agent", "pip", "pipeline-generator"):
-        stub = bindir / name
-        stub.write_text('#!/bin/bash\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$TEST_CALLS"\n')
-        stub.chmod(0o755)
+    stub = bindir / "buildkite-agent"
+    stub.write_text('#!/bin/bash\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$TEST_CALLS"\n')
+    stub.chmod(0o755)
     git = bindir / "git"
     git.write_text('#!/bin/bash\nprintf "%s\\n" "$TEST_CHECKOUT"\n')
     git.chmod(0o755)
-    command = yaml.safe_load(BOOTSTRAP.read_text())["steps"][0]["commands"][0]
-    # Buildkite's Settings editor unescapes $$ before the shell executes it.
-    command = command.replace("$$", "$").replace(
-        "/var/lib/buildkite-agent/.local/bin/pipeline-generator", "pipeline-generator"
-    )
+    entry = yaml.safe_load(ENTRY.read_text())
+    command = next(step for step in entry["steps"] if step["key"] == "upload-backend-comparison")["commands"][0]
+    # The existing initial upload unescapes $$ before this command executes.
+    command = command.replace("$$", "$")
     env = {
         "PATH": f"{bindir}:/usr/bin:/bin",
         "TEST_CALLS": str(calls),
@@ -47,10 +45,7 @@ def bootstrap_runner(tmp_path: Path):
         "BUILDKITE_COMMIT": COMMIT,
     }
 
-    def run(overrides: dict[str, str], *, generator_v2: bool = False):
-        if generator_v2:
-            (tmp_path / ".buildkite").mkdir()
-            (tmp_path / ".buildkite/.pipeline_gen_v2").touch()
+    def run(overrides: dict[str, str]):
         result = subprocess.run(
             ["/bin/bash", "-c", command], cwd=tmp_path, env={**env, **overrides}, capture_output=True, text=True
         )
@@ -59,9 +54,8 @@ def bootstrap_runner(tmp_path: Path):
     return run
 
 
-@pytest.mark.parametrize("generator_v2", [False, True])
-def test_schedule_uploads_only_sglang_before_either_regular_generator(bootstrap_runner, generator_v2):
-    result, calls = bootstrap_runner({}, generator_v2=generator_v2)
+def test_schedule_uploads_only_sglang(comparison_runner):
+    result, calls = comparison_runner({})
     assert result.returncode == 0, result.stderr
     assert calls == ["buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml"]
 
@@ -86,23 +80,47 @@ def test_schedule_uploads_only_sglang_before_either_regular_generator(bootstrap_
         {"MIRROR_HW": "B200"},
     ],
 )
-def test_invalid_comparison_stops_without_uploading_any_pipeline(bootstrap_runner, overrides):
-    result, calls = bootstrap_runner(overrides, generator_v2=True)
+def test_invalid_comparison_stops_without_uploading_any_pipeline(comparison_runner, overrides):
+    result, calls = comparison_runner(overrides)
     assert result.returncode != 0
     assert calls == []
 
 
-def test_existing_nightly_still_uses_regular_entry(bootstrap_runner):
-    result, calls = bootstrap_runner({"BACKEND_COMPARISON_ONLY": "", "BUILDKITE_BRANCH": "main", "NIGHTLY": "1"})
+def test_existing_label_selected_comparison_still_uploads(comparison_runner):
+    result, calls = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": "", "BUILDKITE_BRANCH": "congw729:ci/separate-image", "BUILDKITE_SOURCE": "webhook"}
+    )
     assert result.returncode == 0, result.stderr
-    assert calls == ["buildkite-agent pipeline upload .buildkite/cuda/pipeline.yml"]
+    assert calls == ["buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml"]
 
 
-def test_existing_v2_generator_route_is_preserved(bootstrap_runner):
-    result, calls = bootstrap_runner({"BACKEND_COMPARISON_ONLY": "", "BUILDKITE_BRANCH": "main"}, generator_v2=True)
-    assert result.returncode == 0, result.stderr
-    assert [call.split()[0] for call in calls] == ["pip", "pipeline-generator", "buildkite-agent", "buildkite-agent"]
-    assert calls[-1] == "buildkite-agent pipeline upload .buildkite/pipeline.yaml"
+def test_shared_bootstrap_reaches_the_pr_owned_cuda_entry():
+    # The installed init selects v2 only when this file is present. Recheck
+    # this contract when rebasing: a new generator needs its own routing.
+    assert not (ROOT / ".buildkite/.pipeline_gen_v2").exists()
+    assert ENTRY.is_file()
+
+
+@pytest.mark.parametrize("branch", ["main", "refs/pull/1994/head", "congw729:ci/separate-image"])
+@pytest.mark.parametrize("flag", [None, "", "0", "1"])
+@pytest.mark.parametrize("comparison_label", [False, True])
+def test_only_one_entry_route_is_selected(branch: str, flag: str | None, comparison_label: bool):
+    selected = []
+    for step in yaml.safe_load(ENTRY.read_text())["steps"]:
+        # Evaluate the boolean subset used by these actual YAML expressions;
+        # values are fixed test inputs, and no builtins are available.
+        expression = step["if"].replace('build.env("BACKEND_COMPARISON_ONLY")', repr(flag))
+        expression = expression.replace(
+            'build.pull_request.labels includes "backend-comparison-test"', repr(comparison_label)
+        )
+        expression = expression.replace("build.branch", repr(branch)).replace("null", "None")
+        expression = expression.replace("&&", "and").replace("||", "or").replace("!(", "not (")
+        if eval(expression, {"__builtins__": {}}):
+            selected.append(step["key"])
+    if flag or branch == "refs/pull/1994/head" or (branch != "main" and comparison_label):
+        assert selected == ["upload-backend-comparison"]
+    else:
+        assert selected == ["upload-ci-pipeline"]
 
 
 @pytest.mark.parametrize("checkout_matches", [False, True])

@@ -76,18 +76,26 @@ def test_backend_comparison_entry_excludes_regular_cuda_pipeline() -> None:
     assert set(steps) == {"upload-ci-pipeline", "upload-backend-comparison"}
     regular = steps["upload-ci-pipeline"]
     comparison = steps["upload-backend-comparison"]
-    # Complementary gates: other PR labels cannot enable both routes, and main
-    # keeps its regular scheduled/post-merge pipeline even with the label present.
+    # Both routes exclude/include explicit schedule requests symmetrically;
+    # the execution/condition matrix is in test_backend_comparison_schedule.py.
     assert regular["if"] == (
-        'build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test")'
+        '(build.env("BACKEND_COMPARISON_ONLY") == null || build.env("BACKEND_COMPARISON_ONLY") == "") && '
+        'build.branch != "refs/pull/1994/head" && '
+        '(build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test"))'
     )
     assert comparison["if"] == (
-        'build.branch != "main" && build.pull_request.labels includes "backend-comparison-test"'
+        '(build.env("BACKEND_COMPARISON_ONLY") != null && build.env("BACKEND_COMPARISON_ONLY") != "") || '
+        'build.branch == "refs/pull/1994/head" || '
+        '(build.branch != "main" && build.pull_request.labels includes "backend-comparison-test")'
     )
     assert regular["commands"] == [
         "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml"
     ]
-    assert comparison["commands"] == ["buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml"]
+    assert (
+        comparison["commands"][0]
+        .strip()
+        .endswith("buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml")
+    )
     assert "depends_on" not in comparison
     assert comparison["agents"] == {"queue": "medium_cpu_queue_premerge"}
 
