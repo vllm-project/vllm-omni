@@ -144,6 +144,12 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
     ) -> QuantizeMethodBase | None:
         if not isinstance(layer, LinearBase):
             return None
+        if not self.layer_configs:
+            # Without checkpoint markers every layer would silently stay unquantized.
+            raise ValueError(
+                "int8_convrot needs per-layer metadata from a Comfy INT8 ConvRot checkpoint; "
+                'only MiniMax-H3 with model_paths["transformer"] provides it.'
+            )
         layer_config = self.layer_configs.get(prefix)
         if layer_config is None:
             return UnquantizedLinearMethod()

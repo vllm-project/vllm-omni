@@ -352,6 +352,17 @@ def test_model_load_weights_preserves_comfy_int8_runtime_qkv_layout(monkeypatch)
     torch.testing.assert_close(scale_calls[0], qkv_scale.unsqueeze(1))
 
 
+def test_int8_convrot_rejects_linear_without_checkpoint_metadata(mocker):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config({"method": "int8_convrot"})
+
+    with pytest.raises(ValueError, match="needs per-layer metadata"):
+        config.get_quant_method(mocker.Mock(spec=LinearBase), "blocks.0.attn.qkv_proj")
+
+
 def test_int8_convrot_factory_routes_only_checkpoint_marked_layers(mocker):
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
