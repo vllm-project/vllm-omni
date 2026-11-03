@@ -292,7 +292,15 @@ def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
         for step in steps:
             commands = step.get("commands", [])
             if any(
-                split(command)[:3] == ["pytest", "-sv", "tests/model_executor"]
+                split(command)[:6]
+                == [
+                    "python",
+                    "-u",
+                    ".buildkite/amd/scripts/run_cpu_suite.py",
+                    "model-executor",
+                    "-sv",
+                    "tests/model_executor",
+                ]
                 and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
                 for command in commands
             ):
@@ -401,7 +409,9 @@ def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() 
         model_executor_step = next(
             step for step in steps if step.get("label", "").startswith("Simple · Model Executor Test")
         )
-        pytest_command = next(command for command in model_executor_step["commands"] if "pytest" in command)
+        pytest_command = next(
+            command for command in model_executor_step["commands"] if "tests/model_executor" in command
+        )
         assert "core_model and cpu and not omni" in pytest_command
 
     assert smoke_definitions[0] == smoke_definitions[1]
@@ -455,7 +465,15 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     argv = split(pytest_command)
 
     assert step["parallelism"] == 3
-    assert argv[:3] == ["pytest", "-sv", "tests/model_executor"]
+    assert argv[:6] == [
+        "python",
+        "-u",
+        ".buildkite/amd/scripts/run_cpu_suite.py",
+        "model-executor",
+        "-sv",
+        "tests/model_executor",
+    ]
+    assert step["artifact_paths"] == ["artifacts/amd-cpu-suites/**/*"]
     assert argv[argv.index("-m") + 1] == MODEL_EXECUTOR_CPU_MARKERS
     assert all(not arg.startswith("--ignore") for arg in argv)
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
@@ -746,6 +764,140 @@ def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
     assert 'pytest --collect-only -q "$@"' in guard
     assert "^tests\\/.*::" in guard
     assert '"${actual_count}" != "${expected_count}"' in guard
+
+
+_R2_02_LABEL = "ROCm · Entrypoints GPU Coverage (R2-02)"
+_R2_02_JUNIT_MESSAGE = "Expected exactly 3 executed entrypoint GPU tests"
+
+
+def test_r2_02_entrypoint_execution_guard_stays_nonblocking() -> None:
+    """Collection of three nodes is not a pass; blocking waits on MI300 evidence."""
+    step = _find_step(_R2_02_LABEL, AMD_READY_PIPELINE)
+    commands = step["commands"]
+    joined = "\n".join(commands)
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["timeout_in_minutes"] == 30
+    assert step["artifact_paths"] == ["artifacts/rocm-r2-02/**/*"]
+    assert "assert-pytest-collection.sh 3" in joined
+    assert _R2_02_JUNIT_MESSAGE in joined
+    assert "PIPESTATUS[0]" in joined
+    assert '(exit "$$status")' in joined
+    assert "leaked_processes_detected=1" in joined
+    assert "set -o pipefail" in joined
+    pytest_index = next(i for i, command in enumerate(commands) if _R2_02_JUNIT_MESSAGE in command)
+    cleanup_index = next(i for i, command in enumerate(commands) if "leaked_processes_detected=1" in command)
+    assert pytest_index < cleanup_index
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 3, 0, None, 0),
+        (0, 3, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 3, 0, None, 1),
+        (0, 3, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_r2_02_entrypoint_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=_R2_02_LABEL,
+        command_fragment="pytest -s -v -ra",
+        expected_message=_R2_02_JUNIT_MESSAGE,
+        artifact_env="R2_02_ARTIFACT_DIR",
+        job_id_prefix="r2-02-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("second_ps", "expected_status"),
+    [("same", 0), ("leak", 1), ("ps", 0)],
+    ids=("clean", "leaked-process", "ignored-ps"),
+)
+def test_r2_02_entrypoint_cleanup_failure_propagates(
+    tmp_path: Path,
+    second_ps: str,
+    expected_status: int,
+) -> None:
+    step = _find_step(_R2_02_LABEL, AMD_READY_PIPELINE)
+    before = next(command for command in step["commands"] if "processes-before.txt" in command)
+    cleanup = next(command for command in step["commands"] if "leaked_processes_detected=1" in command)
+    commands = "\n".join((before, cleanup)).replace("$$", "$")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    count_file = tmp_path / "ps-count"
+
+    def write_executable(name: str, body: str) -> None:
+        path = fake_bin / name
+        path.write_text(f"#!/bin/bash\nset -euo pipefail\n{body}", encoding="utf-8")
+        path.chmod(0o755)
+
+    write_executable("rocminfo", "exit 0\n")
+    write_executable("sleep", "exit 0\n")
+    write_executable(
+        "python3",
+        'if [[ "${1:-}" == "-" ]]; then cat >/dev/null; exit 0; fi\nexit 0\n',
+    )
+    write_executable(
+        "ps",
+        "n=0\n"
+        'if [[ -f "$PS_COUNT_FILE" ]]; then n=$(cat "$PS_COUNT_FILE"); fi\n'
+        'printf "%s\\n" "$((n + 1))" > "$PS_COUNT_FILE"\n'
+        'printf "%s\\n" "10 1 Mon Nov 2 00:00:00 2026 S python"\n'
+        'if [[ "$n" == "0" ]]; then exit 0; fi\n'
+        'case "$PS_SECOND" in\n'
+        '  leak) printf "%s\\n" "99 1 Mon Nov 2 00:00:01 2026 S leaked" ;;\n'
+        '  ps) printf "%s\\n" "99 1 Mon Nov 2 00:00:01 2026 S ps" ;;\n'
+        "esac\n"
+        "exit 0\n",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "VLLM_CI_DOCKER_DISABLED": "1",
+            "VLLM_CI_REQUIRE_PERSISTENT_HF_CACHE": "0",
+            "BUILDKITE_JOB_ID": f"r2-02-cleanup-{tmp_path.name}",
+            "HF_HOME": str(tmp_path / "hf"),
+            "R2_02_ARTIFACT_DIR": str(artifact_dir),
+            "PS_COUNT_FILE": str(count_file),
+            "PS_SECOND": second_ps,
+            "TEST_COMMANDS": commands,
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(AMD_RUNNER)],
+        cwd=Path.cwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stdout + result.stderr
+    cleanup_log = (artifact_dir / "process-cleanup.txt").read_text(encoding="utf-8")
+    if expected_status == 0:
+        assert "status=PASS leaked_processes=0" in cleanup_log
+    else:
+        assert "leaked_processes_detected=1" in cleanup_log
 
 
 @pytest.mark.parametrize(("label", "agent_pool", "expected_count", "markers", "artifacts"), TINY_DIFFUSION_JOBS)

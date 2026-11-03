@@ -14,12 +14,14 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       timeout_in_minutes: 90
+      artifact_paths:
+        - "artifacts/amd-cpu-suites/**/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         - >-
-          pytest -sv tests/model_executor
+          python -u .buildkite/amd/scripts/run_cpu_suite.py model-executor -sv tests/model_executor
           -m 'core_model and cpu and not omni'
           --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
           --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
@@ -142,11 +144,13 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      artifact_paths:
+        - "artifacts/amd-cpu-suites/**/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - "python -u .buildkite/amd/scripts/run_cpu_suite.py other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
 
 - group: ":card_index_dividers: Diffusion Test"
   steps:
