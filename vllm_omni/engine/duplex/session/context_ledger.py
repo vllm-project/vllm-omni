@@ -439,6 +439,16 @@ class DuplexContextLedger:
             self._card_catalog_revision += 1
         return tuple(removed)
 
+    def discard(self, node_id: int) -> tuple[int, ...]:
+        """Retire a derived node and its descendants; return IDs in order."""
+        if node_id not in self._nodes:
+            return ()
+        retired = self._retired_with_descendants({node_id})
+        removed = tuple(candidate for candidate in self._nodes if candidate in retired)
+        if self._remove_nodes(retired):
+            self._card_catalog_revision += 1
+        return removed
+
     def valid(self, node_id: int) -> bool:
         """Whether the node survived the latest refresh."""
         return node_id in self._nodes

@@ -394,6 +394,12 @@ L1 nodes for the same source revision are rejected through either admission
 API. Callers refresh against a current authoritative snapshot before reading
 valid nodes.
 
+`discard(node_id)` explicitly retires a derived node and all of its descendants,
+returning their IDs in insertion order. Unknown or already retired IDs are a
+no-op. Retirement clears affected L1 lookups and card terms, leaves tombstones
+for retired card heads, and advances the card catalogue revision once when an
+active card is removed. It never edits authoritative history or reuses node IDs.
+
 Memory cards use the same ledger, with one active head per fact key. The
 session admits a complete candidate batch against a fresh snapshot and its
 private history-slot order. Slot order is allocated when a history position is
