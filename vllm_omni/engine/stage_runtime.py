@@ -815,18 +815,48 @@ class StageRuntime:
                 kv_config["engine_id"] = f"{kv_config['engine_id']}-s{stage_id}-r{replica_id}"
         return replica_cfg, bool(native_kv)
 
-    @staticmethod
+    # Headroom per replica so vLLM's own per-DP-rank port offset (applied
+    # inside ZmqEventPublisher, after this config is handed off) never spills
+    # into the next replica's range. Independent replicas each start their
+    # own DP mesh at rank 0, so without this every replica would bind the
+    # same kv_events_config endpoint/topic.
+    _KV_EVENTS_REPLICA_PORT_STRIDE = 64
+
+    @classmethod
+    def _offset_kv_events_config_for_replica(cls, kv_events_config: Any, replica_id: int) -> None:
+        """Mutate a replica's kv_events_config in place for publisher uniqueness."""
+        from vllm.distributed.kv_events import ZmqEventPublisher
+
+        offset = replica_id * cls._KV_EVENTS_REPLICA_PORT_STRIDE
+        kv_events_config.endpoint = ZmqEventPublisher.offset_endpoint_port(kv_events_config.endpoint, offset)
+        if kv_events_config.replay_endpoint:
+            kv_events_config.replay_endpoint = ZmqEventPublisher.offset_endpoint_port(
+                kv_events_config.replay_endpoint, offset
+            )
+        kv_events_config.topic = f"{kv_events_config.topic}-r{replica_id}"
+
+    @classmethod
     def _prepare_replica_vllm_config(
+        cls,
         stage_vllm_config: Any,
         replica_cfg: Any,
         replica_metadata: StageMetadata,
         *,
         native_kv: bool,
     ) -> Any:
-        """Assign native AR KV identity and the producer bootstrap endpoint."""
-        if not native_kv or stage_vllm_config is None:
+        """Assign native AR KV identity, the producer bootstrap endpoint, and a
+        per-replica KV-event publisher endpoint/topic."""
+        if stage_vllm_config is None:
+            return None
+        kv_events_config = getattr(stage_vllm_config, "kv_events_config", None)
+        needs_kv_events_offset = bool(kv_events_config is not None and kv_events_config.enable_kv_cache_events)
+        if not native_kv and not needs_kv_events_offset:
             return stage_vllm_config
         replica_vllm_config = copy.deepcopy(stage_vllm_config)
+        if needs_kv_events_offset:
+            cls._offset_kv_events_config_for_replica(replica_vllm_config.kv_events_config, replica_metadata.replica_id)
+        if not native_kv:
+            return replica_vllm_config
         kv_config = replica_vllm_config.kv_transfer_config
         kv_config.engine_id = f"{kv_config.engine_id}-s{replica_metadata.stage_id}-r{replica_metadata.replica_id}"
         if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
