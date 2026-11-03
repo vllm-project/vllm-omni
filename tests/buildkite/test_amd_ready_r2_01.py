@@ -66,7 +66,7 @@ def test_r2_01_is_nonblocking_single_gpu_coverage() -> None:
     step = _find_step(R2_01_LABEL)
 
     assert step["agent_pool"] == "mi300_1"
-    assert step["parallelism"] == 2
+    assert step["parallelism"] == 3
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 50
     assert step["mirror_hardwares"] == ["amdproduction"]
@@ -97,6 +97,8 @@ def test_r2_01_runs_once_fails_closed_and_publishes_results() -> None:
     assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
     assert "--collect-only" not in joined
+    assert '$${BUILDKITE_PARALLEL_JOB:-0}" == "0"' in joined
+    assert "assert-pytest-collection.sh 1416" in joined
     assert "VLLM_CI_ALLOW_NO_TESTS" not in joined
     assert any(artifact_dir in command for command in commands)
     assert "-v" in argv

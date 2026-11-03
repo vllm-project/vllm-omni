@@ -12,6 +12,15 @@ import pybase64 as base64
 import requests
 
 
+class JudgeResponseError(ValueError):
+    """Retain an incomplete judge reply without treating its prefix as a score."""
+
+    def __init__(self, raw_response: str, finish_reason: str | None) -> None:
+        self.raw_response = raw_response
+        self.finish_reason = finish_reason
+        super().__init__(f"Judge response is incomplete (finish_reason={finish_reason!r}); cannot score it")
+
+
 def _build_openai_url(base_url: str, api_path: str) -> str:
     base = base_url.rstrip("/")
     normalized_path = api_path if api_path.startswith("/") else f"/{api_path}"
@@ -43,7 +52,13 @@ class DuplexJudge:
             raise requests.HTTPError(
                 f"{response.status_code} response from judge: {response.text[:500]}", response=response
             )
-        return str(response.json()["choices"][0]["message"]["content"])
+        choice = response.json()["choices"][0]
+        content = str(choice["message"]["content"])
+        # The score parser can recover fields from a truncated prefix, so a
+        # parseable score cannot substitute for explicit completion evidence.
+        if choice.get("finish_reason") != "stop":
+            raise JudgeResponseError(content, choice.get("finish_reason"))
+        return content
 
     def temporal(self, prompt: str, frames: list[bytes]) -> str:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]

@@ -32,6 +32,7 @@ related_code_paths:
   - vllm_omni/model_executor/stage_input_processors/**
   - vllm_omni/core/sched/**
   - vllm_omni/distributed/omni_connectors/**
+  - vllm_omni/worker/scheduling_metadata_adapter.py
   - vllm_omni/diffusion/request.py
   - vllm_omni/diffusion/worker/request_batch.py
   - vllm_omni/errors.py
@@ -52,6 +53,9 @@ validation_paths:
   - tests/utils/test_mm_outputs.py
   - tests/utils/test_mm_outputs_partition.py
   - tests/diffusion/test_diffusion_output_metadata.py
+  - tests/core/sched/test_omni_scheduling_coordinator.py
+  - tests/worker/test_omni_connector_mixin.py
+  - tests/worker/test_scheduling_metadata_adapter.py
 upstream_refs:
   - vllm.inputs/**
   - vllm.outputs/**
@@ -95,6 +99,26 @@ decoders; explicit backend selections keep upstream behavior. Encoded-size,
 duration and decoded-memory limits remain enforced by upstream media helpers,
 and recognized-format corruption errors propagate. Tests in
 `tests/inputs/test_audio_decode.py` cover these compatibility boundaries.
+
+## Runner scheduling metadata
+
+`SchedulingMetadataUpdate`, carried by
+`OmniConnectorOutput.request_metadata`, is the internal typed contract from a
+Model Runner to its Scheduler. The full payload remains in the Model Runner's
+local cache.
+
+| Field | Meaning |
+| --- | --- |
+| `prompt_token_ids` | Replace the prompt token IDs and reset prompt-computation state. |
+| `resize_prompt_to` | Resize a prompt that has not started decoding and reset prompt-computation state. |
+| `input_terminal` | Mark terminal input for the coordinator to consume when the request is scheduled. |
+
+A runner-side `SchedulingMetadataAdapter` owns model-specific lookup and
+normalization and produces the prompt updates; runner transport adds the
+terminal-input signal. Configured adapters apply to non-async full-payload
+receive. Native MRV2 async receive uses the built-in adapter and the same
+typed updates; other async-chunk paths remain owned by
+`OmniChunkTransferAdapter`.
 
 ## Candidate invariants
 

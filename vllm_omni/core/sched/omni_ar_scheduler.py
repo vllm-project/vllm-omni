@@ -23,6 +23,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
@@ -345,7 +346,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return is_final
 
     def _init_prefill_admission_policy(self) -> None:
-        """Optional prefill batching under load (stage connector ``extra``).
+        """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
 
         While at least ``ar_prefill_admission_min_running`` requests run, a new
         request waits until ``ar_prefill_admission_min_batch`` requests wait or
@@ -359,6 +360,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
+        # A stage without a configured connector edge sets the same keys in additional_config.
+        additional = getattr(self.vllm_config, "additional_config", None)
+        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -366,6 +370,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("ar_prefill_admission_min_batch > 1 needs ar_prefill_admission_max_wait_ms > 0")
         if self._prefill_admission_min_running < 0:
             raise ValueError("ar_prefill_admission_min_running must be >= 0")
+        if self._prefill_admission_min_batch > 1:
+            logger.info(
+                "Prefill admission batching: %d requests or %.0f ms while >= %d run",
+                self._prefill_admission_min_batch,
+                self._prefill_admission_max_wait_s * 1000,
+                self._prefill_admission_min_running,
+            )
 
     def _should_defer_waiting_admission(self) -> bool:
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
@@ -992,9 +1003,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             status_before_stop = request.status
             sampling_validation_failed = False
-            if req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
+            model_error = (getattr(model_runner_output, "request_errors", None) or {}).get(req_id)
+            if model_error is None and req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
+                model_error = "Sampling received a row with no finite logits"
+            if model_error is not None:
                 request.status = RequestStatus.FINISHED_ERROR
-                request.stop_reason = "Sampling received a row with no finite logits"
+                request.stop_reason = model_error
                 request.resumable = False
                 generated_token_ids = []
                 sampling_validation_failed = True
@@ -1384,6 +1398,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     "new_token_ids": new_token_ids,
                     "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
                 }
+                # Fixed at schedule(): a resumable stop may already have applied the
+                # next chunk's update to the request (duplex session stats only).
+                perf_chunk = OmniSchedulerMixin._duplex_step_chunk(self, scheduler_output, req_id)
+                if isinstance(perf_chunk, tuple):
+                    save_kwargs["duplex_perf_chunk"] = perf_chunk
                 if is_segment_finished:
                     save_kwargs["segment_generation"] = boundary_generation
                 if batch_saves is not None:
@@ -1464,6 +1483,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         self._capture_omni_connector_output(model_runner_output)
+        OmniSchedulerMixin._attach_duplex_stage_work(self, scheduler_output, engine_core_outputs)
 
         # Free blocks that were held for transfer (kv_ready and
         # active_kv_transfers updates already done before the per-request loop).
@@ -1497,6 +1517,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stage 0.
         """
         req_id = session.request_id
+        set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Use the same confirmed span that upstream preserves when extending
