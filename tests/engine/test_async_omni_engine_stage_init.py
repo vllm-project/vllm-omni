@@ -24,7 +24,7 @@ from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
-from vllm_omni.engine import stage_init_utils
+from vllm_omni.engine import stage_init_utils, stage_runtime
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_init_utils import (
@@ -1035,6 +1035,32 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
     assert runtime.stage_pools[1].stage_vllm_config is cfg1
     assert runtime.stage_pools[0].output_processor is stage0_output_processor
     assert runtime.stage_pools[1].output_processor is stage1_output_processor
+
+
+def test_stage_runtime_initializes_pool_for_stage_without_replicas(monkeypatch):
+    """Ensure a stage with no replicas still gets a pool with its config and output processor."""
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace()],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    vllm_config = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    plan = LogicalStageInitPlan(
+        stage_idx=0, stage_id=0, replicas=[], metadata=_make_llm_metadata(0), stage_vllm_config=vllm_config
+    )
+    output_processor = object()
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_initialize_stage_replicas", lambda *_: {0: []})
+    monkeypatch.setattr(stage_runtime, "build_llm_stage_output_processor", lambda *_args, **_kw: output_processor)
+
+    runtime.initialize()
+
+    (pool,) = runtime.stage_pools
+    assert pool.stage_client is None
+    assert pool.stage_vllm_config is vllm_config
+    assert pool.output_processor is output_processor
 
 
 def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
@@ -2833,7 +2859,7 @@ def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async
             stage_vllm_config=None if diffusion else types.SimpleNamespace(kv_transfer_config=config),
             stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": config}),
         )
-        plans.append(types.SimpleNamespace(stage_id=stage_id, replicas=[replica]))
+        plans.append(LogicalStageInitPlan(stage_idx=stage_id, stage_id=stage_id, replicas=[replica]))
     runtime = object.__new__(StageRuntime)
     runtime._async_chunk = async_chunk
     if valid:

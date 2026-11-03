@@ -271,6 +271,26 @@ def test_serve_validate_rejects_stage_id_none_combinations(extra_argv: list[str]
         OmniServeCommand().validate(args)
 
 
+def test_serve_validate_accepts_stage_id_without_master(mocker: MockerFixture) -> None:
+    """Ensure --stage-id N is valid without a master, so the server runs only stage N."""
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--stage-id", "0"])
+
+    OmniServeCommand().validate(args)
+
+
+@pytest.mark.parametrize(
+    "stage_argv",
+    [["--stage-id", "none"], ["--stage-id", "0", "--omni-dp-size-local", "2"]],
+)
+def test_serve_validate_requires_master_for_remote_stages_or_local_replicas(stage_argv: list[str]) -> None:
+    """Ensure a master is still required when every stage is remote, or when adding local replicas."""
+    args = _parse_serve_args(["serve", "fake-model", "--omni", *stage_argv])
+    with pytest.raises(ValueError, match="--omni-master-address and --omni-master-port to be set"):
+        OmniServeCommand().validate(args)
+
+
 def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:
     """The CLI alias must not reach the strict diffusion config validator."""
     parser = TrackingArgumentParser()

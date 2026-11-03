@@ -207,8 +207,16 @@ class OmniServeCommand(CLISubcommand):
                 "--no-collect-stage-metrics requires --disable-log-stats when statistics logging is enabled"
             )
 
-        if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
-            raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        # Without a master, --stage-id N serves only stage N with the frontend,
+        # which should only be used for Run requests. A master must be set for
+        # remote stages and extra local replicas.
+        has_master = args.omni_master_address is not None and args.omni_master_port is not None
+        needs_master = is_frontend_only(args.stage_id) or args.omni_dp_size_local != 1
+        if args.stage_id is not None and needs_master and not has_master:
+            raise ValueError(
+                "--stage-id none or --omni-dp-size-local != 1 require --omni-master-address and "
+                "--omni-master-port to be set"
+            )
         if args.headless and is_frontend_only(args.stage_id):
             raise ValueError("--stage-id none cannot be used with --headless")
 

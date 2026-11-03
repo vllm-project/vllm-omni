@@ -174,16 +174,19 @@ class OmniEngineBase:
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
         # ------------------------------------------------------------------ #
-        # Single-stage mode is enabled when the caller explicitly passes      #
-        # single_stage_mode=True, or when a stage_id is provided in the args. #
-        if self._single_stage_id_filter is not None and not single_stage_mode:
+        # Currently this code is pretty confusing, but single_stage_mode
+        # really means distributed mode, where each process runs one stage
+        # and registers with the master server.
+        # TODO (Alex): Rename single stage mode vars throughout the code
+        self._omni_master_address: str | None = kwargs.get("omni_master_address")
+        self._omni_master_port: int | None = kwargs.get("omni_master_port")
+        if self._single_stage_id_filter is not None and (
+            self._omni_master_address is not None or is_frontend_only(self._single_stage_id_filter)
+        ):
             single_stage_mode = True
         if client_config is not None and int(client_config.get("client_count", 1)) > 1 and single_stage_mode:
             raise ValueError("Multiple API servers cannot be combined with single-stage distributed mode")
         self.single_stage_mode: bool = single_stage_mode
-
-        self._omni_master_address: str | None = kwargs.get("omni_master_address")
-        self._omni_master_port: int | None = kwargs.get("omni_master_port")
 
         # New omni-coordinator flags. Consumed only in single_stage_mode.
         # ``omni_dp_size_local`` is process-local: each invocation (head and
@@ -274,6 +277,12 @@ class OmniEngineBase:
 
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
+            # If a stage is being served by itself (i.e., no master server, and only
+            # taking Run requests), 0 out replicas of the nonselected stages.
+            if not self.single_stage_mode:
+                for stage_cfg in self.stage_configs:
+                    if stage_cfg.stage_id != self._single_stage_id_filter:
+                        stage_cfg.runtime_config.num_replicas = 0
 
         if self._config_resolution is None:
             # Same model, trust_remote_code and deploy path as the resolution

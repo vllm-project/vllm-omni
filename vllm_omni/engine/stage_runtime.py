@@ -745,7 +745,7 @@ class StageRuntime:
 
     def _validate_native_kv_topology(self, plans: list[LogicalStageInitPlan]) -> None:
         """Reject unsupported native AR->DiT graphs before launching any Worker."""
-        if not any(plan.replicas[0].metadata.stage_type == "diffusion" for plan in plans):
+        if not any(plan.metadata.stage_type == "diffusion" for plan in plans):
             return  # Native LLM prefill/decode is outside this path.
         roles = {}
         for plan in plans:
@@ -1436,8 +1436,8 @@ class StageRuntime:
 
         for plan in stage_plans:
             replica_clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = replica_clients[0] if replica_clients else None
-            if first_client is None:
+            # A stage without replicas has no clients; a replica that did not come up is still an error.
+            if any(client is None for client in replica_clients):
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
