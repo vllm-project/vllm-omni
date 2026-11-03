@@ -169,6 +169,9 @@ class TurnDetectionBatcher:
                 self._iter(inbox, finished)
             except BaseException as exc:  # never strand a caller on its future
                 logger.exception("Duplex turn detection iteration failed")
+                # Appends away on the executor since an earlier iteration are not listed: they rejoin
+                # with their result. One offloaded in this iteration is listed, so it fails here and is
+                # skipped when it rejoins.
                 self._abandon([*self._active, *self._scoring, *inbox], exc, finished)
             if finished:
                 assert self._loop is not None  # bound by the first append

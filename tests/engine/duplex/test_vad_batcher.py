@@ -27,7 +27,7 @@ import threading
 import time
 import wave
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -655,13 +655,15 @@ async def test_a_cancelled_smart_turn_job_stays_with_its_session(variant: _Varia
     already running and server_vad sessions are unaffected."""
     entered, release = threading.Event(), threading.Event()
     queued = threading.Event()
-    jobs: list = []
+    cancelled_job: list[Future] = []
 
     class _Recording(ThreadPoolExecutor):
         def submit(self, fn, /, *args, **kwargs):
+            parked = entered.is_set()  # read before submitting: this very job may set it
             future = super().submit(fn, *args, **kwargs)
-            jobs.append(future)
-            if len(jobs) == 2:
+            if parked and not cancelled_job:
+                # the running session is parked in its scorer: this is the other session's job
+                cancelled_job.append(future)
                 queued.set()
             return future
 
@@ -708,7 +710,7 @@ async def test_a_cancelled_smart_turn_job_stays_with_its_session(variant: _Varia
         )
     )
     executor.shutdown(wait=False, cancel_futures=True)
-    assert jobs[1].cancelled()
+    assert cancelled_job[0].cancelled()
     release.set()
     await asyncio.wait_for(asyncio.gather(running_task, cancelled_task, server_tasks), timeout=30)
     batcher.close()
