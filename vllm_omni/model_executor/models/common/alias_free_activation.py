@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Alias-free activation for BigVGAN-style speech decoders.
 
 Provides anti-aliased activation (upsample → activation → downsample) with
@@ -12,6 +12,7 @@ Used by: Qwen2.5-Omni, Qwen3-TTS v1, CoVo-Audio, and future BigVGAN vocoders.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -104,6 +105,50 @@ def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int, pad_right: in
     return torch.cat(segments, dim=-1)
 
 
+def _npu_conv_max_length(kernel_size: int, stride: int) -> int:
+    """Read the opt-in input-length cap once, when a resampler is constructed.
+
+    Zero disables chunking. Other platforms and kernels shorter than the stride
+    keep the native path. A positive cap must accommodate at least one kernel.
+    """
+    if not current_omni_platform.is_npu():
+        return 0
+    name = "VLLM_OMNI_NPU_ANTIALIAS_MAX_CONV_LENGTH"
+    value = int(os.environ.get(name, "0"))
+    if value < 0 or (0 < value < kernel_size):
+        raise ValueError(f"{name} must be 0 or >= kernel_size ({kernel_size}), got {value}")
+    return value if kernel_size >= stride else 0
+
+
+def _chunked_conv_transpose1d(
+    x: torch.Tensor, weight: torch.Tensor, stride: int, max_input_length: int
+) -> torch.Tensor:
+    """Depthwise FIR transpose convolution with bounded input chunks.
+
+    Only bias-free, padding=output_padding=0, dilation=1 FIRs with kernel >=
+    stride are supported. Global edge padding must already be present in x.
+    Left context supplies every contribution to each retained output; outputs
+    are concatenated, not overlap-added. This is mathematically equivalent to
+    the native convolution, but backend rounding can depend on the input shape.
+    """
+    length = x.shape[-1]
+    kernel_size = weight.shape[-1]
+    if max_input_length <= 0 or length <= max_input_length or kernel_size < stride:
+        return F.conv_transpose1d(x, weight, stride=stride, groups=x.shape[1])
+    if max_input_length < kernel_size:
+        raise ValueError("max_input_length must accommodate the FIR kernel")
+    overlap = (kernel_size - 1 + stride - 1) // stride
+    block_size = max_input_length - overlap
+    pieces = []
+    for start in range(0, length, block_size):
+        end = min(start + block_size, length)
+        context_start = max(0, start - overlap)
+        out = F.conv_transpose1d(x[..., context_start:end], weight, stride=stride, groups=x.shape[1])
+        trim = (start - context_start) * stride
+        pieces.append(out[..., trim:] if end == length else out[..., trim : trim + (end - start) * stride])
+    return torch.cat(pieces, dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # Up / Down sampling with Kaiser sinc filters
 # ---------------------------------------------------------------------------
@@ -123,17 +168,18 @@ class UpSample1d(nn.Module):
 
         filt = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
         self.register_buffer("filter", filt, persistent=False)
+        self._max_conv_length = _npu_conv_max_length(self.kernel_size, self.stride)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         channels = hidden_states.shape[1]
         if current_omni_platform.is_npu():
             input_dtype = hidden_states.dtype
             hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad, self.pad)
-            hidden_states = self.ratio * F.conv_transpose1d(
+            hidden_states = self.ratio * _chunked_conv_transpose1d(
                 hidden_states,
                 self.filter.expand(channels, -1, -1),
                 stride=self.stride,
-                groups=channels,
+                max_input_length=self._max_conv_length,
             ).to(input_dtype)
         else:
             input_dtype = hidden_states.dtype

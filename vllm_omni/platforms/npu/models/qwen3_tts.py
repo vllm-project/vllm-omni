@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Patch Qwen3-TTS NPU runtime setup and weights.
 
@@ -68,11 +68,16 @@ def _patched_load_weights(self, weights):
     assert _original_load_weights is not None
     loaded = _original_load_weights(self, weights)
     device = self.vllm_config.device_config.device
-    runtime_dtype = getattr(self, "_npu_decoder_runtime_dtype", lambda _: torch.float32)(device)
-    self.decoder.to(device=device, dtype=runtime_dtype)
+    platform_dtype_override = getattr(self, "_npu_decoder_runtime_dtype", None)
+    if platform_dtype_override is not None:
+        # 310P requires FP16 and deliberately overrides the stage dtype.
+        runtime_dtype = platform_dtype_override(device)
+        self.decoder.to(device=device, dtype=runtime_dtype)
+        if hasattr(self.decoder, "precompute_snake_caches"):
+            self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
-    if runtime_dtype != torch.float32 and hasattr(self.decoder, "precompute_snake_caches"):
-        self.decoder.precompute_snake_caches()
+    actual_dtype = next(self.decoder.parameters()).dtype
+    logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
     return loaded
 
 
@@ -108,8 +113,8 @@ def _apply_a5_prompt_embeds_builder_patch() -> None:
 
     # The talker imports the builder by name at module scope, so its reference
     # must be swapped as well (same as the 310P patch).
-    prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilderA5
-    qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilderA5
+    setattr(prompt_embeds_builder, "Qwen3TTSPromptEmbedsBuilder", _Qwen3TTSPromptEmbedsBuilderA5)
+    setattr(qwen3_tts_talker, "Qwen3TTSPromptEmbedsBuilder", _Qwen3TTSPromptEmbedsBuilderA5)
     _A5_PATCHED = True
     logger.debug("Applied A5 prompt-embeds builder patch for Qwen3-TTS")
 

@@ -346,3 +346,46 @@ def test_chat_audio_metadata_survives_response_serialization(stream, fmt):
             assert audio_file.samplerate == 22050
     else:
         assert len(raw) == frame_count * 2
+
+
+@pytest.mark.parametrize("layout", ["mono", "interleaved", "planar", "strided"])
+def test_float32_pcm_fast_path_matches_soundfile(layout):
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import _float32_to_pcm16_bytes
+
+    rng = np.random.default_rng(0)
+    audio = np.concatenate(
+        [
+            rng.uniform(-1.2, 1.2, 4096),
+            np.array([-1.0, 1.0, 0.0, -0.0, 32767 / 32768, -1 / 32768, 0.5 / 32768, -0.5 / 32768]),
+            np.array([np.nan, np.inf, -np.inf, np.nextafter(np.float32(1 / 32768), np.float32(0))]),
+        ]
+    ).astype(np.float32)
+    if layout != "mono":
+        audio = np.stack((audio, audio[::-1])).T  # Non-contiguous, channels-last stereo.
+        if layout == "interleaved":
+            audio = np.ascontiguousarray(audio)
+        elif layout == "strided":
+            audio = audio[::2]
+    original = audio.copy()
+    with BytesIO() as buffer:
+        soundfile.write(buffer, audio, 24000, format="RAW", subtype="PCM_16")
+        expected = buffer.getvalue()
+    assert _float32_to_pcm16_bytes(audio) == expected
+    np.testing.assert_array_equal(audio, original)
+
+
+def test_float32_pcm_path_matches_soundfile_across_scales():
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import _float32_to_pcm16_bytes
+
+    def reference(audio):
+        with BytesIO() as buffer:
+            soundfile.write(buffer, audio, 24000, format="RAW", subtype="PCM_16")
+            return buffer.getvalue()
+
+    rng = np.random.default_rng(1)
+    for exponent in range(-40, 39, 3):
+        audio = (rng.standard_normal(4096) * 10.0**exponent).astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            assert _float32_to_pcm16_bytes(audio) == reference(audio)
+    stereo = rng.uniform(-1.1, 1.1, (2, 4096)).astype(np.float32).T  # non-contiguous view
+    assert _float32_to_pcm16_bytes(stereo) == reference(stereo)

@@ -92,6 +92,13 @@ class SupportsStepExecution(Protocol):
     ``prepare_encode()`` (one-time request setup), ``denoise_step()``
     (one denoise forward), ``step_scheduler()`` (one scheduler update),
     and ``post_decode()`` (final decode).
+
+    A pipeline may additionally set the optional class attribute
+    ``supports_chunk_step_grouping = True`` to declare that its request state
+    may advance through every denoise step of its current chunk without a
+    serving-scheduler cycle in between (a capability, not a policy: the runner
+    that owns the scheduling decision chooses whether to group steps). It is
+    optional so it does not become part of the runtime protocol check.
     """
 
     supports_step_execution: ClassVar[bool] = True
@@ -112,6 +119,21 @@ class SupportsStepExecution(Protocol):
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Decode output after denoise loop or at a partial chunk boundary."""
+        ...
+
+
+@runtime_checkable
+class SupportsSkipLayerGuidance(Protocol):
+    """Transformer with request-local identity skips for complete DiT blocks.
+
+    Layer IDs are defined by the model. Its forward accepts ``skip_layers``
+    without changing weights, hooks, or other requests' execution state.
+    """
+
+    supports_skip_layer_guidance: ClassVar[bool]
+
+    def validate_skip_layers(self, skip_layers: tuple[int, ...]) -> None:
+        """Reject layer IDs that cannot be skipped by this transformer."""
         ...
 
 
@@ -146,15 +168,52 @@ def supports_step_execution(pipeline: object) -> bool:
     return isinstance(pipeline, SupportsStepExecution)
 
 
+# --- Generic role-based component loading for diffusion disaggregation ---------
+
+# Which component groups (as declared by ``SupportsComponentDiscovery``) each
+# diffusion stage role needs to load. ``encoder`` = text/image encoders,
+# ``dit`` = denoising transformer(s), ``vae`` = VAE. A stage skips loading every
+# group not listed for its role, which is what frees memory on disaggregated
+# workers (e.g. an ENCODE stage drops the DiT + VAE). This mapping is
+# model-agnostic: any pipeline that implements ``SupportsComponentDiscovery``
+# becomes role-splittable without model-specific ``if`` branches.
+_ROLE_COMPONENT_GROUPS: dict[str, frozenset[str]] = {
+    "full": frozenset({"encoder", "dit", "vae"}),
+    "encode": frozenset({"encoder"}),
+    "denoise": frozenset({"dit"}),
+    "denoise_decode": frozenset({"dit", "vae"}),
+    "decode": frozenset({"vae"}),
+}
+
+
+def stage_component_groups(role: str) -> frozenset[str]:
+    """Return the component groups (``encoder``/``dit``/``vae``) a role loads."""
+    return _ROLE_COMPONENT_GROUPS.get(role, _ROLE_COMPONENT_GROUPS["full"])
+
+
+def role_loads_component(role: str, group: Literal["encoder", "dit", "vae"]) -> bool:
+    """Whether a diffusion stage ``role`` should load the given component group.
+
+    Use inside a pipeline ``__init__`` to decide, model-agnostically, whether to
+    instantiate the encoder / DiT / VAE for the current stage role::
+
+        if role_loads_component(role, "dit"):
+            self.transformer = ...
+        if role_loads_component(role, "vae"):
+            self.vae = ...
+    """
+    return group in stage_component_groups(role)
+
+
 @runtime_checkable
 class SupportsInteractionApply(Protocol):
     """Optional protocol for pipelines with unified mid-generation, chunk-boundary hooks."""
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
-        """Return the media timeline represented by the upcoming/current chunk.
+        """Return the media timeline and latent frame count for the upcoming/current chunk.
 
         Useful when interaction handler needs interpolation/integration on a frame-by-frame basis,
-        or for backpressure/pacing.
+        and/or for backpressure/pacing.
         """
         ...
 

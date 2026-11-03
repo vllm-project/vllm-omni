@@ -8,6 +8,7 @@ import struct
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -1346,6 +1347,16 @@ class OmniKVTransferManager:
             logger.exception("KV load failed for %s; falling back to sync receive", request_id)
             return None, 0
 
+    def wait_prefetch(self, timeout: float | None = None) -> bool:
+        """Block until no background prefetch is running; payloads stay consumable.
+
+        Returns False if a prefetch is still in flight when ``timeout`` expires.
+        """
+        futures = list(self._prefetch_futures.values())
+        if not futures:
+            return True
+        return not wait_futures(futures, timeout=timeout).not_done
+
     def _discard_future(self, request_id: str) -> None:
         """Cancel an unstarted prefetch or attach a callback to drop a running one."""
         fut = self._prefetch_futures.pop(request_id, None)
@@ -1364,6 +1375,16 @@ class OmniKVTransferManager:
             except Exception:
                 logger.exception("Failed to shut down KV prefetch executor")
             self._prefetch_executor = None
+
+    def close(self) -> None:
+        """Stop prefetch work before closing the connector owned by this manager."""
+        try:
+            self.shutdown_prefetch()
+        finally:
+            connector = self._connector
+            self._connector = False
+            if connector:
+                connector.close()
 
     @staticmethod
     def _record_stream_for_prefetched(data: dict[str, Any]) -> None:

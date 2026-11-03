@@ -1,0 +1,131 @@
+[
+  {
+    "test_name": "test_hunyuan_image3_prefix_dense",
+    "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
+    "description": "Repeated two-image IT2I request on a single DiT stage: dense baseline (TP4, CFGP1)",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml"
+      },
+      "stage_overrides": {
+        "0": {
+          "max_model_len": 22800,
+          "max_num_batched_tokens": 32768,
+          "diffusion_kv_mode": "dense_legacy",
+          "diffusion_kv_max_rows_per_request": 2,
+          "enable_prefix_caching": false,
+          "vae_use_tiling": true,
+          "parallel_config": {"vae_patch_parallel_size": 4}
+        }
+      }
+    },
+    "benchmark_params": [{
+      "dataset_name": "custom_image",
+      "dataset_path": "tests/assets/hunyuan_image3/it2i.jsonl",
+      "endpoint": "/v1/images/edits",
+      "skip_tokenizer_init": true,
+      "disable_shuffle": true,
+      "num_prompts": 8,
+      "max_concurrency": 1,
+      "num_warmups": 2,
+      "seed": 42,
+      "percentile_metrics": "e2el",
+      "extra_body": {
+        "guidance_scale": 2.5,
+        "sys_type": "en_unified",
+        "seed": 42,
+        "size": "1280x720",
+        "num_inference_steps": 8,
+        "bot_task": "think_recaption"
+      }
+    }]
+  },
+  {
+    "test_name": "test_hunyuan_image3_prefix_paged_no_cache",
+    "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
+    "description": "Repeated two-image IT2I request on a single DiT stage: paged without prefix caching (TP4, CFGP1)",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml"
+      },
+      "stage_overrides": {
+        "0": {
+          "max_model_len": 22800,
+          "max_num_batched_tokens": 32768,
+          "diffusion_kv_mode": "paged_scheduler",
+          "diffusion_kv_max_rows_per_request": 2,
+          "enable_prefix_caching": false,
+          "vae_use_tiling": true,
+          "parallel_config": {"vae_patch_parallel_size": 4}
+        }
+      }
+    },
+    "benchmark_params": [{
+      "dataset_name": "custom_image",
+      "dataset_path": "tests/assets/hunyuan_image3/it2i.jsonl",
+      "endpoint": "/v1/images/edits",
+      "skip_tokenizer_init": true,
+      "disable_shuffle": true,
+      "num_prompts": 8,
+      "max_concurrency": 1,
+      "num_warmups": 2,
+      "seed": 42,
+      "percentile_metrics": "e2el",
+      "extra_body": {
+        "guidance_scale": 2.5,
+        "sys_type": "en_unified",
+        "seed": 42,
+        "size": "1280x720",
+        "num_inference_steps": 8,
+        "bot_task": "think_recaption"
+      }
+    }]
+  },
+  {
+    "test_name": "test_hunyuan_image3_prefix_paged_prefix",
+    "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
+    "description": "Repeated two-image IT2I request on a single DiT stage: paged with full prefix reuse (TP4, CFGP1)",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml"
+      },
+      "stage_overrides": {
+        "0": {
+          "max_model_len": 22800,
+          "max_num_batched_tokens": 32768,
+          "diffusion_kv_mode": "paged_scheduler",
+          "diffusion_kv_max_rows_per_request": 2,
+          "enable_prefix_caching": true,
+          "vae_use_tiling": true,
+          "parallel_config": {"vae_patch_parallel_size": 4}
+        }
+      }
+    },
+    "benchmark_params": [{
+      "dataset_name": "custom_image",
+      "dataset_path": "tests/assets/hunyuan_image3/it2i.jsonl",
+      "endpoint": "/v1/images/edits",
+      "skip_tokenizer_init": true,
+      "disable_shuffle": true,
+      "num_prompts": 8,
+      "max_concurrency": 1,
+      "num_warmups": 2,
+      "seed": 42,
+      "percentile_metrics": "e2el",
+      "extra_body": {
+        "guidance_scale": 2.5,
+        "sys_type": "en_unified",
+        "seed": 42,
+        "size": "1280x720",
+        "num_inference_steps": 8,
+        "bot_task": "think_recaption"
+      }
+    }]
+  }
+]

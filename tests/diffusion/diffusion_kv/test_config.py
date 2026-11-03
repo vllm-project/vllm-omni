@@ -21,6 +21,86 @@ def test_dense_legacy_is_default() -> None:
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
 
 
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+@pytest.mark.parametrize("mode", [None, "dense_legacy", DiffusionKVCacheMode.DENSE_LEGACY])
+def test_prefix_caching_rejects_non_paged_mode(config_cls, mode) -> None:
+    kwargs = {} if mode is None else {"diffusion_kv_mode": mode}
+    with pytest.raises(
+        ValueError,
+        match="set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching",
+    ):
+        config_cls.from_kwargs(enable_prefix_caching=True, **kwargs)
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_prefix_caching_accepts_paged_scheduler(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=True,
+    )
+
+    assert config.enable_prefix_caching is True
+    assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
+
+@pytest.mark.parametrize("build_config", [OmniDiffusionConfig, OmniDiffusionConfig.from_kwargs])
+def test_prefix_caching_rejects_sleep_mode(build_config) -> None:
+    with pytest.raises(ValueError, match="disable enable_prefix_caching or enable_sleep_mode"):
+        build_config(
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+            enable_prefix_caching=True,
+            enable_sleep_mode=True,
+        )
+
+
+@pytest.mark.parametrize("mode", ["dense_legacy", "paged_scheduler"])
+def test_sleep_mode_accepts_disabled_prefix_caching(mode) -> None:
+    config = OmniDiffusionConfig.from_kwargs(
+        diffusion_kv_mode=mode,
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=False,
+        enable_sleep_mode=True,
+    )
+
+    assert config.enable_sleep_mode is True
+    assert config.enable_prefix_caching is False
+
+
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+def test_native_kv_transfer_requires_prefix_caching_disabled(enable_prefix_caching) -> None:
+    kwargs = dict(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=enable_prefix_caching,
+        kv_transfer_config={
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_consumer",
+            "engine_id": "test-diffusion",
+        },
+    )
+    if enable_prefix_caching:
+        with pytest.raises(ValueError, match="disable enable_prefix_caching for AR KV import"):
+            OmniDiffusionConfig.from_kwargs(**kwargs)
+    else:
+        config = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert config.kv_transfer_config.kv_role == "kv_consumer"
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+@pytest.mark.parametrize("mode", ["dense_legacy", "paged_scheduler"])
+def test_disabled_prefix_caching_accepts_both_modes(config_cls, mode) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_kv_mode=mode,
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=False,
+    )
+
+    assert config.enable_prefix_caching is False
+    assert config.diffusion_kv_mode.value == mode
+
+
 def test_paged_worker_local_is_rejected_until_implemented() -> None:
     with pytest.raises(ValueError, match="reserved but not implemented"):
         OmniDiffusionConfig.from_kwargs(diffusion_kv_mode="paged_worker_local")
@@ -80,3 +160,35 @@ def test_worker_row_limit_must_be_a_positive_integer(invalid_limit: object) -> N
         OmniDiffusionConfig.from_kwargs(diffusion_kv_max_rows_per_request=invalid_limit)
     with pytest.raises((TypeError, ValueError)):
         _DiffusionConfigProjection.from_kwargs(diffusion_kv_max_rows_per_request=invalid_limit)
+
+
+@pytest.mark.parametrize("dtype", ["fp8", "fp8_e4m3"])
+def test_dense_legacy_allows_attention_quantization(dtype) -> None:
+    config = OmniDiffusionConfig.from_kwargs(diffusion_kv_cache_dtype=dtype)
+    assert config.diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_unified_knob_conflicts_with_explicit_quant_spec(config_cls) -> None:
+    with pytest.raises(ValueError, match="conflicts with a diffusion_attention_config quant spec"):
+        config_cls.from_kwargs(
+            diffusion_kv_cache_dtype="fp8",
+            diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+        )
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_unified_knob_allows_backend_pin_without_dtypes(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_kv_cache_dtype="fp8",
+        diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"flashinfer_backend": "fa2"}}},
+    )
+    assert config.diffusion_kv_cache_dtype == "fp8"
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_explicit_quant_spec_without_knob_is_allowed(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+    )
+    assert config.diffusion_kv_cache_dtype is None

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import gc
-import importlib
+import importlib.util
 import json
 import os
 import tempfile
@@ -118,11 +118,9 @@ HUNYUAN_COT_REF_PATH = get_asset_path(f"{ASSET_SUBDIR}/{COT_REF_NAME}")
 # Constants
 # ============================================================================
 # Test input
-PROMPT = "基于图一的logo，参考图二中冰箱贴的材质，制作一个新的冰箱贴"
-TEST_IMAGE_URLS = [
-    "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_1_0.png",
-    "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_1_1.png",
-]
+_IT2I_INPUT = json.loads(get_asset_path("hunyuan_image3/it2i.jsonl").read_text(encoding="utf-8"))
+PROMPT = _IT2I_INPUT["prompt"]
+TEST_IMAGE_URLS = _IT2I_INPUT["image_files"]
 SEED = 42
 AR_TP_SIZE = len(AR_DEVICES.split(","))
 DIT_TP_SIZE = len(DIT_DEVICES.split(","))
@@ -391,13 +389,17 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
 def _run_online(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
+    # After #8606, stage_init_timeout is a hard READY deadline. HunyuanImage-3
+    # AR+DiT MoE load regularly exceeds the 300s CLI default on nightly (issue
+    # #9451). Match the 900s used by the prefix-cache online test, and keep
+    # init_timeout above two sequential stage budgets if the GPUs overlap.
     server_args = [
         "--deploy-config",
         deploy_config_path,
         "--stage-init-timeout",
-        "300",
-        "--init-timeout",
         "900",
+        "--init-timeout",
+        "1800",
         "--trust-remote-code",
     ]
     try:

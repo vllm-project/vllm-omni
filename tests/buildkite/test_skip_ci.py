@@ -10,9 +10,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
+from ci_conditions import (  # noqa: E402
+    MERGE_MAIN_IF,
+    RELEASE_LINE_BUILDKITE_PATTERN,
+    RELEASE_LINE_VERSION_PATTERN,
+    is_release_line_branch,
+    is_release_line_push,
+)
 from skip_ci import (  # noqa: E402
     CiDecision,
     _diff_only_contains_skip_mark_changes,
+    _resolve_diff_range,
     resolve_ci_decision,
 )
 
@@ -142,6 +150,14 @@ def test_npu_nightly_only_skips_all_l23() -> None:
     assert _all_l23_skipped(decision)
     assert not decision.is_run("npu", "l2")
     assert not decision.is_run("npu", "l3")
+
+
+def test_amd_weekly_only_skips_all_l23() -> None:
+    decision = _decision([".buildkite/amd/test-amd-weekly.yml"])
+    assert _is_yaml_gated(decision)
+    assert _all_l23_skipped(decision)
+    assert not decision.is_run("amd", "l2")
+    assert not decision.is_run("amd", "l3")
 
 
 def test_amd_nightly_only_skips_all_l23() -> None:
@@ -377,3 +393,95 @@ def test_yaml_gated_message_lists_changed_and_targets() -> None:
     assert "run: cuda/l2" in decision.message
     assert "skip: cuda/l3" in decision.message
     assert "amd/l2" in decision.message
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected"),
+    [
+        ("main", True),
+        ("release/v0.30.0", True),
+        ("release/v10.2.3", True),
+        ("0.30.0", False),
+        ("v0.30.0", False),
+        ("release/v0.30", False),
+        ("release/v0.30.0-rc1", False),
+        ("release/0.30.0", False),
+        ("feature", False),
+        ("", False),
+    ],
+)
+def test_is_release_line_branch(branch: str, expected: bool) -> None:
+    assert is_release_line_branch(branch) is expected
+
+
+def test_version_branch_push_requires_a_non_pr_build() -> None:
+    assert is_release_line_push("main", "99")
+    assert is_release_line_push("main", "false")
+    assert is_release_line_push("release/v0.30.0", "false")
+    assert is_release_line_push("release/v0.30.0", "")
+    assert not is_release_line_push("release/v0.30.0", "99")
+    assert not is_release_line_push("feature", "false")
+    assert "build.pull_request.id == null" in MERGE_MAIN_IF
+    assert RELEASE_LINE_BUILDKITE_PATTERN == r"/^release\/v[0-9]+\.[0-9]+\.[0-9]+$$/"
+    assert RELEASE_LINE_BUILDKITE_PATTERN in MERGE_MAIN_IF
+    assert "%r{" not in MERGE_MAIN_IF
+
+
+def test_release_line_version_pattern_is_shared() -> None:
+    """Python callers import ci_conditions; shell callers source release_line_branch.sh."""
+    helper = Path(".buildkite/common/scripts/release_line_branch.sh").read_text(encoding="utf-8")
+    assert RELEASE_LINE_VERSION_PATTERN in helper
+    assert RELEASE_LINE_VERSION_PATTERN in Path(".buildkite/common/scripts/ci_conditions.py").read_text(
+        encoding="utf-8"
+    )
+    for relative in (
+        ".buildkite/common/scripts/skip_ci.py",
+        ".buildkite/common/scripts/upload_pipeline.py",
+        ".buildkite/amd/scripts/select_test_suites.py",
+    ):
+        text = Path(relative).read_text(encoding="utf-8")
+        assert "ci_conditions" in text, relative
+        assert RELEASE_LINE_VERSION_PATTERN not in text, relative
+    for relative in (
+        ".buildkite/common/scripts/resolve_skip_ci.sh",
+        ".buildkite/common/scripts/run_cov_split.sh",
+        ".buildkite/cuda/bootstrap-upload-steps.yml",
+        ".buildkite/npu/bootstrap-upload-steps.yml",
+    ):
+        text = Path(relative).read_text(encoding="utf-8")
+        assert "release_line_branch.sh" in text, relative
+        assert RELEASE_LINE_VERSION_PATTERN not in text, relative
+
+
+def test_version_branch_diff_uses_parent_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "false")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "release/v0.30.0")
+    monkeypatch.setenv("BUILDKITE_COMMIT", "abc123")
+
+    class _GitResult:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr("skip_ci._git", lambda *_args: _GitResult())
+    assert _resolve_diff_range() == "abc123^..abc123"
+
+
+def test_version_branch_pull_request_uses_pr_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "99")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "release/v0.30.0")
+    monkeypatch.setenv("BUILDKITE_COMMIT", "abc123")
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main")
+
+    class _GitResult:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr("skip_ci._git", lambda *_args: _GitResult())
+    assert _resolve_diff_range() == "origin/main...abc123"
+
+
+def test_feature_branch_diff_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "false")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "feature")
+    monkeypatch.setenv("BUILDKITE_COMMIT", "abc123")
+    assert _resolve_diff_range() is None

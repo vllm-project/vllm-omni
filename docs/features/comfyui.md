@@ -49,8 +49,12 @@ This extension offers the following nodes based on the output modalities:
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video and image-to-video tasks
+- **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio.
+  [Standalone and remote H3 templates](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/seedvr2-restoration.md)
+  use separately configured model services and the whole-clip SeedVR2 API.
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for text-to-music tasks
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
@@ -80,6 +84,36 @@ To build a simple workflow yourself,
     - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
+
+## MiniMax H3 text-to-video workflow
+
+The **MiniMax H3 Text to Video** template uses the existing remote Generate Video,
+H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
+optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
+ComfyUI receives the generated video and audio from the server; it does not load
+H3 weights locally. Configure the server-side LoRA path before enabling Turbo.
+
+See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
+for server setup, template import, Turbo configuration, recorded validation,
+and saved-video/audio checks.
+
+## MiniMax H3 all-in-one workflow
+
+The **MiniMax-H3 All-in-One** template puts T2VA, first/last-frame FL2VA, and
+mixed-reference Ref2VA in one graph built from the existing nodes. The server
+URL, served model name, duration, sampling, and flow shifts are shared by all
+modes, and each mode is a group you enable or mute. It does not include a
+prompt LLM. See the
+[all-in-one workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/h3-06-all-in-one.md).
+
+## MiniMax H3 music video workflow
+
+The **MiniMax-H3 Music Video** template builds a multi-shot music video from a
+supplied track. Each shot is a Ref2VA request driven by its slice of the track
+(`audio_mode=lock_source` on **MiniMax-H3 Video Params**) with a shared
+character/style image. ComfyUI's Concatenate Video node joins the shots and
+attaches the original recording. See the
+[music video workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/h3-03-music-video.md).
 
 ## Examples & Screenshots
 

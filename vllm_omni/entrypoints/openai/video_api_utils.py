@@ -42,6 +42,7 @@ import torch
 from PIL import Image, UnidentifiedImageError
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -72,6 +73,58 @@ DEFAULT_AUDIO_SAMPLE_RATE = 24_000
 VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
 AudioSample = int | float
 AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
+
+
+def validate_control_media_file(
+    path: str,
+    *,
+    allow_image: bool = False,
+    max_duration: float = 15.0,
+    max_frames: int = 3600,
+) -> None:
+    """Validate uploaded conditioning media without retaining decoded frames.
+
+    A static mask can be an image. Video inputs must contain a non-empty,
+    fixed-size video stream. Audio streams are not used for conditioning.
+    Inspect only the usable prefix, with a frame cap for missing/broken
+    timestamps. Long clips remain valid: the model trims to output duration.
+    """
+    import av
+
+    try:
+        if allow_image:
+            try:
+                with Image.open(path) as image:
+                    _validate_image_pixel_limit(image)
+                    image.verify()
+                return
+            except UnidentifiedImageError:
+                pass
+        with av.open(path) as container:
+            if not container.streams.video:
+                raise ValueError("no video stream")
+            shape = None
+            first_time = None
+            for index, frame in enumerate(container.decode(video=0)):
+                timestamp = frame.time
+                if first_time is None and timestamp is not None:
+                    first_time = timestamp
+                if shape is not None and (
+                    index >= max_frames
+                    or (timestamp is not None and first_time is not None and timestamp - first_time >= max_duration)
+                ):
+                    break
+                current_shape = (frame.width, frame.height)
+                if shape is not None and current_shape != shape:
+                    raise ValueError("video frame dimensions must be consistent")
+                shape = current_shape
+                max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+                if max_pixels > 0 and frame.width * frame.height > max_pixels:
+                    raise ValueError("video frame exceeds the decoder pixel limit")
+            if shape is None:
+                raise ValueError("no decodable video frames")
+    except (av.error.FFmpegError, OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+        raise InvalidInputReferenceError(f"Invalid conditioning media: {exc}") from exc
 
 
 class VideoFrames(list[Image.Image]):
@@ -121,7 +174,7 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        with Image.open(BytesIO(image_bytes)) as image:
+        with open_image(BytesIO(image_bytes)) as image:
             _validate_image_pixel_limit(image)
             return image.convert("RGB")
     except _ImagePixelLimitError:
@@ -749,13 +802,21 @@ def _iter_planar_video_frames(
         converter.shutdown()
 
 
+def _iter_borrowed_rgb_video_frames(frames: list[np.ndarray]) -> Generator[av.VideoFrame, None, None]:
+    """Wrap RGB arrays in AVFrames without copying their pixel storage."""
+    import av
+
+    for frame in frames:
+        yield av.VideoFrame.from_numpy_buffer(frame, format="rgb24")
+
+
 def _log_video_encoding_path(
     *,
     selected_path: str,
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
-    fps: int,
+    fps: int | float,
     audio: AudioInput | None,
     audio_sample_rate: int | None,
     effective_frame_conversion_workers: int,
@@ -790,7 +851,7 @@ def _encode_prepared_video_bytes_legacy(
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
@@ -835,14 +896,42 @@ def _encode_video_bytes(
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
+    enable_borrowed_frames: bool = False,
 ) -> bytes:
-    """Encode a video payload through the direct planar or legacy path."""
+    """Encode through the opt-in borrowed RGB, direct planar or legacy path."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
 
     # Prepare once so validation is shared by both paths and malformed common
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
+    if (
+        enable_borrowed_frames
+        and common_dtype == np.dtype(np.uint8)
+        and len(frame_shape) == 3
+        and frame_shape[-1] == 3
+        and all(frame.dtype == np.uint8 and frame.strides[1:] == (3, 1) for frame in frames)
+    ):
+        _log_video_encoding_path(
+            selected_path="borrowed_rgb",
+            frames=frames,
+            frame_shape=frame_shape,
+            common_dtype=common_dtype,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            effective_frame_conversion_workers=0,
+        )
+        audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+        return mux_av_video_audio_bytes(
+            _iter_borrowed_rgb_video_frames(frames),
+            width=frame_shape[1],
+            height=frame_shape[0],
+            audio_waveform=audio_np,
+            fps=float(fps),
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
     fallback_reason = _direct_planar_fallback_reason(
         frames,
         frame_shape,
@@ -957,6 +1046,7 @@ def encode_video_base64(
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
+    enable_borrowed_frames: bool = False,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(
@@ -966,5 +1056,6 @@ def encode_video_base64(
         audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
         frame_converter=frame_converter,
+        **({"enable_borrowed_frames": True} if enable_borrowed_frames else {}),
     )
     return base64.b64encode(video_bytes).decode("utf-8")

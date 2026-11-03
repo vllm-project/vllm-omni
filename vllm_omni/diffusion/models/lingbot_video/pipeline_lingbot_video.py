@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 from __future__ import annotations
@@ -35,7 +35,8 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     normalize_lingbot_request,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler, build_pipeline_scheduler
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -122,9 +123,9 @@ def _transformer_timestep(timestep: torch.Tensor, transformer_dtype: torch.dtype
 
 
 def _transformer_autocast(device: torch.device, transformer_dtype: torch.dtype):
-    if device.type != "cuda" or transformer_dtype not in {torch.bfloat16, torch.float16}:
+    if device.type == "cpu" or transformer_dtype not in {torch.bfloat16, torch.float16}:
         return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=transformer_dtype)
+    return torch.autocast(device_type=device.type, dtype=transformer_dtype)
 
 
 def _group_global_rank(group: Any | None, group_rank: int) -> int:
@@ -287,13 +288,13 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
             output_key = output_keys[0]
             frames = frames[output_key]
         output_type = getattr(sampling_params, "output_type", None) or "pt"
-        # The image serving path currently accepts PIL images or NumPy arrays,
-        # while LingBot decodes T2I outputs to tensors. Keep that compatibility
-        # conversion without discarding the model's image/video payload key.
+        # Decoded LingBot pixels are already in [0, 1]. The video API treats
+        # floating tensors as [-1, 1], so use its NumPy path to avoid normalizing
+        # twice. Images also need NumPy for serving; keep latent tensors intact.
         if (
             isinstance(frames, torch.Tensor)
             and output_type != "latent"
-            and (output_type == "np" or output_key == "image")
+            and (output_type == "np" or output_key in {"image", "video"})
         ):
             frames = frames.float().cpu().numpy()
         return {output_key: frames} if output_key is not None else frames
@@ -306,6 +307,7 @@ class LingBotVideoPipeline(
     SupportImageInput,
     ProgressBarMixin,
     SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
 ):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 
@@ -374,19 +376,18 @@ class LingBotVideoPipeline(
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
         ).to(self.device)
-        self.scheduler = build_pipeline_scheduler(
-            od_config,
-            default_builder=lambda: FlowUniPCMultistepScheduler.from_pretrained(
-                model,
-                subfolder=scheduler_subfolder,
-                local_files_only=local_files_only,
-            ),
-            local_files_only=local_files_only,
+        self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
+            model,
             subfolder=scheduler_subfolder,
+            local_files_only=local_files_only,
         )
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
         self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
+        self.setup_diffusion_pipeline_profiler(
+            profiler_targets=["text_encoder.forward", "transformer.forward", "vae.encode", "vae.decode"],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
+        )
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
@@ -548,12 +549,16 @@ class LingBotVideoPipeline(
         vae_device = _module_device(self.vae)
         vae_dtype = _module_dtype(self.vae)
         vae_latents = self._dit_latent_to_vae(latents).to(device=vae_device, dtype=torch.float32)
-        if vae_latents.ndim == 5:
+        if vae_latents.ndim == 5 and vae_device.type == "cuda":
             vae_latents = vae_latents.contiguous(memory_format=torch.channels_last_3d)
         autocast_dtype = (
-            vae_dtype if vae_device.type == "cuda" and vae_dtype in {torch.bfloat16, torch.float16} else None
+            vae_dtype if vae_device.type != "cpu" and vae_dtype in {torch.bfloat16, torch.float16} else None
         )
-        with torch.autocast("cuda", dtype=autocast_dtype or torch.bfloat16, enabled=autocast_dtype is not None):
+        with torch.autocast(
+            device_type=vae_device.type,
+            dtype=autocast_dtype or torch.bfloat16,
+            enabled=autocast_dtype is not None,
+        ):
             decoded = self.vae.decode(vae_latents)
         frames = decoded[0] if isinstance(decoded, tuple) else decoded.sample
         frames = frames.float().clamp_(-1, 1)
@@ -876,4 +881,7 @@ class LingBotVideoPipeline(
             ),
         )
         output_key = "image" if request_config.mode is LingBotGenerationMode.T2I else "video"
-        return DiffusionOutput(output={output_key: frames})
+        return DiffusionOutput(
+            output={output_key: frames},
+            stage_durations=self.stage_durations if self.enable_diffusion_pipeline_profiler else {},
+        )
