@@ -563,9 +563,7 @@ def prior_history_in_pool(
     if chunk_base <= 0:
         return frozenset()
     return frozenset(
-        (chunk, step, block)
-        for sid, chunk, step, block in cache.pool.keys
-        if sid == kv_id and chunk < chunk_base
+        (chunk, step, block) for sid, chunk, step, block in cache.pool.keys if sid == kv_id and chunk < chunk_base
     )
 
 
