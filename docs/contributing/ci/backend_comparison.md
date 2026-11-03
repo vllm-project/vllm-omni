@@ -6,7 +6,7 @@ for the other side of the comparison.
 
 ```mermaid
 flowchart LR
-    S[Buildkite native schedule: about every 3 days] --> P[Dedicated comparison pipeline]
+    S[Buildkite native schedule: weekly] --> P[Existing pipeline: comparison-only entry]
     P --> I[Build SGLang comparison image]
     I --> B[Qwen3-Omni audio benchmark: 2 H100]
     B --> A[JSON artifacts]
@@ -17,69 +17,93 @@ flowchart LR
 
 ## Administrator setup
 
-Create a dedicated pipeline in Buildkite with these settings. This document
-does not create or enable a pipeline or schedule.
+Use the existing `vllm/vllm-omni` pipeline. This document and the checked-in
+bootstrap prepare the configuration; they do not modify Buildkite settings,
+create a schedule or start a build.
 
 | Setting | Value |
 | --- | --- |
-| Suggested pipeline slug | `vllm-omni-backend-comparison` |
-| Repository | `https://github.com/congw729/vllm-omni.git` |
-| Default branch | `ci/separate-image` |
-| Branch filter | `ci/separate-image` |
-| GitHub push and pull-request builds | Disabled |
-| Initial steps | The upload step below |
+| Pipeline slug | `vllm-omni` (existing) |
+| Repository | Keep `https://github.com/vllm-project/vllm-omni.git` |
+| Default branch / GitHub triggers | Keep existing settings |
+| Initial steps | Copy the complete bootstrap file linked below |
 
-The repository setting makes the agent check out the fork directly. Confirm
-that the organization's GitHub integration and agents can read this repository.
-Install this initial step in the dedicated pipeline's Buildkite settings:
+In **Settings > Steps**, save the current YAML as a rollback copy, then install
+the complete contents of
+[bootstrap-backend-comparison.yml](../../../.buildkite/cuda/bootstrap-backend-comparison.yml).
+The file preserves the existing init queue and regular generator commands.
+Its comparison route runs first, including when `.buildkite/.pipeline_gen_v2`
+exists. The initial step must be updated in Buildkite: editing only the PR's
+`.buildkite/cuda/pipeline.yml` cannot intercept that earlier generator.
 
-```yaml
-steps:
-  - label: ":left_right_arrow: Upload Backend Comparison"
-    key: upload-backend-comparison
-    commands:
-      - buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml
-    agents:
-      queue: medium_cpu_queue_premerge
-```
+The schedule uses GitHub's upstream `refs/pull/1994/head` ref to fetch the
+fork's PR head. Do not use `ci/separate-image`, which belongs to the fork,
+or the webhook display name `congw729:ci/separate-image` as its branch.
+Buildkite resolves `HEAD` after checkout. The uploader embeds that immutable
+SHA in `BACKEND_COMPARISON_COMMIT`; both image and benchmark jobs verify their
+checkout against it before executing work. Image tags use the same SHA.
 
 The uploaded YAML contains only `image-build-sglang-omni` and
 `nightly-sglang-omni-qwen3-omni`. It directly selects the comparison image and
-two-GPU H100 pod. The shared `.buildkite/cuda/pipeline.yml` entry routes by PR
-labels, which native schedules do not supply; keep the dedicated pipeline on
-the direct upload shown above. Shared nightly and NPU settings need no changes.
+two-GPU H100 pod. Scheduled builds do not require PR labels. This route does
+not upload the regular CUDA entry, hardware mirrors or any NPU pipeline.
+Do not change labels to test the schedule: that would create a separate event.
 
 After the branch contains the reviewed producer changes, create a disabled
-Buildkite native schedule on this dedicated pipeline:
+Buildkite native schedule in **Settings > Schedules**:
 
 | Schedule field | Value |
 | --- | --- |
-| Label | Qwen3-Omni backend comparison |
-| Branch | `ci/separate-image` |
-| Commit | `HEAD`, or an administrator-approved fixed runner commit |
-| Cron interval | `0 3 */3 * * UTC` |
-| Environment variables | Empty |
+| Label | `Weekly backend comparison` |
+| Message | `Scheduled backend comparison` |
+| Branch | `refs/pull/1994/head` |
+| Commit | `HEAD` |
+| Cron interval | `0 3 * * 2 UTC` (Tuesday 11:00 Asia/Hong_Kong) |
+| Environment variables | `BACKEND_COMPARISON_ONLY=1` |
 | Enabled | No, until the acceptance run below passes |
 
-This calendar cron runs at 03:00 UTC on days 1, 4, 7, and so on; the gap at a
-month boundary can be shorter than three days. Schedule management requires
+Do not copy `NIGHTLY`, `WEEKLY`, `NON_CRITICAL` or `MIRROR_HW` from another
+schedule. A comparison request with any of these variables fails before any
+pipeline upload. The PR ref without the comparison flag, a wrong flag value,
+a wrong repository/pipeline/ref, or a non-schedule source also fails without
+falling through to ordinary CI. Normal builds without the flag or PR ref
+retain the existing entry behavior. Schedule management requires
 Buildkite `write_pipelines`; `write_builds` alone is insufficient. Buildkite
 documents the [schedule fields](https://buildkite.com/docs/apis/rest-api/pipeline-schedules)
 and [cron semantics](https://buildkite.com/docs/pipelines/configure/workflows/scheduled-builds).
 
-Give the consumer the actual pipeline slug after creation and review its
-allowed source configuration: organization, pipeline, repository, branch,
-step key, and immutable revision/metadata checks. A suggested slug does not
-authorize an existing pipeline with that name. New revisions may be imported
-as observations after these checks; equivalent settings across revisions
-still require workload and deployment evidence.
+The kanban consumer must allow the existing `vllm-omni` pipeline with branch
+`refs/pull/1994/head`, source `schedule`, the upstream repository and step key
+`nightly-sglang-omni-qwen3-omni`. Require experiment metadata v1 and verify
+runner/build/job/source identities and immutable configuration hashes.
+New revisions may be imported as observations after these checks; equivalent
+settings across revisions still require workload and deployment evidence.
 
 Keep the schedule disabled while preparing the first GPU acceptance run.
 After the source configuration and version pins are ready, use Buildkite's
 **Run now** action for one acceptance build; this consumes two H100 GPUs.
-Confirm its resolved fork/branch commit and that it contains only the upload,
-image, and target benchmark jobs. Enable the recurring schedule after that
-run passes and its artifact passes the consumer checks.
+Use **Run now**, which retains source `schedule`; **Run with edits** creates
+source `ui` and this entry rejects it. Confirm the resolved PR commit and
+that the build contains only init, image, and target benchmark jobs. Confirm
+no NPU or ordinary CUDA tasks, all 10 requests succeed, JSON is uploaded,
+kanban imports it and repeat discovery adds no duplicate. Enable the recurring
+schedule after that run passes and its artifact passes the consumer checks.
+
+To pause these weekly tests, disable this new schedule. Keep existing schedules
+and triggers unchanged. To remove the integration, disable it first, then
+restore the saved Settings > Steps YAML.
+
+## CPU validation
+
+Requires Python 3.12, pytest, PyYAML, Bash and Git; no GPU or model weights.
+The bootstrap tests execute commands with local stubs and never contact
+Buildkite. From the repository root:
+
+```bash
+python -m pytest --noconftest -o addopts='' \
+  tests/buildkite/test_backend_comparison_schedule.py \
+  tests/buildkite/test_upload_pipeline.py -m 'core_model and cpu' -q
+```
 
 ## Workload and version pins
 

@@ -1,10 +1,15 @@
 # Separate upload preserves the dedicated image instead of applying the main
 # nightly hardware mirrors, which select the standard vLLM-Omni image.
+env:
+  # Expanded once by the uploader after Buildkite resolves HEAD. All jobs must
+  # use that checkout and the corresponding immutable image tag.
+  BACKEND_COMPARISON_COMMIT: "${BUILDKITE_COMMIT}"
 steps:
   - label: ":docker: Build SGLang-Omni comparison image"
     key: image-build-sglang-omni
     timeout_in_minutes: 60
     commands:
+      - 'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"'
       - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
       - "docker build --progress=plain --file docker/Dockerfile.other -t vllm-omni-ci-sglang ."
       - "docker tag vllm-omni-ci-sglang public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-sglang-omni"
@@ -19,6 +24,7 @@ steps:
     artifact_paths:
       - tests/dfx/perf/results/*.json
     commands:
+      - 'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"'
       - 'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"'
       - export BENCHMARK_DIR=tests/dfx/perf/results
       - python3 .buildkite/cuda/scripts/check_vllm_runtime.py
