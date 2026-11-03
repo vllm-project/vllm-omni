@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Bounded, transactional video KV memory for eager autoregressive inference.
+"""WorldKV pose retrieval and compressed KV history for eager LingBot inference.
 
 WorldKV pose retrieval and bank compression are independent opt-in policies.
 Stored and retrieved keys retain their original RoPE positions; native sink
@@ -18,7 +18,7 @@ import torch
 
 
 @dataclass(frozen=True)
-class VideoMemoryConfig:
+class WorldKVConfig:
     window_frames: int = 18
     sink_frames: int = 0
     retrieval_frames: int = 0
@@ -35,30 +35,30 @@ class VideoMemoryConfig:
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
-                raise ValueError(f"video_memory.{name} must be a non-negative integer")
+                raise ValueError(f"worldkv.{name} must be a non-negative integer")
         if self.window_frames <= self.sink_frames:
-            raise ValueError("video_memory.window_frames must exceed sink_frames")
+            raise ValueError("worldkv.window_frames must exceed sink_frames")
         if (
             isinstance(self.world_keep_ratio, bool)
             or not isinstance(self.world_keep_ratio, (int, float))
             or not 0 <= self.world_keep_ratio <= 1
         ):
-            raise ValueError("video_memory.world_keep_ratio must be in [0,1]")
+            raise ValueError("worldkv.world_keep_ratio must be in [0,1]")
         if self.world_score not in ("pairwise_mean", "centroid"):
-            raise ValueError("video_memory.world_score must be pairwise_mean or centroid")
+            raise ValueError("worldkv.world_score must be pairwise_mean or centroid")
         if self.world_keep_ratio != 1 and not self.retrieval_frames:
             raise ValueError("World compression requires retrieval")
         if self.retrieval_frames and not self.bank_bytes:
-            raise ValueError("video_memory retrieval requires a positive bank_bytes limit")
+            raise ValueError("worldkv retrieval requires a positive bank_bytes limit")
         if self.sink_frames + self.retrieval_frames >= self.window_frames:
-            raise ValueError("video_memory window must leave room for current frames")
+            raise ValueError("worldkv window must leave room for current frames")
 
     @classmethod
-    def parse(cls, value: Mapping[str, object] | None) -> VideoMemoryConfig | None:
+    def parse(cls, value: Mapping[str, object] | None) -> WorldKVConfig | None:
         if value is None:
             return None
         if not isinstance(value, Mapping):
-            raise ValueError("model_config.video_memory must be a mapping")
+            raise ValueError("model_config.worldkv must be a mapping")
         # Dataclass construction rejects unknown keys; __post_init__ validates
         # each untyped configuration value before it reaches model execution.
         return cls(**value)  # type: ignore[arg-type]
@@ -71,9 +71,7 @@ class VideoMemoryConfig:
         tokens = tokens_per_frame + math.ceil((chunk_frames - 1) * tokens_per_frame * self.world_keep_ratio)
         required = 128 + layers * tokens * (2 * heads * dim * itemsize + 16)
         if self.bank_bytes < required:
-            raise ValueError(
-                f"video_memory.bank_bytes={self.bank_bytes} cannot fit one compressed chunk ({required} bytes)"
-            )
+            raise ValueError(f"worldkv.bank_bytes={self.bank_bytes} cannot fit one compressed chunk ({required} bytes)")
 
     def reservation_bytes(
         self,
@@ -175,7 +173,7 @@ def camera_distances(current: torch.Tensor, candidates: torch.Tensor) -> torch.T
     return translation / translation.max().clamp_min(1e-12) + rotation / rotation.max().clamp_min(1e-12)
 
 
-class VideoMemory:
+class WorldKV:
     """One request/branch's clean history, published only after all layers succeed.
 
     Single-sequence eager execution is intentional. Per-layer selections are
@@ -183,9 +181,9 @@ class VideoMemory:
     reduction before enabling compression.
     """
 
-    def __init__(self, config: VideoMemoryConfig, *, num_layers: int, tokens_per_frame: int):
+    def __init__(self, config: WorldKVConfig, *, num_layers: int, tokens_per_frame: int):
         if num_layers <= 0 or tokens_per_frame <= 0:
-            raise ValueError("Invalid video memory geometry")
+            raise ValueError("Invalid WorldKV geometry")
         self.config = config
         self.num_layers = num_layers
         self.tokens_per_frame = tokens_per_frame
@@ -204,17 +202,17 @@ class VideoMemory:
     def set_pose(self, pose: torch.Tensor) -> None:
         """Supply a representative absolute C2W pose in the session coordinate frame."""
         if self._active or self._closed:
-            raise RuntimeError("Set camera pose only between video memory forwards")
+            raise RuntimeError("Set camera pose only between WorldKV forwards")
         pose = pose.detach().to(device="cpu", dtype=torch.float64, copy=True)
         if pose.shape != (4, 4) or not torch.isfinite(pose).all():
-            raise ValueError("Video memory requires a finite 4x4 camera pose")
+            raise ValueError("WorldKV requires a finite 4x4 camera pose")
         rotation = pose[:3, :3]
         if (
             not torch.allclose(rotation.T @ rotation, torch.eye(3, dtype=pose.dtype), atol=1e-4)
             or not torch.allclose(torch.linalg.det(rotation), torch.tensor(1.0, dtype=pose.dtype), atol=1e-4)
             or not torch.allclose(pose[3], torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=pose.dtype))
         ):
-            raise ValueError("Video memory camera pose must be a rigid C2W transform")
+            raise ValueError("WorldKV camera pose must be a rigid C2W transform")
         if self.pose is None or not torch.equal(self.pose, pose):
             self._clear_retrieval()
         self.pose = pose
@@ -295,11 +293,11 @@ class VideoMemory:
     @contextmanager
     def forward(self, start_frame: int, frames: int, *, commit: bool) -> Iterator[None]:
         if self._closed or self._active:
-            raise RuntimeError("Video memory is closed or already in a forward")
+            raise RuntimeError("WorldKV is closed or already in a forward")
         if start_frame != self.next_frame or frames <= 0:
-            raise ValueError("Video memory chunks must be contiguous and nonempty")
+            raise ValueError("WorldKV chunks must be contiguous and nonempty")
         if frames + self.config.sink_frames + self.config.retrieval_frames > self.config.window_frames:
-            raise ValueError("Video memory must fit sink and the complete current chunk")
+            raise ValueError("WorldKV must fit sink and the complete current chunk")
         success = False
         if self._retrieval_frames != frames:
             self._clear_retrieval()
@@ -311,7 +309,7 @@ class VideoMemory:
         try:
             yield
             if len(self._seen) != self.num_layers:
-                raise RuntimeError("Video memory forward did not execute all layers")
+                raise RuntimeError("WorldKV forward did not execute all layers")
             if commit:
                 # No attention consumer remains after the output head succeeds.
                 # Publish CPU rows before consuming pending GPU rows, preserving
@@ -361,11 +359,11 @@ class VideoMemory:
         self, layer: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._active or layer in self._seen or not 0 <= layer < self.num_layers:
-            raise RuntimeError("Each video memory layer must execute exactly once per forward")
+            raise RuntimeError("Each WorldKV layer must execute exactly once per forward")
         if key.ndim != 4 or key.shape != value.shape or query.shape != key.shape or key.shape[0] != 1:
-            raise ValueError("Video memory requires matching single-sequence Q/K/V [1,T,H,D]")
+            raise ValueError("WorldKV requires matching single-sequence Q/K/V [1,T,H,D]")
         if key.shape[1] != self._frames * self.tokens_per_frame:
-            raise ValueError("Current token count does not match video memory geometry")
+            raise ValueError("Current token count does not match WorldKV geometry")
         self.config.validate_bank_capacity(
             self.num_layers, self.tokens_per_frame, key.shape[2], key.shape[3], key.element_size(), self._frames
         )

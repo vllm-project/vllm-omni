@@ -244,7 +244,7 @@ latents, and exact metadata/request identity.
 
 ## Experimental WorldKV memory for LingBot World
 
-LingBot accepts an opt-in `model_config.video_memory` mapping for pose-ranked
+LingBot accepts an opt-in `model_config.worldkv` mapping for pose-ranked
 history retrieval and CPU-bank KV compression. Omitting this mapping preserves
 the native LingBot sink and paged/direct cache paths. All units below are latent
 frames, and `window_frames` includes the current chunk.
@@ -267,7 +267,7 @@ The anchor frame is always retained in full. For a three-frame chunk,
 
 ```yaml
 model_config:
-  video_memory:
+  worldkv:
     window_frames: 18
     sink_frames: 9
     retrieval_frames: 3

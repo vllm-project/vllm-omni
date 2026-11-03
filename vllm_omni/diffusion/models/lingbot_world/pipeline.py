@@ -632,12 +632,12 @@ class LingBotWorldCausalDMDPipeline(
         if isinstance(first_block_limit, bool) or not isinstance(first_block_limit, int) or first_block_limit <= 0:
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
-        from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemoryConfig
+        from vllm_omni.experimental.ar_diffusion.worldkv import WorldKVConfig
 
-        self._video_memory_config = VideoMemoryConfig.parse(model_config.get("video_memory"))
-        if self._video_memory_config is not None:
+        self._worldkv_config = WorldKVConfig.parse(model_config.get("worldkv"))
+        if self._worldkv_config is not None:
             if not od_config.enforce_eager or reuse_last_step_kv or share_first_block:
-                raise ValueError("video_memory requires eager clean commits without first-block sharing")
+                raise ValueError("worldkv requires eager clean commits without first-block sharing")
             if any(
                 getattr(parallel_config, name, 1) != 1
                 for name in (
@@ -647,7 +647,7 @@ class LingBotWorldCausalDMDPipeline(
                     "pipeline_parallel_size",
                 )
             ):
-                raise ValueError("video_memory currently requires single-rank attention")
+                raise ValueError("worldkv currently requires single-rank attention")
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -705,7 +705,7 @@ class LingBotWorldCausalDMDPipeline(
             prefix="transformer",
         )
 
-        self.transformer.video_memory_config = self._video_memory_config
+        self.transformer.worldkv_config = self._worldkv_config
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         _validate_scheduler_config(scheduler_config)
@@ -819,7 +819,7 @@ class LingBotWorldCausalDMDPipeline(
             * int(self.transformer.config.attention_head_dim)
             * element_size
         )
-        memory_config = getattr(self, "_video_memory_config", None)
+        memory_config = getattr(self, "_worldkv_config", None)
         memory_bytes = 0
         if memory_config is not None:
             memory_bytes = memory_config.reservation_bytes(
@@ -1727,7 +1727,7 @@ class LingBotWorldCausalDMDPipeline(
                 session_state=session_state,
             )
         retrieval_poses = None
-        memory_config = getattr(self, "_video_memory_config", None)
+        memory_config = getattr(self, "_worldkv_config", None)
         if memory_config is not None and memory_config.retrieval_frames:
             trajectory = inputs.camera_trajectory
             if inputs.camera_actions is None:

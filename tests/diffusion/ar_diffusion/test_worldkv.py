@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU numerical oracles for eager video memory; no vLLM/CUDA import required."""
+"""CPU numerical oracles for eager WorldKV; no vLLM/CUDA import required."""
 
 import importlib.util
 import sys
@@ -13,10 +13,10 @@ import torch.nn.functional as F
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def load_memory():
-    name = "_video_memory_under_test"
+def load_worldkv():
+    name = "_worldkv_under_test"
     spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).parents[3] / "vllm_omni/experimental/ar_diffusion/video_memory.py"
+        name, Path(__file__).parents[3] / "vllm_omni/experimental/ar_diffusion/worldkv.py"
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -32,12 +32,12 @@ def load_memory():
     return module
 
 
-vm = load_memory()
+worldkv = load_worldkv()
 
 
 def memory(**kwargs):
-    return vm.VideoMemory(
-        vm.VideoMemoryConfig(window_frames=6, sink_frames=2, **kwargs),
+    return worldkv.WorldKV(
+        worldkv.WorldKVConfig(window_frames=6, sink_frames=2, **kwargs),
         num_layers=2,
         tokens_per_frame=2,
     )
@@ -159,7 +159,7 @@ def test_incomplete_duplicate_out_of_order_closed_and_session_isolation():
 )
 def test_invalid_config(config):
     with pytest.raises(ValueError):
-        vm.VideoMemoryConfig(**config)
+        worldkv.WorldKVConfig(**config)
 
 
 def test_real_lingbot_attention_uses_memory_view():
@@ -167,12 +167,12 @@ def test_real_lingbot_attention_uses_memory_view():
 
     module = _load_module()
     attention = module.LingBotSelfAttention(8, 2)
-    state = vm.VideoMemory(vm.VideoMemoryConfig(window_frames=4, sink_frames=1), num_layers=1, tokens_per_frame=1)
+    state = worldkv.WorldKV(worldkv.WorldKVConfig(window_frames=4, sink_frames=1), num_layers=1, tokens_per_frame=1)
     with torch.inference_mode():
         for start in range(7):
             hidden = torch.randn(1, 1, 8)
             with state.forward(start, 1, commit=True):
-                output = attention(hidden, cache=None, current_start=start, sink_tokens=1, memory_layer=(state, 0))
+                output = attention(hidden, cache=None, current_start=start, sink_tokens=1, worldkv_layer=(state, 0))
             assert output.shape == hidden.shape
             assert torch.isfinite(output).all()
     assert state.next_frame == 7
@@ -206,12 +206,12 @@ def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(mon
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    state = vm.VideoMemory(
-        vm.VideoMemoryConfig(window_frames=3, sink_frames=1),
+    state = worldkv.WorldKV(
+        worldkv.WorldKVConfig(window_frames=3, sink_frames=1),
         num_layers=2,
         tokens_per_frame=4,
     )
-    policy = module.LingBotTransformerCache([], [None, None], memory=state)
+    policy = module.LingBotTransformerCache([], [None, None], worldkv=state)
     with torch.inference_mode():
         for frame in range(8):
             hidden = torch.randn(1, 36, 1, 4, 4)
@@ -246,7 +246,7 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     for offset in range(0, start, 2):
         append(state, offset)
     previous = state.history[0]
-    current = vm.MemoryRows(
+    current = worldkv.MemoryRows(
         raw(start),
         raw(start),
         torch.arange(start, start + 2).repeat_interleave(2),
@@ -259,7 +259,7 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     def forbidden(*args, **kwargs):
         pytest.fail("publication must not copy an assembled window again")
 
-    monkeypatch.setattr(vm.MemoryRows, "select", forbidden)
+    monkeypatch.setattr(worldkv.MemoryRows, "select", forbidden)
     result = state._retained(0, current)
     torch.testing.assert_close(result.key, expected_k)
     assert torch.equal(result.token_ids, ids[keep])
@@ -267,9 +267,9 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
 
 
 def test_empty_policy_disables_all_optional_mechanisms():
-    assert vm.VideoMemoryConfig.parse(None) is None
-    config = vm.VideoMemoryConfig.parse({})
-    assert config == vm.VideoMemoryConfig()
+    assert worldkv.WorldKVConfig.parse(None) is None
+    config = worldkv.WorldKVConfig.parse({})
+    assert config == worldkv.WorldKVConfig()
     assert config.sink_frames == 0
     assert config.retrieval_frames == config.bank_bytes == 0
     assert config.world_keep_ratio == 1.0

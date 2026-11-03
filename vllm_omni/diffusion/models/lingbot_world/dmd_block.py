@@ -98,16 +98,16 @@ class LingBotDMDBlockRunner:
         frames = condition.shape[2] // patch_frames
         height = condition.shape[3] // patch_height
         width = condition.shape[4] // patch_width
-        memory_config = getattr(self.transformer, "video_memory_config", None)
+        memory_config = getattr(self.transformer, "worldkv_config", None)
         if memory_config is not None:
-            memory = ar.state.video_memory(
+            memory = ar.state.worldkv(
                 ar.branch,
                 memory_config,
                 tokens_per_frame=height * width,
             )
             if camera_pose is not None:
                 memory.set_pose(camera_pose)
-            return LingBotTransformerCache([], ar.cross_attention, memory=memory)
+            return LingBotTransformerCache([], ar.cross_attention, worldkv=memory)
         return LingBotTransformerCache(
             self_attention=ar.state.get_kv_caches(
                 ar.branch,
@@ -130,8 +130,8 @@ class LingBotDMDBlockRunner:
         bound, else the caller's request-local cache."""
         if ar is not None:
             return self._paged_cache(condition=condition, ar=ar, commit_current=commit_current, camera_pose=camera_pose)
-        if cache is not None and cache.memory is not None and camera_pose is not None:
-            cache.memory.set_pose(camera_pose)
+        if cache is not None and cache.worldkv is not None and camera_pose is not None:
+            cache.worldkv.set_pose(camera_pose)
         return cast(LingBotTransformerCache, cache)
 
     # ── one block ────────────────────────────────────────────────────────

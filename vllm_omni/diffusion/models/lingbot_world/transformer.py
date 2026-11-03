@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import Lease
-    from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemory
+    from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV
 
 
 @dataclass
@@ -69,7 +69,7 @@ class LingBotTransformerCache:
 
     self_attention: list[LingBotAttentionCache | ARDiffusionPagedLayerContext | ARDiffusionPagedLayerInputs]
     cross_attention: list[LingBotAttentionCache | None]
-    memory: VideoMemory | None = None
+    worldkv: WorldKV | None = None
 
 
 def allocate_lingbot_cache(
@@ -325,7 +325,7 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int,
         update_cache: bool = True,
         _projection_lease: Lease | None = None,
-        memory_layer: tuple[VideoMemory, int] | None = None,
+        worldkv_layer: tuple[WorldKV, int] | None = None,
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
@@ -356,8 +356,8 @@ class LingBotSelfAttention(nn.Module):
             )
             query, key, value = qkv.unbind(2)
 
-        if memory_layer is not None:
-            memory, layer = memory_layer
+        if worldkv_layer is not None:
+            memory, layer = worldkv_layer
             visible_key, visible_value = memory.assemble(layer, query, key, value)
             output = self.attn(query, visible_key, visible_value)
         elif isinstance(cache, ARDiffusionPagedLayerInputs):
@@ -649,7 +649,7 @@ class LingBotAttentionBlock(nn.Module):
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
-        memory_layer: tuple[VideoMemory, int] | None = None,
+        worldkv_layer: tuple[WorldKV, int] | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
         if (
@@ -684,8 +684,8 @@ class LingBotAttentionBlock(nn.Module):
             post_context = nullcontext(None)
         with post_context as lease:
             projection_kwargs = {"_projection_lease": lease} if lease is not None else {}
-            if memory_layer is not None:
-                projection_kwargs["memory_layer"] = memory_layer
+            if worldkv_layer is not None:
+                projection_kwargs["worldkv_layer"] = worldkv_layer
             attention_output = self.self_attn(
                 normalized,
                 cache=self_cache,
@@ -1102,18 +1102,18 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         )
         max_tokens = int(window_frames * post_patch_height * post_patch_width)
         num_local_heads = self.blocks[0].self_attn.num_sp_heads
-        memory_config = getattr(self, "video_memory_config", None)
+        memory_config = getattr(self, "worldkv_config", None)
         if memory_config is not None:
-            from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemory
+            from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV
 
             if batch_size != 1:
-                raise ValueError("video_memory requires batch_size=1")
-            memory = VideoMemory(
+                raise ValueError("worldkv requires batch_size=1")
+            memory = WorldKV(
                 memory_config,
                 num_layers=self.config.num_layers,
                 tokens_per_frame=post_patch_height * post_patch_width,
             )
-            return LingBotTransformerCache([], [None] * self.config.num_layers, memory=memory)
+            return LingBotTransformerCache([], [None] * self.config.num_layers, worldkv=memory)
         return allocate_lingbot_cache(
             batch_size=batch_size,
             num_layers=self.config.num_layers,
@@ -1220,7 +1220,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             raise ValueError("Video, text, and camera tensors must use the same dtype.")
         if timestep.device != hidden_states.device:
             raise ValueError("timestep must be on the same device as hidden_states.")
-        if (cache.memory is None and len(cache.self_attention) != self.config.num_layers) or len(
+        if (cache.worldkv is None and len(cache.self_attention) != self.config.num_layers) or len(
             cache.cross_attention
         ) != self.config.num_layers:
             raise ValueError("LingBotTransformerCache layer counts must match num_layers.")
@@ -1289,8 +1289,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         camera_modulation_cache: CameraModulationCache | None = None,
     ) -> torch.Tensor:
         transaction = (
-            cache.memory.forward(start_frame, hidden_states.shape[2], commit=update_cache)
-            if cache.memory is not None
+            cache.worldkv.forward(start_frame, hidden_states.shape[2], commit=update_cache)
+            if cache.worldkv is not None
             else nullcontext()
         )
         with transaction:
@@ -1429,8 +1429,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 timestep_projection,
                 camera_hidden_states,
                 camera_modulation=camera_modulation,
-                **({"memory_layer": (cache.memory, index)} if cache.memory is not None else {}),
-                self_cache=cache.self_attention[index] if cache.memory is None else None,
+                **({"worldkv_layer": (cache.worldkv, index)} if cache.worldkv is not None else {}),
+                self_cache=cache.self_attention[index] if cache.worldkv is None else None,
                 cross_cache=cache.cross_attention[index],
                 current_start=current_start,
                 sink_tokens=sink_tokens,

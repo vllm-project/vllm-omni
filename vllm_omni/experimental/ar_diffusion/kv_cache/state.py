@@ -24,7 +24,7 @@ if TYPE_CHECKING:
         ARDiffusionKVCache,
         ARDiffusionRequestAdapter,
     )
-    from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemory, VideoMemoryConfig
+    from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV, WorldKVConfig
 
 _log = init_logger(__name__)
 
@@ -60,23 +60,23 @@ class ARDiffusionKVState:
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
         self._closed = False
         self._segments: dict[str, ARDiffusionSegmentedKVState] = {}
-        self._video_memories: dict[str, VideoMemory] = {}
+        self._worldkv_memories: dict[str, WorldKV] = {}
         self.conditioning_kv = ConditioningKVScope(kv_cache, session_id, num_layers)
 
-    def video_memory(self, kv_branch: str, config: VideoMemoryConfig, *, tokens_per_frame: int) -> VideoMemory:
+    def worldkv(self, kv_branch: str, config: WorldKVConfig, *, tokens_per_frame: int) -> WorldKV:
         """Return runner-owned policy memory; its capacity is reserved by the model spec."""
-        from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemory
+        from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV
 
         self.adapter(kv_branch)
-        if kv_branch not in self._video_memories:
-            self._video_memories[kv_branch] = VideoMemory(
+        if kv_branch not in self._worldkv_memories:
+            self._worldkv_memories[kv_branch] = WorldKV(
                 config,
                 num_layers=self.num_layers,
                 tokens_per_frame=tokens_per_frame,
             )
-        memory = self._video_memories[kv_branch]
+        memory = self._worldkv_memories[kv_branch]
         if (memory.config, memory.tokens_per_frame) != (config, tokens_per_frame):
-            raise ValueError("Video memory configuration cannot change within a session")
+            raise ValueError("WorldKV configuration cannot change within a session")
         return memory
 
     def segmented(self, kv_branch: str) -> ARDiffusionSegmentedKVState:
@@ -275,9 +275,9 @@ class ARDiffusionKVState:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:
             return
-        for memory in self._video_memories.values():
+        for memory in self._worldkv_memories.values():
             memory.close()
-        self._video_memories.clear()
+        self._worldkv_memories.clear()
         for segments in self._segments.values():
             segments.close()
         self._segments.clear()
@@ -305,9 +305,9 @@ class ARDiffusionKVState:
         if unknown:
             raise KeyError(f"Unknown AR-Diffusion cross-attention caches to keep: {sorted(unknown)}")
         request_ids = {kv_branch: adapter.request_id for kv_branch, adapter in self.adapters.items()}
-        for memory in self._video_memories.values():
+        for memory in self._worldkv_memories.values():
             memory.close()
-        self._video_memories.clear()
+        self._worldkv_memories.clear()
         if keep_cross_attention:
             for segments in self._segments.values():
                 segments.close()

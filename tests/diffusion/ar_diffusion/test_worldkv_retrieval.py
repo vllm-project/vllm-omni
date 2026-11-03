@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.diffusion.ar_diffusion.test_video_memory import absolute_keys, raw, vm
+from tests.diffusion.ar_diffusion.test_worldkv import absolute_keys, raw, worldkv
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -22,8 +22,8 @@ def pose(x=0.0, yaw=0.0):
 
 
 def state(**kwargs):
-    return vm.VideoMemory(
-        vm.VideoMemoryConfig(
+    return worldkv.WorldKV(
+        worldkv.WorldKVConfig(
             window_frames=8,
             sink_frames=2,
             retrieval_frames=2,
@@ -50,9 +50,9 @@ def append(memory, start, *, camera=None):
 def test_pose_scores_against_analytic_translation_and_rotation():
     candidates = torch.stack((pose(0, 0), pose(1, math.pi / 2), pose(2, math.pi)))
     torch.testing.assert_close(
-        vm.camera_distances(pose(), candidates), torch.tensor([0, 0.75, 2.0], dtype=torch.float64)
+        worldkv.camera_distances(pose(), candidates), torch.tensor([0, 0.75, 2.0], dtype=torch.float64)
     )
-    assert torch.equal(vm.camera_distances(pose(), torch.stack([pose()] * 3)), torch.zeros(3, dtype=torch.float64))
+    assert torch.equal(worldkv.camera_distances(pose(), torch.stack([pose()] * 3)), torch.zeros(3, dtype=torch.float64))
 
 
 def test_revisit_attention_matches_manual_chunks_without_duplicates():
@@ -116,7 +116,7 @@ def test_oversized_entry_fails_before_allocating_or_publishing(monkeypatch):
     def unexpected(*args, **kwargs):
         pytest.fail("compression must not run for an undersized bank")
 
-    monkeypatch.setattr(vm, "world_compress", unexpected)
+    monkeypatch.setattr(worldkv, "world_compress", unexpected)
     with pytest.raises(ValueError, match="cannot fit one compressed chunk"):
         append(memory, 0)
     assert memory.bank_nbytes == 0 and memory.next_frame == 0
@@ -178,18 +178,18 @@ def test_ties_are_deterministic_and_sink_recent_never_retrieved():
 )
 def test_invalid_retrieval_config(config):
     with pytest.raises(ValueError):
-        vm.VideoMemoryConfig(**config)
+        worldkv.WorldKVConfig(**config)
 
 
 def test_worldkv_small_fifo_bank_retrieves_over_long_rollout():
-    config = vm.VideoMemoryConfig(
+    config = worldkv.WorldKVConfig(
         window_frames=18,
         sink_frames=3,
         retrieval_frames=3,
         bank_bytes=4 * (2 * 24 * (2 * 8 * 4 + 16) + 128),
         world_keep_ratio=0.25,
     )
-    memory = vm.VideoMemory(config, num_layers=2, tokens_per_frame=16)
+    memory = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=16)
     generator = torch.Generator().manual_seed(7)
     hits = 0
     for start in range(0, 120, 3):
@@ -227,12 +227,12 @@ def test_bank_capacity_exact_boundary_includes_ids_and_pose(ratio):
 
 
 def test_real_geometry_rejects_one_gib_bank_and_reserves_layer_local_scratch():
-    config = vm.VideoMemoryConfig(
+    config = worldkv.WorldKVConfig(
         window_frames=18, sink_frames=3, retrieval_frames=3, bank_bytes=1 << 30, world_keep_ratio=0.25
     )
     with pytest.raises(ValueError, match="cannot fit"):
         config.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
-    policy = vm.VideoMemoryConfig(window_frames=18, sink_frames=3)
+    policy = worldkv.WorldKVConfig(window_frames=18, sink_frames=3)
     reserve = policy.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
     old = 4 * 40 * 18 * 1560 * (2 * 40 * 128 * 2 + 8)
     assert reserve < old
@@ -245,13 +245,13 @@ def test_retrieved_rows_transfer_once_per_chunk_and_clear_on_commit(monkeypatch)
     for start in range(0, 8, 2):
         append(memory, start)
     transfers = []
-    original = vm.MemoryRows.to
+    original = worldkv.MemoryRows.to
 
     def record(rows, device):
         transfers.append(rows.token_ids.tolist())
         return original(rows, device)
 
-    monkeypatch.setattr(vm.MemoryRows, "to", record)
+    monkeypatch.setattr(worldkv.MemoryRows, "to", record)
     outputs = []
     for commit in (False, False, False, True):
         memory.set_pose(pose(2))

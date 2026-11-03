@@ -13,7 +13,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from tests.diffusion.ar_diffusion.test_video_memory import vm
+from tests.diffusion.ar_diffusion.test_worldkv import worldkv
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 ROOT = Path(__file__).parents[3]
@@ -51,7 +51,7 @@ def runtime(monkeypatch):
 
     stub("vllm.v1.kv_cache_interface", SlidingWindowSpec=SlidingWindowSpec)
     stub("vllm.v1.kv_cache_spec_registry", register_kv_cache_spec=lambda **kw: lambda cls: cls)
-    monkeypatch.setitem(sys.modules, AR + ".video_memory", vm)
+    monkeypatch.setitem(sys.modules, AR + ".worldkv", worldkv)
     load(AR + ".kv_cache.config")
     load(AR + ".kv_cache.paged")
     load(AR + ".kv_cache.paged_attention")
@@ -102,25 +102,25 @@ def test_runner_memory_is_per_session_branch_and_cleared_on_reset_close(runtime,
         )
 
     a, b = owner("A"), owner("B")
-    config = vm.VideoMemoryConfig(window_frames=6, sink_frames=2)
-    original = a.video_memory("positive", config, tokens_per_frame=2)
-    assert a.video_memory("positive", config, tokens_per_frame=2) is original
-    assert b.video_memory("positive", config, tokens_per_frame=2) is not original
-    assert a.video_memory("negative", config, tokens_per_frame=2) is not original
+    config = worldkv.WorldKVConfig(window_frames=6, sink_frames=2)
+    original = a.worldkv("positive", config, tokens_per_frame=2)
+    assert a.worldkv("positive", config, tokens_per_frame=2) is original
+    assert b.worldkv("positive", config, tokens_per_frame=2) is not original
+    assert a.worldkv("negative", config, tokens_per_frame=2) is not original
     with pytest.raises(ValueError, match="cannot change"):
-        a.video_memory("positive", replace(config, window_frames=8), tokens_per_frame=2)
+        a.worldkv("positive", replace(config, window_frames=8), tokens_per_frame=2)
     with pytest.raises(ValueError, match="cannot change"):
-        a.video_memory("positive", config, tokens_per_frame=4)
+        a.worldkv("positive", config, tokens_per_frame=4)
     a.reset(keep_cross_attention=keep_cross)
     assert original._closed
-    replacement = a.video_memory("positive", config, tokens_per_frame=2)
+    replacement = a.worldkv("positive", config, tokens_per_frame=2)
     assert replacement is not original
     a.close()
     a.close()
-    assert replacement._closed and not a._video_memories
+    assert replacement._closed and not a._worldkv_memories
     with pytest.raises(RuntimeError, match="closed"):
-        a.video_memory("positive", config, tokens_per_frame=2)
-    assert not b.video_memory("positive", config, tokens_per_frame=2)._closed
+        a.worldkv("positive", config, tokens_per_frame=2)
+    assert not b.worldkv("positive", config, tokens_per_frame=2)._closed
 
 
 @pytest.mark.parametrize("session_bound", [False, True])
@@ -154,14 +154,14 @@ def test_lingbot_dmd_routes_only_enabled_cache_to_worldkv(runtime, monkeypatch, 
         num_frames_per_block=1,
         sliding_window_num_frames=3,
     ).eval()
-    cfg = vm.VideoMemoryConfig(window_frames=3, sink_frames=1) if enabled else None
-    transformer.video_memory_config = cfg
+    cfg = worldkv.WorldKVConfig(window_frames=3, sink_frames=1) if enabled else None
+    transformer.worldkv_config = cfg
     runner = module.LingBotDMDBlockRunner(transformer, device=torch.device("cpu"), enforce_eager=True)
     condition = torch.zeros(1, 36, 1, 4, 4)
     camera = torch.eye(4)
 
     class State:
-        def video_memory(self, branch, config, *, tokens_per_frame):
+        def worldkv(self, branch, config, *, tokens_per_frame):
             assert branch == "positive" and config is cfg and tokens_per_frame == 4
             return memory
 
@@ -169,11 +169,11 @@ def test_lingbot_dmd_routes_only_enabled_cache_to_worldkv(runtime, monkeypatch, 
             assert not enabled and branch == "positive" and seq_len == 4
             return [None, None]
 
-    memory = vm.VideoMemory(cfg, num_layers=2, tokens_per_frame=4) if enabled else None
-    cache = transformer_module.LingBotTransformerCache([None, None], [None, None], memory=memory)
+    memory = worldkv.WorldKV(cfg, num_layers=2, tokens_per_frame=4) if enabled else None
+    cache = transformer_module.LingBotTransformerCache([None, None], [None, None], worldkv=memory)
     ar = module.ARBlockContext(State(), [None, None], "positive") if session_bound else None
     actual = runner._block_cache(condition=condition, cache=cache, ar=ar, commit_current=False, camera_pose=camera)
-    assert actual.memory is memory
+    assert actual.worldkv is memory
     if enabled:
         torch.testing.assert_close(memory.pose, camera.double())
     else:
@@ -200,7 +200,7 @@ def test_real_lingbot_transformer_retrieves_compressed_bank_and_rolls_back(monke
         num_frames_per_block=2,
         sliding_window_num_frames=8,
     ).eval()
-    model.video_memory_config = vm.VideoMemoryConfig(
+    model.worldkv_config = worldkv.WorldKVConfig(
         window_frames=8,
         sink_frames=2,
         retrieval_frames=2,
@@ -208,7 +208,7 @@ def test_real_lingbot_transformer_retrieves_compressed_bank_and_rolls_back(monke
         world_keep_ratio=ratio,
         world_score=score,
     )
-    monkeypatch.setitem(sys.modules, AR + ".video_memory", vm)
+    monkeypatch.setitem(sys.modules, AR + ".worldkv", worldkv)
     cache = model.allocate_cache(
         batch_size=1,
         latent_height=4,
@@ -216,7 +216,7 @@ def test_real_lingbot_transformer_retrieves_compressed_bank_and_rolls_back(monke
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    memory = cache.memory
+    memory = cache.worldkv
     assert memory is not None and not cache.self_attention
     generator = torch.Generator().manual_seed(17)
     text = torch.randn(1, 3, 6, generator=generator)

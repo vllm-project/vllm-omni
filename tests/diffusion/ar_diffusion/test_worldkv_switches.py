@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tests.diffusion.ar_diffusion.test_video_memory import vm
-from tests.diffusion.ar_diffusion.test_video_retrieval import append, pose
+from tests.diffusion.ar_diffusion.test_worldkv import worldkv
+from tests.diffusion.ar_diffusion.test_worldkv_retrieval import append, pose
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -18,20 +18,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 )
 def test_other_policy_keys_are_rejected(name):
     with pytest.raises(TypeError, match=name):
-        vm.VideoMemoryConfig.parse({name: 1})
+        worldkv.WorldKVConfig.parse({name: 1})
 
 
 def test_compression_does_not_implicitly_enable_retrieval():
     with pytest.raises(ValueError, match="requires retrieval"):
-        vm.VideoMemoryConfig(world_keep_ratio=0.5)
+        worldkv.WorldKVConfig(world_keep_ratio=0.5)
     with pytest.raises(ValueError, match="positive bank_bytes"):
-        vm.VideoMemoryConfig(retrieval_frames=2, world_keep_ratio=0.5)
+        worldkv.WorldKVConfig(retrieval_frames=2, world_keep_ratio=0.5)
 
 
 @pytest.mark.parametrize("retrieval,ratio", [(0, 1.0), (2, 1.0), (2, 0.5)])
 @pytest.mark.parametrize("score", ["centroid", "pairwise_mean"])
 def test_retrieval_and_compression_switches_execute_only_when_enabled(retrieval, ratio, score):
-    config = vm.VideoMemoryConfig(
+    config = worldkv.WorldKVConfig(
         window_frames=8,
         sink_frames=2,
         retrieval_frames=retrieval,
@@ -39,9 +39,9 @@ def test_retrieval_and_compression_switches_execute_only_when_enabled(retrieval,
         world_keep_ratio=ratio,
         world_score=score,
     )
-    memory = vm.VideoMemory(config, num_layers=2, tokens_per_frame=2)
+    memory = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
     with (
-        patch.object(vm, "camera_distances", wraps=vm.camera_distances) as rank,
+        patch.object(worldkv, "camera_distances", wraps=worldkv.camera_distances) as rank,
         patch.object(torch.nn.functional, "normalize", wraps=torch.nn.functional.normalize) as normalize,
     ):
         for start in range(0, 40, 2):

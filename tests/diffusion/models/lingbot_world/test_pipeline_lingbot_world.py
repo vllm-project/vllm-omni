@@ -114,7 +114,7 @@ class _Cache:
             SimpleNamespace(key=torch.zeros(shape), value=torch.zeros(shape)) for _ in range(num_layers)
         ]
         self.cross_attention = [None] * num_layers
-        self.memory = None
+        self.worldkv = None
 
 
 class _StubCrossAttention(nn.Module):
