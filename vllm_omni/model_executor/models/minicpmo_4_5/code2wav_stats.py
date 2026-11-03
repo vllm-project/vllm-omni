@@ -82,7 +82,11 @@ class Code2WavSolveStats:
             else:
                 self._window_busy += now - self._last_ts
         else:
-            self._window_start = now
+            # Anchor the window at the *start* of the first solve: its
+            # duration is already counted in busy, so anchoring at its end
+            # would report busy > wall (duty above 100%) for back-to-back
+            # solves.
+            self._window_start = now - (duration if duration is not None else 0.0)
             if duration is not None:
                 self._window_busy += duration
         self._last_ts = now

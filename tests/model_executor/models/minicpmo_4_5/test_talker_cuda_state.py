@@ -310,6 +310,26 @@ def test_commit_cuda_kstep_invalidates_width1_sampler_caches():
     assert "a" not in device_inputs and "b" not in device_inputs
     assert "a" not in device_budgets and "b" not in device_budgets
 
+    # The next width-1 setup rebuilds the sampler from the host state (the
+    # post-commit step counter), so the invalidation is not just a missing
+    # key: the rebuilt state must carry the committed history, not the
+    # pre-fused step. (The device state has no RNG position; seeded sampling
+    # lives in the model-level _request_generators, untouched here.)
+    host_state = model._request_audio_states["a"]
+    rebuilt, _, rebuilt_states = MiniCPMO45OmniTTSForConditionalGeneration._codec_sample_setup(
+        model,
+        "a",
+        hidden[0:1],
+        torch.zeros((1, HISTORY_WINDOW), dtype=torch.int32),
+        host_state,
+        int(host_state["step"]),
+        model._codec_min_tokens,
+        model._codec_max_tokens,
+        model._codec_temperature,
+    )
+    assert rebuilt is rebuilt_states["a"]
+    assert int(rebuilt.step.item()) == int(host_state["step"])
+
 
 def test_model_binding_commit_and_batch_compaction():
     from types import SimpleNamespace

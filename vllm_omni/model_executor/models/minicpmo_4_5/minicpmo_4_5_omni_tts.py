@@ -194,11 +194,11 @@ class _KStepPendingRow(NamedTuple):
     info: dict[str, Any] | None
     deltas: list[torch.Tensor] | None
     delta_slot: int
-    stop_rows: list[torch.Tensor]
-    terminal_flags: list[torch.Tensor]
+    stop_rows: list[torch.Tensor] | None  # None only in test fixtures
+    terminal_flags: list[torch.Tensor] | None  # None only in test fixtures
     stop_slot: int
-    row_stop: torch.Tensor
-    flag_true: torch.Tensor
+    row_stop: torch.Tensor | None  # None only in test fixtures
+    flag_true: torch.Tensor | None  # None only in test fixtures
 
 
 #: Bits of the per-codec-id class table (``_codec_classes``).

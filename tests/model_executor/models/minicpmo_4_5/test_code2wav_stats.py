@@ -67,10 +67,42 @@ def test_duty_uses_solve_durations_not_inter_record_gaps(
         stats.record("cfm", batch=4, frames=32, duration=0.05)  # busy 1.0-1.05
         stats.record("cfm", batch=4, frames=32, duration=0.05)  # busy 1.1-1.15, flush
 
-    # wall = 1.1 s, busy = 0.3 s -> duty 27%, not the flat 100% the gap
+    # wall runs from the first solve's start (-0.2 s) to the last record
+    # (1.1 s) = 1.3 s, busy = 0.3 s -> duty 23%, not the flat 100% the gap
     # accumulation reported for the same timeline.
     assert "busy=0.3s" in caplog.text
-    assert "duty=27%" in caplog.text
+    assert "duty=23%" in caplog.text
+
+
+def test_duty_stays_bounded_for_back_to_back_solves(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A saturated window reports at most 100% duty.
+
+    Review follow-up (PR #9733): record() runs after the solve, so anchoring
+    the window at the first record's timestamp put the first solve's duration
+    into busy against a wall clock that started after it -- back-to-back
+    solves reported duty > 100%. The window now starts at the first solve's
+    start.
+    """
+    monkeypatch.setenv(CODE2WAV_STATS_ENV, "1")
+    clock = iter([0.1, 0.2, 0.3])
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.code2wav_stats.time.perf_counter",
+        lambda: next(clock),
+    )
+    stats = Code2WavSolveStats(flush_every=3)
+
+    with caplog.at_level(logging.INFO):
+        # Three 0.1 s solves back to back; record runs at their ends.
+        for _ in range(3):
+            stats.record("hift", batch=1, frames=8, duration=0.1)
+
+    # busy = 0.3 s over wall = 0.3 s -> duty 100%, not the 150% the
+    # end-anchored window reported.
+    assert "busy=0.3s" in caplog.text
+    assert "duty=100%" in caplog.text
 
 
 def test_flush_reports_window_and_starts_a_new_one(
