@@ -205,6 +205,71 @@ def test_native_connector_keeps_imported_prefix_in_paged_attention(first_step) -
     assert not hasattr(mgr, "_materialize_paged_prefix")
 
 
+@pytest.mark.parametrize("mixed_prefix", [False, True])
+def test_forward_paged_accepts_right_padded_heterogeneous_query_lens(mixed_prefix) -> None:
+    """Pack / mixed-prefix leave logical query_lens shorter than padded T."""
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    # Mimic pack then optional mixed-prefix slice: row0 remaining 4, row1 remaining 8,
+    # right-padded tensor width 8. Prefixes (2, 0) only affect seq_lens / spans.
+    pad_width = 8
+    query_lens = [4, 8]
+    prefixes = [2, 0] if mixed_prefix else [0, 0]
+    seq_lens = [prefix + logical for prefix, logical in zip(prefixes, query_lens, strict=True)]
+    spans = [[(prefix, seq_len)] for prefix, seq_len in zip(prefixes, seq_lens, strict=True)]
+    key, value = _make_known_kv(2 * pad_width)
+    query = torch.randn(2 * pad_width, NUM_HEADS, HEAD_DIM)
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(object()),
+        patch.object(mgr, "_forward_dense_legacy", side_effect=AssertionError("dense KV path")),
+    ):
+        out = mgr._forward_paged(
+            query,
+            key.view(2 * pad_width, NUM_KV_HEADS, HEAD_DIM),
+            value.view(2 * pad_width, NUM_KV_HEADS, HEAD_DIM),
+            first_step=True,
+            query_lens=query_lens,
+            seq_lens=seq_lens,
+            shard_image_size=None,
+            full_attn_spans=spans,
+            uncond_cfg_prefill=False,
+        )
+    assert out.shape == (2 * pad_width, NUM_HEADS, HEAD_DIM)
+    assert len(mgr.attn.paged_calls) == 1
+    assert mgr.attn.paged_calls[0][0].shape == (2, pad_width, NUM_HEADS, HEAD_DIM)
+
+
+def test_rotary_embedder_accepts_right_padded_heterogeneous_query_lens() -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunYuanRotary2DEmbedder,
+    )
+
+    embedder = HunYuanRotary2DEmbedder(num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM)
+    pad_width = 8
+    query_lens = [4, 8]
+    hidden = torch.randn(2, pad_width, NUM_HEADS * HEAD_DIM)
+    q = torch.randn(2 * pad_width, NUM_HEADS * HEAD_DIM)
+    k = torch.randn(2 * pad_width, NUM_KV_HEADS * HEAD_DIM)
+    # Identity rope so we only exercise the reshape contract.
+    embedder.rope = lambda tensor, cos, sin: tensor
+    cos = torch.zeros(2, pad_width, HEAD_DIM)
+    sin = torch.zeros(2, pad_width, HEAD_DIM)
+    out_q, out_k = embedder(
+        q,
+        k,
+        hidden,
+        (cos, sin),
+        mode="gen_image",
+        first_step=True,
+        query_lens=query_lens,
+    )
+    assert out_q.shape == q.shape
+    assert out_k.shape == k.shape
+
+
 def test_legacy_tensor_prefix_still_uses_dense_cache_and_reuse() -> None:
     mgr = _make_cache_mgr()
     prefix_len, prompt_len = 3, 2
