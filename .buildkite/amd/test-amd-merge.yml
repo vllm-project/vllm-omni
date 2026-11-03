@@ -445,6 +445,8 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      # Cold NFS load of the 30B checkpoint plus the rest of the 17 tests.
+      timeout_in_minutes: 90
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - >-

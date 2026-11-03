@@ -22,6 +22,7 @@ from vllm.inputs import TokensPrompt
 
 from tests.helpers.clean import wait_for_gpu_memory_to_clear
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.platforms import current_omni_platform
@@ -91,6 +92,8 @@ async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
             model=MODEL,
             deploy_config=_colocate_async_deploy(),
             enable_sleep_mode=True,
+            stage_init_timeout=QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+            init_timeout=1800,
         )
         after.callback(engine.shutdown)
 
@@ -205,6 +208,8 @@ async def test_colocate_async_resubmit_window_pause_sleep_cycle() -> None:
             model=MODEL,
             deploy_config=_colocate_async_deploy(),
             enable_sleep_mode=True,
+            stage_init_timeout=QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+            init_timeout=1800,
         )
         after.callback(engine.shutdown)
 

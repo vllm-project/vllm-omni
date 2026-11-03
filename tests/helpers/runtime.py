@@ -43,6 +43,11 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 SERVER_STARTUP_TIMEOUT_S = 2400
+# AMD CI build 15260: Qwen3-Omni-30B stages load a 65.68 GiB checkpoint from
+# NFS in parallel. The first shard took about 400s and the 15-shard load
+# finished near 580s, so the 600s stage READY deadline killed the engine
+# while weights were still loading. 1500s covers that load plus post-load init.
+QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S = 1500
 # Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
 # and signal escalation. Keep their tracker alive while the API owns teardown.
 SERVER_SHUTDOWN_TIMEOUT_S = 60
