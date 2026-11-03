@@ -670,7 +670,13 @@ class OmniServeCommand(CLISubcommand):
             "--lora-scale",
             type=float,
             default=None,
-            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+            help=(
+                "Multiplier on top of a startup PEFT LoRA's own alpha/rank scaling; "
+                "effective strength = lora_scale * lora_alpha / r. Pass the same "
+                "value the reference framework uses (e.g. LightX2V's --lora-scale), "
+                "not the pre-multiplied scale * alpha / rank. Distilled LoRAs are "
+                "fused at their checkpoint scale."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
