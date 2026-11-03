@@ -97,3 +97,24 @@ def test_packed_attention_binds_arguments_by_name(monkeypatch: pytest.MonkeyPatc
     # The bounds describe the packed sequences, not a padded length.
     assert captured["max_seqlen_q"] == tokens
     assert captured["max_seqlen_k"] == tokens
+
+
+def test_packed_attention_falls_back_without_a_varlen_callable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``HAS_FLASH_ATTN`` can be true while no varlen callable exists.
+
+    The flag is also set when only the optional dense ``fa3-fwd`` binding was
+    found, so the packed path has to fall back to the PyTorch implementation
+    instead of calling ``None``.
+    """
+    monkeypatch.setattr(whisper_encoder_module, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(whisper_encoder_module, "flash_attn_varlen_func", None)
+
+    attn = MultiHeadAttention(n_state=32, n_head=4, use_flash_attn=True)
+
+    assert attn.use_flash_attn is False
+
+    tokens = 6
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32)
+    output = attn(torch.randn(tokens, 32, dtype=torch.bfloat16), cu_seqlens=cu_seqlens)
+
+    assert output.shape == (tokens, 32)
