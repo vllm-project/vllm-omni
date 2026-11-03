@@ -321,8 +321,9 @@ generation_max_wait_ms: 6
 generation_always_wait_target_batch: false
 ```
 
-Set these keys in connector `extra` or stage `additional_config`, with
-connector values taking precedence. Waiting is disabled by default and requires
+Both AR and generation schedulers accept these keys in stage
+`engine_extras.additional_config` or connector `extra`, with connector values
+taking precedence for compatibility. Waiting is disabled by default and requires
 a batch target greater than one and a positive wait bound. Enabling it together
 with any nonzero `ar_prefill_admission_*` setting raises a configuration error.
 The legacy admission-only policy retains its existing behavior when execution
@@ -365,7 +366,8 @@ including an empty set before input arrives, and be safe during initialization.
 ### Code2Wav Batch Configuration
 
 Generation stages receiving async chunks can coalesce ready inputs with the
-following connector `extra` settings:
+following stage `engine_extras.additional_config` settings (legacy connector
+`extra` remains supported and takes precedence per key):
 
 ```yaml
 generation_min_batch_size: 16
@@ -374,7 +376,7 @@ generation_max_wait_ms: 6
 
 Batch waiting is disabled by default. Ready streams execute when the target
 is reached or the wait bound expires. If fewer requests are registered than the
-configured target, inputs execute immediately unless connector `extra` sets
+configured target, inputs execute immediately unless the configuration sets
 `generation_always_wait_target_batch: true` (default: `false`). On either runner,
 this option caps the target at the registered request count and retains the
 same wait bound. First and final chunks share

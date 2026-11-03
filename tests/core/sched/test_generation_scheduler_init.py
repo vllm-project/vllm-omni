@@ -57,6 +57,24 @@ def test_v1_custom_readiness_enables_batch_waiting(construct_scheduler):
     assert scheduler._generation_max_wait_s == 0.012
 
 
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("connector_override", [False, True])
+def test_stage_additional_config_enables_generation_coalescing(construct_scheduler, native, connector_override):
+    extras = {"generation_min_batch_size": 8} if connector_override else {}
+    config = _config(native=native, extras=extras)
+    config.additional_config = {
+        "generation_min_batch_size": 4,
+        "generation_max_wait_ms": 12,
+        "generation_always_wait_target_batch": True,
+    }
+    scheduler = construct_scheduler(config)
+    assert scheduler._generation_min_batch_size == (8 if connector_override else 4)
+    assert scheduler._generation_max_wait_s == 0.012
+    assert scheduler._generation_always_wait_target_batch is True
+    assert config.additional_config["generation_min_batch_size"] == 4
+    assert config.model_config.stage_connector_config == {"extra": extras}
+
+
 @pytest.mark.parametrize("async_chunk", [False, True])
 def test_v1_stage_zero_enables_batch_waiting_without_override(construct_scheduler, mocker, async_chunk):
     adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
