@@ -589,8 +589,18 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         state.prompt_embeds = ctx["prompt_embeds"]
         state.prompt_embeds_mask = ctx["prompt_embeds_mask"]
+        # Step batches can mix padded and unpadded prompts. InputBatch needs an
+        # explicit mask on every state to pad different lengths safely.
+        if state.prompt_embeds_mask is None:
+            state.prompt_embeds_mask = torch.ones(
+                state.prompt_embeds.shape[:2], dtype=torch.bool, device=state.prompt_embeds.device
+            )
         state.negative_prompt_embeds = ctx["negative_prompt_embeds"]
         state.negative_prompt_embeds_mask = ctx["negative_prompt_embeds_mask"]
+        if state.negative_prompt_embeds is not None and state.negative_prompt_embeds_mask is None:
+            state.negative_prompt_embeds_mask = torch.ones(
+                state.negative_prompt_embeds.shape[:2], dtype=torch.bool, device=state.negative_prompt_embeds.device
+            )
         state.do_true_cfg = ctx["do_true_cfg"]
         sampling.true_cfg_scale = ctx["true_cfg_scale"]
         sampling.cfg_normalize = True

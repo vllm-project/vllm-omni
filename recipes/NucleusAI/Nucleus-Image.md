@@ -25,6 +25,12 @@ and decodes at the aligned dimensions prepared for the request. Ulysses and
 Ring use global expert-choice routing; padding does not participate in
 expert selection.
 
+Ring also accepts image token counts that are not divisible by the SP degree.
+For strict padding exclusion, enable `mask_sp_padding=True` in
+`DiffusionParallelConfig`. Image states and RoPE are padded together; Ring
+uses the original image K/V length, and gathered outputs are cropped back to
+the original token count. The padding-exclusion option defaults to `False`.
+
 ## References
 
 - Upstream model card: <https://huggingface.co/NucleusAI/Nucleus-Image>

@@ -622,7 +622,7 @@ source_file_dependencies:
 
   diffusion_nucleus_image_function:
     - vllm_omni/diffusion/models/nucleus_image/
-    - tests/diffusion/test_nucleus_image.py
+    - tests/diffusion/models/nucleus_image/
     - tests/e2e/offline_inference/test_nucleus_image_expansion.py
     - tests/e2e/online_serving/test_nucleus_image_expansion.py
 

@@ -164,6 +164,24 @@ class NucleusMoEEmbedRope(nn.Module):
         freqs = torch.polar(torch.ones_like(freqs), freqs)
         return freqs
 
+    def _ensure_freqs(self, required_length: int) -> None:
+        current_length = self.pos_freqs.shape[0]
+        if required_length <= current_length:
+            return
+        length = max(required_length, current_length * 2)
+        # Append positive positions and prepend negative positions so existing
+        # frequencies and cached image positions remain unchanged.
+        pos_index = torch.arange(current_length, length)
+        neg_index = torch.arange(-length, -current_length)
+        pos_freqs = torch.cat([self._rope_params(pos_index, dim, self.theta) for dim in self.axes_dim], dim=1).to(
+            self.pos_freqs.device
+        )
+        neg_freqs = torch.cat([self._rope_params(neg_index, dim, self.theta) for dim in self.axes_dim], dim=1).to(
+            self.neg_freqs.device
+        )
+        self.pos_freqs = torch.cat([self.pos_freqs, pos_freqs], dim=0)
+        self.neg_freqs = torch.cat([neg_freqs, self.neg_freqs], dim=0)
+
     def forward(
         self,
         video_fhw: tuple[int, int, int] | list[tuple[int, int, int]],
@@ -203,6 +221,7 @@ class NucleusMoEEmbedRope(nn.Module):
                 max_vid_index = max(height, width, max_vid_index)
 
         max_len = max(txt_seq_lens)
+        self._ensure_freqs(max_vid_index + max_len)
         txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0)
 
@@ -214,6 +233,10 @@ class NucleusMoEEmbedRope(nn.Module):
         if cached is not None:
             return cached
 
+        max_spatial_index = max(height, width)
+        if self.scale_rope:
+            max_spatial_index = (max_spatial_index + 1) // 2
+        self._ensure_freqs(max(idx + frame, max_spatial_index))
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -248,6 +271,22 @@ class NucleusMoEImageRopePrepare(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states = self.img_in(hidden_states)
         vid_freqs, txt_freqs = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            config = ctx.omni_diffusion_config
+            if config is not None:
+                parallel = config.parallel_config
+                if parallel.ring_degree > 1:
+                    # Ring consumes a valid K/V prefix, not an attention mask.
+                    # Pre-pad both outputs before the shared split hook; keep
+                    # auto_pad=True so the hook guarantees equal local lengths.
+                    original_length = hidden_states.shape[1]
+                    padding = (-original_length) % parallel.sequence_parallel_size
+                    ctx.sp_original_seq_len = original_length
+                    ctx.sp_padding_size = padding
+                    if padding:
+                        hidden_states = F.pad(hidden_states, (0, 0, 0, padding))
+                        vid_freqs = F.pad(vid_freqs, (0, 0, 0, padding))
         return hidden_states, vid_freqs, txt_freqs
 
 
@@ -290,6 +329,10 @@ class NucleusMoECrossAttention(nn.Module):
         self.norm_q = RMSNorm(head_dim, eps=eps)
         self.norm_k = RMSNorm(head_dim, eps=eps)
 
+        # Match image QKV head replication when TP exceeds the KV head count.
+        kv_tp_size = self.to_qkv.tp_size // self.to_qkv.num_kv_head_replicas
+        kv_tp_rank = self.to_qkv.tp_rank // self.to_qkv.num_kv_head_replicas
+
         self.add_k_proj = ColumnParallelLinear(
             joint_attention_dim,
             self.total_num_kv_heads * head_dim,
@@ -298,6 +341,8 @@ class NucleusMoECrossAttention(nn.Module):
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.add_k_proj",
+            tp_size=kv_tp_size,
+            tp_rank=kv_tp_rank,
         )
         self.add_v_proj = ColumnParallelLinear(
             joint_attention_dim,
@@ -307,6 +352,8 @@ class NucleusMoECrossAttention(nn.Module):
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.add_v_proj",
+            tp_size=kv_tp_size,
+            tp_rank=kv_tp_rank,
         )
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
@@ -379,6 +426,17 @@ class NucleusMoECrossAttention(nn.Module):
                 txt_key = apply_rotary_emb_nucleus(txt_key, txt_freqs, use_real=False)
 
         attn_metadata = None
+        attention_extra = {}
+        if self.parallel_config is not None and self.parallel_config.ring_degree > 1 and is_forward_context_available():
+            ctx = get_forward_context()
+            if (
+                ctx.sp_original_seq_len is not None
+                and ctx.sp_padding_size > 0
+                and ctx.sp_active
+                and self.parallel_config.mask_sp_padding
+            ):
+                # Only image K/V circulates; replicated text is handled separately.
+                attention_extra["valid_kv_length"] = ctx.sp_original_seq_len
         image_seq_len = img_query.shape[1]
         use_joint_attention_sp = (
             txt_key is not None
@@ -398,17 +456,36 @@ class NucleusMoECrossAttention(nn.Module):
                 dtype=img_query.dtype,
                 device=img_query.device,
             )
-            attn_metadata = AttentionMetadata(
-                joint_query=txt_query,
-                joint_key=txt_key,
-                joint_value=txt_value,
-                joint_attn_mask=encoder_hidden_states_mask,
-                joint_strategy="rear",
-            )
-            if hidden_states_mask is not None:
-                attn_metadata.attn_mask = hidden_states_mask
-            hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
-            hidden_states = hidden_states[:, :image_seq_len, ...]
+            if self.parallel_config.ring_degree > 1 and encoder_hidden_states_mask is not None:
+                # Ring does not consume joint_attn_mask. Compact each row's text
+                # K/V so different prompt lengths never expose padding to attention.
+                outputs = []
+                for row, text_mask in enumerate(encoder_hidden_states_mask):
+                    row_slice = slice(row, row + 1)
+                    attn_metadata = AttentionMetadata(
+                        joint_query=txt_query[row_slice, text_mask],
+                        joint_key=txt_key[row_slice, text_mask],
+                        joint_value=txt_value[row_slice, text_mask],
+                        joint_strategy="rear",
+                        extra=attention_extra.copy(),
+                        attn_mask=hidden_states_mask[row_slice] if hidden_states_mask is not None else None,
+                    )
+                    output = self.attn(img_query[row_slice], img_key[row_slice], img_value[row_slice], attn_metadata)
+                    outputs.append(output[:, :image_seq_len])
+                hidden_states = torch.cat(outputs, dim=0)
+            else:
+                attn_metadata = AttentionMetadata(
+                    joint_query=txt_query,
+                    joint_key=txt_key,
+                    joint_value=txt_value,
+                    joint_attn_mask=encoder_hidden_states_mask,
+                    joint_strategy="rear",
+                    extra=attention_extra.copy(),
+                )
+                if hidden_states_mask is not None:
+                    attn_metadata.attn_mask = hidden_states_mask
+                hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
+                hidden_states = hidden_states[:, :image_seq_len, ...]
         else:
             if txt_key is not None and txt_value is not None:
                 joint_key = torch.cat([img_key, txt_key], dim=1)
@@ -432,6 +509,8 @@ class NucleusMoECrossAttention(nn.Module):
                 joint_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
                 attn_metadata = AttentionMetadata(attn_mask=joint_mask)
 
+            if attention_extra:
+                attn_metadata = AttentionMetadata(extra=attention_extra)
             hidden_states = self.attn(img_query, joint_key, joint_value, attn_metadata)
 
         hidden_states = hidden_states.flatten(2, 3).to(img_query.dtype).contiguous()
@@ -967,21 +1046,36 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(device=hidden_states.device, dtype=torch.bool)
 
         hidden_states_mask = None
-        try:
+        if is_forward_context_available():
             ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    hidden_states.shape[0],
-                    img_padded_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-                if hidden_states_mask.all():
-                    hidden_states_mask = None
-        except Exception:
-            hidden_states_mask = None
+            parallel_config = self.od_config.parallel_config
+            if (
+                parallel_config.sequence_parallel_size > 1
+                and ctx.sp_original_seq_len is not None
+                and ctx.sp_padding_size > 0
+            ):
+                if parallel_config.mask_sp_padding:
+                    # Ulysses consumes the key mask after All-to-All, on the full
+                    # padded image sequence. Do not slice it to the local shard.
+                    # Ring instead receives valid_kv_length in attention metadata.
+                    img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                    if parallel_config.ring_degree == 1:
+                        hidden_states_mask = torch.ones(
+                            hidden_states.shape[0],
+                            img_padded_seq_len,
+                            dtype=torch.bool,
+                            device=hidden_states.device,
+                        )
+                        hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+                else:
+                    logger.warning_once(
+                        "SP auto-padding applied %d token(s) (seq_len=%d, sp_size=%d). "
+                        "Padding tokens are not masked from attention (mask_sp_padding=False). "
+                        "Set mask_sp_padding=True to exclude padding tokens from attention.",
+                        ctx.sp_padding_size,
+                        ctx.sp_original_seq_len,
+                        parallel_config.sequence_parallel_size,
+                    )
 
         image_rotary_emb = (vid_freqs, txt_freqs)
 
