@@ -162,7 +162,7 @@ async def test_replica_attached_at_runtime_is_read_without_waiting_for_reconcile
         attached.push_engine_core_outputs(_engine_core_outputs("attached-raw", 1.0))
 
         await _wait_for(lambda: len(processor.process_calls) == 1)
-        assert processor.process_calls[0][0][0] == ["attached-raw"]
+        assert [output.request_id for output in processor.process_calls[0][0][0]] == ["attached-raw"]
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
     assert pool.membership_listener is None

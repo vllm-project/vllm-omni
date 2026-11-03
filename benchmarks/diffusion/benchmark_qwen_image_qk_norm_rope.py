@@ -1,17 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Benchmark Qwen-Image Q/K RMSNorm + interleaved RoPE.
+"""Benchmark Qwen-Image Q/K RMSNorm + interleaved RoPE, with and without the fused kernels.
 
-Example:
+``--mode per-stream`` (default) times one stream: the eager ``F.rms_norm`` + ``RotaryEmbedding``
+chain against ``fused_qk_norm_rope``.
+
+``--mode joint`` times what one dual-stream block does to hand Q/K/V to attention:
+
+* ``native``: both streams through the eager chain, then the three text-first ``torch.cat`` calls;
+* ``per_stream``: both streams through ``fused_qk_norm_rope`` (main's default above the token
+  gate), then the same three cats;
+* ``joint``: one ``fused_joint_qkv_norm_rope`` launch. Its ``[B*(S_txt+S_img), D]`` table is packed
+  once per forward in the model, so it is built outside the timed region.
+
+Examples:
 
     CUDA_VISIBLE_DEVICES=0 python benchmarks/diffusion/benchmark_qwen_image_qk_norm_rope.py \
       --seq-len 4096 --warmup 20 --iters 100 --include-compiled --profile
+
+    CUDA_VISIBLE_DEVICES=0 python benchmarks/diffusion/benchmark_qwen_image_qk_norm_rope.py \
+      --mode joint --txt-len 512 --img-len 4096 --batches 1,2,4,8
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 from collections.abc import Callable
 
@@ -20,15 +35,27 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
+    pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 
+@functools.cache
+def _rope() -> RotaryEmbedding:
+    # Built once, as the transformer keeps one RotaryEmbedding per attention block.
+    return RotaryEmbedding(is_neox_style=False)
+
+
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--mode", choices=("per-stream", "joint"), default="per-stream")
     parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument("--seq-len", type=int, default=4096)
+    parser.add_argument("--batches", default=None, help="joint mode: comma-separated batch sizes (overrides --batch)")
+    parser.add_argument("--seq-len", type=int, default=4096, help="per-stream mode: tokens per stream")
+    parser.add_argument("--txt-len", type=int, default=512, help="joint mode: text tokens")
+    parser.add_argument("--img-len", type=int, default=4096, help="joint mode: image tokens (1024x1024 -> 4096)")
     parser.add_argument("--heads", type=int, default=24)
     parser.add_argument("--kv-heads", type=int, default=24)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -85,9 +112,9 @@ def _native(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = F.rms_norm(q, (q.shape[-1],), q_weight, eps)
     k = F.rms_norm(k, (k.shape[-1],), k_weight, eps)
-    rope = RotaryEmbedding(is_neox_style=False)
     cos = freqs.real.to(q.dtype)
     sin = freqs.imag.to(q.dtype)
+    rope = _rope()
     return rope(q, cos, sin), rope(k, cos, sin)
 
 
@@ -118,7 +145,7 @@ def _fused(
     )
 
 
-def _measure(fn: Callable[[], tuple[torch.Tensor, torch.Tensor]], warmup: int, iters: int) -> list[float]:
+def _measure(fn: Callable[[], object], warmup: int, iters: int) -> list[float]:
     for _ in range(warmup):
         fn()
     torch.accelerator.synchronize()
@@ -143,7 +170,7 @@ def _stats(samples: list[float]) -> dict[str, float]:
     }
 
 
-def _profile(fn: Callable[[], tuple[torch.Tensor, torch.Tensor]]) -> str:
+def _profile(fn: Callable[[], object]) -> str:
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
@@ -152,12 +179,11 @@ def _profile(fn: Callable[[], tuple[torch.Tensor, torch.Tensor]]) -> str:
     return prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=15)
 
 
-def main() -> None:
-    args = _parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("This benchmark requires CUDA")
-    device = torch.device("cuda")
-    dtype = _dtype(args.dtype)
+def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (a.float() - b.float()).abs().max().item()
+
+
+def _run_per_stream(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> None:
     eps = 1e-6
     q, k, q_weight, k_weight, freqs = _make_inputs(args, dtype, device)
 
@@ -168,6 +194,7 @@ def main() -> None:
         return _fused(q, k, q_weight, k_weight, freqs, eps)
 
     results: dict[str, object] = {
+        "mode": "per-stream",
         "device": torch.cuda.get_device_name(),
         "batch": args.batch,
         "seq_len": args.seq_len,
@@ -196,8 +223,8 @@ def main() -> None:
     results["native"] = native_stats
     results["fused"] = fused_stats
     results["speedup_vs_native"] = native_stats["median_ms"] / fused_stats["median_ms"]
-    results["max_abs_q"] = (actual_q.float() - expected_q.float()).abs().max().item()
-    results["max_abs_k"] = (actual_k.float() - expected_k.float()).abs().max().item()
+    results["max_abs_q"] = _max_abs(actual_q, expected_q)
+    results["max_abs_k"] = _max_abs(actual_k, expected_k)
     results["mean_abs_q"] = (actual_q.float() - expected_q.float()).abs().mean().item()
     results["mean_abs_k"] = (actual_k.float() - expected_k.float()).abs().mean().item()
 
@@ -216,6 +243,113 @@ def main() -> None:
     if args.profile:
         print("\n# fused profile")
         print(_profile(fused))
+
+
+def _make_joint_inputs(args: argparse.Namespace, batch: int, dtype: torch.dtype, device: torch.device):
+    torch.manual_seed(2026)
+
+    def stream(seq_len: int):
+        q = torch.randn(batch, seq_len, args.heads, args.head_dim, device=device, dtype=dtype)
+        k = torch.randn(batch, seq_len, args.kv_heads, args.head_dim, device=device, dtype=dtype)
+        v = torch.randn(batch, seq_len, args.kv_heads, args.head_dim, device=device, dtype=dtype)
+        q_weight = torch.randn(args.head_dim, device=device, dtype=dtype)
+        k_weight = torch.randn(args.head_dim, device=device, dtype=dtype)
+        angles = torch.randn(seq_len, args.head_dim // 2, device=device, dtype=torch.float32)
+        freqs = torch.polar(torch.ones_like(angles), angles)
+        return q, k, v, q_weight, k_weight, freqs
+
+    return stream(args.txt_len), stream(args.img_len)
+
+
+def _run_joint_batch(args: argparse.Namespace, batch: int, dtype: torch.dtype, device: torch.device) -> dict:
+    eps = 1e-6
+    txt, img = _make_joint_inputs(args, batch, dtype, device)
+    txt_q, txt_k, txt_v, txt_qw, txt_kw, txt_freqs = txt
+    img_q, img_k, img_v, img_qw, img_kw, img_freqs = img
+    joint_freqs = torch.cat((txt_freqs, img_freqs), dim=0)
+    # Packed once per forward in QwenImageTransformer2DModel, shared by all blocks.
+    table = pack_qk_norm_rope_table(
+        joint_freqs.real, joint_freqs.imag, batch, dtype=torch.float32, activation_dtype=dtype
+    )
+    if table is None:
+        raise RuntimeError("the fused CUDA path is unavailable for these inputs (needs BF16 on CUDA with Triton)")
+
+    def native():
+        tq, tk = _native(txt_q, txt_k, txt_qw, txt_kw, txt_freqs, eps)
+        iq, ik = _native(img_q, img_k, img_qw, img_kw, img_freqs, eps)
+        return torch.cat([tq, iq], dim=1), torch.cat([tk, ik], dim=1), torch.cat([txt_v, img_v], dim=1)
+
+    def per_stream():
+        tq, tk = _fused(txt_q, txt_k, txt_qw, txt_kw, txt_freqs, eps)
+        iq, ik = _fused(img_q, img_k, img_qw, img_kw, img_freqs, eps)
+        return torch.cat([tq, iq], dim=1), torch.cat([tk, ik], dim=1), torch.cat([txt_v, img_v], dim=1)
+
+    def joint():
+        return fused_joint_qkv_norm_rope(
+            txt_q, txt_k, txt_v, img_q, img_k, img_v, txt_qw, txt_kw, img_qw, img_kw, table, eps
+        )
+
+    arms = {"native": native, "per_stream": per_stream, "joint": joint}
+    stats = {name: _stats(_measure(fn, args.warmup, args.iters)) for name, fn in arms.items()}
+    outputs = {name: fn() for name, fn in arms.items()}
+    torch.accelerator.synchronize()
+    result = {
+        "batch": batch,
+        "txt_len": args.txt_len,
+        "img_len": args.img_len,
+        "joint_tokens": batch * (args.txt_len + args.img_len),
+        **stats,
+        "joint_speedup_vs_native": stats["native"]["median_ms"] / stats["joint"]["median_ms"],
+        "joint_speedup_vs_per_stream": stats["per_stream"]["median_ms"] / stats["joint"]["median_ms"],
+        "per_stream_speedup_vs_native": stats["native"]["median_ms"] / stats["per_stream"]["median_ms"],
+        "max_abs_joint_vs_per_stream": max(_max_abs(a, b) for a, b in zip(outputs["joint"], outputs["per_stream"])),
+        "max_abs_joint_vs_native": max(_max_abs(a, b) for a, b in zip(outputs["joint"], outputs["native"])),
+    }
+    if args.profile:
+        result["joint_profile"] = _profile(joint)
+    return result
+
+
+def _run_joint(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> None:
+    batches = [int(b) for b in args.batches.split(",")] if args.batches else [args.batch]
+    cases = [_run_joint_batch(args, batch, dtype, device) for batch in batches]
+    profiles = [case.pop("joint_profile", None) for case in cases]
+    results: dict[str, object] = {
+        "mode": "joint",
+        "device": torch.cuda.get_device_name(),
+        "heads": args.heads,
+        "kv_heads": args.kv_heads,
+        "head_dim": args.head_dim,
+        "dtype": args.dtype,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "cases": cases,
+    }
+    print(json.dumps(results, indent=2))
+    print("\n| B | tokens | native ms | per-stream ms | joint ms | joint vs native | joint vs per-stream |")
+    print("|---|---|---|---|---|---|---|")
+    for case in cases:
+        print(
+            f"| {case['batch']} | {case['joint_tokens']} | {case['native']['median_ms']:.4f} "
+            f"| {case['per_stream']['median_ms']:.4f} | {case['joint']['median_ms']:.4f} "
+            f"| {case['joint_speedup_vs_native']:.2f}x | {case['joint_speedup_vs_per_stream']:.2f}x |"
+        )
+    for case, prof in zip(cases, profiles):
+        if prof:
+            print(f"\n# joint profile, batch {case['batch']}")
+            print(prof)
+
+
+def main() -> None:
+    args = _parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("This benchmark requires CUDA")
+    device = torch.device("cuda")
+    dtype = _dtype(args.dtype)
+    if args.mode == "joint":
+        _run_joint(args, dtype, device)
+    else:
+        _run_per_stream(args, dtype, device)
 
 
 if __name__ == "__main__":

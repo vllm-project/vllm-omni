@@ -104,6 +104,18 @@ Defensive fail-safe: if `transfer_emitter` or `replica_resolver` is missing, or 
 
 The Orchestrator instantiates `OmniPrometheusStatLogger` (a thin subclass of upstream `vllm.v1.metrics.loggers.PrometheusStatLogger`) and feeds it scheduler stats and iteration stats after processing each batch of engine outputs. This populates the standard ~37 vLLM metric families (TTFT, ITL, TPOT, KV cache usage, etc.) using the same upstream code path — but with the `engine` label reshaped into `stage` + `replica` so multi-replica deployments produce distinct series per replica. See the next section for the wrap mechanics.
 
+At stage readiness, the orchestrator requests the worker's saved allocator
+snapshot through a control-plane remote procedure call (RPC) and publishes it
+before the frontend becomes ready. Qwen3-TTS Code2Wav supplies the snapshot.
+The snapshot does not travel through model-runner, request, or API output.
+
+Remote replica attachment triggers another snapshot request. A replacement in
+the same slot publishes its own values, and the orchestrator ignores late
+replies from a removed worker. Detachment and eviction remove memory series
+from the ordinary process-local registry. See
+[post-warmup memory](#generation-stage-post-warmup-memory-2) for measurement
+scope and the separate Prometheus multiprocess storage limitation.
+
 ### Shared State Between Threads
 
 The Orchestrator runs in a background thread. The API server (OmniBase) runs in the asyncio event loop thread. `OmniRequestCounter` bridges them — a plain Python object with an `int` field. The Orchestrator increments/decrements it; the entrypoint reads it for gauge updates. No lock is needed because the counter is advisory (a stale read by one Prometheus scrape interval is acceptable). It is created by `AsyncOmniEngine.__init__()` and passed to the Orchestrator at construction time.
@@ -139,7 +151,13 @@ stage_replica_map = {
 
 A reverse map `(stage_id, replica_id) -> flat_idx` is maintained on the Orchestrator so the per-replica `record(engine_idx=...)` call site can look up the right flat index.
 
-> Dynamic add/remove of replicas at runtime is intentionally out of scope — the upstream `PrometheusStatLogger` materializes per-engine_idx child metrics at init time, and supporting hot-add would require non-trivial intervention into upstream's per-family child dictionaries.
+New replicas receive metric slots when they attach or first report statistics.
+Existing flat indexes and cumulative counters remain across detachment and
+rejoining. Attachment refreshes post-warmup memory samples from the new worker,
+including replacements that reuse a slot. Detachment removes those samples
+from the ordinary process-local registry; the
+[multiprocess storage limitation](#multiprocess-storage-retains-removed-labels)
+still applies.
 
 ## Gating: `--log-stats` and `--collect-stage-metrics`
 
@@ -153,7 +171,7 @@ Behavior with `log_stats=False` (the Python-interface default, or API serving wi
 - `OmniPrometheusStatLogger` is not constructed in `_init_metrics_state`, so the ~65 upstream `vllm:*` wrap families are not registered in the default registry at all.
 - The engine core's `Scheduler.make_stats()` also short-circuits inside upstream (`if not self.log_stats: return None`), so no `SchedulerStats` is produced per step — the per-iteration cost is bounded by the existing upstream gate.
 
-Behavior with `log_stats=True`: all metric paths fire normally; the orchestrator's per-replica recording is bounded only by `OmniSchedulerMixin.make_stats()`'s per-scheduler 1 Hz throttle (see next section).
+Behavior with `log_stats=True`: the post-warmup memory snapshot is published at readiness and on remote replica attachment. Request-time metric paths fire normally, as described below.
 
 The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omni-30B single replica (30 sequential audio requests) showed a mean latency delta of +0.6% (Welch's t = 0.318, n=30, not statistically significant at α=0.05); the `/metrics` line count drops from 1358 to 124 lines when the flag is off.
 
@@ -161,7 +179,7 @@ The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omn
 
 Upstream vLLM's `Scheduler.make_stats()` runs on every AR generation step, returning a SchedulerStats object for the orchestrator. Under vLLM's architecture, this is fine. But since vLLM-Omni requires that the object be serialized and transferred over ZMQ, receiving a SchedulerStats object on every step can introduce unacceptable overhead to the system.
 
-`OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step overhead.
+`OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step serialization overhead.
 
 The orchestrator side does not add its own throttle on top. Scheduler gauges are
 recorded when `raw_outputs.scheduler_stats is not None` (i.e. this replica's
@@ -256,6 +274,71 @@ Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
 | `vllm_omni:transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
 | `vllm_omni:transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
 | `vllm_omni:transfer_in_flight_s` | Histogram | Network in-flight time (TX done → RX recv start) |
+
+### Generation-stage post-warmup memory (2)
+
+Qwen3-TTS exposes a saved memory snapshot for each generation-stage replica.
+The snapshot describes memory held by the rank-0 worker's PyTorch allocator
+immediately after decoder graph warmup. The values are static and do not track
+request-time memory use.
+
+Both gauges use the labels `{model_name, stage, replica}` and report bytes:
+
+| Metric | Description |
+| --- | --- |
+| `vllm_omni:stage_post_warmup_memory_allocated_bytes` | Worker PyTorch allocator bytes allocated after decoder graph warmup |
+| `vllm_omni:stage_post_warmup_memory_reserved_bytes` | Worker PyTorch allocator bytes reserved after decoder graph warmup |
+
+#### Measurement happens during model loading
+
+The decoder records the snapshot after successful graph warmup during model
+loading. Publication happens later, at stage readiness or remote replica
+attachment, when statistics are enabled and rank 0 supplies a snapshot.
+The saved values are reused without per-request or per-step sampling.
+
+The values are absolute allocator totals for the rank-0 worker on its device.
+They include other PyTorch allocations held by that worker at capture time.
+They do not isolate the decoder's allocation increase or include non-PyTorch
+device allocations. Values are not summed across tensor- or pipeline-parallel
+ranks.
+
+Capture precedes engine key-value (KV) cache allocation and later graph
+captures. The snapshot therefore does not represent the final stage memory
+footprint.
+
+CUDA and ROCm decoder graphs can supply a snapshot. Eager decoders, unsuccessful
+graph warmup, models without the snapshot hook, and NPU workers emit no samples.
+The default ROCm deployment runs Code2Wav in eager mode and therefore emits no
+snapshot samples. An eager serving check does not validate graph-based memory
+collection.
+
+#### Replica attachment refreshes the saved values
+
+The orchestrator fetches the attached worker's snapshot, including when a new
+worker reuses an existing replica slot. It rejects late replies from detached
+workers and replies that arrive after shutdown.
+
+Detachment, eviction, and engine shutdown remove the memory series from the
+ordinary process-local Prometheus registry. Multiprocess storage has the
+separate removal limitation described below.
+
+#### Multiple API frontends publish one observation per replica
+
+Each API frontend publishes the same shared worker's snapshot. The gauges use
+`multiprocess_mode="mostrecent"` to export the latest observation once per
+`{model_name, stage, replica}`. The collector neither adds a `pid` label nor
+sums duplicate observations. A shared worker's saved snapshot remains available
+after an API process exits.
+
+#### Multiprocess storage retains removed labels
+
+Prometheus multiprocess storage retains samples for removed label sets.
+`mostrecent` controls aggregation; it does not enable label removal. Multi-API
+serving currently excludes remote replica membership changes.
+
+Let vLLM create a fresh multiprocess directory for each server run. If setting
+`PROMETHEUS_MULTIPROC_DIR` manually, use an empty directory at startup to avoid
+mixing files from older runs or gauge modes.
 
 ### LLM stage-level (wrapped `vllm:*`)
 

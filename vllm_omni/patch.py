@@ -25,11 +25,16 @@ from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.inputs.audio import apply_soundfile_first_audio_decode_patch
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
+
+# Decoder rounding is visible to audio encoders and can change mixed-media
+# answers. Preserve Omni's existing default while retaining explicit choices.
+apply_soundfile_first_audio_decode_patch()
 
 # Omni's deploy config selects a runner per stage. vLLM 0.31's config property
 # otherwise defaults to v2 independently of the runner selected by our workers,
@@ -45,7 +50,7 @@ if not getattr(_runner_property.fget, "_omni_stage_runner", False):
             return self.model_config.use_v2_model_runner
         return _upstream(self)
 
-    _patched_use_v2_model_runner._omni_stage_runner = True
+    setattr(_patched_use_v2_model_runner, "_omni_stage_runner", True)
     _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 # =============================================================================
@@ -317,7 +322,7 @@ if _legacy_nvfp4_linear_method is not None:
 
     # Sentinel so a later reload of this module recovers the genuine upstream
     # method above instead of wrapping this wrapper (see reload-idempotency note).
-    _patched_nvfp4_pwal._vllm_omni_wrapped_pwal = _original_nvfp4_pwal
+    setattr(_patched_nvfp4_pwal, "_vllm_omni_wrapped_pwal", _original_nvfp4_pwal)
 
     if not _already_patched_upstream:
         _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading = _patched_nvfp4_pwal
@@ -380,19 +385,19 @@ for module_name, module in list(sys.modules.items()):
     if "vllm" not in module_name:
         continue
     if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
-        module.EngineCoreOutput = OmniEngineCoreOutput
+        setattr(module, "EngineCoreOutput", OmniEngineCoreOutput)
     if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
-        module.EngineCoreOutputs = OmniEngineCoreOutputs
+        setattr(module, "EngineCoreOutputs", OmniEngineCoreOutputs)
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
-        module.TokensPrompt = OmniTokensPrompt
+        setattr(module, "TokensPrompt", OmniTokensPrompt)
     if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
-        module.MRotaryEmbedding = OmniMRotaryEmbedding
+        setattr(module, "MRotaryEmbedding", OmniMRotaryEmbedding)
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
-        module.Request = OmniRequest
+        setattr(module, "Request", OmniRequest)
     if hasattr(module, "StreamingUpdate") and module.StreamingUpdate == _OriginalStreamingUpdate:
-        module.StreamingUpdate = OmniStreamingUpdate
+        setattr(module, "StreamingUpdate", OmniStreamingUpdate)
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
-        module.EngineCoreRequest = OmniEngineCoreRequest
+        setattr(module, "EngineCoreRequest", OmniEngineCoreRequest)
 
 
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
@@ -481,7 +486,7 @@ def _patch_flashinfer_fp8_scaled_mm_output_shape():
             out = out.view(*output_shape)
         return out
 
-    _patched_apply_scaled_mm._omni_output_shape_patched = True
+    setattr(_patched_apply_scaled_mm, "_omni_output_shape_patched", True)
     FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = _patched_apply_scaled_mm
 
 
@@ -579,7 +584,7 @@ def _patch_inductor_factorable_divisibility():
             return True
         return _provably_factorable_multiple(numerator, denominator)
 
-    statically_known_multiple_of._vllm_omni_factorable_divisibility = True
+    setattr(statically_known_multiple_of, "_vllm_omni_factorable_divisibility", True)
     SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
     _PATCH_LOGGER.info("inductor factorable-divisibility patch: installed.")
 
@@ -656,7 +661,10 @@ def release_cumem_allocations_for_shutdown(allocator) -> int:
 def _patch_cumem_free_callback_cuda() -> None:
     try:
         from vllm.device_allocator import cumem as cumem_module
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+        if not cumem_available:
+            return
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
@@ -697,13 +705,48 @@ def _patch_cumem_free_callback_cuda() -> None:
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
-    _patched_free_callback._omni_cumem_cuda_patched = True
+    setattr(_patched_free_callback, "_omni_cumem_cuda_patched", True)
     CuMemAllocator._python_free_callback = _patched_free_callback
     cumem_module.unmap_and_release = _tracking_unmap_and_release
     _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
 
 
+def _patch_xpumem_free_callback_xpu() -> None:
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator, xpumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem] XpuMemAllocator not available; skipping patch")
+        return
+
+    if not xpumem_available:
+        return
+
+    if getattr(XpuMemAllocator._python_free_callback, "_omni_xpumem_xpu_patched", False):
+        return
+
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr)
+        if data.cpu_backup_tensor is not None:
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            device, size, d_mem, _ = data.handle
+            result = (device, size, d_mem, [])
+            _PATCH_LOGGER.debug(
+                "[xpumem] Free callback: asleep entry %s -> empty handle",
+                ptr,
+            )
+            return result
+        # Drain pending kernels before the C extension unmaps.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    setattr(_patched_free_callback, "_omni_xpumem_xpu_patched", True)
+    XpuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info("[xpumem] XpuMemAllocator._python_free_callback patched: asleep guard enabled for XPU.")
+
+
 _patch_cumem_free_callback_cuda()
+_patch_xpumem_free_callback_xpu()
 
 
 def _patch_batched_seeded_random_sample() -> None:

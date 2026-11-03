@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from vllm.config.lora import LoRAConfig, MaxLoRARanks
 from vllm.logger import init_logger
-from vllm.lora.layers import BaseLayerWithLoRA
+from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
@@ -28,11 +28,39 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVPar
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
+    detach_moe_lora_context,
     from_layer_diffusion,
+    moe_lora_kernel_requires_context,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
+
+
+def _moe_lora_proj_names(moe_config: object | None) -> list[str]:
+    """Map PEFT projection names to upstream ``[w1, w2, w3]`` order.
+
+    Gated MoE uses gate/down/up. Non-gated MoE uses up/down with an unused
+    up placeholder for w3. Shared by checkpoint validation and weight binding.
+    """
+    is_gated = bool(getattr(moe_config, "is_act_and_mul", True))
+    if is_gated:
+        return ["gate_proj", "down_proj", "up_proj"]
+    return ["up_proj", "down_proj", "up_proj"]
+
+
+def _moe_lora_target_names(full_module_name: str, module: nn.Module) -> list[str]:
+    projections = list(dict.fromkeys(_moe_lora_proj_names(getattr(module, "moe_config", None))))
+    global_num_experts = getattr(module, "global_num_experts", None)
+    if global_num_experts is None:
+        global_num_experts = getattr(getattr(module, "moe_config", None), "num_experts", 0)
+    if not global_num_experts:
+        return projections
+    return [
+        f"{full_module_name}.{expert_id}.{projection}"
+        for expert_id in range(global_num_experts)
+        for projection in projections
+    ]
 
 
 class LoRABackend(str, Enum):
@@ -59,7 +87,9 @@ class DiffusionLoRAManager:
     # Adapter whose weights are still uploaded while gated off. Class-level so
     # a manager built without __init__ (some tests use object.__new__) reads as
     # "nothing suspended" instead of raising.
+    _active_adapter_id: int | None = None
     _suspended_adapter_id: int | None = None
+    _max_num_batched_tokens: int | None = None
 
     def __init__(
         self,
@@ -69,6 +99,7 @@ class DiffusionLoRAManager:
         max_cached_adapters: int = 1,
         lora_path: str | None = None,
         lora_scale: float = 1.0,
+        max_num_batched_tokens: int | None = None,
     ):
         """
         Initialize the DiffusionLoRAManager.
@@ -77,22 +108,24 @@ class DiffusionLoRAManager:
             max_cached_adapters: Maximum number of LoRA adapters to keep in the
                 CPU-side cache (LRU). This mirrors vLLM's `max_cpu_loras` and is
                 exposed to users via `OmniDiffusionConfig.max_cpu_loras`.
+            max_num_batched_tokens: Preallocated token-mapping capacity for MoE
+                LoRA forwards.
         """
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
-        # Imported here: vllm_omni.diffusion.data imports this package while it
-        # is still initializing, and the offloader package imports that module.
-        from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
-
-        od_config = getattr(pipeline, "od_config", None)
-        # DLO owns the base-weight lifecycle. Keep request-switchable LoRA
-        # sidecars resident instead of rebuilding DLO host shards per request.
-        self._resident_lora_device = (
-            device
-            if od_config is not None and resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
-            else None
-        )
+        if max_num_batched_tokens is not None and (
+            type(max_num_batched_tokens) is not int or max_num_batched_tokens <= 0
+        ):
+            raise ValueError("max_num_batched_tokens must be a positive integer")
+        self._max_num_batched_tokens = max_num_batched_tokens
+        # LoRA sidecars are allocated outside the base-weight lifecycle, so no
+        # sleep/offload path knows to move them. Keep them resident on the
+        # execution device under every offload strategy: buffers created or
+        # re-created while the base weights sit on CPU (the standard RL
+        # weight-sync moment) would otherwise stay there after wake, and
+        # apply() would matmul device activations against host buffers.
+        self._resident_lora_device = device
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -105,6 +138,8 @@ class DiffusionLoRAManager:
             self._supported_lora_modules,
             self._packed_modules_mapping,
         )
+        # Include indexed expert suffixes before replacing MoE runners.
+        self._expected_lora_modules = self._expand_expected_modules_for_moe(self._expected_lora_modules)
 
         # LRU-style cache management
         self.max_cached_adapters = max_cached_adapters  # max_cpu_loras
@@ -123,6 +158,8 @@ class DiffusionLoRAManager:
         self._lora_modules: dict[str, BaseLayerWithLoRA] = {}
         # Track the maximum LoRA rank we've allocated buffers for.
         self._max_lora_rank: int = 0
+        # Lazily created token-to-slot mapping shared by all MoE wrappers.
+        self._moe_punica_wrapper = None
         self._merged_adapters: dict[int, MergedLoRAWeights] = {}
         self._closed = False
         self._fixed_adapter = getattr(pipeline, "diffusion_lora_fixed_adapter", False) is True
@@ -148,6 +185,11 @@ class DiffusionLoRAManager:
                 self.set_active_adapter(init_request, 1.0 if self._fixed_adapter else lora_scale)
                 if self._fixed_adapter:
                     self.pin_adapter(init_request.lora_int_id)
+            # MoE kernels are LoRA-capable as soon as vllm_config.lora_config is
+            # set, including HunyuanImage3 baseline generate() before any
+            # adapter is loaded. Wrap runners and publish a no-adapter mapping
+            # so TRTLLM LoRA experts have a context on that first forward.
+            self._ensure_moe_lora_context()
             bind = getattr(pipeline, "_bind_diffusion_lora_manager", None)
             if callable(bind):
                 bind(self)
@@ -288,6 +330,30 @@ class DiffusionLoRAManager:
 
         return mapping
 
+    def _expand_expected_modules_for_moe(self, expected: set[str]) -> set[str]:
+        """Whitelist indexed PEFT suffixes such as ``experts.0.gate_proj``.
+
+        The loader requires indexed suffixes instead of bare projection names.
+        Enumerate all global experts before layer replacement; EP slicing is
+        applied later while binding adapter weights.
+        """
+        expanded = set(expected)
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        for _, module in self.pipeline.named_modules():
+            if not isinstance(module, MoERunner):
+                continue
+            moe_config = getattr(module, "moe_config", None)
+            global_num_experts = getattr(module, "global_num_experts", None)
+            if global_num_experts is None:
+                global_num_experts = getattr(moe_config, "num_experts", 0)
+            if not global_num_experts:
+                continue
+            for proj in set(_moe_lora_proj_names(moe_config)):
+                for ei in range(global_num_experts):
+                    expanded.add(f"experts.{ei}.{proj}")
+        return expanded
+
     def _get_packed_sublayer_suffixes(self, packed_module_suffix: str, n_slices: int) -> list[str] | None:
         sub_suffixes = self._packed_modules_mapping.get(packed_module_suffix)
         if not sub_suffixes:
@@ -391,7 +457,6 @@ class DiffusionLoRAManager:
             peft_helper = PEFTHelper.from_local_dir(
                 lora_path,
                 max_position_embeddings=None,  # no need in diffusion
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
             )
 
             lora_model = LoRAModel.from_local_checkpoint(
@@ -402,7 +467,6 @@ class DiffusionLoRAManager:
                 device="cpu",  # consistent w/ vllm's behavior
                 dtype=self.dtype,
                 model_vocab_size=None,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
                 weights_mapper=None,
             )
         else:
@@ -444,6 +508,30 @@ class DiffusionLoRAManager:
             return ["0", "1"]
         return []
 
+    def _iter_lora_components(self) -> Iterator[tuple[str, nn.Module]]:
+        """Yield named denoiser modules that may contain LoRA-capable layers.
+
+        Framework defaults only cover generic diffusers names: ``transformer``
+        (plus ``transformer_2`` for dual-DiT pipelines such as Wan2.2) and
+        ``unet`` for SDXL-style pipelines. Model-specific attribute names must
+        be declared via ``_dit_modules`` or ``_lora_components``. If the
+        denoiser is not scanned, adapters can load while applying to zero
+        layers and produce base-identical output.
+        """
+        default_components = (
+            "transformer",
+            "transformer_2",
+            "unet",
+        )
+        declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
+        extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
+        for component_name in dict.fromkeys((*default_components, *declared_components, *extra_components)):
+            if not hasattr(self.pipeline, component_name):
+                continue
+            component = getattr(self.pipeline, component_name)
+            if isinstance(component, nn.Module):
+                yield component_name, component
+
     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
         self._ensure_max_lora_rank(peft_helper.r)
 
@@ -473,41 +561,24 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Components scanned for LoRA-capable layers: framework defaults,
-        # declared DiT components, and any a pipeline opts into via
-        # ``_lora_components``. The defaults only cover the generic diffusers
-        # naming convention: ``transformer`` (plus ``transformer_2`` for
-        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
-        # pipelines. Model-specific attribute names must be declared by the
-        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
-        #
-        # NOTE: if the denoiser component is not scanned here, adapters can
-        # load/activate while effectively applying to zero layers, producing
-        # base-identical output.
-        default_components = (
-            "transformer",
-            "transformer_2",
-            "unet",
-        )
-        declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
-        extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
-        component_names = dict.fromkeys((*default_components, *declared_components, *extra_components))
-        for component_name in component_names:
-            if not hasattr(self.pipeline, component_name):
-                continue
-            component = getattr(self.pipeline, component_name)
-            if not isinstance(component, nn.Module):
-                continue
-
+        for component_name, component in self._iter_lora_components():
             # Collect replacements first to avoid mutating the module tree
             # while iterating over named_modules().
             pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
+            from vllm.model_executor.layers.fused_moe import MoERunner
+
+            moe_runner_module_names: set[str] = set()
 
             for module_name, module in component.named_modules(remove_duplicate=False):
                 # Don't recurse into already-replaced LoRA wrappers. Their
                 # original LinearBase lives under "base_layer", and replacing
                 # that again would nest LoRA wrappers and break execution.
                 if isinstance(module, BaseLayerWithLoRA) or "base_layer" in module_name.split("."):
+                    continue
+
+                # Wrapping a runner moves its children under base_layer.
+                # Skip collected runners and descendants to avoid duplicate wrapping.
+                if any(module_name == p or module_name.startswith(p + ".") for p in moe_runner_module_names):
                     continue
 
                 full_module_name = f"{component_name}.{module_name}"
@@ -521,6 +592,13 @@ class DiffusionLoRAManager:
                     selected = select_packed(full_module_name, module)
                     if selected is not None:
                         packed_modules_list = selected
+
+                # Match MoE targets by logical projection names, not the runner name.
+                is_moe_runner = isinstance(module, MoERunner)
+                moe_target_names: list[str] | None = None
+                if is_moe_runner:
+                    moe_target_names = _moe_lora_target_names(full_module_name, module)
+
                 if target_modules_pattern is not None or target_modules_list is not None:
                     should_replace = _matches_target(full_module_name)
                     if not should_replace and len(packed_modules_list) > 1:
@@ -532,9 +610,13 @@ class DiffusionLoRAManager:
                                 if _matches_target(sub_full_name):
                                     should_replace = True
                                     break
-
+                    if not should_replace and moe_target_names is not None:
+                        should_replace = any(_matches_target(name) for name in moe_target_names)
                     if not should_replace:
                         continue
+
+                if is_moe_runner:
+                    moe_runner_module_names.add(module_name)
 
                 pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
 
@@ -545,19 +627,75 @@ class DiffusionLoRAManager:
                     lora_config=lora_config,
                     packed_modules_list=packed_modules_list,
                     model_config=None,
+                    max_num_batched_tokens=self._max_num_batched_tokens,
                 )
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
-                    if self._resident_lora_device is not None:
-                        set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
-                        if not callable(set_buffer_device):
-                            raise RuntimeError(
-                                f"{type(lora_layer).__name__} cannot keep dynamic LoRA buffers resident for DLO"
-                            )
+                    # Layers without the re-homing hook keep the legacy
+                    # placement (buffers follow the base weight device).
+                    set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                    if callable(set_buffer_device):
                         set_buffer_device(self._resident_lora_device)
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
+
+    def _ensure_moe_lora_context(self) -> None:
+        """Wrap MoE runners and publish mapping before the first forward.
+
+        ``configure_diffusion_vllm_config`` sets ``lora_config`` for MoE + PEFT
+        even when no adapter is loaded. TRTLLM LoRA experts then require a
+        context on every apply(), including HunyuanImage3 baseline generate().
+        """
+        if self._max_num_batched_tokens is None:
+            return
+        if self._max_lora_rank <= 0:
+            self._ensure_max_lora_rank(min(self._VALID_MAX_RANKS))
+        self._replace_moe_runners_with_lora()
+        self._publish_moe_lora_context()
+
+    def _replace_moe_runners_with_lora(self) -> None:
+        """Replace every MoE runner so LoRA-capable kernels get a mapping."""
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        lora_config = LoRAConfig(
+            max_lora_rank=self._max_lora_rank,
+            max_loras=1,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+        for component_name, component in self._iter_lora_components():
+            pending: list[tuple[str, str, nn.Module]] = []
+            runner_names: set[str] = set()
+            for module_name, module in component.named_modules(remove_duplicate=False):
+                if isinstance(module, BaseLayerWithLoRA) or "base_layer" in module_name.split("."):
+                    continue
+                if any(module_name == p or module_name.startswith(p + ".") for p in runner_names):
+                    continue
+                if not isinstance(module, MoERunner):
+                    continue
+                full_module_name = f"{component_name}.{module_name}"
+                if full_module_name in self._lora_modules:
+                    continue
+                runner_names.add(module_name)
+                pending.append((module_name, full_module_name, module))
+            for module_name, full_module_name, module in pending:
+                lora_layer = from_layer_diffusion(
+                    layer=module,
+                    max_loras=1,
+                    lora_config=lora_config,
+                    packed_modules_list=[],
+                    model_config=None,
+                    max_num_batched_tokens=self._max_num_batched_tokens,
+                )
+                if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                    set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                    if callable(set_buffer_device):
+                        set_buffer_device(self._resident_lora_device)
+                    replace_submodule(component, module_name, lora_layer)
+                    self._lora_modules[full_module_name] = lora_layer
+                    logger.debug("Replaced MoE runner: %s -> %s", full_module_name, type(lora_layer).__name__)
 
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
@@ -573,6 +711,7 @@ class DiffusionLoRAManager:
 
         logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
         self._max_lora_rank = valid_max_rank
+        self._moe_punica_wrapper = None
 
         if not self._lora_modules:
             return
@@ -597,6 +736,8 @@ class DiffusionLoRAManager:
             active_scale = self._adapter_scales[active_id]
             self._active_adapter_id = None
             self._activate_adapter(active_id, active_scale)
+        else:
+            self._publish_moe_lora_context()
 
     @classmethod
     def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
@@ -669,6 +810,15 @@ class DiffusionLoRAManager:
         # activate weights in each LoRA layer
         for full_module_name, lora_layer in self._lora_modules.items():
             lora_weights = self._get_lora_weights(lora_model, full_module_name)
+            # MoE weights need per-expert gathering before the dense binding path.
+            if self._bind_moe_adapter_weights(
+                full_module_name=full_module_name,
+                lora_layer=lora_layer,
+                lora_model=lora_model,
+                scale=scale,
+                bound_lora_names_cb=_record_bound,
+            ):
+                continue
 
             if lora_weights is None:
                 n_slices = getattr(lora_layer, "n_slices", 1)
@@ -815,11 +965,47 @@ class DiffusionLoRAManager:
                 scale,
             )
 
-        unbound_lora_names = sorted(set(lora_model.loras) - bound_lora_names)
-        if not bound_lora_names or unbound_lora_names:
+        all_lora_names = set(lora_model.loras)
+        # Exclude only confirmed remote experts of known MoE layers under EP.
+        from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        non_local_expert_names: set[str] = set()
+        for full_module_name, lora_layer in self._lora_modules.items():
+            base_layer = getattr(lora_layer, "base_layer", None)
+            if not isinstance(base_layer, MoERunner):
+                continue
+            if not isinstance(lora_layer, FusedMoEWithLoRA):
+                continue
+            local_num_experts = getattr(lora_layer, "local_num_experts", None)
+            if not local_num_experts:
+                continue
+            if not getattr(lora_layer, "use_ep", False):
+                continue
+            ep_rank = getattr(lora_layer, "ep_rank", 0)
+            global_num_experts = lora_layer.global_num_experts
+            local_start = ep_rank * local_num_experts
+            proj_names = _moe_lora_proj_names(getattr(base_layer, "moe_config", None))
+            for global_ei in range(global_num_experts):
+                if local_start <= global_ei < local_start + local_num_experts:
+                    continue
+                for proj in proj_names:
+                    cand = f"{full_module_name}.{global_ei}.{proj}"
+                    # Resolve to the PEFT namespace exactly as binding does.
+                    sub = self._get_lora_weights(lora_model, cand)
+                    if sub is not None:
+                        name = lora_names_by_id.get(id(sub))
+                        if name is not None:
+                            non_local_expert_names.add(name)
+        non_local_expert_names -= bound_lora_names
+        unbound_lora_names = sorted(all_lora_names - bound_lora_names - non_local_expert_names)
+        expected_count = len(all_lora_names) - len(non_local_expert_names)
+        # A sparse adapter can target only remote experts on this rank. That
+        # is a valid local no-op, unlike an empty or wholly unmatched adapter.
+        if not all_lora_names or unbound_lora_names or (expected_count and not bound_lora_names):
             raise ValueError(
                 f"LoRA adapter {lora_model.id} binding is incomplete: "
-                f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, "
+                f"bound={len(bound_lora_names)}/{expected_count}, "
                 f"unbound modules={unbound_lora_names}; "
                 f"expected target modules in {sorted(self._expected_lora_modules)}"
             )
@@ -830,10 +1016,176 @@ class DiffusionLoRAManager:
                 bound_lora_names=frozenset(bound_lora_names),
             )
 
+    def _bind_moe_adapter_weights(
+        self,
+        *,
+        full_module_name: str,
+        lora_layer,
+        lora_model: LoRAModel,
+        scale: float,
+        bound_lora_names_cb,
+    ) -> bool:
+        """Bind per-expert PEFT weights to a MoE LoRA wrapper.
+
+        Returns ``False`` for non-MoE layers. For MoE layers, gathers this
+        rank's expert factors in upstream ``[w1, w2, w3]`` order, zero-fills
+        missing factors, and writes them to slot 0.
+        """
+        from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        base_layer = getattr(lora_layer, "base_layer", None)
+        if not isinstance(base_layer, MoERunner):
+            return False
+        if not isinstance(lora_layer, FusedMoEWithLoRA):
+            return False
+
+        moe_config = getattr(base_layer, "moe_config", None)
+        local_num_experts = getattr(lora_layer, "local_num_experts", None)
+        use_ep = bool(getattr(lora_layer, "use_ep", False))
+        ep_rank = getattr(lora_layer, "ep_rank", 0)
+        is_gated = bool(getattr(moe_config, "is_act_and_mul", True))
+        proj_names = _moe_lora_proj_names(moe_config)  # [w1, w2, w3]
+
+        prefix = full_module_name
+        per_proj: list[list] = []  # per-projection list of (lora_a, lora_b) or None
+        any_found = False
+        for proj in proj_names:
+            expert_factors: list = []
+            if local_num_experts is None:
+                per_proj.append(expert_factors)
+                continue
+            for ei in range(local_num_experts):
+                # PEFT uses global expert IDs; convert local IDs under EP.
+                global_ei = ep_rank * local_num_experts + ei if use_ep else ei
+                cand = f"{prefix}.{global_ei}.{proj}"
+                sub = self._get_lora_weights(lora_model, cand)
+                if sub is not None and not isinstance(sub, PackedLoRALayerWeights):
+                    expert_factors.append((sub.lora_a, sub.lora_b))
+                    any_found = True
+                    bound_lora_names_cb(sub)
+                else:
+                    expert_factors.append(None)
+            per_proj.append(expert_factors)
+
+        if not any_found:
+            lora_layer.reset_lora(0)
+            return True
+
+        # Upstream requires every slot and expert; missing factors mean zero delta.
+        reference_a, reference_b = next(f for factors in per_proj for f in factors if f is not None)
+        hidden = lora_layer.hidden_size
+        intermediate = lora_layer.intermediate_size_per_partition * lora_layer.tp_size
+        lora_a_list: list[torch.Tensor] = []
+        lora_b_list: list[torch.Tensor] = []
+        for proj, factors in zip(proj_names, per_proj):
+            template = next((f for f in factors if f is not None), None)
+            if template is None:
+                rank = reference_a.shape[0]
+                in_features, out_features = (intermediate, hidden) if proj == "down_proj" else (hidden, intermediate)
+                zero_a = reference_a.new_zeros((rank, in_features))
+                zero_b = reference_b.new_zeros((out_features, rank))
+            else:
+                zero_a, zero_b = (torch.zeros_like(t) for t in template)
+            a_stack = torch.stack([zero_a if f is None else f[0] for f in factors], dim=0)
+            b_stack = torch.stack([zero_b if f is None else f[1] for f in factors], dim=0)
+            lora_a_list.append(a_stack)
+            # Scaling B yields scale * (B @ A).
+            lora_b_list.append(b_stack * scale)
+
+        lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+        logger.debug(
+            "Activated MoE LoRA for %s (local_experts=%d, gated=%s, ep=%s, scale=%.2f)",
+            full_module_name,
+            local_num_experts,
+            is_gated,
+            use_ep,
+            scale,
+        )
+        return True
+
     def _reset_lora_layers(self) -> None:
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
         self._suspended_adapter_id = None
+
+    def _moe_token_lora_mapping(self) -> tuple[LoRAMapping, list[int | None]]:
+        """Build a uniform token mapping for the current adapter state.
+
+        Slot 0 is the no-adapter sentinel. Punica maps it to ``-1``, which sets
+        ``no_lora_flag`` so TRTLLM LoRA experts take the base-model fast path.
+        """
+        max_tokens = self._max_num_batched_tokens
+        if max_tokens is None:
+            raise RuntimeError("MoE LoRA token capacity was not configured")
+        slot = 1 if self._active_adapter_id is not None else 0
+        mapping = LoRAMapping(
+            index_mapping=(slot,) * max_tokens,
+            prompt_mapping=(slot,),
+            is_prefill=False,
+        )
+        lora_index_to_id: list[int | None] = [1] if slot == 1 else [None]
+        return mapping, lora_index_to_id
+
+    def _get_moe_punica_wrapper(self):
+        """Lazily create the shared MoE token-to-slot mapping."""
+        if self._moe_punica_wrapper is not None:
+            return self._moe_punica_wrapper
+        from vllm.lora.punica_wrapper import get_punica_wrapper
+
+        max_tokens = self._max_num_batched_tokens
+        if max_tokens is None:
+            raise RuntimeError("MoE LoRA token capacity was not configured")
+        # GPU Punica requires LoRAConfig; also pass it to NPU.
+        lora_config = LoRAConfig(
+            max_lora_rank=self._max_lora_rank,
+            max_loras=1,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+        punica = get_punica_wrapper(max_tokens, max_batches=1, device=self.device, lora_config=lora_config)
+        mapping, lora_index_to_id = self._moe_token_lora_mapping()
+        punica.update_metadata(mapping, lora_index_to_id, 1, 0)
+        self._moe_punica_wrapper = punica
+        return punica
+
+    def _publish_moe_lora_context(self) -> None:
+        """Publish weight buffers and enablement through each MoE wrapper's mapping.
+
+        Republish after buffer reallocation so kernels reference the current tensors.
+        Refresh the punica token mapping so baseline (no adapter) and adapted
+        forwards select the matching TRTLLM path, or detach the context entirely
+        while idle on runners that treat its presence as the LoRA switch.
+        """
+        from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+
+        moe_wrappers = [ll for ll in self._lora_modules.values() if isinstance(ll, FusedMoEWithLoRA)]
+        if not moe_wrappers:
+            return
+        if self._active_adapter_id is None:
+            # Decide per wrapper, since one process can mix kernels. Kernels
+            # that branch on "a context is published" rather than on the punica
+            # no-adapter flag (Triton, Ascend) must have it detached while
+            # idle, or every baseline step pays the LoRA path for a zero delta.
+            # Only TRT-LLM requires the slot-0 mapping, and takes its own fast
+            # path from it. Anything we cannot detach keeps the mapping too.
+            needs_context = []
+            for lora_layer in moe_wrappers:
+                if moe_lora_kernel_requires_context(lora_layer) or not detach_moe_lora_context(lora_layer):
+                    needs_context.append(lora_layer)
+            detached = len(moe_wrappers) - len(needs_context)
+            if detached:
+                logger.debug("Detached idle MoE LoRA context on %d wrapper(s)", detached)
+            if not needs_context:
+                return
+            moe_wrappers = needs_context
+        punica = self._get_moe_punica_wrapper()
+        mapping, lora_index_to_id = self._moe_token_lora_mapping()
+        punica.update_metadata(mapping, lora_index_to_id, 1, 0)
+        for lora_layer in moe_wrappers:
+            lora_layer.set_mapping(punica)
+        logger.debug("Published MoE LoRA context on %d wrapper(s)", len(moe_wrappers))
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
         if self._is_active_at_scale(adapter_id, scale):
@@ -853,6 +1205,7 @@ class DiffusionLoRAManager:
                     lora_layer.resume_lora()
             self._suspended_adapter_id = None
             self._active_adapter_id = adapter_id
+            self._publish_moe_lora_context()
             logger.debug("Re-armed suspended adapter %d", adapter_id)
             return
 
@@ -870,6 +1223,8 @@ class DiffusionLoRAManager:
         self._suspended_adapter_id = None
         try:
             self._bind_adapter_weights(lora_model, scale)
+            # Publish after binding so kernels see the current weight buffers.
+            self._publish_moe_lora_context()
             create_merged = getattr(self.pipeline, "_create_diffusion_merged_lora", None)
             if bank is None and callable(create_merged):
                 bank = create_merged(lora_model=lora_model, modules=self._lora_modules, scale=scale)
@@ -884,11 +1239,19 @@ class DiffusionLoRAManager:
             if bank is not None:
                 bank.close()
             self._reset_lora_layers()
+            # Roll back to the no-adapter mapping: the token mapping is derived
+            # from ``_active_adapter_id``, which is still None here.
+            self._publish_moe_lora_context()
             raise
 
         self._active_adapter_id = adapter_id
         self._active_scale = scale
         self._update_adapter_scale(adapter_id, scale)
+        # Republish now that the adapter state is committed. The mapping is
+        # derived from ``_active_adapter_id``, so the publish inside ``try``
+        # still binds slot 0; without this the MoE kernels would keep taking
+        # the no-LoRA path and silently skip the expert contribution.
+        self._publish_moe_lora_context()
 
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
@@ -902,6 +1265,7 @@ class DiffusionLoRAManager:
             lora_layer.suspend_lora()
         self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
+        self._publish_moe_lora_context()
         logger.debug("All adapters deactivated")
 
     def _evict_for_new_adapter(self) -> None:

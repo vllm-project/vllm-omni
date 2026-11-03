@@ -22,8 +22,10 @@ observed baseline and selection limits. CUDA retains cuDNN and CUDA RNG.
 NPU calibration does not establish CUDA thresholds.
 
 Normal execution enforces the user-selected bounds in thresholds.json with one
-reference generation. Set QWEN_IMAGE_21_CALIBRATE=1 to generate two references
-and collect calibration evidence without enforcing bounds; this reports XFAIL.
+reference generation. A documented expected-XFAIL profile still executes both
+runtimes and retains metrics/artifacts, but does not claim a pixel-accuracy pass.
+Set QWEN_IMAGE_21_CALIBRATE=1 to generate two references and collect calibration
+evidence without enforcing bounds; this reports XFAIL.
 """
 
 from __future__ import annotations
@@ -112,6 +114,26 @@ def _reference(request_path: Path, output: Path, *, preflight: bool, repeats: in
     return json.loads((output / "reference_preflight.json").read_text(encoding="utf-8"))
 
 
+def _source_provenance() -> dict[str, str]:
+    try:
+        return {
+            "git_head": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+            ).strip(),
+            "git_status": subprocess.check_output(
+                ["git", "status", "--short"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+            ),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        buildkite_commit = os.environ.get("BUILDKITE_COMMIT")
+        if not buildkite_commit:
+            raise RuntimeError("Cannot identify the tested source: no Git checkout or BUILDKITE_COMMIT") from None
+        return {
+            "git_head": buildkite_commit,
+            "git_status": "unavailable: repository metadata is not mounted",
+        }
+
+
 def _native(request: dict, output: Path) -> None:
     payload = {
         "prompt": request["prompt"],
@@ -134,8 +156,7 @@ def _native(request: dict, output: Path) -> None:
             "serve_args": serve_args,
             "request": payload,
             "python": sys.executable,
-            "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-            "git_status": subprocess.check_output(["git", "status", "--short"], cwd=ROOT, text=True),
+            **_source_provenance(),
             "versions": {name: version(name) for name in ("vllm", "diffusers", "torch", "transformers", "Pillow")},
         },
     )
@@ -180,7 +201,7 @@ def _scores(prediction: Image.Image, reference: Image.Image) -> dict[str, float]
 
 
 @pytest.mark.parametrize("case_name", ["it2i", "t2i"])
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level: str, case_name: str) -> None:
     """Own both generations and fresh artifacts; no prerequisite test or old output reuse."""
     assert run_level == "full_model", "Accuracy requires --run-level full_model"
@@ -191,10 +212,16 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     policy = json.loads((HERE / "thresholds.json").read_text(encoding="utf-8"))
     bounds = policy[case_name]
     write_json_artifact(output / "threshold_policy.json", policy)
-    device_type = current_omni_platform.device_type
+    device_type = "rocm" if current_omni_platform.is_rocm() else current_omni_platform.device_type
     device = device_preflight(device_type)
     device_name = device["device"]
     profile = resolve_device_profile(device_name, profiles=bounds)
+    xfail_profiles = policy.get("expected_xfail", {}).get(case_name, {})
+    xfail_profile = resolve_device_profile(device_name, profiles=xfail_profiles)
+    expected_xfail = xfail_profiles.get(xfail_profile)
+    if expected_xfail:
+        assert isinstance(expected_xfail, str) and expected_xfail
+        assert f"{xfail_profile}.{case_name}" in policy["calibration_notes"]
     if not calibration:
         assert policy["status"] == "selected", (
             "No user-selected Qwen-Image 2.1 gate. Select bounds in thresholds.json after calibration; "
@@ -300,6 +327,8 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
             "profile": profile,
             "threshold_status": policy["status"],
             "resolved_bounds": bounds.get(profile, bounds["default"]),
+            "expected_xfail_profile": xfail_profile if expected_xfail else None,
+            "expected_xfail_reason": expected_xfail,
             "calibration_only": calibration,
             "reference_generations": reference_repeats,
             "representation": "RGBA uint8 / 255, no compositing or resizing",
@@ -312,6 +341,8 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     )
     if calibration:
         pytest.xfail(f"Calibration collected; thresholds were not enforced. Metrics: {output / 'metrics.json'}")
+    if expected_xfail:
+        pytest.xfail(f"{expected_xfail} Metrics: {output / 'metrics.json'}")
     assert selected is not None
     assert_similarity_metrics(
         model_name=f"Qwen-Image 2.1 {case_name}; artifacts: {output}",
