@@ -411,6 +411,9 @@ class LingBotSelfAttention(nn.Module):
                     max_query_len=query.shape[1],
                     max_seq_len=visible_key.shape[1],
                     softmax_scale=self.head_dim**-0.5,
+                    npu_lengths=(query.shape[1], visible_key.shape[1])
+                    if query.device.type == "npu"
+                    else None,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
@@ -1331,6 +1334,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            if hidden_states.device.type == "npu":
+                # prepare() already owns these exact valid lengths on the CPU.
+                # Keep them forward-local: max_seq_len includes padded capacity.
+                lengths = (int(forward_context.query_len), int(forward_context.kv_len))
+                cache.self_attention = [entry._replace(npu_lengths=lengths) for entry in cache.self_attention]
         sp_size = self.blocks[0].self_attn.ulysses_world_size
         global_tokens = patched_frames * tokens_per_frame
         hidden_dim = hidden_states.shape[-1]
