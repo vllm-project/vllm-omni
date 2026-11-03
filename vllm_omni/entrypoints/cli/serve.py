@@ -709,6 +709,17 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "On by default; disable with --no-enable-cfg-batching. Not used with "
+                "cfg-parallel or a cache backend."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",
