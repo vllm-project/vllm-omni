@@ -297,7 +297,7 @@ def test_run_stage_chain_returns_speech(omni_server, run_level: str) -> None:
 def test_run_stage_chain_across_single_stage_servers(run_level: str) -> None:
     """Ensure servers that each run one stage chain /v1/run calls into the speech."""
     request_config = {"input": get_prompt(), "voice": "vivian", "response_format": "wav"}
-    # NOTE: Start the servers one at a time to avoid hanging from clearing the GPU memory.
+    # NOTE: Start the servers one at a time to avoid waiting for the other server's GPU memory to clear.
     with _single_stage_server(0, run_level) as talker:
         first = requests.post(
             f"http://{talker.host}:{talker.port}/v1/run",

@@ -12,7 +12,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
-# StageMetadata defaults for tests, whose values may be overridden on per test deepcopies.
+# StageMetadata defaults for tests, whose values may be overridden on per-test deep copies.
 _DEFAULT_STAGE_METADATA = StageMetadata(
     stage_id=0,
     stage_type="llm",

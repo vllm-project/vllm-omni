@@ -2874,8 +2874,8 @@ class OrchestratorBase:
         if pinned_replica_id is not None:
             next_pool.bind_request_to_replica(req_id, pinned_replica_id)
         route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
-        # Only kill the engine if this isn't a run request and the next pool has
-        # no replicas that we can forward to (i.e., died while in flight).
+        # Fail the request if the next stage has no live replica to forward to (i.e., they died
+        # while it was in flight), unless it yields here instead, as /v1/run calls do.
         if req_state.yield_stage_id != src_stage_id and not next_pool.live_replica_ids():
             await self._fail_request_dead_stage(req_id, next_logical)
             return

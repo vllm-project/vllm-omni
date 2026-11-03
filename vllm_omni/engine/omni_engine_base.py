@@ -174,9 +174,9 @@ class OmniEngineBase:
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
         # ------------------------------------------------------------------ #
-        # Currently this code is pretty confusing, but single_stage_mode
-        # really means distributed mode, where each process runs one stage
-        # and registers with the master server.
+        # single_stage_mode means distributed mode, where each process runs one
+        # stage and registers with the master server. A stage_id without a master
+        # runs only that stage in this process instead.
         # TODO (Alex): Rename single stage mode vars throughout the code
         self._omni_master_address: str | None = kwargs.get("omni_master_address")
         self._omni_master_port: int | None = kwargs.get("omni_master_port")
