@@ -5,6 +5,7 @@
 import gc
 import importlib
 import sys
+import weakref
 from dataclasses import replace
 
 import msgspec
@@ -202,6 +203,89 @@ def _cancel(control):
 def test_cancel_unclaimed_export():
     with spawn_workers((_cancel, ())) as workers:
         receive(workers[0][1], "closed")
+
+
+def _partial_import_spec(api):
+    return api.WeightSpec(
+        "failure-test", "revision", "final", tuple(api.TensorSpec(name, "float32", (32,)) for name in ("a", "b"))
+    )
+
+
+def _partial_import_provider(control):
+    api, backend, context = _runtime()
+    weights = {name: torch.arange(32, dtype=torch.float32, device="npu:0") for name in ("a", "b")}
+    sources = [weakref.ref(tensor) for tensor in weights.values()]
+    exported = backend.prepare_export(weights, _partial_import_spec(api), context)
+    del weights
+    control.send(backend.claim_export(exported))
+    receive(control, "failed")
+    assert backend.release_export(exported).status == "HELD"
+    backend.mark_failed(exported)
+    assert backend.release_export(exported).status == "POISONED"
+    gc.collect()
+    assert all(source() is not None for source in sources)
+    control.send("checked")
+    receive(control, "exit")  # Keep provider allocations alive until the consumer exits.
+
+
+def _partial_import_consumer(control):
+    api, backend, context = _runtime()
+    payload = receive(control)
+    original_import = backend._codec.import_storage
+    rebuilt = []
+    uncertain = []
+
+    def import_storage(descriptor, device_index):
+        carrier = original_import(descriptor, device_index)
+        rebuilt.append(weakref.ref(carrier))
+        if len(rebuilt) == 2:
+            # The native rebuild consumed the counter before the injected error.
+            # Retain its uncertain result until this process terminates.
+            uncertain.append(carrier)
+            raise RuntimeError("injected failure after NPU rebuild")
+        return carrier
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(backend._codec, "import_storage", import_storage)
+        with pytest.raises(api.WeightSharingError) as error:
+            backend.open_import(payload, _partial_import_spec(api), context)
+        assert error.value.poisoned
+        assert isinstance(error.value.__cause__, RuntimeError)
+        assert str(error.value.__cause__) == "injected failure after NPU rebuild"
+        del error  # Do not let the exception traceback keep the first mapping alive.
+        gc.collect()
+        snapshot = backend.session_status(context.identity.session_id)
+        assert snapshot.state == api.SessionState.POISONED
+        assert snapshot.imported_storage_ids == ("storage-0",)
+        assert snapshot.active_storage_id == "storage-1"
+        assert len(rebuilt) == 2 and len(uncertain) == 1
+        record = backend._sessions[snapshot.session_id]
+        assert record.result is None  # No import receipt was produced.
+        assert record.carriers["storage-0"] is rebuilt[0]()
+        assert len(record.leases) == 1 and not record.leases[0].expired()
+        result = backend.close_import(snapshot.session_id)
+        assert result.status == "POISONED" and result.receipt is None and not result.local_complete
+        with pytest.raises(api.WeightSharingError, match="reused"):
+            backend.open_import(payload, _partial_import_spec(api), context)
+        assert len(rebuilt) == 2  # Re-import must not call the native rebuilder again.
+        assert record.carriers["storage-0"] is rebuilt[0]()
+        first = record.carriers["storage-0"].view(torch.float32)
+        torch.testing.assert_close(first.cpu(), torch.arange(32, dtype=torch.float32))
+        control.send("checked")
+        receive(control, "exit")
+
+
+def test_partial_import_failure_retains_real_npu_mapping():
+    with spawn_workers((_partial_import_provider, ()), (_partial_import_consumer, ())) as workers:
+        (_, provider), (consumer_process, consumer) = workers
+        consumer.send(receive(provider))
+        receive(consumer, "checked")
+        provider.send("failed")
+        receive(provider, "checked")
+        consumer.send("exit")
+        consumer_process.join(timeout=45)
+        assert consumer_process.exitcode == 0
+        provider.send("exit")
 
 
 def _unsupported(kind, control):

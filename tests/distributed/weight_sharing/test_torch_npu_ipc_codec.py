@@ -35,7 +35,7 @@ def _args():
         False,
         b"counter",
         7,
-        b"event",
+        b"e" * 64,
         True,
     )
 
@@ -93,6 +93,10 @@ def test_reject_unknown_reducer_abi(codec_module, contracts, index, value):
         {"handle": b"x" * 4097},
         {"ref_counter_handle": b""},
         {"event_handle": b""},
+        {"event_handle": b"e"},
+        {"event_handle": b"e" * 63},
+        {"event_handle": b"e" * 65},
+        {"event_handle": b"e" * 4096},
         {"event_sync_required": 1},
     ],
 )
@@ -102,6 +106,14 @@ def test_reject_bad_descriptor_before_native_import(codec_module, contracts, mon
     monkeypatch.setitem(sys.modules, "torch_npu.multiprocessing.reductions", None)
     with pytest.raises((contracts.CompatibilityError, contracts.UnsupportedError)):
         codec_module.TorchNpuIpcCodec().import_storage(descriptor, 0)
+
+
+def test_unused_event_handle_does_not_require_cann_event_size(codec_module):
+    args = list(_args())
+    args[13:15] = [b"unused", False]
+    descriptor = codec_module._encode_reduction(tuple(args), "s", 64)
+    assert descriptor.event_handle == b"unused"
+    assert not descriptor.event_sync_required
 
 
 @pytest.mark.parametrize("device", [-1, True, "0"])

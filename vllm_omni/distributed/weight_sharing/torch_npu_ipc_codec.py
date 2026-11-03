@@ -20,6 +20,7 @@ from .contracts import CompatibilityError, PreparedWeights, SessionContext, Stor
 from .torch_cuda_ipc_codec import TorchCudaIpcCodec, _allocator_segments, _describe_bindings, _native_blocks
 
 _CODEC_ID = "npu-ipc-v1"
+_ACL_IPC_EVENT_HANDLE_SIZE = 64
 
 
 def _device_uuid(device_index: int) -> str:
@@ -69,6 +70,8 @@ def _validate_descriptor(descriptor: StorageExport) -> None:
         raise CompatibilityError("invalid NPU IPC handle")
     if type(descriptor.event_sync_required) is not bool:
         raise CompatibilityError("invalid NPU IPC event state")
+    if descriptor.event_sync_required and len(descriptor.event_handle) != _ACL_IPC_EVENT_HANDLE_SIZE:
+        raise CompatibilityError("NPU IPC event handle must match CANN's 64-byte ABI")
 
 
 def _encode_reduction(args: tuple[object, ...], storage_id: str, nbytes: int) -> StorageExport:
@@ -116,6 +119,8 @@ class TorchNpuIpcCodec(TorchCudaIpcCodec):
         _validate_runtime(context)
         if torch_npu.npu.memory.get_allocator_backend() != "native":
             raise UnsupportedError("only the native torch_npu caching allocator is supported")
+        segments = _allocator_segments(torch_npu.npu.memory._snapshot())
+        blocks = _native_blocks([s for s in segments if s.get("is_expandable") is False], context.device_index)
         for name, tensor in bindings.items():
             if not isinstance(tensor, torch.Tensor) or tensor.device != torch.device("npu", context.device_index):
                 raise CompatibilityError(f"binding is not on the session's NPU device: {name}")
@@ -123,18 +128,13 @@ class TorchNpuIpcCodec(TorchCudaIpcCodec):
             # and stride cannot reconstruct padded/tiled internal formats.
             if str(torch_npu.get_npu_format(tensor)) not in ("ND", "NCHW"):
                 raise UnsupportedError(f"only ND/NCHW NPU formats are supported: {name}")
-        prepared = _describe_bindings(bindings, spec)
-        segments = _allocator_segments(torch_npu.npu.memory._snapshot())
-        blocks = _native_blocks([s for s in segments if s.get("is_expandable") is False], context.device_index)
-        for carrier in prepared.carriers.values():
-            assert isinstance(carrier, torch.Tensor)
-            storage = carrier.untyped_storage()
+            storage = tensor.untyped_storage()
             if storage.nbytes() and (not storage.resizable() or blocks.get(storage.data_ptr(), 0) < storage.nbytes()):
                 raise UnsupportedError(
                     "storage must belong to a live native allocation outside private pools; "
                     "create weights with PYTORCH_NPU_ALLOC_CONF=expandable_segments:False"
                 )
-        return prepared
+        return _describe_bindings(bindings, spec)
 
     def validate_runtime(self, context: SessionContext) -> None:
         # The consumer maps provider-owned memory; its allocator need not match.
