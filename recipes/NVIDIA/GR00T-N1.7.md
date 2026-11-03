@@ -31,7 +31,7 @@ keys (`eef_9d`, `gripper_position`, `joint_position`) with action horizon 40.
 - OS: Linux
 - Python: 3.11+
 - Driver / runtime: NVIDIA CUDA
-- Hardware: 1 NVIDIA GPU. The upstream model card lists 16 GB+ VRAM for inference (e.g. RTX 4090, L40, H100); in practice this serving path uses ~6 GiB peak (bf16, TP=1, `max_num_seqs: 1`).
+- Hardware: 1 NVIDIA GPU. The upstream model card lists 16 GB+ VRAM for inference (e.g. RTX 4090, L40, H100); in practice this serving path uses ~6 GiB peak (bf16, TP=1, `max_num_seqs: 1`), and about 6.3 GiB with `max_num_seqs: 8`.
 - vLLM-Omni version or commit: use versions from your current checkout
 
 ## Start server
@@ -49,22 +49,52 @@ vllm serve nvidia/GR00T-N1.7-3B \
 
 Notes:
 
-- Only `max_num_seqs: 1` is supported (configured in the deploy YAML). The
-  policy is markovian (`state_history_length=1`, `reset()` returns `{}`) — the
-  reason for the cap is that `Gr00tPolicy` does its own per-sample
-  (un)batching inside `get_action` and is not integrated with vLLM's
-  continuous batching path.
+- The bundled deploy YAML serves one request at a time (`max_num_seqs: 1`).
+  To serve several robots from one GPU, see
+  [Serving several robots](#serving-several-robots).
 - This pipeline is a thin wrapper around the upstream HF policy
   (`AutoModel.from_pretrained` + `enforce_eager`, `tensor_parallel_size=1`,
   pipeline `load_weights` is a no-op). The standard diffusion accelerators
   (SP, CFG, TeaCache, VAE tiling) do not transfer to a flow-matching action
-  policy at batch size 1, so a native-kernel port is intentionally out of
+  policy, so a native-kernel port is intentionally out of
   scope for this recipe — the value is the OpenPI serving integration, not
   kernel-level acceleration.
 - The WebSocket endpoint is `ws://127.0.0.1:8000/v1/realtime/robot/openpi`.
   The server handshake message (first frame after connect) is a msgpack-encoded
   dict with `action_horizon`, `action_keys`, `embodiment_tag`, and
   `needs_session_id`.
+
+## Serving several robots
+
+The pipeline supports request-level batching. Requests that arrive together are
+served by one policy call, and each request keeps its own seed. Raise
+`max_num_seqs` and give the scheduler a short wait so concurrent closed-loop
+clients land in the same batch:
+
+```yaml
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    request_batch_max_wait_ms: 20
+```
+
+Measured on 1x RTX PRO 6000 Blackwell with N closed-loop OpenPI clients (eager,
+40 requests per client):
+
+| Clients | `max_num_seqs: 1` | `max_num_seqs: 8`, wait 20 ms |
+| --- | --- | --- |
+| 1 | 9.7 req/s, 103 ms | 9.2 req/s, 109 ms |
+| 2 | 9.9 req/s, 201 ms | 15.4 req/s, 130 ms |
+| 4 | 9.8 req/s, 406 ms | 23.9 req/s, 167 ms |
+| 8 | 9.9 req/s, 798 ms | 28.5 req/s, 277 ms |
+
+Without the wait, two clients alternate and rarely share a batch. With a single
+robot, keep the bundled config: the wait only adds latency.
+
+Batched actions are not bit-identical to the same request served alone: bf16
+kernels change with the batch size, which moves actions by up to about 0.02 for
+`joint_position` and 0.09 for `gripper_position`. Changing the seed moves them
+much more (about 0.09 and 0.53).
 
 ## Verification
 
