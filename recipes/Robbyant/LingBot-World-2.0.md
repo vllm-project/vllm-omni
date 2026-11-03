@@ -73,13 +73,29 @@ This experimental mode stores the final noisy probe's KV rather than clean
 `x0` KV, so generated outputs can differ. The four denoising steps, chunk
 boundaries, and paged-context finalization remain the same.
 
-## Experimental NPU host lengths
+## Experimental NPU primitives
 
-Set `model_config.lingbot_npu_host_lengths: true` to pass the singleton
-forward's CPU-owned valid query/KV lengths to NPU paged attention without
-per-layer device reads. The default is `false`. Padded block-table capacity
-must not be used as the valid length. This option does not require a compile
-backend; NPU correctness and performance validation remain necessary.
+Two independent, default-disabled `model_config` options are available for
+device validation. Neither requires the proposed MindIE-SD compile backend:
+
+```yaml
+model_config:
+  lingbot_npu_host_lengths: false
+  lingbot_npu_fused_rmsnorm: false
+```
+
+`lingbot_npu_host_lengths` passes the singleton forward's valid query/KV
+lengths from the CPU context to NPU paged attention, avoiding per-layer
+device-to-host length reads. Padded block-table capacity is not a valid KV
+length. CUDA/ROCm keep their existing custom-op schema. The non-paged replay
+path uses the visible tensor lengths instead.
+
+`lingbot_npu_fused_rmsnorm` selects `torch_npu.npu_rms_norm` for BF16/FP16 NPU
+projections at TP1. It normalizes across the flattened projection width,
+not separately within each attention head. TP greater than one and other
+devices/dtypes retain the original global-square-sum implementation. Different
+reduction/rounding can change outputs; enabling the flag requires numerical
+and full-session quality validation, not just successful inference.
 
 ## Experimental Ascend SP8 output paths
 

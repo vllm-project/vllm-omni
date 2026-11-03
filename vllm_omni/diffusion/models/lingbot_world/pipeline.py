@@ -613,8 +613,9 @@ class LingBotWorldCausalDMDPipeline(
         self.od_config = od_config
         model_config = getattr(od_config, "model_config", None) or {}
         npu_host_lengths = model_config.get("lingbot_npu_host_lengths", False)
-        if type(npu_host_lengths) is not bool:
-            raise ValueError("lingbot_npu_host_lengths must be a boolean")
+        npu_fused_rmsnorm = model_config.get("lingbot_npu_fused_rmsnorm", False)
+        if type(npu_host_lengths) is not bool or type(npu_fused_rmsnorm) is not bool:
+            raise ValueError("lingbot_npu_host_lengths and lingbot_npu_fused_rmsnorm must be booleans")
         from vllm_omni.diffusion.models.lingbot_world.pixel_output import validate_mode
 
         self._lingbot_pixel_output_mode = validate_mode(model_config.get("lingbot_npu_pixel_output_mode", "native"))
@@ -690,8 +691,8 @@ class LingBotWorldCausalDMDPipeline(
             quant_config=getattr(od_config, "quantization_config", None),
             prefix="transformer",
         )
-        if npu_host_lengths:
-            self.transformer.configure_npu_optimizations(host_lengths=npu_host_lengths)
+        if npu_host_lengths or npu_fused_rmsnorm:
+            self.transformer.configure_npu_optimizations(host_lengths=npu_host_lengths, fused_rmsnorm=npu_fused_rmsnorm)
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         _validate_scheduler_config(scheduler_config)

@@ -101,6 +101,7 @@ class _LingBotRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.eps = eps
+        self.npu_fused = False
         self.weight = nn.Parameter(torch.ones(hidden_size))
         set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
@@ -123,6 +124,13 @@ class _LingBotRMSNorm(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         tp_size = get_tensor_model_parallel_world_size()
+        if (
+            self.npu_fused
+            and tp_size == 1
+            and value.device.type == "npu"
+            and value.dtype in (torch.float16, torch.bfloat16)
+        ):
+            return self._forward_npu(value)
         value_float = value.float()
         sum_of_squares = value_float.pow(2).sum(dim=-1, keepdim=True)
         element_count = value.shape[-1]
@@ -131,6 +139,13 @@ class _LingBotRMSNorm(nn.Module):
             element_count *= tp_size
         rms = torch.sqrt(sum_of_squares / element_count + self.eps)
         return (value_float / rms * self.weight.float()).to(value.dtype)
+
+    def _forward_npu(self, value: torch.Tensor) -> torch.Tensor:
+        # Normalize the flat TP-local projection, NOT each 128-D head. TP>1
+        # must retain the global-square-sum all-reduce in forward().
+        import torch_npu
+
+        return torch_npu.npu_rms_norm(value, self.weight, epsilon=self.eps)[0]
 
 
 def _projection_prefix(prefix: str, name: str) -> str:
@@ -1012,13 +1027,20 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         buffer.copy_(projection)
         return buffer
 
-    def configure_npu_optimizations(self, *, host_lengths: bool = False) -> None:
-        """Enable singleton NPU host metadata before capture or compilation."""
-        if type(host_lengths) is not bool:
+    def configure_npu_optimizations(self, *, host_lengths: bool = False, fused_rmsnorm: bool = False) -> None:
+        """Enable experimental providers without changing checkpoint parameters.
+
+        Configure before compilation/capture. Numerical and performance
+        acceptance on the deployment's NPU remains a separate requirement.
+        """
+        if type(host_lengths) is not bool or type(fused_rmsnorm) is not bool:
             raise ValueError("LingBot NPU optimization options must be booleans")
         self.npu_host_lengths = host_lengths
         for block in self.blocks:
             block.self_attn.npu_host_lengths = host_lengths
+        for module in self.modules():
+            if isinstance(module, _LingBotRMSNorm):
+                module.npu_fused = fused_rmsnorm
 
     @property
     def dtype(self) -> torch.dtype:
