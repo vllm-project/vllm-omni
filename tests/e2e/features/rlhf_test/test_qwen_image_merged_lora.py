@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generate with a Qwen-Image policy delivered as adapter-only CUDA IPC."""
 
+import time
 from contextlib import ExitStack
 
 import numpy as np
@@ -72,14 +73,20 @@ async def test_qwen_image_merged_lora_changes_and_restores_generation():
         await engine.init_weight_transfer_engine({"packed": False})
         torch.accelerator.reset_peak_memory_stats()
         memory_before = (torch.accelerator.memory_allocated(), torch.accelerator.memory_reserved())
+        update_started = time.perf_counter()
         await _publish(engine, [(f"{prefix}.lora_A.weight", a), (f"{prefix}.lora_B.weight", b)])
+        update_seconds = time.perf_counter() - update_started
         memory_after = (
             torch.accelerator.memory_allocated(),
             torch.accelerator.memory_reserved(),
             torch.accelerator.max_memory_allocated(),
             torch.accelerator.max_memory_reserved(),
         )
-        print(f"Qwen-Image merged IPC HBM before={memory_before} after/peak={memory_after}", flush=True)
+        print(
+            f"Qwen-Image merged IPC HBM before={memory_before} after/peak={memory_after} "
+            f"update_seconds={update_seconds:.3f}",
+            flush=True,
+        )
         assert weight.data_ptr() == pointer
         assert not torch.equal(weight, base)
         merged = await generate("merged_lora_active")

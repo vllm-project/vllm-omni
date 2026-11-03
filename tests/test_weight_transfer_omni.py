@@ -107,6 +107,30 @@ def test_ar_merged_backend_rejects_runtime_lora_before_model_load():
         worker.load_model()
 
 
+def test_ar_merged_finish_failure_uses_pinned_worker_cleanup(monkeypatch):
+    from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+
+    from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+
+    engine = object.__new__(MergedLoRAIPCWeightTransferEngine)
+    engine.reset_weight_update_target = MagicMock()
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.weight_transfer_engine = engine
+    worker._weight_update_active = True
+    worker._end_weight_update = lambda **kwargs: pytest.fail("unpinned private vLLM cleanup called")
+
+    def fail_finish(self):
+        raise RuntimeError("rank vote failed")
+
+    monkeypatch.setattr(GPUWorker, "finish_weight_update", fail_finish)
+    with pytest.raises(RuntimeError, match="rank vote failed"):
+        worker.finish_weight_update()
+
+    assert worker._weight_update_active is False
+    engine.reset_weight_update_target.assert_called_once_with()
+
+
 # --- Diffusion stage: implemented on DiffusionWorker ---
 
 

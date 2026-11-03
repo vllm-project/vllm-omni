@@ -55,6 +55,7 @@ class MergedLinearWeights:
             ValueError: A weight layout or computed value is unsupported.
         """
         prepared = dict(self._base)
+        finite_checks: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
         for name, layer in modules.items():
             active = layer._diffusion_lora_active_slices
             if not any(active):
@@ -81,14 +82,24 @@ class MergedLinearWeights:
                     merged[offset : offset + rows].add_(delta * scale)
                 offset += rows
             value = merged.to(dtype=weight.dtype)
-            if not torch.isfinite(value).all():
-                raise ValueError(f"Merged LoRA produced non-finite weights for {name}")
+            finite_checks.setdefault(value.device, []).append((name, torch.isfinite(value).all()))
             prepared[name] = value
+
+        # One device-to-host synchronization per device instead of branching on
+        # one CUDA scalar for every target projection.
+        for checks in finite_checks.values():
+            if not torch.stack([finite for _, finite in checks]).all().item():
+                failed_name = next(name for name, finite in checks if not finite.item())
+                raise ValueError(f"Merged LoRA produced non-finite weights for {failed_name}")
         return prepared
 
     @torch.no_grad()
     def apply(self, prepared: dict[str, torch.Tensor], group: torch.distributed.ProcessGroup | None = None) -> None:
         """Install prepared values in place, rolling back a failed copy.
+
+        Rollback snapshots stay on the host to cap transient HBM use. This
+        intentionally adds one device-to-host copy per committed update; the
+        model-level E2E tests report its update latency alongside peak memory.
 
         Args:
             prepared: Values returned by ``prepare`` on this bank.

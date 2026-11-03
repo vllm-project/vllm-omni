@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise real Qwen3-Omni generation around adapter-only IPC updates."""
 
+import time
 from contextlib import ExitStack
 
 import pytest
@@ -69,9 +70,15 @@ async def test_qwen3_omni_merged_lora_ipc_preserves_graph_storage_and_restores_o
         await engine.init_weight_transfer_engine(dict(IPC_INIT_INFO))
         memory_before = await engine.collective_rpc("merged_memory_probe", kwargs={"reset": True}, stage_ids=[0])
 
+        update_started = time.perf_counter()
         await _publish_adapter(engine, [(f"{prefix}.lora_A.weight", a), (f"{prefix}.lora_B.weight", b)])
+        update_seconds = time.perf_counter() - update_started
         memory_after = await engine.collective_rpc("merged_memory_probe", stage_ids=[0])
-        print(f"Qwen3-Omni merged IPC HBM before={memory_before} after={memory_after}", flush=True)
+        print(
+            f"Qwen3-Omni merged IPC HBM before={memory_before} after={memory_after} "
+            f"update_seconds={update_seconds:.3f}",
+            flush=True,
+        )
         (after_merge,) = await engine.collective_rpc("merged_q_projection", stage_ids=[0])
         assert after_merge[0]["data_ptr"] == projection["data_ptr"]
         assert after_merge[0]["sample"] != projection["sample"]

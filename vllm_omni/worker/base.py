@@ -161,12 +161,17 @@ class OmniGPUWorkerBase(GPUWorker):
             return res
 
     def finish_weight_update(self) -> None:
-        """End failed merged sessions so the trainer can publish a new adapter."""
+        """End failed merged sessions so the trainer can publish a new adapter.
+
+        Keep this cleanup on the public worker/engine lifecycle: the vLLM
+        version pinned by vLLM-Omni does not provide ``_end_weight_update``.
+        """
         try:
             super().finish_weight_update()
         except Exception:
             if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
-                self._end_weight_update(refresh=False)
+                self._weight_update_active = False
+                self.weight_transfer_engine.reset_weight_update_target()
             raise
 
     def remove_lora(self, lora_id: int) -> bool:

@@ -90,6 +90,22 @@ def test_failed_prepare_leaves_previous_policy_live(failure):
         torch.testing.assert_close(layer.base_layer.weight, value, rtol=0, atol=0)
 
 
+def test_prepare_batches_finite_checks_per_device(monkeypatch):
+    modules = {"first": _layer(), "second": _layer()}
+    item = torch.Tensor.item
+    item_calls = 0
+
+    def count_item(tensor, *args, **kwargs):
+        nonlocal item_calls
+        item_calls += 1
+        return item(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "item", count_item)
+    MergedLinearWeights().prepare(modules)
+
+    assert item_calls == 1
+
+
 def test_copy_failure_restores_every_previously_written_weight(monkeypatch):
     modules = {"first": _layer(), "second": _layer()}
     bank = MergedLinearWeights()
