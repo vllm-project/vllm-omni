@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
@@ -92,6 +93,17 @@ class LogicalStageInitPlan:
     stage_idx: int
     stage_id: int
     replicas: list[ReplicaInitPlan]
+    # Defaults to the first replica's, so only plans without replicas must pass it.
+    metadata: StageMetadata | None = None
+    stage_vllm_config: VllmConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.metadata is not None:
+            return
+        if not self.replicas:
+            raise ValueError(f"Stage {self.stage_id} has no replicas, so its plan must be given metadata")
+        self.metadata = self.replicas[0].metadata
+        self.stage_vllm_config = self.replicas[0].stage_vllm_config
 
 
 def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
@@ -1649,7 +1661,7 @@ def build_llm_stage_output_processor(
     --log-stats CLI flag plumbed through AsyncOmniEngine.
     """
 
-    metadata = plan.replicas[0].metadata
+    metadata = plan.metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
         tokenizer = None
     else:

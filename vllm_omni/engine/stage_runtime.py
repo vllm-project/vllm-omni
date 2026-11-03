@@ -972,6 +972,8 @@ class StageRuntime:
                     stage_idx=stage_idx,
                     stage_id=stage_id,
                     replicas=replicas,
+                    metadata=base_metadata,
+                    stage_vllm_config=stage_vllm_config,
                 )
             )
 
@@ -1439,11 +1441,10 @@ class StageRuntime:
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
-            metadata = plan.replicas[0].metadata
             # Initialize watermarkers based on the output type as needed
-            watermarkers = StagePool.initialize_watermarkers(metadata.final_output_type, self._watermark_config)
-            if metadata.stage_type != "diffusion":
-                stage_vllm_config = plan.replicas[0].stage_vllm_config
+            watermarkers = StagePool.initialize_watermarkers(plan.metadata.final_output_type, self._watermark_config)
+            if plan.metadata.stage_type != "diffusion":
+                stage_vllm_config = plan.stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
                 output_processor = build_llm_stage_output_processor(
