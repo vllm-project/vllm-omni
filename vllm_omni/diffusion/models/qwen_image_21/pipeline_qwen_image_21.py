@@ -233,14 +233,26 @@ def get_qwen_image_21_pre_process_func(
             if metadata is not None:
                 request.sampling_params.height = metadata["height"]
                 request.sampling_params.width = metadata["width"]
-            request.batch_compatibility_key = ("qwen_image_21", tuple(tuple(size) for size in sizes))
+            request.batch_compatibility_key = (
+                "qwen_image_21",
+                tuple(tuple(size) for size in sizes),
+                request.sampling_params.max_sequence_length,
+                (metadata or {}).get(
+                    "has_negative_conditioning", (conditioning or {}).get("negative_prompt_embeds") is not None
+                ),
+            )
             request.prompt = prompt
             return request
 
         if isinstance(raw_image, tuple):
             raw_image = list(raw_image)
         if raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0):
-            request.batch_compatibility_key = ("qwen_image_21", ())
+            request.batch_compatibility_key = (
+                "qwen_image_21",
+                (),
+                request.sampling_params.max_sequence_length,
+                request.sampling_params.true_cfg_scale > 1 and prompt.get("negative_prompt") is not None,
+            )
             request.prompt = prompt
             return request
 
@@ -284,7 +296,12 @@ def get_qwen_image_21_pre_process_func(
         prompt["additional_information"]["input_image_sizes"] = input_image_sizes
         prompt["additional_information"]["calculated_height"] = calculated_height
         prompt["additional_information"]["calculated_width"] = calculated_width
-        request.batch_compatibility_key = ("qwen_image_21", tuple(input_image_sizes))
+        request.batch_compatibility_key = (
+            "qwen_image_21",
+            tuple(input_image_sizes),
+            request.sampling_params.max_sequence_length,
+            request.sampling_params.true_cfg_scale > 1 and prompt.get("negative_prompt") is not None,
+        )
         request.prompt = prompt
         return request
 
@@ -1330,8 +1347,26 @@ class QwenImage21Pipeline(
             num_outputs_per_prompt=num_images_per_prompt,
         )
 
+    @staticmethod
+    def _validate_stage_batch_settings(batch: DiffusionRequestBatch, fields: tuple[str, ...]) -> None:
+        """Reject incompatible direct callers before running shared model computation.
+
+        RequestScheduler groups all these sampling fields. Atomic E/D calls
+        under StepScheduler additionally validate the fields they consume.
+        """
+        if not batch.requests:
+            return
+        first = batch.sampling_params_list[0]
+        for sampling in batch.sampling_params_list[1:]:
+            for field in fields:
+                if getattr(sampling, field) != getattr(first, field):
+                    raise ValueError(f"QwenImage21 stage batch requires matching {field}.")
+
     def encode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        """Encode the compatible batch together, then split conditioning by request."""
+        """Encode compatible requests together, then retain each request's geometry."""
+        if not batch.requests:
+            return []
+        self._validate_stage_batch_settings(batch, ("height", "width", "max_sequence_length", "true_cfg_scale"))
         prompt, negative_prompt = self._extract_prompts(batch.prompts)
         sampling = batch.sampling_params_list[0]
         height, width = normalize_min_aligned_size(
@@ -1350,9 +1385,7 @@ class QwenImage21Pipeline(
             generator=batch.collate_request_generators(max(sampling.num_outputs_per_prompt, 1), None),
         )
         outputs = []
-        for index in range(batch.num_reqs):
-            # Keep the batch's sequence padding and masks, as in forward().
-            # Image latents are a list of slots, each with a leading batch axis.
+        for index, request in enumerate(batch.requests):
             request_conditioning = {
                 key: value[index : index + 1] if isinstance(value, torch.Tensor) else value
                 for key, value in conditioning.items()
@@ -1361,6 +1394,11 @@ class QwenImage21Pipeline(
                 request_conditioning["image_latents"] = [
                     image[index : index + 1] for image in conditioning["image_latents"]
                 ]
+            height, width = normalize_min_aligned_size(
+                request.sampling_params.height or OUTPUT_RESOLUTION,
+                request.sampling_params.width or OUTPUT_RESOLUTION,
+                self.vae_scale_factor * 2,
+            )
             outputs.append(
                 DiffusionOutput(
                     custom_output={
@@ -1369,46 +1407,95 @@ class QwenImage21Pipeline(
                             "height": height,
                             "width": width,
                             "input_image_sizes": conditioning["input_image_sizes"],
+                            "has_negative_conditioning": conditioning["negative_prompt_embeds"] is not None,
                         },
                     }
                 )
             )
         return outputs
 
+    def _collate_stage_conditioning(self, batch: DiffusionRequestBatch) -> dict[str, Any]:
+        """Right-pad text sequences and concatenate request rows for native DiT batching."""
+        rows = [self._stage_conditioning(request.prompt) for request in batch.requests]
+        result = dict(rows[0])
+        for prefix in ("", "negative_"):
+            fields = tuple(prefix + suffix for suffix in ("prompt_embeds", "prompt_embeds_mask", "image_pad_mask"))
+            present = [row[fields[0]] is not None for row in rows]
+            if not any(present):
+                continue
+            if not all(present):
+                raise ValueError("QwenImage21 stage batch requires matching negative conditioning availability.")
+            length = max(row[fields[0]].shape[1] for row in rows)
+            for field in fields:
+                padded = []
+                for row in rows:
+                    value = row[field].to(self.device)
+                    padding = (0, 0, 0, length - value.shape[1]) if value.ndim == 3 else (0, length - value.shape[1])
+                    padded.append(F.pad(value, padding))
+                result[field] = torch.cat(padded, dim=0)
+        sizes = result["input_image_sizes"]
+        if any(row["input_image_sizes"] != sizes for row in rows):
+            raise ValueError("QwenImage21 stage batch requires matching condition image sizes.")
+        if result["image_latents"] is not None:
+            result["image_latents"] = [
+                torch.cat([row["image_latents"][slot].to(self.device) for row in rows], dim=0)
+                for slot in range(len(sizes))
+            ]
+        return result
+
     def diffuse_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        """Consume complete upstream conditioning and return packed target latents."""
-        outputs = []
-        for request in batch.requests:
-            conditioning = self._stage_conditioning(request.prompt)
-            latents, height, width, _ = self._generate_latents(
-                DiffusionRequestBatch(requests=[request]), conditioning=conditioning
+        """Denoise the scheduler batch in one native DiT call, preserving row order."""
+        if not batch.requests:
+            return []
+        self._validate_stage_batch_settings(
+            batch,
+            (
+                "height",
+                "width",
+                "max_sequence_length",
+                "true_cfg_scale",
+                "num_outputs_per_prompt",
+                "num_inference_steps",
+                "sigmas",
+            ),
+        )
+        conditioning = self._collate_stage_conditioning(batch)
+        latents, height, width, num_outputs = self._generate_latents(batch, conditioning=conditioning)
+        return [
+            DiffusionOutput(
+                custom_output={
+                    "latents": latents[index * num_outputs : (index + 1) * num_outputs],
+                    "qwen_image_21_metadata": {"height": height, "width": width, "input_image_sizes": []},
+                }
             )
-            outputs.append(
-                DiffusionOutput(
-                    custom_output={
-                        "latents": latents,
-                        "qwen_image_21_metadata": {"height": height, "width": width, "input_image_sizes": []},
-                    }
-                )
-            )
-        return outputs
+            for index in range(batch.num_reqs)
+        ]
 
     def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        """Decode each request's packed target latents using its output geometry."""
-        outputs = []
+        """Decode compatible request latents together through the native VAE path."""
+        if not batch.requests:
+            return []
+        self._validate_stage_batch_settings(batch, ("height", "width", "output_type", "num_outputs_per_prompt"))
+        sampling = batch.sampling_params_list[0]
+        height, width = normalize_min_aligned_size(
+            sampling.height or OUTPUT_RESOLUTION,
+            sampling.width or OUTPUT_RESOLUTION,
+            self.vae_scale_factor * 2,
+        )
+        num_outputs = max(sampling.num_outputs_per_prompt, 1)
+        expected_shape = (
+            num_outputs,
+            height // self.vae_scale_factor * (width // self.vae_scale_factor),
+            self.latent_channels,
+        )
+        latents = []
         for request in batch.requests:
-            latents = DiffusionRequestBatch.get_prompt_field(request.prompt, "latents")
-            sampling = request.sampling_params
-            height, width = normalize_min_aligned_size(
-                sampling.height or OUTPUT_RESOLUTION,
-                sampling.width or OUTPUT_RESOLUTION,
-                self.vae_scale_factor * 2,
-            )
-            expected_shape = (height // self.vae_scale_factor * (width // self.vae_scale_factor), self.latent_channels)
-            if not isinstance(latents, torch.Tensor) or latents.ndim != 3 or latents.shape[1:] != expected_shape:
-                raise ValueError("QwenImage21 DECODE requires packed latents matching the output height and width.")
-            outputs.append(self._decode_latents(latents.to(self.device), height, width, sampling.output_type or "pil"))
-        return outputs
+            value = DiffusionRequestBatch.get_prompt_field(request.prompt, "latents")
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
+                raise ValueError("QwenImage21 DECODE requires packed latents matching the output geometry and count.")
+            latents.append(value.to(self.device))
+        result = self._decode_latents(torch.cat(latents, dim=0), height, width, sampling.output_type or "pil")
+        return split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=num_outputs)
 
     def _prepare_dummy_denoise_payload(self, batch: DiffusionRequestBatch) -> None:
         """Supply the encoder payload absent from a stage-local warmup."""

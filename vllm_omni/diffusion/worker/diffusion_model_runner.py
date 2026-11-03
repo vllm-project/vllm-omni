@@ -1353,29 +1353,22 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if scheduler_output.scheduled_cached_reqs.request_ids:
             raise ValueError("An atomic diffusion stage cannot contain cached stepwise requests.")
 
-        runner_outputs: list[RunnerOutput] = []
-        for new_req in scheduler_output.scheduled_new_reqs:
-            try:
-                result = self.execute_model(
-                    new_req.req,
-                    diffusion_kv_metadata=new_req.diffusion_kv_metadata,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Atomic step-stage execution failed for %s",
-                    new_req.request_id,
-                    exc_info=True,
-                )
-                result = DiffusionOutput.from_exception(exc)
-            runner_outputs.append(
-                RunnerOutput(
-                    request_id=new_req.request_id,
-                    step_index=0,
-                    finished=True,
-                    result=result,
-                )
+        # Atomic stages use the same compatible batch and transport setup as
+        # request mode; only their terminal step bookkeeping differs.
+        try:
+            output = self.execute_model_batch(scheduler_output, self.od_config)
+        except Exception as exc:
+            logger.error("Atomic step-stage batch execution failed", exc_info=True)
+            output = BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(request_id=request.request_id, result=DiffusionOutput.from_exception(exc))
+                    for request in scheduler_output.scheduled_new_reqs
+                ]
             )
-        return BatchRunnerOutput.from_list(runner_outputs)
+        for request_output in output.runner_outputs:
+            request_output.step_index = 0
+            request_output.finished = True
+        return output
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""

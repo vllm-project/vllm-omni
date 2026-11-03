@@ -110,7 +110,12 @@ def test_encode_batch_preserves_encoder_batch_and_request_conditioning(mocker, i
                 assert torch.all(image == 10 * index + slot)
         else:
             assert conditioning["image_latents"] is None
-        assert payload["qwen_image_21_metadata"] == {"height": 64, "width": 96, "input_image_sizes": sizes}
+        assert payload["qwen_image_21_metadata"] == {
+            "height": 64,
+            "width": 96,
+            "input_image_sizes": sizes,
+            "has_negative_conditioning": use_cfg,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -485,3 +490,75 @@ def test_postprocess_envelope_normalizes_non_dict_metadata(postprocess):
     result = postprocess({"payload": {"image": torch.rand(1, 4, 16, 16)}, "metadata": "bogus"})
 
     assert result["metadata"] == {}
+
+
+@pytest.mark.parametrize(
+    "field,value", [("height", 96), ("width", 128), ("true_cfg_scale", 3), ("max_sequence_length", 128)]
+)
+def test_encode_rejects_incompatible_direct_batch_before_encoding(mocker, field, value):
+    pipeline = _toy_pipeline()
+    requests = [
+        OmniDiffusionRequest(
+            request_id=str(i),
+            prompt="text",
+            sampling_params=OmniDiffusionSamplingParams(height=64, width=64, true_cfg_scale=1),
+        )
+        for i in range(2)
+    ]
+    setattr(requests[1].sampling_params, field, value)
+    encode = mocker.patch.object(pipeline, "_encode_conditioning")
+    with pytest.raises(ValueError, match=field):
+        pipeline.encode_batch(DiffusionRequestBatch(requests=requests))
+    encode.assert_not_called()
+
+
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_stage_generator_and_decoder_use_native_batches(mocker, num_outputs):
+    from vllm_omni.diffusion.data import DiffusionOutput
+
+    pipeline = _toy_pipeline()
+    pipeline.device = torch.device("cpu")
+    rows = []
+    requests = []
+    for i, length in enumerate((2, 3)):
+        rows.append(
+            {
+                "version": 1,
+                "prompt_embeds": torch.full((1, length, 4), float(i + 1)),
+                "prompt_embeds_mask": torch.ones(1, length),
+                "image_pad_mask": torch.zeros(1, length, dtype=torch.bool),
+                "negative_prompt_embeds": None,
+                "negative_prompt_embeds_mask": None,
+                "negative_image_pad_mask": None,
+                "image_latents": [torch.full((1, 4, 1, 2, 2), float(i + 10))],
+                "input_image_sizes": [(32, 32)],
+            }
+        )
+        requests.append(
+            OmniDiffusionRequest(
+                request_id=str(i),
+                prompt={"row": i},
+                sampling_params=OmniDiffusionSamplingParams(height=64, width=64, num_outputs_per_prompt=num_outputs),
+            )
+        )
+    mocker.patch.object(pipeline, "_stage_conditioning", side_effect=lambda p: rows[p["row"]])
+    packed = torch.arange(2 * num_outputs, dtype=torch.float32).view(-1, 1, 1).expand(-1, 16, 4)
+    generate = mocker.patch.object(pipeline, "_generate_latents", return_value=(packed, 64, 64, num_outputs))
+    batch = DiffusionRequestBatch(requests=requests)
+    outputs = pipeline.diffuse_batch(batch)
+    generate.assert_called_once()
+    assert generate.call_args.args[0] is batch
+    conditioning = generate.call_args.kwargs["conditioning"]
+    assert conditioning["prompt_embeds"].shape == (2, 3, 4)
+    assert conditioning["prompt_embeds_mask"].tolist() == [[1, 1, 0], [1, 1, 1]]
+    assert conditioning["image_latents"][0][:, 0, 0, 0, 0].tolist() == [10, 11]
+    for i, output in enumerate(outputs):
+        torch.testing.assert_close(output.custom_output["latents"], packed[i * num_outputs : (i + 1) * num_outputs])
+        requests[i].prompt = output.custom_output
+    decoded = torch.arange(2 * num_outputs, dtype=torch.float32).view(-1, 1, 1, 1)
+    decode = mocker.patch.object(pipeline, "_decode_latents", return_value=DiffusionOutput(output=decoded))
+    outputs = pipeline.decode_batch(batch)
+    decode.assert_called_once()
+    torch.testing.assert_close(decode.call_args.args[0], packed)
+    for i, output in enumerate(outputs):
+        torch.testing.assert_close(output.output, decoded[i * num_outputs : (i + 1) * num_outputs])

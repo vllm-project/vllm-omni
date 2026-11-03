@@ -202,4 +202,33 @@ def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess)
     assert isinstance(prompt_image, Image.Image)
     (width, height) = info["input_image_sizes"][0]
     assert prompt_image.size == (width, height)
-    assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),))
+    assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),), None, False)
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+@pytest.mark.parametrize(
+    "field,value",
+    [("height", 512), ("width", 768), ("true_cfg_scale", 3.0), ("max_sequence_length", 128)],
+)
+def test_scheduler_separates_stage_sampling_settings(preprocess, scheduler_class, field, value):
+    first = preprocess(make_request("first", []))
+    second = make_request("second", [])
+    setattr(second.sampling_params, field, value)
+    second = preprocess(second)
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    assert scheduler.schedule().scheduled_request_ids == ["first"]
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+def test_scheduler_separates_missing_negative_conditioning(preprocess, scheduler_class):
+    first, second = make_request("first", []), make_request("second", [])
+    first.sampling_params.true_cfg_scale = second.sampling_params.true_cfg_scale = 3.0
+    second.prompt["negative_prompt"] = "blurry"
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+    scheduler.add_request(preprocess(first))
+    scheduler.add_request(preprocess(second))
+    assert scheduler.schedule().scheduled_request_ids == ["first"]

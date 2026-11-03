@@ -177,6 +177,7 @@ class _DecodedStagePipeline(_DenoiseOnlyStagePipeline):
 
 
 class _AtomicStagePipeline(DiffusionStageMixin):
+    supports_request_batch = True
     device = torch.device("cpu")
 
     def __init__(self, role, *, step_execution=True):
@@ -745,10 +746,13 @@ def test_execute_stepwise_uses_atomic_stage_capability(monkeypatch, role):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    second = OmniDiffusionRequest(
+        prompt="another", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1), request_id="atomic-second"
+    )
     scheduler_output = DiffusionSchedulerOutput(
         step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_new_reqs=[NewRequestData(request_id=r.request_id, req=r) for r in (request, second)],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_running_reqs=1,
         num_waiting_reqs=0,
@@ -758,8 +762,9 @@ def test_execute_stepwise_uses_atomic_stage_capability(monkeypatch, role):
     assert runner.pipeline.stage_uses_step_execution is False
     result = runner.execute_stepwise(scheduler_output).get_request_output(request.request_id)
 
-    assert runner.pipeline.calls == [(role.value, [request.request_id])]
+    assert runner.pipeline.calls == [(role.value, [request.request_id, second.request_id])]
     assert result.finished is True
+    assert result.step_index == 0
     assert result.result.error is None
     assert runner.state_cache == {}
 

@@ -228,7 +228,9 @@ request-batch support.
 The runner preserves the scheduler's request batch for every diffusion stage
 role and passes it to `run_stage()`. Role permissions do not force a batch into
 single-request calls. Each pipeline operation consumes the batch and returns
-one output per request under the same request-batch support contract.
+one output per request under the same request-batch support contract. Atomic encode/decode stages under step
+scheduling reuse `execute_model_batch()` and mark each result terminal; they do
+not run `execute_model()` separately for each admitted request.
 
 **Distributed layerwise offload with AllGather (DLO DP concurrency)** is a
 separate dispatch path supported by `mp` and `ray`. It activates when

@@ -312,11 +312,21 @@ The Qwen-Image 2.1 preprocessor accepts condition images under either
 the single-reference form used by the multistage OpenAI image-edit path;
 both forms must produce the same VLM and VAE conditioning before stage handoff.
 
-An ENCODE operation encodes compatible requests together using the native
-batch conditioning path, then splits embeddings, masks and each condition-image
-latent into one payload per request. Sequence padding is retained in those
-payloads. BF16 encoding can depend on batch shape, so output comparisons should
-use the same encoder batches as the full pipeline.
+Stage batches must share output geometry, CFG scale, maximum text length,
+output count and the operation's other shared sampling settings. Request-mode
+scheduling already compares the public sampling fields; Qwen's condition key
+also includes maximum text length and negative-conditioning availability for
+step-mode atomic stages. Direct incompatible stage batches fail before model
+computation rather than inheriting the first request's settings.
+
+ENCODE encodes compatible requests together and splits conditioning with each
+request's geometry. DENOISE right-pads upstream text conditions and calls the
+native DiT path once for the compatible batch; DECODE concatenates packed
+latents and calls the VAE once, then splits outputs in request order. Atomic
+E/D stages under step scheduling also preserve the scheduled batch. This
+supports batch execution when the scheduler actually admits multiple compatible
+requests; `max_num_seqs` alone does not guarantee a full batch. BF16 results can
+still depend on actual batch composition.
 
 ## Parameters
 
