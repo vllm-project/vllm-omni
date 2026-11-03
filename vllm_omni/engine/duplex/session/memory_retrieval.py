@@ -9,10 +9,7 @@ from unicodedata import normalize
 from vllm_omni.engine.duplex.memory_types import DuplexMemoryCardHead, DuplexMemoryEvidenceSpan
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
-
-_STOP_WORDS = frozenset(
-    "a an the is are was were i my me you your user self what which where when do does did in of to and please".split()
-)
+from vllm_omni.engine.duplex.session.memory_lexical import lexemes as _lexemes
 
 
 @dataclass(frozen=True)
@@ -23,18 +20,6 @@ class DuplexRetrievedCard:
     sources: tuple[DuplexSourceRef, ...]
     text: str = field(repr=False)
     score: tuple[int, int]
-
-
-def _lexemes(text: str) -> frozenset[str]:
-    words = "".join(char if char.isalnum() else " " for char in normalize("NFKC", text).casefold()).split()
-    terms = set(words).difference(_STOP_WORDS)
-    for word in words:
-        terms.update(
-            word[index : index + 2]
-            for index in range(len(word) - 1)
-            if all("\u3400" <= char <= "\u9fff" for char in word[index : index + 2])
-        )
-    return frozenset(terms)
 
 
 def retrieve_memory_cards(
@@ -71,7 +56,7 @@ def retrieve_memory_cards(
         text = node.message.get("content")
         if not isinstance(text, str):
             continue
-        score = (int(metadata.fact_key in query), len(terms.intersection(_lexemes(metadata.fact_key + " " + text))))
+        score = (int(metadata.fact_key in query), len(terms.intersection(ledger.card_lexemes(node.node_id))))
         if score == (0, 0):
             continue
         ranked.append(

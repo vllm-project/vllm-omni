@@ -408,6 +408,14 @@ and evidence-order floor, so deleting a replacement cannot restore its predecess
 and freshly re-extracting older evidence cannot overwrite a later fact.
 
 Lexical retrieval refreshes source validity before selecting bounded candidates.
+Normalized terms may be retained for active immutable card nodes within their
+own session. Retirement and source invalidation release the corresponding
+terms; closing a session releases the index and disables further retention.
+The index is lazy, does not replace source validation, and does not share
+historical text between sessions.
+Retained term objects have a per-session 4 MiB accounting budget; candidates
+beyond it are scored without caching. The bounded mapping and Python allocator
+overheads are separate, so this is not a process memory limit.
 Pending corrections are session-owned barriers, scoped to known keys or all cards
 when the affected key is unknown. Explicit reconciliation must cover the captured
 trigger text and every required key; an empty extraction does not clear a barrier.

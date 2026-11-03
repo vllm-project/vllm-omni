@@ -481,6 +481,7 @@ class DuplexEngineSession:
     def begin_close(self, *, reason: str) -> bool:
         """Make close irreversible while retaining stage resources for cleanup retry."""
         self.accept_fence(self.fence)
+        self._context_ledger.close_retrieval_cache()
         if self.lease.terminal_reason is not None:
             return True
         return self.lease.mark_terminal(reason)

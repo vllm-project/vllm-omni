@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
+from sys import getsizeof
 from types import MappingProxyType
 from unicodedata import normalize
 
@@ -20,6 +21,15 @@ from vllm_omni.engine.duplex.memory_types import (
     DuplexMemoryEvidenceSpan,
 )
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
+from vllm_omni.engine.duplex.session.memory_lexical import lexemes
+
+_MAX_CARD_LEXEME_BYTES = 4 * 1024 * 1024
+
+
+def _lexeme_bytes(terms: frozenset[str]) -> int:
+    # Account retained term objects; the mapping is separately bounded by the
+    # card-head limit. This is not a process RSS or allocator-arena limit.
+    return getsizeof(terms) + sum(getsizeof(term) for term in terms)
 
 
 class DuplexContextLevel(IntEnum):
@@ -120,6 +130,9 @@ class DuplexContextLedger:
         self._next_node_id = 1
         self._card_heads: dict[str, DuplexMemoryCardHead] = {}
         self._card_catalog_revision = 0
+        self._card_lexemes: dict[int, frozenset[str]] | None = None
+        self._card_lexeme_bytes = 0
+        self._retrieval_cache_closed = False
 
     @property
     def card_catalog_revision(self) -> int:
@@ -132,6 +145,36 @@ class DuplexContextLedger:
     def card_candidates(self) -> tuple[DuplexContextNode, ...]:
         """Return active cards as of the latest authoritative refresh."""
         return tuple(self._nodes[head.node_id] for head in self._card_heads.values() if head.node_id is not None)
+
+    def card_lexemes(self, node_id: int) -> frozenset[str]:
+        """Reuse terms for an active immutable card after authoritative refresh.
+
+        This index grants no source validity: retrieval must still refresh.
+        Closed-owner diagnostics compute without retaining new terms.
+        """
+        node = self._nodes.get(node_id) if type(node_id) is int and node_id > 0 else None
+        if node is None or node.card is None or node.level is not DuplexContextLevel.MEMORY_CARD:
+            raise DuplexContextNodeRejectedError("memory_card_not_active")
+        head = self._card_heads.get(node.card.fact_key)
+        text = node.message.get("content")
+        if head is None or head.node_id != node_id or not isinstance(text, str):
+            raise DuplexContextNodeRejectedError("memory_card_not_active")
+        if self._card_lexemes is not None and node_id in self._card_lexemes:
+            return self._card_lexemes[node_id]
+        terms = lexemes(node.card.fact_key + " " + text)
+        cost = _lexeme_bytes(terms)
+        if not self._retrieval_cache_closed and self._card_lexeme_bytes + cost <= _MAX_CARD_LEXEME_BYTES:
+            if self._card_lexemes is None:
+                self._card_lexemes = {}
+            self._card_lexemes[node_id] = terms
+            self._card_lexeme_bytes += cost
+        return terms
+
+    def close_retrieval_cache(self) -> None:
+        """Drop derived text terms and disable retention after session close."""
+        self._card_lexemes = None
+        self._card_lexeme_bytes = 0
+        self._retrieval_cache_closed = True
 
     def admit_card_batch(
         self,
@@ -267,6 +310,12 @@ class DuplexContextLedger:
                 if self._media_dropped_by_source.get(source_id) == node_id:
                     del self._media_dropped_by_source[source_id]
             if node.card is not None:
+                if self._card_lexemes is not None:
+                    retired_terms = self._card_lexemes.pop(node_id, None)
+                    if retired_terms is not None:
+                        self._card_lexeme_bytes -= _lexeme_bytes(retired_terms)
+                    if not self._card_lexemes:
+                        self._card_lexemes = None
                 head = self._card_heads[node.card.fact_key]
                 if head.node_id == node_id:
                     self._card_heads[head.fact_key] = DuplexMemoryCardHead(
