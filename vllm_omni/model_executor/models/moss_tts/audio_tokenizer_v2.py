@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -30,8 +31,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_utils import PreTrainedAudioTokenizerBase
 from transformers.utils import ModelOutput, auto_docstring, logging
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 from .configuration_moss_audio_tokenizer_v2 import MossAudioTokenizerConfig
+from .triton_launch import cuda_pdl_launch_kwargs
 
 logger = logging.get_logger(__name__)
 
@@ -200,6 +204,21 @@ class StreamingExecutionContext:
     state_slot_ids: torch.Tensor
     valid_rows: torch.Tensor
     attention_metadata: StreamingAttentionMetadata | None = None
+    # One transformer's ``rope_angles`` result, shared by its layers, whose
+    # per-slot offsets advance together.
+    rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Packed decode (see ``packed_codec``): one (1, N) sequence holding a
+    # segment of ``segment_frames`` code frames per stream, in order; row ``s``
+    # of ``state_slot_ids``/``valid_rows`` belongs to segment ``s``.
+    segment_frames: torch.Tensor | None = None
+    segment_starts: torch.Tensor | None = None  # first frame of each segment
+    frame_segments: torch.Tensor | None = None  # segment of each frame, (N,)
+    # Set by a transformer for its layers: token lengths, token starts and
+    # the attention program table at that transformer's token rate.
+    packed_stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    # Set with ``packed_stage`` when the transformer advances its layers'
+    # offsets itself: every segment's offset, equal in all of its layers.
+    packed_offsets: torch.Tensor | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -356,6 +375,64 @@ def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
 # =============================================================================
 
 
+def _rope_angles(
+    offset: torch.Tensor,
+    batch: int,
+    num_frames: int,
+    head_dim: int,
+    max_period: float,
+    time_before_heads: bool,
+    device: torch.device,
+    freqs_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """fp32 rotation angles, (B, T, 1, D/2) or (B, 1, T, D/2)."""
+    if freqs_cache is None:
+        ds = torch.arange(head_dim // 2, device=device, dtype=torch.float32)
+        freqs_cache = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+    ts = offset.float().view(-1, 1) + torch.arange(num_frames, device=device, dtype=torch.float32)
+    return freqs_cache * (ts.view(batch, -1, 1, 1) if time_before_heads else ts.view(batch, 1, -1, 1))
+
+
+@torch.library.custom_op("vllm_omni::moss_codec_rope_angles", mutates_args=())
+def rope_angles(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)``, each (B, 1, T, D/2) fp32, as ``apply_rope`` computes them.
+
+    Opaque to Inductor on purpose: a materialized table is shared by many
+    layers instead of being recomputed inside every rotation kernel.
+    """
+    angles = _rope_angles(offset, offset.shape[0], num_frames, head_dim, max_period, False, offset.device, freqs_cache)
+    return torch.cos(angles), torch.sin(angles)
+
+
+@rope_angles.register_fake
+def _(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (offset.shape[0], 1, num_frames, head_dim // 2)
+    return offset.new_empty(shape, dtype=torch.float32), offset.new_empty(shape, dtype=torch.float32)
+
+
+@torch.library.custom_op("vllm_omni::moss_codec_rope_angles_at", mutates_args=())
+def rope_angles_at(positions: torch.Tensor, head_dim: int, max_period: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)``, each (1, N, 1, D/2) fp32, at absolute token ``positions`` (N,).
+
+    The packed-decode table: the angle of a token equals ``rope_angles``' for
+    its stream offset plus its index in the chunk (integers exact in fp32).
+    """
+    ds = torch.arange(head_dim // 2, device=positions.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+    angles = freqs * positions.float().view(1, -1, 1, 1)
+    return torch.cos(angles), torch.sin(angles)
+
+
+@rope_angles_at.register_fake
+def _(positions: torch.Tensor, head_dim: int, max_period: float) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (1, positions.shape[0], 1, head_dim // 2)
+    return positions.new_empty(shape, dtype=torch.float32), positions.new_empty(shape, dtype=torch.float32)
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -363,6 +440,7 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
     freqs_cache: torch.Tensor | None = None,
+    table: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -380,6 +458,13 @@ def apply_rope(
     returned tensors are **not** interchangeable between the two paths — callers
     must not mix NPU and non-NPU outputs.  Result is bf16-equivalent (max
     ``max_abs_diff <= 1 ULP``).  Falls back to the eager path on non-NPU.
+
+    When ``table`` is provided (precomputed by the parent ``Transformer.forward``
+    via ``rope_angles`` and shared across all layers within that block), the
+    per-layer cos/sin computation is skipped on both the NPU and the eager
+    path -- one computation per transformer block instead of one per layer
+    (~86 redundant dispatches removed for a 92-layer / 6-block decoder, ~15x
+    reduction per block on NPU).
     """
     if time_before_heads:
         B, T, H, D = q.shape
@@ -390,24 +475,17 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    if freqs_cache is not None:
-        freqs = freqs_cache
-    else:
-        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
-
-    if time_before_heads:
-        ts = ts.view(B, -1, 1, 1)
-    else:
-        ts = ts.view(B, 1, -1, 1)
-
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
         torch_npu = _get_torch_npu()
 
-        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
-        sin_d2 = torch.sin(freqs * ts)
+        if table is not None:
+            # Precomputed by ``rope_angles`` for these offsets: same values.
+            cos_d2, sin_d2 = table
+        else:
+            angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+            cos_d2 = torch.cos(angles)  # (..., 1, T, D//2)
+            sin_d2 = torch.sin(angles)
         # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
         cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
@@ -432,8 +510,13 @@ def apply_rope(
     qr, qi = q[..., 0].float(), q[..., 1].float()
     kr, ki = k[..., 0].float(), k[..., 1].float()
 
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
+    if table is not None:
+        # Precomputed by ``rope_angles`` for these offsets: same values.
+        rotr, roti = table
+    else:
+        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+        rotr = torch.cos(angles)
+        roti = torch.sin(angles)
 
     qor = qr * rotr - qi * roti
     qoi = qr * roti + qi * rotr
@@ -472,10 +555,11 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         k: torch.Tensor,
         offset: torch.Tensor,
         time_before_heads: bool = False,
+        table: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         D = q.shape[-1]
         freqs = self._get_freqs(D, q.device)  # noqa: N806
-        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs)
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs, table=table)
 
 
 # =============================================================================
@@ -823,6 +907,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         self._register_load_state_dict_pre_hook(self._load_hook, with_module=True)
 
+        self._cached_attn_bias: torch.Tensor | None = None
+
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
         mappings = {
@@ -896,9 +982,12 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         key: torch.Tensor,
         value: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
+        if execution_context is not None and execution_context.packed_stage is not None:
+            return self._forward_packed(query, state, execution_context)
         metadata = execution_context.attention_metadata if execution_context is not None else None
 
         if state is None:
@@ -919,11 +1008,18 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         projected = apply_weights_per_step(self.in_projs, self.weights_per_step_schedule, query, offset_cpu)
         dim_per_head = self.embed_dim // self.num_heads
-        projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head).permute(2, 0, 3, 1, 4)
-        q, k, v = projected[0], projected[1], projected[2]
-
-        if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+        projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head)
+        table = execution_context.rope_table if execution_context is not None and self.rope else None
+        if table is not None and projected.is_cuda:
+            # One kernel rotates Q and K in place from the stage's shared table.
+            rope_qk_(projected, *table)
+            projected = projected.permute(2, 0, 3, 1, 4)
+            q, k, v = projected[0], projected[1], projected[2]
+        else:
+            projected = projected.permute(2, 0, 3, 1, 4)
+            q, k, v = projected[0], projected[1], projected[2]
+            if self.rope:
+                q, k = self.rope(q, k, offset, time_before_heads=False, table=table)
 
         slot_attention = getattr(self, "_slot_attention", None)
         slot_attention_rows = getattr(self, "_slot_attention_rows", None)
@@ -969,42 +1065,47 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             )
         else:
             k, v, pos_k = self._complete_kv(k, v, execution_context)
-            pos_k = pos_k[:, None]
 
-            if metadata is not None:
-                attn_bias = metadata.attn_bias
-                streaming_attention = getattr(self, "_streaming_attention", None)
-            elif self.causal:
-                # Reuse cached arange(T) — keyed by (device, T) so that changing
-                # T never frees a previous allocation (CUDA graph safety: a
-                # captured graph bakes in the pointer, so storage must live as
-                # long as the module and all captured graphs).
-                cache_key = (q.device, T)
-                if cache_key not in self._arange_t_cache:
-                    self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
-                pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
-                delta = pos_q - pos_k
-                # Build mask directly in the convention needed by the active path.
-                # SDPA / streaming_attention use True=attend; npu_fusion_attention
-                # uses True=masked.  On NPU we construct the inverted mask directly
-                # (avoids a ~attn_bias allocation + kernel per layer per step).
-                is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
-                streaming_attention = getattr(self, "_streaming_attention", None)
-                use_npu_path = is_npu and streaming_attention is None
-                if use_npu_path:
-                    # NPU convention: True = masked (inverted)
-                    attn_bias = (pos_k < 0) | (delta < 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias | (delta >= self.context)
-                    attn_bias = attn_bias[:, None]
+            if attn_bias is None:
+                pos_k = pos_k[:, None]
+                if metadata is not None:
+                    attn_bias = metadata.attn_bias
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                elif self.causal:
+                    # Reuse cached arange(T) — keyed by (device, T) so that changing
+                    # T never frees a previous allocation (CUDA graph safety: a
+                    # captured graph bakes in the pointer, so storage must live as
+                    # long as the module and all captured graphs).
+                    cache_key = (q.device, T)
+                    if cache_key not in self._arange_t_cache:
+                        self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
+                    pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
+                    delta = pos_q - pos_k
+                    # Build mask directly in the convention needed by the active path.
+                    # SDPA / streaming_attention use True=attend; npu_fusion_attention
+                    # uses True=masked.  On NPU we construct the inverted mask directly
+                    # (avoids a ~attn_bias allocation + kernel per layer per step).
+                    is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = is_npu and streaming_attention is None
+                    if use_npu_path:
+                        # NPU convention: True = masked (inverted)
+                        attn_bias = (pos_k < 0) | (delta < 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias | (delta >= self.context)
+                        attn_bias = attn_bias[:, None]
+                    else:
+                        # SDPA / streaming_attention convention: True = attend
+                        attn_bias = (pos_k >= 0) & (delta >= 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias & (delta < self.context)
+                        attn_bias = attn_bias[:, None]
                 else:
-                    # SDPA / streaming_attention convention: True = attend
-                    attn_bias = (pos_k >= 0) & (delta >= 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias & (delta < self.context)
-                    attn_bias = attn_bias[:, None]
+                    attn_bias = None
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = False
+                self._cached_attn_bias = attn_bias
             else:
-                attn_bias = None
                 streaming_attention = getattr(self, "_streaming_attention", None)
                 use_npu_path = False
 
@@ -1058,6 +1159,55 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 state.offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
                 if advance_kv_offset:
                     state.kv_cache.end_offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
+        return x
+
+    def _forward_packed(
+        self, query: torch.Tensor, state: MHAState | None, context: StreamingExecutionContext
+    ) -> torch.Tensor:
+        """Self-attention over packed streams (see ``MossAudioTokenizerTransformer._forward_packed``)."""
+        from vllm_omni.model_executor.models.moss_tts.slot_attention import slot_ring_flash_attention_packed
+
+        if state is None or state.kv_cache is None or not self.causal or self.weights_per_step or self.rope is None:
+            raise RuntimeError("Packed codec decode needs causal RoPE attention with a ring cache.")
+        assert context.packed_stage is not None and context.rope_table is not None
+        lengths, tok_starts, entry_seg, entry_blk = context.packed_stage
+        _, N = query.shape[:2]
+        slots = context.state_slot_ids
+        hoisted = context.packed_offsets is not None
+        offset = context.packed_offsets if hoisted else state.offset.index_select(0, slots)
+        dim_per_head = self.embed_dim // self.num_heads
+        projected = self.in_projs[0](query).view(1, N, 3, self.num_heads, dim_per_head)
+        # Token-major (1, N, H, D) views keep every stride but the batch one fixed.
+        if projected.is_cuda:
+            cos, sin = context.rope_table
+            rope_qk_(projected, cos.view(1, 1, N, -1), sin.view(1, 1, N, -1))
+            q, k = projected[:, :, 0], projected[:, :, 1]
+        else:
+            q, k = self.rope(
+                projected[:, :, 0], projected[:, :, 1], offset, time_before_heads=True, table=context.rope_table
+            )
+        v = projected[:, :, 2]
+        x = slot_ring_flash_attention_packed(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            state.kv_cache.cache,
+            offset,
+            slots,
+            lengths,
+            tok_starts,
+            entry_seg,
+            entry_blk,
+            self.context if self.context is not None else -1,
+            int(self._packed_block_m),
+            *getattr(self, "_packed_launch", (0, 0, 0)),
+        )
+        x = self.out_projs[0](x.transpose(1, 2).reshape(1, N, self.embed_dim))
+        if hoisted:
+            return x
+        next_offset = torch.where(context.valid_rows, offset + lengths, offset)
+        state.offset.index_copy_(0, slots, next_offset)
+        state.kv_cache.end_offset.index_copy_(0, slots, next_offset)
         return x
 
 
@@ -1170,37 +1320,254 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         if self.gating is None:
             assert self.linear1 is not None
             assert self.linear2 is not None
-            update = self.linear2(self.activation(self.linear1(x)))
+            gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
+            if gelu_bias is not None:
+                # GELU in the up-projection GEMM
+                # epilogue (cuBLASLt, tanh form, applied before bf16 rounding)
+                # instead of a separate pass over the FFN activations. Under
+                # the decoder's bf16 autocast the norm output is FP32; round it
+                # here as autocast does for linear1, so Inductor fuses the cast
+                # into the norm kernel.
+                weight = self.linear1.weight
+                hidden = linear_gelu_epilogue(x.reshape(-1, x.shape[-1]).to(weight.dtype), weight, gelu_bias)
+                update = self.linear2(hidden.view(*x.shape[:-1], hidden.shape[-1]))
+            else:
+                update = self.linear2(self.activation(self.linear1(x)))
         else:
             if self.weights_per_step:
                 assert isinstance(self.gating, nn.ModuleList)
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
+        if isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_2.scale)
         return x_orig.to(update.dtype) + self.layer_scale_2(update)
+
+    def _ff_update(self, x: torch.Tensor) -> torch.Tensor:
+        """The FFN of ``_ff_block`` on already-normalized ``x``, without the residual."""
+        gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
+        if gelu_bias is not None:
+            weight = self.linear1.weight
+            hidden = linear_gelu_epilogue(x.reshape(-1, x.shape[-1]).to(weight.dtype), weight, gelu_bias)
+            return self.linear2(hidden.view(*x.shape[:-1], hidden.shape[-1]))
+        return self.linear2(self.activation(self.linear1(x)))
+
+    @property
+    def fused_norm_ready(self) -> bool:
+        """LayerNorm + layer-scale layer whose residual adds can fuse with its norms."""
+        return (
+            self.gating is None
+            and not self.weights_per_step
+            and isinstance(self.norm1, nn.LayerNorm)
+            and isinstance(self.norm2, nn.LayerNorm)
+            and isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale)
+            and isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale)
+        )
 
     def _sa_block(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         x_orig = x
         x = self.norm1(x)
-        update = self.self_attn(x, x, x, execution_context=execution_context)
+        update = self.self_attn(x, x, x, execution_context=execution_context, attn_bias=attn_bias)
+        if isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_1.scale)
         return x_orig.to(update.dtype) + self.layer_scale_1(update)
 
     def forward(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
-        x = self._sa_block(x, execution_context)
+        x = self._sa_block(x, execution_context, attn_bias)
         x = self._ff_block(x, execution_context)
         state = self._streaming_state
         if state is not None and execution_context is None:
             assert isinstance(state, LayerState)
             state.offset_cpu += x.shape[1]
         return x
+
+
+@torch.library.custom_op("vllm_omni::moss_linear_gelu_epilogue", mutates_args=())
+def linear_gelu_epilogue(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    """``gelu(x @ weight.T)`` with GELU (tanh form) in the cuBLASLt epilogue.
+
+    Custom ops are not autocast-aware, so callers pass ``x`` in the weight
+    dtype; other input is rounded to it here, as autocast would for a GEMM.
+    """
+    return torch._addmm_activation(zero_bias, x.to(weight.dtype), weight.t(), use_gelu=True)
+
+
+@linear_gelu_epilogue.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=weight.dtype)
+
+
+_USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
+
+
+@triton.jit
+def _rope_qk(
+    qkv_ptr,
+    cos_ptr,
+    sin_ptr,
+    frames,
+    s_b,
+    s_t,
+    s_c,
+    s_h,
+    c_b,
+    c_t,
+    H: tl.constexpr,  # noqa: N803
+    BH: tl.constexpr,  # noqa: N803
+    HALF: tl.constexpr,  # noqa: N803
+    USE_PDL: tl.constexpr,  # noqa: N803
+):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    pid = tl.program_id(0)
+    b = pid // frames
+    t = pid - b * frames
+    i = tl.arange(0, HALF)
+    cos = tl.load(cos_ptr + b * c_b + t * c_t + i)
+    sin = tl.load(sin_ptr + b * c_b + t * c_t + i)
+    h = tl.arange(0, BH)
+    mask = (h < H)[:, None]
+    base = qkv_ptr + b.to(tl.int64) * s_b + t.to(tl.int64) * s_t + h[:, None] * s_h + 2 * i[None, :]
+    for c in tl.static_range(2):
+        ptr = base + c * s_c
+        re = tl.load(ptr, mask).to(tl.float32)
+        im = tl.load(ptr + 1, mask).to(tl.float32)
+        tl.store(ptr, (re * cos[None, :] - im * sin[None, :]).to(qkv_ptr.dtype.element_ty), mask)
+        tl.store(ptr + 1, (re * sin[None, :] + im * cos[None, :]).to(qkv_ptr.dtype.element_ty), mask)
+
+
+def rope_qk_(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
+    """``apply_rope`` on Q and K of the projection ``qkv`` (B, T, 3, H, D), in place, one kernel.
+
+    ``cos``/``sin`` are the FP32 (B, 1, T, D/2) table of ``rope_angles``. The
+    rotation is computed in FP32 and rounded once, as ``apply_rope`` does.
+    """
+    B, T, three, H, D = qkv.shape
+    assert three == 3 and qkv.stride(4) == 1 and D % 2 == 0
+    assert cos.shape == (B, 1, T, D // 2) and cos.stride(3) == 1 and sin.stride() == cos.stride()
+    if B * T:
+        _rope_qk[(B * T,)](
+            qkv,
+            cos,
+            sin,
+            T,
+            qkv.stride(0),
+            qkv.stride(1),
+            qkv.stride(2),
+            qkv.stride(3),
+            cos.stride(0),
+            cos.stride(2),
+            H,
+            triton.next_power_of_2(H),
+            D // 2,
+            USE_PDL=_USE_PDL,
+            num_warps=4,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
+        )
+
+
+@triton.jit
+def _add_layer_norm(
+    x_ptr,
+    u_ptr,
+    scale_ptr,
+    w_ptr,
+    b_ptr,
+    res_ptr,
+    out_ptr,
+    N: tl.constexpr,  # noqa: N803
+    eps,
+    BN: tl.constexpr,  # noqa: N803
+    HAS_UPDATE: tl.constexpr,  # noqa: N803
+    HAS_BIAS: tl.constexpr,  # noqa: N803
+    USE_PDL: tl.constexpr,  # noqa: N803
+):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BN)
+    m = cols < N
+    x = tl.load(x_ptr + row * N + cols, m, 0.0).to(tl.float32)
+    if HAS_UPDATE:
+        u = tl.load(u_ptr + row * N + cols, m, 0.0).to(tl.float32)
+        # torch.addcmul(x, update, scale): one rounding to the residual dtype
+        r = (x + u * tl.load(scale_ptr + cols, m, 0.0).to(tl.float32)).to(res_ptr.dtype.element_ty)
+        tl.store(res_ptr + row * N + cols, r, m)
+        x = r.to(tl.float32)
+    mean = tl.sum(x, 0) / N
+    xc = tl.where(m, x - mean, 0.0)
+    y = xc * tl.rsqrt(tl.sum(xc * xc, 0) / N + eps) * tl.load(w_ptr + cols, m, 0.0).to(tl.float32)
+    if HAS_BIAS:
+        y = y + tl.load(b_ptr + cols, m, 0.0).to(tl.float32)
+    tl.store(out_ptr + row * N + cols, y.to(out_ptr.dtype.element_ty), m)
+
+
+def add_layer_norm(
+    x: torch.Tensor, update: torch.Tensor | None, scale: torch.Tensor | None, norm: nn.LayerNorm
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(r, norm(r))`` with ``r = torch.addcmul(x, update, scale)`` (``x`` without an update), one kernel."""
+    N = x.shape[-1]
+    assert x.is_contiguous() and norm.weight is not None and norm.weight.shape == (N,)
+    if update is not None:
+        assert scale is not None and update.is_contiguous() and update.shape == x.shape
+    res = torch.empty_like(x) if update is not None else x
+    out = torch.empty_like(x)
+    if x.numel():
+        _add_layer_norm[(x.numel() // N,)](
+            x,
+            update if update is not None else x,
+            scale if scale is not None else norm.weight,
+            norm.weight,
+            norm.bias if norm.bias is not None else norm.weight,
+            res,
+            out,
+            N,
+            float(norm.eps),
+            triton.next_power_of_2(N),
+            update is not None,
+            norm.bias is not None,
+            USE_PDL=_USE_PDL,
+            num_warps=4 if N <= 2048 else 8,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
+        )
+    return res, out
+
+
+def enable_gelu_epilogue(model: nn.Module) -> int:
+    """Fuse each eligible CUDA FFN GELU into its up-projection GEMM.
+
+    Eligible layers use the plain GELU FFN with a bias-free half-precision
+    CUDA ``linear1``. cuBLASLt's GELU epilogue uses the tanh form on the FP32
+    accumulator, so outputs change at bf16-rounding level (not bitwise).
+    Returns the number of layers switched.
+    """
+    switched = 0
+    for module in model.modules():
+        if not isinstance(module, MossAudioTokenizerTransformerLayer):
+            continue
+        linear1 = module.linear1
+        if module.gating is not None or module.weights_per_step or module.activation is not F.gelu:
+            continue
+        if not isinstance(linear1, nn.Linear) or linear1.bias is not None:
+            continue
+        weight = linear1.weight
+        if weight.device.type != "cuda" or weight.dtype not in (torch.bfloat16, torch.float16):
+            continue
+        module._gelu_epilogue_bias = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        switched += 1
+    return switched
 
 
 # =============================================================================
@@ -1252,7 +1619,7 @@ class MossAudioTokenizerTransformer(StreamingModule):
         self._kv_capacity = context if context is not None else 1024
         self._kv_context = context
         self._kv_causal = causal
-
+        self._head_dim = d_model // num_heads
         self.rope: MossAudioTokenizerRotaryEmbedding | None = None
         if positional_embedding in {"rope", "sin_rope"}:
             self.rope = MossAudioTokenizerRotaryEmbedding(max_period=max_period)
@@ -1273,6 +1640,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
                 )
             )
 
+        self._share_attn_bias: bool = True
+
     def _init_streaming_state(self, batch_size: int) -> TransformerState:
         device = next(self.parameters()).device
         return TransformerState(
@@ -1290,6 +1659,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
             raise RuntimeError("Shared decoder KV pools require explicit execution slots.")
         if execution_context is not None and not isinstance(execution_context, StreamingExecutionContext):
             raise TypeError("execution_context must be a StreamingExecutionContext.")
+        if execution_context is not None and execution_context.segment_frames is not None:
+            return self._forward_packed(x, execution_context)
         if state is None:
             offsets = torch.zeros(1, dtype=torch.long, device=x.device)
         elif not isinstance(state, TransformerState):
@@ -1325,22 +1696,135 @@ class MossAudioTokenizerTransformer(StreamingModule):
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
-        for layer in self.layers:
-            x = layer(x, *args, execution_context=execution_context, **kwargs)
+        if self.rope is not None and execution_context is not None and getattr(self, "_shared_rope", False):
+            # Every layer's attention offset equals these offsets (one reset,
+            # one advance per call), so they share one rotation table.
+            table = rope_angles(
+                offsets, T, self._head_dim, float(self.rope.max_period), self.rope._get_freqs(self._head_dim, x.device)
+            )
+            execution_context = dataclasses.replace(execution_context, rope_table=table)
 
-        if state is not None:
-            assert isinstance(state, TransformerState)
-            if execution_context is None:
-                state.offsets[:] = torch.where(state.exec_mask, state.offsets + T, state.offsets)
-            elif metadata is not None:
-                from .codec_kv_state import commit_offsets
+        if self._fused_norm_ready(x, execution_context):
+            return self._forward_fused_layers(x, state, offsets, metadata, execution_context, T)
 
-                commit_offsets(
-                    metadata.next_offsets, state.offsets, execution_context.state_slot_ids, execution_context.valid_rows
-                )
-            else:
-                next_offsets = torch.where(execution_context.valid_rows, offsets + T, offsets)
-                state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
+        shared_attn_bias: torch.Tensor | None = None
+        try:
+            for i, layer in enumerate(self.layers):
+                if self._share_attn_bias and i == 0:
+                    x = layer(x, *args, attn_bias=None, execution_context=execution_context, **kwargs)
+                    shared_attn_bias = layer.self_attn._cached_attn_bias
+                elif self._share_attn_bias:
+                    x = layer(x, *args, attn_bias=shared_attn_bias, execution_context=execution_context, **kwargs)
+                else:
+                    x = layer(x, *args, attn_bias=None, execution_context=execution_context, **kwargs)
+        finally:
+            for layer in self.layers:
+                layer.self_attn._cached_attn_bias = None
+
+        self._advance_offsets(state, offsets, metadata, execution_context, T)
+        return x
+
+    def _advance_offsets(self, state, offsets, metadata, execution_context, frames: int) -> None:
+        if state is None:
+            return
+        assert isinstance(state, TransformerState)
+        if execution_context is None:
+            state.offsets[:] = torch.where(state.exec_mask, state.offsets + frames, state.offsets)
+        elif metadata is not None:
+            from .codec_kv_state import commit_offsets
+
+            commit_offsets(
+                metadata.next_offsets, state.offsets, execution_context.state_slot_ids, execution_context.valid_rows
+            )
+        else:
+            next_offsets = torch.where(execution_context.valid_rows, offsets + frames, offsets)
+            state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
+
+    def _fused_norm_ready(self, x: torch.Tensor, execution_context) -> bool:
+        if not x.is_cuda or not x.is_contiguous():
+            return False
+        # Layers track a CPU offset only on the slot-less streaming path.
+        if execution_context is None and any(layer._streaming_state is not None for layer in self.layers):
+            return False
+        return len(self.layers) > 0 and all(layer.fused_norm_ready for layer in self.layers)
+
+    def _forward_fused_layers(self, x, state, offsets, metadata, execution_context, frames: int):
+        x = self._fused_layers(x, execution_context)
+        self._advance_offsets(state, offsets, metadata, execution_context, frames)
+        return x
+
+    def _fused_layers(self, x, execution_context):
+        """The layer loop with every residual add fused into the next LayerNorm.
+
+        Per layer: attention on ``norm1(x)``, then one kernel for
+        ``x += ls1 * attn`` and ``norm2``, the FFN, then one kernel for
+        ``x += ls2 * ffn`` and the next layer's ``norm1``.
+        """
+        layers = self.layers
+        x, h = add_layer_norm(x, None, None, layers[0].norm1)
+        shared_attn_bias = None
+        try:
+            for i, layer in enumerate(layers):
+                update = layer.self_attn(h, h, h, execution_context=execution_context, attn_bias=shared_attn_bias)
+                if self._share_attn_bias and i == 0:
+                    shared_attn_bias = layer.self_attn._cached_attn_bias
+                x, h = add_layer_norm(x, update.contiguous(), layer.layer_scale_1.scale, layer.norm2)
+                update = layer._ff_update(h)
+                if i + 1 < len(layers):
+                    x, h = add_layer_norm(x, update.contiguous(), layer.layer_scale_2.scale, layers[i + 1].norm1)
+                else:
+                    x = torch.addcmul(x, update, layer.layer_scale_2.scale)
+        finally:
+            for layer in layers:
+                layer.self_attn._cached_attn_bias = None
+        return x
+
+    def _forward_packed(self, x: torch.Tensor, context: StreamingExecutionContext) -> torch.Tensor:
+        """Packed streams: x is (1, N * f, C), segment ``s`` spans ``f * segment_frames[s]`` tokens.
+
+        ``f`` (``_packed_factor``) is this transformer's tokens per code frame
+        and ``_packed_block_m`` the attention tile of a steady batched chunk
+        at this rate. Valid segments advance their slot offsets like batched
+        rows; padding segments (``valid_rows`` False) keep them.
+        """
+        from vllm_omni.model_executor.models.moss_tts.slot_attention import packed_block_entries
+
+        state = self._streaming_state
+        if not isinstance(state, TransformerState) or self.rope is None or self.positional_embedding != "rope":
+            raise RuntimeError("Packed codec decode needs streaming state and RoPE-only transformers.")
+        f = int(self._packed_factor)
+        block_m = int(self._packed_block_m)
+        assert context.segment_starts is not None and context.frame_segments is not None
+        slots = context.state_slot_ids
+        offsets = state.offsets.index_select(0, slots)
+        lengths = context.segment_frames * f
+        tok_starts = context.segment_starts * f
+        tokens = torch.arange(x.shape[1], device=x.device)
+        segment = context.frame_segments[tokens // f] if f > 1 else context.frame_segments
+        positions = offsets[segment] + (tokens - tok_starts[segment])
+        table = rope_angles_at(positions, self._head_dim, float(self.rope.max_period))
+        entry_seg, entry_blk = packed_block_entries(lengths, block_m, x.shape[1] // block_m + slots.shape[0])
+        # Rows of the decoder's slot-offset storage holding this transformer's
+        # and its layers' offsets (see ``_centralize_decoder_slot_offsets``):
+        # they are equal per slot, so the layers take ``offsets`` and one
+        # launch advances them all.
+        block = getattr(self, "_packed_offset_block", None)
+        context = dataclasses.replace(
+            context,
+            rope_table=table,
+            packed_stage=(lengths, tok_starts, entry_seg, entry_blk),
+            packed_offsets=offsets if block is not None else None,
+        )
+        if self._fused_norm_ready(x, context):
+            x = self._fused_layers(x, context)
+        else:
+            for layer in self.layers:
+                x = layer(x, execution_context=context)
+        next_offsets = torch.where(context.valid_rows, offsets + lengths, offsets)
+        if block is not None:
+            block.index_copy_(1, slots, next_offsets.unsqueeze(0).expand(block.shape[0], -1))
+        else:
+            state.offsets.index_copy_(0, slots, next_offsets)
         return x
 
 
@@ -2009,11 +2493,30 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             device=next(self.parameters()).device,
         )
         row = 0
+        row_of: dict[int, int] = {}
         for state, fields in state_tensors:
             for owner, name in fields:
                 setattr(owner, name, storage[row])
+                row_of[id(getattr(owner, name))] = row
                 row += 1
         self._decoder_slot_offsets = storage
+        # A transformer's offsets and its layers' attention offsets advance
+        # together; when their rows are contiguous, packed decode advances
+        # them with one launch (``MossAudioTokenizerTransformer._forward_packed``).
+        for module in self._streaming_modules:
+            state = module._streaming_state
+            if not isinstance(state, TransformerState):
+                continue
+            rows = [row_of[id(state.offsets)]]
+            for sub in module.modules():
+                sub_state = getattr(sub, "_streaming_state", None)
+                if isinstance(sub_state, MHAState):
+                    rows.append(row_of[id(sub_state.offset)])
+                    if sub_state.kv_cache is not None:
+                        rows.append(row_of[id(sub_state.kv_cache.end_offset)])
+            first, last = min(rows), max(rows)
+            if sorted(rows) == list(range(first, last + 1)):
+                module._packed_offset_block = storage[first : last + 1]
 
     def _stop_streaming(self) -> None:
         """Stop streaming mode for all modules."""
@@ -2021,6 +2524,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             module._streaming_state = None
             if isinstance(module, MossAudioTokenizerTransformer):
                 module._shared_kv_metadata = False
+            module.__dict__.pop("_packed_offset_block", None)
         self._streaming_modules = []
         self._streaming_exec_mask = None
         self._decoder_state_capacity = 0
@@ -2028,7 +2532,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._decoder_null_slot = None
 
     def initialize_decoder_state_pool(
-        self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0
+        self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0, *, packed: bool = False
     ) -> None:
         """Allocate persistent decoder state independently of execution B.
 
@@ -2045,8 +2549,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             )
         if self._streaming_modules:
             raise RuntimeError("MOSS Audio Tokenizer is already streaming.")
-        scratch_capacity = 1
-        self._decoder_null_slot = state_capacity
+        # Packed segments need distinct padding slots and per-layer offsets.
+        # Keep the upstream shared/null-slot pool for ordinary batched decode.
+        if not packed:
+            scratch_capacity = 1
+            self._decoder_null_slot = state_capacity
         for module in self.decoder:
             if not isinstance(module, MossAudioTokenizerProjectedTransformer):
                 continue

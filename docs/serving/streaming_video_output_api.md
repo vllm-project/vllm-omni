@@ -45,7 +45,7 @@ bytes.
 | Server to client | `session.interaction.queued` | Confirms that an interaction was queued |
 | Client to server | `session.ping` | Refreshes the stall clock |
 | Server to client | `session.pong` | Acknowledges a ping |
-| Client to server | `session.stop` | Cancels the active generation |
+| Client to server | `session.stop` | Cancels the active generation; the resulting `session.done` reports `stop_latency_s` |
 | Server to client | `session.done` | Reports completion or cancellation and the chunk count |
 | Server to client | `error` | Reports validation, generation, or timeout failures |
 
@@ -67,6 +67,58 @@ Start a minimal session with:
 Only `m4s` output is currently accepted. Concatenate the binary frames in
 receive order, then remux the fragmented stream if the target player requires
 a progressive MP4 file.
+
+## Playback Backpressure
+
+A compatible single-stage interactive pipeline can pace generation against a
+client playhead. Enable step execution, `streaming_output=True` and
+`max_num_seqs=1`, then include these fields in `session.start`:
+
+```json
+{
+  "streaming_pacing": {
+    "enabled": true,
+    "mode": "client_playhead",
+    "max_lead_ms": 1500,
+    "max_output_bytes": 67108864,
+    "idle_timeout_s": 30
+  }
+}
+```
+
+This is a request fragment; include the model's normal prompt, image and video
+parameters. Omitting `streaming_pacing` or setting `enabled` to `false` keeps
+unpaced execution. `streaming_buffer_seconds` remains a compatibility alias for
+existing clients. The ordinary `/v1/videos` endpoint does not accept
+playback pacing.
+
+While playing, repeatedly send the actual cumulative media playhead:
+
+```json
+{"type":"session.playback","position_seconds":1.25}
+```
+
+The engine starts the next chunk only if **generated duration + next chunk
+duration - played duration** fits the configured window. The window must fit a
+whole chunk. Old feedback is ignored and future feedback is clamped to already
+generated media. Paused playback blocks advancement; pings and duplicate
+playback positions do not prevent the consumption idle timeout.
+
+A paced stream retains at most one generation chunk until encoding and sending
+finish. The byte limit checks decoded payloads and encoded fragments; it does
+not cap model workspace, transient decode allocations or process RSS. Oversize
+output, idle timeout, Stop and disconnect release request state without waiting
+for another inference request. Other requests retain the single-stream queueing
+behavior.
+
+Chunk metadata includes `pacing.lead_seconds`, cumulative
+`pacing.wait_seconds`, `pacing.retained_bytes` and `output_chunk_index`.
+`AsyncOmni.generate` consumers release a chunk by advancing their async iterator;
+close or abort an abandoned iterator. Controls and playback feedback remain
+receivable while media output is blocked, through bounded control queues.
+
+For interaction timing, queue limits and cancellation semantics, see the
+[streaming video example protocol](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/streaming_video_generation/README.md).
 
 ## Mid-Generation Interaction
 

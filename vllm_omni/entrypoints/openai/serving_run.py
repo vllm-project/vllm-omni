@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+import os
+from collections.abc import Sequence
+from typing import Any
+
+import msgspec
+import pybase64 as base64
+from vllm.outputs import RequestOutput
+from vllm.sampling_params import SamplingParams
+
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniMsgpackDecoder, OmniMsgpackEncoder
+from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.messages import NextStageInputMessage, OutputMessage
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.protocol.run import RunRequest, RunResponse
+from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
+from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+
+# A modified stage_input can crash a stage, so /v1/run is only served when explicitly enabled.
+_RUN_ENDPOINT_ENV = "VLLM_OMNI_ENABLE_RUN_ENDPOINT"
+
+
+def run_endpoint_restrictions() -> tuple[EndpointRestriction, ...]:
+    """Restrict /v1/run unless VLLM_OMNI_ENABLE_RUN_ENDPOINT enables it."""
+    if os.environ.get(_RUN_ENDPOINT_ENV) == "1":
+        return ()
+    reason = f"/v1/run is disabled; set {_RUN_ENDPOINT_ENV}=1 to enable it for trusted callers."
+    return (EndpointRestriction(OmniServingCapability.RUN, reason),)
+
+
+def encode_payload(payload: NextStageInputMessage | RequestOutput) -> str:
+    """Encode a next stage input or a final output as base64 text for a JSON response."""
+    return base64.b64encode(OmniMsgpackEncoder().encode(payload)).decode("ascii")
+
+
+def decode_stage_input(data: str, stage_types: Sequence[str]) -> NextStageInputMessage:
+    """Decode a next stage input encoded by `encode_payload`.
+
+    The codec returns structs and dataclasses as plain containers, which we rebuild based on stage type.
+    """
+    stage_input = NextStageInputMessage(**OmniMsgpackDecoder().decode(base64.b64decode(data)))
+    stage_input.check_stage_ids(len(stage_types))
+    if stage_types[stage_input.receiver_stage_id] != "diffusion":
+        stage_input.requests = [msgspec.convert(request, OmniEngineCoreRequest) for request in stage_input.requests]
+    stage_input.sampling_params_list = [
+        _decode_sampling_params(params, stage_type)
+        for params, stage_type in zip(stage_input.sampling_params_list, stage_types, strict=True)
+    ]
+    return stage_input
+
+
+def _decode_sampling_params(params: dict[str, Any], stage_type: str) -> OmniSamplingParams:
+    if stage_type == "diffusion":
+        return OmniDiffusionSamplingParams.from_dict(params)
+    return msgspec.convert(params, SamplingParams)
+
+
+def decode_output(data: str) -> RequestOutput:
+    """Decode a final output encoded by `encode_payload`."""
+    # NOTE: This is temporarily how we get the response back from the last stage,
+    # but will change as we integrate into route specific post processing.
+    output = OmniMsgpackDecoder().decode(base64.b64decode(data))
+    if not isinstance(output, RequestOutput):
+        raise ValueError(f"output decodes to {type(output).__name__}, not a RequestOutput")
+    return output
+
+
+class ServingRun:
+    """Runs one stage per call and returns its raw encoded result."""
+
+    def __init__(self, engine_client: AsyncOmni) -> None:
+        self.engine_client = engine_client
+        self.stage_types = [get_stage_type(stage_config) for stage_config in engine_client.stage_configs]
+
+    async def run(self, request: RunRequest, *, request_id: str) -> RunResponse:
+        """Run the stage named by `request.stage_id` and return its encoded result."""
+        if request.stage_id == 0:
+            response = await self._run_entry_stage(request, request_id=request_id)
+        else:
+            response = await self._run_downstream_stage(request, request_id=request_id)
+        return self._build_stage_response(response)
+
+    async def _run_entry_stage(self, request: RunRequest, *, request_id: str) -> NextStageInputMessage | OutputMessage:
+        """Run stage 0 on the prompt in request.stage_input."""
+        if not isinstance(request.stage_input, dict):
+            raise OmniClientError("Stage 0 takes a prompt dict as stage_input")
+        sampling_params_list = to_sampling_params_list(self.engine_client, request.sampling_params or [])
+        return await self.engine_client.run_entry_stage(
+            request.stage_input, sampling_params_list, request_id=request_id
+        )
+
+    async def _run_downstream_stage(
+        self, request: RunRequest, *, request_id: str
+    ) -> NextStageInputMessage | OutputMessage:
+        """Run the stage that request.stage_input was built for, once it matches request.stage_id."""
+        if not isinstance(request.stage_input, str):
+            raise OmniClientError(f"Stage {request.stage_id} takes the stage_input returned by the previous call")
+        if request.sampling_params is not None:
+            raise OmniClientError("Only the stage 0 call takes sampling_params; later calls carry them in stage_input")
+        stage_input = decode_stage_input(request.stage_input, self.stage_types)
+        if stage_input.receiver_stage_id != request.stage_id:
+            raise OmniClientError(
+                f"stage_input is for stage {stage_input.receiver_stage_id}, not stage {request.stage_id}"
+            )
+        return await self.engine_client.run_downstream_stage(stage_input, request_id=request_id)
+
+    @staticmethod
+    def _build_stage_response(response: NextStageInputMessage | OutputMessage) -> RunResponse:
+        """Encode the next stage input, or the final stage's output after the last stage."""
+        if isinstance(response, NextStageInputMessage):
+            return RunResponse(stage_id=response.receiver_stage_id, stage_input=encode_payload(response))
+        return RunResponse(output=encode_payload(response.engine_outputs))

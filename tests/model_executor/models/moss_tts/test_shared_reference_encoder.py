@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """API processes share one reference encoder through a Unix socket."""
 
+import os
 import threading
-from tempfile import TemporaryDirectory
+from multiprocessing.connection import Listener
 
 import pytest
 import torch
 
+from vllm_omni.entrypoints.api_server_shared_dir import create_api_server_shared_dir, remove_api_server_shared_dir
 from vllm_omni.model_executor.models.moss_tts import shared_reference_encoder as shared
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -33,9 +35,11 @@ class _Recorder:
 @pytest.fixture
 def host_dir(monkeypatch):
     monkeypatch.setattr(shared, "_host_lock_handle", None)
-    # AF_UNIX limits the full socket path, including pytest directory names.
-    with TemporaryDirectory(prefix="moss-ref-") as path:
-        yield path
+    # AF_UNIX limits the full socket path: use the server's short directory,
+    # not pytest's nested one.
+    path = create_api_server_shared_dir()
+    yield path
+    remove_api_server_shared_dir(path)
 
 
 def test_only_one_process_per_directory_hosts(host_dir):
@@ -168,7 +172,7 @@ def test_reference_encoder_client_falls_back_to_local_encode(host_dir, monkeypat
     from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
     monkeypatch.setenv(re_mod._SHARED_CODES_DIR_ENV, host_dir)
-    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda: "client")
+    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda shared_dir: "client")
     monkeypatch.setattr(shared, "_CONNECT_TIMEOUT_S", 0.3)
     proc = _FakeProcessor()
     enc = re_mod.MossReferenceEncoder(
@@ -178,6 +182,75 @@ def test_reference_encoder_client_falls_back_to_local_encode(host_dir, monkeypat
     monkeypatch.setattr(enc, "_place_tokenizer_for_local_encode", lambda: placed.append(True))
     out = enc._encode_batch_sync([([7.0] * 50, _SR)])
     assert placed == [True] and proc.attempt_sizes == [1] and int(out[0][0, 0]) == 7
+
+
+def test_concurrent_local_fallbacks_wait_for_the_whole_tokenizer_move(host_dir, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tests.model_executor.models.moss_tts.test_reference_encoder import _N_VQ, _SR, _FakeProcessor
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+    from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+    target = torch.device("meta")
+    half_moved, resume = threading.Event(), threading.Event()
+
+    class _Tokenizer:
+        """Moves its parameters one at a time, like ``nn.Module.to``."""
+
+        def __init__(self):
+            self.params = [SimpleNamespace(device=torch.device("cpu")) for _ in range(2)]
+
+        def parameters(self):
+            return iter(self.params)
+
+        def to(self, device):
+            for i, param in enumerate(self.params):
+                param.device = device
+                if i == 0:
+                    half_moved.set()
+                    resume.wait(5)
+            return self
+
+    class _Processor(_FakeProcessor):
+        audio_tokenizer: _Tokenizer
+        _vllm_omni_ref_encoder_device: torch.device
+
+        def encode_audios_from_wav(self, wav_list, sampling_rate, n_vq=None):
+            if any(p.device != target for p in self.audio_tokenizer.params):
+                raise RuntimeError("encode on a partly moved tokenizer")
+            return super().encode_audios_from_wav(wav_list, sampling_rate, n_vq)
+
+    monkeypatch.setenv(re_mod._SHARED_CODES_DIR_ENV, host_dir)
+    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda shared_dir: "client")
+    proc = _Processor()
+    proc.audio_tokenizer = _Tokenizer()
+    proc._vllm_omni_ref_encoder_device = target
+    enc = re_mod.MossReferenceEncoder(
+        proc, variant="local", n_vq=_N_VQ, sr_target=_SR, speaker_cache=SpeakerEmbeddingCache(max_bytes=1 << 20)
+    )
+    enc._shared_client = Mock()
+    enc._shared_client.encode.side_effect = ConnectionError("host gone")
+
+    results = {}
+
+    def encode(value):
+        results[value] = enc._encode_shared_or_local([torch.full((1, 50), value)])
+
+    first = threading.Thread(target=encode, args=(1.0,))
+    first.start()
+    assert half_moved.wait(5)
+    # A second batch falls back while the first is still moving the tokenizer.
+    second = threading.Thread(target=encode, args=(2.0,))
+    second.start()
+    second.join(0.3)
+    resume.set()
+    for thread in (first, second):
+        thread.join(5)
+        assert not thread.is_alive()
+    for value in (1.0, 2.0):
+        assert isinstance(results[value][0], torch.Tensor), results[value]
+        assert int(results[value][0][0, 0]) == int(value)
 
 
 def test_workers_encode_concurrently_after_their_warmups(host_dir):
@@ -324,7 +397,7 @@ def test_startup_failure_does_not_trigger_local_capture(host_dir, monkeypatch):
     from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
     monkeypatch.setenv(re_mod._SHARED_CODES_DIR_ENV, host_dir)
-    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda: "client")
+    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda shared_dir: "client")
     enc = re_mod.MossReferenceEncoder(
         _FakeProcessor(),
         variant="local",
@@ -339,3 +412,30 @@ def test_startup_failure_does_not_trigger_local_capture(host_dir, monkeypatch):
     with pytest.raises(shared.SharedReferenceEncoderStartupError):
         enc._encode_shared_or_local([torch.ones(1, 20)])
     local.assert_not_called()
+
+
+def test_socket_path_bound_matches_a_real_listener(host_dir):
+    socket_bytes = len(os.fsencode(os.path.join(host_dir, shared._SOCKET_NAME)))
+    at_bound = os.path.join(host_dir, "d" * (shared._MAX_SOCKET_PATH_BYTES - socket_bytes - 1))
+    os.mkdir(at_bound)
+    assert shared.socket_path_fits(at_bound) and not shared.socket_path_fits(at_bound + "d")
+    host = shared.SharedReferenceEncoderHost(at_bound, [(_Recorder(), None)])
+    try:
+        wav = torch.full((1, 40), 3.0)
+        assert torch.equal(shared.SharedReferenceEncoderClient(at_bound).encode([wav])[0], _codes(wav))
+    finally:
+        host.close()
+    # Longer than sun_path on Linux (108) and macOS (104).
+    with pytest.raises(OSError, match="too long"):
+        Listener(os.path.join(host_dir, "d" * 110, shared._SOCKET_NAME), family="AF_UNIX")
+
+
+def test_too_long_a_directory_encodes_in_each_process(host_dir, monkeypatch):
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    monkeypatch.setattr(re_mod, "_shared_role", None)
+    too_long = os.path.join(host_dir, "d" * shared._MAX_SOCKET_PATH_BYTES)
+    assert re_mod.shared_encoder_role(too_long) == ""
+    assert not os.path.exists(too_long)  # no lock, no socket
+    monkeypatch.setattr(re_mod, "_shared_role", None)
+    assert re_mod.shared_encoder_role(os.path.join(host_dir, "moss-ref-codes")) == "host"

@@ -46,6 +46,10 @@ def _make_talker(device: str = "cpu") -> MiniCPMO45OmniTTSForConditionalGenerati
     talker._request_condition_states = {}
     talker._deferred_cleanup_ids = set()
     talker._tts_config = ConditionalChatTTSConfig()
+    # Set by __init__ from the stage-1 speculative config; the single-frame
+    # paths this fixture drives read it, so it has to be present even though
+    # __init__ is bypassed here.
+    talker._k_step_frames = 0
     generator = torch.Generator().manual_seed(0)
     talker.emb_code = nn.ModuleList([nn.Embedding(_VOCAB, 4)])
     talker.head_code = nn.ModuleList([nn.Linear(4, _VOCAB, bias=False)])

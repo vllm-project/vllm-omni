@@ -35,7 +35,7 @@ def _to_device_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     keeps the CPU running ahead (the caching host allocator keeps the pinned
     source alive until the copy's stream event completes).
     """
-    if torch.device(device).type != "cuda" or t.device.type != "cpu":
+    if torch.device(device).type not in ("cuda", "npu") or t.device.type != "cpu":
         return t.to(device=device)
     return t.pin_memory().to(device=device, non_blocking=True)
 
@@ -480,6 +480,18 @@ class ARDiffusionPagedForwardContext:
         window inside the attention custom op instead of at the compiled boundary.
         """
         if not self.staging_enabled:
+            # NPU eager dispatch of the fused write+attend custom op rejects
+            # None for a tensor argument declared mutable, so hand back
+            # zero-size buffers there; the op treats an empty stage buffer
+            # like None (fresh allocation). Other devices keep the upstream
+            # None contract.
+            k_pool = self.kv_cache._k_pools[layer_idx]
+            if k_pool.device.type == "npu":
+                v_pool = self.kv_cache._v_pools[layer_idx]
+                return (
+                    torch.empty(0, device=k_pool.device, dtype=k_pool.dtype),
+                    torch.empty(0, device=v_pool.device, dtype=v_pool.dtype),
+                )
             return None, None
         return self.kv_cache.history_staging[layer_idx]
 
@@ -719,6 +731,45 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
+    if query_flat.device.type == "npu":
+        # NPU: gather the visible blocks on device, then run the fused
+        # npu_fusion_attention kernel over the packed (contiguous) window.
+        # Mirrors the ROCm gather path; the reference implementation below is
+        # the correctness oracle but pays per-block gathers and fp32 einsum.
+        import torch_npu
+
+        # Gather whole blocks in one index_select instead of per-token
+        # advanced indexing: the block-major flatten + truncate is byte-identical
+        # (same block_table row mapping) and measurably faster on NPU
+        # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
+        # SP8 on 910C; 477-frame precodec output bit-identical).
+        block_size = key_cache.shape[1]
+        num_blocks = (int(max_seq_len) + block_size - 1) // block_size
+        block_ids = block_table[0, :num_blocks].long()
+        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
+        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
+        kv_len = int(seq_lens[0].item())
+        packed_k = gathered_k[:kv_len]
+        packed_v = gathered_v[:kv_len]
+        # TND layout: per-sequence lengths and their cu_seqlens prefixes.
+        q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
+        actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
+        actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
+        out = torch_npu.npu_fusion_attention(
+            query_flat.contiguous(),
+            packed_k.contiguous(),
+            packed_v.contiguous(),
+            head_num=query_flat.shape[1],
+            input_layout="TND",
+            actual_seq_qlen=actual_seq_q,
+            actual_seq_kvlen=actual_seq_kv,
+            scale=float(softmax_scale),
+            keep_prob=1.0,
+        )[0]
+        if batched:
+            return out.reshape(query.shape)
+        return out
+
     if not query_flat.is_cuda:
         out = _reference_paged_attention(
             query_flat,
@@ -772,7 +823,7 @@ def ar_diffusion_paged_attention(
         if n_blocks * block_size != int(max_seq_len):
             raise ValueError("the contiguous K/V gather path requires max_seq_len to be block-aligned")
         block_ids = block_table[0, :n_blocks].to(torch.long)
-        if stage_key is None or stage_value is None:
+        if stage_key is None or stage_value is None or stage_key.numel() == 0:
             # Fresh allocations on purpose: a module-level cached buffer that is first
             # allocated inside a CUDA-graph-trees warm-up run lives in the graph pool
             # untracked ("tensor(s) in the cudagraph pool not tracked as outputs").

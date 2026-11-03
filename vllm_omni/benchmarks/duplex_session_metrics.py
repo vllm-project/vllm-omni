@@ -29,6 +29,25 @@ _REQUEST_MEASUREMENT_ORIGIN = {
     "tpot": "Stage-0 engine mean time per output token",
     "rtf": "response.created client receive to last audio packet divided by emitted audio duration",
 }
+_CLIENT_MEASUREMENT_ORIGIN = {
+    "client_ttft": (
+        "response.created client receive to first non-empty text delta; includes server prompt preparation "
+        "and engine submission when they follow response creation, as in Qwen3-Omni"
+    ),
+}
+_TEXT_DELTA_TYPES = frozenset(
+    {"response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
+)
+
+#: Per-response latencies exported as flat ``mean_/median_/p99_<name>`` keys,
+#: the shape perf baselines read (like ``mean_ttft_ms``). Every response
+#: counts once, however many responses its session had.
+DUPLEX_RESPONSE_LATENCY_FIELDS = (
+    ("ttft_ms", "duplex_response_ttft_ms", "server TTFT"),
+    ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP"),
+    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT"),
+    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client append TTFP"),
+)
 _STREAM_MEASUREMENT_ORIGIN = {
     "ttft": "input stream start to first non-empty text delta",
     "ttfp": "input stream start to first audio packet",
@@ -55,6 +74,119 @@ def audio_rtf_from_raw_metric(raw_metric: Mapping[str, object]) -> float | None:
     if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
         return None
     return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
+
+
+def union_ns(spans: Sequence[Sequence[int]]) -> int:
+    """Length of the union of ``[start_ns, duration_ns]`` intervals; overlap counts once."""
+    total = 0
+    cur_start: int | None = None
+    cur_end = 0
+    for start, duration in sorted((int(span[0]), int(span[1])) for span in spans):
+        end = start + duration
+        if cur_start is None or start > cur_end:
+            if cur_start is not None:
+                total += cur_end - cur_start
+            cur_start, cur_end = start, end
+        else:
+            cur_end = max(cur_end, end)
+    return total + (0 if cur_start is None else cur_end - cur_start)
+
+
+def turn_is_final(turn: Mapping[str, object]) -> bool:
+    """Whether the server marked the turn final: its work and measurements have drained."""
+    chunks = turn.get("chunks")
+    return (
+        turn.get("final") is True
+        and isinstance(chunks, list)
+        and all(isinstance(chunk, Mapping) and isinstance(chunk.get("done_ns"), int) for chunk in chunks)
+    )
+
+
+def session_stats_turn_metrics(
+    turn: Mapping[str, object],
+    *,
+    stage_ids: Sequence[int] | None = None,
+) -> dict[str, object]:
+    """Busy RTF and stall ratio of one ``session.stats`` turn (RFC #8325 §1.3).
+
+    ``busy RTF = G / A``: ``G`` is the union of every stage's work spans over all
+    of the turn's chunks, ``A`` the audio the turn emitted (``turn["audio"]``). The stall time
+    ``W - G`` is the part of the turn span ``W`` (the union of each chunk's
+    ``[submitted_ns, done_ns]``) in which no stage worked on the turn. A turn
+    that is not final yet returns ``{"final": False}`` and no numbers: a queued
+    chunk has no spans, and counting it anyway would hide its wait.
+
+    With ``stage_ids`` (the snapshot's stages), a final turn that emitted audio
+    but has no spans from one of them also gets no numbers; ``missing_stage_ids``
+    names them. Busy RTF without a stage's work would read low, e.g. when the
+    chunk id cannot reach that stage.
+    """
+    chunks = turn.get("chunks")
+    if not turn_is_final(turn) or not isinstance(chunks, list):
+        return {"final": False, "epoch": turn.get("epoch"), "turn_id": turn.get("turn_id")}
+    audio = turn.get("audio")
+    if stage_ids is not None and isinstance(audio, list) and audio:
+        reported = {
+            work.get("stage_id") for chunk in chunks for work in chunk.get("stage_work") or () if work.get("spans")
+        }
+        if missing := sorted(set(stage_ids) - reported):
+            return {
+                "final": False,
+                "epoch": turn.get("epoch"),
+                "turn_id": turn.get("turn_id"),
+                "missing_stage_ids": missing,
+            }
+    all_spans: list[Sequence[int]] = []
+    in_engine: list[tuple[int, int]] = []
+    for chunk in chunks:
+        for work in chunk.get("stage_work") or ():
+            all_spans.extend(work.get("spans") or ())
+        submitted_ns = int(chunk["submitted_ns"])
+        in_engine.append((submitted_ns, int(chunk["done_ns"]) - submitted_ns))
+    audio_ms = sum(float(piece.get("duration_ms") or 0.0) for piece in audio) if isinstance(audio, list) else 0.0
+    generation_ms = union_ns(all_spans) / 1e6
+    turn_span_ms = union_ns(in_engine) / 1e6
+    stall_ms = max(0.0, turn_span_ms - generation_ms)
+    return {
+        "final": True,
+        "epoch": turn.get("epoch"),
+        "turn_id": turn.get("turn_id"),
+        "status": turn.get("status"),
+        "generation_ms": round(generation_ms, 3),
+        "audio_ms": round(audio_ms, 3),
+        "turn_span_ms": round(turn_span_ms, 3),
+        "stall_ms": round(stall_ms, 3),
+        "busy_rtf": round(generation_ms / audio_ms, 6) if audio_ms > 0 else None,
+        "stall_ratio": round(stall_ms / audio_ms, 6) if audio_ms > 0 else None,
+    }
+
+
+def _client_response_latencies(
+    collector: EventCollector,
+    response_id: str,
+    *,
+    after_s: float,
+) -> float | None:
+    """Client-observed ``response.created`` to first non-empty text, in ms.
+
+    This timer starts when the client learns a response exists. Qwen3-Omni
+    creates the response before prompt preparation and engine submission, so
+    that work is included. Model-native duplex may create the response only
+    with the first output; its earlier preparation is then excluded.
+    """
+    created_at_s: float | None = None
+    first_text_at_s: float | None = None
+    for event, received_at_s in zip(collector.events, collector.event_received_at_s, strict=True):
+        if received_at_s < after_s or collector.response_id(event) != response_id:
+            continue
+        event_type = event.get("type")
+        if event_type == "response.created":
+            created_at_s = received_at_s if created_at_s is None else created_at_s
+        elif event_type in _TEXT_DELTA_TYPES and isinstance(event.get("delta"), str) and event["delta"]:
+            first_text_at_s = received_at_s if first_text_at_s is None else first_text_at_s
+    if created_at_s is None or first_text_at_s is None:
+        return None
+    return round(max(0.0, first_text_at_s - created_at_s) * 1000.0, 3)
 
 
 def collect_duplex_session_metrics(
@@ -91,6 +223,20 @@ def collect_duplex_session_metrics(
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)
+            metric["client_ttft_ms"] = _client_response_latencies(collector, response_id, after_s=stream_start)
+            origin = metric.get("measurement_origin")
+            metric["measurement_origin"] = {
+                **(origin if isinstance(origin, dict) else {}),
+                "client_ttft": _CLIENT_MEASUREMENT_ORIGIN["client_ttft"],
+            }
+            client_rtf = audio_rtf_from_raw_metric(
+                {
+                    "audio_generation_ms": raw_metric.get("client_audio_generation_ms"),
+                    "audio_duration_ms": raw_metric.get("audio_duration_ms"),
+                }
+            )
+            if client_rtf is not None:
+                metric["client_rtf"] = client_rtf
         copied_stages: dict[str, dict[str, object]] = {}
         if isinstance(stages, dict):
             for stage_id, stage_snapshot in stages.items():
@@ -107,6 +253,11 @@ def collect_duplex_session_metrics(
         request_metrics,
         session_id=session_id,
     )
+    from vllm_omni.clients.duplex import distribution_summary
+
+    for field in ("client_ttft_ms", "client_ttfp_ms"):
+        if (summary := distribution_summary(_finite_nonnegative(request_metrics, field))) is not None:
+            session_metrics[field] = summary
     stream_metrics = collector.global_timing_summary(
         after_s=stream_start,
         window_started_at_s=stream_start,
@@ -129,6 +280,46 @@ def collect_duplex_session_metrics(
         session_metrics=session_metrics,
         output_tokens=output_tokens,
     )
+
+
+def _finite_nonnegative(rows: Sequence[Mapping[str, object]], field: str) -> list[float]:
+    return [
+        float(value)
+        for row in rows
+        if isinstance((value := row.get(field)), int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    ]
+
+
+def duplex_response_latency_metrics(request_metrics: Sequence[Mapping[str, object]]) -> dict[str, float | int]:
+    """Flatten per-response latencies into ``num_/mean_/median_/p99_<name>`` keys."""
+    from vllm_omni.clients.duplex import distribution_summary
+
+    result: dict[str, float | int] = {}
+    for field, name, _ in DUPLEX_RESPONSE_LATENCY_FIELDS:
+        summary = distribution_summary(_finite_nonnegative(request_metrics, field))
+        if summary is None:
+            continue
+        result[f"num_{name}_samples"] = summary["count"]
+        result[f"mean_{name}"] = summary["mean"]
+        result[f"median_{name}"] = summary["p50"]
+        result[f"p99_{name}"] = summary["p99"]
+    return result
+
+
+def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) -> None:
+    """Print the per-response latency block of a benchmark summary."""
+    if not metrics:
+        return
+    print("{s:{c}^{n}}".format(s=" Duplex Per-Response Latency ", n=50, c="="))
+    for _, name, label in DUPLEX_RESPONSE_LATENCY_FIELDS:
+        if f"mean_{name}" not in metrics:
+            continue
+        for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
+            print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+    print("=" * 50)
 
 
 def duplex_stream_metrics(session_metrics: Sequence[Mapping[str, object]]) -> dict[str, object]:
@@ -166,6 +357,7 @@ def build_duplex_metrics_report(
         "duplex_session_metrics": [dict(metric) for metric in session_metrics],
     }
     report.update(duplex_stream_metrics(session_metrics))
+    report.update(duplex_response_latency_metrics(request_metrics))
     return report
 
 

@@ -13,12 +13,10 @@ framework through the one seam the framework has, ``PipelineConfig.duplex_plugin
 
 from .input import PersonaPlexPcmAppendBuffer
 from .plugin import PersonaPlexDuplexPlugin
-from .policy import PrefillStep
 from .stage0 import PersonaPlexStage0DuplexRuntime
 
 __all__ = [
     "PersonaPlexDuplexPlugin",
     "PersonaPlexPcmAppendBuffer",
     "PersonaPlexStage0DuplexRuntime",
-    "PrefillStep",
 ]

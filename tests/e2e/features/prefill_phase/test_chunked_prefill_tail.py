@@ -17,6 +17,7 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
@@ -28,6 +29,11 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
     # identical. Use invariant kernels for the exact codes/waveform comparison.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     model = str(Path(os.environ.get("MODEL_PREFIX", "")) / "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    # Resolve the weights once, then use the same local snapshot for both
+    # engines. A Hub repo ID makes each stage query remote metadata again,
+    # which can hit the shared CI token's API rate limit during initialization.
+    if not Path(model).is_dir():
+        model = hf_api().snapshot_download(repo_id=model)
     tokenizer = AutoTokenizer.from_pretrained(model)
     config = Qwen3TTSConfig.from_pretrained(model)
     info = {
