@@ -302,6 +302,7 @@ vllm_omni/
 │           ├── context.py           DuplexSessionContext / DuplexRunState: what the runner shares with its components
 │           ├── emitter.py           SessionEmitter: projection, epoch filter, domain effects of a terminal event
 │           ├── model_channel.py     ModelChannel: submit an append, project stage output, continue a turn
+│           ├── memory_runtime.py    SessionMemoryRuntime: execute private model-planned memory requests
 │           ├── control.py           SessionControl: server VAD and the events that reconfigure it
 │           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
 │           ├── helpers.py           pure reads and payload builders over a session
@@ -459,6 +460,61 @@ for queue updates and the final validity check before delivery.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+- **Session stats (busy RTF, RFC #8325).** Opt-in with
+  `duplex_session.collect_stats`. `ModelChannel` stamps each Stage-0 append's
+  envelope with `duplex.perf_chunk = [epoch, seq]` (a seq retried after a failed
+  submit gets a fresh id, so the aborted submit's late spans are ignored); the orchestrator copies the
+  producing step's chunk into forwarded updates and the chunk transfer adapter
+  into connector payloads. Stage schedulers (`DuplexStageWorkRecorder`) time
+  every step of a request that carries a chunk and return the spans on
+  `OmniEngineCoreOutput.stage_work`, which the orchestrator hands to the
+  session as it collects them. `DuplexEngineSession.perf`
+  (`SessionPerfLedger`) groups chunks by turn with their acceptance times and
+  spans (a chunk is done at its last span end), and records each turn's emitted audio through the
+  response it belongs to; turns close on model-turn completion, barge-in or
+  close. The runner answers `session.stats.get` from the ledger on
+  the ordered mailbox; clients derive busy RTF and stall ratio
+  (`vllm_omni.benchmarks.duplex_session_metrics`). A turn is reported final
+  only after the model turn completed, its responses ended and every chunk was
+  handled; cancelled turns never become final, and later spans are counted in
+  `late_spans`. With the flag off nothing is stamped or attached, and stage
+  schedulers check only newly scheduled requests. Single-host only: the API and
+  stage processes must share one `CLOCK_MONOTONIC`.
+
+Model plugins may opt into one bounded auxiliary request per Session. The
+Session-owned `SessionMemoryRuntime` gives it a separate resource identity,
+submits and terminates it at the selected stage, and intercepts its output and
+errors before response policy, speech routing, playback history or response
+metrics. The plugin receives immutable
+committed history and owns prompt/result formatting and source validation. Sources
+can cover text, images or model-owned derived state. The helper checks the epoch,
+session configuration revision, operation identity and plugin source validity before
+mailbox writeback. Appending newer history can preserve a stable prefix; editing
+or deleting its evidence invalidates it. Cancellation and close abort owned
+requests. A failed cleanup retains its resource for teardown retry and prevents
+new auxiliary work from accumulating behind it. Each auxiliary cleanup attempt
+uses the shorter of five seconds and the model request timeout, keeping long
+generation deadlines separate from this cancellation-safe cleanup wait.
+The configuration revision tracks adopted Session settings; model-owned chunk
+and tool progress retain their existing stage generation and preserve pending
+memory work while its source remains valid.
+The plugin supplies a stable work key and whether work can enter the existing
+stage queue during an ordinary observation. Explicit user interaction takes
+priority through cancellation after its append plan passes validation, and
+suppresses restart until its turn completes. Rejected input leaves an in-flight
+summary running so it can release memory capacity for the next input.
+Requests may specify short retry delays and a cooldown for subsequent attempts;
+failures remain keyed to the same source as newer observations arrive. Background
+failures are logged on the server. Successful application allows the next
+bounded chunk to catch up without waiting for new input.
+The session's committed-history revision lets unchanged input events skip history
+snapshotting and hashing. Prefix fingerprints still validate summary writeback.
+The runner delegates auxiliary lifecycle and retry state to this helper through
+`DuplexSessionContext`, tracks its tasks, and dispatches completion events through
+the existing mailbox. Model plugins retain the existing policy hooks and own
+content policy, memory tiers, prompts and budgets. Recoverable input-capacity
+rejection releases the unsubmitted request and its reservations while keeping
+the Session open.
 
 ### Semantic turn decisions
 
@@ -653,6 +709,39 @@ offloaded from the loop.
 Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
+
+MiniCPM-o 4.5 preserves the complete reference waveform after resampling to
+16 kHz. Its first-append context budget follows the whole-clip encoder:
+ceil to 160-sample mel frames, ceil through the stride-2 CNN, then floor
+through stride-5 pooling. Reference audio must not be cropped to a 100 ms
+boundary to simplify budgeting: the remaining samples can change the
+embeddings even when they do not add a pooled token.
+
+The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
+sessions. SDPA and eager produce different BF16 embeddings, which can change
+scene descriptions during long video sessions. Turn-mode and non-CUDA vision
+retain SDPA by default. An explicit engine or vision attention setting still
+overrides the default.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
+
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
+
+MiniCPM-o deployments select `TRITON_ATTN` for CUDA stage 0, including the
+standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
+profiles. Talker and NPU attention settings are unchanged. This aligns the
+Thinker backend selection; it does not establish accuracy or performance parity
+across GPU types and layouts.
 
 Tool result conversion is preparation until the session's final deadline/epoch
 check and admission. `runtime_config_for_function_output` receives an isolated

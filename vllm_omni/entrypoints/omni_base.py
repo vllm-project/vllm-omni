@@ -20,6 +20,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
@@ -171,8 +172,11 @@ class OmniBase(PDDisaggregationMixin):
     def __init__(
         self,
         model: str,
+        watermark_config: WatermarkConfig | None = None,
         **kwargs: Any,
     ) -> None:
+        if watermark_config is not None and not isinstance(watermark_config, WatermarkConfig):
+            raise TypeError("watermark_config must be a WatermarkConfig; use --watermark-config for CLI JSON")
         if "engine_args" in kwargs:
             logger.warning(
                 "engine_args were passed as a kwarg to an Omni instance; this is not supported. "
@@ -223,6 +227,7 @@ class OmniBase(PDDisaggregationMixin):
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,
             collect_stage_metrics=collect_stage_metrics,
+            watermark_config=watermark_config,
             **kwargs,
         )
         self._shutdown_called = False
@@ -510,8 +515,8 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
-            if msg.mm_cache_miss_hashes and msg.request_id is not None and msg.request_id not in self.request_states:
-                # The engine has applied cache feedback for a cancelled request.
+            if msg.request_id is not None and msg.request_id not in self.request_states:
+                # Ignore queued errors from completed or cancelled requests.
                 return True, None, None, None
             self._raise_nonfatal_error_message(msg)
 

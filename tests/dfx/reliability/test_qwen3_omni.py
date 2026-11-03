@@ -78,9 +78,18 @@ def _hard_oom_config() -> dict[str, Any]:
     }
 
 
+def _recover_oom_max_free_bytes() -> int | None:
+    import torch
+
+    # A proportional target leaves several GiB free on high-memory MI300 cards.
+    # Match the proven HIP hard-OOM ceiling while preserving ratio-only CUDA.
+    return 32 * 1024 * 1024 if getattr(torch.version, "hip", None) else None
+
+
 OOM_RECOVER_INJECTION_CONFIG: dict[str, Any] = {
     "device": _default_oom_device_spec(),
     "target_mem_ratio": 0.95,
+    "max_free_bytes": _recover_oom_max_free_bytes(),
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -443,9 +452,9 @@ def _mix_prompt() -> str:
 def _run_oom_recovery(omni_server_function: Any, online_client_function: Any) -> None:
     """Black-box: under bounded GPU pressure, a heavy mix chat fails; after hog stops, the same request succeeds.
 
-    Uses ``OOM_RECOVER_INJECTION_CONFIG``: same ratio as the hard OOM sidecar, but
-    without ``max_free_bytes``, so pressure can starve the multimodal forward pass
-    without pinning the device down to the hard ceiling.
+    Uses ``OOM_RECOVER_INJECTION_CONFIG``: HIP applies the proven hard-OOM free-memory
+    ceiling because a proportional target alone leaves several GiB free on MI300.
+    CUDA keeps the existing ratio-only behavior.
 
     Fault and recovery phases use raw ``/v1/chat/completions`` HTTP so tests can assert
     on status codes and JSON error payloads (or fault keywords in streamed bodies).
@@ -460,6 +469,7 @@ def _run_oom_recovery(omni_server_function: Any, online_client_function: Any) ->
         hold_seconds=OOM_RECOVER_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_RECOVER_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_RECOVER_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_RECOVER_INJECTION_CONFIG["max_free_bytes"],
     )
     host = omni_server_function.host
     port = omni_server_function.port
