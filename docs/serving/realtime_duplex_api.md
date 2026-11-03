@@ -41,6 +41,30 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Qwen3-Omni cross-turn Thinker KV reuse
+
+On CUDA, `qwen3_omni_duplex.yaml` and `qwen3_omni_duplex_mrv2.yaml`
+enable Thinker prefix caching. Each committed turn still submits a fresh,
+non-resumable request with the current conversation history. Matching complete
+prefix blocks reuse Thinker KV; the stage-output cache supplies the matching
+hidden-state rows needed by Talker. Talker and Code2Wav remain per-turn and
+do not enable prefix caching.
+
+This reduces repeated history prefill when matching blocks remain cached. It
+does not retain a session-owned Thinker request or change the commit, playback
+acknowledgement, or cancellation protocol. After interruption, history
+calibration, item edits, tool-result insertion, or history pruning, reuse is
+limited to the prefix matching the newly rendered prompt and multimodal inputs.
+The remaining suffix is computed normally; cache eviction also falls back to
+normal prefill. In particular, reuse does not append an unheard assistant
+suffix to the conversation.
+
+Prefix caching does not eliminate input processing or Talker/Code2Wav work,
+so commit-to-first-audio latency gains depend on the workload. Budget host RAM
+for the [stage-output cache](../design/feature/prefix_caching.md).
+Non-CUDA platform overrides keep this cache disabled. To disable it on CUDA,
+set `enable_prefix_caching: false` on stage 0 in a deployment overlay.
+
 ### Qwen3-Omni voice selection
 
 The duplex session forwards the configured voice to the Talker as the

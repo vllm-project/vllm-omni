@@ -6,8 +6,9 @@ model_runner: v1
 session_mode: duplex
 stages:
   - stage_id: 0
-    # The base profile's Thinker prefix cache is validated for turn serving only.
-    enable_prefix_caching: false
+    # Reuse matching history KV and cached stage-output rows across commits.
+    # Requests remain per-turn; non-CUDA platform overrides keep caching off.
+    enable_prefix_caching: true
     limit_mm_per_prompt:
       audio: 4
       image: 8
