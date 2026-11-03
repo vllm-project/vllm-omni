@@ -16,6 +16,7 @@ import pytest
 import torch
 from vllm.outputs import RequestError
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.request import RequestStatus
 
 import vllm_omni.core.sched.omni_generation_scheduler as gen_sched_mod
@@ -260,6 +261,26 @@ def _finish_via_error_outputs(scheduler, request_id: str) -> None:
             message="Invalid structured outputs: fixture",
         )
     }
+    scheduler._finish_error_requests(defaultdict(list))
+
+
+@_SCHEDULERS
+@pytest.mark.parametrize("grammar_errors", [set(), {"req-error"}, ["req-error"]])
+def test_error_requests_reject_unexpected_grammar_container(scheduler_cls, grammar_errors) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
+    scheduler.grammar_compile_error_reqs = grammar_errors
+    scheduler.encoder_cache_mismatch_reqs = {"encoder-error"}
+    outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+    with pytest.raises(TypeError, match="grammar_compile_error_reqs must be a dict"):
+        scheduler._finish_error_requests(outputs)
+    assert scheduler.grammar_compile_error_reqs is grammar_errors
+    assert scheduler.encoder_cache_mismatch_reqs == {"encoder-error"}
+    assert not outputs
+
+
+@_SCHEDULERS
+def test_error_requests_allow_absent_grammar_state(scheduler_cls) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
     scheduler._finish_error_requests(defaultdict(list))
 
 

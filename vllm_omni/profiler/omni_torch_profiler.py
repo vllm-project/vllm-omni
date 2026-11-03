@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Mapping
 from datetime import datetime
+from inspect import signature
 from typing import Any, Literal
 
 import torch
@@ -107,14 +109,36 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             "on_trace_ready": self._on_trace_ready,
         }
         kwargs.update(self._profiler_kwargs)
+        try:
+            signature(torch.profiler.profile).bind(**kwargs)
+        except TypeError as exc:
+            raise TypeError(f"Invalid profiler_kwargs: {exc}") from exc
         return torch.profiler.profile(**kwargs)
 
     def set_profiler_kwargs(self, profiler_kwargs: dict | None) -> None:
         """Apply constructor overrides to the next inactive profiling session."""
+        if profiler_kwargs is not None and not isinstance(profiler_kwargs, Mapping):
+            raise TypeError("profiler_kwargs must be a mapping or None")
+        kwargs = dict(profiler_kwargs or {})
         if self._active:
+            if kwargs:
+                logger.warning("Ignoring profiler_kwargs because profiling is active")
             return
-        self._profiler_kwargs = dict(profiler_kwargs or {})
-        self.profiler = self._create_profiler(self.profiler_config, self._activities)
+        # Mutable or opaque options may have changed in place since construction.
+        if (
+            all(value is None or type(value) in (bool, int, float, str, bytes) for value in kwargs.values())
+            and kwargs == self._profiler_kwargs
+            and not kwargs.get("acc_events", False)
+        ):
+            return
+        previous_kwargs = self._profiler_kwargs
+        self._profiler_kwargs = kwargs
+        try:
+            profiler = self._create_profiler(self.profiler_config, self._activities)
+        except Exception:
+            self._profiler_kwargs = previous_kwargs
+            raise
+        self.profiler = profiler
 
     def set_trace_filename(self, filename: str) -> None:
         """Set the trace filename before starting profiling.

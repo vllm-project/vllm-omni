@@ -1018,6 +1018,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # EngineCoreOutput.error. Snapshot first: replacing the attribute drops
         # the dict the caller still needs for the error field.
         grammar_error_reqs = getattr(self, "grammar_compile_error_reqs", None)
+        if grammar_error_reqs is not None and not isinstance(grammar_error_reqs, dict):
+            raise TypeError(
+                "grammar_compile_error_reqs must be a dict of RequestError values, "
+                f"got {type(grammar_error_reqs).__name__}"
+            )
         request_errors: dict[str, Any] = dict(grammar_error_reqs) if isinstance(grammar_error_reqs, dict) else {}
         if isinstance(grammar_error_reqs, dict):
             self.grammar_compile_error_reqs: dict[str, Any] = {}

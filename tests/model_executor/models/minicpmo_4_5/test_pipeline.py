@@ -226,7 +226,8 @@ class TestDeployTopology:
     def test_npu_graph_configuration_is_stage_scoped(self, filename: str, monkeypatch: pytest.MonkeyPatch) -> None:
         # Let the production merge select NPU once, independently of the host.
         # Applying NPU first would let merge_pipeline_deploy overlay CUDA again.
-        monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", SimpleNamespace(device_name="npu"))
+        monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+        monkeypatch.setattr(current_omni_platform, "device_type", "npu")
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         connector_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
         assert "code2wav_enable_npu_graph" not in connector_extra

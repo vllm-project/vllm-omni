@@ -6,7 +6,7 @@
 import torch
 
 
-def _add_stored_gemm_outputs(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+def add_stored_gemm_outputs(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Add GEMM outputs after each result has been stored.
 
     Inductor rewrites ``gemm + gemm`` as ``addmm`` and adds in the accumulator,

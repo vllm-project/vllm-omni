@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.utils.torch_utils import _add_stored_gemm_outputs
+from vllm_omni.diffusion.utils.torch_utils import add_stored_gemm_outputs
 
 from .attention import Magi2PackedAttentionKernel, VarlenHandler
 from .common_layers import (
@@ -316,7 +316,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
         # separately keeps both GEMM outputs and the down-projection inputs dense.
         shared = swiglu7(self.shared_expert_fc1(normalized))
         modality = swiglu7(self.modality_specific_shared_expert_fc1(normalized, dispatcher))
-        return _add_stored_gemm_outputs(
+        return add_stored_gemm_outputs(
             self.shared_expert_fc2(shared),
             self.modality_specific_shared_expert_fc2(modality, dispatcher),
         )
@@ -335,7 +335,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
         routed: torch.Tensor,
         dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
-        return _add_stored_gemm_outputs(
+        return add_stored_gemm_outputs(
             self.merge_linear(routed),
             self._shared_experts(normalized, dispatcher),
         )
