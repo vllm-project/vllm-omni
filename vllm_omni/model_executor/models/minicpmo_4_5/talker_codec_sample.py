@@ -45,14 +45,8 @@ _FUSED_PRELUDE_OK = True
 _FUSED_PRELUDE_WARMED = False
 _PRELUDE_BLOCK = 1024
 
-# Engine step 7d (top-k + top-p) runs as one Triton kernel on NPU when both
-# filters are active -- the stochastic tail right after the fused prelude.
-# Same two controls as the prelude: ``talker_codec_fused_tail: false`` in the
-# stage connector's ``extra`` block forces the eager chain (accuracy triage),
-# and ``_TAIL_FUSION_OK`` is a process-wide permanent latch fed by the first
-# failed compile/launch. The eager pair is launch-overhead-bound at this
-# vocab (per-op fixed cost dominates: 6562-wide and 25-wide eager ops time
-# the same), so the fusion removes launches, not arithmetic.
+# Engine step 7d (top-k + top-p) as one Triton kernel on NPU when both filters are active;
+# ``talker_codec_fused_tail: false`` or the permanent ``_TAIL_FUSION_OK`` latch falls back to eager.
 _TAIL_FUSION_OK = True
 _TAIL_FUSION_WARMED = False
 _TAIL_BLOCK = 1024
@@ -129,12 +123,8 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         mx = tl.max(v, axis=0)
         e = tl.where(cand, tl.exp(v - mx), 0.0)
         q = e / tl.sum(e, axis=0)
-        # The ascending order must be decided on the raw logits, not on q:
-        # softmax is monotonic so v_j < v_i iff q_j < q_i, but tl.exp and the
-        # eager softmax exp can differ by ~1e-7 relative -- enough to flip the
-        # order of near-equal neighbours on near-flat rows, which shifts the
-        # ascending prefix by one candidate. The raw logits carry no
-        # computation and therefore no implementation drift.
+        # Order on the raw logits: tl.exp and the eager exp differ by ~1e-7, enough to flip
+        # near-equal neighbours (and the ascending prefix) on near-flat rows.
         vi = tl.reshape(v, (KP, 1))
         vj = tl.reshape(v, (1, KP))
         qj = tl.reshape(q, (1, KP))
@@ -551,11 +541,8 @@ def prepare_codec_logits(
         probabilities = torch.softmax(logits, dim=-1)
         min_p_threshold = probabilities.amax(dim=-1, keepdim=True) * min_p
         logits.masked_fill_(probabilities < min_p_threshold, float("-inf"))
-    # Engine step 7d: top-k then top-p over the filtered distribution. On NPU
-    # the pair runs as one Triton kernel when both filters are active (the
-    # deployment pins top_k=25/top_p=0.85) -- the eager pair is dominated by
-    # per-launch overhead at this vocab. Either path leaves the caller's
-    # softmax + multinomial input identical in shape, dtype and RNG stream.
+    # Engine step 7d: top-k then top-p; on NPU both run as one Triton kernel (the eager pair is
+    # launch-bound). Either path leaves the caller's softmax input and RNG stream identical.
     tail = _topk_topp_fused(logits, top_k, top_p) if (fused_tail and top_k > 0 and 0.0 < float(top_p) < 1.0) else None
     if tail is not None:
         return tail

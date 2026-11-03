@@ -1145,12 +1145,8 @@ def _materialize_att_rows(rows: list) -> list[torch.Tensor]:
 def _pack_att_cache(att: object) -> object:
     """``(depth, 2, N, H, T, D)`` split K/V pairs -> upstream ``(depth, N, H, T, 2D)``.
 
-    The fused/ragged bodies keep K and V in a leading ``2`` so a layer slice is
-    one contiguous pair; upstream ``blocks_forward_chunk`` (and the NPU attention
-    patch) instead expects the ``[K | V]`` packed slice per layer. ``None`` and
-    the ``[None] * depth`` placeholder of a cold start pass through untouched;
-    every other shape is a layout mismatch and fails loudly here instead of
-    reaching the upstream ``cat`` and failing there.
+    ``None`` and the all-``None`` cold-start placeholder pass through; any other
+    shape raises here instead of failing inside the upstream ``cat``.
     """
     if att is None:
         return None

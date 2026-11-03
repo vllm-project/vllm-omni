@@ -1706,14 +1706,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
-        # Optimization C: one-row-deep pipeline of boundary heads. The
-        # head Linear for the NEXT row is submitted before THIS row's
-        # D2H + numpy sampling, so this row's .cpu() wait disappears
-        # (the pre-submitted head finished while the previous row's
-        # numpy chain ran) and this row's numpy chain overlaps the next
-        # head on the device. A pre-submitted row that turns out to be
-        # skipped (continue / non-host branch) is dropped stale: one
-        # wasted ~0.2 ms device call, never a wrong binding.
+        # Optimization C: submit the next row's head Linear before this row's D2H + numpy
+        # sampling, so the host wait disappears; a row that is then skipped is dropped stale.
         pending_lg: torch.Tensor | None = None
         pending_lg_row = -1
         for index, info in enumerate(infos):
@@ -1868,21 +1862,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if emit_frame:
                 codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], sampled.reshape(1)])
                 delta = sampled.reshape(1, 1)
-                # K-step: the multi-frame loop owns sampling, so the rows
-                # vLLM schedules for the next step carry placeholder
-                # continue ids. Record this frame's sample so the decode
-                # preprocess embeds the real previous frame's codec id
-                # (the k_last branch) instead of the placeholder, and keep
-                # the confirmed-frame history that streaming prompt
-                # recompute rebuilds its window from -- the scheduler's
-                # token slice holds the placeholder ids.
+                # K-step: scheduled rows carry placeholder continue ids, so record this frame's
+                # sample for the decode preprocess and the recompute window.
                 state["last_code"] = sampled_id
                 histories = getattr(self, "_request_codec_history", None)
                 if not isinstance(histories, dict):
-                    # Instances built without __init__ (CPU tests,
-                    # subclasses) still need a place for the record -- the
-                    # readers at the recompute and cleanup sites already
-                    # tolerate a missing dict the same way.
+                    # Built without __init__ (CPU tests): readers tolerate a missing dict.
                     histories = {}
                     self._request_codec_history = histories
                 codec_history = histories.get(request_id)
@@ -2401,12 +2386,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # The frame loop advances state["step"] (and passes it here) in
         # lockstep with the device state's own counter, so trust the caller.
         hstate["step"] = int(step)
-        # Device: project + one D2H of the raw logits row. The sampling
-        # chain below runs on numpy host scalars: the equivalent chain of
-        # small CPU torch ops costs ~0.9ms/frame in dispatch alone, which
-        # lands directly on the c1 serial critical path. With Optimization
-        # C the projection arrived pre-submitted (lg_dev), so this D2H
-        # returns immediately and the numpy chain overlaps the next head.
+        # Device: project + one D2H of the raw logits row; the numpy chain (~0.9 ms/frame
+        # cheaper than CPU torch ops) then overlaps the pre-submitted next head.
         lg = (
             (lg_dev if lg_dev is not None else self.head_code[0](hidden_state).float().reshape(-1).detach())
             .cpu()

@@ -146,10 +146,8 @@ def _graphable_estimator_step(
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
     old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
-    # Upstream walks the layers itself and needs ``[K | V]`` packed per layer,
-    # while the buffers kept across steps are split by K/V half (the NPU
-    # attention patch and the fused bodies consume that layout only through
-    # ``batched_token2wav``): pack on the way in, unpack the result back.
+    # Upstream expects ``[K | V]`` packed per layer while the kept buffers are split by
+    # K/V half: pack on the way in, unpack the result back.
     from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
         _pack_att_cache,
         _packed_att_buffer,
