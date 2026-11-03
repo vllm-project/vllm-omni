@@ -30,6 +30,7 @@ from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
 from vllm.config.utils import config
+from vllm.config.weight_transfer import WeightTransferConfig as VllmWeightTransferConfig
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -304,6 +305,7 @@ class _StageEngineValues:
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
+    weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None
 
 
 @dataclass(frozen=True)
@@ -1280,15 +1282,10 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-# The three fields below are vLLM config objects passed through verbatim
-# instead of being unpacked structurally. speculative_config was missing from
-# this list, so a stage-1 multi-frame setup failed to load: stage_config.py
-# injects a speculative_config into stage 1 (vLLM uses spec_token_ids to
-# advance K tokens per request) and the ownership check here rejected the whole
-# stage-1 override block with a startup ValueError ("Stage 1 (llm_ar) has
-# explicit engine argument(s) with no structured config owner"). It joins the
-# two pass-through fields already listed.
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
+# These vLLM config inputs pass through without being unpacked into stage sub-configs.
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset(
+    {"compilation_config", "profiler_config", "speculative_config", "weight_transfer_config"}
+)
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1657,6 +1654,7 @@ def _stage_engine_values(
         # silently disappears (no error) and speculative decoding loses effect
         # (engine logs show speculative_config=None).
         speculative_config=_copy_value(engine.get("speculative_config")),
+        weight_transfer_config=_copy_value(engine.get("weight_transfer_config")),
     )
 
 
@@ -1726,6 +1724,7 @@ class BaseVllmOmniStageConfig:
     # dict early and break that step with "SpeculativeConfig object has no
     # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
     speculative_config: Mapping[str, Any] | None = None
+    weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1899,6 +1898,9 @@ def _build_common_stage_config_kwargs(
             "compilation_config": _copy_value(engine.compilation_config),
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
+            "weight_transfer_config": _copy_value(
+                _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config)
+            ),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,

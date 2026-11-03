@@ -344,6 +344,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
+    supports_weight_reload: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
     # The warmup request's blank image routes this AR+diffusion model down its
@@ -436,6 +437,7 @@ class HunyuanImage3Pipeline(
         self.lm_head = nn.Linear(self.hf_config.hidden_size, self.hf_config.vocab_size, bias=False)
         self.vllm_config = get_current_vllm_config()
         self.post_init()
+        self._prepare_auxiliary_weight_modules()
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
         )
@@ -472,9 +474,8 @@ class HunyuanImage3Pipeline(
         except (RuntimeError, ValueError):
             return None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
-        # List of unexpected keywords in weight names
+    def _prepare_auxiliary_weight_modules(self) -> None:
+        """Place auxiliary modules before reload metadata captures their storage."""
         non_model_layer_prefixes = [
             "vae",
             "vision_model",
@@ -497,6 +498,8 @@ class HunyuanImage3Pipeline(
             if mod:
                 mod.to(device)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
         # Note: guidance_emb and timestep_r_emb are no longer skipped
         # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
         loader = AutoWeightsLoader(self)
