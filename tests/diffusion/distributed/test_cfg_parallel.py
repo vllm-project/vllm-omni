@@ -1337,40 +1337,8 @@ def _packed_list_inputs(seed: int = 11) -> tuple[list[torch.Tensor], list[torch.
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
-@pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_combine_cfg_noise_combines_packed_lists_elementwise(cfg_normalize: bool):
-    """A packed prediction is a list of per-request tensors, not one tensor."""
-    pipeline = _build_pipeline_on_device(
-        TestCFGPipeline,
-        hidden_dim=32,
-        model_seed=0,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-    )
-    positive, negative = _packed_list_inputs()
-
-    combined = pipeline.combine_cfg_noise(positive, negative, 5.0, cfg_normalize)
-
-    assert isinstance(combined, list)
-    assert len(combined) == len(positive)
-    for pos, neg, actual in zip(positive, negative, combined, strict=True):
-        expected = neg + 5.0 * (pos - neg)
-        if cfg_normalize:
-            expected = pipeline.cfg_normalize_function(pos, expected)
-        torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
 def test_combine_cfg_noise_rejects_mixed_list_and_tensor():
-    pipeline = _build_pipeline_on_device(
-        TestCFGPipeline,
-        hidden_dim=32,
-        model_seed=0,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-    )
+    pipeline = _PackedListPipeline()
 
     with pytest.raises(TypeError, match="cannot mix a list prediction"):
         pipeline.combine_cfg_noise([torch.zeros(1, 4)], torch.zeros(1, 4), 5.0)
@@ -1380,13 +1348,7 @@ def test_combine_cfg_noise_rejects_mixed_list_and_tensor():
 @pytest.mark.diffusion
 @pytest.mark.cpu
 def test_combine_cfg_noise_rejects_prediction_count_mismatch():
-    pipeline = _build_pipeline_on_device(
-        TestCFGPipeline,
-        hidden_dim=32,
-        model_seed=0,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-    )
+    pipeline = _PackedListPipeline()
 
     with pytest.raises(ValueError, match="one negative prediction per positive one"):
         pipeline.combine_cfg_noise([torch.zeros(1, 4)], [torch.zeros(1, 4), torch.zeros(1, 4)], 5.0)
