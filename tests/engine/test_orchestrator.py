@@ -19,6 +19,7 @@ import janus
 import msgspec
 import pytest
 import torch
+from pytest_mock import MockerFixture
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -2339,27 +2340,31 @@ async def test_stage_pool_requested_replica_selects_exact_live_replica(requested
 
 
 @pytest.mark.parametrize("requested_replica_id", [-1, 99])
-def test_stage_pool_requested_replica_rejects_unknown_id(requested_replica_id: int) -> None:
+def test_stage_pool_requested_replica_rejects_unknown_id(requested_replica_id: int, caplog) -> None:
     pool, clients, _ = _distributed_routing_pool()
 
-    with pytest.raises(
-        OmniClientError,
-        match=rf"replica_id {requested_replica_id} does not exist or is not available",
-    ):
-        pool.bind_requested_replica("requested", requested_replica_id)
+    with caplog.at_level(logging.DEBUG, logger="vllm_omni.engine.stage_pool"):
+        with pytest.raises(
+            OmniClientError,
+            match=rf"replica_id {requested_replica_id} does not exist or is not available",
+        ):
+            pool.bind_requested_replica("requested", requested_replica_id)
 
     assert pool.get_bound_replica_id("requested") is None
     assert all(not client.add_request_calls for client in clients)
+    assert "out of range" in caplog.text
 
 
-def test_stage_pool_requested_replica_rejects_down_replica_without_fallback() -> None:
+def test_stage_pool_requested_replica_rejects_down_replica_without_fallback(caplog) -> None:
     pool, clients, _ = _distributed_routing_pool((ReplicaStatus.UP, ReplicaStatus.DOWN))
 
-    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
-        pool.bind_requested_replica("requested", 1)
+    with caplog.at_level(logging.DEBUG, logger="vllm_omni.engine.stage_pool"):
+        with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
+            pool.bind_requested_replica("requested", 1)
 
     assert pool.get_bound_replica_id("requested") is None
     assert all(not client.add_request_calls for client in clients)
+    assert "not UP and serviceable" in caplog.text
 
 
 def test_stage_pool_requested_replica_rejects_locally_unavailable_replica() -> None:
@@ -2371,6 +2376,15 @@ def test_stage_pool_requested_replica_rejects_locally_unavailable_replica() -> N
 
     assert pool.get_bound_replica_id("requested") is None
     assert all(not client.add_request_calls for client in clients)
+
+
+def test_bind_requested_replica_validates_once(mocker: MockerFixture) -> None:
+    pool, _, _ = _distributed_routing_pool()
+    validate = mocker.spy(pool, "_validate_requested_replica")
+
+    assert pool.bind_requested_replica("requested", 1) == 1
+
+    validate.assert_called_once_with(1)
 
 
 @pytest.mark.asyncio

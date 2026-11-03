@@ -577,17 +577,41 @@ class StagePool:
         Returns its input address in distributed mode and ``None`` otherwise.
         """
         input_addr: str | None = None
-        available = self.is_replica_available(replica_id)
-        if available and self.is_distributed:
+        reason: str | None = None
+        if not 0 <= replica_id < self.num_replicas:
+            reason = f"out of range for {self.num_replicas} replica slot(s)"
+        elif self.clients[replica_id] is None:
+            reason = "no local client is attached"
+        elif replica_id in self._unavailable_replicas:
+            reason = "marked locally unavailable"
+        elif self.is_distributed:
             input_addr = self._replica_id_to_addr.get(replica_id)
-            available = input_addr is not None and self._serviceable_replica_id_for_addr(input_addr) == replica_id
-        if not available:
+            if input_addr is None:
+                reason = "no distributed input address is recorded"
+            elif self._serviceable_replica_id_for_addr(input_addr) != replica_id:
+                reason = f"distributed address {input_addr} is not UP and serviceable"
+        if reason is not None:
+            logger.debug(
+                "Rejecting requested stage-%s replica-%s: %s",
+                self.stage_id,
+                replica_id,
+                reason,
+            )
             raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} does not exist or is not available")
         return input_addr
 
-    def reserve_requested_replica(self, request_id: str, replica_id: int) -> int:
-        """Record explicit routing intent without marking the request active."""
+    def validate_requested_replica(self, replica_id: int) -> None:
+        """Read-only preflight for a caller-selected replica.
+
+        Admission must validate again because membership can change after this
+        method returns. This helper exists for frontend multimodal preprocessing,
+        where rejecting an already-invalid route before processing avoids
+        populating sender-cache entries that no replica will consume.
+        """
         self._validate_requested_replica(replica_id)
+
+    def _record_requested_replica(self, request_id: str, replica_id: int) -> int:
+        """Record already-validated explicit routing intent."""
 
         reserved_replica_id = self._requested_replica_ids.get(request_id)
         if reserved_replica_id is not None and reserved_replica_id != replica_id:
@@ -606,10 +630,15 @@ class StagePool:
         self._requested_replica_ids[request_id] = replica_id
         return replica_id
 
+    def reserve_requested_replica(self, request_id: str, replica_id: int) -> int:
+        """Validate and record explicit intent without marking the request active."""
+        self._validate_requested_replica(replica_id)
+        return self._record_requested_replica(request_id, replica_id)
+
     def bind_requested_replica(self, request_id: str, replica_id: int) -> int:
         """Revalidate and activate a caller-requested stage-local replica."""
         input_addr = self._validate_requested_replica(replica_id)
-        self.reserve_requested_replica(request_id, replica_id)
+        self._record_requested_replica(request_id, replica_id)
 
         bound_replica_id = self.get_bound_replica_id(request_id)
         if bound_replica_id is not None:

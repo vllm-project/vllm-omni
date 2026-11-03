@@ -173,13 +173,20 @@ class AsyncOmniEngine(OmniEngineBase):
             return None, prompt
 
         stage0_pool = stage_pools[0]
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
+            return None, prompt
+
+        if requested_replica_id is not None:
+            # Read-only frontend preflight: do not populate sender-cache entries
+            # for a route that is already invalid. The orchestrator remains the
+            # owner of routing state and revalidates at admission to close the
+            # membership-change race after enqueue.
+            stage0_pool.validate_requested_replica(requested_replica_id)
+
         # TODO: Currently only supports the ar -> dit process.
         # Future scenarios (e.g., dit -> ar) need to be added, which will require modifications here.
         if stage0_pool.stage_type == "diffusion" or self._stage_pool_replica_count(stage0_pool) <= 1:
-            return None, prompt
-
-        prompts = prompt if isinstance(prompt, list) else [prompt]
-        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
             return None, prompt
 
         if requested_replica_id is not None:
