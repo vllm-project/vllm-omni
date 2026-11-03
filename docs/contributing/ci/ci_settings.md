@@ -88,8 +88,10 @@ Canonical layout (prefer these paths for new changes):
 
     On scheduled release-line builds (`main` or non-PR `release/vX.Y.Z`), `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
 
-    - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires a release line: `main` or a branch named `release/vX.Y.Z` (for example `release/v0.30.0`).
+    - **Reliability** / **Perf Test** → `WEEKLY=1` (or PR label `weekly-test`). Pipeline upload for scheduled env vars still requires a release line: `main` or a branch named `release/vX.Y.Z` (for example `release/v0.30.0`).
     - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
+
+    **Simple · CPU Coverage Test** is in `test-nightly.yml` and runs when `NIGHTLY=1`.
 
     **`--e2e`:** when uploading ready/merge on a release line (`main` or `release/vX.Y.Z`) with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
 
@@ -182,6 +184,46 @@ Canonical layout (prefer these paths for new changes):
     **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
 
     **Hardware in YAML:** `agent_pool` (for example `mi325_1`) plus `mirror_hardwares: [amdproduction]` (array—Buildkite template filter, not the CUDA/NPU uploader preset mechanism).
+
+    **READY/MERGE CPU timing:** the three **Model Executor** shards and **Other Test** use
+    `.buildkite/amd/scripts/run_cpu_suite.py`. It invokes pytest once with the existing
+    selectors and shard arguments, adding `--durations=50` and JUnit output. Test
+    grades, timeouts, and shard counts are unchanged. READY and MERGE retain identical
+    definitions for these jobs so combined builds can still deduplicate them.
+
+    Each invocation uploads `artifacts/amd-cpu-suites/<suite>-<build>-<job>-<shard>-<unique>/`:
+
+    - `invocation.json`: pytest arguments, marker/run level, shard parameters, commit,
+      and Buildkite identifiers. The configured image tag is recorded; the resolved
+      digest is `null` because it is not exposed to this runner. Use the Buildkite
+      group/build metadata to identify READY, MERGE, or a combined tier.
+    - `selection.json`: node IDs collected before filtering, selected after filtering
+      and sharding, and `not_selected` (their difference). `deselected` records
+      pytest notifications only: pytest-shard 0.1.2 removes items silently.
+      No extra collection pass is run.
+    - `events.jsonl`: elapsed timestamps for collection, test starts, and each
+      setup/call/teardown report, including duration and outcome.
+    - `pytest.xml`: pytest's JUnit execution results.
+    - `cpu-before.json` / `cpu-after.json`: CPU affinity, cgroup v1/v2 limits,
+      throttling counters, CPU pressure, load, and thread environment settings.
+      Unavailable Linux fields are identified explicitly.
+    - `summary.json`: pytest exit code, collection status, node counts, and phase
+      totals. `executed` counts nodes with a call report; setup skips/errors are
+      separate outcomes. A teardown failure makes the node failed even if its call
+      passed. `skipped` includes expected failures (see `wasxfail` in events).
+
+    `runner_wall` spans the measured invocation, including artifact overhead.
+    Phase totals describe this pytest process: setup/teardown include fixture costs,
+    while collection is wall time around pytest's collection hook. They exclude
+    image-build, dependency-wait, and queue time and are not per-fixture profiles.
+    Match job IDs to Buildkite timestamps when analyzing end-to-end latency.
+
+    Events are closed after every write so completed records survive process
+    termination. SIGTERM/SIGKILL can leave no final summary or JUnit file; treat
+    such artifacts as partial, never as a passing run. Upload still depends on
+    the agent retaining the workspace. The runner preserves nonzero pytest exit
+    codes; artifact errors fail an otherwise successful invocation. This adds
+    measurement only; CI overhead and build-time savings require hardware evidence.
 
     **Data file fields**
 
@@ -329,8 +371,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ### Policy
 
-- **Always uploaded** (no key): L2/L3 groups outside **E2E Test**—Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1` or `NON_CRITICAL=1` have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Always uploaded** (no key): L2 **Simple Test**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
@@ -374,7 +416,7 @@ Test". Coverage + artifact upload run only when bootstrap uploaded that job with
 the same job runs plain pytest without `--cov`. It runs on a single GPU so the
 pilot is cheap to reproduce.
 
-**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on a release line (`main` or `release/vX.Y.Z`) with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
+**L1 package coverage (CPU):** ready Simple Test jobs run without `--cov`. Scheduled nightly on a release line (`main` or `release/vX.Y.Z`) with `NIGHTLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-nightly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under

@@ -86,6 +86,20 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether a dense ``[B, 1|H, Q, KV]`` Boolean mask can be consumed natively.
+
+        The FlashAttention family only implements 2D key-validity masks (its
+        masked-varlen path asserts on 4D input), while SDPA, cuDNN, and Ascend
+        ``npu_fusion_attention`` consume the dense mask directly. The attention
+        layer uses this capability to route an incompatible dense-mask call to
+        SDPA for that call instead of letting the backend assert deep inside
+        the kernel wrapper.
+        """
+        del attention_spec
+        return False
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         """Whether a 2D mask excludes K/V only, including when Q and K have equal lengths."""
         del attention_spec

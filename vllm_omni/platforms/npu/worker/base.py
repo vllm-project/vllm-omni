@@ -23,6 +23,12 @@ class OmniNPUWorkerBase(NPUWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # Ascend inherits vLLM's global runner default (V2 in vLLM 0.32),
+        # while Omni resolves the runner independently for each deploy stage.
+        # Keep runner construction and inherited worker lifecycle methods on
+        # the same stage-selected path, including mixed V2 AR / V1 DAC deploys.
+        self.use_v2_model_runner = bool(getattr(self.vllm_config.model_config, "use_v2_model_runner", False))
+
         # Replace vllm-ascend's profiler with OmniProfiler
         profiler_config = self.vllm_config.profiler_config
         if profiler_config and profiler_config.profiler == "torch":
@@ -35,6 +41,28 @@ class OmniNPUWorkerBase(NPUWorker):
                 worker_name=worker_name,
                 local_rank=self.local_rank,
             )
+
+    def get_stage_post_warmup_memory_stats(self) -> None:
+        """NPU workers do not provide the optional CUDA warmup snapshot."""
+        return None
+
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        self._capture_auxiliary_graphs()
+        return result
+
+    def _capture_auxiliary_graphs(self) -> None:
+        """Let opt-in models warm valid inputs before the worker becomes ready.
+
+        Mirrors ``OmniGPUWorkerBase._capture_auxiliary_graphs``: the CUDA base
+        has called this from ``compile_or_warm_up_model`` for a while, the NPU
+        base did not, so a model that relies on the hook (e.g. capturing its
+        audio graphs at startup rather than on the first request) silently
+        skipped it on Ascend.
+        """
+        capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
+        if callable(capture):
+            capture()
 
     def profile(
         self,
