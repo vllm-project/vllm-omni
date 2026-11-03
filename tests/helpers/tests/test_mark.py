@@ -139,6 +139,54 @@ def test_same_count_multi_platform_stays_one_item():
     assert "MI325" in names
 
 
+@pytest.mark.parametrize(
+    ("active_platform", "device_name", "device_count", "should_skip"),
+    [
+        ("cuda", "NVIDIA H100", 1, False),
+        ("oot", "Tenstorrent Wormhole", 1, False),
+        ("oot", "AMD MI300X", 1, True),
+        ("oot", "Tenstorrent Wormhole", 0, True),
+    ],
+)
+def test_same_count_cuda_and_oot_are_alternatives(monkeypatch, active_platform, device_name, device_count, should_skip):
+    import vllm.platforms
+
+    import vllm_omni.platforms
+
+    class CurrentPlatform:
+        def is_cuda(self):
+            return active_platform == "cuda"
+
+        def is_rocm(self):
+            return False
+
+        def is_xpu(self):
+            return False
+
+        def device_count(self):
+            return device_count
+
+    class CurrentOmniPlatform:
+        def is_out_of_tree(self):
+            return active_platform == "oot"
+
+        def get_device_name(self):
+            return device_name
+
+        def get_device_count(self):
+            return device_count
+
+    monkeypatch.setattr(vllm.platforms, "current_platform", CurrentPlatform())
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", CurrentOmniPlatform())
+
+    @hardware_test(res={"cuda": "H100", "oot": "Tenstorrent"})
+    def _probe():
+        return None
+
+    skip = next(mark for mark in _probe.pytestmark if mark.name == "skipif")
+    assert skip.args == (should_skip,)
+
+
 def test_rocm_multicard_marks_skip_an_undersized_rocm_worker(monkeypatch):
     import vllm.platforms
 
