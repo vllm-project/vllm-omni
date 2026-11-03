@@ -24,6 +24,11 @@ Behaviour:
   commit carries the matching docs;
 * nothing relevant staged: exit quietly.
 
+It runs on every commit (`always_run`), including deletion-only commits, which
+pre-commit would otherwise not match against `files:` at all. When nothing
+relevant is staged it returns immediately, so the always-on run costs one
+`git diff --cached --name-only`.
+
 Set SKIP=sync-example-docs to disable it, for example when rebasing a branch
 that is already green.
 """
