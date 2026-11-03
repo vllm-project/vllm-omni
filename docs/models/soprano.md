@@ -38,7 +38,7 @@ Shared entrypoints are documented in the [offline TTS hub](../user_guide/example
   the connector, with a supported range of 1–64. Windows retain at most
   `8 + chunk_size` hidden rows, first regular decode needs `4 + chunk_size`
   predictors, and flush ends at `2048 * (T - 1)` samples. Short generations
-  can finish before a regular chunk. Request state is released at finish,
+  can finish before a regular chunk. Audio-window state is released at finish,
   error and cancellation, including worker-slot reuse.
 - A failed decoder stream stays failed for subsequent chunks of that request.
   Its failure marker is retained until the runner's finish/abort callback;

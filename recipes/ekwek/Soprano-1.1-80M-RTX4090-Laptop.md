@@ -57,7 +57,7 @@ select the Soprano pipeline. Do not edit `config.json` to imitate another model.
 | NVIDIA driver | 610.47 |
 | PyTorch / runtime | 2.13.0+cu130 / CUDA 13.0; driver capability is not the PyTorch runtime version |
 | vLLM / Transformers | 0.32.0 / 5.19.0 |
-| Runtime implementation | Post-integration runtime validated at `301ed5c37361dec9d5136d0e7a6a4303d0184d73`; the qualification-only documentation update preserves its runtime, benchmark and test trees |
+| Runtime implementation | Post-integration runtime validated at `888671bd744ac7e0d2482b306035b1259307712f`; the qualification-only documentation update preserves its runtime, benchmark and test trees |
 | Checkpoint revision | `27b5a5f5f541a1db3a51d6fd1b0fc7147b92cd01` |
 
 ## Setup
@@ -233,7 +233,7 @@ saved audio after stopping services, avoiding ASR GPU contention.
 | Other hardware/platforms | CPU-only inference, desktop 4090, L4/H100, AMD/ROCm, Ascend, Intel, macOS/MPS and native Windows not qualified by this recipe |
 | Quality | Historical English ASR and manual-review checklist; fresh online content assertions; human listening/MOS pending, no cloning SIM acceptance |
 
-The post-integration command replay at `301ed5c37361dec9d5136d0e7a6a4303d0184d73` produced 98304 samples
+The post-integration command replay at `888671bd744ac7e0d2482b306035b1259307712f` produced 98304 samples
 (3.072 seconds) per fixed-text WAV at 32000 Hz mono. The streaming profile's
 WAV, raw PCM and 12 SSE audio deltas were sample-identical; the SSE terminal
 event was present. The documented benchmark smoke completed 20/20 requests,
