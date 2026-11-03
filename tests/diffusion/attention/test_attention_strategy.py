@@ -404,3 +404,26 @@ def test_fractional_schedule_uses_current_total_without_request_state():
         assert plan.current_layout() == 1
         context.total_denoise_steps = 10
         assert plan.current_layout() == 0
+
+
+@pytest.mark.parametrize("eager,granularity", [(True, "full"), (False, "regional")])
+def test_seacache_strategy_scope(eager, granularity):
+    config = OmniDiffusionConfig(
+        model="unused",
+        diffusion_attention_config=recipe(),
+        cache_backend="sea_cache",
+        enforce_eager=eager,
+        diffusion_compile_granularity=granularity,
+    )
+    assert config.cache_backend == "sea_cache"
+
+
+def test_seacache_strategy_rejects_bypassed_full_compilation():
+    with pytest.raises(ValueError, match="SeaCache with full compilation"):
+        OmniDiffusionConfig(
+            model="unused",
+            diffusion_attention_config=recipe(),
+            cache_backend="sea_cache",
+            enforce_eager=False,
+            diffusion_compile_granularity="full",
+        )

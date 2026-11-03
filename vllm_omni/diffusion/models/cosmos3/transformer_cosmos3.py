@@ -2700,6 +2700,9 @@ class Cosmos3VFMTransformer(nn.Module):
         self, prep: _GenPrepared, attention_layout: int | None = None, attention_context: _GenRequest | None = None
     ) -> torch.Tensor:
         """Execute the cacheable GEN stack, including final norm."""
+        runner = getattr(self, "_attention_strategy_runner", None)
+        if runner is not None and attention_layout is None:
+            return runner.run_cached_stack(self._run_gen_stack, prep, attention_context=attention_context)
         return self.norm_moe_gen(self._run_gen_layers_from_prep(prep, attention_layout, attention_context))
 
     def _gen_postprocess(

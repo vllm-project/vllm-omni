@@ -635,3 +635,49 @@ def test_shared_config_defaults() -> None:
     assert config.sea_residual_order == 1
     assert config.sea_max_consecutive_cached == 2
     assert config.sea_power_exp == 3.0
+
+
+def test_strategy_cache_misses_dispatch_without_resetting_history():
+    from vllm_omni.diffusion.attention.strategy import AttentionStrategyRunner, ForwardStrategyPlan
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=4)
+    layouts = []
+
+    class StrategyTransformer(TinyCosmos3Transformer):
+        _run_gen_stack = Cosmos3VFMTransformer._run_gen_stack
+
+        def _run_gen_layers(self, hidden_gen):
+            return self._run_gen_stack(hidden_gen)
+
+        def _run_gen_layers_from_prep(self, prep, attention_layout, attention_context):
+            layouts.append(attention_layout)
+            return prep * (2 + attention_layout)
+
+    transformer = StrategyTransformer()
+    transformer.norm_moe_gen = torch.nn.Identity()
+    plan = ForwardStrategyPlan(("dense", "sparse"), "step_index", ((1, 0), (None, 1)))
+    transformer.forward_with_attention_layout = lambda **kwargs: None
+    runner = AttentionStrategyRunner(transformer, plan)
+    transformer._attention_strategy_runner = runner
+    hook = _apply_test_hook(transformer, metadata, SeaCacheConfig(threshold=100.0, max_consecutive_cached=2))
+    hook.refresh(transformer)
+    for step, timestep in enumerate((1000, 750, 500, 250)):
+        metadata.step = step
+        metadata.sigma = timestep / 1000
+        with override_forward_context(ForwardContext(denoise_step_idx=step, total_denoise_steps=4)):
+            _run_step(transformer, timestep, 1.0 - step * 0.01, hook=hook)
+    assert layouts == [0, 1]
+    assert hook.full_count == 2
+    assert hook.skip_count == 2
+    assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
+
+    # Explicit warmup must exercise both layouts even through the cache boundary.
+    runner.set_warmup(True)
+    layouts.clear()
+    with override_forward_context(ForwardContext(denoise_step_idx=3, total_denoise_steps=4)):
+        result = transformer._run_gen_stack(torch.ones(1))
+    assert layouts == [0, 1]
+    torch.testing.assert_close(result, torch.full((1,), 3.0))
+    assert runner.warmup_status()["layouts_pending"] == ()

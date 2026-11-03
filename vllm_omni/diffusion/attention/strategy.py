@@ -178,8 +178,14 @@ def validate_strategy_runtime(config):
         return
     validate_strategy_parallel(config)
     unsupported = []
-    if config.cache_backend not in (None, "none"):
+    if config.cache_backend not in (None, "none", "sea_cache"):
         unsupported.append(f"cache acceleration ({config.cache_backend})")
+    if (
+        config.cache_backend == "sea_cache"
+        and not config.enforce_eager
+        and config.diffusion_compile_granularity != "regional"
+    ):
+        unsupported.append("SeaCache with full compilation (use regional compilation or eager execution)")
     if config.step_execution:
         unsupported.append("step execution")
     if config.streaming_output:
@@ -395,6 +401,19 @@ class AttentionStrategyRunner:
 
     def set_warmup(self, active):
         self.warming = active
+
+    def run_cached_stack(self, forward, *args, **kwargs):
+        """Dispatch cache misses without changing the cache's reuse policy."""
+        layout = self.plan.current_layout()
+        if not self.warming:
+            return forward(*args, attention_layout=layout, **kwargs)
+        # Cache hooks bypass __call__; warm every regional layout here too.
+        for index in range(len(self.plan.layout_names)):
+            result = forward(*args, attention_layout=index, **kwargs)
+            if index == layout:
+                output = result
+            self._warmed_layouts.add(index)
+        return output
 
     def __call__(self, *args, **kwargs):
         if "attention_layout" in kwargs:
