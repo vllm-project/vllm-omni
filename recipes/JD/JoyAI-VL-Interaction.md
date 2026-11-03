@@ -58,13 +58,14 @@ decision produces text and audio, followed by `response.done`. Playback acknowle
 `response.cancel`, `session.close`, and reconnect use the shared Session lifecycle.
 
 This first profile runs observations sequentially. Incoming frames can be buffered
-while an answer is being generated. The Talker streams codec frames to Code2Wav, so
-speech audio is delivered chunk by chunk while synthesis continues. Prompts retain up to four recent camera
-frames (thumbnail size at most 448×448) and eight recent text messages. Older
-history/frames are evicted when the expanded visual-token count plus the generation
-budget would exceed the configured JoyAI-stage context limit. The active instruction
-and newest frame are retained; an oversized instruction is reported as an error.
-These bounds provide a small working context, with summary memory planned in
+while an answer is being generated. The Talker streams codec frames to Code2Wav,
+so speech audio is delivered chunk by chunk while synthesis continues. Prompts
+retain up to four recent camera frames (thumbnail size at most 448×448) and eight
+recent text messages. Older history/frames are evicted when the expanded
+visual-token count plus the generation budget would exceed the configured
+JoyAI-stage context limit. The active instruction and newest frame are retained;
+an oversized instruction is reported as an error. These bounds provide a small
+working context, with summary memory planned in
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
 The current profile accepts

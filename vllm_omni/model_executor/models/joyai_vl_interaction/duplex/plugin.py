@@ -274,7 +274,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index, params in enumerate(defaults):
             if isinstance(params, SamplingParams):
                 params = params.clone()
-                # Code2Wav streams each decoded chunk once; the rest only matter when complete.
+                # Code2Wav streams each decoded chunk once. DELTA is also safe on the all-sync
+                # profiles, where Code2Wav emits one output per request. The rest only matter when complete.
                 params.output_kind = (
                     RequestOutputKind.DELTA if index == self.audio_stage_id else RequestOutputKind.FINAL_ONLY
                 )
