@@ -42,6 +42,7 @@ def _qkv_head_layer_norm_kernel(
     stride_qn,
     stride_qh,
     stride_qt,
+    stride_kv2,
     stride_kvn,
     stride_kvh,
     stride_kvt,
@@ -82,7 +83,7 @@ def _qkv_head_layer_norm_kernel(
     tl.store(dst, k, mask=mask)
 
     v = tl.load(src + 2 * inner, mask=mask, other=0.0)
-    tl.store(dst + HEAD_DIM, v, mask=mask)
+    tl.store(dst + stride_kv2, v, mask=mask)
 
 
 def qkv_head_layer_norm(
@@ -96,20 +97,20 @@ def qkv_head_layer_norm(
     rows: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Split packed ``qkv``, LayerNorm q/k per head, write q and interleaved ``kv``."""
+    """Split packed ``qkv``, LayerNorm q/k per head, write q and the split ``kv`` cache."""
     batch, frames, width = (int(dim) for dim in qkv.shape)
     inner = num_heads * head_dim
     if width != 3 * inner or qkv.stride(2) != 1:
         raise ValueError(f"qkv_head_layer_norm: qkv must be (N, T, 3*{inner}) with contiguous channels")
     if (
-        kv.dim() != 4
-        or (rows is None and int(kv.shape[0]) != batch)
-        or int(kv.shape[1]) != num_heads
-        or (positions is None and int(kv.shape[2]) < frames)
-        or int(kv.shape[3]) != 2 * head_dim
-        or kv.stride(3) != 1
+        kv.dim() != 5
+        or (rows is None and int(kv.shape[1]) != batch)
+        or int(kv.shape[2]) != num_heads
+        or (positions is None and int(kv.shape[3]) < frames)
+        or int(kv.shape[4]) != head_dim
+        or kv.stride(4) != 1
     ):
-        raise ValueError(f"qkv_head_layer_norm: kv must be (N, H, >= T, 2*D), got {tuple(kv.shape)}")
+        raise ValueError(f"qkv_head_layer_norm: kv must be (2, N, H, >= T, D), got {tuple(kv.shape)}")
     if rows is not None and tuple(rows.shape) != (batch,):
         raise ValueError(f"qkv_head_layer_norm: rows must be ({batch},), got {tuple(rows.shape)}")
     if positions is not None and (tuple(positions.shape) != (batch, frames) or not positions.is_contiguous()):
@@ -122,16 +123,16 @@ def qkv_head_layer_norm(
         keys = k_norm(heads[:, :, 1].transpose(1, 2))
         values = heads[:, :, 2].transpose(1, 2)
         if rows is None and positions is None:
-            kv[:, :, :frames, :head_dim].copy_(keys)
-            kv[:, :, :frames, head_dim:].copy_(values)
+            kv[0, :, :, :frames].copy_(keys)
+            kv[1, :, :, :frames].copy_(values)
             return q_out
         pool_rows = rows.tolist() if rows is not None else range(batch)
         for n, pool_row in enumerate(pool_rows):
             frame_index = positions[n] if positions is not None else torch.arange(frames, device=kv.device)
             written = frame_index >= 0
             destination = frame_index[written].to(kv.device)
-            kv[pool_row, :, destination, :head_dim] = keys[n][:, written]
-            kv[pool_row, :, destination, head_dim:] = values[n][:, written]
+            kv[0, pool_row, destination] = keys[n][:, written]
+            kv[1, pool_row, destination] = values[n][:, written]
         return q_out
     if batch * frames == 0:
         return q_out
@@ -158,6 +159,7 @@ def qkv_head_layer_norm(
         kv.stride(0),
         kv.stride(1),
         kv.stride(2),
+        kv.stride(3),
         q_eps,
         k_eps,
         HEADS=num_heads,
