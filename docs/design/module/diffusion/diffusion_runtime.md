@@ -228,9 +228,18 @@ request-batch support.
 The runner preserves the scheduler's request batch for every diffusion stage
 role and passes it to `run_stage()`. Role permissions do not force a batch into
 single-request calls. Each pipeline operation consumes the batch and returns
-one output per request under the same request-batch support contract. Atomic encode/decode stages under step
-scheduling reuse `execute_model_batch()` and mark each result terminal; they do
-not run `execute_model()` separately for each admitted request.
+one output per request under the same request-batch support contract. Atomic
+encode/decode stages under step scheduling reuse `execute_model_batch()` and
+mark each result terminal; they do not run `execute_model()` separately for
+each admitted request. An exception from shared batch validation or execution
+fails every request in that batch, matching request-mode failure isolation;
+the runner does not retry batch members individually. Per-request errors
+returned by the pipeline remain attached to their own outputs.
+
+`execute_model_batch()` validates and installs each new request's
+`diffusion_kv_metadata` from `scheduled_new_reqs`, passes the metadata in
+request order to the shared forward path, and removes the installed rows
+after execution. This also applies to atomic stages under step scheduling.
 
 **Distributed layerwise offload with AllGather (DLO DP concurrency)** is a
 separate dispatch path supported by `mp` and `ray`. It activates when
@@ -322,6 +331,13 @@ and timesteps. Its request and step paths share this preparation. Lightweight
 preprocessing can recover output dimensions and batch compatibility before the
 worker receives tensors. A denoise-only stage emits packed target latents plus
 this geometry; the decoder reuses the native unpack/denormalize/decode path.
+
+Native Qwen generator batches share a padded joint sequence layout. The current
+Transformer counts padded prefix slots when positioning image tokens with RoPE,
+so attention masks alone do not preserve the positions used by separate
+requests with shorter text. This also applies to native FULL batching; output
+differences across batch compositions can include position changes as well as
+floating-point rounding.
 
 ## Request state and identity
 

@@ -771,6 +771,83 @@ def test_execute_stepwise_uses_atomic_stage_capability(monkeypatch, role):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("role", [DiffusionStageRole.ENCODE, DiffusionStageRole.DECODE])
+def test_atomic_step_stage_shared_failure_is_terminal_for_every_batch_member(monkeypatch, role):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _AtomicStagePipeline(role)
+    operation = "encode_batch" if role is DiffusionStageRole.ENCODE else "decode_batch"
+    monkeypatch.setattr(runner.pipeline, operation, Mock(side_effect=ValueError("bad batch member")))
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    scheduled = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=_make_scheduler_output(2).scheduled_new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+
+    output = runner._execute_atomic_step_stage(scheduled)
+
+    assert [item.request_id for item in output.runner_outputs] == ["req-0", "req-1"]
+    for item in output.runner_outputs:
+        assert item.finished is True
+        assert item.step_index == 0
+        assert item.result.error == "bad batch member"
+    getattr(runner.pipeline, operation).assert_called_once()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("role", [DiffusionStageRole.ENCODE, DiffusionStageRole.DECODE])
+@pytest.mark.parametrize("execution_fails", [False, True])
+def test_atomic_step_stage_forwards_each_requests_kv_metadata(monkeypatch, role, execution_fails):
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _AtomicStagePipeline(role)
+    runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    metadata = [DiffusionKVMetadata(request_id=f"req-{i}", allocation_generation=i + 1, sequences=()) for i in range(2)]
+    requests = [
+        OmniDiffusionRequest(request_id=m.request_id, prompt="prompt", sampling_params=OmniDiffusionSamplingParams())
+        for m in metadata
+    ]
+    scheduled = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            NewRequestData(request_id=r.request_id, req=r, diffusion_kv_metadata=m) for r, m in zip(requests, metadata)
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+    install = Mock()
+    remove = Mock()
+    execute = Mock(
+        return_value=BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id=r.request_id, result=DiffusionOutput()) for r in requests]
+        )
+    )
+    if execution_fails:
+        execute.side_effect = ValueError("shared forward failed")
+    monkeypatch.setattr(runner, "install_diffusion_kv_metadata", install)
+    monkeypatch.setattr(runner, "remove_diffusion_kv_requests", remove)
+    monkeypatch.setattr(runner, "_execute_request_list", execute)
+
+    result = runner._execute_atomic_step_stage(scheduled)
+
+    assert [call.args[0] for call in install.call_args_list] == metadata
+    assert execute.call_args.args[0] == requests
+    assert execute.call_args.kwargs["diffusion_kv_metadata"] == metadata
+    remove.assert_called_once_with([r.request_id for r in requests])
+    assert all(item.finished for item in result.runner_outputs)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_step_mode_rejects_uninitialized_or_request_only_mixin_contract():
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     runner.od_config.step_execution = True

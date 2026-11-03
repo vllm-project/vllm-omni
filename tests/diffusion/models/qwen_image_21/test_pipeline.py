@@ -7,6 +7,7 @@ order, KV-cache assembly across step phases, and the post-process func."""
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -518,8 +519,80 @@ def test_encode_rejects_incompatible_direct_batch_before_encoding(mocker, field,
     encode.assert_not_called()
 
 
+@pytest.mark.parametrize("first_type", [list, tuple, np.array, torch.tensor])
+@pytest.mark.parametrize("second_type", [list, tuple, np.array, torch.tensor])
+@pytest.mark.parametrize("compatible", [False, True])
+def test_diffuse_compares_custom_sigma_values_before_generation(mocker, first_type, second_type, compatible):
+    pipeline = _toy_pipeline()
+    requests = [
+        OmniDiffusionRequest(
+            request_id=str(i),
+            prompt="text",
+            sampling_params=OmniDiffusionSamplingParams(height=64, width=64),
+        )
+        for i in range(2)
+    ]
+    requests[0].sampling_params.sigmas = first_type([0.75, 0.5, 0.25])
+    requests[1].sampling_params.sigmas = second_type([0.75, 0.5, 0.25 if compatible else 0.125])
+    collate = mocker.patch.object(pipeline, "_collate_stage_conditioning")
+    generate = mocker.patch.object(pipeline, "_generate_latents", return_value=(torch.zeros(2, 16, 4), 64, 64, 1))
+    batch = DiffusionRequestBatch(requests=requests)
+    if compatible:
+        assert len(pipeline.diffuse_batch(batch)) == 2
+        generate.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="requires matching sigmas"):
+            pipeline.diffuse_batch(batch)
+        collate.assert_not_called()
+        generate.assert_not_called()
+
+
+@pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])
+@pytest.mark.parametrize("negative_prompt", [None, "", "blurry"])
+@pytest.mark.parametrize("image_count", [0, 1])
+def test_negative_conditioning_key_matches_encoded_payload(
+    mocker, tmp_path, true_cfg_scale, negative_prompt, image_count
+):
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import get_qwen_image_21_pre_process_func
+
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir()
+    (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
+    preprocess = get_qwen_image_21_pre_process_func(SimpleNamespace(model=str(tmp_path)))
+    pipeline = _toy_pipeline()
+    pipeline.device = torch.device("cpu")
+    pipeline._max_length = 128
+    encoder = mocker.patch.object(
+        pipeline,
+        "encode_prompt",
+        return_value=(torch.ones(1, 2, 4), torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.bool)),
+    )
+    mocker.patch.object(pipeline, "_encode_vae_image", return_value=torch.ones(1, 4, 1, 2, 2))
+    request = preprocess(
+        OmniDiffusionRequest(
+            request_id="raw",
+            prompt={
+                "prompt": "teapot",
+                "negative_prompt": negative_prompt,
+                "multi_modal_data": {"image": [Image.new("RGB", (32, 32))] * image_count},
+            },
+            sampling_params=OmniDiffusionSamplingParams(height=64, width=64, true_cfg_scale=true_cfg_scale),
+        )
+    )
+    output = pipeline.encode_batch(DiffusionRequestBatch(requests=[request]))[0]
+    downstream = preprocess(
+        OmniDiffusionRequest(request_id="encoded", prompt=output.custom_output, sampling_params=request.sampling_params)
+    )
+    expected = true_cfg_scale == 3.0 and negative_prompt is not None
+    assert request.batch_compatibility_key == downstream.batch_compatibility_key
+    assert downstream.batch_compatibility_key[-1] is expected
+    assert (output.custom_output["qwen_image_21_conditioning"]["negative_prompt_embeds"] is not None) is expected
+    assert encoder.call_count == (2 if expected else 1)
+
+
 @pytest.mark.parametrize("num_outputs", [1, 2])
-def test_stage_generator_and_decoder_use_native_batches(mocker, num_outputs):
+@pytest.mark.parametrize("use_cfg", [False, True])
+def test_stage_generator_and_decoder_use_native_batches(mocker, num_outputs, use_cfg):
     from vllm_omni.diffusion.data import DiffusionOutput
 
     pipeline = _toy_pipeline()
@@ -533,9 +606,9 @@ def test_stage_generator_and_decoder_use_native_batches(mocker, num_outputs):
                 "prompt_embeds": torch.full((1, length, 4), float(i + 1)),
                 "prompt_embeds_mask": torch.ones(1, length),
                 "image_pad_mask": torch.zeros(1, length, dtype=torch.bool),
-                "negative_prompt_embeds": None,
-                "negative_prompt_embeds_mask": None,
-                "negative_image_pad_mask": None,
+                "negative_prompt_embeds": torch.full((1, length + 2, 4), float(i + 3)) if use_cfg else None,
+                "negative_prompt_embeds_mask": torch.ones(1, length + 2) if use_cfg else None,
+                "negative_image_pad_mask": torch.zeros(1, length + 2, dtype=torch.bool) if use_cfg else None,
                 "image_latents": [torch.full((1, 4, 1, 2, 2), float(i + 10))],
                 "input_image_sizes": [(32, 32)],
             }
@@ -557,6 +630,13 @@ def test_stage_generator_and_decoder_use_native_batches(mocker, num_outputs):
     conditioning = generate.call_args.kwargs["conditioning"]
     assert conditioning["prompt_embeds"].shape == (2, 3, 4)
     assert conditioning["prompt_embeds_mask"].tolist() == [[1, 1, 0], [1, 1, 1]]
+    assert conditioning["prompt_embeds"][0, -1].count_nonzero() == 0
+    assert not conditioning["image_pad_mask"].any()
+    if use_cfg:
+        assert conditioning["negative_prompt_embeds"].shape == (2, 5, 4)
+        assert conditioning["negative_prompt_embeds_mask"].tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]]
+        assert conditioning["negative_prompt_embeds"][0, -1].count_nonzero() == 0
+        assert not conditioning["negative_image_pad_mask"].any()
     assert conditioning["image_latents"][0][:, 0, 0, 0, 0].tolist() == [10, 11]
     for i, output in enumerate(outputs):
         torch.testing.assert_close(output.custom_output["latents"], packed[i * num_outputs : (i + 1) * num_outputs])

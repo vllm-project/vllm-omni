@@ -139,3 +139,22 @@ def test_boundary_selector_has_no_concrete_stage_permissions(operator):
     with pytest.raises(ValueError, match="Resolve boundary selector"):
         _ = operator.required_stages
     assert all(operator not in role.allowed_operators for role in DiffusionStageRole)
+
+
+@pytest.mark.parametrize("role", list(DiffusionStageRole))
+def test_role_enumeration_and_repr_do_not_read_boundary_permissions(monkeypatch, role):
+    original = DiffusionStageOperator.required_stages.fget
+    observed = set()
+
+    def required_stages(operator):
+        assert not operator.is_boundary_selector
+        observed.add(operator)
+        return original(operator)
+
+    monkeypatch.setattr(DiffusionStageOperator, "required_stages", property(required_stages))
+    assert role.required_operators(step_execution=False) <= role.allowed_operators
+    assert role.required_operators(step_execution=True) <= role.allowed_operators
+    assert role.step_operators <= role.allowed_operators
+    for operator in DiffusionStageOperator:
+        assert operator.value in repr(operator)
+    assert observed == {operator for operator in DiffusionStageOperator if not operator.is_boundary_selector}

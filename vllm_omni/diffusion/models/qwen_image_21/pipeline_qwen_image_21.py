@@ -151,6 +151,15 @@ def _exclude_text_encoder_subtrees_from_quant(
     return config
 
 
+def _should_encode_negative_prompt(true_cfg_scale: float | None, negative_prompt: str | list[str] | None) -> bool:
+    """Share the negative-conditioning policy between scheduling and encoding.
+
+    An absent negative prompt does not imply an empty/default negative prompt.
+    Explicit empty strings do request negative conditioning when CFG is enabled.
+    """
+    return true_cfg_scale is not None and true_cfg_scale > 1 and negative_prompt is not None
+
+
 def get_qwen_image_21_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -251,7 +260,7 @@ def get_qwen_image_21_pre_process_func(
                 "qwen_image_21",
                 (),
                 request.sampling_params.max_sequence_length,
-                request.sampling_params.true_cfg_scale > 1 and prompt.get("negative_prompt") is not None,
+                _should_encode_negative_prompt(request.sampling_params.true_cfg_scale, prompt.get("negative_prompt")),
             )
             request.prompt = prompt
             return request
@@ -301,7 +310,7 @@ def get_qwen_image_21_pre_process_func(
             "qwen_image_21",
             tuple(input_image_sizes),
             request.sampling_params.max_sequence_length,
-            request.sampling_params.true_cfg_scale > 1 and prompt.get("negative_prompt") is not None,
+            _should_encode_negative_prompt(request.sampling_params.true_cfg_scale, prompt.get("negative_prompt")),
         )
         request.prompt = prompt
         return request
@@ -1053,7 +1062,7 @@ class QwenImage21Pipeline(
             max_sequence_length=max_sequence_length,
         )
         negative_prompt_embeds = negative_prompt_embeds_mask = negative_image_pad_mask = None
-        if true_cfg_scale > 1 and negative_prompt is not None:
+        if _should_encode_negative_prompt(true_cfg_scale, negative_prompt):
             negative_prompt_embeds, negative_prompt_embeds_mask, negative_image_pad_mask = self.encode_prompt(
                 prompt=negative_prompt,
                 images_per_prompt=images_per_prompt if has_images else None,
@@ -1380,7 +1389,19 @@ class QwenImage21Pipeline(
         first = batch.sampling_params_list[0]
         for sampling in batch.sampling_params_list[1:]:
             for field in fields:
-                if getattr(sampling, field) != getattr(first, field):
+                value, reference = getattr(sampling, field), getattr(first, field)
+                if field == "sigmas":
+                    # Direct callers may supply tensors/arrays despite the
+                    # public list annotation. Compare schedule values without
+                    # truth-testing an elementwise equality result.
+                    if isinstance(value, torch.Tensor):
+                        value = value.tolist()
+                    if isinstance(reference, torch.Tensor):
+                        reference = reference.tolist()
+                    matches = np.array_equal(value, reference)
+                else:
+                    matches = value == reference
+                if not matches:
                     raise ValueError(f"QwenImage21 stage batch requires matching {field}.")
 
     def encode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
