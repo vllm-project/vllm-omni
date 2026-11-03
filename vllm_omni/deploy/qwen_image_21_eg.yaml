@@ -1,6 +1,7 @@
 # Qwen-Image 2.1 Encode/Generation deployment on two devices.
 # E: Qwen3-VL + VAE encoder. G: DiT + VAE decoder.
 # Select with --deploy-config vllm_omni/deploy/qwen_image_21_eg.yaml.
+# Template: shipped settings have not been smoke-tested; see the model recipe.
 pipeline: qwen_image_21_eg
 async_chunk: false
 

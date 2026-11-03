@@ -208,6 +208,13 @@ The opt-in deployment files select two or three diffusion workers:
 | `vllm_omni/deploy/qwen_image_21_eg.yaml` | 2 | Qwen3-VL + VAE encoder → DiT + VAE decoder |
 | `vllm_omni/deploy/qwen_image_21_egd.yaml` | 3 | Qwen3-VL + VAE encoder → DiT → VAE decoder |
 
+These YAMLs are deployment templates, and neither has been smoke-tested
+with its shipped settings. Both default to `max_num_seqs: 1`; the EGD template
+requires three devices (`0/1/2`). The recorded two-A100 matrix used custom
+placements with `max_num_seqs=4`, so those results do not validate either YAML
+as shipped. In particular, the three-device EGD template remains unverified
+on a three-GPU host.
+
 ```bash
 vllm serve Qwen/Qwen-Image-2.1 --omni \
   --deploy-config vllm_omni/deploy/qwen_image_21_eg.yaml --port 8091

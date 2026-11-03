@@ -1,6 +1,7 @@
 # Qwen-Image 2.1 Encode/Denoise/Decode deployment on three devices.
 # E: Qwen3-VL + VAE encoder. G: DiT. D: VAE decoder.
 # Select with --deploy-config vllm_omni/deploy/qwen_image_21_egd.yaml.
+# Template: requires three GPUs; shipped settings have not been smoke-tested.
 pipeline: qwen_image_21_egd
 async_chunk: false
 
