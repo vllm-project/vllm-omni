@@ -16,6 +16,18 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+def _graph_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        diffusion_use_graph=True,
+        enforce_eager=False,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        cache_backend="none",
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
+
+
 @hardware_test(res={"cuda": "L4", "xpu": "B60"})
 @torch.inference_mode()
 def test_step_replay_matches_eager_across_shapes_and_invalidation():
@@ -26,16 +38,7 @@ def test_step_replay_matches_eager_across_shapes_and_invalidation():
     def step(*, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return model(x) * t
 
-    od_config = SimpleNamespace(
-        diffusion_use_graph=True,
-        enforce_eager=False,
-        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
-        cache_backend="none",
-        enable_cpu_offload=False,
-        enable_layerwise_offload=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-    )
-    runner = build_denoise_graph_runner(od_config, step, "device")
+    runner = build_denoise_graph_runner(_graph_config(), step, "device")
     assert runner is not None
 
     # Three shapes through the two-graph LRU, then back to the first; then the
@@ -53,3 +56,31 @@ def test_step_replay_matches_eager_across_shapes_and_invalidation():
     stats = runner.stats()
     assert runner.enabled
     assert (stats["captures"], stats["eager_calls"]) == (5, 0)
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+@torch.inference_mode()
+def test_tensor_only_inside_nested_dict_is_captured_and_replayed():
+    device = torch.device(current_omni_platform.device_type, 0)
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(256, 512), nn.GELU(), nn.Linear(512, 256)).to(device, torch.bfloat16)
+
+    # The step's only tensor sits two dicts deep; every top-level argument is a container or a primitive.
+    def step(*, cond: dict, scale: float) -> torch.Tensor:
+        return model(cond["inputs"]["x"]) * scale
+
+    runner = build_denoise_graph_runner(_graph_config(), step, "nested")
+    assert runner is not None
+
+    outputs = []
+    for rows in (64, 64, 96):
+        cond = {"inputs": {"x": torch.randn(rows, 256, device=device, dtype=torch.bfloat16)}}
+        out = runner(cond=cond, scale=0.5)
+        torch.testing.assert_close(out, step(cond=cond, scale=0.5), rtol=0, atol=0)
+        outputs.append(out)
+    # The second call replays the first graph, so it must read the new nested values, not the captured ones.
+    assert not torch.equal(outputs[0], outputs[1])
+
+    stats = runner.stats()
+    assert runner.enabled
+    assert (stats["captures"], stats["replays"], stats["eager_calls"]) == (2, 3, 0)
