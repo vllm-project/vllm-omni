@@ -462,6 +462,7 @@ class DiffusionPagedAttentionAdapter:
                         f"row contains only {installed_kernel_blocks // block_multiplier} blocks"
                     )
 
+    @torch.compiler.disable
     def _build_native_metadata(
         self,
         *,
@@ -475,6 +476,8 @@ class DiffusionPagedAttentionAdapter:
         slot_mappings: torch.Tensor,
         causal: bool | Mapping[int, bool],
     ) -> dict[str, Any]:
+        # Native builders mutate CPU scheduler state and enter configuration
+        # scopes. Keep them outside regional DiT compilation.
         dcp_local_seq_lens = None
         if self.block_tables.cp_size > 1:
             dcp_local_seq_lens = get_dcp_local_seq_lens(

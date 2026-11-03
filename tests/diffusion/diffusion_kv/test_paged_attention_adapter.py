@@ -266,6 +266,40 @@ def test_prepare_batch_reuses_native_block_table_and_metadata_builders(monkeypat
     assert batch.slot_mappings_by_layer["layer-0"].tolist() == [4, 5, 6, 0, 1]
 
 
+def test_native_metadata_builder_runs_outside_compiled_dit(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    calls = []
+
+    def build_metadata(**kwargs):
+        assert not torch.compiler.is_compiling()
+        calls.append(kwargs["num_tokens"])
+        return {"layer-0": kwargs["positions"]}
+
+    monkeypatch.setattr(adapter_module.current_omni_platform, "build_diffusion_kv_attn_metadata", build_metadata)
+    offsets = torch.tensor([0, 3], dtype=torch.int32)
+    lengths = torch.tensor([3], dtype=torch.int32)
+
+    @torch.compile(backend="eager")
+    def forward(positions):
+        metadata = adapter._build_native_metadata(
+            query_lens=[3],
+            query_start_loc=offsets,
+            query_start_loc_cpu=offsets,
+            seq_lens=lengths,
+            seq_lens_cpu=lengths,
+            positions=positions,
+            block_tables=[torch.zeros((1, 1), dtype=torch.int32)],
+            slot_mappings=positions,
+            causal=True,
+        )
+        return positions + metadata["layer-0"].sum()
+
+    positions = torch.arange(3)
+    assert torch.equal(forward(positions), positions + 3)
+    assert torch.equal(forward(positions + 1), positions + 7)
+    assert calls == [3, 3]
+
+
 def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
