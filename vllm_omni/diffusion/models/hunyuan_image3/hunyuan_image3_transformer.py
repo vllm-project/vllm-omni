@@ -797,6 +797,31 @@ class LightProjector(nn.Module):
         return self.layers(x)
 
 
+def _reshape_width_for_query_batch(token_count: int, query_lens: list[int]) -> tuple[int, int]:
+    """Return ``(batch, pad_width)`` for a flat ``[B*T, ...]`` query tensor.
+
+    Packed Hunyuan rows right-pad to a shared tensor width, so logical
+    ``query_lens`` may be shorter than ``T``. Reshape must use the padded
+    width, not ``query_lens[0]``; per-row logical lengths stay with the
+    paged adapter plan / gather.
+    """
+
+    if not query_lens:
+        raise ValueError("Hunyuan query batch requires at least one query length")
+    batch = len(query_lens)
+    if token_count % batch != 0:
+        raise ValueError(
+            f"Hunyuan flat token count must divide evenly across rows: tokens={token_count}, batch={batch}"
+        )
+    pad_width = token_count // batch
+    if any(query_len <= 0 or query_len > pad_width for query_len in query_lens):
+        raise ValueError(
+            "Hunyuan logical query lengths must fit inside the padded tensor width: "
+            f"query_lens={query_lens}, pad_width={pad_width}"
+        )
+    return batch, pad_width
+
+
 class HunYuanRotary2DEmbedder:
     r"""
     A RoPE wrapper specifically designed for HunYuan-Image attention.
@@ -871,11 +896,9 @@ class HunYuanRotary2DEmbedder:
         # 1. Prepare cos/sin
         cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
 
-        # 2. Shape validation
+        # 2. Shape validation — use padded width, not logical query_lens[0].
         query_lens: list[int] = kwargs.get("query_lens")
-        bs = len(query_lens)
-        q_len = query_lens[0]
-        assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
+        bs, q_len = _reshape_width_for_query_batch(hidden_states.shape[0], query_lens)
 
         # 3. Reshape + transpose for apply_rotary_pos_emb
         #    Assume q shape [B*L, H*D] -> [2, L, H, D] -> [2, H, L, D]
@@ -1138,9 +1161,9 @@ class ImageKVCacheManager(nn.Module):
             raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
 
         self.clear_legacy_prompt_kv_cache()
-        bs = len(query_lens)
-        q_len = query_lens[0]
-        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
+        # Packed / mixed-prefix rows right-pad to a shared T; reshape on T, not
+        # logical query_lens[0]. Adapter gather keeps per-row logical lengths.
+        bs, q_len = _reshape_width_for_query_batch(query.shape[0], query_lens)
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
@@ -1193,10 +1216,8 @@ class ImageKVCacheManager(nn.Module):
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
         shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
-        bs = len(query_lens)
-        q_len = query_lens[0]
+        bs, q_len = _reshape_width_for_query_batch(query.shape[0], query_lens)
         seq_len = seq_lens[0]
-        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]

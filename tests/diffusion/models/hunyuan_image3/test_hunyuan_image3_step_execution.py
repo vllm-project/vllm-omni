@@ -274,6 +274,17 @@ def test_slice_cached_prefix_inputs_cuts_mixed_prefix_rows() -> None:
     torch.testing.assert_close(sliced_positions[0, :4], position_ids[0, 2:6])
     torch.testing.assert_close(sliced_mask[0, :, :4, :], attention_mask[0, :, 2:6, :])
     torch.testing.assert_close(sliced_scatter, torch.tensor([[2], [2]]))
+    # Mixed-prefix pack leaves heterogeneous logical lengths inside padded T;
+    # RoPE / _forward_paged must reshape on T, not query_lens[0].
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        _reshape_width_for_query_batch,
+    )
+
+    batch, pad_width = _reshape_width_for_query_batch(
+        sliced_embeds.shape[0] * sliced_embeds.shape[1],
+        sliced_query_lens,
+    )
+    assert (batch, pad_width) == (2, 8)
 
 
 @pytest.mark.parametrize("local_prefix_hit", [True, False])
