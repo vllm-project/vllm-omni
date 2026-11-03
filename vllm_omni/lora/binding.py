@@ -21,6 +21,7 @@ from vllm_omni.lora.layers import (
     OmniRowParallelLinearWithLoRA,
 )
 
+
 def _select_moe_lora_wrapper_cls() -> type:
     """Select the vLLM or Ascend MoE LoRA wrapper for the current platform."""
     if current_platform.device_type == "npu":

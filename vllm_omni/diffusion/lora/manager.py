@@ -6,8 +6,6 @@ from vllm_omni.lora.manager import (
     DiffusionLoRAManager,
     LoRABackend,
     LoRAManager,
-    _moe_lora_proj_names,
-    _moe_lora_target_names,
 )
 
 __all__ = ["DiffusionLoRAManager", "LoRABackend", "LoRAManager"]

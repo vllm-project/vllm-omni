@@ -10,9 +10,9 @@ from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
 from vllm.model_executor.models.utils import WeightsMapper
 
+from vllm_omni.lora.manager import LoRAManager
 from vllm_omni.lora.merged_manager import ARMergedLoRAManager
 from vllm_omni.lora.merged_weights import check_merge_error
-from vllm_omni.lora.manager import LoRAManager
 from vllm_omni.lora.request import TensorLoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -25,12 +25,9 @@ def _manager_prepare_failure_rank(rank: int, port: int) -> None:
     from vllm.model_executor.models.utils import WeightsMapper
 
     from vllm_omni.lora.merged_manager import ARMergedLoRAManager
-    from vllm_omni.lora.merged_weights import check_merge_error
     from vllm_omni.lora.request import TensorLoRARequest
 
-    torch.distributed.init_process_group(
-        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
-    )
+    torch.distributed.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
     try:
         # Keep this CPU integration check independent of a vLLM TP group.
         for module in (linear, parameter):
@@ -52,9 +49,7 @@ def _manager_prepare_failure_rank(rank: int, port: int) -> None:
             generator = torch.Generator().manual_seed(29)
             tensors = {}
             for name, rows in (("q_proj", 8), ("k_proj", 4), ("v_proj", 4)):
-                tensors[f"base_model.model.thinker.model.{name}.lora_A.weight"] = torch.randn(
-                    2, 4, generator=generator
-                )
+                tensors[f"base_model.model.thinker.model.{name}.lora_A.weight"] = torch.randn(2, 4, generator=generator)
                 tensors[f"base_model.model.thinker.model.{name}.lora_B.weight"] = torch.randn(
                     rows, 2, generator=generator
                 )

@@ -762,7 +762,7 @@ def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
 
 
 def test_move_moe_lora_buffers_keeps_all_stacks_and_views_on_device():
-    from vllm_omni.diffusion.lora.utils import _move_moe_lora_buffers
+    from vllm_omni.lora.binding import _move_moe_lora_buffers
 
     wrapper = SimpleNamespace(
         max_loras=1,
