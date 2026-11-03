@@ -34,7 +34,6 @@ from vllm_omni.diffusion.forward_context import (
     MixFusionStep,
     override_forward_context,
 )
-from vllm_omni.diffusion.hooks import module_has_active_hooks
 from vllm_omni.diffusion.hooks.mixfusion import (
     MixFusionPackingError,
     apply_mixfusion,
@@ -543,7 +542,6 @@ class TestApplyRemove:
         for block in model.transformer_blocks:
             assert "mixfusion_expand_rows" in block.img_mod._hook_registry._hooks
         assert "mixfusion_expand_arg" in model.norm_out._hook_registry._hooks
-        assert module_has_active_hooks(model)
 
     def test_apply_is_idempotent(self):
         model = _DummyTransformer()
@@ -559,11 +557,11 @@ class TestApplyRemove:
         apply_mixfusion(model, _plan())
         remove_mixfusion(model, _plan())
         assert model._mixfusion_hooks_applied is False
-        assert not module_has_active_hooks(model)
-        assert not module_has_active_hooks(model.image_rope_prepare)
+        assert not model._hook_registry._hooks
+        assert not model.image_rope_prepare._hook_registry._hooks
         for block in model.transformer_blocks:
-            assert not module_has_active_hooks(block.img_mod)
-        assert not module_has_active_hooks(model.norm_out)
+            assert not block.img_mod._hook_registry._hooks
+        assert not model.norm_out._hook_registry._hooks
         assert torch.equal(_serial_forward(model, batch), serial)
 
     def test_unknown_spec_raises(self):

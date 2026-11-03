@@ -853,11 +853,6 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
             # latents.
             pipeline.mixfusion_driver = MixFusionDriver(pipeline, first_transformer, None)
 
-        # update forward context mixfusion_hooks_applied
-        ctx = get_forward_context()
-        ctx.mixfusion_hooks_applied = applied_count > 0
-        logger.debug(f"Setting mixfusion_hooks_applied={ctx.mixfusion_hooks_applied} in ``ForwardContext``!")
-
         if applied_count == 0:
             logger.warning(
                 "MixFusion is enabled but no transformer with _mixfusion_plan found. MixFusion hooks not applied."

@@ -116,9 +116,6 @@ class ForwardContext:
     # is armed by the pipeline for exactly one packed transformer call; the
     # MixFusion module hooks are inert while it is None.
     mixfusion_step: MixFusionStep | None = None
-    # Set by the registry when _mixfusion_plan hooks are applied; lets the
-    # pipeline fall back to the serial path when they are missing.
-    mixfusion_hooks_applied: bool = False
 
     @property
     def sp_active(self) -> bool:

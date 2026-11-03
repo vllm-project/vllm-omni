@@ -42,7 +42,7 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     override_forward_context,
 )
-from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, module_has_active_hooks
+from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, StreamSpec
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
@@ -244,16 +244,6 @@ def _hsdp_like_block() -> nn.Module:
     block = _PlainBlock()
     block.register_forward_pre_hook(lambda module, args: args)
     return block
-
-
-def test_module_has_active_hooks():
-    plain = _PlainBlock()
-    registry_only = _PlainBlock()
-    HookRegistry.get_or_create(registry_only)  # empty registry must not count
-
-    assert not module_has_active_hooks(plain)
-    assert not module_has_active_hooks(registry_only)
-    assert module_has_active_hooks(_hooked_block())
 
 
 def test_plan_foreign_hooks_reports_block_hooks():

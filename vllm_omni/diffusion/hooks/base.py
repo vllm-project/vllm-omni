@@ -141,17 +141,6 @@ class _WrappedForward:
         return registry.dispatch(*args, **kwargs)
 
 
-def module_has_active_hooks(module: nn.Module) -> bool:
-    """Whether this module's hook registry holds any registered hook.
-
-    Path-specific forwards that bypass the wrapped ``module.forward`` (and thus
-    the registry's dispatch) must check this before running, so that hooks such
-    as layerwise offload keep firing.
-    """
-    registry: HookRegistry | None = getattr(module, "_hook_registry", None)
-    return registry is not None and bool(registry._hooks)
-
-
 def sort_hooks_after_call(func):
     """Calls the method on the hook registry, then sorts the hooks.
 
