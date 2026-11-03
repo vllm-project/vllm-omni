@@ -308,9 +308,12 @@ def _is_pooled_output(candidate: object) -> bool:
     """Whether ``candidate`` is one pooled output rather than a list of them.
 
     A ``PoolingOutput`` carries the pooled ``data`` and no per-completion
-    fields. A sequence of completions is left to the generic iterable path, so
-    an output container that happens to expose ``data`` is still read as the
-    sequence of completions it is.
+    fields. The check is duck-typed on purpose, so a renamed or subclassed
+    upstream type is still recognized; the trade-off is that any non-sequence
+    object exposing ``data`` (a bare tensor, for example) is read as a single
+    pooled entry instead of being iterated. That is the safer direction: a
+    pooled entry is never mistaken for a sequence of completions, while the
+    reverse would lose the completions' text and finish reason.
     """
     return hasattr(candidate, "data") and not isinstance(candidate, Sequence)
 
@@ -325,7 +328,9 @@ def iter_output_entries(mm_source: object) -> list[Any]:
     can iterate the entries without mistaking a ``PoolingOutput`` for a
     sequence of completions.
 
-    Any other iterable is read as a sequence of completions, as before.
+    Any other iterable is read as a sequence of completions, as before. No
+    upstream ``outputs`` type is a string or a mapping, but the fallback would
+    expand one into characters or keys.
 
     Args:
         mm_source: Duck-typed container with an optional ``outputs`` attribute
