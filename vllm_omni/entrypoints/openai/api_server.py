@@ -172,6 +172,7 @@ from vllm_omni.entrypoints.openai.protocol.rollout import (
 from vllm_omni.entrypoints.openai.protocol.run import RunRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
+    VideoDepthResponse,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoListResponse,
@@ -201,6 +202,13 @@ from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_v
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.video.depth.helpers import (
+    VIDEO_DEPTH_COLORMAPS,
+    VIDEO_DEPTH_MAX_BYTES,
+    extract_video_depth,
+    render_video_depth_response,
+    supports_video_depth,
+)
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
@@ -413,6 +421,20 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        provider = getattr(getattr(engine_client, "engine", None), "tracer_provider", None)
+        if provider is not None:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+            from vllm_omni.tracing import TraceContextMiddleware
+
+            # Upstream build_app may already have cached the uninstrumented stack.
+            app.middleware_stack = None
+            FastAPIInstrumentor.instrument_app(
+                app,
+                tracer_provider=provider,
+                exclude_spans=["send", "receive"],
+                excluded_urls="health,healthz,metrics",
+            )
         app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
@@ -524,6 +546,7 @@ async def omni_run_server_worker(
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
+                self._asgi = TraceContextMiddleware(inner) if provider is not None else inner
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
@@ -533,7 +556,7 @@ async def omni_run_server_worker(
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
 
-                await self._inner(scope, receive, send)
+                await self._asgi(scope, receive, send)
 
         # Startup duplex warmup: real /v1/realtime connections wait on this
         # event. Video-required models (AURA) do this by default — one short
@@ -2263,6 +2286,11 @@ async def generate_images(
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
             if request.flow_shift is not None:
                 extra_body["flow_shift"] = request.flow_shift
+            if request.layers is not None:
+                # Layered models (e.g. Qwen-Image-Layered) read the requested
+                # layer count from ``extra_body``; the single-stage and
+                # multi-stage edit paths already forward it here.
+                extra_body["layers"] = request.layers
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
@@ -2951,6 +2979,85 @@ async def segment_video(
         logger.exception("Video segmentation failed: %s", e)
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Video segmentation failed: {e}"
+        ) from e
+    finally:
+        if path is not None and os.path.exists(path):
+            os.unlink(path)
+
+
+@router.post(
+    "/v1/videos/depth",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": VideoDepthResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def estimate_video_depth(
+    raw_request: Request,
+    video: UploadFile | None = File(None),
+    input_size: int | None = Form(None),
+    max_res: int | None = Form(None),
+    colormap: str = Form("grayscale"),
+    return_depth: bool = Form(False),
+    model: str | None = Form(None),
+) -> Response:
+    """Estimate temporally consistent depth for every frame of a video."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not supports_video_depth(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support video depth estimation.",
+        )
+    if video is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'video'.")
+    if colormap not in VIDEO_DEPTH_COLORMAPS:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"colormap must be one of {', '.join(VIDEO_DEPTH_COLORMAPS)}, got {colormap!r}.",
+        )
+    path = None
+    try:
+        request_id = f"vid_depth-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        suffix = os.path.splitext(video.filename or "")[1].lower() or ".mp4"
+        path = await _persist_uploaded_reference(
+            video, field_name="video", suffix=suffix, max_bytes=VIDEO_DEPTH_MAX_BYTES
+        )
+        extra_args = {
+            key: value for key, value in (("input_size", input_size), ("max_res", max_res)) if value is not None
+        }
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=OmniTextPrompt(prompt="", multi_modal_data={"video": path}),
+            request_id=request_id,
+        )
+        payload = extract_video_depth(result)
+        # Encode off the event loop: a long video's depth video and raw maps can be hundreds of MB.
+        body = await asyncio.to_thread(render_video_depth_response, payload, model_name, colormap, return_depth)
+        return Response(content=body, media_type="application/json")
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Video depth estimation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Video depth estimation failed: {e}"
         ) from e
     finally:
         if path is not None and os.path.exists(path):
