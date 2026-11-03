@@ -317,6 +317,13 @@ accepted for interface parity but are not enforced: a hung worker blocks the
 calling thread. Sticky accelerator faults mark the executor dead through
 failure callbacks; ordinary request errors stay per-request.
 
+Before returning device-backed output, UNI records a producer-stream completion
+event. The output stream waits on that event before handing the result to its
+consumer thread and records tensor storage on the consumer stream. This applies
+only to materialized outputs, including streamed chunks; denoising steps without
+an output do not synchronize. CPU outputs need no device event. Platforms without
+event support finish the producer before returning the output.
+
 ### Multiproc backend
 
 `MultiprocDiffusionExecutor`:
