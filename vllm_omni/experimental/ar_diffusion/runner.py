@@ -581,13 +581,26 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> BatchRunnerOutput:
         """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            # Fail-closed only for this wave's pool keys — never wipe unrelated sessions.
+            batch_kv_ids: list[str] = []
+            for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
+                req = getattr(new_req, "req", None)
+                if req is None:
+                    continue
+                kv_id, _persist, _reset, _close = self._noisy_kv_id(req)
+                if kv_id:
+                    batch_kv_ids.append(kv_id)
             ctx = self._make_chunk_context()
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     return super().execute_model_batch(scheduler_output, od_config)
             except Exception:
-                ctx.kv.reset_all()
-                logger.warning("AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed")
+                for kv_id in dict.fromkeys(batch_kv_ids):
+                    ctx.kv.release_session(kv_id)
+                logger.warning(
+                    "AR-Diffusion chunk batch failed; released NoisyKV for batch kv_ids=%s (other sessions kept)",
+                    list(dict.fromkeys(batch_kv_ids)),
+                )
                 raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."

@@ -365,6 +365,68 @@ def test_pipeline_lifecycle_matches_runner_for_batch_members():
     assert persist is False and kv_id == "r0"
 
 
+def test_batch_failure_preserves_unrelated_session_history(monkeypatch):
+    """A bad member in batch B/C must not wipe retained history for session A."""
+    from vllm_omni.diffusion.worker import diffusion_model_runner as dmr
+
+    runner = _bare_noisy_runner()
+    cache = runner.noisy_kv_cache
+    assert cache is not None
+    schedule_a = CellSchedule(
+        chunks=1,
+        num_denoise_steps=1,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=1,
+    )
+    cache.pool.alloc(("session-a", 0, 1, 0))
+    cache.bind_session_structure("session-a", schedule_a.structural_key())
+
+    def _req(request_id: str, **extra):
+        return OmniDiffusionRequest(
+            prompt="x",
+            request_id=request_id,
+            sampling_params=OmniDiffusionSamplingParams(extra_args=extra),
+        )
+
+    batch = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req=_req("rb", session_id="session-b", chunk_base=-1)),
+            SimpleNamespace(req=_req("rc", session_id="session-c")),
+        ]
+    )
+
+    def _boom(self, scheduler_output, od_config):
+        # Mid-batch scratch for a batch member must still be scoped to that wave.
+        self.noisy_kv_cache.pool.alloc(("session-b", 0, 1, 0))
+        raise ValueError("chunk_base must be non-negative, got -1")
+
+    monkeypatch.setattr(dmr.DiffusionModelRunner, "execute_model_batch", _boom)
+
+    with pytest.raises(ValueError, match="chunk_base"):
+        runner.execute_model_batch(batch, od_config=SimpleNamespace())
+
+    assert cache.pool.has(("session-a", 0, 1, 0))
+    assert "session-a" in cache._session_structural_keys
+    assert not cache.pool.has(("session-b", 0, 1, 0))
+    # Session A can still continue with its retained structural key.
+    cache.bind_session_structure("session-a", schedule_a.structural_key())
+    prior = expected_prior_cells(
+        CellSchedule(
+            chunks=1,
+            num_denoise_steps=1,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SELF_FORCING,
+            kv_history_chunks=1,
+            chunk_base=1,
+        )
+    )
+    assert prior == frozenset({(0, 1, 0)})
+    assert prior <= prior_history_in_pool(cache, "session-a", chunk_base=1)
+
+
 def test_runner_ephemeral_request_releases_pool_key(monkeypatch):
     from vllm_omni.diffusion.worker import diffusion_model_runner as dmr
 
