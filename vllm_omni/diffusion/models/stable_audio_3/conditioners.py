@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import warnings
 from enum import Enum
 from math import pi
@@ -273,13 +272,10 @@ class T5GemmaConditioner(Conditioner):
         self.enable_grad = enable_grad
         self.model_name = model_name
 
-        # Silence HF download progress + transformers logging while loading.
-        # PORT_FROM: conditioners.py:185-220 (verbatim).
-        prev_hf_hub = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
-        prev_transformers = os.environ.get("TRANSFORMERS_VERBOSITY")
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-
+        # Silence transformers logging while loading.
+        # PORT_FROM: conditioners.py:185-220. Upstream's HF_HUB_DISABLE_PROGRESS_BARS /
+        # TRANSFORMERS_VERBOSITY env writes are dropped: both libraries read them once
+        # when first imported, which has already happened in the worker.
         previous_level = logging.root.manager.disable
         logging.disable(logging.ERROR)
 
@@ -303,14 +299,6 @@ class T5GemmaConditioner(Conditioner):
                 )
             finally:
                 logging.disable(previous_level)
-                if prev_hf_hub is None:
-                    os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
-                else:
-                    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_hf_hub
-                if prev_transformers is None:
-                    os.environ.pop("TRANSFORMERS_VERBOSITY", None)
-                else:
-                    os.environ["TRANSFORMERS_VERBOSITY"] = prev_transformers
 
         # Register the encoder so CPU offload and Module.to() see it. Its weights
         # come from from_pretrained above, not the SA3 checkpoint, so exempt them

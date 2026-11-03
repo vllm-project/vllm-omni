@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os as _os
 import typing as tp
 from collections.abc import Callable, Iterable
 from functools import reduce
@@ -144,22 +143,6 @@ def precompute_varlen_metadata(padding_mask: torch.Tensor) -> dict | None:
         "batch_size": batch_size,
         "seq_len": seq_len,
     }
-
-
-# PORT_FROM: models/utils.py compile helper (inlined to avoid extra file).
-# Upstream's process-wide torch._dynamo.config writes are dropped: importing a
-# model must not change compile behavior for the rest of the worker.
-_enable_torch_compile = _os.environ.get("ENABLE_TORCH_COMPILE", "0") == "1"
-
-
-def compile(function, *args, **kwargs):
-    """torch.compile wrapper with ENABLE_TORCH_COMPILE env gate. PORT_FROM: models/utils.py."""
-    if _enable_torch_compile:
-        try:
-            return torch.compile(function, *args, **kwargs)
-        except RuntimeError:
-            return function
-    return function
 
 
 def _left_pad_to_match(emb, target_len):
@@ -624,7 +607,6 @@ class FeedForward(nn.Module):
             Rearrange("b n d -> b d n") if use_conv else nn.Identity(),
         )
 
-    # @compile
     def forward(self, x, varlen_metadata=None):
         if varlen_metadata is not None and index_first_axis is not None and pad_input is not None:
             # Pack valid tokens for efficient FFN computation (skip padding tokens)
@@ -713,7 +695,6 @@ class Attention(nn.Module):
 
         self.causal = causal
 
-    @compile
     def apply_qk_layernorm(self, q, k):
         q_type = q.dtype
         k_type = k.dtype
@@ -845,7 +826,6 @@ class Attention(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=causal if causal is not None else False)
         return out
 
-    # @compile
     def forward(
         self,
         x,
@@ -1015,7 +995,6 @@ class ConformerModule(nn.Module):
         self.swish = nn.SiLU()
         self.pointwise_conv_2 = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
 
-    # @compile
     def forward(self, x):
         x = self.in_norm(x)
         x = rearrange(x, "b n d -> b d n")
@@ -1154,7 +1133,6 @@ class TransformerBlock(nn.Module):
 
         return x
 
-    @compile
     def forward(
         self,
         x,
