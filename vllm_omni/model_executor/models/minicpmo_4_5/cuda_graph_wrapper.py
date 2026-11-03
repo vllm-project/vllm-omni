@@ -323,6 +323,15 @@ class HiFTGraphWrapper:
         num_frames = speech_feat.shape[2]
         cache_source_len = cache_source.shape[2]
 
+        # An already-captured exact continuation key replays directly: the
+        # padding branch below only consults _legit_shapes, so an exact key
+        # off the bucket grid -- a captured continuation/tail shape such as
+        # (1, 28, 3840) -- would be padded away from its own graph and pay
+        # for a wider bucket's replay or fall back to eager.
+        exact_key = (batch_size, num_frames, cache_source_len)
+        if exact_key in getattr(self, "_exact_keys", ()) and exact_key in self.graph:
+            return self._replay_key(exact_key, speech_feat, cache_source)
+
         # Tail chunks off the bucket grid pad up to the next width bucket and
         # crop the waveform back afterwards; replays stay on captured graphs.
         padded_frames = None
@@ -354,7 +363,13 @@ class HiFTGraphWrapper:
         return self._replay_frames(speech_feat, cache_source, num_frames, cache_source_len, batch_size)
 
     def _width_pad_target(self, num_frames: int, cache_source_len: int) -> int | None:
-        """Narrowest capture bucket at or above ``num_frames`` for this cache length."""
+        """Narrowest capture bucket at or above ``num_frames`` for this cache length.
+
+        ``hift_graph_width_bucket: 0`` disables width padding: tail chunks
+        then run eager instead of on a padded replay of a chunk-width graph.
+        """
+        if self.width_pad_bucket == 0:
+            return None
         candidates = [
             frames for frames, cache_len in self._legit_shapes if cache_len == cache_source_len and frames >= num_frames
         ]
