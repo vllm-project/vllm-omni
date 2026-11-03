@@ -571,20 +571,29 @@ class StagePool:
         self._request_bindings[request_id] = replica_id
         return replica_id
 
+    def _local_replica_unavailability_reason(self, replica_id: int) -> str | None:
+        """Return why a local replica slot cannot accept work, if any.
+
+        Keep local automatic and explicit routing aligned by making both
+        :meth:`is_replica_available` and :meth:`_validate_requested_replica`
+        consume this shared check.
+        """
+        if not 0 <= replica_id < self.num_replicas:
+            return f"out of range for {self.num_replicas} replica slot(s)"
+        if self.clients[replica_id] is None:
+            return "no local client is attached"
+        if replica_id in self._unavailable_replicas:
+            return "marked locally unavailable"
+        return None
+
     def _validate_requested_replica(self, replica_id: int) -> str | None:
         """Validate a caller-selected replica without creating an affinity.
 
         Returns its input address in distributed mode and ``None`` otherwise.
         """
         input_addr: str | None = None
-        reason: str | None = None
-        if not 0 <= replica_id < self.num_replicas:
-            reason = f"out of range for {self.num_replicas} replica slot(s)"
-        elif self.clients[replica_id] is None:
-            reason = "no local client is attached"
-        elif replica_id in self._unavailable_replicas:
-            reason = "marked locally unavailable"
-        elif self.is_distributed:
+        reason = self._local_replica_unavailability_reason(replica_id)
+        if reason is None and self.is_distributed:
             input_addr = self._replica_id_to_addr.get(replica_id)
             if input_addr is None:
                 reason = "no distributed input address is recorded"
@@ -606,7 +615,9 @@ class StagePool:
         Admission must validate again because membership can change after this
         method returns. This helper exists for frontend multimodal preprocessing,
         where rejecting an already-invalid route before processing avoids
-        populating sender-cache entries that no replica will consume.
+        populating sender-cache entries that no replica will consume. The
+        frontend intentionally calls it only for prompts with multimodal data;
+        text-only explicit routes remain validated solely at admission.
         """
         self._validate_requested_replica(replica_id)
 
@@ -766,11 +777,7 @@ class StagePool:
         return self.release_replica_bindings(replica_id)
 
     def is_replica_available(self, replica_id: int) -> bool:
-        return (
-            0 <= replica_id < self.num_replicas
-            and self.clients[replica_id] is not None
-            and replica_id not in self._unavailable_replicas
-        )
+        return self._local_replica_unavailability_reason(replica_id) is None
 
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
