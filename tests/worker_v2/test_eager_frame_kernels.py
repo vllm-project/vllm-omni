@@ -149,7 +149,7 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         def __init__(self):
             self.device = device
 
-        def __call__(self, codes, slots, pos):
+        def __call__(self, codes, slots, pos, *, initial=False):
             return codes[:, 0, :1].float().repeat(1, 4)
 
     decoder = Decoder()
