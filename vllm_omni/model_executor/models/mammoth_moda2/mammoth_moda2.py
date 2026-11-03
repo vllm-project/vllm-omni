@@ -229,7 +229,10 @@ def moe_forward(
         if gen_token_mask is None or gen_token_mask.numel() == 0:
             raise RuntimeError(
                 "MammothModa2 MoE CUDA-graph capture requires gen_token_mask; "
-                "keep input_ids on the mm graph path via requires_raw_input_tokens."
+                "keep input_ids on the mm graph path via requires_raw_input_tokens. "
+                "If capture still fails (for example under model_runner: v2 or a "
+                "PP path that drops the mask), set enforce_eager: true or use a "
+                "non-FULL cudagraph_mode such as FULL_DECODE_ONLY / PIECEWISE."
             )
         return _moe_blend(hidden_states, und_expert, gen_expert, gen_token_mask)
 
@@ -497,6 +500,9 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             dtype: torch.dtype,
             device: torch.device,
         ) -> IntermediateTensors:
+            # Seed gen_token_mask so PP rank > 0 always has the key during
+            # capture/replay; the first rank overwrites it with the real mask
+            # derived from input_ids when requires_raw_input_tokens holds.
             return IntermediateTensors(
                 {
                     "hidden_states": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
@@ -522,9 +528,10 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         gen_mask = input_ids >= int(self.gen_vocab_start_index)
         if _is_graph_capturing(input_ids.device):
             # Graph-safe blend: compute both embeddings and select per token.
-            # Clamp both lookups so the out-of-range side (gen ids for the base
-            # table, base ids for the gen table) maps to index 0 instead of an
-            # out-of-range index; those rows are discarded by where().
+            # Clamp both lookups so the discarded side stays in-bounds for the
+            # table being indexed: base ids clamp to base_vocab_size-1, gen ids
+            # clamp to [0, gen_embed_tokens.num_embeddings-1]. Those rows are
+            # ignored by where().
             base_ids = input_ids.clamp(max=self.base_vocab_size - 1)
             base_emb = self.embed_tokens(base_ids)
             gen_ids = (input_ids - int(self.gen_vocab_start_index)).clamp(
@@ -730,7 +737,12 @@ class Mammoth3DecoderLayer(Qwen3DecoderLayer):
 
 
 class MammothModa2Qwen3ForCausalLM(MammothModa2Qwen2ForCausalLM):
-    """MammothModa2 generation-aware language model using Qwen3 attention."""
+    """MammothModa2 generation-aware language model using Qwen3 attention.
+
+    Inherits ``forward`` / ``get_input_embeddings`` from the Qwen2 MoE host, so
+    ``gen_token_mask = input_ids >= gen_vocab_start_index`` is derived the same
+    way once ``requires_raw_input_tokens`` keeps ``input_ids`` on the mm path.
+    """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(

@@ -75,10 +75,10 @@ def test_moe_forward_capturing_none_mask_fails_closed(monkeypatch: pytest.Monkey
     monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
     hidden = torch.randn(2, 3, 4)
 
-    with pytest.raises(RuntimeError, match="requires gen_token_mask"):
+    with pytest.raises(RuntimeError, match="requires gen_token_mask.*enforce_eager"):
         m.moe_forward(hidden, _und, _gen, None)
 
-    with pytest.raises(RuntimeError, match="requires gen_token_mask"):
+    with pytest.raises(RuntimeError, match="requires gen_token_mask.*enforce_eager"):
         m.moe_forward(hidden, _und, _gen, torch.zeros(0, dtype=torch.bool))
 
 
@@ -108,6 +108,26 @@ def test_ar_wrappers_keep_raw_input_tokens() -> None:
     """The runner decides whether to drop input_ids from the top-level module."""
     assert m.MammothModa2ARForConditionalGeneration.requires_raw_input_tokens is True
     assert m.MammothModa2Qwen3ARForConditionalGeneration.requires_raw_input_tokens is True
+    # Qwen3 LM inherits forward/mask derivation from the Qwen2 MoE host, so the
+    # same requires_raw_input_tokens path feeds gen_token_mask under capture.
+    assert issubclass(m.MammothModa2Qwen3ForCausalLM, m.MammothModa2Qwen2ForCausalLM)
+
+
+def test_empty_intermediate_tensors_seed_gen_token_mask() -> None:
+    """PP ranks replay through IntermediateTensors; the empty factory must seed the mask key."""
+    from vllm.sequence import IntermediateTensors
+
+    batch_size, hidden = 3, 8
+    tensors = IntermediateTensors(
+        {
+            "hidden_states": torch.zeros((batch_size, hidden)),
+            "residual": torch.zeros((batch_size, hidden)),
+            "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool),
+        }
+    )
+    assert "gen_token_mask" in tensors.tensors
+    assert tensors.tensors["gen_token_mask"].dtype == torch.bool
+    assert tuple(tensors.tensors["gen_token_mask"].shape) == (batch_size,)
 
 
 def test_is_graph_capturing_warns_once_without_backend_probe(
