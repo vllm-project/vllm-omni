@@ -153,6 +153,16 @@ def test_live_progress_and_single_pass_decode(client, fragments, monkeypatch):
     decoded_frames = []
     opened = []
 
+    # The previous cumulative-prefix algorithm, using the same real fixture.
+    prefix = bytearray()
+    reference_counts = []
+    for part in fragments:
+        prefix.extend(part)
+        with real_open(io.BytesIO(bytes(prefix)), format="mp4") as container:
+            reference_counts.append(sum(1 for _ in container.decode(container.streams.video[0])))
+    assert reference_counts == [8, 20, 32, 33]
+    assert sum(reference_counts) == 93
+
     @contextlib.contextmanager
     def observed_open(*args, **kwargs):
         with real_open(*args, **kwargs) as container:
@@ -317,3 +327,219 @@ def test_unexpected_decoder_failure_does_not_report_success(client, monkeypatch)
         assert counter.error == "decode_failed"
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("size", [1, 7, 31, 4096])
+def test_binary_message_boundaries_do_not_change_count(client, fragments, size):
+    """A short queued piece must not be mistaken for the end of an MP4 box."""
+    data = b"".join(fragments)
+
+    async def run():
+        counter = client._StreamingFrameCounter(stream_format="m4s")
+        try:
+            for start in range(0, len(data), size):
+                counter.feed(data[start : start + size])
+                counter.feed(b"")
+                await asyncio.sleep(0)
+            assert await counter.finish() == 33
+        finally:
+            await counter.finish()
+
+    asyncio.run(run())
+
+
+def test_cancel_during_final_drain_marks_count_unknown(client, fragments, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    real_open = av.open
+
+    def blocked_open(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(client.av, "open", blocked_open)
+
+    async def run():
+        counter = client._StreamingFrameCounter(stream_format="m4s")
+        counter.feed(b"".join(fragments))
+        finish_task = asyncio.create_task(counter.finish())
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            finish_task.cancel()
+            await asyncio.sleep(0)
+            assert counter.count is None
+            assert counter.error == "shutdown_cancelled"
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await finish_task
+            await counter.finish()
+        assert not counter._thread.is_alive()
+
+    asyncio.run(run())
+
+
+def test_cancel_during_drain_waits_for_scheduler_cleanup(client, fragments, monkeypatch, tmp_path, capsys):
+    release_decoder = threading.Event()
+    real_open = av.open
+    real_finish = client._StreamingFrameCounter.finish
+    saved = []
+
+    def blocked_open(*args, **kwargs):
+        assert release_decoder.wait(5)
+        return real_open(*args, **kwargs)
+
+    async def run():
+        scheduler_started = asyncio.Event()
+        allow_scheduler_cleanup = asyncio.Event()
+        scheduler_settled = asyncio.Event()
+        drain_started = asyncio.Event()
+        drain_settled = asyncio.Event()
+
+        async def scheduler(*args, **kwargs):
+            scheduler_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                await allow_scheduler_cleanup.wait()
+                scheduler_settled.set()
+
+        async def finish(counter):
+            drain_started.set()
+            try:
+                return await real_finish(counter)
+            finally:
+                drain_settled.set()
+
+        class Connection:
+            def __init__(self):
+                self.messages = iter([json.dumps({"type": "video.start", "format": "m4s"}), b"".join(fragments)])
+
+            async def send(self, message):
+                pass
+
+            async def recv(self):
+                message = next(self.messages, None)
+                if message is not None:
+                    return message
+                await scheduler_started.wait()
+                return json.dumps({"type": "session.done"})
+
+        @contextlib.asynccontextmanager
+        async def connect(*args, **kwargs):
+            yield Connection()
+
+        monkeypatch.setattr(client, "connect", connect)
+        monkeypatch.setattr(client, "_run_camera_update_scheduler", scheduler)
+        monkeypatch.setattr(client._StreamingFrameCounter, "finish", finish)
+        args = client.parse_args()
+        args.camera_updates = [client.ScheduledCameraUpdate(at=0, camera={"mode": "velocity"}, transition_chunks=None)]
+        session = asyncio.create_task(client.stream_video(args))
+        try:
+            await asyncio.wait_for(drain_started.wait(), 3)
+            session.cancel()
+            release_decoder.set()
+            await asyncio.wait_for(drain_settled.wait(), 3)
+            assert not session.done(), "session returned before its scheduler cleanup completed"
+        finally:
+            release_decoder.set()
+            allow_scheduler_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await session
+            await asyncio.wait_for(scheduler_settled.wait(), 3)
+
+    monkeypatch.setattr(client.av, "open", blocked_open)
+    monkeypatch.setattr(client, "save_video", lambda chunks, *args, **kwargs: saved.append(b"".join(chunks)))
+    monkeypatch.setattr("sys.argv", ["client", "--output", str(tmp_path / "out.mp4")])
+    asyncio.run(run())
+    assert saved == [b"".join(fragments)]
+    assert "[decode] total_frames=unknown status=shutdown_cancelled" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_loopback_websocket_keeps_controls_and_received_media(
+    client, fragments, monkeypatch, tmp_path, capsys, overflow
+):
+    """Use real WebSocket I/O; only final saving is replaced by byte capture."""
+    from websockets.asyncio.server import serve
+
+    entered = threading.Event()
+    release = threading.Event()
+    gate_observations = []
+    controls = []
+    counters = []
+    saved = []
+    real_open = av.open
+    real_counter = client._StreamingFrameCounter
+
+    def gated_open(*args, **kwargs):
+        entered.set()
+        gate_observations.append(release.wait(5))
+        return real_open(*args, **kwargs)
+
+    def create_counter(**kwargs):
+        counter = real_counter(**kwargs)
+        counters.append(counter)
+        return counter
+
+    async def run():
+        handler_done = asyncio.get_running_loop().create_future()
+
+        async def handler(websocket):
+            try:
+                assert json.loads(await websocket.recv())["type"] == "session.start"
+                await websocket.send(json.dumps({"type": "video.start", "format": "m4s"}))
+                for index, (part, frames) in enumerate(zip(fragments, (9, 12, 12, 0))):
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "video.chunk_metadata",
+                                "kind": "trailer" if index == 3 else "media",
+                                "num_frames": frames,
+                                "byte_length": len(part),
+                                "generation_chunk_index": index,
+                            }
+                        )
+                    )
+                    await websocket.send(part)
+                assert await asyncio.to_thread(entered.wait, 3)
+                for _ in range(2):
+                    control = json.loads(await asyncio.wait_for(websocket.recv(), 3))
+                    assert control["type"] == "session.interaction"
+                    controls.append(control["interaction"]["event"])
+                release.set()
+                await websocket.send(json.dumps({"type": "session.done"}))
+            except Exception as exc:
+                handler_done.set_exception(exc)
+            else:
+                handler_done.set_result(None)
+            finally:
+                release.set()
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            args = client.parse_args()
+            args.port = server.sockets[0].getsockname()[1]
+            args.prompt_updates = client._parse_prompt_updates('[{"at": 0, "prompt": "updated test prompt"}]')
+            args.camera_updates = client._parse_camera_updates('[{"at": 0, "actions": ["w"]}]')
+            await asyncio.wait_for(client.stream_video(args), 10)
+            await handler_done
+
+    if overflow:
+        monkeypatch.setattr(real_counter, "_MAX_PENDING_BYTES", 3000)
+    monkeypatch.setattr(client.av, "open", gated_open)
+    monkeypatch.setattr(client, "_StreamingFrameCounter", create_counter)
+    monkeypatch.setattr(client, "save_video", lambda chunks, *args, **kwargs: saved.append(b"".join(chunks)))
+    monkeypatch.setattr("sys.argv", ["client", "--prompt", "test prompt", "--output", str(tmp_path / "out.mp4")])
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert gate_observations == [True]
+    assert len(controls) == 2
+    assert any(event.get("prompt") == "updated test prompt" for event in controls)
+    assert any("camera" in event.get("multi_modal_data", {}) for event in controls)
+    assert saved == [b"".join(fragments)]
+    assert not counters[0]._thread.is_alive()
+    expected = "unknown status=buffer_limit_exceeded" if overflow else "33 status=complete"
+    assert f"[decode] total_frames={expected}" in capsys.readouterr().out

@@ -331,15 +331,19 @@ class _StreamingFrameCounter:
         if size <= 0:
             return b""
         with self._condition:
-            self._condition.wait_for(lambda: self._pending or self._eof)
-            if not self._pending:
-                return b""
-            data = self._pending.popleft()
-            result = bytes(data[:size])
-            if len(data) > size:
-                self._pending.appendleft(data[size:])
-            self._pending_bytes -= len(result)
-            return result
+            # Short reads inside an MP4 box can be treated as EOF by FFmpeg.
+            # Transport messages need not coincide with either boxes or reads.
+            self._condition.wait_for(lambda: self._pending_bytes >= size or self._eof)
+            remaining = min(size, self._pending_bytes)
+            self._pending_bytes -= remaining
+            pieces = []
+            while remaining:
+                data = self._pending.popleft()
+                pieces.append(data[:remaining])
+                if len(data) > remaining:
+                    self._pending.appendleft(data[remaining:])
+                remaining -= len(pieces[-1])
+            return b"".join(pieces)
 
     def _decode(self) -> None:
         try:
@@ -347,7 +351,8 @@ class _StreamingFrameCounter:
                 self,
                 format=self._format,
                 mode="r",
-                buffer_size=4096,
+                # Keep the full-read requirement small enough for live progress.
+                buffer_size=1024,
                 options={"probesize": "32", "analyzeduration": "0"},
             ) as container:
                 for _ in container.decode(container.streams.video[0]):
@@ -368,9 +373,16 @@ class _StreamingFrameCounter:
             self._eof = True
             self._condition.notify_all()
         if self._thread is not None:
-            await asyncio.to_thread(self._thread.join, self._JOIN_TIMEOUT)
-            if self._thread.is_alive():
-                self._fail("shutdown_timeout")
+            join_task = asyncio.create_task(asyncio.to_thread(self._thread.join, self._JOIN_TIMEOUT))
+            try:
+                await asyncio.shield(join_task)
+            except asyncio.CancelledError:
+                self._fail("shutdown_cancelled")
+                await asyncio.shield(join_task)
+                raise
+            finally:
+                if self._thread.is_alive():
+                    self._fail("shutdown_timeout")
         return self.count
 
 
@@ -520,17 +532,21 @@ async def stream_video(args: argparse.Namespace) -> None:
         for task in tasks:
             task.cancel()
         try:
-            if frame_counter is not None:
-                decoded_total = await frame_counter.finish()
-                print(
-                    f"[decode] total_frames={decoded_total if decoded_total is not None else 'unknown'} "
-                    f"status={frame_counter.error or 'complete'} "
-                    f"total_elapsed={time.perf_counter() - started_at:.2f}s"
-                )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                    raise result
+            try:
+                if frame_counter is not None:
+                    await frame_counter.finish()
+            finally:
+                if frame_counter is not None:
+                    decoded_total = frame_counter.count
+                    print(
+                        f"[decode] total_frames={decoded_total if decoded_total is not None else 'unknown'} "
+                        f"status={frame_counter.error or 'complete'} "
+                        f"total_elapsed={time.perf_counter() - started_at:.2f}s"
+                    )
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                        raise result
         finally:
             print(
                 "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"

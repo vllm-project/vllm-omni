@@ -87,8 +87,9 @@ Frame accounting uses one background decoder for the session, retaining the
 fragmented MP4 context without repeatedly decoding earlier frames. On each chunk
 line, `frames` is the server's declared `num_frames` (`unknown` if absent), while
 `total_frames` is a snapshot of frames actually decoded so far. These snapshots
-can lag reception due to worker scheduling and codec buffering; differences
-between snapshots are not per-chunk frame counts or instantaneous generation FPS.
+can lag reception due to worker scheduling, input buffering (up to a 1 KiB
+read), and codec buffering; differences between snapshots are not per-chunk
+frame counts or instantaneous generation FPS.
 At shutdown, the client signals end-of-input and prints a final `[decode]` total
 and elapsed time after draining the decoder, including any frames in the trailer.
 For interrupted streams, this counts the decodable received media only; it need
@@ -99,8 +100,11 @@ Counting never waits for queued media to be decoded in the receive loop. Its
 pending input is limited to 64 MiB; overflow or a decoder error disables counting
 and reports `total_frames=unknown` with a reason in the final `[decode]` line.
 Shutdown waits up to five seconds for the decoder off the event loop; a timeout
-also reports an unknown total. A native codec call cannot be forcibly interrupted
-by this thread-based helper, so the worker is a daemon. These limits apply to
+also reports an unknown total. Cancellation during this drain disables counting,
+preserves the received bytes for saving, and then propagates cancellation. The
+client waits for decoder and scheduled-control cleanup unless cancellation is
+requested again. A native codec call cannot be forcibly interrupted by this
+thread-based helper, so the worker is a daemon. These limits apply to
 accounting only: the client still retains all received chunks for saving, and
 final remuxing is unchanged.
 
