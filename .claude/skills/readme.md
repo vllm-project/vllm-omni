@@ -7,8 +7,19 @@ pull request review.
 
 ## Directory Structure
 
-Each skill lives in its own directory under `.claude/skills/`. A skill may
-include:
+Each skill lives in its own directory under `.claude/skills/`. The Ascend
+optimization router has a single root-level skill entry for discovery:
+
+```text
+.claude/skills/
+├── readme.md
+├── dit-npu-fusion-analysis/
+│   ├── SKILL.md                  # MindIE-SD routing instructions
+│   └── agents/openai.yaml       # English UI metadata
+└── ...                          # Other existing skills
+```
+
+A skill may include:
 
 - `SKILL.md`: the main workflow and operating instructions
 - `references/`: focused reference material used by the skill
@@ -41,6 +52,11 @@ self-check.
   image/video performance-benchmark cases and their nightly/weekly Buildkite
   Perf coverage, using the `run_benchmark.py` config schema and a fixed
   measurement contract
+- [`dit-npu-fusion-analysis`](dit-npu-fusion-analysis/SKILL.md):
+  routes Ascend NPU diffusion model and operator optimization to the applicable
+  MindIE-SD skill, supplying Omni context and retaining repository-local tests;
+  the existing name remains a discovery entry, with optimization methods and
+  acceptance guidance maintained in MindIE-SD
 - [`find-simplifications`](find-simplifications/SKILL.md): finds evidence-backed
   opportunities to remove or merge dead, duplicated, speculative,
   over-generalized, or unnecessarily defensive vLLM-Omni code
@@ -66,6 +82,25 @@ self-check.
   wiring (`test-ready.yml`, `test-merge.yml`, `test-nightly.yml`,
   `test-weekly.yml`), and copy-paste local plus CI-like `pytest` commands; see
   `references/test-routing.md` for level-to-command mapping
+
+## Ascend Optimization Routing
+
+For Ascend NPU diffusion tasks, `diffusion-perf-opt` consults the
+[MindIE-SD router](dit-npu-fusion-analysis/SKILL.md)
+before hardware-specific analysis. The router locates an existing checkout or
+the official dev skill index and reads the selected instructions. It does not
+copy SD's operator catalogue, benefit model or acceptance protocol into Omni.
+
+| Task | Guidance owner | Omni responsibility |
+| --- | --- | --- |
+| Model optimization, bottleneck unknown | MindIE-SD model optimization entry | Supply active source, workload/configuration and existing evidence |
+| Fusion, kernel, pattern or focused profiling task | Relevant MindIE-SD capability | Preserve repository ownership and authorized execution scope |
+| Changes to Omni | Omni test/accuracy skills plus SD NPU acceptance guidance | Implement/test the Omni changes and return actual artifacts |
+| Production qualification | production-add-diffusion-model | Retain independent API, lifecycle and feature-combination checks |
+
+Read the external index at execution time; selected names and support can vary
+by revision. If guidance is inaccessible, disclose the gap rather than claiming
+that the external workflow ran.
 
 ## MiniMax H3 Creative Skills
 
