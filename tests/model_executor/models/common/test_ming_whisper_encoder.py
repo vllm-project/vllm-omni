@@ -99,7 +99,23 @@ def test_packed_attention_binds_arguments_by_name(monkeypatch: pytest.MonkeyPatc
     assert captured["max_seqlen_k"] == tokens
 
 
-def test_packed_attention_falls_back_without_a_varlen_callable(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("cu_seqlens", "slices"),
+    [
+        # One sequence: the padding mask is all zeros and the per-sequence
+        # scatter is trivial.
+        (torch.tensor([0, 6], dtype=torch.int32), [(0, 6)]),
+        # Two sequences of unequal length: the padding mask and the
+        # cross-sequence boundaries have to be right as well.
+        (torch.tensor([0, 2, 6], dtype=torch.int32), [(0, 2), (2, 6)]),
+    ],
+    ids=["one-sequence", "two-sequences"],
+)
+def test_packed_attention_falls_back_without_a_varlen_callable(
+    monkeypatch: pytest.MonkeyPatch,
+    cu_seqlens: torch.Tensor,
+    slices: list[tuple[int, int]],
+) -> None:
     """``HAS_FLASH_ATTN`` can be true while no varlen callable exists.
 
     The flag is also set when only the optional dense ``fa3-fwd`` binding was
@@ -113,16 +129,16 @@ def test_packed_attention_falls_back_without_a_varlen_callable(monkeypatch: pyte
 
     assert attn.use_flash_attn is False
 
-    tokens = 6
-    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32)
+    tokens = int(cu_seqlens[-1])
     x = torch.randn(tokens, 32, dtype=torch.bfloat16)
 
     output = attn(x, cu_seqlens=cu_seqlens)
 
     assert output.shape == (tokens, 32)
 
-    # The fallback has to compute the right attention, not merely run. One
-    # packed sequence of ``tokens`` frames is a plain self-attention over
-    # them, so the dense implementation is an independent reference for it.
-    reference = attn._forward_dense(x.float().unsqueeze(0)).squeeze(0)
-    torch.testing.assert_close(output.float(), reference, rtol=5e-2, atol=5e-2)
+    # The fallback has to compute the right attention, not merely run. Each
+    # packed sequence is a plain self-attention over its own frames, so the
+    # dense implementation is an independent reference for it.
+    for start, end in slices:
+        reference = attn._forward_dense(x[start:end].float().unsqueeze(0)).squeeze(0)
+        torch.testing.assert_close(output[start:end].float(), reference, rtol=5e-2, atol=5e-2)
