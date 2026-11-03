@@ -272,6 +272,7 @@ class TestPipelineStreamingOutputToEntrypoint:
             ):
                 outputs.append(output)
 
+            assert audio_calls == [(None, None), (None, None)]
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id.startswith("req-omni-")
             assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
@@ -296,10 +297,13 @@ class TestPipelineStreamingOutputToEntrypoint:
 
         encoded = [b"pipeline-fmp4-0", b"pipeline-fmp4-1"]
 
+        audio_calls = []
+
         class FakeStreamingVideoEncoder:
             encode_calls: list[int] = []
 
-            def encode(self, video):
+            def encode(self, video, audio=None, *, audio_sample_rate=None):
+                audio_calls.append((audio, audio_sample_rate))
                 del video
                 idx = len(self.encode_calls)
                 self.encode_calls.append(idx)
