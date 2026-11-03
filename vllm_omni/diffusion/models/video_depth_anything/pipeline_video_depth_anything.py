@@ -52,12 +52,24 @@ DEFAULT_INPUT_SIZE = 518
 DEFAULT_MAX_RES = 1280
 MAX_INPUT_SIZE = 1022  # 73 patches; larger sizes leave the trained position-embedding range far behind.
 MAX_VIDEO_FRAMES = 2048
+# Bounds the FP16 output (2 bytes per pixel, 6.25 GiB): any clip within the frame limit at the
+# default max_res fits, while full-resolution 4K stops at about 400 frames.
+MAX_OUTPUT_PIXELS = MAX_VIDEO_FRAMES * DEFAULT_MAX_RES * DEFAULT_MAX_RES
 # Depth maps cross the worker boundary in FP16: half the bytes, about three significant digits.
 DEPTH_DTYPE = np.float16
 
 
 def _too_many_frames() -> ValueError:
     return ValueError(f"Video Depth Anything accepts at most {MAX_VIDEO_FRAMES} frames")
+
+
+def _check_output_size(num_frames: int, height: int, width: int) -> None:
+    if num_frames * height * width > MAX_OUTPUT_PIXELS:
+        raise ValueError(
+            f"Video Depth Anything output is limited to {MAX_OUTPUT_PIXELS} depth pixels "
+            f"(frames x height x width); {num_frames} frames at {width}x{height} exceed it. "
+            "Lower max_res or split the video."
+        )
 
 
 def _int_option(extra: dict[str, Any], key: str, default: int) -> int:
@@ -81,19 +93,23 @@ def parse_options(extra: dict[str, Any]) -> tuple[int, int]:
     return input_size, max_res
 
 
-def _video_frames(video: Any) -> tuple[Iterator[np.ndarray], float | None]:
-    """RGB uint8 [H, W, 3] frames from a file path or decoded frames, plus the frame rate."""
+def _video_frames(video: Any) -> tuple[Iterator[np.ndarray], float | None, int | None]:
+    """RGB uint8 [H, W, 3] frames from a file path or decoded frames, the frame rate and the frame count if known."""
     if isinstance(video, np.ndarray) and video.ndim == 4:
         if len(video) > MAX_VIDEO_FRAMES:
             raise _too_many_frames()
-        return iter(np.ascontiguousarray(frame) for frame in video), None
+        return iter(np.ascontiguousarray(frame) for frame in video), None, len(video)
     if isinstance(video, (list, tuple)):
         if len(video) > MAX_VIDEO_FRAMES:
             raise _too_many_frames()
-        return iter(
-            np.asarray(frame.convert("RGB")) if isinstance(frame, PIL.Image.Image) else np.ascontiguousarray(frame)
-            for frame in video
-        ), None
+        return (
+            iter(
+                np.asarray(frame.convert("RGB")) if isinstance(frame, PIL.Image.Image) else np.ascontiguousarray(frame)
+                for frame in video
+            ),
+            None,
+            len(video),
+        )
     if not isinstance(video, str):
         raise ValueError(f"Video Depth Anything cannot read a video of type {type(video).__name__}")
     container = av.open(video)
@@ -116,7 +132,7 @@ def _video_frames(video: Any) -> tuple[Iterator[np.ndarray], float | None]:
                     raise _too_many_frames()
                 yield frame.to_ndarray(format="rgb24")
 
-    return decode(), fps
+    return decode(), fps, stream.frames or None
 
 
 def _bounded(frames: Iterator[np.ndarray], max_res: int) -> Iterator[np.ndarray]:
@@ -147,6 +163,61 @@ def preprocess(frame: np.ndarray, size: tuple[int, int]) -> torch.Tensor:
     """Normalized float32 [3, h, w], resized with OpenCV's bicubic filter like the reference."""
     image = cv2.resize(frame.astype(np.float32) / 255.0, (size[1], size[0]), interpolation=cv2.INTER_CUBIC)
     return torch.from_numpy(np.ascontiguousarray(((image - IMAGE_MEAN) / IMAGE_STD).transpose(2, 0, 1), np.float32))
+
+
+class DepthStitcher:
+    """Stitches windows as they arrive, as the reference ``infer_video_depth`` does after the fact.
+
+    Each window is aligned to the previous one (relative models) and its first
+    frames cross-fade into the last ``INTERP_LEN`` stitched frames. Only those
+    frames and the alignment references change later, so every earlier frame
+    is final and stored as FP16 at once; host memory holds the FP16 output plus
+    one window, not every window's FP32 maps.
+    """
+
+    def __init__(self, metric: bool):
+        self.metric = metric
+        self.frames: list[np.ndarray] = []  # Final, FP16.
+        self.tail: list[np.ndarray] = []  # The last INTERP_LEN stitched frames, FP32.
+        self.reference: list[np.ndarray] = []
+
+    def add(self, window: np.ndarray) -> None:
+        """Stitch the next window's ``INFER_LEN`` raw depth maps."""
+        align_len = OVERLAP - INTERP_LEN
+        align_keyframes = KEYFRAMES[:align_len]
+        if not self.reference:
+            self.reference = [window[index].copy() for index in align_keyframes]
+            self._extend(list(window))
+            return
+        if self.metric:
+            scale, shift = 1.0, 0.0
+        else:
+            scale, shift = scale_and_shift(np.concatenate(window[:align_len]), np.concatenate(self.reference))
+
+        def adjusted(depth: np.ndarray) -> np.ndarray:
+            depth = depth * scale + shift
+            depth[depth < 0] = 0
+            return depth
+
+        # The last INTERP_LEN stitched frames fade into this window's view of the same frames.
+        # Python-float weights keep the maps FP32, as in the reference.
+        step = 1.0 / (INTERP_LEN - 1)
+        weights = [0.0] + [index * step for index in range(1, INTERP_LEN - 1)] + [1.0]
+        post = [adjusted(window[index]) for index in range(align_len, OVERLAP)]
+        faded = [pre * (1 - weight) + new * weight for pre, new, weight in zip(self.tail, post, weights)]
+        self.tail = []
+        self._extend(faded + [adjusted(window[index]) for index in range(OVERLAP, INFER_LEN)])
+        self.reference = self.reference[:1] + [adjusted(window[index]) for index in align_keyframes[1:]]
+
+    def _extend(self, stitched: list[np.ndarray]) -> None:
+        stitched = self.tail + stitched
+        self.frames.extend(depth.astype(DEPTH_DTYPE) for depth in stitched[:-INTERP_LEN])
+        self.tail = stitched[-INTERP_LEN:]
+
+    def result(self, num_frames: int) -> np.ndarray:
+        """The first ``num_frames`` stitched maps as an FP16 [T, H, W] array."""
+        frames = self.frames + [depth.astype(DEPTH_DTYPE) for depth in self.tail]
+        return np.stack(frames[:num_frames])
 
 
 def scale_and_shift(prediction: np.ndarray, target: np.ndarray) -> tuple[float, float]:
@@ -222,12 +293,15 @@ class VideoDepthAnythingPipeline(nn.Module):
 
     @torch.inference_mode()
     def estimate(self, video: Any, input_size: int = DEFAULT_INPUT_SIZE, max_res: int = DEFAULT_MAX_RES) -> dict:
-        frames, fps = _video_frames(video)
+        frames, fps, expected_frames = _video_frames(video)
         frames = _bounded(frames, max_res)
         first = next(frames, None)
         if first is None:
             raise ValueError("Video Depth Anything input has no frames")
         height, width = first.shape[:2]
+        if expected_frames is not None:
+            # Reject a known-oversized clip before running the model; streams are checked as they decode.
+            _check_output_size(expected_frames, height, width)
         size = network_size(height, width, input_size)
         step = INFER_LEN - OVERLAP
 
@@ -236,14 +310,15 @@ class VideoDepthAnythingPipeline(nn.Module):
             yield from frames
 
         source = stream()
-        windows: list[np.ndarray] = []  # Per window, 32 raw depth maps.
+        stitcher = DepthStitcher(self.config.metric)
+        num_windows = 0
         num_frames = 0
         last = first
         previous: torch.Tensor | None = None
         # Window k covers frames [22k, 22k + 32) for every 22k below the clip length. Its first 10
         # inputs are keyframes of window k - 1, so only frames [22k + 10, 22k + 32) are new, and the
         # clip is padded with its last frame to whole windows, as in the reference.
-        while previous is None or num_frames > len(windows) * step:
+        while previous is None or num_frames > num_windows * step:
             needed = INFER_LEN if previous is None else step
             batch = []
             for frame in source:
@@ -252,48 +327,22 @@ class VideoDepthAnythingPipeline(nn.Module):
                 if len(batch) == needed:
                     break
             num_frames += len(batch)
+            _check_output_size(num_frames, height, width)
             batch += [last] * (needed - len(batch))
             inputs = torch.stack([preprocess(frame, size) for frame in batch]).to(self._device).unsqueeze(0)
             if previous is not None:
                 inputs = torch.cat([previous[:, list(KEYFRAMES)], inputs], dim=1)
-            windows.append(self._window_depth(inputs, height, width))
+            stitcher.add(self._window_depth(inputs, height, width))
+            num_windows += 1
             previous = inputs
         return {
-            "depth": self._align(windows, num_frames).astype(DEPTH_DTYPE),
+            "depth": stitcher.result(num_frames),
             "fps": fps,
             "width": width,
             "height": height,
             "num_frames": num_frames,
             "metric": self.config.metric,
         }
-
-    def _align(self, windows: list[np.ndarray], num_frames: int) -> np.ndarray:
-        """Stitch windows: align each to the previous one, cross-fade the overlap (reference ``infer_video_depth``)."""
-        align_len = OVERLAP - INTERP_LEN
-        align_keyframes = KEYFRAMES[:align_len]
-        aligned = list(windows[0])
-        reference = [windows[0][index] for index in align_keyframes]
-        for window in windows[1:]:
-            if self.config.metric:
-                scale, shift = 1.0, 0.0
-            else:
-                scale, shift = scale_and_shift(np.concatenate(window[:align_len]), np.concatenate(reference))
-
-            def adjusted(depth: np.ndarray) -> np.ndarray:
-                depth = depth * scale + shift
-                depth[depth < 0] = 0
-                return depth
-
-            # The last INTERP_LEN aligned frames fade into this window's view of the same frames.
-            # Python-float weights keep the maps FP32, as in the reference.
-            step = 1.0 / (INTERP_LEN - 1)
-            weights = [0.0] + [index * step for index in range(1, INTERP_LEN - 1)] + [1.0]
-            post = [adjusted(window[index]) for index in range(align_len, OVERLAP)]
-            for offset, (pre, new) in enumerate(zip(aligned[-INTERP_LEN:], post)):
-                aligned[len(aligned) - INTERP_LEN + offset] = pre * (1 - weights[offset]) + new * weights[offset]
-            aligned.extend(adjusted(window[index]) for index in range(OVERLAP, INFER_LEN))
-            reference = reference[:1] + [adjusted(window[index]) for index in align_keyframes[1:]]
-        return np.stack(aligned[:num_frames])
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:

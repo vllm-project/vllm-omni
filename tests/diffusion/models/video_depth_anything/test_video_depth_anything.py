@@ -8,6 +8,8 @@ weights; see ``recipes/depth-anything/Video-Depth-Anything-H200.md``.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -112,24 +114,81 @@ def test_windows_cover_the_clip_like_the_reference(frames, windows, monkeypatch)
         torch.testing.assert_close(seen[1][:10], seen[0][[0, 12, *range(24, 32)]])
 
 
+def _stitch(pipeline: P.VideoDepthAnythingPipeline, windows: list[np.ndarray], num_frames: int) -> np.ndarray:
+    stitcher = P.DepthStitcher(pipeline.config.metric)
+    for window in windows:
+        stitcher.add(window)
+    return stitcher.result(num_frames)
+
+
 def test_relative_windows_are_aligned_and_cross_faded():
     pipeline = _pipeline()
     # Window 1 sees the same scene at twice the scale plus one: alignment must undo it.
     truth = np.arange(54, dtype=np.float32)[:, None, None] * np.ones((1, 2, 3), np.float32) + 1
     first = truth[:32]
     second = np.concatenate([truth[[0, 12]], truth[24:32], truth[32:54]]) * 2 + 1
-    aligned = pipeline._align([first, second], 54)
-    np.testing.assert_allclose(aligned, truth, rtol=1e-5, atol=1e-4)
+    aligned = _stitch(pipeline, [first, second], 54)
+    np.testing.assert_allclose(aligned, truth, rtol=1e-3, atol=1e-2)
 
 
 def test_metric_windows_are_stitched_without_rescaling():
     pipeline = _pipeline(metric=True)
     first = np.full((32, 2, 2), 2.0, np.float32)
     second = np.full((32, 2, 2), 4.0, np.float32)
-    aligned = pipeline._align([first, second], 54)
+    aligned = _stitch(pipeline, [first, second], 54)
     # Frames 24-31 fade from the first window's 2.0 to the second's 4.0; frames 32+ keep 4.0 unscaled.
-    np.testing.assert_allclose(aligned[24:32, 0, 0], 2.0 + 2.0 * np.arange(8) / 7, rtol=1e-6)
+    np.testing.assert_allclose(aligned[24:32, 0, 0], 2.0 + 2.0 * np.arange(8) / 7, rtol=1e-3)
     assert (aligned[32:] == 4.0).all() and (aligned[:24] == 2.0).all()
+
+
+def test_stitcher_keeps_only_the_cross_fade_tail_in_fp32():
+    """Host memory must not hold every window: earlier frames are final and stored as FP16."""
+    stitcher = P.DepthStitcher(metric=False)
+    rng = np.random.default_rng(0)
+    for index in range(5):
+        stitcher.add(rng.random((32, 3, 4), dtype=np.float32) + 1)
+        assert len(stitcher.frames) == 24 + 22 * index
+        assert len(stitcher.tail) == P.INTERP_LEN and len(stitcher.reference) == 2
+        assert all(frame.dtype == np.float16 for frame in stitcher.frames)
+    assert stitcher.result(100).shape == (100, 3, 4)
+
+
+def test_oversized_output_is_rejected_before_inference(monkeypatch):
+    pipeline = _pipeline()
+    monkeypatch.setattr(P, "MAX_OUTPUT_PIXELS", 10 * 4 * 6)
+    monkeypatch.setattr(pipeline, "_window_depth", lambda *_: pytest.fail("ran the model on an oversized clip"))
+    with pytest.raises(ValueError, match="Lower max_res or split the video"):
+        pipeline.estimate(np.zeros((11, 4, 6, 3), np.uint8), input_size=14, max_res=-1)
+
+
+def test_oversized_stream_is_rejected_while_decoding(monkeypatch):
+    """Containers without a frame count are checked as frames arrive."""
+    pipeline = _pipeline()
+    monkeypatch.setattr(P, "MAX_OUTPUT_PIXELS", 40 * 4 * 6)
+    frames = [np.zeros((4, 6, 3), np.uint8)] * 60
+    monkeypatch.setattr(P, "_video_frames", lambda video: (iter(frames), None, None))
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_window_depth",
+        lambda inputs, height, width: calls.append(1) or np.ones((32, height, width), np.float32),
+    )
+    with pytest.raises(ValueError, match="54 frames at 6x4 exceed it"):
+        pipeline.estimate("stream.mkv", input_size=14, max_res=-1)
+    assert len(calls) == 1
+
+
+def test_importing_checkpoints_does_not_load_the_pipeline():
+    """The config resolver imports ``.checkpoints`` for every served model."""
+    pipeline_module = P.__name__
+    code = (
+        "import sys\n"
+        "import vllm_omni.diffusion.models.video_depth_anything.checkpoints\n"
+        f"assert {pipeline_module!r} not in sys.modules\n"
+        "from vllm_omni.diffusion.models.video_depth_anything import VideoDepthAnythingPipeline\n"
+        f"assert VideoDepthAnythingPipeline.__module__ == {pipeline_module!r}\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_pipeline_runs_end_to_end_on_random_weights():

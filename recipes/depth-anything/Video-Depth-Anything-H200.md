@@ -110,7 +110,9 @@ Expected for the reference repository's `assets/example_videos/davis_rollercoast
   `--dtype` except `float32`. The served float16 depth of `Tokyo-Walk` (Small)
   is within 3.4e-4 of the FP32 reference, of which float16 storage alone
   accounts for 2.1e-4.
-- Known limitations: one video per request, at most 2048 frames; the whole
+- Known limitations: one video per request, at most 2048 frames and
+  2048 × 1280 × 1280 output depth pixels (about 400 frames of 4K with
+  `max_res=-1`); the whole
   output is returned at once, so `return_depth=true` on long high-resolution
   videos produces large responses (about 150 MB of NPZ for 195 frames at
   720p).

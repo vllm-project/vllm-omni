@@ -60,8 +60,11 @@ Multipart form fields:
 | `model` | string | served model | Must match the served model when given. |
 
 Every frame of the upload is processed in decode order. A video may have at
-most 2048 frames (about 68 s at 30 fps); longer videos answer 400, so split
-them into clips.
+most 2048 frames (about 68 s at 30 fps), and the output at most
+2048 × 1280 × 1280 depth pixels (frames × height × width, after `max_res`).
+Every video within the frame limit fits at the default `max_res`; with
+`max_res=-1`, a 1080p video stops at about 1600 frames and a 4K one at about
+400. Larger requests answer 400: lower `max_res` or split the video into clips.
 
 ## Response
 
@@ -100,8 +103,11 @@ The model sees 32 frames at a time. Consecutive windows advance by 22 frames,
 and each later window also re-reads keyframes of the previous one. For relative
 models, each window is aligned to the previous one with a least-squares scale
 and shift over the shared keyframes; for every model, the 8 overlapping frames
-are cross-faded. Memory therefore does not grow with the video length apart
-from the decoded frames and the output.
+are cross-faded. Windows are stitched as they finish: every frame outside the
+8 still to be cross-faded is final and kept as float16 at once. GPU memory
+therefore does not grow with the video length, and host memory grows only with
+the float16 output (about twice its size at the peak, while the frames are
+gathered into one array).
 
 ## Offline Inference
 
