@@ -42,14 +42,39 @@ def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, 
     return pred if isinstance(pred, tuple) else (pred,)
 
 
+def _as_sequence(
+    pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+) -> list[torch.Tensor] | tuple[torch.Tensor, ...]:
+    """Normalize to a sequence, keeping list and tuple inputs unchanged.
+
+    ``_wrap`` predates packed batches: a list prediction (MixFusion's
+    per-request output) is a sequence of predictions, not one prediction, so
+    wrapping it into a 1-tuple would make the CFG formula apply to the list
+    container itself. Lists therefore pass through as lists.
+    """
+    return pred if isinstance(pred, (list, tuple)) else (pred,)
+
+
 def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Unwrap single-element tuple to plain tensor; keep multi-element as tuple."""
     return pred[0] if len(pred) == 1 else pred
 
 
-def _slice_pred(pred: tuple[torch.Tensor, ...], output_slice: int) -> tuple[torch.Tensor, ...]:
-    """Slice each element along dim 1."""
-    return tuple(p[:, :output_slice] for p in pred)
+def _slice_pred(pred, output_slice: int):
+    """Slice each prediction along dim 1, preserving the container type.
+
+    Accepts a tensor (sliced directly), a list (one slice per element, list
+    out) or a tuple (tuple out). Packed batches carry a list, so the CFG path
+    must keep it a list end to end: the runner indexes packed outputs by
+    request.
+    """
+    if isinstance(pred, list):
+        return [p[:, :output_slice] for p in pred]
+    if isinstance(pred, tuple):
+        return tuple(p[:, :output_slice] for p in pred)
+    if isinstance(pred, torch.Tensor):
+        return pred[:, :output_slice]
+    return pred
 
 
 def _dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
@@ -171,9 +196,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     **({} if kwargs is None else {"kwargs": kwargs}),
                 )
             else:
-                # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
-                negative_noise_pred = _wrap(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
+                # Sequential CFG: compute both positive and negative. Packed
+                # batches predict one tensor per request and return a list;
+                # keep the list so the combine stays per request.
+                positive_noise_pred = _as_sequence(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
+                negative_noise_pred = _as_sequence(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -187,10 +214,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     **({} if kwargs is None else {"kwargs": kwargs}),
                 )
         else:
-            # No CFG: only compute positive/conditional prediction
+            # No CFG: only compute positive/conditional prediction. A packed
+            # list keeps its per-request shape through the optional slice.
             pred = self._predict_noise_for_cfg_branch("positive", positive_kwargs)
             if output_slice is not None:
-                pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
+                pred = _slice_pred(pred, output_slice)
+                if not isinstance(pred, list):
+                    # Keep the legacy 1-tuple collapse for dense predictions.
+                    pred = _unwrap(_wrap(pred))
             return pred
 
     def _predict_noise_for_cfg_branch(self, branch: str, predict_kwargs: dict[str, Any] | None) -> Any:
@@ -229,18 +260,20 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
     def combine_cfg_noise(
         self,
-        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
-        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        positive_noise_pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
         true_cfg_scale: float,
         cfg_normalize: bool = False,
         kwargs: dict[str, Any] | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]:
         """
         Combine conditional and unconditional noise predictions with CFG.
 
-        Accepts both plain tensors (backward-compatible, used by LTX2 etc.)
-        and tuples (multi-output models). Default implementation applies the
-        standard CFG formula to every element.
+        Accepts plain tensors (backward-compatible, used by LTX2 etc.), tuples
+        (multi-output models) and lists (packed batches, one prediction per
+        request). Default implementation applies the standard CFG formula to
+        every element and returns the inputs' container type: packed batches
+        must stay a list because the runner indexes them by request.
 
         Multi-output models can override this to apply different logic per element.
 
@@ -253,8 +286,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 return (video_combined, audio_pos)  # audio: positive only, no CFG
 
         Args:
-            positive_noise_pred: Positive/conditional prediction(s) — Tensor or tuple
-            negative_noise_pred: Negative/unconditional prediction(s) — Tensor or tuple
+            positive_noise_pred: Positive/conditional prediction(s) — Tensor, list or tuple
+            negative_noise_pred: Negative/unconditional prediction(s) — Tensor, list or tuple
             true_cfg_scale: CFG scale factor
             cfg_normalize: Whether to normalize the combined prediction (default: False)
             kwargs: Optional extra context for custom combine implementations.
@@ -262,8 +295,18 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Combined noise prediction(s) — same type as inputs
         """
-        pos_t = _wrap(positive_noise_pred)
-        neg_t = _wrap(negative_noise_pred)
+        as_list = isinstance(positive_noise_pred, list) or isinstance(negative_noise_pred, list)
+        if as_list and not (isinstance(positive_noise_pred, list) and isinstance(negative_noise_pred, list)):
+            raise TypeError(
+                "CFG combine cannot mix a list prediction with a non-list one: "
+                f"got {type(positive_noise_pred).__name__} and {type(negative_noise_pred).__name__}."
+            )
+        pos_t = _as_sequence(positive_noise_pred)
+        neg_t = _as_sequence(negative_noise_pred)
+        if len(pos_t) != len(neg_t):
+            raise ValueError(
+                f"CFG combine expects one negative prediction per positive one: got {len(pos_t)} and {len(neg_t)}."
+            )
 
         results = []
         for p, n in zip(pos_t, neg_t):
@@ -271,6 +314,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             if cfg_normalize:
                 comb = self.cfg_normalize_function(p, comb)
             results.append(comb)
+        if as_list:
+            return results
         return _unwrap(tuple(results))
 
     # ── N-branch CFG interface (for 3+ branch models) ──

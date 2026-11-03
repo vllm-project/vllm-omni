@@ -165,12 +165,11 @@ class _DummyTransformer(nn.Module):
         cached=None,
     ):
         """Stand-in pack method with the real model's contract."""
-        self.pack_calls.append({"cached": cached})
         rows = [h.float() for h in hidden_states]
         row_freqs = [torch.arange(SEQ_LEN, dtype=torch.float32).reshape(SEQ_LEN, 1)] * len(rows)
         chunks, freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(rows, row_freqs, CHUNK_SIZE)
         packed_hidden = torch.cat(chunks, dim=0)
-        return SimpleNamespace(
+        packed = SimpleNamespace(
             hidden_states=packed_hidden,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=(
@@ -185,6 +184,8 @@ class _DummyTransformer(nn.Module):
             image_row_counts=[1] * len(rows),
             key=("dummy", tuple(h.shape for h in hidden_states)),
         )
+        self.pack_calls.append({"cached": cached, "produced": packed})
+        return packed
 
     def forward(
         self,
@@ -348,6 +349,45 @@ class TestPackedForward:
         # Second call received the first bundle as ``cached``.
         assert model.pack_calls[0]["cached"] is None
         assert model.pack_calls[1]["cached"] is not None
+
+    def test_cache_is_scoped_per_cfg_branch(self):
+        # Sequential true-CFG alternates positive and negative calls within a
+        # step; each branch must keep its own bundle or they evict each other.
+        model = _DummyTransformer()
+        apply_mixfusion(model, _plan())
+        kwargs = _packed_kwargs(_latents())
+        with override_forward_context(_armed_ctx()):
+            for branch in ("positive", "negative", "positive", "negative", "positive", "negative"):
+                model.cfg_branch = branch
+                model(**kwargs)
+
+        calls = model.pack_calls
+        assert len(calls) == 6
+        assert calls[0]["cached"] is None
+        assert calls[1]["cached"] is None
+        # Same branch receives the bundle it produced, across interleaved calls.
+        assert calls[2]["cached"] is calls[0]["produced"]
+        assert calls[3]["cached"] is calls[1]["produced"]
+        assert calls[4]["cached"] is calls[2]["produced"]
+        assert calls[5]["cached"] is calls[3]["produced"]
+        # Branches never share a bundle.
+        assert calls[0]["produced"] is not calls[1]["produced"]
+
+    def test_cache_evicts_least_recently_used_branch(self):
+        model = _DummyTransformer()
+        apply_mixfusion(model, _plan())
+        root_hook = model._hook_registry._hooks["mixfusion_pack"]
+        kwargs = _packed_kwargs(_latents())
+        with override_forward_context(_armed_ctx()):
+            for branch in ("positive", "negative", "a", "b", "c", "positive"):
+                model.cfg_branch = branch
+                model(**kwargs)
+
+        assert len(root_hook._cached) == root_hook.MAX_CACHE_SLOTS
+        # Inserting a/b/c pushed "positive" out; its next call was a miss and
+        # pushed "negative" out in turn.
+        assert list(root_hook._cached) == ["a", "b", "c", "positive"]
+        assert model.pack_calls[-1]["cached"] is None
 
 
 class _FakeModel(nn.Module):

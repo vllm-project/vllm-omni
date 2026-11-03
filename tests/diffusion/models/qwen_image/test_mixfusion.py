@@ -35,6 +35,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.forward_context import (
     ForwardContext,
     MixFusionStep,
@@ -125,7 +126,7 @@ def _pipeline(transformer):
         # ``interrupt`` is a read-only property on the real pipeline.
         interrupt=False,
         attention_kwargs=None,
-        parallel_config=SimpleNamespace(sequence_parallel_size=1),
+        parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1),
     )
 
 
@@ -207,9 +208,9 @@ def _denoise_kwargs(batch):
         img_shapes=batch.img_shapes,
         txt_seq_lens=batch.txt_seq_lens,
         do_true_cfg=batch.do_true_cfg,
-        negative_prompt_embeds=None,
-        negative_prompt_embeds_mask=None,
-        negative_txt_seq_lens=None,
+        negative_prompt_embeds=getattr(batch, "negative_prompt_embeds", None),
+        negative_prompt_embeds_mask=getattr(batch, "negative_prompt_embeds_mask", None),
+        negative_txt_seq_lens=getattr(batch, "negative_txt_seq_lens", None),
         image_latents=batch.image_latents,
         extra_transformer_kwargs={"attention_kwargs": None, "return_dict": False},
     )
@@ -470,6 +471,101 @@ def test_predict_noise_keeps_a_packed_list_intact():
     pipeline = SimpleNamespace(transformer=lambda **kwargs: packed)
 
     assert QwenImagePipeline.predict_noise(pipeline, hidden_states=None) is packed
+
+
+# ---------------------------------------------------------------------------
+# Sequential true-CFG: both branches run inside one armed packed step.
+# ---------------------------------------------------------------------------
+
+
+class _PackedCfgTransformer(_StubTransformer):
+    """Packed transformer stub that returns one noise prediction per request."""
+
+    def forward(self, hidden_states, **kwargs):
+        self.packed_calls += 1
+        self.calls.append(
+            {
+                "hidden_states": hidden_states,
+                "cfg_branch": getattr(self, "cfg_branch", None),
+                "armed": get_forward_context().mixfusion_step is not None,
+            }
+        )
+        # The packed forward returns one tensor per request (root-hook output).
+        return [torch.full_like(latent, float(self.packed_calls)) for latent in hidden_states]
+
+    __call__ = forward
+
+
+class _StubCfgPipeline(CFGParallelMixin):
+    """The pipeline surface ``predict_noise_maybe_with_cfg`` needs, no weights."""
+
+    predict_noise = QwenImagePipeline.predict_noise
+
+    def __init__(self, transformer):
+        self.transformer = transformer
+
+
+def _cfg_packed_input_batch():
+    batch = _packed_input_batch()
+    batch.do_true_cfg = True
+    batch.true_cfg_scale = 4.0
+    batch.cfg_normalize = False
+    # The negative prompt has a different text length from the positive one,
+    # which the packed text stream must keep per request.
+    batch.negative_prompt_embeds = torch.ones(2, 3, 8)
+    batch.negative_prompt_embeds_mask = None
+    batch.negative_txt_seq_lens = [3, 3]
+    return batch
+
+
+def _cfg_delegated_dense_step(pipeline):
+    """Stand-in for ``pipeline.denoise_step``: real sequential-CFG dispatch."""
+
+    def dense_step(batch, **kwargs):
+        positive_kwargs, negative_kwargs, output_slice = _denoise_kwargs(batch)
+        return pipeline.predict_noise_maybe_with_cfg(
+            batch.do_true_cfg,
+            batch.true_cfg_scale,
+            positive_kwargs,
+            negative_kwargs,
+            batch.cfg_normalize,
+            output_slice,
+        )
+
+    return dense_step
+
+
+def test_driver_packs_both_sequential_cfg_branches():
+    transformer = _PackedCfgTransformer()
+    pipeline = _StubCfgPipeline(transformer)
+    driver = MixFusionDriver(_pipeline(transformer), transformer, QwenImageMixFusionAdapter())
+    input_batch = _cfg_packed_input_batch()
+    dense_step = _cfg_delegated_dense_step(pipeline)
+
+    with override_forward_context(ForwardContext()):
+        first = driver.run(input_batch, states=[], dense_step=dense_step)
+        # A second step reuses the armed machinery: the packed calls scale
+        # with steps x branches, like the real pipeline.
+        second = driver.run(input_batch, states=[], dense_step=dense_step)
+        assert get_forward_context().mixfusion_step is None
+
+    # Sequential true-CFG is admitted for packed batches: no serial fallback.
+    assert transformer.packed_calls == 4
+    assert [call["cfg_branch"] for call in transformer.calls] == ["positive", "negative"] * 2
+    assert all(call["armed"] for call in transformer.calls)
+    # Both branches pack the same per-request list; the root hook owns the
+    # layout, so the pipeline kwargs stay request-ordered.
+    assert all(call["hidden_states"] is input_batch.latents for call in transformer.calls)
+    # The stamp never leaks past the CFG helper.
+    assert transformer.cfg_branch is None
+
+    # Each request is combined separately and returned as a packed list.
+    for result, positive_value, negative_value in ((first, 1.0, 2.0), (second, 3.0, 4.0)):
+        assert isinstance(result, list)
+        assert len(result) == len(input_batch.latents)
+        for out, latent in zip(result, input_batch.latents):
+            expected = negative_value + input_batch.true_cfg_scale * (positive_value - negative_value)
+            assert torch.equal(out, torch.full_like(latent, expected))
 
 
 # ---------------------------------------------------------------------------

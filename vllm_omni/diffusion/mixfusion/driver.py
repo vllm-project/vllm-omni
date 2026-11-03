@@ -134,10 +134,15 @@ class MixFusionDriver:
         # Packing splits and stacks the image stream itself; SP would shard
         # rows a second time.
         parallel_config = getattr(self.pipeline, "parallel_config", None)
-        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+        if parallel_config is not None and getattr(parallel_config, "sequence_parallel_size", 1) > 1:
             return False, "sequence parallelism is enabled"
-        if input_batch.do_true_cfg:
-            return False, "do_true_cfg is enabled"
+        # Sequential true-CFG is supported: both branches run through the same
+        # armed step and the packed output stays a per-request list. CFG
+        # parallel instead has each rank compute one branch and all-gathers
+        # tensor predictions, which has no per-request list semantics, so keep
+        # that configuration on the serial path.
+        if parallel_config is not None and getattr(parallel_config, "cfg_parallel_size", 1) > 1:
+            return False, "CFG parallel is enabled"
         if input_batch.image_latents is not None:
             return False, "image_latents is set"
         # The packed forward bypasses some module calls (boundaries, block

@@ -22,6 +22,7 @@ MixFusion is not active.
 from __future__ import annotations
 
 import inspect
+from collections import OrderedDict
 
 from torch import nn
 
@@ -102,11 +103,20 @@ class MixFusionRootHook(ModelHook):
     back into one output per request.
     """
 
+    #: Upper bound on retained branch bundles. Sequential CFG alternates the
+    #: positive and negative branch every step, so at least two slots are
+    #: needed; a small margin covers model variants that change layouts.
+    MAX_CACHE_SLOTS = 4
+
     def __init__(self) -> None:
-        # Bundle from the previous denoise step: the layout (RoPE tables,
-        # plan, row counts) depends only on request shapes, so the adapter
-        # reuses it through the ``cache`` argument. Cleared by reset_state.
-        self._cached: PackedInputs | None = None
+        # Bundle from the previous call of the same CFG branch: the layout
+        # (RoPE tables, plan, row counts) depends only on the call's shapes,
+        # so the adapter reuses it through the ``cache`` argument. Keyed by
+        # branch because sequential true-CFG interleaves positive and negative
+        # calls within one step; a single slot would make them evict each
+        # other on every step. The adapter revalidates the layout key itself,
+        # so a stale entry for the same branch is a miss, never a wrong reuse.
+        self._cached: OrderedDict[str | None, PackedInputs] = OrderedDict()
 
     def pre_forward(self, module, *args, **kwargs):
         step = _active_step()
@@ -122,12 +132,18 @@ class MixFusionRootHook(ModelHook):
             raise MixFusionPackingError(
                 f"{type(module).__name__} declined packing after admission: {reason or 'no reason given'}"
             )
-        packed = adapter.pack_inputs(module, bound, step=step, cache=self._cached)
+        # ``cfg_branch`` is stamped by the pipeline around each sequential CFG
+        # call; a call outside CFG uses ``None``.
+        branch = getattr(module, "cfg_branch", None)
+        packed = adapter.pack_inputs(module, bound, step=step, cache=self._cached.get(branch))
         if packed is None:
             raise MixFusionPackingError(
                 f"{type(adapter).__name__}.pack_inputs returned no bundle for {type(module).__name__} after admission."
             )
-        self._cached = packed
+        self._cached.pop(branch, None)
+        self._cached[branch] = packed
+        while len(self._cached) > self.MAX_CACHE_SLOTS:
+            self._cached.popitem(last=False)
         step.adapter = adapter
         step.plan = packed.plan
         step.layout = adapter.build_attention_layout(packed.plan)
@@ -144,7 +160,7 @@ class MixFusionRootHook(ModelHook):
         return step.adapter.restore_output(module, output, step.packed.plan)
 
     def reset_state(self, module):
-        self._cached = None
+        self._cached.clear()
         return module
 
 

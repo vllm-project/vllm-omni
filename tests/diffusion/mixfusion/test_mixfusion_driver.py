@@ -98,11 +98,17 @@ class _DriftingAdapter(_FakeAdapter):
         return False, "answer drifted after admission"
 
 
-def _pipeline(*, interrupt: bool = False, attention_kwargs: dict | None = None, sp_size: int = 1):
+def _pipeline(
+    *,
+    interrupt: bool = False,
+    attention_kwargs: dict | None = None,
+    sp_size: int = 1,
+    cfg_size: int = 1,
+):
     return SimpleNamespace(
         interrupt=interrupt,
         attention_kwargs=attention_kwargs,
-        parallel_config=SimpleNamespace(sequence_parallel_size=sp_size),
+        parallel_config=SimpleNamespace(sequence_parallel_size=sp_size, cfg_parallel_size=cfg_size),
     )
 
 
@@ -346,7 +352,7 @@ def test_admission_rejects_sequence_parallelism():
     assert reason == "sequence parallelism is enabled"
 
 
-def test_admission_rejects_true_cfg():
+def test_admission_accepts_sequential_true_cfg():
     driver, _ = _driver()
 
     accepted, reason = driver.admit(
@@ -355,8 +361,20 @@ def test_admission_rejects_true_cfg():
         max_chunks=DEFAULT_MAX_CHUNKS,
     )
 
+    assert accepted, reason
+
+
+def test_admission_rejects_cfg_parallel():
+    driver, _ = _driver(pipeline=_pipeline(cfg_size=2))
+
+    accepted, reason = driver.admit(
+        _ragged_batch(do_true_cfg=True),
+        min_chunk_tokens=1,
+        max_chunks=DEFAULT_MAX_CHUNKS,
+    )
+
     assert not accepted
-    assert reason == "do_true_cfg is enabled"
+    assert reason == "CFG parallel is enabled"
 
 
 def test_admission_rejects_image_latents():
