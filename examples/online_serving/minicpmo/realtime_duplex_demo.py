@@ -181,6 +181,36 @@ def _post_commit_model_decision(
     return None
 
 
+def _post_commit_response_created(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> bool:
+    if committed_index is None:
+        return False
+    return any(event.get("type") == "response.created" for event in events[committed_index + 1 :])
+
+
+def _post_commit_response_done(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> bool:
+    """Whether a post-commit response reached a non-cancelled terminal state.
+
+    A forced commit must be drained before the session closes: closing while
+    the requested response is still generating drops its transcript and audio,
+    which is exactly the silent failure a mandatory final answer must not have.
+    """
+    if committed_index is None:
+        return False
+    for event in events[committed_index + 1 :]:
+        if event.get("type") != "response.done":
+            continue
+        response = event.get("response")
+        if not isinstance(response, dict) or response.get("status") != "cancelled":
+            return True
+    return False
+
+
 def _latest_model_decision(
     events: list[dict[str, object]],
     after_index: int,
@@ -203,7 +233,12 @@ def _response_in_progress(events: list[dict[str, object]]) -> bool:
     )
 
 
-async def _commit_input_after_playback_checkpoint(client: DuplexClient, collector: EventCollector) -> float:
+async def _commit_input_after_playback_checkpoint(
+    client: DuplexClient,
+    collector: EventCollector,
+    *,
+    create_response: bool = False,
+) -> float:
     """Commit input only after preserving already-played assistant history.
 
     Native duplex can finish several responses while the user is still
@@ -213,10 +248,17 @@ async def _commit_input_after_playback_checkpoint(client: DuplexClient, collecto
     Checkpoint playback first so the server commits each assistant item at its
     original history position.  A second acknowledgement after the commit can
     then safely advance response-local playback that drained in the meantime.
+
+    ``create_response`` sets the commit's ``response_create`` flag. Native
+    duplex sessions never auto-respond: the model decides per unit whether to
+    speak or keep listening, so a session can end with the last user turn
+    unanswered. Forwarding this flag makes the commit itself ask for one
+    response built from the committed input, which is the only protocol-level
+    way to make the final answer mandatory instead of model luck.
     """
     await acknowledge_collected_playback(client, collector)
     commit_sent_at_s = time.monotonic()
-    await client.commit()
+    await client.commit(create_response=True if create_response else None)
     return commit_sent_at_s
 
 
@@ -228,6 +270,59 @@ def _event_count_after(
     if index is None:
         return 0
     return sum(event.get("type") == event_type for event in events[index + 1 :])
+
+
+#: How long a forced final commit may take to open its response before the
+#: client re-asks with an explicit ``response.create``. A native duplex
+#: precreated response usually arrives well under a second after the commit
+#: acknowledgement, so this only absorbs a slow stage-0 schedule.
+_FORCED_RESPONSE_CREATE_TIMEOUT_S = 15.0
+
+
+async def _drain_forced_post_commit_response(
+    client: DuplexClient,
+    collector: EventCollector,
+    *,
+    committed_index: int | None,
+    timeout_s: float,
+    create_timeout_s: float = _FORCED_RESPONSE_CREATE_TIMEOUT_S,
+) -> bool:
+    """Drain the commit-requested response, re-asking once if it never opens.
+
+    The commit carries ``response_create``, so the server answers its retained
+    audio directly. If no response opened, ``response.create`` is the
+    protocol's second, explicit way to ask for the same answer -- but only on
+    an idle server: a commit held behind an active response is promoted with
+    its forced create once that response settles, and re-asking then just
+    yields ``response_already_active``. Errors reported after the commit
+    suppress the re-ask too, since the server is refusing rather than slow.
+
+    Returns whether the explicit fallback was sent. Raises ``TimeoutError``
+    when the drain does not finish, so the caller records a client timeout
+    instead of closing on a half-generated answer.
+    """
+    fallback_sent = False
+    try:
+        await wait_for_condition(
+            lambda: _post_commit_response_created(collector.events, committed_index),
+            timeout_s=create_timeout_s,
+            label="post-commit forced response.created",
+        )
+    except TimeoutError:
+        if (
+            _event_count_after(collector.events, "error", committed_index) == 0
+            and not _response_in_progress(collector.events)
+        ):
+            with suppress(DuplexClientError, DuplexSessionClosedError):
+                await client.send({"type": "response.create"})
+                fallback_sent = True
+    await wait_for_condition(
+        lambda: _post_commit_response_done(collector.events, committed_index)
+        and not _response_in_progress(collector.events),
+        timeout_s=timeout_s,
+        label="post-commit forced response drain",
+    )
+    return fallback_sent
 
 
 def _video_has_audio(video_path: Path) -> bool:
@@ -597,8 +692,17 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             input_pcm16,
             chunk_period_ms=_chunk_period_ms(collector.events),
         )
+        # ``getattr`` keeps every Namespace built before this flag existed
+        # working unchanged: only callers that ask for a mandatory final
+        # answer opt in.
+        final_create_response = bool(getattr(args, "final_create_response", False))
+        forced_response_fallback_sent = False
         wait_for_post_commit_decision = False
-        commit_sent_at_s = await _commit_input_after_playback_checkpoint(client, collector)
+        commit_sent_at_s = await _commit_input_after_playback_checkpoint(
+            client,
+            collector,
+            create_response=final_create_response,
+        )
         wait_error: str | None = None
         committed_index: int | None = None
         post_commit_decision: str | None = None
@@ -610,15 +714,26 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
             committed_index = _input_committed_index(collector.events, commit_event_cursor)
             stream_decision = _latest_model_decision(collector.events[: committed_index + 1], stream_event_cursor)
-            wait_for_post_commit_decision = input_has_residual_model_unit or _response_in_progress(
-                collector.events[: committed_index + 1]
+            wait_for_post_commit_decision = (
+                final_create_response
+                or input_has_residual_model_unit
+                or _response_in_progress(collector.events[: committed_index + 1])
             )
             if wait_for_post_commit_decision:
-                await wait_for_condition(
-                    lambda: _post_commit_model_decision(collector.events, committed_index) is not None,
-                    timeout_s=args.timeout_s,
-                    label="post-commit model decision or response drain",
-                )
+                if final_create_response:
+                    forced_response_fallback_sent = await _drain_forced_post_commit_response(
+                        client,
+                        collector,
+                        committed_index=committed_index,
+                        timeout_s=args.timeout_s,
+                        create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
+                    )
+                else:
+                    await wait_for_condition(
+                        lambda: _post_commit_model_decision(collector.events, committed_index) is not None,
+                        timeout_s=args.timeout_s,
+                        label="post-commit model decision or response drain",
+                    )
                 post_commit_decision = _post_commit_model_decision(collector.events, committed_index)
         except TimeoutError as exc:
             wait_error = str(exc)
@@ -717,7 +832,14 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
+                "final_create_response": final_create_response,
+                "forced_response_fallback_sent": forced_response_fallback_sent,
                 "input_had_residual_model_unit": input_has_residual_model_unit,
+                "response_created_count": _event_count_after(
+                    collector.events,
+                    "response.created",
+                    committed_index,
+                ),
                 "response_listen_count": _event_count_after(
                     collector.events,
                     "response.listen",
@@ -852,6 +974,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Additional silent seconds holding the last frame to allow the final answer to finish.",
+    )
+    parser.add_argument(
+        "--final-create-response",
+        action="store_true",
+        help=(
+            "Ask the server for one response on the final commit and drain it "
+            "before closing. Native duplex lets the model keep listening, so "
+            "without this the last user turn can stay unanswered."
+        ),
     )
     parser.add_argument("--require-audio", action="store_true")
     args = parser.parse_args()

@@ -189,8 +189,8 @@ def test_final_input_commit_checkpoints_playback_first():
         async def ack_playback(self, played_ms, *, response_id=None, item_id=None, committed_ms=None):
             calls.append({"type": "playback.ack", "response_id": response_id, "played_ms": int(played_ms)})
 
-        async def commit(self):
-            calls.append({"type": "input_audio_buffer.commit"})
+        async def commit(self, *, create_response=None):
+            calls.append({"type": "input_audio_buffer.commit", "create_response": create_response})
 
     commit_sent_at_s = asyncio.run(demo._commit_input_after_playback_checkpoint(_Client(), collector))
 
@@ -199,7 +199,153 @@ def test_final_input_commit_checkpoints_playback_first():
     assert [event["type"] for event in calls] == ["playback.ack", "input_audio_buffer.commit"]
     assert calls[0]["response_id"] == "resp-zero-audio"
     assert calls[0]["played_ms"] == 0
+    # Legacy callers keep the previous wire shape: no response_create flag.
+    assert calls[1]["create_response"] is None
     assert isinstance(commit_sent_at_s, float)
+
+
+def test_final_commit_forwards_the_mandatory_response_flag():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    calls: list[object] = []
+
+    class _Client:
+        async def ack_playback(self, played_ms, *, response_id=None, item_id=None, committed_ms=None):
+            pass
+
+        async def commit(self, *, create_response=None):
+            calls.append(create_response)
+
+    asyncio.run(demo._commit_input_after_playback_checkpoint(_Client(), collector, create_response=True))
+
+    assert calls == [True]
+
+
+def test_final_create_response_flag_is_opt_in_for_legacy_namespaces(monkeypatch):
+    demo = _load_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        ["realtime_duplex_demo.py", "--input-wav", "input.wav"],
+    )
+
+    assert demo.parse_args().final_create_response is False
+    # Tests build bare Namespaces without the new field; run_demo must still
+    # treat that as "not requested" instead of raising AttributeError.
+    assert getattr(demo.argparse.Namespace(input_wav="input.wav"), "final_create_response", False) is False
+
+
+def test_final_create_response_flag_parses_from_the_cli(monkeypatch):
+    demo = _load_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        ["realtime_duplex_demo.py", "--input-wav", "input.wav", "--final-create-response"],
+    )
+
+    assert demo.parse_args().final_create_response is True
+
+
+def test_a_forced_response_must_drain_before_the_session_closes():
+    demo = _load_demo_module()
+    events = [
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.created", "response": {"id": "resp-forced"}},
+        {"type": "response.done", "response": {"id": "resp-forced"}},
+    ]
+
+    assert demo._post_commit_response_created(events, 0)
+    assert demo._post_commit_response_done(events, 0)
+    # A listener decision or a cancelled generation is not a drained answer.
+    assert not demo._post_commit_response_done(
+        [{"type": "input_audio_buffer.committed"}, {"type": "response.listen"}],
+        0,
+    )
+    assert not demo._post_commit_response_done(
+        [
+            {"type": "input_audio_buffer.committed"},
+            {"type": "response.done", "response": {"status": "cancelled"}},
+        ],
+        0,
+    )
+
+
+def test_forced_response_drains_an_opened_response_without_reasking():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    collector.add({"type": "response.created", "response": {"id": "resp-forced"}})
+    collector.add({"type": "response.done", "response": {"id": "resp-forced"}})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    fallback = asyncio.run(
+        demo._drain_forced_post_commit_response(_Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05)
+    )
+
+    assert fallback is False
+    assert sent == []
+
+
+def test_forced_response_falls_back_to_an_explicit_create_when_idle():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(_Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05)
+        )
+
+    assert sent == [{"type": "response.create"}]
+
+
+def test_forced_response_does_not_reask_while_a_response_is_active():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-inflight"}})
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    # The deferred commit is promoted with its forced create once the active
+    # response settles; re-asking now only yields response_already_active.
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(_Client(), collector, committed_index=1, timeout_s=0.05, create_timeout_s=0.05)
+        )
+
+    assert sent == []
+
+
+def test_forced_response_does_not_reask_after_a_commit_error():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    collector.add({"type": "error", "error": {"message": "input_audio_buffer_empty"}})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(_Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05)
+        )
+
+    assert sent == []
 
 
 def test_streaming_collector_acks_each_finished_reply_like_the_web_client():
