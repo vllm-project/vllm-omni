@@ -527,6 +527,30 @@ def test_allgather_precollective_validation_rejects_padded_local_geometry(
         )
 
 
+def test_allgather_precollective_validation_rejects_prebuilt_query_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch, capacity=16)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=8, seq_len=8)]
+    )
+    local_qkv = torch.randn(1, 4, 2, 4)
+    metadata = AttentionMetadata(query_ranges=(QueryRange(0, 4, 0),))
+
+    with (
+        adapter.activate(batch),
+        pytest.raises(ValueError, match="query_ranges must be produced by the parallel strategy"),
+    ):
+        adapter.validate_allgather_sp_before_collective(
+            "layer-0",
+            local_qkv,
+            local_qkv,
+            local_qkv,
+            omni_attn_metadata=metadata,
+            sequence_parallel_degree=2,
+        )
+
+
 def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
     layer.attn_backend.forward_includes_kv_cache_update = True

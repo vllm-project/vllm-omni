@@ -263,6 +263,32 @@ the paged path, the same regions are described as native segments that read
 persistent pages. The two modes can therefore have different kernel names and
 call counts while preserving the same mask semantics.
 
+#### AllGather-KV adapter MVP
+
+The adapter has a narrow execution-level path for plain AllGather-KV and
+strict Ulysses x AllGather-KV. The parallel strategy explicitly declares the
+asymmetric layout: query rows remain local while gathered K/V rows describe
+the complete Scheduler write span. Before any sequence-parallel collective,
+the adapter validates the rank-invariant subset of this contract, including
+row count, non-causal mode, cold full-sequence writes, aligned local Q/K/V
+lengths, and `local_length * sequence_parallel_degree + joint_length` matching
+the Scheduler row. Padding therefore fails on every rank before a peer can
+enter the gather.
+
+This MVP accepts one Scheduler row and one contiguous query range, with no
+piecewise spans, attention mask, nonempty joint query, or retained prefix.
+Rank-local query metadata is built once per active batch and reused by every
+layer; the Scheduler's global slot mapping remains separate and is used for
+the gathered K/V write.
+
+Each rank owns an independent physical KV pool. Consequently, every rank in
+an AllGather group writes and retains the complete gathered sequence for its
+Ulysses head slice (`S x H/U` per layer). The dense AllGather path also
+materializes gathered K/V on every rank, but only as a transient tensor; the
+paged path keeps that replicated payload in the pool. No current model
+integration advertises this adapter-level MVP as a supported user
+configuration, so the user guide continues to list AllGather-KV as unsupported.
+
 ### Piecewise planning
 
 The common planner supports both row layouts:
@@ -326,8 +352,11 @@ required.
 
 - Hunyuan `paged_scheduler` is request-level only; request batching and step
   execution are not implemented (see [Execution Modes](#execution-modes)).
-- Only strict Ulysses SP and the current two-branch CFG layout are supported;
-  Ring, AllGather-KV, and independent Hunyuan KV contexts are not implemented.
+- Only strict Ulysses SP and the current two-branch CFG layout are integrated
+  and supported for users. Plain AllGather-KV and strict Ulysses x
+  AllGather-KV have the adapter-level MVP described above, but no model
+  integration currently satisfies its restricted contract. Ring and
+  independent Hunyuan KV contexts are not implemented.
 - Imported AR-to-DiT page transfer and cross-request canonical prefix caching
   are follow-up integrations; `ar_diffusion_kv` is a separate contract.
 - Quantized KV and CPU/DLO offload combinations are untested.

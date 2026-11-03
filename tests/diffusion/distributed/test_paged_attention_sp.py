@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -245,16 +246,16 @@ def _worker(
         )
 
         torch.manual_seed(20261025)
-        first_qkv = torch.randn(
-            3, 1, _GLOBAL_TOKENS, _NUM_HEADS, _HEAD_SIZE, dtype=torch.float16, device=device
-        )
+        first_qkv = torch.randn(3, 1, _GLOBAL_TOKENS, _NUM_HEADS, _HEAD_SIZE, dtype=torch.float16, device=device)
         second_qkv = torch.randn_like(first_qkv)
         local_tokens = _GLOBAL_TOKENS // world_size
         local_slice = slice(local_rank * local_tokens, (local_rank + 1) * local_tokens)
 
         def prepare_case(qkv):
             global_query, global_key, global_value = qkv.unbind(0)
-            local_qkv = tuple(tensor[:, local_slice].contiguous() for tensor in (global_query, global_key, global_value))
+            local_qkv = tuple(
+                tensor[:, local_slice].contiguous() for tensor in (global_query, global_key, global_value)
+            )
             global_expected = (
                 F.scaled_dot_product_attention(
                     global_query.transpose(1, 2),
@@ -280,8 +281,7 @@ def _worker(
             second_dense = dense_attention._forward_impl(*second_local_qkv, attn_metadata=None).clone()
             second_paged = paged_attention._forward_impl(*second_local_qkv, attn_metadata=None).clone()
 
-            query_metadata_by_layer = next(iter(adapter._active_allgather_query_metadata.values()))
-            query_positions = query_metadata_by_layer[_LAYER_NAME].positions.tolist()
+            query_ranges = tuple(adapter._active_allgather_query_metadata)
         current_omni_platform.synchronize()
 
         torch.testing.assert_close(first_paged, first_expected, rtol=2e-2, atol=2e-2)
@@ -297,9 +297,17 @@ def _worker(
         ]
         assert batch.slot_mappings.tolist() == [expected_slots]
         expected_query_start = sp_group.allgather_rank * (_GLOBAL_TOKENS // allgather_degree)
-        assert query_positions == list(range(expected_query_start, expected_query_start + _GLOBAL_TOKENS // allgather_degree))
+        assert query_ranges == (
+            (
+                QueryRange(
+                    local_start=0,
+                    local_end=_GLOBAL_TOKENS // allgather_degree,
+                    global_start=expected_query_start,
+                ),
+            ),
+        )
         if sp_group.allgather_rank == 1:
-            assert query_positions[0] % _BLOCK_SIZE == 8
+            assert query_ranges[0][0].global_start % _BLOCK_SIZE == 8
 
         local_heads = _NUM_HEADS // ulysses_degree
         head_start = sp_group.ulysses_rank * local_heads

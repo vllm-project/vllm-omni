@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 
-from vllm_omni.diffusion.attention.backends.abstract import QueryRange
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     PagedPiecewisePlan,
     build_paged_piecewise_plan,
@@ -874,7 +874,7 @@ class DiffusionPagedAttentionAdapter:
         key: torch.Tensor,
         value: torch.Tensor,
         *,
-        omni_attn_metadata: Any | None,
+        omni_attn_metadata: AttentionMetadata | None,
         sequence_parallel_degree: int,
     ) -> None:
         """Fail every rank consistently before paged AllGather collectives.
@@ -904,6 +904,8 @@ class DiffusionPagedAttentionAdapter:
         if len(batch.rows) != 1:
             raise NotImplementedError("Paged AllGather-KV MVP currently supports one row per forward")
 
+        if omni_attn_metadata is not None and omni_attn_metadata.query_ranges is not None:
+            raise ValueError("Paged AllGather-KV query_ranges must be produced by the parallel strategy")
         full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
         if full_attn_spans is not None:
             raise NotImplementedError("Paged AllGather-KV MVP does not yet support piecewise attention")
@@ -938,11 +940,13 @@ class DiffusionPagedAttentionAdapter:
         joint_value = None if omni_attn_metadata is None else getattr(omni_attn_metadata, "joint_value", None)
         if (joint_key is None) != (joint_value is None):
             raise ValueError("Paged AllGather-KV requires joint_key and joint_value together")
-        if joint_key is not None and int(joint_key.shape[1]) != int(joint_value.shape[1]):
-            raise ValueError(
-                "Paged AllGather-KV requires matching joint K/V sequence lengths: "
-                f"joint_key={joint_key.shape[1]}, joint_value={joint_value.shape[1]}"
-            )
+        if joint_key is not None:
+            assert joint_value is not None
+            if int(joint_key.shape[1]) != int(joint_value.shape[1]):
+                raise ValueError(
+                    "Paged AllGather-KV requires matching joint K/V sequence lengths: "
+                    f"joint_key={joint_key.shape[1]}, joint_value={joint_value.shape[1]}"
+                )
 
         joint_kv_len = int(joint_key.shape[1]) if joint_key is not None else 0
         expected_write_len = local_query_len * sequence_parallel_degree + joint_kv_len
@@ -992,6 +996,7 @@ class DiffusionPagedAttentionAdapter:
             )
 
         if asymmetric_layout:
+            assert query_ranges is not None
             if len(batch.rows) != 1:
                 raise NotImplementedError("Paged AllGather-KV MVP currently supports one row per forward")
 
@@ -1028,6 +1033,7 @@ class DiffusionPagedAttentionAdapter:
         )
 
         if asymmetric_layout:
+            assert query_ranges is not None
             if key_token_shape != value_token_shape:
                 raise ValueError(
                     "Paged AllGather-KV key/value write layouts must match: "
