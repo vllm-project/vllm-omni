@@ -1410,8 +1410,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
                 raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
         for full_name, _buffer in model.named_buffers():
-            if full_name.rsplit(".", 1)[0] in shared_module_names:
-                raise ValueError(f"shared-backbone module owns a buffer: {full_name}")
+            owner_name = full_name.rsplit(".", 1)[0]
+            if owner_name not in shared_module_names:
+                continue
+            owner = model.get_submodule(owner_name) if owner_name else model
+            # Non-persistent buffers are runtime state (e.g. inv_freq), not
+            # quant scales/zero_point; they are fine to leave untouched.
+            if full_name.rsplit(".", 1)[1] in getattr(owner, "_non_persistent_buffers_set", ()):
+                continue
+            raise ValueError(f"shared-backbone module owns a persistent buffer: {full_name}")
 
         # Mark shared params as planned and drop checkpoint keys that feed them.
         # disallow_weights is a backstop that fails loudly if the predicate
