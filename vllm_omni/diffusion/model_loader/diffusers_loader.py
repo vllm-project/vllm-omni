@@ -52,6 +52,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.component_utils import encoder_component_type
 from vllm_omni.diffusion.offloader.config import (
@@ -386,19 +387,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-        quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
-        )
-        use_torchao = (
-            not use_safetensors
-            and quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "torchao"
-            and getattr(quant_config, "is_checkpoint_torchao_serialized", False)
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
@@ -409,7 +402,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self.load_config.use_tqdm_on_load,
                 max_workers=num_threads,
             )
-        elif use_torchao:
+        elif not use_safetensors:
+            # PyTorch pickles (.bin/.pt/.pth); torchao-serialized checkpoints take this path too.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = pt_weights_iterator(
                 sorted_hf_weights_files,
@@ -532,6 +526,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             "Stream-offloaded %d online-quantized layers to CPU during weight loading",
             offloaded,
         )
+
+    @staticmethod
+    def _finalize_online_quant_weights_to_cpu(model: nn.Module) -> None:
+        """Bound deferred quantization after the weight consumer has returned."""
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            finalize_layerwise_processing,
+            get_layerwise_info,
+        )
+
+        # A consumer may buffer the iterator before assigning weights. Do not
+        # finalize at generator exhaustion: the last buffered tensors may not
+        # have reached their layers yet.
+        for module in model.modules():
+            if not getattr(getattr(module, "quant_method", None), "uses_meta_device", False):
+                continue
+            if get_layerwise_info(module).can_load():
+                # Padded linears cannot finish during checkpoint consumption.
+                # Finalizing the whole model would accumulate them on device.
+                finalize_layerwise_processing(module, model_config=None)
+            # Also catch the final layer if the consumer processed it after
+            # the streaming generator's last offload_completed() call.
+            module.to("cpu")
 
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
@@ -1152,6 +1168,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
         loaded_weights = model.load_weights(weights)
+        if stream_online_quant_to_cpu:
+            self._finalize_online_quant_weights_to_cpu(model)
         if loaded_weights is not None:
             loaded_weights = set(loaded_weights).union(planned_weights)
 
@@ -1281,6 +1299,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
+        prepare_model_for_weight_reload(model, self.od_config, target_device)
         return model
 
     def _load_model_with_pre_sharded_hsdp(

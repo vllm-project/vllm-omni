@@ -8,6 +8,8 @@ session_mode: duplex
 
 stages:
   - stage_id: 0
+    # Each utterance is a fresh request, so the base profile's opt-in
+    # Thinker prefix cache applies unchanged (shared session prefix hits).
     limit_mm_per_prompt:
       audio: 4
       image: 8
