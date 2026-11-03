@@ -1196,3 +1196,39 @@ def test_timestep_projection_is_staged_into_one_static_buffer_per_shape() -> Non
     # A different shape gets its own buffer; the first one is kept.
     other = model._stage_timestep_projection(torch.randn(1, 4, 6, model.dim))
     assert other is not staged_first and len(model._timestep_projection_buffers) == 2
+
+
+@pytest.mark.cpu
+@torch.no_grad()
+def test_block_condition_cache_reuses_pre_sp_projections_without_changing_output():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1).eval()
+    video = torch.randn(1, 36, 1, 4, 4)
+    camera = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+    text = torch.randn(1, 3, 6)
+
+    def run(held):
+        return model(
+            video,
+            torch.tensor([1.0]),
+            text,
+            camera,
+            cache=_cache(module, model),
+            start_frame=0,
+            update_cache=False,
+            camera_modulation_cache=held,
+        )
+
+    reference = run(None)
+    model.configure_npu_optimizations(cache_block_conditions=True)
+    calls = attention_tests._record_outputs(model.c2ws_hidden_states_layer1)
+    held = module.CameraModulationCache()
+    for _ in range(3):
+        torch.testing.assert_close(run(held), reference, rtol=0, atol=0)
+    assert len(calls) == 1
+    assert held.prepared is not None
+    run(module.CameraModulationCache())
+    assert len(calls) == 2
+    model.configure_npu_optimizations()
+    run(held)
+    assert len(calls) == 3
