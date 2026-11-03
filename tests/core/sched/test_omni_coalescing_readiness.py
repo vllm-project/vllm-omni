@@ -37,6 +37,25 @@ def test_legacy_readiness_is_a_snapshot(scheduler):
     assert adapter.requests_with_ready_chunks == {"ready"}
 
 
+@pytest.mark.parametrize("connector_form", ["absent", "flat", "nested", "object"])
+def test_shared_config_resolution_preserves_connector_precedence(scheduler, connector_form):
+    additional = {"generation_min_batch_size": 4, "generation_max_wait_ms": 12}
+    scheduler.vllm_config.additional_config = additional
+    extra = {"generation_min_batch_size": 8}
+    scheduler.vllm_config.model_config.stage_connector_config = {
+        "absent": None,
+        "flat": extra,
+        "nested": {"extra": extra},
+        "object": SimpleNamespace(extra=extra),
+    }[connector_form]
+    assert scheduler._get_scheduler_extra_config() == {
+        "generation_min_batch_size": 4 if connector_form == "absent" else 8,
+        "generation_max_wait_ms": 12,
+    }
+    assert additional == {"generation_min_batch_size": 4, "generation_max_wait_ms": 12}
+    assert extra == {"generation_min_batch_size": 8}
+
+
 @pytest.mark.parametrize("source", ["none", "sender", "stage_zero", "full_payload"])
 def test_unsupported_sources_are_distinct_from_empty(scheduler, source):
     if source == "sender":

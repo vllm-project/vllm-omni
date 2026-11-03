@@ -336,6 +336,17 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         session.num_prompt_tokens = len(new_prompt)
         self._finish_streaming_session_update(session, update)
 
+    def _get_scheduler_extra_config(self) -> dict[str, Any]:
+        """Resolve stage settings, with legacy connector values taking precedence."""
+        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+        extra = (
+            connector_config.get("extra", connector_config)
+            if isinstance(connector_config, dict)
+            else getattr(connector_config, "extra", None)
+        ) or {}
+        additional = getattr(self.vllm_config, "additional_config", None)
+        return {**(additional if isinstance(additional, dict) else {}), **extra}
+
     def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
         """Initialize shared batch settings from scheduler-resolved config.
 

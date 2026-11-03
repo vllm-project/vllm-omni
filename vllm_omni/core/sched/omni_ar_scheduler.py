@@ -376,18 +376,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         is_final, _ = self._omni_final_stage_flags(request)
         return is_final
 
-    def _get_scheduler_extra_config(self) -> dict[str, Any]:
-        """Resolve AR settings, with connector values taking precedence."""
-        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
-        extra = (
-            connector_config.get("extra", connector_config)
-            if isinstance(connector_config, dict)
-            else getattr(connector_config, "extra", None)
-        ) or {}
-        # A stage without a configured connector edge sets the same keys in additional_config.
-        additional = getattr(self.vllm_config, "additional_config", None)
-        return {**(additional if isinstance(additional, dict) else {}), **extra}
-
     def _init_prefill_admission_policy(self, extra: Mapping[str, Any]) -> None:
         """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
 
