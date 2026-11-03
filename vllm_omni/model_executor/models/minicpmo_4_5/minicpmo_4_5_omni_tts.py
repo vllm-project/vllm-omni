@@ -2223,14 +2223,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
             if state.get("finished") or not sample_eligible[index]:
                 continue
-            if int(state.get("turn_end_drain") or _DRAIN_NONE) == _DRAIN_UNTIL_SILENT:
-                step = _codec_int_param(state, "step", 0)
-                confirmed = getattr(self, "_request_codec_history", {}).get(request_id) or []
-                _, quiet_run = _trailing_code_runs(
-                    step, confirmed[-step:] if step > 0 else [], self.silent_codec_ids, self.quiet_codec_ids
-                )
-                if quiet_run >= _TURN_END_QUIET_STOP_FRAMES:
-                    continue
+            confirmed = getattr(self, "_request_codec_history", {}).get(request_id) or []
+            if self._kstep_quiet_run_closes(state, confirmed):
+                continue
             projection_indices[index] = len(projection_rows)
             projection_rows.append(end - 1)
         head_logits_all = None
@@ -2976,6 +2971,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             inputs_embeds=inputs_embeds,
         )
 
+    def _kstep_quiet_run_closes(self, state: dict, confirmed: list[int] | None) -> bool:
+        """Whether the until-silent drain has gathered enough quiet frames.
+
+        The single until-silent judgement: the trailing ``step`` confirmed
+        codec codes are split into silent/quiet runs, and the condition closes
+        once the quiet run reaches ``_TURN_END_QUIET_STOP_FRAMES``. The
+        frame-loop gate and flush_kstep_pending's committed-history re-check
+        share it so the two copies cannot drift apart.
+        """
+        if int(state.get("turn_end_drain") or _DRAIN_NONE) != _DRAIN_UNTIL_SILENT:
+            return False
+        step = _codec_int_param(state, "step", 0)
+        confirmed = confirmed if confirmed is not None else []
+        _, quiet_run = _trailing_code_runs(
+            step, confirmed[-step:] if step > 0 else [], self.silent_codec_ids, self.quiet_codec_ids
+        )
+        return quiet_run >= _TURN_END_QUIET_STOP_FRAMES
+
     def flush_kstep_pending(self) -> None:
         """Commit sampled rows before the next frame reads host-side state."""
         pending = getattr(self, "_kstep_pending_packed", None)
@@ -3054,17 +3067,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # never be scheduled, leaving the request unfinished. Re-check
             # with this frame's code committed and rewrite this step's stop
             # row so the stop id reaches vLLM's sampler in the same step.
-            if not stop and int(state.get("turn_end_drain") or _DRAIN_NONE) == _DRAIN_UNTIL_SILENT:
-                step = _codec_int_param(state, "step", 0)
-                _, quiet_run = _trailing_code_runs(
-                    step,
-                    codec_history[-step:] if step > 0 else [],
-                    self.silent_codec_ids,
-                    self.quiet_codec_ids,
-                )
-                if quiet_run >= _TURN_END_QUIET_STOP_FRAMES:
-                    stop = True
-                    state["finished"] = True
+            if not stop and self._kstep_quiet_run_closes(state, codec_history):
+                stop = True
+                state["finished"] = True
             if stop:
                 stop_rows[stop_slot] = row_stop
                 terminal_flags[stop_slot] = flag_true
