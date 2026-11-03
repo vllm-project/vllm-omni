@@ -26,8 +26,11 @@ def early_state():
 
 
 @pytest.mark.parametrize("batch_prefill", [False, True])
+@pytest.mark.parametrize("continuation", [False, True])
 @pytest.mark.parametrize("computed,count,eligible", [(0, 2, False), (2, 2, True), (3, 1, True)])
-def test_only_completed_prefill_arms_first_audio_including_prefix_hits(batch_prefill, computed, count, eligible):
+def test_only_completed_prefill_arms_first_audio_including_prefix_hits(
+    batch_prefill, continuation, computed, count, eligible
+):
     state = _state(MossLocalModelState, torch.device("cpu"))
     state._batch_prefill = batch_prefill
     state._early_first_audio = MossEarlyFirstAudioState(state, None)
@@ -36,12 +39,13 @@ def test_only_completed_prefill_arms_first_audio_including_prefix_hits(batch_pre
         "req_id": "a",
         "codes": {"ref": torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])},
         "sampling_params": SamplingParams(max_tokens=10),
+        "meta": {"ref_code_len": 2} if continuation else {},
     }
     batch = _batch(torch.device("cpu"), [0], [count])
     req = SimpleNamespace(prompt_len=np.full(5, 4), num_computed_tokens=np.full(5, computed))
     with torch.inference_mode():
         state.run_preprocess(batch, {"input_ids": batch.input_ids}, req)
-    assert ("a" in state._early_first_audio.waiting) == eligible
+    assert ("a" in state._early_first_audio.waiting) == (eligible and not continuation)
 
 
 def test_owned_first_codes_batch_reorder_and_one_time_promise(mocker):
