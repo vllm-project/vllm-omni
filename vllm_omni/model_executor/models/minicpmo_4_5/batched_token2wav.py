@@ -642,17 +642,21 @@ class BatchedToken2Wav(nn.Module):
         self._setup_cache_size = setup_cache_size
         self._setup_cache: OrderedDict[tuple[tuple[str, str], int], BatchedToken2WavState] = OrderedDict()
 
-    def _sync_solve_timing(self) -> None:
-        """Drain the device before/after a timed solve.
+    def _sync_solve_timing(self, device: torch.device) -> None:
+        """Drain ``device`` before/after a timed solve.
 
         ``time.perf_counter`` around an async launch measures the enqueue,
         not the solve: a CUDA graph replay and most eager kernels return as
         soon as the work is queued. With the stats enabled (a debug knob)
-        synchronize so ``duration`` is real device time; a CPU-only host has
-        no accelerator to drain.
+        synchronize the tensor's device so ``duration`` is real device time.
+        A CPU host has nothing to drain; a torch build without accelerator
+        dispatch for this backend (older torch_npu) keeps the enqueue timing
+        rather than failing the solve.
         """
-        if self._solve_stats.enabled and torch.accelerator.is_available():
-            torch.accelerator.synchronize()
+        if not self._solve_stats.enabled or device.type == "cpu":
+            return
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize(device)
 
     def _hift_inference(
         self,
@@ -662,13 +666,13 @@ class BatchedToken2Wav(nn.Module):
         if int(mel.shape[2]) == 0:
             # No frames, no samples: HiFT itself cannot run on an empty mel.
             return empty_hift_outputs(mel)
-        self._sync_solve_timing()
+        self._sync_solve_timing(mel.device)
         started = time.perf_counter()
         if self.hift_graph_wrapper is None:
             result = self.hift.inference(mel, source_cache)
         else:
             result = self.hift_graph_wrapper.replay(mel, source_cache)
-        self._sync_solve_timing()
+        self._sync_solve_timing(mel.device)
         self._solve_stats.record(
             "hift",
             batch=int(mel.shape[0]),
@@ -1405,9 +1409,10 @@ class BatchedToken2Wav(nn.Module):
         # not the telescoping gap to the next record. Synchronize around the
         # solve so an async launch cannot be mistaken for a finished one.
         solve_timing = self._solve_stats.enabled
+        solve_started = 0.0
         if solve_timing:
-            self._sync_solve_timing()
-        solve_started = time.perf_counter() if solve_timing else 0.0
+            self._sync_solve_timing(mu.device)
+            solve_started = time.perf_counter()
         if self._cfm_only_float16:
             mu, speakers, cond = mu.half(), speakers.half(), cond.half()
         decoder = self.flow.decoder
@@ -1518,7 +1523,8 @@ class BatchedToken2Wav(nn.Module):
                 prompt_lengths=prompt_lengths,
             )
             if whole_euler_result is not None:
-                if self._solve_stats.enabled:
+                if solve_timing:
+                    self._sync_solve_timing(mu.device)
                     self._solve_stats.record(
                         "cfm",
                         batch=batch_size,
@@ -1634,7 +1640,7 @@ class BatchedToken2Wav(nn.Module):
                     next_att_cache[step][..., mel_frames : mel_frames + pad_frames, :] = 0.0
                 del step_att
         if solve_timing:
-            self._sync_solve_timing()
+            self._sync_solve_timing(mu.device)
             self._solve_stats.record(
                 "cfm",
                 batch=batch_size,

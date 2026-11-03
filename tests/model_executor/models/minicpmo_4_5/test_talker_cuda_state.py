@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -328,7 +328,10 @@ def test_commit_cuda_kstep_invalidates_width1_sampler_caches():
         model._codec_temperature,
     )
     assert rebuilt is rebuilt_states["a"]
-    assert int(rebuilt.step.item()) == int(host_state["step"])
+    # Pin the absolute post-commit value: comparing rebuilt against the host
+    # mirror alone would pass if the commit never advanced the mirror either.
+    assert int(host_state["step"]) == 2  # two committed frames
+    assert int(rebuilt.step.item()) == 2
 
 
 def test_model_binding_commit_and_batch_compaction():
