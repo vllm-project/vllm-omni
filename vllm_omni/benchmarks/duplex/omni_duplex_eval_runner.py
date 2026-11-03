@@ -106,6 +106,13 @@ _COMPLETION_ACTIVITY = frozenset(
         "response.text.delta",
     }
 )
+# In 'none' mode the client sends nothing but silence padding after the
+# commit, so a `response.listen` from then on is the server acknowledging
+# that padding rather than the reply moving forward. Counting it lets every
+# padded step reset the quiet window and leaves each drain to end at its
+# timeout (measured against the real MiniCPM-o server: one listen per
+# padded unit).
+_DRAIN_ACTIVITY = _COMPLETION_ACTIVITY - {"response.listen"}
 
 
 @dataclass(frozen=True)
@@ -304,8 +311,12 @@ def _response_status(event: dict[str, object]) -> str | None:
     return status if isinstance(status, str) else None
 
 
-def _completion_activity(events: list[dict[str, object]], start: int) -> int:
-    return sum(event.get("type") in _COMPLETION_ACTIVITY for event in events[start:])
+def _completion_activity(
+    events: list[dict[str, object]],
+    start: int,
+    activity_types: frozenset[str] = _COMPLETION_ACTIVITY,
+) -> int:
+    return sum(event.get("type") in activity_types for event in events[start:])
 
 
 def _completion_diagnostics(
@@ -778,7 +789,10 @@ async def generate_sample(
                 nonlocal seen_activity, stable_since
                 client.raise_if_reader_stopped()
                 events = client.events.events
-                activity = _completion_activity(events, commit_from)
+                # The drain wait runs after the commit, where 'none' mode only
+                # streams silence padding; the server's per-unit listens must
+                # not reset the quiet window (see _DRAIN_ACTIVITY).
+                activity = _completion_activity(events, commit_from, activity_types=_DRAIN_ACTIVITY)
                 if activity != seen_activity:
                     seen_activity, stable_since = activity, time.monotonic()
                 if not all(client.events.response_is_done(response_id) for response_id in client.events.response_ids):

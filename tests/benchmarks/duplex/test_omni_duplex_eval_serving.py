@@ -740,6 +740,71 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
 
 
 @pytest.mark.asyncio
+async def test_padding_listens_do_not_reset_the_drain_quiet_window(tmp_path, prepared, monkeypatch):
+    """The real server answers every padded silence unit with a listen.
+
+    A per-unit `response.listen` used to reset the drain's quiet window on
+    each padded step and left every drain to end at its timeout (measured
+    against the MiniCPM-o server: 19/19 drains timed out with padding
+    enabled, and one drain logged 151 listens). The drain settle test must
+    ignore the padding-acknowledging listens and settle on the reply's own
+    tail. The fake paces its listens faster than the settle window so each
+    one lands before the threshold would, mirroring the 1s padding period
+    against the 2s settle.
+    """
+    sample = _samples(tmp_path)[0]
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.15)
+    original_wait = runner.wait_for
+
+    async def bounded_wait(predicate, **kwargs):
+        await original_wait(predicate, timeout_s=0.5, label=kwargs["label"])
+
+    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+
+    async def listen_every(socket, interval):
+        while True:
+            await asyncio.sleep(interval)
+            listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+            await socket.send(json.dumps(listen))
+
+    async def handler(socket):
+        listens = None
+        try:
+            async for raw in socket:
+                event = json.loads(raw)
+                if event["type"] == "session.update":
+                    await socket.send(json.dumps({"type": "session.created"}))
+                elif event["type"] == "input_audio_buffer.commit":
+                    await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                    for response in [
+                        {"type": "response.created", "response": {"id": "r1"}},
+                        {"type": "response.output_text.delta", "response_id": "r1", "delta": "Earlier."},
+                        {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                    ]:
+                        await socket.send(json.dumps(response))
+                    # The real server listens on every padded silence unit;
+                    # pace them faster than the settle window.
+                    listens = asyncio.create_task(listen_every(socket, 0.1))
+                elif event["type"] == "session.close":
+                    await socket.send(json.dumps({"type": "session.closed"}))
+                    return
+        finally:
+            if listens is not None:
+                listens.cancel()
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success is True
+    assert output.duplex_eval_result.metadata["drain_timeout"] is None
+    summary = adapter.finalize_duplex_eval([sample], [output])
+    assert summary["published"] == 1
+    response = json.loads(output.duplex_eval_result.output.read_text())
+    assert response["sentences"][0]["sentence"] == "Earlier."
+
+
+@pytest.mark.asyncio
 async def test_lazy_preparation_keeps_loop_responsive_and_excludes_decode_latency(tmp_path, prepared, monkeypatch):
     sample = _samples(tmp_path)[0]
     entered = asyncio.Event()
