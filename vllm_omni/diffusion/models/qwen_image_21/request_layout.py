@@ -430,6 +430,10 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
         )
 
     num_images = len(layout.input_image_sizes)
+    # Block causality permits broader reuse mathematically, but changing
+    # image layout or CFG branch changes encoder/GEMM kernel shapes. Keep
+    # those numerical realizations isolated until cross-layout parity is
+    # validated; replacing a later image currently requires the same layout.
     layout_digest = hash_prefix_cache_value(("qwen-image-21-reference-layout-v1", layout.input_image_sizes)).hex()
     cumulative_image_digests: list[str] = []
     if num_images > 0:

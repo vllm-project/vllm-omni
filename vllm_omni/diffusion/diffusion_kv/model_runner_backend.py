@@ -136,6 +136,14 @@ class DiffusionKVModelRunnerBackend:
                         device=self.device,
                         ulysses_degree=self._get_paged_attention_ulysses_degree(layer),
                     )
+                    if (
+                        self._batch_invariant_paged_attention
+                        and adapters[layer_name].attn_backend.get_name() != "FLASH_ATTN"
+                    ):
+                        raise NotImplementedError(
+                            "Batch-invariant HSDP/Ulysses paged attention requires native CUDA FlashAttention; "
+                            f"resolved {adapters[layer_name].attn_backend.get_name()}"
+                        )
         except Exception:
             self.vllm_config.attention_config.use_non_causal = previous_use_non_causal
             raise
