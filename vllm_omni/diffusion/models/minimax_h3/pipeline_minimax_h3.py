@@ -2368,7 +2368,14 @@ class MiniMaxH3Pipeline(
         cache_runtime = getattr(self, "_cache_dit_runtime", None)
         if cache_runtime is not None:
             cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
-        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+        # RoPE preparation runs before the first transformer forward, so its
+        # buffers must already be placed by the module-offload hook.
+        component_scope = (
+            self._component_on_device(transformer)
+            if getattr(self, "_model_cpu_offload_modules", None)
+            else nullcontext()
+        )
+        with component_scope, self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],

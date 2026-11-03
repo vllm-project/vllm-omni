@@ -3,7 +3,9 @@
 
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -136,6 +138,45 @@ def test_consumed_host_noise_is_released_before_denoising(pipeline, monkeypatch)
             **kwargs,
             request_context=context,
         )
+
+
+def test_module_offload_places_dit_before_denoise_preparation(pipeline, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+    from vllm_omni.diffusion.offloader import apply_sequential_offload, sequential_backend
+
+    # A real CPU-to-meta move exposes preparation before the first forward
+    # without requiring an accelerator or a model checkpoint.
+    transformer = torch.nn.Module()
+    transformer.register_buffer("inv_freq", torch.ones(4))
+    pipeline.transformer = transformer
+    pipeline.device = torch.device("meta")
+    # Adapt only the accelerator boundary: Tensor.data cannot be reassigned
+    # from CPU to meta, whereas Module.to supports this allocation-free move.
+    monkeypatch.setattr(sequential_backend.SequentialOffloadHook, "_to_gpu", lambda hook, model: model.to(hook.device))
+    monkeypatch.setattr(
+        sequential_backend,
+        "current_omni_platform",
+        SimpleNamespace(synchronize=lambda: None, get_free_memory=lambda: 0),
+    )
+    apply_sequential_offload(
+        [transformer],
+        [],
+        device=pipeline.device,
+        pin_memory=False,
+        offload_dit_modules=(),
+    )
+    pipeline._model_cpu_offload_modules = [transformer]
+    monkeypatch.setattr(pipeline, "progress_bar", lambda **kwargs: nullcontext(SimpleNamespace(update=lambda: None)))
+
+    def prepare_before_first_forward(**kwargs):
+        assert kwargs["model"].inv_freq.device == pipeline.device
+        raise RuntimeError("preparation device checked")
+
+    monkeypatch.setattr(module, "minimax_h3_denoise_loop", prepare_before_first_forward)
+    with pytest.raises(RuntimeError, match="preparation device checked"):
+        pipeline.diffuse(**_ref2va_kwargs(42))
+    # Encoder-only offload must keep the unselected DiT resident on exit.
+    assert transformer.inv_freq.device == pipeline.device
 
 
 @pytest.mark.parametrize("failure_stage", ["text", "media"])
