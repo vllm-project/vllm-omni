@@ -2340,12 +2340,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # refreshed here, outside capture. Models that opt into
             # supports_omni_decode_step_metadata must not rely on Python
             # forward to cache values later read from compute_logits.
-            runtime_infos = model_kwargs_extra.get("runtime_additional_information")
-            if runtime_infos is not None:
-                decode_meta_kwargs["runtime_additional_information"] = runtime_infos
-            model_buffer = model_kwargs_extra.get("model_intermediate_buffer")
-            if model_buffer is not None:
-                decode_meta_kwargs["model_intermediate_buffer"] = model_buffer
+            # Always pass the key (even when None) so a step with no runtime
+            # info clears the previous batch's cache instead of leaving it.
+            decode_meta_kwargs["runtime_additional_information"] = model_kwargs_extra.get(
+                "runtime_additional_information"
+            )
+            decode_meta_kwargs["model_intermediate_buffer"] = model_kwargs_extra.get("model_intermediate_buffer")
             update_decode_metadata(**decode_meta_kwargs)
 
         try:

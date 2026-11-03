@@ -739,11 +739,10 @@ class _MammothModa2T2ITokenConstraints:
                 # Missing length is not column 0. Leave this row unconstrained
                 # rather than applying the wrong visual/EOL mask. Live decode
                 # always stamps it, so reaching this branch means the refresh
-                # regressed; make that visible instead of silently unconstrained.
-                logger.debug(
-                    "MammothModa2 t2i row %d has no generated_len; leaving it "
-                    "unconstrained. Check the update_decode_step_metadata refresh.",
-                    i,
+                # regressed; warn once so it is visible at the default log level.
+                logger.warning_once(
+                    "MammothModa2 t2i row has no generated_len; leaving it "
+                    "unconstrained. Check the update_decode_step_metadata refresh."
                 )
                 continue
             generated_len = int(runtime_info["generated_len"])

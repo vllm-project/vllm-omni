@@ -47,6 +47,16 @@ def test_update_decode_step_metadata_refreshes_cache_without_forward() -> None:
     assert host._last_runtime_additional_information[0]["generated_len"] == 3
 
 
+def test_update_decode_step_metadata_clears_cache_when_runtime_info_missing() -> None:
+    """A step with no runtime payload must not keep the previous batch's list."""
+    host = _host()
+    host.update_decode_step_metadata(runtime_additional_information=[_t2i_info(3)])
+    host.update_decode_step_metadata(runtime_additional_information=None)
+    assert host._last_runtime_additional_information is None
+    logits = torch.arange(16, dtype=torch.float32).unsqueeze(0)
+    torch.testing.assert_close(host._apply_t2i_token_constraints(logits.clone()), logits)
+
+
 def test_intra_row_allows_only_visual_tokens() -> None:
     host = _host()
     host.update_decode_step_metadata(runtime_additional_information=[_t2i_info(0)])
