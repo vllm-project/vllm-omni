@@ -132,6 +132,18 @@ def pcm_bytes_per_sample(fmt: object) -> int:
     return 4  # pcm_f32le, the engine's decoded format
 
 
+def pcm_sample_count(audio: object, fmt: object) -> int:
+    """Mono samples in an engine-side base64 PCM payload (``audio`` as the converter returned it).
+
+    The input clock counts the client's audio from this; a converter that
+    handed back anything but base64 text would make it count nothing, so
+    that is an error here rather than a silently stalled ``audio_end_ms``.
+    """
+    if not isinstance(audio, str):
+        raise TypeError(f"engine-side PCM payload must be base64 text, got {type(audio).__name__}")
+    return base64_payload_size_bytes({"audio": audio}) // pcm_bytes_per_sample(fmt)
+
+
 # --------------------------------------------------------------------------- #
 # Turn transitions                                                            #
 # --------------------------------------------------------------------------- #

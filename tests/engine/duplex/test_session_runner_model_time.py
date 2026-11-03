@@ -279,6 +279,53 @@ async def test_an_append_the_runner_refuses_after_decoding_does_not_count_its_au
 
 
 @pytest.mark.usefixtures("input_clock_model")
+@pytest.mark.parametrize(
+    ("fmt", "sample_rate_hz", "payload", "expected_ms"),
+    [
+        ("pcm16", 16000, b"\x10\x00" * 4800, 300),
+        ("pcm16", 8000, b"\x10\x00" * 2400, 300),  # resampled to 16 kHz on the way in: still 300 ms sent
+        ("g711_ulaw", 8000, b"\xff" * 2400, 300),
+    ],
+)
+async def test_audio_end_ms_counts_the_decoded_audio_of_every_input_format(
+    fmt: str, sample_rate_hz: int, payload: bytes, expected_ms: int
+) -> None:
+    """``audio_end_ms`` is read off the converted payload, so decoded formats count like ``pcm_f32le``."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        events = await h.run(
+            commands.AppendAudio(audio=payload, format=fmt, sample_rate_hz=sample_rate_hz, event_id="evt-fmt")
+        )
+        (ack,) = _acks(events)
+        assert (ack.decision, ack.audio_end_ms) == (None, expected_ms)
+
+        (ack,) = _acks(await h.run(append_audio(samples=1600)))
+        assert ack.audio_end_ms == expected_ms + 100
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_converter_that_returns_no_base64_text_fails_the_append_instead_of_counting_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``audio_end_ms`` must not stall silently while ``unit_end_ms`` keeps advancing: such an append fails."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        monkeypatch.setattr(
+            runner_module, "convert_input_audio_with_rate", lambda audio, fmt, **kwargs: (b"raw", "pcm_f32le", 16000)
+        )
+        events = await h.run(append_audio(samples=3200, event_id="evt-raw"))
+
+        assert types(events) == ["error", "input_audio_buffer.processed"]
+        assert events[0].code == "internal_error"
+        assert events[1].audio_end_ms == 0
+        assert h.port.submissions == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
 async def test_a_handler_failure_is_reported_before_the_acknowledgement(monkeypatch: pytest.MonkeyPatch) -> None:
     h = await open_harness(extra_body=INPUT_CLOCK)
     try:
@@ -400,6 +447,37 @@ async def test_a_speaking_unit_is_acknowledged_after_its_final_stage_output() ->
         # No silence unit: the model only hears what the client sent.
         assert len(h.port.submissions) == 1
     finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_continuation_that_blocks_delays_the_acknowledgement_only_by_the_bounded_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wait for ``duplex-continue`` tasks is bounded: a blocked one is logged, not a stuck session."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    warnings: list[str] = []
+    monkeypatch.setattr(runner_module, "CONTINUATION_SETTLE_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(runner_module.logger, "warning", lambda msg, *args: warnings.append(msg % args))
+    released = asyncio.Event()
+
+    async def _blocked() -> None:
+        await released.wait()
+
+    try:
+        request_id = await _speaking_unit(h)
+        h.runner.spawn(_blocked(), name="duplex-continue")
+
+        events = await h.deliver_and_settle(
+            tts_output(request_id, samples=48000, text="hello", tts_is_last_chunk=True),
+            segment_finished=True,
+        )
+
+        assert types(events)[-1] == "input_audio_buffer.processed"
+        assert events[-1].units == ({"end_ms": 1000, "decision": "speak"},)
+        assert [w for w in warnings if "continuation(s) still running" in w]
+    finally:
+        released.set()
         await close_harness(h)
 
 

@@ -146,6 +146,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+#: How long a stage-progress record of an input-clocked session waits for the
+#: response continuations spawned by its output's handler before the
+#: acknowledgement goes out without them (``_on_stage_progress``).
+CONTINUATION_SETTLE_TIMEOUT_S = 1.0
+
 _OffloadT = TypeVar("_OffloadT")
 
 
@@ -637,16 +642,31 @@ class DuplexSessionRunner:
         # which can end the response (``response.done``) on its first step;
         # let it finish first, so the acknowledgement follows those events too.
         # In a clocked session it never suspends (no silence continuation), so
-        # awaiting it cannot stall the worker.
+        # it is done within a few loop turns. That is an invariant of the
+        # continuation, not something this wait can enforce: it is bounded, so
+        # a continuation that does block (one that waits for this worker would
+        # otherwise deadlock the session) costs an early acknowledgement and a
+        # warning, not a stuck session.
         continuations = [
             task for task in self._background_tasks if task.get_name() == "duplex-continue" and not task.done()
         ]
         if continuations:
-            for result in await asyncio.gather(*continuations, return_exceptions=True):
-                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            done, pending = await asyncio.wait(continuations, timeout=CONTINUATION_SETTLE_TIMEOUT_S)
+            for task in done:
+                if not task.cancelled() and task.exception() is not None:
                     logger.warning(
-                        "Duplex session %s response continuation failed: %r", self.session.session_id, result
+                        "Duplex session %s response continuation failed: %r",
+                        self.session.session_id,
+                        task.exception(),
                     )
+            if pending:
+                logger.warning(
+                    "Duplex session %s: %d response continuation(s) still running after %.1fs; acknowledging the "
+                    "stage progress without them (a clocked continuation must not block)",
+                    self.session.session_id,
+                    len(pending),
+                    CONTINUATION_SETTLE_TIMEOUT_S,
+                )
         clock.on_stage_progress(progress)
 
     def _input_clock_progress(
@@ -1683,9 +1703,7 @@ class DuplexSessionRunner:
             ack = self._current_input_ack
             if clock is not None and ack is not None and isinstance(sample_rate_hz, int | float):
                 clock.note_input_audio(
-                    ack,
-                    samples=helpers.base64_payload_size_bytes(event) // helpers.pcm_bytes_per_sample(fmt),
-                    sample_rate_hz=int(sample_rate_hz),
+                    ack, samples=helpers.pcm_sample_count(audio, fmt), sample_rate_hz=int(sample_rate_hz)
                 )
             detected = await self.control.run_turn_detection(event)
             for segment, _ in detected:
