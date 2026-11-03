@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias, TypeVar, cast
 
+import msgspec
 import torch
 from typing_extensions import NotRequired, TypedDict
 from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
@@ -460,6 +461,14 @@ class OmniDiffusionSamplingParams:
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
             f"got {type(params).__name__!r}."
         )
+
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
+        """Reconstruct params from a dict decoded after IPC, handling LoRA."""
+        lora_request = params.get("lora_request")
+        if lora_request is not None and not isinstance(lora_request, LoRARequest):
+            params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
+        return cls(**params)
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
