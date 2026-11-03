@@ -1218,7 +1218,10 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ref_hidden = caches["ref_hidden"]
-        conv_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
+        if old_quantized.shape[-1] >= _CONV_CONTEXT_FRAME:
+            conv_context = old_quantized[:, :, -_CONV_CONTEXT_FRAME:]
+        else:
+            conv_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
         suffix_cache_length = int(self.config.sliding_window)
 
         new_quantized = self.quantizer.decode(new_codes)
