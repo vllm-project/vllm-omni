@@ -397,7 +397,7 @@ class _BucketedEncoder:
             # The fixed-window shim (when present) produces a dataclass, not a
             # tuple, so a length-carrying _aux_spec learned from the prime call
             # would otherwise make output[1] raise on the bucketed path.
-            if not (isinstance(output, tuple) and len(output) > 1):
+            if not (isinstance(output, tuple) and len(output) == 2):
                 raise TypeError(
                     f"encoder {self.name!r} returned {type(output).__name__}, expected a (features, lengths) tuple"
                 )
