@@ -25,7 +25,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_pre_process_func,
     load_wan_weights_with_optional_gate,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import OmniDiffusionRequest, resolve_video_num_frames
 
 # SkyReels Diffusers docs: flow_shift=8.0 for T2V.
 SKYREELS_V2_DEFAULT_FLOW_SHIFT = 8.0
@@ -56,10 +56,18 @@ def get_skyreels_v2_pre_process_func(od_config: OmniDiffusionConfig):
     resolution_defaults = get_skyreels_v2_resolution_defaults(getattr(od_config, "model", None))
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        # Startup warmup sets its own lightweight shape; keep it as Wan does.
+        if request.is_dummy_run:
+            return wan_pre_process_func(request)
         sampling_params = request.sampling_params
-        for field, value in resolution_defaults.items():
+        for field in ("height", "width"):
             if getattr(sampling_params, field) is None:
-                setattr(sampling_params, field, value)
+                setattr(sampling_params, field, resolution_defaults[field])
+        sampling_params.num_frames = resolve_video_num_frames(
+            sampling_params.num_frames,
+            default_num_frames=resolution_defaults["num_frames"],
+            is_dummy_run=False,
+        )
         if sampling_params.num_inference_steps is None:
             sampling_params.num_inference_steps = SKYREELS_V2_DEFAULT_NUM_INFERENCE_STEPS
         if not sampling_params.guidance_scale_provided:

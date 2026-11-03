@@ -55,12 +55,14 @@ def test_skyreels_v2_post_process_reuses_wan22(monkeypatch) -> None:
     assert get_skyreels_v2_post_process_func(od_config) is sentinel_post
 
 
-def _run_skyreels_pre_process(monkeypatch, model: str, sampling: OmniDiffusionSamplingParams):
+def _run_skyreels_pre_process(
+    monkeypatch, model: str, sampling: OmniDiffusionSamplingParams, is_dummy_run: bool = False
+):
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.skyreels_v2.pipeline_skyreels_v2.get_wan22_pre_process_func",
         lambda config: lambda request: request,
     )
-    request = SimpleNamespace(sampling_params=sampling)
+    request = SimpleNamespace(sampling_params=sampling, is_dummy_run=is_dummy_run)
     return get_skyreels_v2_pre_process_func(SimpleNamespace(model=model))(request).sampling_params
 
 
@@ -92,6 +94,16 @@ def test_skyreels_v2_pre_process_preserves_explicit_values(monkeypatch) -> None:
     assert (sampling.height, sampling.width, sampling.num_frames) == (480, 832, 33)
     assert sampling.num_inference_steps == 20
     assert sampling.guidance_scale == 1.0
+
+
+def test_skyreels_v2_pre_process_keeps_dummy_run_shape(monkeypatch) -> None:
+    sampling = OmniDiffusionSamplingParams(height=256, width=256, num_inference_steps=1)
+    sampling = _run_skyreels_pre_process(
+        monkeypatch, "Skywork/SkyReels-V2-T2V-14B-540P-Diffusers", sampling, is_dummy_run=True
+    )
+    assert (sampling.height, sampling.width, sampling.num_frames) == (256, 256, 1)
+    assert sampling.num_inference_steps == 1
+    assert sampling.guidance_scale_provided is False
 
 
 def test_skyreels_v2_metadata_declares_video_output() -> None:
