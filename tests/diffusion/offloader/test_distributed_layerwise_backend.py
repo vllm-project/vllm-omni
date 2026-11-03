@@ -19,7 +19,6 @@ from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
 from tests.diffusion.offloader.helpers import (
     DummyStream,
-    _DummyBlock,
     _PlainEncoder,
     _SingleBlockModel,
     _StagedEncoder,
@@ -34,11 +33,6 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
-from vllm_omni.diffusion.offloader.block_discovery import (
-    get_blocks_attr_names,
-    get_blocks_from_dit,
-    set_blocks_attr_names,
-)
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -1311,29 +1305,6 @@ def test_failed_unregistration_retains_lease_after_backend_is_dropped(
     retained_lease.close()
 
 
-class _MultiBlockModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
-
-    def __init__(self, num_transformer: int = 2, num_single: int = 2):
-        super().__init__()
-        self.transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(num_transformer)])
-        self.single_transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(num_single)])
-
-
-class _EmptyBlocksModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["blocks"]
-
-    def __init__(self):
-        super().__init__()
-        self.blocks = nn.ModuleList([])
-
-
-class _NoAttrsModel(nn.Module):
-    def __init__(self, num_blocks: int = 2):
-        super().__init__()
-        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
-
-
 class _MmapPostLoadModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["blocks"]
 
@@ -1633,51 +1604,6 @@ class TestMmapWeightLoading:
         assert not backend.enabled
         assert not backend._blocks
         assert not backend._all_hook_groups
-
-
-class TestGetBlocksFromDit:
-    def test_get_blocks_from_dit_single_block_attr(self):
-        model = _SingleBlockModel(num_blocks=3)
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert attr_names == ["blocks"]
-        assert len(blocks) == 3
-        assert all(isinstance(b, _DummyBlock) for b in blocks)
-
-    def test_get_blocks_from_dit_multi_block_attrs(self):
-        model = _MultiBlockModel(num_transformer=2, num_single=3)
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert set(attr_names) == {"transformer_blocks", "single_transformer_blocks"}
-        assert len(blocks) == 5
-
-    def test_get_blocks_from_dit_empty_blocks(self):
-        model = _EmptyBlocksModel()
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert attr_names == []
-        assert blocks == []
-
-    def test_get_blocks_from_dit_no_attrs_defined(self):
-        model = _NoAttrsModel(num_blocks=3)
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert attr_names == []
-        assert blocks == []
-
-
-class TestGetBlocksAttrNames:
-    def test_get_blocks_attr_names_new_format(self):
-        model = _MultiBlockModel()
-        attrs = get_blocks_attr_names(model)
-        assert attrs == ["transformer_blocks", "single_transformer_blocks"]
-
-    def test_get_blocks_attr_names_no_attrs(self):
-        model = _NoAttrsModel()
-        attrs = get_blocks_attr_names(model)
-        assert attrs == []
-
-    def test_set_blocks_attr_names(self):
-        model = _NoAttrsModel()
-        set_blocks_attr_names(model, ["new_blocks"])
-        assert hasattr(model.__class__, "_layerwise_offload_blocks_attrs")
-        assert model.__class__._layerwise_offload_blocks_attrs == ["new_blocks"]
 
 
 class TestCrossGroupSharedBuffer:
