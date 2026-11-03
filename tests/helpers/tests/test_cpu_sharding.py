@@ -107,13 +107,16 @@ def suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     directory = tmp_path / "tests/model_executor"
     directory.mkdir(parents=True)
     for name in "abcd":
+        skipped_case = (
+            "@pytest.mark.skip(reason='synthetic platform skip')\ndef test_skip(): pass\n" if name == "a" else ""
+        )
         (directory / f"test_{name}.py").write_text(
             "from pathlib import Path\nimport pytest\npytestmark = [pytest.mark.core_model, pytest.mark.cpu]\n"
             "@pytest.fixture(scope='module')\ndef shared():\n"
             "    with Path('fixtures.txt').open('a') as stream: stream.write(__name__ + '\\n')\n"
             "    return object()\n"
             "@pytest.mark.parametrize('value', [1, 2])\ndef test_case(shared, value): pass\n"
-            "@pytest.mark.omni\ndef test_omni(): assert False\n",
+            "@pytest.mark.omni\ndef test_omni(): assert False\n" + skipped_case,
             encoding="utf-8",
         )
     write_profile(tmp_path / "profile.json", {node("a", "test_case[1]"): 10.0, node("removed"): 99999.0})
@@ -165,13 +168,46 @@ def test_three_executed_partitions_match_filtered_baseline(suite: Path) -> None:
         plan = json.loads((suite / f"plan-{index}.json").read_text())
         plans.append(plan)
         selected = {n for n, shard in plan["node_shards"].items() if shard == index}
-        executed = {line.split(" PASSED")[0] for line in result.stdout.splitlines() if " PASSED" in line}
-        assert selected == executed, result.stdout
+        completed = {
+            line.split(f" {outcome}")[0]
+            for line in result.stdout.splitlines()
+            for outcome in ("PASSED", "SKIPPED")
+            if f" {outcome}" in line
+        }
+        assert selected == completed, result.stdout
         assert not owners.keys() & selected
         owners.update({n: index for n in selected})
     assert set(owners) == nodes
     assert plans[0] == plans[1] == plans[2]
     assert sorted((suite / "fixtures.txt").read_text().splitlines()) == ["test_a", "test_c", "test_d"]
+
+
+def test_skip_outcome_matches_unsharded_execution(suite: Path) -> None:
+    filters = ("-k", "test_skip", "-vv")
+    baseline = run_pytest(suite, *filters)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    baseline_skips = {line.split(" SKIPPED")[0] for line in baseline.stdout.splitlines() if " SKIPPED" in line}
+    assert baseline_skips == {node("a", "test_skip")}
+
+    shard_skips: set[str] = set()
+    plans = []
+    for index in range(3):
+        result = run_pytest(suite, *filters, *partition_args(index, f"skip-plan-{index}.json"))
+        plan = json.loads((suite / f"skip-plan-{index}.json").read_text())
+        plans.append(plan)
+        selected = {n for n, shard in plan["node_shards"].items() if shard == index}
+        completed = {
+            line.split(f" {outcome}")[0]
+            for line in result.stdout.splitlines()
+            for outcome in ("PASSED", "SKIPPED")
+            if f" {outcome}" in line
+        }
+        assert selected == completed, result.stdout + result.stderr
+        assert result.returncode == (0 if selected else 5), result.stdout + result.stderr
+        shard_skips.update(line.split(" SKIPPED")[0] for line in result.stdout.splitlines() if " SKIPPED" in line)
+
+    assert plans[0] == plans[1] == plans[2]
+    assert shard_skips == baseline_skips
 
 
 def test_default_hash_sharding_is_unchanged(suite: Path) -> None:
