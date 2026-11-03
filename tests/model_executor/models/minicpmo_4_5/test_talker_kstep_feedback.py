@@ -1541,7 +1541,9 @@ def test_host_sampler_carries_the_generator_across_a_condition_reset():
 
     def draws(request_id: str, count: int) -> list[int]:
         return [
-            model._sample_audio_code_host(hidden, torch.tensor([10, 11]), request_id, request_state, 0, 0, 100, False)[0]
+            model._sample_audio_code_host(hidden, torch.tensor([10, 11]), request_id, request_state, 0, 0, 100, False)[
+                0
+            ]
             for _ in range(count)
         ]
 
