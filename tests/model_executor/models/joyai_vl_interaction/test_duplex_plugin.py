@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from tests.engine.duplex.test_session_runner import (
@@ -314,7 +314,7 @@ def test_opt_in_profile_preserves_turn_pipeline():
     assert duplex.session_mode == "duplex"
     assert normal.stages == duplex.stages
     assert normal.connectors == duplex.connectors
-    assert not duplex.async_chunk
+    assert duplex.async_chunk
     stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
     assert len(stages) == 3
     assert all(stage.session_mode == "duplex" for stage in stages)
@@ -1401,6 +1401,41 @@ async def test_spoken_action_forwards_once_and_audio_completes_response():
         assert any(e.get("delta") == "The pot is smoking." for e in events)
         assert any(e["type"] == "response.output_audio.delta" for e in events)
         assert h.port.cleanups[-1][0] == [request_id]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streamed_audio_chunks_complete_on_empty_final_delta():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    params = plugin.configure_sampling_params(runtime_config={}, defaults=tuple(SamplingParams() for _ in range(3)))
+    assert [p.output_kind for p in params] == [
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.DELTA,
+    ]
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        # DELTA Code2Wav: each output carries only new samples, and the final one may carry none.
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        final = tts_output(request_id, finished=True)
+        final.multimodal_output = {"audio": []}
+        await h.deliver_and_settle(final, stage_id=2, segment_finished=True)
+        await h.run(AckPlayback(response_id=response_id, played_ms=200))
+        assert h.session.active_response_id is None
+        events = [event.to_realtime() for event in h.events]
+        assert sum(e["type"] == "response.output_audio.delta" for e in events) == 2
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "completed"
     finally:
         await h.manager.shutdown()
 

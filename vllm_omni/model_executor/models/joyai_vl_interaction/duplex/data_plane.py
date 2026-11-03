@@ -111,6 +111,7 @@ class Observation:
     delegation_tools: bool = False
     chunk_id: str | None = None
     text_sent: bool = False
+    audio_sent: bool = False
     call_sent: bool = False
     response_text: str = ""
     query_reference: QueryReference | None = None
@@ -269,13 +270,17 @@ class JoyAIDataPlane(DuplexDataPlane):
                     for chunk in chunks
                 ]
                 samples = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float32)
-                if output.finished and not samples.size:
+                # Streamed (DELTA) outputs carry only new samples; the final one may be empty.
+                observation.audio_sent |= bool(samples.size)
+                if output.finished and not observation.audio_sent:
                     event.update(
                         error_code="missing_audio", error="JoyAI Code2Wav completed without audio", end_of_turn=True
                     )
                     yield event
                     continue
-                if output.finished and samples.size and observation.state is not None:
+                if not output.finished and not samples.size:
+                    continue
+                if output.finished and observation.state is not None:
                     observation.state.last_response_text = observation.response_text
                 event.update(
                     audio_data=self.encode_audio(samples, rate, context.response_format, context.speed)
