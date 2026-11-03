@@ -810,52 +810,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
-    def _kstep_row_budget(self) -> int:
-        """Rows the batch may reach before the step drops to a 1-wide width.
-
-        A step narrower than the K frames pays the whole per-step cost for a
-        single frame, so the budget has to cover the running set the engine
-        admits, not a hand-picked number: with ``max_num_seqs: 16`` a budget of
-        8 turned every 9..16-row step into a 1-wide one and cost 33-40% of the
-        c=16/c=32 throughput (25 ms/step against main's 3.7), while a budget of
-        16 keeps the frames and lands within 3-5% of main.
-        """
-        config = getattr(self, "scheduler_config", None) or getattr(
-            getattr(self, "vllm_config", None), "scheduler_config", None
-        )
-        max_num_seqs = getattr(config, "max_num_seqs", None)
-        try:
-            return max(1, int(max_num_seqs))
-        except (TypeError, ValueError):
-            return 1
-
-    def _talker_plain_step_for_wide_batch(self) -> int | None:
-        """Drop the Talker's K-frame width for a wide decode batch.
-
-        Returns the previous ``num_spec_tokens`` when the caller must restore it,
-        None when the step keeps its K-step width. The row budget equals the
-        engine's ``max_num_seqs``, so the guard below never fires for a batch
-        the scheduler can hold; it remains for a future budget that admits
-        fewer rows than the active request cap.
-        """
-        if not self._talker_kstep_armed():
-            return None
-        device_config = getattr(getattr(self, "vllm_config", None), "device_config", None)
-        if getattr(device_config, "device_type", None) != "cuda":
-            return None
-        num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
-        if num_spec <= 0:
-            return None
-        if len(self.running) <= self._kstep_row_budget():
-            return None
-        # Zeroing only disables upstream's pad_spec_decode width uniformisation
-        # for this step: request buffers keep their per-slot draft accounting
-        # (num_tokens_with_spec), and any uneven row this leaves is folded to
-        # width 1 by _enforce_kstep_span_uniformity instead of being scheduled
-        # at a mixed span.
-        self.num_spec_tokens = 0
-        return num_spec
-
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -871,11 +825,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # the multi-frame loop requires uniform decode spans and the runner
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
-        # Wide batches do not pay for the K-frame step: above the row budget the
-        # Talker is throughput-bound, and scheduling 1 + num_spec rows per request
-        # only adds KV writes and padding. Fall back to the plain one-token decode
-        # (what main ships) for those steps.
-        plain_step_spec_tokens = self._talker_plain_step_for_wide_batch()
 
         original_wait_queues = None
         if self._should_defer_waiting_admission():
@@ -893,8 +842,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
-            if plain_step_spec_tokens is not None:
-                self.num_spec_tokens = plain_step_spec_tokens
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
@@ -2398,6 +2345,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
     """Asynchronous AutoRegressive scheduler."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Fail at startup, not mid-traffic: an armed K-step stage under async
+        # scheduling dies inside the first request (see the module note below).
+        _reject_kstep_async_scheduling(self)
+
 
 # K-step multi-frame decode requires async_scheduling off: the booking it relies
 # on is written by the synchronous runner contract (the step that reserves
@@ -2409,3 +2362,20 @@ class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
 # not uniform" (and, before that, "prefill span exceeds condition"), which
 # fails every in-flight request. So the K-step overlay keeps
 # async_scheduling: false and does not carry async-specific code paths.
+
+
+def _reject_kstep_async_scheduling(scheduler: OmniARScheduler) -> None:
+    """Refuse an async scheduler that drives the K-step multi-frame decode.
+
+    Review follow-up (PR #9733): the combination was known-broken (the note
+    below) but only failed once traffic arrived, inside a request. Raise at
+    scheduler construction instead, pointing at the two ways out.
+    """
+    if scheduler._talker_kstep_armed():
+        raise ValueError(
+            "K-step multi-frame decode requires async_scheduling: false. "
+            "Async scheduling books the speculative span one step ahead, "
+            "which the multi-frame loop refuses (mixed spans, booked "
+            "positions outrunning the prompt). Disable async_scheduling or "
+            "remove the Talker speculative config."
+        )
