@@ -14,6 +14,7 @@ from collections import defaultdict
 import msgspec
 import pytest
 import torch
+from vllm.outputs import RequestError
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
@@ -253,8 +254,19 @@ def test_scheduler_output_defaults_to_no_prewarms() -> None:
 
 
 def _finish_via_error_outputs(scheduler, request_id: str) -> None:
-    scheduler.grammar_compile_error_reqs = {request_id}
+    scheduler.grammar_compile_error_reqs = {
+        request_id: RequestError(
+            code="validation_error",
+            message="Invalid structured outputs: fixture",
+        )
+    }
     scheduler._finish_error_requests(defaultdict(list))
+
+
+def _finish_via_encoder_cache_mismatch(scheduler, request_id: str) -> None:
+    scheduler.encoder_cache_mismatch_reqs = {request_id}
+    scheduler._finish_error_requests(defaultdict(list))
+    assert scheduler.encoder_cache_mismatch_reqs == set()
 
 
 @_SCHEDULERS
@@ -265,6 +277,7 @@ def _finish_via_error_outputs(scheduler, request_id: str) -> None:
         pytest.param(lambda s, rid: s.finish_requests(rid, RequestStatus.FINISHED_ABORTED), id="abort-single-id"),
         pytest.param(lambda s, rid: s._finish_input_timeout_requests({rid}), id="input-timeout"),
         pytest.param(_finish_via_error_outputs, id="error-outputs"),
+        pytest.param(_finish_via_encoder_cache_mismatch, id="encoder-cache-mismatch"),
     ],
 )
 def test_finish_paths_discard_undrained_prewarm(scheduler_cls, base_scheduler, finish) -> None:

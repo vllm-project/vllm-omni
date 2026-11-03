@@ -393,7 +393,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             _orig = _mr_module.init_model_state
             _mr_module.init_model_state = _init_model_state
             try:
-                super().load_model(*args, **kwargs)
+                # Upstream's model-construction scope ends before custom_sampler.
+                # Collect kernels selected by that hook in this runner's registry.
+                with self.jit_warmup_registry.activate():
+                    super().load_model(*args, **kwargs)
             finally:
                 _mr_module.init_model_state = _orig
         self._last_aux_output = None
@@ -567,7 +570,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         uniform_tok_count: int | None,
         num_active_loras: int,
         use_eager: bool,
-        max_query_len: int,
+        max_query_len: int | None,
+        allow_skip_drafts: bool = False,
     ):
         return dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -579,7 +583,48 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             max_query_len=max_query_len,
             need_eager=use_eager,
             num_active_loras=num_active_loras,
+            parallel_config=self.parallel_config,
+            # This override never calls ubatch_runner.run. Selecting a
+            # multi-ubatch descriptor would dispatch a shape the forward
+            # does not execute.
+            allow_ubatching=False,
+            uniform_decode=uniform_tok_count == self.decode_query_len,
+            allow_skip_drafts=allow_skip_drafts,
         )
+
+    def _adjust_dispatch_token_count(
+        self,
+        batch_req_state: Any,
+        num_toks: int,
+        max_query_len: int | None,
+    ) -> tuple[int, int | None]:
+        if batch_req_state is None:
+            return num_toks, max_query_len
+        num_toks = batch_req_state.num_tokens
+        if batch_req_state.has_prefill:
+            # Varlen decode graphs replay decodes only. Their query bound
+            # alone would admit a short prefill.
+            max_query_len = None
+        if self.pcp_manager is not None:
+            num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
+                batch_req_state.num_scheduled_tokens,
+                batch_req_state.is_prefilling_np,
+            )
+        return num_toks, max_query_len
+
+    def _apply_encoder_input_updates(self, scheduler_output: SchedulerOutput) -> None:
+        # add_requests initializes RoPE positions from CPU metadata first.
+        encoder_cache = self.encoder_cache
+        if encoder_cache is None:
+            return
+        for req_id, updates in scheduler_output.encoder_input_updates.items():
+            encoder_cache.update_encoder_inputs(req_id, updates)
+
+    def _num_spec_tokens_to_schedule(self, scheduler_output: SchedulerOutput, dp_sync: Any) -> int:
+        skip_drafts = dp_sync.skip_drafts if dp_sync is not None else scheduler_output.skip_drafts
+        if skip_drafts:
+            return 0
+        return scheduler_output.num_spec_tokens_to_schedule
 
     @torch.inference_mode()
     @staged_writes.runner_context
@@ -602,6 +647,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self._apply_encoder_input_updates(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
             reanchor = getattr(self.model, "apply_duplex_kv_reanchor", None)
@@ -619,8 +665,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(scheduler_output, dummy_run)
-        if batch_req_state is not None:
-            num_toks = batch_req_state.num_tokens
+        num_toks, max_query_len = self._adjust_dispatch_token_count(batch_req_state, num_toks, max_query_len)
         num_active_loras = 0
         if self.lora_config:
             req_ids = list(scheduler_output.num_scheduled_tokens.keys())
@@ -640,6 +685,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             num_active_loras=num_active_loras,
             use_eager=is_profile or skip_compiled,
             max_query_len=max_query_len,
+            allow_skip_drafts=scheduler_output.skip_drafts,
         )
 
         if batch_desc.num_tokens == 0:
@@ -725,6 +771,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
             if randomize_inputs:
                 input_batch.input_ids.random_(0, self.vocab_size)
+            if self.pcp_manager is not None:
+                input_batch = self.pcp_manager.prepare_inputs_for_capture_or_profile(input_batch)
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch, valid_dummy_state_slots)
                 if context_len:
@@ -734,6 +782,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                         context_len,
                         self.kv_cache_config.num_blocks,
                         self.max_model_len,
+                        input_block_tables=block_tables,
                     )
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
@@ -876,7 +925,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             finished_req_ids=scheduler_output.finished_req_ids,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=None,
-            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            num_spec_tokens_to_schedule=self._num_spec_tokens_to_schedule(scheduler_output, dp_sync),
         )
 
         assert isinstance(hidden_states, torch.Tensor)

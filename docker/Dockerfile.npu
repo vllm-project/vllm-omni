@@ -1,3 +1,7 @@
+# Legacy Ascend 0.32 runtime; this default does not qualify the vLLM 0.33
+# alignment checkout. A matching 0.33 vLLM-Ascend image and NPU validation
+# are required before using this checkout. Override VLLM_ASCEND_IMAGE and
+# VLLM_ASCEND_VERSION only with that verified runtime; do not relabel 0.32.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
 ARG VLLM_ASCEND_VERSION=v0.32.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=

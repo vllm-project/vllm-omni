@@ -53,6 +53,7 @@ def _make_update_sched(scheduler_cls) -> MagicMock:
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None
     sched.defer_block_free = True
+    sched.defer_async_loads = False
     sched.processed_step_seq = 0
     return sched
 
@@ -81,6 +82,31 @@ def test_update_from_output_advances_fence_and_drains(scheduler_cls) -> None:
 
     assert sched.processed_step_seq == 1
     sched._drain_deferred_frees.assert_called_once_with()
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])
+def test_completed_step_starts_fenced_async_kv_load(scheduler_cls) -> None:
+    """A queued HiSparse load must become runnable when its GPU fence completes."""
+    sched = _make_update_sched(scheduler_cls)
+    sched.defer_async_loads = True
+    pending_loads = {"remote-request": 1}
+    started_loads = []
+
+    def drain_loads():
+        for request_id, fence in list(pending_loads.items()):
+            if fence <= sched.processed_step_seq:
+                started_loads.append(request_id)
+                del pending_loads[request_id]
+
+    sched._drain_deferred_loads.side_effect = drain_loads
+    empty_step, model_output = _empty_frame(total_num_scheduled_tokens=0)
+    scheduler_cls.update_from_output(sched, empty_step, model_output)
+    assert not started_loads
+
+    completed_step, model_output = _empty_frame(total_num_scheduled_tokens=3)
+    scheduler_cls.update_from_output(sched, completed_step, model_output)
+    assert started_loads == ["remote-request"]
+    assert not pending_loads
 
 
 @pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])

@@ -245,7 +245,7 @@ vllm_omni/
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
 │   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
-│   │   ├── warmup.py                startup warmup probe; wait_for_duplex_warmup holds clients until it finishes
+│   │   ├── warmup.py                startup warmup probe; holds native session admission after WebSocket acceptance
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)

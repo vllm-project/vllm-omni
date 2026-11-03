@@ -25,6 +25,14 @@ published recipe when available and otherwise to the corresponding recipe in
 this directory. The recipe files remain the source of truth for commands and
 validation details.
 
+This source checkout targets final vLLM 0.33.0. Use the matching runtime in
+[the installation guide](../docs/getting_started/installation/README.md).
+Recipes explicitly pinned to an older Omni release, commit, external PR or
+container retain their historical runtime. Their measured hardware and quality
+results do not establish acceptance for this checkout. Source installs must not
+combine current Omni with an older vLLM wheel; ROCm, XPU and NPU qualification
+limits are recorded in the installation guide.
+
 Example layout:
 
 ```text

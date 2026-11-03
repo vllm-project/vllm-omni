@@ -685,6 +685,7 @@ class DiffusionWorker:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         """Start or stop profiling for this GPU worker.
 
@@ -693,6 +694,7 @@ class DiffusionWorker:
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
+            profiler_kwargs: Per-session profiler constructor overrides.
         """
         profiler = self._get_profiler()
         if profiler is None:
@@ -704,6 +706,7 @@ class DiffusionWorker:
 
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 profiler.set_trace_filename(filename)
+            profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
