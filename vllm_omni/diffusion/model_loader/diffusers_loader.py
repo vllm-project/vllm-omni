@@ -1175,6 +1175,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         sources: Sequence["ComponentSource"] | None = None,
         planned_weights: Iterable[str] = (),
         weight_name_filter: Callable[[str], bool] | None = None,
+        disallow_weights: Iterable[str] = (),
     ) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
@@ -1186,7 +1187,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if stream_online_quant_to_cpu:
             self._finalize_online_quant_weights_to_cpu(model)
         if loaded_weights is not None:
-            loaded_weights = set(loaded_weights).union(planned_weights)
+            loaded_weights = set(loaded_weights)
+            overlap = loaded_weights.intersection(disallow_weights)
+            if overlap:
+                raise ValueError(f"shared backbone weights were written during checkpoint load: {sorted(overlap)}")
+            loaded_weights = loaded_weights.union(planned_weights)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
@@ -1310,7 +1315,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             device_ctx = contextlib.nullcontext() if hsdp_defer_to_cpu else target_device
             with device_ctx:
                 if load_format == "default":
-                    model = initialize_model(self.od_config, model_init_kwargs={"backbone_meta": backbone_meta})
+                    model_init_kwargs = {"backbone_meta": True} if backbone_meta else None
+                    model = initialize_model(self.od_config, model_init_kwargs=model_init_kwargs)
                 elif load_format == "diffusers":
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
@@ -1364,24 +1370,41 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             raise ValueError(f"consumer model {type(model).__name__} has no attach_shared_backbone hook")
 
         index = getattr(target_device, "index", None)
-        device_index = 0 if index is None else int(index)
+        if index is None:
+            from vllm_omni.platforms import current_omni_platform
+
+            device_index = current_omni_platform.current_device()
+        else:
+            device_index = int(index)
         payload = getattr(shared_group, "payload", None)
         if payload is None:
             raise ValueError("consumer weight sharing requires the provider's claimed payload")
         backend = TorchCudaIpcBackend()
         imported = attach(backend, payload, shared_group, device_index)
 
-        # The shared params are externally bound; report them as planned so the
-        # strict unloaded-weight check still passes for the filtered load.
+        shared = shared_param_full_names(model)
+        params_by_name = dict(model.named_parameters())
+        # The imported views are finalized; post-load processing must neither
+        # repack them in place (corrupting the provider's weights) nor swap them
+        # for a fresh allocation (silently dropping the sharing).
+        shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
+
+        # Mark shared params as planned and drop checkpoint keys that feed them.
+        # disallow_weights makes a filter miss fail loudly instead of writing
+        # into memory owned by the AR provider.
         self.load_weights(
             model,
-            planned_weights=shared_param_full_names(model),
+            planned_weights=shared,
             weight_name_filter=is_shared_checkpoint_name,
+            disallow_weights=shared,
         )
         self._process_weights_after_loading(model, target_device)
 
         params_by_name = dict(model.named_parameters())
-        meta_left = [name for name in shared_param_full_names(model) if params_by_name[name].device.type == "meta"]
+        for name in shared:
+            if params_by_name[name].data_ptr() != shared_data_ptrs[name]:
+                raise ValueError(f"shared backbone weight was repacked after import: {name}")
+        meta_left = [name for name in shared if params_by_name[name].device.type == "meta"]
         if meta_left:
             raise ValueError(f"shared backbone parameters remain on meta after attach: {meta_left[:16]}")
 

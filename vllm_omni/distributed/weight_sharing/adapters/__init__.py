@@ -13,12 +13,14 @@ from .hunyuan_image3 import (
     build_weight_spec,
     claim_backbone_export,
     collect_shared_bindings,
+    filter_shared_checkpoint_weights,
     is_shared_checkpoint_name,
     is_shared_param,
     open_backbone_import,
     publish_backbone,
     shared_backbone_names,
     shared_param_full_names,
+    validate_supported_layout,
 )
 
 __all__ = [
@@ -28,10 +30,12 @@ __all__ = [
     "build_weight_spec",
     "claim_backbone_export",
     "collect_shared_bindings",
+    "filter_shared_checkpoint_weights",
     "is_shared_checkpoint_name",
     "is_shared_param",
     "open_backbone_import",
     "publish_backbone",
     "shared_backbone_names",
     "shared_param_full_names",
+    "validate_supported_layout",
 ]
