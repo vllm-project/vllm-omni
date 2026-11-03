@@ -119,7 +119,10 @@ def _warn_on_dropped_pooling_keys(pooling_output: Any, mm_output: Any) -> None:
 
     Every in-tree producer mirrors one payload on both channels or sets only
     one, so a difference means a producer broke that contract and the next
-    stage loses data.
+    stage loses data. Only missing keys are flagged: a key on both channels
+    with different values still resolves to ``multimodal_output`` silently,
+    so this is not a full mirror-consistency check. The warning repeats once
+    per distinct set of dropped keys.
     """
     if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
         return
