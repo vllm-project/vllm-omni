@@ -1087,7 +1087,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         cfg = getattr(self.od_config, "diffusion_attention_config", None)
         apply_skip_softmax_calibration(cfg, model)
 
-    def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
+    def _process_weights_after_loading(
+        self,
+        model: nn.Module,
+        target_device: torch.device,
+        *,
+        skip_module_names: frozenset[str] = frozenset(),
+    ) -> None:
         """Process weights after loading for quantization methods.
 
         This handles vLLM's quantization methods that need to process weights
@@ -1117,7 +1123,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             # have none, so passing None is safe here.
             finalize_layerwise_processing(model, model_config=None)
 
-        for _, module in model.named_modules():
+        for module_name, module in model.named_modules():
+            if module_name in skip_module_names:
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
                 continue
@@ -1186,11 +1194,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         loaded_weights = model.load_weights(weights)
         if stream_online_quant_to_cpu:
             self._finalize_online_quant_weights_to_cpu(model)
-        if loaded_weights is not None:
+        if loaded_weights is None:
+            if disallow_weights:
+                raise ValueError(
+                    "shared-backbone loading requires load-weight tracking, but model.load_weights returned None"
+                )
+        else:
             loaded_weights = set(loaded_weights)
             overlap = loaded_weights.intersection(disallow_weights)
             if overlap:
-                raise ValueError(f"shared backbone weights were written during checkpoint load: {sorted(overlap)}")
+                raise ValueError(
+                    "a checkpoint key wrote into a shared weight and may have corrupted "
+                    f"the AR provider's storage: {sorted(overlap)}"
+                )
             loaded_weights = loaded_weights.union(planned_weights)
 
         self.counter_after_loading_weights = time.perf_counter()
@@ -1384,25 +1400,29 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         shared = shared_param_full_names(model)
         params_by_name = dict(model.named_parameters())
-        # The imported views are finalized; post-load processing must neither
-        # repack them in place (corrupting the provider's weights) nor swap them
-        # for a fresh allocation (silently dropping the sharing).
+        # The imported views are finalized; post-load processing must not touch
+        # them at all: an in-place repack corrupts the provider's live weights
+        # and a swap silently drops the sharing. Skip the modules that own them.
         shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
+        shared_module_names = frozenset(name.rsplit(".", 1)[0] for name in shared)
 
         # Mark shared params as planned and drop checkpoint keys that feed them.
-        # disallow_weights makes a filter miss fail loudly instead of writing
-        # into memory owned by the AR provider.
+        # disallow_weights is a backstop that fails loudly if the predicate
+        # misses a key that would write into the provider's storage.
         self.load_weights(
             model,
             planned_weights=shared,
             weight_name_filter=is_shared_checkpoint_name,
             disallow_weights=shared,
         )
-        self._process_weights_after_loading(model, target_device)
+        self._process_weights_after_loading(model, target_device, skip_module_names=shared_module_names)
 
         params_by_name = dict(model.named_parameters())
         for name in shared:
-            if params_by_name[name].data_ptr() != shared_data_ptrs[name]:
+            param = params_by_name.get(name)
+            if param is None:
+                raise ValueError(f"shared backbone weight disappeared after import: {name}")
+            if param.data_ptr() != shared_data_ptrs[name]:
                 raise ValueError(f"shared backbone weight was repacked after import: {name}")
         meta_left = [name for name in shared if params_by_name[name].device.type == "meta"]
         if meta_left:

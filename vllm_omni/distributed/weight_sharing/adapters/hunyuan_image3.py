@@ -201,15 +201,19 @@ def is_shared_checkpoint_name(name: str) -> bool:
         if tail[0] in ("input_layernorm", "post_attention_layernorm"):
             return True
         if tail[0] == "self_attn" and len(tail) >= 2:
-            return tail[1] in ("q_proj", "k_proj", "v_proj", "o_proj", "query_layernorm", "key_layernorm")
+            return tail[1] in ("q_proj", "k_proj", "v_proj", "qkv_proj", "o_proj", "query_layernorm", "key_layernorm")
         if tail[0] == "mlp" and len(tail) >= 2:
             if tail[1] == "experts":
                 return True
             if tail[1] == "gate":
                 return True
-            if tail[1] in ("gate_proj", "up_proj", "down_proj", "gate_and_up_proj"):
+            if tail[1] in ("gate_proj", "gate_up_proj", "up_proj", "down_proj", "gate_and_up_proj"):
                 return True
-            if tail[1] == "shared_mlp" and len(tail) >= 3 and tail[2] in ("gate_proj", "up_proj", "down_proj"):
+            if (
+                tail[1] == "shared_mlp"
+                and len(tail) >= 3
+                and tail[2] in ("gate_proj", "gate_up_proj", "up_proj", "down_proj")
+            ):
                 return True
     return False
 

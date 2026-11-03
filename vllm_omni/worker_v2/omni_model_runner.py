@@ -424,7 +424,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if publish is None:
             raise ValueError(
                 f"weight sharing requested for a provider rank, but {type(self.model).__name__} "
-                "has no publish_shared_backbone hook; AR weight sharing requires MRv2"
+                "has no publish_shared_backbone hook"
             )
         from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
 
@@ -437,8 +437,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             device_index = int(index)
         backend = TorchCudaIpcBackend()
+        # Assign both handles only after publish succeeds, so a failed publish
+        # leaves neither a dangling backend nor a half-set session behind.
+        session = publish(backend, group, device_index)
         self._weight_share_backend = backend
-        self._weight_share_session = publish(backend, group, device_index)
+        self._weight_share_session = session
         logger.info("Published shared backbone weights for sharing group %s", getattr(group, "group_id", None))
 
     def _adopt_model_logits_vocab(self, model: Any) -> None:
