@@ -309,9 +309,8 @@ async def _drain_forced_post_commit_response(
             label="post-commit forced response.created",
         )
     except TimeoutError:
-        if (
-            _event_count_after(collector.events, "error", committed_index) == 0
-            and not _response_in_progress(collector.events)
+        if _event_count_after(collector.events, "error", committed_index) == 0 and not _response_in_progress(
+            collector.events
         ):
             with suppress(DuplexClientError, DuplexSessionClosedError):
                 await client.send({"type": "response.create"})

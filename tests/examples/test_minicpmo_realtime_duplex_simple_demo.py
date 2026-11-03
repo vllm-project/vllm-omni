@@ -283,7 +283,9 @@ def test_forced_response_drains_an_opened_response_without_reasking():
             sent.append(event)
 
     fallback = asyncio.run(
-        demo._drain_forced_post_commit_response(_Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05)
+        demo._drain_forced_post_commit_response(
+            _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05
+        )
     )
 
     assert fallback is False
@@ -302,7 +304,9 @@ def test_forced_response_falls_back_to_an_explicit_create_when_idle():
 
     with pytest.raises(TimeoutError):
         asyncio.run(
-            demo._drain_forced_post_commit_response(_Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05)
+            demo._drain_forced_post_commit_response(
+                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05
+            )
         )
 
     assert sent == [{"type": "response.create"}]
@@ -323,7 +327,9 @@ def test_forced_response_does_not_reask_while_a_response_is_active():
     # response settles; re-asking now only yields response_already_active.
     with pytest.raises(TimeoutError):
         asyncio.run(
-            demo._drain_forced_post_commit_response(_Client(), collector, committed_index=1, timeout_s=0.05, create_timeout_s=0.05)
+            demo._drain_forced_post_commit_response(
+                _Client(), collector, committed_index=1, timeout_s=0.05, create_timeout_s=0.05
+            )
         )
 
     assert sent == []
@@ -342,7 +348,9 @@ def test_forced_response_does_not_reask_after_a_commit_error():
 
     with pytest.raises(TimeoutError):
         asyncio.run(
-            demo._drain_forced_post_commit_response(_Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05)
+            demo._drain_forced_post_commit_response(
+                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05
+            )
         )
 
     assert sent == []
