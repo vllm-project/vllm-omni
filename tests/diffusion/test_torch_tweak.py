@@ -79,7 +79,7 @@ def test_dit_modules_are_recorded_by_default(on_xpu, tmp_path):
     pipeline.transformer(torch.ones(1, 2))
     pipeline.text_encoder(torch.ones(1, 2))
 
-    assert [path.name for path in tmp_path.iterdir()] == ["org_model.transformer"]
+    assert [path.name for path in tmp_path.iterdir()] == ["transformer"]
 
 
 def test_modules_setting_replaces_the_dit_modules(on_xpu, tmp_path):
@@ -92,4 +92,4 @@ def test_modules_setting_replaces_the_dit_modules(on_xpu, tmp_path):
     pipeline.transformer(torch.ones(1, 2))
     pipeline.text_encoder(torch.ones(1, 2))
 
-    assert [path.name for path in tmp_path.iterdir()] == ["org_model.text_encoder"]
+    assert [path.name for path in tmp_path.iterdir()] == ["text_encoder"]

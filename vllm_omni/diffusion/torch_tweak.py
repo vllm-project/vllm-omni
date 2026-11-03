@@ -45,7 +45,7 @@ def serve_with_torch_tweak(pipeline: nn.Module, od_config: OmniDiffusionConfig, 
         module = getattr(pipeline, attr_name, None)
         if module is None:
             continue
-        tt.ServedModule(module, f"{od_config.model}.{attr_name}", config, device=device)
+        tt.ServedModule(module, attr_name, config, device=device)
         served.append(attr_name)
     logger.info("Torch Tweak serves %s from %s.", served, config.workdir)
     return True
