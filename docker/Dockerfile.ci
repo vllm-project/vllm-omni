@@ -107,7 +107,7 @@ from pathlib import Path
 import torch
 
 maps = Path("/proc/self/maps").read_text()
-assert any(path in maps for path in os.environ["LD_PRELOAD"].split() if "libcudnn.so.9" in path)
+assert any(os.path.realpath(path) in maps for path in os.environ["LD_PRELOAD"].split() if "libcudnn.so.9" in path)
 assert torch.arange(4, device="cpu").sum().item() == 6
 cuda_available = torch.cuda.is_available()
 assert not torch.cuda.is_initialized()
