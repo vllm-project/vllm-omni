@@ -67,6 +67,7 @@ from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 
 logger = init_logger(__name__)
 
@@ -456,7 +457,7 @@ class OmniEngineBase:
         self.stage_metadata = [
             StageRuntimeInfo(
                 final_output=metadata.final_output,
-                final_output_type=metadata.final_output_type,
+                final_output_type=cast(FinalOutputModalityType | None, metadata.final_output_type),
                 stage_type=metadata.stage_type,
                 model_stage=metadata.model_stage,
             )
