@@ -123,6 +123,16 @@ class MixFusionAdapter(Protocol):
         ``bound`` is an :class:`inspect.BoundArguments` over the model's
         forward. Return ``(False, reason)`` to keep the serial path; the
         reason is used in diagnostics.
+
+        The driver calls this during admission, binding
+        ``build_packed_call(input_batch)`` to the model's forward signature,
+        to decide between the packed and serial paths. The root hook then
+        calls it again on the real forward call as an assertion: once the
+        model is running it cannot fall back, so a False answer there raises
+        and aborts the packed step. Implementations must therefore be
+        deterministic for equivalent arguments. Raise ``TypeError`` when the
+        call lacks a required argument (e.g. ``hidden_states``); admission
+        treats that as a refusal.
         """
         ...
 

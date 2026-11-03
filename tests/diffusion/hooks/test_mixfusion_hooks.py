@@ -14,8 +14,9 @@ minimal stand-in transformer plus a fake adapter that reuses the real
 - the replace-output hook returns the adapter-computed boundary value instead
   of running the (layout-incompatible) original forward;
 - the expand hooks map per-request rows to per-chunk rows;
-- adapter refusals (``can_pack`` false / ``pack_inputs`` returning ``None``)
-  and a missing adapter fail or fall back as documented;
+- a refusal from an armed root hook (``can_pack`` false / ``pack_inputs``
+  returning ``None``) raises ``MixFusionPackingError`` so the driver can fall
+  back, while a missing adapter still fails with an actionable error;
 - ``apply_mixfusion`` / ``remove_mixfusion`` round-trip, including the
   ``transformer_blocks.*`` wildcard, idempotence and unknown-spec refusal.
 """
@@ -35,6 +36,7 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.hooks import module_has_active_hooks
 from vllm_omni.diffusion.hooks.mixfusion import (
+    MixFusionPackingError,
     apply_mixfusion,
     remove_mixfusion,
 )
@@ -262,15 +264,17 @@ class TestInertWithoutArmedStep:
         assert torch.equal(out.sample, _serial_forward(model, batch))
         assert model.pack_calls == []
 
-    def test_armed_but_tensor_hidden_states_stays_serial(self):
-        # Memory profiling style: a batched tensor call while the step is
-        # armed must not attempt packing.
+    def test_armed_but_tensor_hidden_states_raises_packing_error(self):
+        # An armed step asserts that this call is the admitted packed call, so
+        # a batched tensor here is a contract violation the driver must hear
+        # about rather than silently packing nothing. Memory profiling and
+        # other dense forwards run without an armed step (covered above).
         model = _DummyTransformer()
         apply_mixfusion(model, _plan())
         batch = torch.cat(_latents(), dim=0)
         with override_forward_context(_armed_ctx()):
-            out = model(hidden_states=batch, encoder_hidden_states=torch.zeros(2, 5, 2))
-        assert torch.equal(out.sample, _serial_forward(model, batch))
+            with pytest.raises(MixFusionPackingError, match="hidden_states is a batched tensor"):
+                model(hidden_states=batch, encoder_hidden_states=torch.zeros(2, 5, 2))
         assert model.pack_calls == []
 
 
@@ -424,27 +428,32 @@ class TestAdapterProtocol:
         assert ctx.mixfusion_step.adapter is adapter
         assert ctx.mixfusion_step.packed is not None
 
-    def test_can_pack_false_keeps_serial(self):
+    def test_can_pack_false_raises_packing_error(self):
+        # Admission preflighted can_pack, so a refusal here means the adapter
+        # drifted. Running the model with the original args would hand it list
+        # latents; the driver turns this sentinel into the serial fallback.
         adapter = _RecordingAdapter(can_pack=False)
         model = _FakeModel(adapter)
         apply_mixfusion(model, {"": MixFusionRoot()})
         x = torch.zeros(1, 2)
         ctx = _armed_ctx()
         with override_forward_context(ctx):
-            out = model(hidden_states=x)
-        assert torch.equal(out.sample, x)
+            with pytest.raises(MixFusionPackingError, match="declined packing after admission: refused"):
+                model(hidden_states=x)
+        assert model.seen is None
         assert [call[0] for call in adapter.calls] == ["can_pack"]
         assert ctx.mixfusion_step.plan is None
         assert ctx.mixfusion_step.packed is None
 
-    def test_pack_inputs_none_keeps_serial(self):
+    def test_pack_inputs_none_raises_packing_error(self):
         adapter = _RecordingAdapter(returns_none=True)
         model = _FakeModel(adapter)
         apply_mixfusion(model, {"": MixFusionRoot()})
         x = torch.zeros(1, 2)
         with override_forward_context(_armed_ctx()):
-            out = model(hidden_states=x)
-        assert torch.equal(out.sample, x)
+            with pytest.raises(MixFusionPackingError, match="returned no bundle"):
+                model(hidden_states=x)
+        assert model.seen is None
         assert [call[0] for call in adapter.calls] == ["can_pack", "pack_inputs"]
 
     def test_missing_adapter_raises_actionable_error(self):

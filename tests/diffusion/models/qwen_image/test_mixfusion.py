@@ -140,12 +140,16 @@ class _StubTransformer:
         # call when the registry never installed the hooks.
         self._mixfusion_hooks_applied = True
 
-    def __call__(self, **kwargs):
+    def forward(self, hidden_states, **kwargs):
         self.packed_calls += 1
-        self.calls.append(kwargs)
+        self.calls.append({"hidden_states": hidden_states, **kwargs})
         # The driver must arm the step for exactly the transformer call.
         self.armed_at_call = get_forward_context().mixfusion_step is not None
         return "packed"
+
+    # Admission binds ``build_packed_call`` against ``forward`` via
+    # ``inspect.signature``; calling the stub goes through the same signature.
+    __call__ = forward
 
 
 class _StubAdapter:
@@ -153,6 +157,11 @@ class _StubAdapter:
 
     def build_packed_call(self, input_batch):
         return {"hidden_states": input_batch.latents}
+
+    def can_pack(self, module, bound):
+        if "hidden_states" not in bound.arguments:
+            raise TypeError("MixFusion packing requires a `hidden_states` argument.")
+        return True, ""
 
 
 def _driver(transformer, adapter):

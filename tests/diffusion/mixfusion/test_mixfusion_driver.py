@@ -31,11 +31,13 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     override_forward_context,
 )
+from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
 from vllm_omni.diffusion.mixfusion.driver import (
     DEFAULT_MAX_CHUNKS,
     DEFAULT_MIN_CHUNK_TOKENS,
     MixFusionDriver,
 )
+from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -58,17 +60,42 @@ class _FakeTransformer(nn.Module):
         self.calls: list[dict] = []
         self.armed_at_call: MixFusionStep | None = None
 
-    def forward(self, **kwargs):
+    def forward(self, hidden_states, **kwargs):
+        # ``hidden_states`` is explicit, like a real model forward: the adapter
+        # preflight reads it off ``BoundArguments.arguments``.
         self.armed_at_call = get_forward_context().mixfusion_step
-        self.calls.append(kwargs)
+        self.calls.append({"hidden_states": hidden_states, **kwargs})
         return PACKED_OUTPUT
 
 
 class _FakeAdapter:
     """Packs by handing the per-request latents straight to the fake forward."""
 
+    def __init__(self, *, can_pack: bool = True, refuse_reason: str = "refused") -> None:
+        self._can_pack = can_pack
+        self._refuse_reason = refuse_reason
+
     def build_packed_call(self, input_batch) -> dict:
         return {"hidden_states": input_batch.latents}
+
+    def can_pack(self, module, bound) -> tuple[bool, str]:
+        if "hidden_states" not in bound.arguments:
+            raise TypeError("MixFusion packing requires a `hidden_states` argument.")
+        return self._can_pack, "" if self._can_pack else self._refuse_reason
+
+
+class _DriftingAdapter(_FakeAdapter):
+    """Admits the admission preflight, then declines the armed hook's call."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.can_pack_calls = 0
+
+    def can_pack(self, module, bound) -> tuple[bool, str]:
+        self.can_pack_calls += 1
+        if self.can_pack_calls == 1:
+            return True, ""
+        return False, "answer drifted after admission"
 
 
 def _pipeline(*, interrupt: bool = False, attention_kwargs: dict | None = None, sp_size: int = 1):
@@ -193,6 +220,27 @@ def test_run_falls_back_to_serial_ragged_when_admission_rejects():
     assert driver.pipeline._current_timestep is batch.timesteps
 
 
+def test_run_falls_back_to_serial_ragged_when_the_armed_hook_declines():
+    # Admission accepted this call; the armed hook then asks again and gets a
+    # different answer. The sentinel must become the serial fallback instead of
+    # handing list latents to the model forward.
+    transformer = _FakeTransformer(plan={"": MixFusionRoot()}, hooks_applied=False)
+    apply_mixfusion(transformer, {"": MixFusionRoot()})
+    adapter = _DriftingAdapter()
+    driver, _ = _driver(transformer, adapter)
+    batch = _ragged_batch()
+    serial_batches: list = []
+    driver.serial_ragged = lambda input_batch, states, dense_step: serial_batches.append(input_batch) or "serial"
+
+    with override_forward_context(ForwardContext()):
+        result = driver.run(batch, states=(), dense_step=_record_dense([]))
+
+    assert result == "serial"
+    assert serial_batches == [batch]
+    assert transformer.calls == []
+    assert adapter.can_pack_calls == 2
+
+
 # ── admission ──
 
 
@@ -202,6 +250,30 @@ def test_admission_accepts_a_plain_ragged_batch():
     accepted, reason = driver.admit(_ragged_batch(), min_chunk_tokens=1, max_chunks=DEFAULT_MAX_CHUNKS)
 
     assert (accepted, reason) == (True, "ok")
+
+
+def test_admission_rejects_when_the_adapter_declines_packing():
+    driver, _ = _driver(adapter=_FakeAdapter(can_pack=False, refuse_reason="shape not supported"))
+
+    accepted, reason = driver.admit(_ragged_batch(), min_chunk_tokens=1, max_chunks=DEFAULT_MAX_CHUNKS)
+
+    assert not accepted
+    assert reason == "adapter declined packing: shape not supported"
+
+
+def test_admission_rejects_a_packed_call_the_adapter_cannot_bind():
+    # A packed call without ``hidden_states`` makes ``can_pack`` raise
+    # ``TypeError``; admission must reject rather than crash.
+    class _IncompleteAdapter(_FakeAdapter):
+        def build_packed_call(self, input_batch) -> dict:
+            return {}
+
+    driver, _ = _driver(adapter=_IncompleteAdapter())
+
+    accepted, reason = driver.admit(_ragged_batch(), min_chunk_tokens=1, max_chunks=DEFAULT_MAX_CHUNKS)
+
+    assert not accepted
+    assert reason.startswith("adapter cannot bind the packed call: ")
 
 
 def test_admission_rejects_a_transformer_without_an_adapter():

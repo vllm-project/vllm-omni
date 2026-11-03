@@ -16,6 +16,7 @@ driver only calls. Adding a model therefore needs an adapter (and its
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -24,7 +25,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import MixFusionStep, get_forward_context
-from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
+from vllm_omni.diffusion.hooks.mixfusion import MixFusionPackingError, plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter
 from vllm_omni.diffusion.mixfusion.execution_plan import plan_chunk_size
 from vllm_omni.diffusion.mixfusion.request import DEFAULT_MAX_CHUNKS, DEFAULT_MIN_CHUNK_TOKENS
@@ -63,6 +64,12 @@ class MixFusionDriver:
         batches (list latents) either pack or fall back to one dense call per
         request. The packed branch must not call ``dense_step``: the dense
         keyword builder only accepts a tensor of latents.
+
+        Admission preflights ``adapter.can_pack``, so the armed root hook
+        normally has nothing to refuse. If it nevertheless declines (an
+        adapter whose answer drifted between admission and the forward), it
+        raises :class:`MixFusionPackingError`; rerun the batch serially rather
+        than let list latents reach the model forward.
         """
         if not isinstance(input_batch.latents, list):
             return dense_step(input_batch, states=states)
@@ -83,8 +90,15 @@ class MixFusionDriver:
             )
             return self.serial_ragged(input_batch, states, dense_step)
 
-        with self.armed(min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks):
-            return self.transformer(**self.adapter.build_packed_call(input_batch))
+        try:
+            with self.armed(min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks):
+                return self.transformer(**self.adapter.build_packed_call(input_batch))
+        except MixFusionPackingError as exc:
+            logger.warning(
+                "MixFusion packing failed after admission: %s. Falling back to per-request denoise.",
+                exc,
+            )
+            return self.serial_ragged(input_batch, states, dense_step)
 
     def admit(
         self,
@@ -134,6 +148,20 @@ class MixFusionDriver:
         )
         if foreign:
             return False, f"foreign hooks on the packed path ({', '.join(foreign)})"
+
+        # Preflight the adapter on the exact call the driver would make. A
+        # refusal must become the serial fallback *before* the armed forward
+        # starts: once the root hook runs, the model is already inside
+        # ``transformer.forward`` with list latents and cannot fall back.
+        # ``build_packed_call`` only shapes arguments (no projection compute),
+        # so binding it costs nothing next to running the model.
+        try:
+            bound = inspect.signature(self.transformer.forward).bind(**self.adapter.build_packed_call(input_batch))
+            packable, pack_reason = self.adapter.can_pack(self.transformer, bound)
+        except TypeError as exc:
+            return False, f"adapter cannot bind the packed call: {exc}"
+        if not packable:
+            return False, f"adapter declined packing: {pack_reason or 'no reason given'}"
 
         accepted, reason, _, _ = plan_chunk_size(
             input_batch.latents,

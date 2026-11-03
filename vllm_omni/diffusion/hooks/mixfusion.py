@@ -56,6 +56,18 @@ MIXFUSION_HOOK_NAMES = (
 )
 
 
+class MixFusionPackingError(RuntimeError):
+    """An admitted call could not be packed at the root hook.
+
+    The driver preflights ``can_pack`` before admitting a batch, so this
+    signals the two answers disagreeing (admission accepted, the armed hook
+    then declined). It is a sentinel, not a user error: the driver catches it
+    and reruns the batch through the serial per-request fallback, because by
+    the time the hook runs the caller is inside ``transformer.forward`` with
+    list latents and cannot fall back itself.
+    """
+
+
 def _active_step():
     """Return the armed MixFusionStep, or None when this forward is not packed.
 
@@ -102,14 +114,19 @@ class MixFusionRootHook(ModelHook):
             return args, kwargs
         adapter = _resolve_adapter(module, step)
         bound = inspect.signature(module.forward).bind(*args, **kwargs)
-        can_pack, _ = adapter.can_pack(module, bound)
+        can_pack, reason = adapter.can_pack(module, bound)
         if not can_pack:
-            # A batched tensor while the step is armed (e.g. memory
-            # profiling): stay serial.
-            return args, kwargs
+            # Admission already accepted this exact call, so returning the
+            # original args here would hand list latents to the model forward.
+            # Raise a sentinel the driver turns into the serial fallback.
+            raise MixFusionPackingError(
+                f"{type(module).__name__} declined packing after admission: {reason or 'no reason given'}"
+            )
         packed = adapter.pack_inputs(module, bound, step=step, cache=self._cached)
         if packed is None:
-            return args, kwargs
+            raise MixFusionPackingError(
+                f"{type(adapter).__name__}.pack_inputs returned no bundle for {type(module).__name__} after admission."
+            )
         self._cached = packed
         step.adapter = adapter
         step.plan = packed.plan
