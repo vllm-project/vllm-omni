@@ -16,6 +16,9 @@ import regex as re
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets/minicpmo_4_5/duplex_recognition"
 CHINESE_NUMBERS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
+# On H100 a near-tied speak/listen decision occasionally flips and the model
+# stays silent for one scene (#9517), so a coverage-only miss gets a new session.
+MAX_SESSIONS = 3
 
 
 def load_manifest() -> dict:
@@ -98,3 +101,8 @@ def evaluate_session(transcript: str, events: list[dict], scenes: list[dict]) ->
         "event_counts": dict(counts),
         "transcript": transcript,
     }
+
+
+def retryable_miss(report: dict) -> bool:
+    """Only missing scenes justify another session; a protocol error never does."""
+    return bool(report["missing_scenes"]) and not report["protocol_errors"]

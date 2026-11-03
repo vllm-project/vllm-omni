@@ -12,6 +12,7 @@ from tests.e2e.online_serving.helpers.minicpmo_duplex_recognition import (
     covered_scenes,
     evaluate_session,
     load_manifest,
+    retryable_miss,
     unpack_inputs,
 )
 
@@ -82,3 +83,20 @@ def test_correct_transcript_does_not_hide_protocol_failure(failure: str) -> None
     assert report["missing_scenes"] == []
     assert report["protocol_errors"]
     assert not report["passed"]
+
+
+@pytest.mark.parametrize(
+    ("name", "retry"),
+    [("omni_sdpa", True), ("omni_final_clean", False), ("transformers_4_51_3_eager", False)],
+)
+def test_only_a_scene_miss_gets_another_session(name: str, retry: bool) -> None:
+    report = evaluate_session(_recordings()[name]["transcript"], _completed_events(), load_manifest()["scenes"])
+    assert retryable_miss(report) is retry
+
+
+def test_protocol_failure_with_a_scene_miss_is_not_retried() -> None:
+    events = _completed_events()
+    events.append({"type": "client.timeout", "message": "drain timeout"})
+    report = evaluate_session(_recordings()["omni_sdpa"]["transcript"], events, load_manifest()["scenes"])
+    assert report["missing_scenes"] == [12]
+    assert not retryable_miss(report)
