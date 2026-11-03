@@ -281,6 +281,17 @@ def main(args) -> None:
             tot += len(rw)
         print(f"WER({label}) on clean: {dist / tot:.4f}  ({dist}/{tot})")
 
+    # WER(on vs off): how much bucketing changes the decoded text, with the
+    # bucketing-off hypothesis as the reference. This is decoupled from the
+    # model's paraphrase/rewrite baseline against ground truth, so it isolates
+    # the on/off delta (mask-aware encoders ≈ 0%, unmasked fixed-window ones > 0).
+    dist = tot = 0
+    for idx in clean:
+        ow = normalize(off[idx])
+        dist += levenshtein(ow, normalize(on[idx]))
+        tot += len(ow)
+    print(f"WER(on vs off) on clean: {dist / tot:.4f}  ({dist}/{tot})")
+
 
 def parse_args():
     parser = FlexibleArgumentParser(description="End-to-end WER for encoder bucketing")
