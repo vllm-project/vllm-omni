@@ -176,6 +176,7 @@ def _snapshot_tensor_payload_to_cpu_async(
     *,
     copy_stream: torch.cuda.Stream,
     pin_memory: bool,
+    blocking: bool = False,
 ) -> _AsyncCPUPayloadSnapshot:
     cuda_sources: list[torch.Tensor] = []
     cloned = _clone_cuda_tensor_payload(value, cuda_sources)
@@ -183,7 +184,7 @@ def _snapshot_tensor_payload_to_cpu_async(
         return _AsyncCPUPayloadSnapshot(cloned, None, cuda_sources)
 
     source_stream = torch.cuda.current_stream()
-    ready_event = torch.cuda.Event()
+    ready_event = torch.cuda.Event(blocking=blocking)
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
@@ -387,6 +388,7 @@ class GPUARModelRunner(
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
     _prefix_cache_coalesce_decode = True
+    omni_output_copy_blocking = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1896,6 +1898,7 @@ class GPUARModelRunner(
                 # on the 17.5k-token Thinker prefill). Resolve pinning from the
                 # platform helper so the copy is a true async cudaMemcpyAsync.
                 pin_memory=is_pin_memory_available(),
+                blocking=self.omni_output_copy_blocking,
             )
 
         payload = async_payload_snapshot.payload

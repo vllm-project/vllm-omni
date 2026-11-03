@@ -49,6 +49,10 @@ receive also uses this coordinator and typed updates, with the built-in
 metadata adapter. Other async-chunk paths retain `OmniChunkTransferAdapter`
 ownership of chunk transfer and request updates.
 
+Model schedulers may specialize that adapter through
+`OmniSchedulerMixin.chunk_transfer_adapter_cls`; the default remains
+`OmniChunkTransferAdapter`.
+
 ## Candidate invariants
 
 ### AR-INV-001: vLLM owns base scheduling semantics
@@ -87,6 +91,11 @@ scheduler metadata before the next execution can reuse them. Background
 construction snapshots those inputs. Both paths reuse the request IDs already
 copied by upstream bookkeeping; connector collection stays on the main thread
 because it can run a tensor-parallel collective.
+
+An AR runner may set `omni_output_copy_blocking = True` so background output
+builders sleep while waiting for the D2H completion event. The default remains
+busy waiting. Both policies retain the same owned snapshot and source-storage
+fences; neither permits consuming the payload before the copy completes.
 
 ## Request-local model errors
 

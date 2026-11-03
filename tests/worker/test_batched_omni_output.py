@@ -10,7 +10,8 @@ from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
-def test_async_packed_snapshot_survives_source_reuse():
+@pytest.mark.parametrize("blocking", [False, True])
+def test_async_packed_snapshot_survives_source_reuse(blocking):
     values = [
         torch.arange(12, device="cuda").view(1, 12),
         torch.empty((0, 12), device="cuda", dtype=torch.long),
@@ -18,7 +19,10 @@ def test_async_packed_snapshot_survives_source_reuse():
     ]
     expected = [v.cpu() for v in values]
     snapshot = _snapshot_tensor_payload_to_cpu_async(
-        {"list": values, "tuple": tuple(values)}, copy_stream=torch.cuda.Stream(), pin_memory=True
+        {"list": values, "tuple": tuple(values)},
+        copy_stream=torch.cuda.Stream(),
+        pin_memory=True,
+        blocking=blocking,
     )
     for v in values:
         v.fill_(-99)

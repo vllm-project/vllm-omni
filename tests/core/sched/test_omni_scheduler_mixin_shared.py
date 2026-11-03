@@ -33,7 +33,7 @@ def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_rec
         created_adapters.append(adapter)
         return adapter
 
-    monkeypatch.setattr(omni_scheduler_mixin, "OmniChunkTransferAdapter", adapter_factory)
+    monkeypatch.setattr(OmniSchedulerMixin, "chunk_transfer_adapter_cls", staticmethod(adapter_factory))
 
     def init_scheduler(**model_config):
         scheduler = _Scheduler()
@@ -78,9 +78,9 @@ def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_rec
 )
 def test_full_payload_coordinator_matches_legacy_gate(monkeypatch, stage_id, async_chunk, required, enabled):
     monkeypatch.setattr(
-        omni_scheduler_mixin,
-        "OmniChunkTransferAdapter",
-        lambda _config: SimpleNamespace(),
+        OmniSchedulerMixin,
+        "chunk_transfer_adapter_cls",
+        staticmethod(lambda _config: SimpleNamespace()),
     )
     scheduler = _Scheduler()
     scheduler.vllm_config = SimpleNamespace(

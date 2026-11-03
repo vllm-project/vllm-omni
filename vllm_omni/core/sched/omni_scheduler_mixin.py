@@ -167,6 +167,8 @@ class _OmniWaitingQueue:
 class OmniSchedulerMixin(_SchedulerMixinBase):
     """Shared scheduler helpers for omni-specific request handling."""
 
+    chunk_transfer_adapter_cls = OmniChunkTransferAdapter
+
     # Provided by the concrete vLLM scheduler.
     vllm_config: VllmConfig
     requests: dict[str, Request]
@@ -206,7 +208,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             use_v2_model_runner=self.use_v2_model_runner,
         )
         self.chunk_transfer_adapter = (
-            OmniChunkTransferAdapter(self.vllm_config)
+            self.chunk_transfer_adapter_cls(self.vllm_config)
             if getattr(model_config, "async_chunk", False) and not self._native_data_plane
             else None
         )
