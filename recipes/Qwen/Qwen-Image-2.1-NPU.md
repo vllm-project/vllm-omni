@@ -107,6 +107,7 @@ vllm serve /path/to/Qwen-Image-2.1-Turbo \
   --omni \
   --host 0.0.0.0 \
   --port "${PORT}" \
+  --served-model-name Qwen/Qwen-Image-2.1-Turbo \
   --num-gpus 1 \
   --enforce-eager \
   --trust-remote-code
@@ -131,12 +132,14 @@ The 8 cards do two different jobs, and they do not stack for a single image:
 # Lower latency for one image: one 4-card sequence-parallel server
 vllm serve /path/to/Qwen-Image-2.1-Turbo \
   --omni --num-gpus 4 --ulysses-degree 4 --ulysses-mode strict \
+  --served-model-name Qwen/Qwen-Image-2.1-Turbo \
   --enforce-eager --trust-remote-code --port 8091
 
 # Higher throughput: run several single-card servers and balance requests across
 # them (each request keeps single-card latency; N servers serve N images at once)
 vllm serve /path/to/Qwen-Image-2.1-Turbo \
-  --omni --num-gpus 1 --enforce-eager --trust-remote-code --port 8092
+  --omni --num-gpus 1 --served-model-name Qwen/Qwen-Image-2.1-Turbo \
+  --enforce-eager --trust-remote-code --port 8092
 ```
 
 ## HTTP API
@@ -227,9 +230,10 @@ for throughput.
   encoder runs replicated on every rank.
 - The first `vllm serve` request after startup is a warmup (regional kernel
   compile) and runs ~3x steady state, so drop it from any latency measurement.
-  The numbers above are steady-state and were confirmed end-to-end: single-card
-  Turbo 1280×704 serves real images in ~2.27 s, and the 4-card Ulysses
-  `--ulysses-degree 4` server in ~1.47 s at 1024×1024.
+  The numbers above are steady-state engine timings, confirmed by real serving
+  runs: single-card Turbo 1280×704 serves real images in ~2.27 s (engine), and
+  the 4-card Ulysses `--ulysses-degree 4` server in ~1.47 s at 1024×1024
+  (engine).
 
 ## Additional resources
 
