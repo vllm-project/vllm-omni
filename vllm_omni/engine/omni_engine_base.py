@@ -436,26 +436,22 @@ class OmniEngineBase:
             # Chat requests that bypass stage 0 are rendered for stage 1; the
             # orchestrator runs their multimodal processing.
             self._entry_stage_renderers[1] = build_omni_renderer(self.stage_vllm_configs[1])
-        self.prompt_transform_func = (
-            getattr(self.stage_clients[0], "prompt_transform_func", None) if self.stage_clients else None
-        )
+        # Per-stage lists come from stage metadata, which still exists with no client
+        metadata_by_stage = self._runtime.stage_metadata
+        self.prompt_transform_func = metadata_by_stage[0].prompt_transform_func
         self.prompt_expand_func = next(
-            (
-                getattr(client, "prompt_expand_func", None)
-                for client in self.stage_clients
-                if getattr(client, "prompt_expand_func", None) is not None
-            ),
+            (metadata.prompt_expand_func for metadata in metadata_by_stage if metadata.prompt_expand_func is not None),
             None,
         )
-        self.default_sampling_params_list = [client.default_sampling_params for client in self.stage_clients]
+        self.default_sampling_params_list = [metadata.default_sampling_params for metadata in metadata_by_stage]
         self.stage_metadata = [
             StageRuntimeInfo(
-                final_output=client.final_output,
-                final_output_type=client.final_output_type,
-                stage_type=client.stage_type,
-                model_stage=getattr(client, "model_stage", None),
+                final_output=metadata.final_output,
+                final_output_type=metadata.final_output_type,
+                stage_type=metadata.stage_type,
+                model_stage=metadata.model_stage,
             )
-            for client in self.stage_clients
+            for metadata in metadata_by_stage
         ]
         supported_tasks: set[str] = set()
         if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):

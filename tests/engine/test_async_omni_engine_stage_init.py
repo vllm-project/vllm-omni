@@ -263,9 +263,11 @@ def _make_llm_metadata(
         stage_id=stage_id,
         stage_type="llm",
         runtime_cfg={},
+        prompt_transform_func=None,
         prompt_expand_func=None,
         final_output=final_output,
         final_output_type=final_output_type,
+        model_stage=None,
         default_sampling_params=types.SimpleNamespace(name=f"sp-{stage_id}-{replica_id}"),
         custom_process_input_func=None,
         engine_input_source=[] if stage_id == 0 else [stage_id - 1],
@@ -426,7 +428,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
-    runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
+    runtime = types.SimpleNamespace(stage_pools=[], stage_metadata=[_make_llm_metadata(0)], initialize=lambda: None)
 
     def _capture_create_stage_runtime(**kwargs):
         captured.update(kwargs)
@@ -478,7 +480,7 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
         stage_vllm_config=None,
         output_processor=None,
     )
-    runtime = types.SimpleNamespace(stage_pools=[pool], initialize=lambda: None)
+    runtime = types.SimpleNamespace(stage_pools=[pool], stage_metadata=[client], initialize=lambda: None)
     monkeypatch.setattr(engine_mod, "create_stage_runtime", lambda **_kwargs: runtime)
 
     engine._initialize_stages(stage_init_timeout=7)

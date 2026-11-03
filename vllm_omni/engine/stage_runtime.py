@@ -210,6 +210,7 @@ class StageRuntime:
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
+        self.stage_metadata: list[StageMetadata] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
         # Serialize process spawning and process-global environment overlays.
@@ -712,6 +713,7 @@ class StageRuntime:
     ) -> None:
         """Populate runtime fields after replica initialization succeeds."""
         self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+        self.stage_metadata = [plan.metadata for plan in stage_plans]
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Hook for runtimes that need infrastructure before replica init."""

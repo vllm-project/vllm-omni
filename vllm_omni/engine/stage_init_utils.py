@@ -93,17 +93,17 @@ class LogicalStageInitPlan:
     stage_idx: int
     stage_id: int
     replicas: list[ReplicaInitPlan]
-    # Defaults to the first replica's, so only plans without replicas must pass it.
-    metadata: StageMetadata | None = None
+    # Both default to the first replica's, so only plans without replicas must pass them.
+    metadata: StageMetadata = None  # type: ignore[assignment]  # set in __post_init__
     stage_vllm_config: VllmConfig | None = None
 
     def __post_init__(self) -> None:
-        if self.metadata is not None:
-            return
-        if not self.replicas:
-            raise ValueError(f"Stage {self.stage_id} has no replicas, so its plan must be given metadata")
-        self.metadata = self.replicas[0].metadata
-        self.stage_vllm_config = self.replicas[0].stage_vllm_config
+        if self.metadata is None:
+            if not self.replicas:
+                raise ValueError(f"Stage {self.stage_id} has no replicas, so its plan must be given metadata")
+            self.metadata = self.replicas[0].metadata
+        if self.stage_vllm_config is None and self.replicas:
+            self.stage_vllm_config = self.replicas[0].stage_vllm_config
 
 
 def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
