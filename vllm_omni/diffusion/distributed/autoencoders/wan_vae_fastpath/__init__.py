@@ -36,6 +36,7 @@ from .install import (
     install_wan_vae_fastpath,
     is_encoder_installed,
     is_installed,
+    reference_forward_copy,
     uninstall_wan_vae_encoder_fastpath,
     uninstall_wan_vae_fastpath,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "is_installed",
     "is_encoder_installed",
     "probe_stats",
+    "reference_forward_copy",
     "reset_probe_stats",
     "uninstall_wan_vae_encoder_fastpath",
     "uninstall_wan_vae_fastpath",

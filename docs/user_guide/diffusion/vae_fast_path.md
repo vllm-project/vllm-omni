@@ -310,6 +310,46 @@ benchmark and card give 60.8 dB at 1024x1024 and 61.4 dB at 1328x1328. Prefer
 `lossless` for Qwen-Image where fidelity matters. On this card `channels_last`
 gives Qwen-Image-2.1 no decode gain and a slower encode.
 
+## Fast paths for other VAEs
+
+`--vae-fast-path` and `--vae-encode-fast-path` are not Wan-specific. At model
+load, `vllm_omni.diffusion.vae_fast_path.apply_vae_fast_paths` gives each
+pipeline VAE the most recently registered `VaeFastPath` that matches it, and
+installs its decoder and its encoder at the configured levels. The Wan-family
+fast path above is the built-in entry (`wan_family`, CUDA and XPU). A VAE with
+a different architecture gets its own entry instead of its own switches:
+
+```python
+from vllm_omni.diffusion.vae_fast_path import VaeFastPathContext, register_vae_fast_path
+
+
+class MyVaeFastPath:
+    name = "my_vae"
+
+    def matches(self, vae) -> bool:
+        return isinstance(vae, MyVideoVAE)
+
+    def supported(self, ctx: VaeFastPathContext) -> bool:
+        return ctx.platform.is_xpu()
+
+    def install(self, vae, component, level, ctx):
+        # component is "decoder" or "encoder"; level is never "off".
+        # Return an object with `installed` and `reason`.
+        ...
+
+
+register_vae_fast_path(MyVaeFastPath())
+```
+
+Every entry keeps the level contract: `lossless` must be bitwise identical to
+the reference forwards, and anything that changes values (a different
+attention kernel, `torch.compile`, a lower-precision weight copy) belongs to
+`channels_last` or must stay off. An entry that cannot honour a level reports
+it as not installed. `ctx.compile_allowed()` applies the DiT's compile
+precedence (`--enforce-eager` vetoes it, then the platform must support torch
+inductor), so an entry that compiles must check it. An install failure is
+logged and leaves that component on its reference forwards.
+
 ## Measured decoder performance
 
 Cosmos3-Nano VAE, 1280x720 x 189 frames, bf16, one GB200 GPU, `bench_wan_vae_decode.py`

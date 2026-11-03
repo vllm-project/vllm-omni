@@ -8,6 +8,7 @@ registered Wan-style implementation (diffusers Wan, Qwen-Image, Qwen-Image-2.1, 
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
@@ -498,6 +499,23 @@ def _install_family_encoder(
     return _install_bindings(vae, encoder, bindings, convs, level=level, family=family, encoder=True)
 
 
+def reference_forward_copy(component: nn.Module) -> nn.Module:
+    """A copy of component that runs the reference forwards and shares its parameters and buffers.
+
+    The fast-path bindings (instance forward and its config) are dropped from the copy only; component
+    keeps its installation. Weights are shared, layouts included, so after a channels_last install the copy
+    computes on channels-last weights (same values). For callers that rebuild a component around its modules,
+    such as spatially sharded encode: the fast forwards inline the convolutions such a caller replaces.
+    """
+    memo: dict[int, Any] = {id(t): t for t in (*component.parameters(), *component.buffers())}
+    copied = copy.deepcopy(component, memo)
+    for module in copied.modules():
+        if forwards.CFG_ATTR in module.__dict__:
+            module.__dict__.pop("forward", None)
+            del module.__dict__[forwards.CFG_ATTR]
+    return copied
+
+
 def uninstall_wan_vae_encoder_fastpath(vae: nn.Module) -> None:
     """Restore encoder forwards/layouts without altering the decoder installation."""
     undo = vae.__dict__.pop(_ENCODER_UNDO_ATTR, None)
@@ -523,6 +541,7 @@ __all__ = [
     "install_wan_vae_encoder_fastpath",
     "is_encoder_installed",
     "is_installed",
+    "reference_forward_copy",
     "uninstall_wan_vae_fastpath",
     "uninstall_wan_vae_encoder_fastpath",
 ]

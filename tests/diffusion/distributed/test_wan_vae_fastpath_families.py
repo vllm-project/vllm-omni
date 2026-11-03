@@ -292,7 +292,7 @@ def test_registry_installs_on_qwen_vaes(monkeypatch) -> None:
     for name in sorted(BUILDERS):
         model = nn.Module()
         model.vae = _build_pair(name, torch.float32)[1]
-        registry_module._apply_wan_vae_fastpath_if_enabled(
+        registry_module._apply_vae_fast_paths_if_enabled(
             model, SimpleNamespace(vae_fast_path="lossless", vae_encode_fast_path="channels_last")
         )
         assert getattr(model.vae, REPORT_ATTR).family == name

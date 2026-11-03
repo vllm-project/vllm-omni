@@ -729,7 +729,7 @@ def test_registry_hook_installs_on_supported_platform(mocker, device_type: str, 
     platform.is_xpu.return_value = device_type == "xpu"
     mocker.patch.object(registry_module, "current_omni_platform", platform)
 
-    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path=level))
+    registry_module._apply_vae_fast_paths_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path=level))
     assert is_installed(vae) is expected
     if expected:
         assert getattr(vae, REPORT_ATTR).level == level
@@ -741,12 +741,12 @@ def test_registry_hook_skips_unsupported_platform_and_non_wan_vaes(mocker) -> No
     platform.is_cuda.return_value = False
     platform.is_xpu.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
-    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
+    registry_module._apply_vae_fast_paths_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
     assert not is_installed(vae)
 
     platform.is_cuda.return_value = True
     other = nn.Linear(2, 2)
-    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(other), SimpleNamespace(vae_fast_path="lossless"))
+    registry_module._apply_vae_fast_paths_if_enabled(_StubPipeline(other), SimpleNamespace(vae_fast_path="lossless"))
     assert not hasattr(other, REPORT_ATTR)
 
 
@@ -759,7 +759,7 @@ def test_registry_encoder_decoder_settings_are_independent(mocker, decode_level,
     platform = mocker.Mock()
     platform.is_cuda.return_value = True
     mocker.patch.object(registry_module, "current_omni_platform", platform)
-    registry_module._apply_wan_vae_fastpath_if_enabled(
+    registry_module._apply_vae_fast_paths_if_enabled(
         _StubPipeline(vae), SimpleNamespace(vae_fast_path=decode_level, vae_encode_fast_path=encode_level)
     )
     assert is_installed(vae) == (decode_level != "off")
@@ -777,7 +777,7 @@ def test_registry_component_failure_does_not_disable_other_component(mocker, fai
     mocker.patch.object(registry_module, "current_omni_platform", platform)
     install_name = "install_wan_vae_encoder_fastpath" if failed_component == "encoder" else "install_wan_vae_fastpath"
     mocker.patch.object(wan_vae_fastpath, install_name, side_effect=RuntimeError("injected failure"))
-    registry_module._apply_wan_vae_fastpath_if_enabled(
+    registry_module._apply_vae_fast_paths_if_enabled(
         _StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless", vae_encode_fast_path="lossless")
     )
     assert is_encoder_installed(vae) == (failed_component != "encoder")
