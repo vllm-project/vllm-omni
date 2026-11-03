@@ -465,7 +465,11 @@ for queue updates and the final validity check before delivery.
   envelope with `duplex.perf_chunk = [epoch, seq]` (a seq retried after a failed
   submit gets a fresh id, so the aborted submit's late spans are ignored); the orchestrator copies the
   producing step's chunk into forwarded updates and the chunk transfer adapter
-  into connector payloads. Stage schedulers (`DuplexStageWorkRecorder`) time
+  into connector payloads. Plugins that build plain prompts (turn-commit
+  models such as JoyAI) get a minimal envelope holding only `perf_chunk` (no
+  `data_plane` flag) on the Stage-0 prompt and on forwarded inputs; when the
+  multimodal input processor drops `model_intermediate_buffer`, the
+  orchestrator carries back only the chunk id. Stage schedulers (`DuplexStageWorkRecorder`) time
   every step of a request that carries a chunk and return the spans on
   `OmniEngineCoreOutput.stage_work`, which the orchestrator hands to the
   session as it collects them. `DuplexEngineSession.perf`

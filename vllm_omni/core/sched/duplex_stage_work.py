@@ -52,6 +52,25 @@ def perf_chunk_from_buffer(buffer: object) -> tuple[int, int] | None:
     return parse_perf_chunk(duplex.get(PERF_CHUNK_KEY)) if isinstance(duplex, Mapping) else None
 
 
+def buffer_with_perf_chunk(buffer: object, chunk: tuple[int, int]) -> dict[str, object] | None:
+    """Return a copy of ``buffer`` whose duplex envelope names ``chunk``.
+
+    A missing buffer or envelope becomes a minimal one with only the chunk id (no
+    ``data_plane`` flag), so plain prompts such as JoyAI's are timed too. Returns
+    None for unexpected types; the caller then leaves the input unchanged.
+    """
+    if buffer is None:
+        buffer = {}
+    if not isinstance(buffer, Mapping):
+        return None
+    duplex = buffer.get("duplex")
+    if duplex is None:
+        duplex = {}
+    if not isinstance(duplex, Mapping):
+        return None
+    return {**buffer, "duplex": {**duplex, PERF_CHUNK_KEY: [int(chunk[0]), int(chunk[1])]}}
+
+
 def set_request_perf_chunk(request: Request, chunk: tuple[int, int] | None) -> None:
     """Record the chunk an update or payload hands to ``request``; None keeps the previous one."""
     global _perf_chunk_seen

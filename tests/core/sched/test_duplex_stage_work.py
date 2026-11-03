@@ -9,6 +9,7 @@ import pytest
 from vllm_omni.core.sched import duplex_stage_work
 from vllm_omni.core.sched.duplex_stage_work import (
     DuplexStageWorkRecorder,
+    buffer_with_perf_chunk,
     parse_perf_chunk,
     perf_chunk_from_buffer,
     request_perf_chunk,
@@ -67,6 +68,31 @@ def test_perf_chunk_is_read_from_the_duplex_envelope_and_validated() -> None:
     # The stage-0 envelope always has epoch/seq; without perf_chunk the request is not measured.
     assert perf_chunk_from_buffer({"duplex": {"epoch": 0, "seq": 4}}) is None
     assert perf_chunk_from_buffer(None) is None
+
+
+def test_buffer_with_perf_chunk_copies_the_envelope_or_adds_a_minimal_one() -> None:
+    duplex = {"data_plane": True, "epoch": 0, "seq": 3}
+    buffer = {"request_id": "r", "duplex": duplex}
+    stamped = buffer_with_perf_chunk(buffer, (0, 3))
+    assert stamped == {"request_id": "r", "duplex": {**duplex, "perf_chunk": [0, 3]}}
+    assert "perf_chunk" not in duplex and stamped["duplex"] is not duplex
+    # Plain prompts (turn-commit plugins such as JoyAI) have no buffer or no envelope:
+    # they get one carrying only the chunk id, with no data_plane flag.
+    assert buffer_with_perf_chunk(None, (1, 2)) == {"duplex": {"perf_chunk": [1, 2]}}
+    assert buffer_with_perf_chunk({"codes": 1}, (1, 2)) == {"codes": 1, "duplex": {"perf_chunk": [1, 2]}}
+    assert buffer_with_perf_chunk({"duplex": None}, (1, 2)) == {"duplex": {"perf_chunk": [1, 2]}}
+    assert perf_chunk_from_buffer(buffer_with_perf_chunk(None, (1, 2))) == (1, 2)
+    # Unexpected shapes are left to the caller untouched.
+    assert buffer_with_perf_chunk(["not", "a", "dict"], (1, 2)) is None
+    assert buffer_with_perf_chunk({"duplex": "x"}, (1, 2)) is None
+
+
+def test_a_request_with_a_minimal_envelope_is_timed() -> None:
+    clock = _Clock()
+    recorder = DuplexStageWorkRecorder(clock=clock)
+    plain = SimpleNamespace(request_id="joyai", model_intermediate_buffer=buffer_with_perf_chunk(None, (0, 5)))
+    outputs = _step(recorder, clock, {"joyai": plain}, begin=100, end=130, emit=("joyai",))
+    assert stage_work_rows(outputs["joyai"].stage_work) == [(0, 5, 100, 30)]
 
 
 def test_an_update_or_payload_retags_the_request_and_none_keeps_the_previous_chunk() -> None:
