@@ -2113,8 +2113,8 @@ class WholeEulerCFMGraphWrapper:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor]] | None:
         """Solve the chunk through captured graphs; ``None`` sends it to the step/eager path.
 
-        ``att_cache`` is the stacked ``(n_t, depth, 2B, heads, L, 2*head_dim)``
-        estimator cache, or one ``(n_t, depth, 2, heads, L, 2*head_dim)``
+        ``att_cache`` is the stacked ``(n_t, depth, 2, 2B, heads, L, head_dim)``
+        split K/V estimator cache, or one ``(n_t, depth, 2, B, heads, L, head_dim)``
         tensor per request; the new cache comes back in the same form, trimmed
         by ``att_keep`` (``_att_keep_ranges``) on the way out. Per request,
         caches move straight into and out of the arena and no stacked copy of

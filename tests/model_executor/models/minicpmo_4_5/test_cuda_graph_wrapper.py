@@ -830,8 +830,8 @@ def _eager_solve_euler(
     cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
     cnn_width = int(block0.conv.block[1].causal_padding[0])
     heads = int(block0.attn.num_heads)
-    att_width = int(block0.attn.head_dim * 2)
-    offset = int(att_cache.shape[4]) if att_cache is not None else 0
+    head_dim = int(block0.attn.head_dim)
+    offset = int(att_cache.shape[-2]) if att_cache is not None else 0
 
     next_cnns = []
     next_atts = []
@@ -844,19 +844,23 @@ def _eager_solve_euler(
         estimator_input = torch.cat((x_cfg, mu_cfg, speaker_features, cond_cfg), dim=1)
 
         c_out = torch.empty(depth, 2 * batch_size, cnn_channels, cnn_width, device=x.device, dtype=x.dtype)
-        a_out = torch.empty(depth, 2 * batch_size, heads, offset + width, att_width, device=x.device, dtype=x.dtype)
+        # Split K/V rows like the wrapper keeps; upstream still reads [K | V]
+        # packed per layer, so pack on the way in and unpack the result back.
+        a_out = torch.empty(depth, 2, 2 * batch_size, heads, offset + width, head_dim, device=x.device, dtype=x.dtype)
         old_c = cnn_cache[step] if cnn_cache is not None else [None] * depth
         old_a = att_cache[step] if att_cache is not None else [None] * depth
 
+        packed_out = wrapper_module._packed_att_buffer(a_out)
         est = estimator.blocks_forward_chunk(
             estimator_input,
             time_embedding,
             attn_mask,
             old_c,
-            old_a,
+            wrapper_module._pack_att_cache(old_a),
             c_out,
-            a_out,
+            packed_out,
         )
+        wrapper_module._unpack_att_cache(packed_out, a_out)
 
         if pad_frames > 0:
             wrapper_module._zero_padded_cnn_cache(c_out, estimator, pad_frames)
@@ -1703,9 +1707,21 @@ def _whole_euler_chunk(batch_size: int, width: int) -> dict[str, torch.Tensor]:
     }
 
 
-def _split_cfg_rows(stacked: torch.Tensor, batch_size: int) -> list[torch.Tensor]:
+def _split_cfg_rows(stacked: torch.Tensor, batch_size: int, cfg_axis: int = 2) -> list[torch.Tensor]:
+    """Split the CFG-paired rows of a stacked cache into per-row tensors.
+
+    CNN caches pair the rows on axis 2; split K/V attention caches carry
+    ``(n_t, depth, 2, 2B, ...)`` and pair them on axis 3.
+    """
+    head = (slice(None),) * cfg_axis
     return [
-        torch.cat((stacked[:, :, row : row + 1], stacked[:, :, batch_size + row : batch_size + row + 1]), dim=2)
+        torch.cat(
+            (
+                stacked[head + (slice(row, row + 1),)],
+                stacked[head + (slice(batch_size + row, batch_size + row + 1),)],
+            ),
+            dim=cfg_axis,
+        )
         for row in range(batch_size)
     ]
 
@@ -1792,7 +1808,7 @@ def test_whole_euler_storage_growth_retires_the_graphs_on_the_old_storage(monkey
     assert wrapper._stats["flushes"] == 1
     assert len(wrapper._cache) == 1
     storage = wrapper.arena._att
-    assert storage is not None and int(storage.shape[4]) >= 3 * w
+    assert storage is not None and int(storage.shape[-2]) >= 3 * w
     for statics, _final_x, _out_cnn, out_att, _graph in wrapper._cache.values():
         assert statics.att_cache.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
         assert out_att.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
@@ -1831,16 +1847,16 @@ def test_whole_euler_per_request_rows_match_stacked(monkeypatch: pytest.MonkeyPa
     rows_x, rows_cnn, rows_att = wrapper.replay(
         **chunk,
         cnn_cache=cnn,
-        att_cache=_split_cfg_rows(att, batch_size),
+        att_cache=_split_cfg_rows(att, batch_size, cfg_axis=3),
         att_keep=keep,
     )
 
     torch.testing.assert_close(rows_x, stacked_x)
     torch.testing.assert_close(rows_cnn, stacked_cnn)
     assert isinstance(rows_att, list) and len(rows_att) == batch_size
-    kept = wrapper_module._att_keep_ranges(int(stacked_att.shape[4]), keep)
+    kept = wrapper_module._att_keep_ranges(int(stacked_att.shape[-2]), keep)
     assert sum(length for _, length in kept) == 10
-    for row, expected in enumerate(_split_cfg_rows(stacked_att, batch_size)):
+    for row, expected in enumerate(_split_cfg_rows(stacked_att, batch_size, cfg_axis=3)):
         trimmed = torch.cat([expected[..., start : start + length, :] for start, length in kept], dim=-2)
         torch.testing.assert_close(rows_att[row], trimmed)
     wrapper._flush()
@@ -2189,7 +2205,7 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(
         results = {}
         for name, wrapper in (("exact", exact), ("bucketed", bucketed)):
             cnn, att = caches[name]
-            offset = 0 if att is None else int(att.shape[4])
+            offset = 0 if att is None else int(att.shape[-2])
             width = int(chunk["mu_cfg"].shape[2])
             results[name] = wrapper.replay(
                 **{key: value.clone() for key, value in chunk.items()},
@@ -2398,7 +2414,7 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(
 
     lengths = [8, 5, 3]
     second = _whole_euler_chunk(batch_size, width)
-    rows_att = _split_cfg_rows(eager_att, batch_size)
+    rows_att = _split_cfg_rows(eager_att, batch_size, cfg_axis=3)
     out_x, out_cnn, out_att = wrapper.replay(
         **second,
         cnn_cache=eager_cnn,
@@ -2424,7 +2440,7 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(
         )
         torch.testing.assert_close(out_x[row : row + 1, :, :length], ref_x, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(cnn_rows[row], ref_cnn, rtol=1e-4, atol=1e-5)
-        assert out_att[row].shape[4] == length + width
+        assert out_att[row].shape[-2] == length + width
         torch.testing.assert_close(out_att[row], ref_att, rtol=1e-4, atol=1e-5)
     wrapper._flush()
 
@@ -2498,7 +2514,7 @@ def test_whole_euler_mixed_histories_match_independent_streams(
             )
             torch.testing.assert_close(out_x[row : row + 1, :, :length], expected_x, rtol=1e-4, atol=1e-5)
             torch.testing.assert_close(out_cnn_rows[row], expected_cnn, rtol=1e-4, atol=1e-5)
-            assert out_att[row].shape[4] == offset + length
+            assert out_att[row].shape[-2] == offset + length
             torch.testing.assert_close(out_att[row], expected_att, rtol=1e-4, atol=1e-5)
     wrapper._flush()
 
@@ -2575,7 +2591,7 @@ def test_whole_euler_mixed_prompts_reuse_caches_after_streaming_trim(
     batch_size, width = 3, 25
     lengths = [25, 23, 21]
     for _ in range(8):
-        offsets = [cache.shape[4] for cache in att]
+        offsets = [cache.shape[-2] for cache in att]
         current = _whole_euler_chunk(batch_size, width)
         query_valid = torch.arange(width, device="cuda")[None, :] < torch.tensor(lengths * 2, device="cuda")[:, None]
         history_valid = (
@@ -2619,7 +2635,7 @@ def test_whole_euler_mixed_prompts_reuse_caches_after_streaming_trim(
             assert current_pointers == pointers
         pointers = current_pointers
         histories = next_histories
-    assert [cache.shape[4] for cache in att] == [length + 100 for length in prompt_lengths]
+    assert [cache.shape[-2] for cache in att] == [length + 100 for length in prompt_lengths]
     wrapper._flush()
 
 
@@ -2693,7 +2709,7 @@ def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest
     )
     batch_size, width, keep = 2, 8, (8, 16)
     _, _, prompt_att = wrapper.replay(**_whole_euler_chunk(1, width), cnn_cache=None, att_cache=None, att_keep=keep)
-    (shared,) = _split_cfg_rows(prompt_att, 1)
+    (shared,) = _split_cfg_rows(prompt_att, 1, cfg_axis=3)
     shared_before = shared.clone()
 
     def fixed_copy(cache: torch.Tensor) -> torch.Tensor:
@@ -2709,7 +2725,7 @@ def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest
         )
         _, _, rows = wrapper.replay(**chunk, cnn_cache=None, att_cache=rows, att_keep=keep)
         for row, reference in zip(rows, expected, strict=True):
-            assert row.shape[4] == frames
+            assert row.shape[-2] == frames
             assert torch.equal(row, reference)
             assert row.untyped_storage().nbytes() == row[..., :1, :].numel() * sum(keep) * row.element_size()
         if storages is None:
