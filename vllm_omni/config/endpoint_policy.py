@@ -73,8 +73,9 @@ def build_rejection_handler(reason: str):
 
 def shutdown_full_pipeline_routes(app: FastAPI, reason: str) -> None:
     """Reject HTTP routes that need the full pipeline and remove WebSocket routes.
+
     This is useful for putting an API server in front of a single stage in a multistage
-    pipelines.
+    pipeline.
     """
     keep_paths = {capability.path for capability in OmniServingCapability if not capability.requires_full_pipeline}
     rejection_handler = build_rejection_handler(reason)

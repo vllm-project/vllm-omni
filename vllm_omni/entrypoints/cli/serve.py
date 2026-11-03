@@ -486,7 +486,9 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "Select and launch a single stage by stage_id. Pass 'none' on the "
-                "head to launch no local stage (API server + orchestrator only)."
+                "head to launch no local stage (API server + orchestrator only). "
+                "Without --omni-master-address, the server runs only this stage "
+                "and serves /v1/run calls for it."
             ),
         )
         omni_config_group.add_argument(
