@@ -98,7 +98,8 @@ def main() -> None:
                         elapsed = time.perf_counter() - start
                         request_id = output.request_id
                         payload = output.outputs[0].multimodal_output
-                        audio = payload["audio"] if payload else None
+                        # DELTA streams can also emit metadata-only updates.
+                        audio = payload.get("audio") if payload else None
                         if audio is not None:
                             audio = torch.cat(audio) if isinstance(audio, list) else audio
                             if audio.numel():
