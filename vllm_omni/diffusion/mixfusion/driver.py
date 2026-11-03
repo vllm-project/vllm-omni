@@ -62,8 +62,9 @@ class MixFusionDriver:
 
         Dense batches (tensor latents) go straight to ``dense_step``. Ragged
         batches (list latents) either pack or fall back to one dense call per
-        request. The packed branch must not call ``dense_step``: the dense
-        keyword builder only accepts a tensor of latents.
+        compatible group of requests. The packed branch must not call
+        ``dense_step``: the dense keyword builder only accepts a tensor of
+        latents.
 
         Admission preflights ``adapter.can_pack``, so the armed root hook
         normally has nothing to refuse. If it nevertheless declines (an
@@ -176,25 +177,53 @@ class MixFusionDriver:
         states: Sequence[Any],
         dense_step: Callable[..., Any],
     ) -> list[Any]:
-        """Denoise each request on its own through the dense path.
+        """Denoise the ragged batch through the dense path, one call per group.
 
-        Rebuilding the step-local batch per request keeps every per-image
+        Requests that ``InputBatch.make_batch`` can express together (same
+        latent token shape and same CFG/guidance settings) are stacked into
+        one dense batch: the batch dimension is per-image, so requests with
+        different ``num_images`` share a call as long as ``S`` and ``C``
+        match. A group of one request is exactly the old per-request path.
+
+        Rebuilding the step-local batch per group keeps every per-image
         conditioning row (prompts, guidance, condition images) aligned with
-        the request's latents, which a flattened dense batch cannot express.
+        the group's latents, which a flattened dense batch cannot express.
+        The output is per request, in the caller's request order, whether
+        ``dense_step`` returns one tensor for the group or a list of them.
         """
-        outputs: list[Any] = []
-        num_requests = len(input_batch.latents)
-        for req_idx in range(num_requests):
+        groups: dict[tuple, list[int]] = {}
+        for req_idx, latents in enumerate(input_batch.latents):
+            state = states[req_idx]
+            group_key = (
+                tuple(latents.shape[1:]),
+                state.do_true_cfg,
+                getattr(state.sampling, "true_cfg_scale", None) or 4.0,
+                bool(getattr(state.sampling, "cfg_normalize", False)),
+                state.guidance is None,
+            )
+            groups.setdefault(group_key, []).append(req_idx)
+
+        outputs: list[Any] = [None] * len(input_batch.latents)
+        for indices in groups.values():
             sub_batch = InputBatch.make_batch(
                 states,
-                idx_mapping=torch.tensor([req_idx], dtype=torch.int32),
+                idx_mapping=torch.tensor(indices, dtype=torch.int32),
             )
             if isinstance(sub_batch.latents, list):
-                # A single ragged request still reports list latents; flatten
-                # it so the dense path sees the request's [num_images, S, C]
-                # tensor (and does not recurse back here).
-                sub_batch.latents = sub_batch.latents[0]
-            outputs.append(dense_step(sub_batch, states=sub_batch.states))
+                # Ragged latents come back as one [num_images, S, C] tensor per
+                # request; stacking the group restores a dense batch. The
+                # group key guarantees every tensor has the same S and C.
+                sub_batch.latents = torch.cat(sub_batch.latents, dim=0)
+            pred = dense_step(sub_batch, states=sub_batch.states)
+            if isinstance(pred, (list, tuple)):
+                for offset, req_idx in enumerate(indices):
+                    outputs[req_idx] = pred[offset]
+                continue
+            offset = 0
+            for req_idx in indices:
+                rows = input_batch.latents[req_idx].shape[0]
+                outputs[req_idx] = pred[offset : offset + rows]
+                offset += rows
         return outputs
 
     @contextmanager

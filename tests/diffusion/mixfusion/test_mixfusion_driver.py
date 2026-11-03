@@ -14,7 +14,7 @@ model imports, pinning the three responsibilities the driver owns:
   with the strictest request's limits;
 - lifecycle: ``armed`` publishes the step the hooks read, restores any
   previous step (CFG calls the transformer twice) and survives exceptions;
-  ``serial_ragged`` rebuilds one single-request dense batch per request.
+  ``serial_ragged`` rebuilds one dense batch per compatible group of requests.
 """
 
 from __future__ import annotations
@@ -148,13 +148,23 @@ def _record_dense(calls: list, result: str = "dense"):
     return dense_step
 
 
-def _state(request_id: str, latents: torch.Tensor) -> StepRequestState:
+def _state(
+    request_id: str,
+    latents: torch.Tensor,
+    *,
+    do_true_cfg: bool = False,
+    true_cfg_scale: float | None = None,
+    cfg_normalize: bool = False,
+    guidance: torch.Tensor | None = None,
+) -> StepRequestState:
     """One ragged request state accepted by ``InputBatch.make_batch``."""
     return StepRequestState(
         request_id=request_id,
-        sampling=SimpleNamespace(true_cfg_scale=None, cfg_normalize=False),
+        sampling=SimpleNamespace(true_cfg_scale=true_cfg_scale, cfg_normalize=cfg_normalize),
         latents=latents,
         timesteps=torch.tensor([500.0]),
+        do_true_cfg=do_true_cfg,
+        guidance=guidance,
         extra={"use_ragged_latents": True},
     )
 
@@ -449,31 +459,88 @@ def test_armed_restores_the_previous_step_after_an_exception():
 # ── serial ragged path ──
 
 
-def test_serial_ragged_builds_one_dense_batch_per_request():
+def test_serial_ragged_batches_requests_with_the_same_latent_shape():
     driver, transformer = _driver()
     first = torch.full((1, 8, 4), 1.0)
     second = torch.full((2, 8, 4), 2.0)
     states = [_state("req-0", first), _state("req-1", second)]
-    input_batch = SimpleNamespace(latents=[first, second])
     seen: list = []
 
     def dense_step(batch, **kwargs):
         seen.append((batch, kwargs))
-        return f"dense:{batch.request_ids[0]}"
+        return batch.latents + 100
 
-    outputs = driver.serial_ragged(input_batch, states, dense_step)
+    outputs = driver.serial_ragged(SimpleNamespace(latents=[first, second]), states, dense_step)
 
-    assert outputs == ["dense:req-0", "dense:req-1"]
     assert transformer.calls == []
-    assert [batch.request_ids for batch, _ in seen] == [["req-0"], ["req-1"]]
-    # A single ragged request still reports list latents; the driver flattens
-    # it so the dense path receives the request's [num_images, S, C] tensor.
-    assert isinstance(seen[0][0].latents, torch.Tensor)
-    assert torch.equal(seen[0][0].latents, first)
-    assert torch.equal(seen[1][0].latents, second)
-    assert seen[0][0].num_reqs == 1
-    assert seen[1][0].num_reqs == 1
-    assert seen[0][1]["states"] is seen[0][0].states
+    # Different image counts share a batch: the batch dim is per-image, and
+    # S/C match, so ``make_batch`` can express both requests together.
+    assert len(seen) == 1
+    batch, kwargs = seen[0]
+    assert batch.request_ids == ["req-0", "req-1"]
+    assert batch.num_reqs == 2
+    assert isinstance(batch.latents, torch.Tensor)
+    assert torch.equal(batch.latents, torch.cat([first, second], dim=0))
+    assert kwargs["states"] is batch.states
+    # Outputs are sliced per request, in request order.
+    assert len(outputs) == 2
+    assert torch.equal(outputs[0], first + 100)
+    assert torch.equal(outputs[1], second + 100)
+
+
+def test_serial_ragged_splits_groups_by_latent_shape():
+    driver, _ = _driver()
+    latents = [torch.full((1, length, 4), float(length)) for length in (8, 12, 8, 12)]
+    states = [_state(f"req-{idx}", lat) for idx, lat in enumerate(latents)]
+    seen: list[InputBatch] = []
+
+    def dense_step(batch, **kwargs):
+        seen.append(batch)
+        return batch.latents + 1
+
+    outputs = driver.serial_ragged(SimpleNamespace(latents=latents), states, dense_step)
+
+    assert [batch.request_ids for batch in seen] == [["req-0", "req-2"], ["req-1", "req-3"]]
+    for output, lat in zip(outputs, latents):
+        assert torch.equal(output, lat + 1)
+
+
+def test_serial_ragged_splits_groups_by_cfg_and_guidance_settings():
+    # ``InputBatch`` raises on mixed CFG or guidance settings, so requests that
+    # differ in either must land in different dense batches.
+    driver, _ = _driver()
+    latents = [torch.full((1, 8, 4), float(idx)) for idx in range(3)]
+    states = [
+        _state("req-0", latents[0], do_true_cfg=True),
+        _state("req-1", latents[1]),
+        _state("req-2", latents[2], guidance=torch.zeros(())),
+    ]
+    seen: list[InputBatch] = []
+
+    def dense_step(batch, **kwargs):
+        seen.append(batch)
+        return batch.latents + 1
+
+    outputs = driver.serial_ragged(SimpleNamespace(latents=latents), states, dense_step)
+
+    assert [batch.request_ids for batch in seen] == [["req-0"], ["req-1"], ["req-2"]]
+    for output, lat in zip(outputs, latents):
+        assert torch.equal(output, lat + 1)
+
+
+def test_serial_ragged_maps_list_outputs_to_requests():
+    driver, _ = _driver()
+    latents = [torch.zeros(1, 8, 4), torch.ones(1, 8, 4)]
+    states = [_state("req-0", latents[0]), _state("req-1", latents[1])]
+    per_request = [torch.full_like(latents[0], 7.0), torch.full_like(latents[1], 9.0)]
+
+    outputs = driver.serial_ragged(
+        SimpleNamespace(latents=latents),
+        states,
+        lambda batch, **kwargs: per_request,
+    )
+
+    assert outputs == per_request
 
 
 def test_serial_ragged_reuses_the_input_batch_type():
@@ -484,7 +551,7 @@ def test_serial_ragged_reuses_the_input_batch_type():
     driver.serial_ragged(
         SimpleNamespace(latents=[state.latents]),
         [state],
-        lambda batch, **kwargs: batches.append(batch),
+        lambda batch, **kwargs: batches.append(batch) or batch.latents,
     )
 
     assert isinstance(batches[0], InputBatch)
