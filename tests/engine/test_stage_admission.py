@@ -224,3 +224,114 @@ async def test_cancelled_or_replaced_request_cannot_be_accepted_after_routing_wa
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.parametrize("wait_point", ["input_lock", "routing"])
+@pytest.mark.parametrize("change", ["unchanged", "edit", "delete", "supersede", "close"])
+async def test_owner_receipt_is_checked_after_wait_and_rejection_allows_explicit_clean_retry(
+    monkeypatch, wait_point, change
+):
+    counter = FakeRunningCounter()
+    orchestrator, clients, rpc, _ = _build(running_counter=counter)
+    entered, release = asyncio.Event(), asyncio.Event()
+    checked: list[tuple[int, ...]] = []
+    task = None
+    held_lock = None
+    try:
+        assert (await _open(orchestrator, rpc)).ok
+        session = orchestrator.session_manager.get(SESSION_ID)
+        node_id = _card(session, "city", "Hangzhou")
+        receipt = session.capture_memory_prompt(query="Hangzhou")
+        assert session.memory_prompt_matches(receipt, (node_id,))
+        context = DuplexStageRequestContext(
+            request_id=_stage0_request_id(),
+            session_id=SESSION_ID,
+            fence=session.fence,
+            stage_id=0,
+            final_stage_id=0,
+            config_generation=0,
+            sampling_params=(clients[0].default_sampling_params,),
+        )
+        orchestrator.ensure_request(context)
+        original_state = orchestrator.request_states[context.request_id]
+        pool = orchestrator.stage_pools[0]
+        if wait_point == "input_lock":
+            held_lock = orchestrator._stage_input_submission_locks.setdefault(0, asyncio.Lock())
+            await held_lock.acquire()
+        else:
+            original_select = pool._pick_or_select
+
+            async def select(*args, **kwargs):
+                entered.set()
+                await release.wait()
+                return await original_select(*args, **kwargs)
+
+            monkeypatch.setattr(pool, "_pick_or_select", select)
+
+        def guard(request):
+            checked.append(tuple(request.prompt_token_ids))
+            if not session.memory_prompt_matches(receipt, (node_id,)):
+                raise ValueError("stale_selection")
+
+        async def submit():
+            if wait_point == "input_lock":
+                entered.set()
+            return await orchestrator.submit(
+                DuplexStageSubmission(context, {"prompt_token_ids": [11, 12]}, False, resumable=False),
+                before_accept=guard,
+            )
+
+        task = asyncio.create_task(submit())
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not task.done() and not checked
+        assert not clients[0].add_request_calls and not pool.output_processor.add_request_calls
+        if change == "edit":
+            session.register_history_item("city", {"role": "user", "content": "Shanghai"})
+        elif change == "delete":
+            assert session.delete_history_item("city")
+        elif change == "supersede":
+            _card(session, "replacement", "Shanghai", generation=1)
+        elif change == "close":
+            session.begin_close(reason="test")
+        if held_lock is not None:
+            held_lock.release()
+            held_lock = None
+        release.set()
+        if change == "unchanged":
+            await task
+            assert [call[0].prompt_token_ids for call in clients[0].add_request_calls] == [[11, 12]]
+            assert len(pool.output_processor.add_request_calls) == 1
+            assert counter.value == 1
+        else:
+            with pytest.raises(ValueError, match="stale_selection"):
+                await task
+            assert not clients[0].add_request_calls and not pool.output_processor.add_request_calls
+            assert counter.value == 0 and not original_state.running_counter_registered
+            assert not original_state.stage_submit_ts and not original_state.stage_fences
+        assert checked == [(11, 12)]
+        assert not orchestrator._stage_input_submission_locks[0].locked()
+        await orchestrator.cleanup([context.request_id], abort=False)
+        assert context.request_id not in orchestrator.request_states
+        assert pool.get_bound_replica_id(context.request_id) is None
+        assert counter.value == 0
+        if change == "edit":
+            # The consumer decides when to retry. This is an explicit caller
+            # retry after cleanup, not an automatic fallback implementation.
+            orchestrator.ensure_request(context)
+            assert orchestrator.request_states[context.request_id] is not original_state
+            await orchestrator.submit(
+                DuplexStageSubmission(context, {"prompt_token_ids": [7, 8]}, False, resumable=False)
+            )
+            assert [call[0].prompt_token_ids for call in clients[0].add_request_calls] == [[7, 8]]
+            assert len(pool.output_processor.add_request_calls) == 1
+            assert counter.value == 1
+            await orchestrator.cleanup([context.request_id], abort=False)
+            assert counter.value == 0
+    finally:
+        if held_lock is not None:
+            held_lock.release()
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await orchestrator.session_manager.shutdown()
