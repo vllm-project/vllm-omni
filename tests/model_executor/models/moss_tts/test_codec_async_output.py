@@ -24,7 +24,7 @@ class CausalCodec(nn.Module):
         self.channels = channels
         self.config = SimpleNamespace(codebook_size=1024)
 
-    def initialize_decoder_state_pool(self, capacity, scratch):
+    def initialize_decoder_state_pool(self, capacity, scratch, *, chunk_frames=0, packed=False):
         self.state = torch.zeros(capacity + scratch, device=self.weight.device)
 
     def reset_decoder_state_slots(self, slots):
@@ -119,9 +119,22 @@ def test_ramp_chunks_are_captured_at_exact_frame_counts(ramp, frames):
 def test_gpu_output_requires_local_streaming_mrv2_and_cuda(v2, streaming, model_type):
     decoder = make_decoder(v2=v2, streaming=streaming, model_type=model_type)
     assert decoder._gpu_stream_output == (v2 and streaming and model_type == "moss_tts_local")
+    assert decoder._stream_ring_headroom == (model_type == "moss_tts_local")
     session = decoder._ensure_stream_session()
     slot = session.acquire()
     assert session.step({slot: torch.ones(2, 3)})[slot].device.type == "cpu"
+
+
+@pytest.mark.cpu
+def test_whole_sequence_v2_does_not_use_v1_graph_api(mocker):
+    from tests.model_executor.models.moss_tts.test_codec_ring_headroom import tiny_codec
+
+    decoder = make_decoder(streaming=False)
+    decoder.vllm_config.model_config.enforce_eager = False
+    decoder._codec = tiny_codec()
+    legacy_graph = mocker.patch.object(decoder, "_enable_non_streaming_decoder_cudagraph")
+    decoder._configure_decoder_cudagraph(torch.device("cpu"))
+    legacy_graph.assert_not_called()
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)

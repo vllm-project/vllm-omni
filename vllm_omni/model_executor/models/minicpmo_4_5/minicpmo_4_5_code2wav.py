@@ -1856,8 +1856,75 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
             watchdog=self._watchdog,
         )
-        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
+        # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
+        # runners without that hook, the first chunk that needs a graph. Capturing
+        # under vLLM's weight load held GiBs, so the sweep must not run here.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Warm the graphs from the engine's warmup step, before the worker is ready.
+
+        ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
+        runner's own init work, i.e. weights loaded, profiling done, nothing
+        served yet. Runners that capture their own graphs (CUDA V1) already run a
+        dummy forward at that point, which fires the deferred sweep first and
+        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
+        defer the sweep to the first real request, where a C8 duplex replay
+        stalls every in-flight stream for ~1-2 s per graph while its first-wave
+        sessions time out.
+
+        Capturing here rather than in ``load_weights`` also keeps the allocator
+        layout the runner already uses: a sweep at weight-load time raises the
+        reserved footprint by ~4 GiB on CUDA (measured), which is enough to OOM
+        at concurrency 8.
+
+        ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
+        because this is where CUDA V1 already swept: the runner's own warmup has
+        run by now, so the capture reuses the allocator it warmed instead of
+        raising the reserved footprint the way a weight-load-time sweep does.
+        """
+        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+            logger.warning_once(
+                "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
+                "the startup sweep is controlled by cfm_graph_precapture_at_init"
+            )
+        if not self._startup_sweep_enabled():
+            return
+        self._precapture_before_serve()
+
+    def _startup_sweep_enabled(self) -> bool:
+        """Resolve ``cfm_graph_precapture_at_init``, on unless disabled.
+
+        The deferred sweep used to wait for a forward that stage 2 never runs, so
+        runners without a warmup forward (Model Runner V2, Ascend) paid for the
+        capture on their first real request. Only an explicit ``false`` opts out.
+        """
+        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
+
+    def _precapture_before_serve(self) -> None:
+        """Run the precapture sweep once, under the context ``forward`` uses.
+
+        Inference mode plus this stage's matmul policy, so a graph captured here
+        replays the kernels the lazy path would have recorded.
+
+        Per-graph failures are already handled inside ``_precapture_default_prompt``;
+        a poisoned wrapper still fails startup there, so this must not catch it.
+        """
+        if not getattr(self, "_precapture_pending", False) or self.backend is None:
+            return
+        try:
+            with torch.inference_mode(), _stage_matmul_policy(self._tf32_mode):
+                self._precapture_default_prompt()
+        finally:
+            if getattr(self, "_precapture_empty_cache", False):
+                try:
+                    self._release_precapture_cache()
+                except Exception:
+                    # Never mask the sweep error this ``finally`` may run for.
+                    logger.warning(
+                        "MiniCPM-o Code2Wav: releasing the precapture cache failed",
+                        exc_info=True,
+                    )
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
