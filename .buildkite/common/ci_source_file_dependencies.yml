@@ -447,6 +447,8 @@ source_file_dependencies:
     - tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py
 
   omni_minicpmo_4_5_function:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *minicpmo_4_5
     - *minicpmo_4_5_functional_runtime
     - tests/e2e/offline_inference/test_minicpmo_4_5.py
