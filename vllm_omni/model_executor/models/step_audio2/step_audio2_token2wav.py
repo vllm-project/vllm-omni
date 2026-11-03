@@ -5,7 +5,8 @@ import io
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -868,6 +869,19 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         self._batched_precapture_pending = self._batched_enabled and read_bool_flag(
             batched_extra, "token2wav_graph_precapture", True
         )
+        # Per-request backend streaming states, keyed by request id. Finished
+        # requests drop their entry; a size cap evicts the least-recently-used
+        # entry so abandoned (preempted-and-gone) requests cannot leak state.
+        self._batched_states: OrderedDict[str, Any] = OrderedDict()
+        scheduler = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = getattr(scheduler, "max_num_seqs", None)
+        self._batched_states_cap = max(16, 2 * int(max_num_seqs)) if max_num_seqs else 16
+        if self._batched_enabled:
+            # The batched path splits the runner's flat ``input_ids`` by
+            # per-request token counts, so it needs the padding trimmed (#6712)
+            # and the per-request ids the runner stamps in kwargs.
+            self.requires_exact_input_shape = True
+            self.requires_request_ids = True
 
         self.make_empty_intermediate_tensors = lambda: None
 
@@ -1007,12 +1021,15 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         runtime_additional_information: list[dict[str, Any]],
         **kwargs: Any,
     ) -> OmniOutput:
-        """Handle one async_chunk forward step (batch=1).
+        """Handle one async_chunk forward step (batch=1 on the legacy path).
 
         The end-of-stream flag is encoded as ``left_context_size == 1``
         (the only field the framework transparently forwards from the
         async_chunk payload to ``request.additional_information``).
         """
+        if self._batched_enabled:
+            return self._forward_async_chunk_batched(input_ids, runtime_additional_information, **kwargs)
+
         # --- batch=1 guard ---
         batch_size = sum(1 for info in runtime_additional_information if _get_left_context_size(info) is not None)
         if batch_size != 1:
@@ -1083,6 +1100,185 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": [waveform.detach().cpu().contiguous()]},
+        )
+
+    @staticmethod
+    def _split_flat_tokens(flat: torch.Tensor, counts: Any, key: str) -> list[torch.Tensor]:
+        """Split a flat batch ``input_ids`` into per-request token segments.
+
+        Same contract as the MiniCPM-o facade's segment splitting: the runner's
+        ``seq_token_counts`` (or the payload meta's per-entry counts) must sum
+        to the flat token count, or the batch cannot be mapped to requests.
+        """
+        if counts is None or isinstance(counts, (str, bytes, bytearray)):
+            raise RuntimeError(f"Token2Wav batched path cannot split input_ids: invalid {key}")
+        if not isinstance(counts, Sequence):
+            raise RuntimeError(f"Token2Wav batched path cannot split input_ids: {key} is not a sequence")
+        normalized = [int(value) for value in counts]
+        if any(value < 0 for value in normalized):
+            raise RuntimeError(f"Token2Wav batched path got negative {key}: {normalized}")
+        if sum(normalized) != int(flat.numel()):
+            raise RuntimeError(
+                f"Token2Wav batched path {key} sum {sum(normalized)} != {int(flat.numel())} input tokens"
+            )
+        return list(torch.split(flat, normalized))
+
+    def _forward_async_chunk_batched(
+        self,
+        input_ids: torch.Tensor,
+        runtime_additional_information: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> OmniOutput:
+        """Async-chunk streaming through the opt-in BatchedToken2Wav backend.
+
+        One ragged decode per forward step covers every scheduled request —
+        including mixed steady/final chunks of different widths — with
+        per-request states keyed by request id, so batch>1 works without the
+        legacy path's batch=1 guard. Audio returns device-resident (the same
+        contract the MiniCPM-o code2wav stage uses).
+        """
+        if self._batched_backend is None:
+            self._build_batched_backend()
+        backend = self._batched_backend
+        assert backend is not None
+        if self._batched_precapture_pending:
+            # Runner without the warmup hook: sweep here (first chunk) rather
+            # than capturing lazily mid-stream.
+            self._precapture_backend_graphs()
+
+        prompt_wav = self._default_prompt_wav
+        if not os.path.exists(prompt_wav):
+            raise FileNotFoundError(f"Token2Wav: prompt_wav file not found: {prompt_wav}")
+
+        # --- parse per-request payloads (before segmenting: the fallback
+        # needs to know which entries actually carry tokens) ---
+        if isinstance(input_ids, torch.Tensor):
+            flat = input_ids.reshape(-1)
+        else:
+            flat = torch.empty(0, dtype=torch.long)
+        total = len(runtime_additional_information)
+        request_ids = kwargs.get("request_ids")
+        device = flat.device if isinstance(flat, torch.Tensor) else torch.device("cpu")
+        placeholder = torch.zeros(1, dtype=torch.float32, device=device)
+        outputs: list[torch.Tensor] = [placeholder] * total
+        parsed: list[tuple[int, str, bool] | None] = [None] * total
+        for index, info in enumerate(runtime_additional_information):
+            meta = info.get("meta") if isinstance(info, dict) else None
+            if not isinstance(meta, dict):
+                meta = info if isinstance(info, dict) else {}
+            marker = meta.get("left_context_size")
+            if marker is None and meta.get("last_chunk") is None:
+                continue  # bookkeeping-only step: no payload to decode
+            last_chunk = bool(meta["last_chunk"]) if meta.get("last_chunk") is not None else marker == 1
+            request_id = str(
+                meta.get("request_id")
+                or (request_ids[index] if request_ids is not None and index < len(request_ids) else "")
+                or index
+            )
+            parsed[index] = (index, request_id, last_chunk)
+
+        # --- split the flat input_ids into per-request segments ---
+        payload_indexes = [index for index, entry in enumerate(parsed) if entry is not None]
+        runner_counts = kwargs.get("seq_token_counts")
+        if runner_counts is not None:
+            segments = self._split_flat_tokens(flat, runner_counts, "seq_token_counts")
+        else:
+            # Fallback: per-entry payload sizes stamped by the stage input
+            # processor (valid when every scheduled entry carries a payload).
+            meta_counts = [
+                (
+                    int(info["meta"]["code_flat_numel"])
+                    if isinstance(info, dict)
+                    and isinstance(info.get("meta"), dict)
+                    and info["meta"].get("code_flat_numel") is not None
+                    else None
+                )
+                for info in runtime_additional_information
+            ]
+            if all(count is not None for count in meta_counts) and sum(meta_counts) == int(flat.numel()):
+                segments = list(torch.split(flat, meta_counts))
+            elif len(payload_indexes) == 1:
+                # No usable per-request counts and only one entry could own
+                # the tokens: give them all to that entry.
+                only = payload_indexes[0]
+                segments = [flat[:0]] * total
+                segments[only] = flat
+            else:
+                raise RuntimeError(
+                    "Token2Wav batched path cannot split input_ids across "
+                    f"{len(payload_indexes)} payload requests without seq_token_counts "
+                    "or per-payload code_flat_numel"
+                )
+        if len(segments) != total:
+            raise RuntimeError(f"Token2Wav batched path: {len(segments)} token segments != {total} scheduled requests")
+
+        rows: list[tuple[int, str, torch.Tensor, bool]] = []
+        for index, entry in enumerate(parsed):
+            if entry is None:
+                continue
+            _, request_id, last_chunk = entry
+            segment = segments[index]
+            if segment.numel() == 0:
+                # Empty payload (EOF marker with no audio tokens).
+                self._batched_states.pop(request_id, None)
+                continue
+            rows.append((index, request_id, segment, last_chunk))
+
+        if rows:
+            # The same context ``capture_auxiliary_graphs`` swept under, so a
+            # graph captured there replays the kernels recorded here.
+            with torch.inference_mode(), _stage_matmul_policy(self._batched_tf32):
+                try:
+                    features = backend.prepare_prompt(_BATCHED_PROMPT_CACHE_ID, prompt_wav)
+                    tokens = [row[2].to(device=self.token2wav.device) for row in rows]
+                    states = []
+                    for _, request_id, _, _ in rows:
+                        state = self._batched_states.pop(request_id, None)
+                        if state is None:
+                            state = backend.setup_batch(features, 1)[0]
+                        states.append(state)
+                    last_chunks = [row[3] for row in rows]
+                    # Uniform rows (same cache signature, token width and
+                    # final flag) decode through one stacked decode_batch —
+                    # the Whole-Euler graph path; ragged only for genuinely
+                    # mixed rows, whose per-request attention solve is slower
+                    # (measured 2.2x at batch 1 on H100). Same dispatch rule
+                    # as the MiniCPM-o facade's _decode_rows.
+                    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+                        state_shape_signature,
+                    )
+
+                    if (
+                        len({state_shape_signature(state) for state in states}) > 1
+                        or len({int(t.numel()) for t in tokens}) > 1
+                        or len(set(last_chunks)) > 1
+                    ):
+                        audios, next_states = backend.decode_ragged_batch(
+                            tokens, features, states, last_chunks=last_chunks
+                        )
+                    else:
+                        audios, next_states = backend.decode_batch(
+                            torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0]
+                        )
+                except Exception:
+                    # Drop this step's states so a retry starts from a fresh
+                    # setup instead of continuing from a half-consumed cache.
+                    for _, request_id, _, _ in rows:
+                        self._batched_states.pop(request_id, None)
+                    raise
+                for (index, request_id, _, last_chunk), audio, next_state in zip(rows, audios, next_states):
+                    outputs[index] = audio.reshape(-1).to(dtype=torch.float32)
+                    if last_chunk:
+                        self._batched_states.pop(request_id, None)
+                    else:
+                        self._batched_states[request_id] = next_state
+                        self._batched_states.move_to_end(request_id)
+                while len(self._batched_states) > self._batched_states_cap:
+                    self._batched_states.popitem(last=False)
+
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={"model_outputs": outputs},
         )
 
     # ------------------------------------------------------------------
@@ -1220,11 +1416,19 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
             if not self._batched_enabled:
                 return
             self._build_batched_backend()
-        if not self._batched_precapture_pending:
+        self._precapture_backend_graphs()
+
+    def _precapture_backend_graphs(self) -> None:
+        """Run the pending graph sweep once, under the context forward uses.
+
+        Inference mode plus this stage's matmul policy, so a graph captured
+        here replays the kernels the decode path records. No-op when the
+        sweep already ran or the knob is off.
+        """
+        if not self._batched_precapture_pending or self._batched_backend is None:
             return
         self._batched_precapture_pending = False
         backend = self._batched_backend
-        assert backend is not None
         started = time.perf_counter()
 
         def precapture(name: str, capture: Callable[[], int]) -> None:
