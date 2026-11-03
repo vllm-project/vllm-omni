@@ -1458,14 +1458,15 @@ def _bias_head_to(model, token_id: int):
 
 
 def test_frame_loop_repetition_stop_surfaces_as_stop_row():
-    """Repetition detection must surface as a stop row on the next step.
+    """Repetition detection must surface as a stop row in the detecting step.
 
     Review follow-up (PR #9733): ``_codec_repetition_detected`` runs in
-    ``flush_kstep_pending`` after the frame loop, so the detecting step still
-    packs its frame as a continue row. The next step must take the finished
-    early-exit and pack the row as a stop row (batch stop logits argmax at
-    the stop slot), or the scheduler never learns the request ended and it
-    runs on to ``max_tokens``.
+    ``flush_kstep_pending``, which now runs before the stop rows freeze into
+    ``batch_stop_logits``. The detecting step rewrites its own row from
+    continue to stop, so the stop slot wins the batch stop logits lookup in
+    the same step -- previously the rewrite waited for a next step that a
+    duplex turn-boundary request may never get scheduled, and the scheduler
+    never learned the request ended (it ran on to ``max_tokens``).
     """
     model = _make_talker(k_step_frames=8, scripted_samples=[42] * 16)
     state = {
@@ -1481,20 +1482,22 @@ def test_frame_loop_repetition_stop_surfaces_as_stop_row():
     # One sample is not a repetition yet; the frame is a normal continue row.
     assert state["finished"] is False
     assert warming.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+    assert int(model.batch_stop_logits[0].argmax()) == 0
 
     detecting = _frame_call(model, hidden)
-    # The flush that notices the repeating tail runs after this step's frames
-    # were packed, so the detecting step still carried audio, not a stop row.
+    # The flush that notices the repeating tail rewrites this step's row, so
+    # the detecting frame still carries audio *and* its stop row is a stop.
     assert state["finished"] is True
     assert detecting.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
-
-    stopping = _frame_call(model, hidden)
-    # The finished early-exit packs the row as a stop row and emits no
-    # further audio; the stop slot wins the batch stop logits lookup.
-    assert stopping.multimodal_outputs["codes"]["audio"][0].numel() == 0
     logits = model.batch_stop_logits
     assert logits is not None and logits.shape[0] >= 1
     assert int(logits[0].argmax()) == 1
+
+    stopping = _frame_call(model, hidden)
+    # The finished early-exit packs the row as a stop row and emits no
+    # further audio.
+    assert stopping.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert int(model.batch_stop_logits[0].argmax()) == 1
 
 
 def test_stop_id_finishes_request_through_device_state_greedy():
@@ -1762,9 +1765,16 @@ def test_kstep_turn_end_drain_matches_single_frame(drain, previous, current, exp
 
 
 def test_kstep_drain_until_silent_across_steps():
-    """Step by step, as the multi-frame loop runs: the stop lands where the single-frame path puts it."""
+    """Step by step, as the multi-frame loop runs: the closing stop lands in the same step.
+
+    The quiet run only completes when the closing silent code commits in
+    ``flush_kstep_pending``; the flush re-checks the drain condition with that
+    frame confirmed and rewrites the closing frame's stop row in the same
+    step, so the request finishes without waiting for a next frame (which a
+    duplex turn boundary may never schedule).
+    """
     # The silent pair straddles the step boundary at frame 16, the closing
-    # silence fills the fourth step, and the stop lands on frame 0 of the fifth.
+    # silence fills the fourth step, and the stop lands on its closing frame.
     k = 8
     script = [_SPEECH] * 15 + [_SILENT] * 2 + [_SPEECH] * 7 + [_SILENT] * _TURN_END_QUIET_STOP_FRAMES
     model = _make_talker(k_step_frames=k, scripted_samples=[])
@@ -1790,12 +1800,19 @@ def test_kstep_drain_until_silent_across_steps():
         stops = model.take_batch_stop_logits().argmax(dim=-1).tolist()
         codes = merged.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist()
         finished = bool(merged.multimodal_outputs["meta"]["finished"][0])
-        if step_index < full_steps:
+        if step_index < full_steps - 1:
             assert codes == script[step_index * k : (step_index + 1) * k], step_index
             assert stops == [0] * k, step_index
             assert not finished, step_index
+        elif step_index == full_steps - 1:
+            # The closing frame's flush confirms the eighth quiet code and
+            # flips that frame's stop row: audio still emits, and the request
+            # finishes in this same step.
+            assert codes == script[step_index * k : (step_index + 1) * k], step_index
+            assert stops == [0] * (k - 1) + [1], step_index
+            assert finished, step_index
         else:
-            # The eighth silent code stops the chunk on the next frame, without sampling.
+            # The finished early-exit emits no further audio.
             assert codes == []
             assert stops == [1] * k
             assert finished
@@ -1828,7 +1845,9 @@ def test_kstep_flush_discards_stale_request(replaced):
     old_state = {"codes": torch.empty(0, dtype=torch.long)}
     model._request_audio_states["r1"] = {} if replaced else old_state
     model._deferred_cleanup_ids = set() if replaced else {"r1"}
-    model._kstep_pending_packed = [(torch.tensor([42, 0, 1]), "r1", old_state, None, None, 0)]
+    model._kstep_pending_packed = [
+        (torch.tensor([42, 0, 1]), "r1", old_state, None, None, 0, None, None, 0, None, None)
+    ]
     model.flush_kstep_pending()
     assert model._request_codec_history == {}
     assert "last_code" not in old_state
