@@ -114,6 +114,7 @@ class _Cache:
             SimpleNamespace(key=torch.zeros(shape), value=torch.zeros(shape)) for _ in range(num_layers)
         ]
         self.cross_attention = [None] * num_layers
+        self.memory = None
 
 
 class _StubCrossAttention(nn.Module):
@@ -3413,3 +3414,55 @@ def test_uint8_frames_match_the_pil_conversion_byte_for_byte() -> None:
     assert frames.dtype == np.uint8 and frames.shape == (5, 8, 8, 3)
     assert frames.flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(frames, expected)
+
+
+@pytest.mark.parametrize("fail", [None, "text", "key", "value"])
+def test_ar_text_projection_activates_offloaded_transformer(monkeypatch, fail):
+    from contextlib import contextmanager
+
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, od_config=_od_config(enable_cpu_offload=True))
+    pipeline._ar_diffusion_kv_state = _FakeARState()
+    active = False
+    events = []
+
+    @contextmanager
+    def activate(transformer):
+        nonlocal active
+        assert transformer is pipeline.transformer
+        active = True
+        events.append("load")
+        try:
+            yield
+        finally:
+            active = False
+            events.append("release")
+
+    class Guard(nn.Module):
+        def __init__(self, stage):
+            super().__init__()
+            self.stage = stage
+
+        def forward(self, value):
+            assert active, "text projections ran outside the transformer offload context"
+            if fail == self.stage:
+                raise RuntimeError("projection failed")
+            return value
+
+    monkeypatch.setattr(module, "sequential_offload_component", activate, raising=False)
+    pipeline.transformer.text_embedding = Guard("text")
+    for block in pipeline.transformer.blocks:
+        block.cross_attn.k = Guard("key")
+        block.cross_attn.v = Guard("value")
+    embeds = torch.ones(1, 4, 8)
+    if fail:
+        with pytest.raises(RuntimeError, match="projection failed"):
+            pipeline._ar_text_caches(embeds, invalidate=False, condition_revision="prompt")
+        assert not active and events == ["load", "release"]
+        fail = None
+    caches = pipeline._ar_text_caches(embeds, invalidate=False, condition_revision="prompt")
+    assert not active and len(caches) == 2
+    torch.testing.assert_close(caches[0].key, embeds.unflatten(2, (2, 4)))
+    count = len(events)
+    pipeline._ar_text_caches(embeds, invalidate=False, condition_revision="prompt")
+    assert len(events) == count  # Cache hit must not reload transformer weights.

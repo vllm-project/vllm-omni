@@ -1,0 +1,325 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""World retrieval ranking, attention, byte bounds, and transactional CPU tests."""
+
+import math
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from tests.diffusion.ar_diffusion.test_video_memory import absolute_keys, raw, vm
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def pose(x=0.0, yaw=0.0):
+    result = torch.eye(4, dtype=torch.float64)
+    c, s = math.cos(yaw), math.sin(yaw)
+    result[:3, :3] = torch.tensor([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=torch.float64)
+    result[0, 3] = x
+    return result
+
+
+def state(**kwargs):
+    return vm.VideoMemory(
+        vm.VideoMemoryConfig(
+            window_frames=8,
+            sink_frames=2,
+            retrieval_frames=2,
+            bank_bytes=kwargs.pop("bank_bytes", 1 << 20),
+            **kwargs,
+        ),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+
+
+def append(memory, start, *, camera=None):
+    memory.set_pose(pose(start) if camera is None else camera)
+    with memory.forward(start, 2, commit=True):
+        for layer in range(2):
+            memory.assemble(
+                layer,
+                raw(start),
+                absolute_keys(raw(start) + layer, torch.arange(start, start + 2).repeat_interleave(2)),
+                raw(start) * 2,
+            )
+
+
+def test_pose_scores_against_analytic_translation_and_rotation():
+    candidates = torch.stack((pose(0, 0), pose(1, math.pi / 2), pose(2, math.pi)))
+    torch.testing.assert_close(
+        vm.camera_distances(pose(), candidates), torch.tensor([0, 0.75, 2.0], dtype=torch.float64)
+    )
+    assert torch.equal(vm.camera_distances(pose(), torch.stack([pose()] * 3)), torch.zeros(3, dtype=torch.float64))
+
+
+def test_revisit_attention_matches_manual_chunks_without_duplicates():
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    original = memory.bank[2].layers[0].key.clone()
+    for _ in range(3):
+        memory.set_pose(pose(2))
+        with memory.forward(8, 2, commit=False):
+            assert [chunk.start for chunk in memory._retrieved] == [2]
+            for layer in range(2):
+                positions = torch.arange(8, 10).repeat_interleave(2)
+                current = absolute_keys(raw(8) + layer, positions)
+                k, v = memory.assemble(layer, raw(8), current, raw(8) * 2)
+                key_parts, value_parts = [], []
+                for chunk in (0, 2, 6, 8):
+                    target = chunk
+                    key_parts.append(
+                        absolute_keys(raw(chunk) + layer, torch.arange(target, target + 2).repeat_interleave(2))
+                    )
+                    value_parts.append(raw(chunk) * 2)
+                expected_k, expected_v = torch.cat(key_parts, 1), torch.cat(value_parts, 1)
+                torch.testing.assert_close(k, expected_k)
+                torch.testing.assert_close(v, expected_v)
+                expected = F.scaled_dot_product_attention(
+                    raw(8).transpose(1, 2), expected_k.transpose(1, 2), expected_v.transpose(1, 2)
+                )
+                actual = F.scaled_dot_product_attention(raw(8).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+                torch.testing.assert_close(actual, expected)
+                assert k.shape[1] == memory.config.window_frames * 2
+    assert torch.equal(memory.bank[2].layers[0].key, original)
+
+
+def test_bank_byte_budget_eviction_and_noisy_read_only():
+    sample = state()
+    append(sample, 0)
+    append(sample, 2)
+    entry_bytes = sample.bank_nbytes
+    memory = state(bank_bytes=entry_bytes * 2)
+    for start in range(0, 30, 2):
+        append(memory, start)
+        assert memory.bank_nbytes <= entry_bytes * 2
+        assert len(memory.bank) <= 2
+        for entry in memory.bank.values():
+            assert all(rows.key.device.type == "cpu" for rows in entry.layers)
+    assert list(memory.bank) == [26, 28]
+    before = memory.bank
+    memory.set_pose(pose(26))
+    with memory.forward(30, 2, commit=False):
+        for layer in range(2):
+            memory.assemble(layer, raw(30), raw(30), raw(30))
+    assert memory.bank is before and memory.next_frame == 30
+    memory.close()
+    assert memory.bank_nbytes == 0
+
+
+def test_oversized_entry_fails_before_allocating_or_publishing(monkeypatch):
+    memory = state(bank_bytes=1)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("compression must not run for an undersized bank")
+
+    monkeypatch.setattr(vm, "world_compress", unexpected)
+    with pytest.raises(ValueError, match="cannot fit one compressed chunk"):
+        append(memory, 0)
+    assert memory.bank_nbytes == 0 and memory.next_frame == 0
+    assert memory.history == [None, None] and not memory._pending
+
+
+def test_bank_is_transactional_and_copies_camera(monkeypatch):
+    memory = state()
+    camera = pose(2)
+    append(memory, 0)
+    append(memory, 2, camera=camera)
+    camera[0, 3] = 99
+    assert memory.bank[2].pose[0, 3] == 2
+    old_bank, old_history = memory.bank, memory.history
+
+    def fail():
+        raise RuntimeError("CPU bank copy failed")
+
+    monkeypatch.setattr(memory, "_publish_bank", fail)
+    with pytest.raises(RuntimeError, match="copy failed"):
+        append(memory, 4)
+    assert memory.bank is old_bank and memory.history is old_history and memory.next_frame == 4
+
+
+@pytest.mark.parametrize("bad", [torch.eye(3), torch.full((4, 4), float("nan")), torch.ones(4, 4), -torch.eye(4)])
+def test_invalid_camera(bad):
+    with pytest.raises(ValueError):
+        state().set_pose(bad)
+
+
+def test_missing_pose_rejected_and_pose_required_again_after_commit():
+    memory = state()
+    with pytest.raises(ValueError, match="absolute camera pose"):
+        with memory.forward(0, 2, commit=False):
+            pass
+    append(memory, 0)
+    with pytest.raises(ValueError, match="absolute camera pose"):
+        with memory.forward(2, 2, commit=False):
+            pass
+
+
+def test_ties_are_deterministic_and_sink_recent_never_retrieved():
+    memory = state()
+    for start in range(0, 12, 2):
+        append(memory, start, camera=pose())
+    memory.set_pose(pose())
+    assert [chunk.start for chunk in memory._retrieve(2)] == [2]
+    assert 0 not in memory.bank
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"retrieval_frames": -1},
+        {"retrieval_frames": 3},
+        {"sink_frames": 9, "retrieval_frames": 9, "bank_bytes": 100},
+        {"bank_bytes": True},
+    ],
+)
+def test_invalid_retrieval_config(config):
+    with pytest.raises(ValueError):
+        vm.VideoMemoryConfig(**config)
+
+
+def test_worldkv_small_fifo_bank_retrieves_over_long_rollout():
+    config = vm.VideoMemoryConfig(
+        window_frames=18,
+        sink_frames=3,
+        retrieval_frames=3,
+        bank_bytes=4 * (2 * 24 * (2 * 8 * 4 + 16) + 128),
+        world_keep_ratio=0.25,
+    )
+    memory = vm.VideoMemory(config, num_layers=2, tokens_per_frame=16)
+    generator = torch.Generator().manual_seed(7)
+    hits = 0
+    for start in range(0, 120, 3):
+        data = [torch.randn(1, 48, 1, 8, generator=generator) for _ in range(2)]
+        memory.set_pose(pose())
+        for commit in (False, True):
+            with memory.forward(start, 3, commit=commit):
+                hits += len(memory._retrieved) if not commit else 0
+                for layer, x in enumerate(data):
+                    memory.assemble(layer, x, x, x)
+                    previous = memory.history[layer]
+                    if previous is not None:
+                        tail_start = max(3, start + 3 - 18 + 3 + 3)
+                        visible_ids = previous.token_ids[(previous.positions < 3) | (previous.positions >= tail_start)]
+                        for chunk in memory._retrieved:
+                            assert not torch.isin(chunk.layers[layer].token_ids, visible_ids).any()
+        assert len(memory.bank) <= 4
+    assert hits > 0
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.25, 1.0])
+def test_bank_capacity_exact_boundary_includes_ids_and_pose(ratio):
+    sample = state(world_keep_ratio=ratio)
+    append(sample, 0)
+    append(sample, 2)
+    exact = sample.bank_nbytes
+    config = state(world_keep_ratio=ratio, bank_bytes=exact)
+    config.config.validate_bank_capacity(2, 2, 2, 8, 8, 2)
+    append(config, 0)
+    append(config, 2)
+    assert config.bank_nbytes == exact
+    too_small = state(world_keep_ratio=ratio, bank_bytes=exact - 1)
+    with pytest.raises(ValueError, match="cannot fit"):
+        too_small.config.reservation_bytes(2, 2, 2, 8, 8, chunk_frames=2)
+
+
+def test_real_geometry_rejects_one_gib_bank_and_reserves_layer_local_scratch():
+    config = vm.VideoMemoryConfig(
+        window_frames=18, sink_frames=3, retrieval_frames=3, bank_bytes=1 << 30, world_keep_ratio=0.25
+    )
+    with pytest.raises(ValueError, match="cannot fit"):
+        config.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
+    policy = vm.VideoMemoryConfig(window_frames=18, sink_frames=3)
+    reserve = policy.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
+    old = 4 * 40 * 18 * 1560 * (2 * 40 * 128 * 2 + 8)
+    assert reserve < old
+    # Publication retains old and replacement canonical windows.
+    assert reserve >= 40 * 1560 * 36 * (2 * 40 * 128 * 2)
+
+
+def test_retrieved_rows_transfer_once_per_chunk_and_clear_on_commit(monkeypatch):
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    transfers = []
+    original = vm.MemoryRows.to
+
+    def record(rows, device):
+        transfers.append(rows.token_ids.tolist())
+        return original(rows, device)
+
+    monkeypatch.setattr(vm.MemoryRows, "to", record)
+    outputs = []
+    for commit in (False, False, False, True):
+        memory.set_pose(pose(2))
+        with memory.forward(8, 2, commit=commit):
+            for layer in range(2):
+                k, v = memory.assemble(layer, raw(8), raw(8), raw(8))
+                outputs.append((k.clone(), v.clone()))
+    assert len(transfers) == 2  # one chunk, two layers, four forwards
+    for i in range(2, len(outputs)):
+        torch.testing.assert_close(outputs[i], outputs[i % 2])
+    assert not memory._device_retrieved and not memory._retrieved
+    assert memory._retrieval_frames == 0
+
+
+@pytest.mark.parametrize("end", ["failure", "pose", "close"])
+def test_retrieved_device_cache_invalidated_on_lifecycle_changes(end):
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    memory.set_pose(pose(2))
+    with memory.forward(8, 2, commit=False):
+        for layer in range(2):
+            memory.assemble(layer, raw(8), raw(8), raw(8))
+    assert memory._device_retrieved and memory._retrieved
+    if end == "failure":
+        with pytest.raises(RuntimeError, match="injected"):
+            with memory.forward(8, 2, commit=True):
+                memory.assemble(0, raw(8), raw(8), raw(8))
+                raise RuntimeError("injected")
+        assert memory.next_frame == 8
+    elif end == "pose":
+        memory.set_pose(pose(4))
+    else:
+        memory.close()
+    assert not memory._device_retrieved and not memory._retrieved
+    assert memory._retrieval_frames == 0
+
+
+def test_clean_publication_releases_device_views_and_consumes_pending_transactionally(monkeypatch):
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    old_history, old_bank = memory.history, memory.bank
+    publish, retain = memory._publish_bank, memory._retained
+    calls = []
+
+    def checked_publish():
+        assert not memory._device_retrieved
+        assert len(memory._pending) == 2
+        calls.append("bank")
+        return publish()
+
+    def checked_retain(layer, current):
+        assert calls[0] == "bank"
+        assert layer not in memory._pending
+        assert len(memory._pending) == 1 - layer
+        assert memory.history is old_history and memory.bank is old_bank
+        calls.append(layer)
+        if layer == 1:
+            raise RuntimeError("late retention failed")
+        return retain(layer, current)
+
+    monkeypatch.setattr(memory, "_publish_bank", checked_publish)
+    monkeypatch.setattr(memory, "_retained", checked_retain)
+    with pytest.raises(RuntimeError, match="late retention"):
+        append(memory, 8)
+    assert memory.history is old_history and memory.bank is old_bank and memory.next_frame == 8
+    assert not memory._pending and not memory._device_retrieved
+    monkeypatch.setattr(memory, "_retained", retain)
+    append(memory, 8)
+    assert memory.next_frame == 10

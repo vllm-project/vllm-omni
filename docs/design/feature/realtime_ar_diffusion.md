@@ -241,3 +241,76 @@ CPU contract tests cover:
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output
 latents, and exact metadata/request identity.
+
+## Experimental WorldKV memory for LingBot World
+
+LingBot accepts an opt-in `model_config.video_memory` mapping for pose-ranked
+history retrieval and CPU-bank KV compression. Omitting this mapping preserves
+the native LingBot sink and paged/direct cache paths. All units below are latent
+frames, and `window_frames` includes the current chunk.
+
+The two mechanism controls are:
+
+| Mechanism | Disabled by default | Enable explicitly |
+| --- | --- | --- |
+| Pose retrieval | `retrieval_frames: 0` | Set a positive frame budget and `bank_bytes` |
+| Bank KV compression | `world_keep_ratio: 1.0` | Set a ratio in `[0,1)` with retrieval enabled |
+
+Compression only reduces rows stored in the retrieval bank. It does not
+compress the current chunk, native sink, or recent canonical history. Compression
+requires retrieval; enabling compression alone is rejected rather than silently
+activating retrieval. `world_score: centroid` uses the released WorldKV code's
+normalized raw-anchor centroid; `pairwise_mean` (the default) uses mean cosine
+similarity to the anchor tokens. These scores can select different tokens.
+The anchor frame is always retained in full. For a three-frame chunk,
+`world_keep_ratio: 0.5` therefore retains about two thirds of all chunk tokens.
+
+```yaml
+model_config:
+  video_memory:
+    window_frames: 18
+    sink_frames: 9
+    retrieval_frames: 3
+    bank_bytes: 51539607552  # 48 GiB CPU bank; tune for resolution and weight dtype
+    world_keep_ratio: 0.5  # use 1.0 for the uncompressed retrieval control
+    world_score: centroid
+```
+
+An empty mapping selects a transactional 18-frame window with no sink,
+retrieval, or compression; it is different from omitting the mapping. For a
+no-retrieval control matching native LingBot sink retention, explicitly set
+`window_frames: 18`, `sink_frames: 9`, and `retrieval_frames: 0`.
+
+Only single-rank, single-sequence eager attention with clean-x0 KV commits is
+supported. First-block sharing and last-denoise-step KV reuse are rejected.
+The model's session reservation includes policy history, pending commits,
+retrieved device rows and layer-local scratch; a minimum legacy pool remains
+allocated for runtime geometry. CPU bank capacity must fit at least one
+complete compressed chunk across all layers, including pose and row metadata.
+For the 40-layer, 40-head LingBot geometry at 480x832 in bf16, a three-frame
+chunk with ratio 0.25 needs approximately 1.79 GiB. A small FIFO bank can fit a
+chunk yet evict it before it becomes eligible for retrieval: provision enough
+history to survive the sink/recent exclusion window.
+
+Retrieval ranks absolute C2W poses by normalized translation and rotation
+distance. It excludes sink and still-visible recent chunks, fits complete
+bank chunks into the retrieval token budget, and preserves chronological order
+for attention. The CPU bank is byte-bounded with FIFO eviction. Retrieved rows
+are transferred once per chunk/layer and reused during denoising. A new pose,
+clean commit, failed forward, reset or close invalidates device staging.
+Only a successful all-layer clean forward publishes history and bank together;
+failed publication leaves canonical state unchanged. Session branches and
+requests own separate memories and release them on reset or close.
+
+This branch contains only the WorldKV-inspired retrieval/compression path.
+Deep Sink, Participative Compression, RoPE rebasing and CausVid policy integration
+are not included; their configuration keys are rejected. Stored and retrieved
+keys retain their original temporal RoPE phase. This is a method transfer to
+LingBot v2, not a claim to reproduce the original paper's full benchmark or
+improve long-video quality. Prior three-minute results belong to the combined
+branch and do not replace validation of this extraction.
+
+CPU tests cover dense numerical compression oracles, raw/retrieved attention,
+feature isolation, bank capacity and eviction, transaction rollback, and real
+LingBot attention/transformer integration. GPU output and performance claims
+require E2E results for the exact branch revision, backend and workload.
