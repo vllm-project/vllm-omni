@@ -43,6 +43,7 @@ class TestKeyBasedReadWrite:
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() - 1) is None
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1)[0] == {"value": 7}
 
+    # Stable IDs keep xdist collection identical despite the per-process random key.
     @pytest.mark.parametrize(
         "key",
         ["test_key_1", "speech-" + uuid.uuid4().hex + "-" + uuid.uuid4().hex + "_0_0"],
