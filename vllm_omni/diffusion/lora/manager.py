@@ -88,6 +88,7 @@ class DiffusionLoRAManager:
     _active_adapter_id: int | None = None
     _suspended_adapter_id: int | None = None
     _max_num_batched_tokens: int | None = None
+    _defer_moe_wrap: bool = False
 
     def __init__(
         self,
@@ -163,6 +164,10 @@ class DiffusionLoRAManager:
         self._fixed_adapter = getattr(pipeline, "diffusion_lora_fixed_adapter", False) is True
         self._fixed_adapter_request: LoRARequest | None = None
         self._scale_in_epilogue = getattr(pipeline, "diffusion_lora_scale_in_epilogue", False) is True
+        # Pipelines that own their MoE quant-method dispatch opt out of the eager
+        # no-adapter MoE runner wrap. Runners are still wrapped when a loaded
+        # adapter targets them.
+        self._defer_moe_wrap = getattr(pipeline, "diffusion_lora_defer_moe_wrap", False) is True
 
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -186,7 +191,8 @@ class DiffusionLoRAManager:
             # MoE kernels are LoRA-capable as soon as vllm_config.lora_config is
             # set, including HunyuanImage3 baseline generate() before any
             # adapter is loaded. Wrap runners and publish a no-adapter mapping
-            # so TRTLLM LoRA experts have a context on that first forward.
+            # so TRTLLM LoRA experts have a context on that first forward,
+            # unless the pipeline sets diffusion_lora_defer_moe_wrap.
             self._ensure_moe_lora_context()
             bind = getattr(pipeline, "_bind_diffusion_lora_manager", None)
             if callable(bind):
@@ -644,8 +650,11 @@ class DiffusionLoRAManager:
         ``configure_diffusion_vllm_config`` sets ``lora_config`` for MoE + PEFT
         even when no adapter is loaded. TRTLLM LoRA experts then require a
         context on every apply(), including HunyuanImage3 baseline generate().
+
+        Skipped when the pipeline sets ``diffusion_lora_defer_moe_wrap``; its
+        runners are then wrapped only when a loaded adapter targets them.
         """
-        if self._max_num_batched_tokens is None:
+        if self._max_num_batched_tokens is None or self._defer_moe_wrap:
             return
         if self._max_lora_rank <= 0:
             self._ensure_max_lora_rank(min(self._VALID_MAX_RANKS))

@@ -109,8 +109,11 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     ) -> None:
         if hasattr(layer, "pre_quant_scale"):
             raise ValueError(f"{module_name} uses unsupported SmoothQuant pre_quant_scale")
+        # Merged layers (e.g. gate/up) hold one tensorwise scale per logical
+        # shard until the native transform requantizes them to a single scale.
         weight_scale = getattr(layer, "weight_scale", None)
-        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != 1:
+        num_shards = len(getattr(layer, "logical_widths", None) or [None])
+        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != num_shards:
             raise ValueError(f"{module_name} requires serialized tensorwise FP8 weights")
         fp8_kernel = getattr(method, "kernel", None)
         from vllm.model_executor.kernels.linear.scaled_mm.marlin import (

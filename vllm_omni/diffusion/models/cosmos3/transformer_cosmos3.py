@@ -240,6 +240,22 @@ def _validate_mixed_precision_runtime(
             raise ValueError("Cosmos3 mixed precision with HSDP does not support CPU offload")
 
 
+def _validate_moe_mixed_precision_runtime(od_config: OmniDiffusionConfig) -> None:
+    # Routed experts switch precision through a per-object quant_method.apply
+    # override, which these features bypass or replace without notice.
+    if getattr(od_config, "lora_path", None):
+        raise ValueError(
+            "Cosmos3 mixed precision on routed experts does not support LoRA "
+            "because the LoRA MoE wrapper replaces the expert quant method"
+        )
+    cache_backend = getattr(od_config, "cache_backend", None)
+    if cache_backend not in (None, "none"):
+        raise ValueError(
+            "Cosmos3 mixed precision on routed experts does not support Cache-DiT "
+            f"or other step caches (cache_backend={cache_backend!r})"
+        )
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -1533,6 +1549,8 @@ class Cosmos3VFMTransformer(nn.Module):
         if mixed_precision_config is not None:
             self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
             self.mixed_precision_runtime.install(self)
+            if self.mixed_precision_runtime.has_routed_experts:
+                _validate_moe_mixed_precision_runtime(od_config)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps) if is_pp_last_rank else PPMissingLayer()
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
