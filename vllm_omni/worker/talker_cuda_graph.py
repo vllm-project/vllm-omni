@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import os
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Hashable
@@ -143,7 +142,7 @@ class CUDANarrowStep:
         outside this callback. The returned storage is overwritten by the next
         replay and must be cloned before retaining multiple frame outputs.
         """
-        if not capture or self.inputs_embeds.device.type != "cuda" or os.environ.get("KSTEP_CUDA_GRAPH", "1") == "0":
+        if not capture or self.inputs_embeds.device.type != "cuda":
             self.eager_calls += 1
             return forward()
         captured = self.graphs.get(graph_key)
@@ -203,7 +202,7 @@ class CUDANarrowStep:
         The callback must bind each frame, update embeddings, forward, sample,
         and store frame outputs without host reads or request-dictionary writes.
         """
-        if self.inputs_embeds.device.type != "cuda" or os.environ.get("KSTEP_CUDA_GRAPH", "1") == "0":
+        if self.inputs_embeds.device.type != "cuda":
             self.eager_calls += 1
             return forward_frames()
         key = ("fused", state_key)
@@ -483,8 +482,6 @@ def begin_cuda_narrow_step(
     spans: list[tuple[int, int]],
     graph_owner: Any = None,
 ) -> CUDANarrowStep | None:
-    if os.environ.get("KSTEP_CUDA_NARROW", "1") == "0":
-        return _decline("disabled")
     rows = len(spans)
     metadata = forward_context.attn_metadata
     if not rows or frames < 1 or not isinstance(metadata, dict) or positions.ndim != 1:

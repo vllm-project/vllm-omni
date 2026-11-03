@@ -116,7 +116,6 @@ class _FakeCUDA:
 @pytest.mark.cpu
 @pytest.mark.parametrize("failure", ["warmup", "capture", "registration", None])
 def test_fused_trial_advances_state_once_and_failed_key_does_not_retry(monkeypatch, failure):
-    monkeypatch.setenv("KSTEP_CUDA_GRAPH", "1")
     state = _State()
     narrow = _narrow(state, fake_cuda=True)
     initial = state.snapshot()
@@ -161,7 +160,6 @@ def test_fused_trial_advances_state_once_and_failed_key_does_not_retry(monkeypat
 @pytest.mark.cpu
 @pytest.mark.parametrize("restore_number", [1, 2])
 def test_fused_restore_failure_propagates_without_eager_or_cache(monkeypatch, restore_number):
-    monkeypatch.setenv("KSTEP_CUDA_GRAPH", "1")
     state = _State()
     narrow = _narrow(state, fake_cuda=True)
     cuda = _FakeCUDA(monkeypatch, state.advance, "registration" if restore_number == 2 else None)
@@ -204,8 +202,7 @@ def test_snapshot_restores_every_workspace_field_rng_kv_and_embedding_in_place()
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-def test_real_cuda_fused_first_capture_and_replay_match_one_eager_step(monkeypatch):
-    monkeypatch.setenv("KSTEP_CUDA_GRAPH", "1")
+def test_real_cuda_fused_first_capture_and_replay_match_one_eager_step():
     state = _State("cuda")
     narrow = _narrow(state)
     initial = state.snapshot()

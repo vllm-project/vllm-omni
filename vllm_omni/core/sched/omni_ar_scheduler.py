@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -821,12 +820,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         c=16/c=32 throughput (25 ms/step against main's 3.7), while a budget of
         16 keeps the frames and lands within 3-5% of main.
         """
-        override = os.environ.get("KSTEP_MAX_ROWS")
-        if override:
-            try:
-                return max(1, int(override))
-            except ValueError:
-                pass
         config = getattr(self, "scheduler_config", None) or getattr(
             getattr(self, "vllm_config", None), "scheduler_config", None
         )
@@ -840,14 +833,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Drop the Talker's K-frame width for a wide decode batch.
 
         Returns the previous ``num_spec_tokens`` when the caller must restore it,
-        None when the step keeps its K-step width.
-
-        With the default row budget (``max_num_seqs``) the guard below never
-        fires — every batch the scheduler can hold keeps the K-frame loop — so
-        this only takes effect when ``KSTEP_MAX_ROWS`` is lowered explicitly.
+        None when the step keeps its K-step width. The row budget equals the
+        engine's ``max_num_seqs``, so the guard below never fires for a batch
+        the scheduler can hold; it remains for a future budget that admits
+        fewer rows than the active request cap.
         """
-        if os.environ.get("KSTEP_PLAIN_STEP", "1") == "0":
-            return None
         if not self._talker_kstep_armed():
             return None
         device_config = getattr(getattr(self, "vllm_config", None), "device_config", None)

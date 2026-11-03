@@ -10,7 +10,6 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
-import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
@@ -671,10 +670,8 @@ class GPUARModelRunner(
           filters are the two-wide continue/stop logits, so the codec vocabulary
           alone is not enough;
         * the workspace-bound codec prelude and the seeded exponential fill,
-          which the model compiles on first use inside ``prepare_cuda_kstep``.
+        which the model compiles on first use inside ``prepare_cuda_kstep``.
         """
-        if os.environ.get("KSTEP_WARMUP_SAMPLER", "1") == "0":
-            return
         try:
             from vllm.v1.sample.ops.topk_topp_triton import (
                 _SPLIT_MAX_BATCH,
