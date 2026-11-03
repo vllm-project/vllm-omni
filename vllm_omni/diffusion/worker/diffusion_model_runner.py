@@ -16,6 +16,7 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -1414,7 +1415,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if new_req.diffusion_kv_metadata is not None:
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
-            return self._execute_stepwise_core(
+            execute = (
+                self._execute_completion_boundary
+                if getattr(self.od_config, "completion_boundary_batching", False)
+                else self._execute_stepwise_core
+            )
+            return execute(
                 scheduler_output,
                 record_output_peak_memory=record_output_peak_memory,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
@@ -1424,6 +1430,66 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
+
+    def _execute_completion_boundary(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        record_output_peak_memory: bool,
+        in_diffusion_kv_memory_profile: bool = False,
+    ) -> BatchRunnerOutput:
+        """Keep one admitted cohort on the worker until its first completion.
+
+        Reuse the ordinary step implementation, including per-request Euler grids,
+        error handling, output preparation, and retirement. Only the engine /
+        worker round trip and serving-scheduler admission frequency change.
+        """
+        if self.od_config.streaming_output:
+            raise ValueError("completion_boundary_batching does not support streaming output")
+
+        def execute(wave: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+            return self._execute_stepwise_core(
+                wave,
+                record_output_peak_memory=record_output_peak_memory,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+            )
+
+        output = execute(scheduler_output)
+        request_ids = scheduler_output.scheduled_request_ids
+
+        def reached_boundary(result: BatchRunnerOutput) -> bool:
+            for request_id in request_ids:
+                item = result.get_request_output(request_id)
+                if item is None:
+                    raise RuntimeError(f"Missing grouped step output for {request_id}")
+                if item.finished or item.result is not None or item.wait_for_interaction is not None:
+                    return True
+            return not request_ids
+
+        if reached_boundary(output):
+            return output
+        # Use initialized schedules: a pipeline may use fewer actual updates
+        # than sampling_params.num_inference_steps (e.g. a terminal grid point).
+        remaining = min(
+            self.state_cache[request_id].total_steps - self.state_cache[request_id].step_index
+            for request_id in request_ids
+        )
+        if remaining <= 0:
+            raise RuntimeError("Grouped step execution reached a schedule end without a terminal output")
+        cached_wave = replace(
+            scheduler_output,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(request_ids=list(request_ids)),
+            finished_req_ids=set(),
+        )
+        for _ in range(remaining):
+            previous = {request_id: self.state_cache[request_id].step_index for request_id in request_ids}
+            output = execute(cached_wave)
+            if reached_boundary(output):
+                return output
+            if any(self.state_cache[request_id].step_index != previous[request_id] + 1 for request_id in request_ids):
+                raise RuntimeError("Grouped step execution must advance each request by exactly one step")
+        raise RuntimeError("Grouped step execution did not stop at the expected completion boundary")
 
     def _execute_stepwise_core(
         self,

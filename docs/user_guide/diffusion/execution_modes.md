@@ -125,6 +125,43 @@ its throughput — see the measured numbers in the
 — so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
 selected pipeline's documentation and source for the latest support status.
 
+## Completion-Boundary Batching (Experimental)
+
+With a single-device, non-streaming step pipeline, opt into worker-local step
+grouping until the first request in the current cohort completes:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni \
+  --step-execution \
+  --completion-boundary-batching \
+  --max-num-seqs 8
+```
+
+The default is off. The Python and stage configuration field is
+`completion_boundary_batching=True`; it requires `step_execution=True`,
+`streaming_output=False`, `num_gpus=1`, and the default
+`diffusion_kv_mode="dense_legacy"`.
+
+For example, requests with 4 and 10 remaining denoising updates share four
+updates before returning control to the serving scheduler. The finished request
+returns its output, while the survivor keeps its latent, conditioning, generator,
+and original timestep schedule. Subsequent admission still uses the existing
+scheduler's capacity, FIFO, shape, guidance, LoRA, and first-step compatibility
+checks. This option does not relax any of those checks.
+
+Grouping reduces serving-scheduler and executor round trips. The ordinary
+pipeline's per-step operations, tensor preparation, and scheduler updates still
+run on every denoising step. New arrivals wait until the next completion
+boundary; larger groups can therefore increase admission and cancellation
+latency. Existing request cancellation checks inside a pipeline remain in place,
+but this option does not add checks between locally grouped steps.
+
+A per-request error, interrupt, intermediate output, or interaction wait returns
+control early. Streaming and multi-device execution are excluded from this
+experimental option. Pipelines must already implement step execution; this flag
+does not add it to request-only pipelines such as the current Pi0.5 integration.
+No model or GPU performance improvement is guaranteed by this option.
+
 ## Streaming Output
 
 Use `--diffusion-streaming-output` for a pipeline that can produce intermediate

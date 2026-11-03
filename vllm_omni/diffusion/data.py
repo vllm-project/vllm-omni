@@ -1148,6 +1148,7 @@ class OmniDiffusionConfig:
 
     # Step mode settings
     step_execution: bool = False
+    completion_boundary_batching: bool = False
 
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
@@ -1340,6 +1341,9 @@ class OmniDiffusionConfig:
             if self.enable_sleep_mode:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
+        if self.completion_boundary_batching and (not self.step_execution or self.streaming_output):
+            raise ValueError("completion_boundary_batching requires step_execution=True and streaming_output=False")
+
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
@@ -1373,6 +1377,10 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if self.completion_boundary_batching and self.num_gpus != 1:
+            raise ValueError("completion_boundary_batching currently requires a single device")
+        if self.completion_boundary_batching and self.diffusion_kv_mode is not DiffusionKVCacheMode.DENSE_LEGACY:
+            raise ValueError("completion_boundary_batching currently requires diffusion_kv_mode='dense_legacy'")
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)

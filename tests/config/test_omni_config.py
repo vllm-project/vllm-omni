@@ -2633,3 +2633,15 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+@pytest.mark.parametrize("model_type", ["bagel", "bagel_single_stage"])
+def test_completion_boundary_cli_is_scoped_to_diffusion(model_type):
+    config = _from_pipeline_key(
+        model_type, cli_overrides={"step_execution": True, "completion_boundary_batching": True}
+    )
+    for stage in config.stage_configs:
+        if isinstance(stage, VllmOmniDiffusionStageConfig):
+            assert stage.diffusion_config.completion_boundary_batching is True
+        else:
+            assert not getattr(stage, "completion_boundary_batching", False)
