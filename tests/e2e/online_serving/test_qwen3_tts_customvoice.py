@@ -297,16 +297,18 @@ def test_run_stage_chain_returns_speech(omni_server, run_level: str) -> None:
 def test_run_stage_chain_across_single_stage_servers(run_level: str) -> None:
     """Ensure servers that each run one stage chain /v1/run calls into the speech."""
     request_config = {"input": get_prompt(), "voice": "vivian", "response_format": "wav"}
-    with _single_stage_server(0, run_level) as talker, _single_stage_server(1, run_level) as code2wav:
+    # NOTE: Start the servers one at a time to avoid hanging from clearing the GPU memory.
+    with _single_stage_server(0, run_level) as talker:
         first = requests.post(
             f"http://{talker.host}:{talker.port}/v1/run",
             json={"stage_input": _stage0_input(request_config["input"], request_config["voice"])},
             timeout=300,
         )
         first.raise_for_status()
-        next_request = first.json()
-        assert next_request["stage_id"] == 1
+    next_request = first.json()
+    assert next_request["stage_id"] == 1
 
+    with _single_stage_server(1, run_level) as code2wav:
         final = requests.post(f"http://{code2wav.host}:{code2wav.port}/v1/run", json=next_request, timeout=300)
         final.raise_for_status()
     response = OmniResponse(success=True, audio_bytes=_output_to_wav(final.json()["output"]), audio_format="audio/wav")
