@@ -207,16 +207,18 @@ def test_session_continuation_and_nonlocking_retain():
     kv.end_request("world", retain=retain2)
     assert cache.pool.has(("world", 2, 1, 0)) and not cache.pool.has(("world", 1, 1, 0))
 
-    # Continuation retain pins only the keep set; prior is reclaimable via last-use.
+    # Separate pool: world still holds one retained version after the half above.
+    wide_cache = _cache(history=6)
+    wide_kv = NoisyKVState(wide_cache)
     wide = _schedule(chunks=6, kv_history_chunks=6, chunk_base=6)
     for chunk in range(6):
-        cache.pool.alloc(("wide", chunk, 1, 0))
+        wide_cache.pool.alloc(("wide", chunk, 1, 0))
     plan = build_cell_plan(wide, prior_history=expected_prior_cells(wide))
     keep = clean_history_cells(wide, num_blocks=1)
-    kv.begin_request("wide", plan, chunk_tokens=4, retain=keep)
+    wide_kv.begin_request("wide", plan, chunk_tokens=4, retain=keep)
     assert expected_prior_cells(wide).isdisjoint(keep)
-    assert all(not kv._is_retained("wide", cell) for cell in expected_prior_cells(wide))
-    assert all(kv._is_retained("wide", cell) for cell in keep)
+    assert all(not wide_kv._is_retained("wide", cell) for cell in expected_prior_cells(wide))
+    assert all(wide_kv._is_retained("wide", cell) for cell in keep)
 
 
 def test_runner_lifecycle_and_batch_isolation(monkeypatch):
