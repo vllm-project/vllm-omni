@@ -46,7 +46,10 @@ def test_rocm_base_tracks_cuda_bootstrap_release() -> None:
     assert separator, f"expected a tagged ROCm base image, got {rocm_base}"
     assert cuda_image == "vllm/vllm-openai"
     assert image_ref == "vllm/vllm-openai-rocm"
-    assert image_tag == cuda_release_tag == _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG").split("@")[0]
+    cuda_ci_tag = _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG").replace(
+        "${VLLM_VERSION}", _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_VERSION")
+    )
+    assert image_tag == cuda_release_tag == cuda_ci_tag.split("@")[0]
 
 
 def test_rocm_defaults_to_building_the_candidate_runtime() -> None:

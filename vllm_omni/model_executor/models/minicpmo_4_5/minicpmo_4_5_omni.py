@@ -1219,7 +1219,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 except TypeError:
                     text = decode(chunk)
             except Exception:
+                logger.debug(
+                    "MiniCPM-o soft character-cap decode failed for row %s; retaining hard token/request caps.",
+                    row,
+                    exc_info=True,
+                )
                 continue
+            # Invalid UTF-8 may also leave U+FFFD; hard token/request caps bound this fallback.
             if isinstance(text, str) and not text.endswith("\ufffd") and len(text) >= max_chars:
                 capped.add(row)
         return capped

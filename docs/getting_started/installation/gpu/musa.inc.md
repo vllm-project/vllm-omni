@@ -29,6 +29,9 @@ vLLM-Omni for MUSA requires building from source. Pre-built wheels are not curre
 
 #### Installation of vLLM-MUSA
 
+The MUSA source steps below remain pinned to `v0.18.0-dev`. MUSA runtime
+validation for this checkout's vLLM 0.33.0 alignment has not been performed.
+
 ```bash
 git clone https://github.com/MooreThreads/vllm-musa.git
 cd vllm-musa

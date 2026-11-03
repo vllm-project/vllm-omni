@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.utils.torch_utils import _add_stored_gemm_outputs
 
 from .attention import Magi2PackedAttentionKernel, VarlenHandler
 from .common_layers import (
@@ -48,18 +49,6 @@ class Modality(IntEnum):
     AUDIO = 1
     TEXT = 2
     TIME = 3
-
-
-def _add_stored_gemm_outputs(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    """Add GEMM outputs after each result has been stored.
-
-    Inductor rewrites ``gemm + gemm`` as ``addmm`` and adds in the accumulator,
-    skipping the bf16 store eager inserts between the GEMM and the add.
-    Promoting the compiled add restores that store-then-add rounding.
-    """
-    if torch.compiler.is_compiling():
-        return (left.float() + right.float()).to(dtype=left.dtype)
-    return left + right
 
 
 class Magi2Attention(nn.Module):

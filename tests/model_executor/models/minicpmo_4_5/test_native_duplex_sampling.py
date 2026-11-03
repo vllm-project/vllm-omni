@@ -209,7 +209,7 @@ def _character_cap_case(monkeypatch, *, deferred, all_greedy=True):
 @pytest.mark.parametrize("prefix", [[20] * 9, [20] * 8 + [19]])
 def test_character_target_keeps_crossing_token_then_caps_without_sampling(monkeypatch, deferred, all_greedy, prefix):
     model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
-    # Token20 has3characters, token19 has2:27+2 crosses;26+2 reaches28.
+    # Token 20 has 3 characters, token 19 has 2: 27 + 2 crosses; 26 + 2 reaches 28.
     md.output_token_ids[0] = prefix.copy()
     assert sample(19) == 19
     assert state.generated_tokens == [19]

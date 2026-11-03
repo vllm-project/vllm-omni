@@ -21,10 +21,18 @@ SCRIPT = Path(__file__).resolve().parents[2] / ".buildkite/cuda/scripts/check_vl
 )
 @pytest.mark.parametrize("lmcache_abi_error", [False, True])
 @pytest.mark.parametrize("version", ["0.33.0", "0.33.0rc3.dev3+g4ba787ec9", "0.33.0.post1"])
-@pytest.mark.parametrize("cudnn", [92501, 92400])
-def test_release_wheel_commit_check(monkeypatch, commit, lmcache_abi_error, version, cudnn):
+@pytest.mark.parametrize("cudnn,cudnn_preamble", [(92501, ""), (92400, ""), (92501, "# Private runtime pin\n\n")])
+def test_release_wheel_commit_check(monkeypatch, commit, lmcache_abi_error, version, cudnn, cudnn_preamble):
     # Source and package identities are independent: RC and final wheels can
     # share a commit, and a different build can advertise the final version.
+    if cudnn_preamble:
+        original_read_text = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            text = original_read_text(path, *args, **kwargs)
+            return cudnn_preamble + text if path.name == "cudnn-runtime.txt" else text
+
+        monkeypatch.setattr(Path, "read_text", read_text)
     fake_vllm = ModuleType("vllm")
     vars(fake_vllm)["__version__"] = version
     fake_version = ModuleType("vllm._version")

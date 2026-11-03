@@ -26,7 +26,11 @@ def main() -> None:
         raise RuntimeError(f"Missing vLLM version pin in {dockerfile}")
     expected_version = version_match.group(1)
     cudnn_requirements = root / "requirements/cudnn-runtime.txt"
-    cudnn_match = re.match(r"nvidia-cudnn-cu13==(\d+)\.(\d+)\.(\d+)\.\d+(?:\s|$)", cudnn_requirements.read_text())
+    cudnn_match = re.search(
+        r"^nvidia-cudnn-cu13==(\d+)\.(\d+)\.(\d+)\.\d+(?:\s|$)",
+        cudnn_requirements.read_text(),
+        re.MULTILINE,
+    )
     if cudnn_match is None:
         raise RuntimeError(f"Missing cuDNN runtime pin in {cudnn_requirements}")
     major, minor, patch = map(int, cudnn_match.groups())
