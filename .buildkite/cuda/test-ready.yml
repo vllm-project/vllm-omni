@@ -22,10 +22,20 @@ steps:
           - "pytest -sv tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
-      - label: "Simple · Engine&Entrypoints&Diffusion Test"
+      # Split the CPU sweep so neither half approaches the step timeout
+      # (#9847). The merged step collected 11540 tests and ran pytest for
+      # 19m47s (build 18720); the halves below collect roughly half of that
+      # each and keep the same per-step timeout budget.
+      - label: "Simple · Engine&Entrypoints Test"
         timeout_in_minutes: 25
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
+          - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Diffusion Test"
+        timeout_in_minutes: 25
+        commands:
+          - "pytest -sv tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
