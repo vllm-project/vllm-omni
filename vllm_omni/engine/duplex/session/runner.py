@@ -1648,7 +1648,10 @@ class DuplexSessionRunner:
         request_id = self.ctx.manager.stage_request_id(
             append_fence,
             stage_id=0,
-            resumable=session.capabilities.supports_core_resumable_request,
+            resumable=(
+                session.capabilities.supports_core_resumable_request
+                or session.capabilities.supports_turn_kv_continuation
+            ),
         )
         if final or precreate_response:
             session.bind_request(request_id)
