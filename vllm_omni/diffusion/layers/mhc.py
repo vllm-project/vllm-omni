@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2026 SandAI. All Rights Reserved.
 
-"""Native and eager Triton mHC post-processing, without projection or tensor caches."""
+"""Native and eager Triton mHC post-processing, without projection or tensor caches.
+
+The statically-unrolled bit-exact post-residual kernel targets CUDA; MUSA keeps
+the #7261 tile kernel (``_mhc_post_residual_tile_kernel``).
+"""
 
 import threading
 
@@ -50,40 +54,34 @@ def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float)
     return matrix
 
 
-if current_omni_platform.is_musa():
+@triton.jit
+def _asm_add_rn_f32(a, b):
+    """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
 
-    @triton.jit
-    def _asm_add_rn_f32(a, b):
-        """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+    The native expression runs the scaled-logits multiply and the bias
+    add as separate kernels, so they can never fuse; an inline-asm add
+    is invisible to the optimizer's contraction and keeps the kernel
+    bit-equal to that boundary.
 
-        The MUSA assembler cannot allocate the PTX ``=f`` register class
-        for inline asm, so the barrier is expressed as a correctly-rounded
-        fused op instead: ``fma_rn(a, 1.0, b)`` is exactly the
-        correctly-rounded ``a + b`` (``a * 1`` is exact) and is already a
-        single fused multiply-add, so the optimizer cannot contract
-        anything further.
-        """
-        return tldevice.fma_rn(a, 1.0, b)
+    Only the CUDA bit-exact kernel uses this barrier; MUSA dispatches to
+    the #7261 tile kernel, so the inline asm is never compiled there.
+    """
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;",
+        "=f,f,f",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
 
-else:
 
-    @triton.jit
-    def _asm_add_rn_f32(a, b):
-        """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
-
-        The native expression runs the scaled-logits multiply and the bias
-        add as separate kernels, so they can never fuse; an inline-asm add
-        is invisible to the optimizer's contraction and keeps the kernel
-        bit-equal to that boundary.
-        """
-        return tl.inline_asm_elementwise(
-            "add.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            [a, b],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+# CUDA runs the statically-unrolled bit-exact kernel, which mirrors the
+# PyTorch CUDA reduction orders and libdevice expf/div_rn. MUSA keeps the
+# #7261 tile kernel: on S5000 (Triton 3.2) the unrolled form both diverges
+# from the eager formula by one ULP and compiles roughly 15x slower
+# (7-9 ms vs ~0.5 ms per call); see the #7545 review thread.
+_POST_RESIDUAL_BITEXACT = not current_omni_platform.is_musa()
 
 
 @triton.jit
@@ -468,6 +466,50 @@ def _mhc_post_residual_kernel(
 
 
 @triton.jit
+def _mhc_post_residual_tile_kernel(
+    post_ptr,
+    residual_ptr,
+    alpha_post_ptr,
+    bias_post_ptr,
+    alpha_residual_ptr,
+    bias_residual_ptr,
+    post_out_ptr,
+    residual_out_ptr,
+    post_stride,
+    residual_stride,
+    scale,
+    epsilon,
+    iterations: tl.constexpr,
+):
+    # The #7261 tile kernel, kept verbatim for MUSA: one token per program
+    # with vectorized tl.sigmoid/tl.exp/tl.sum/tl.max reductions. MUSA Triton
+    # (3.2, S5000) compiles and runs this form fast and parity-exact, while
+    # the statically-unrolled bit-exact kernel is both slower there and one
+    # ULP off the eager formula (see _POST_RESIDUAL_BITEXACT).
+    token = tl.program_id(0).to(tl.int64)
+    index = tl.arange(0, 4)
+    post = tl.load(post_ptr + token * post_stride + index)
+    ap = tl.load(alpha_post_ptr)
+    bp = tl.load(bias_post_ptr + index)
+    post = 2.0 * tl.sigmoid(ap * scale * post + bp)
+    offsets = index[:, None] * 4 + index[None, :]
+    matrix = tl.load(residual_ptr + token * residual_stride + offsets)
+    ar = tl.load(alpha_residual_ptr)
+    br = tl.load(bias_residual_ptr + offsets)
+    matrix = ar * scale * matrix + br
+    # Native amax propagates any NaN to the whole token's normalization.
+    has_nan = tl.sum(tl.sum((matrix != matrix).to(tl.int32), axis=0), axis=0) != 0
+    maximum = tl.max(tl.max(matrix, axis=0), axis=0)
+    maximum = tl.where(has_nan, float("nan"), maximum)
+    matrix = tl.exp(matrix - maximum)
+    for _ in tl.static_range(iterations):
+        matrix = matrix / (tl.sum(matrix, axis=0)[None, :] + epsilon)
+        matrix = matrix / (tl.sum(matrix, axis=1)[:, None] + epsilon)
+    tl.store(post_out_ptr + token * 4 + index, post)
+    tl.store(residual_out_ptr + token * 16 + offsets, matrix)
+
+
+@triton.jit
 def _mhc_mix_kernel(streams_ptr, branch_ptr, post_ptr, matrix_ptr, out_ptr, hidden, block_size: tl.constexpr):
     token = tl.program_id(0).to(tl.int64)
     channels = tl.program_id(1).to(tl.int64) * block_size + tl.arange(0, block_size)
@@ -574,21 +616,38 @@ class MHCPostResidual(CustomOp):
         residual_out = torch.empty((tokens, 4, 4), device=post_logits.device, dtype=out_dtype)
         if tokens:
             try:
-                _mhc_post_residual_kernel[(triton.cdiv(tokens, 32),)](
-                    *tensors,
-                    post_out,
-                    residual_out,
-                    post_logits.stride(0),
-                    residual_logits.stride(0),
-                    scale,
-                    epsilon,
-                    tokens,
-                    iterations=iterations,
-                    tokens_per_program=32,
-                    out_dtype_code={torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}[out_dtype],
-                    num_warps=1,
-                    enable_fp_fusion=False,
-                )
+                if _POST_RESIDUAL_BITEXACT:
+                    _mhc_post_residual_kernel[(triton.cdiv(tokens, 32),)](
+                        *tensors,
+                        post_out,
+                        residual_out,
+                        post_logits.stride(0),
+                        residual_logits.stride(0),
+                        scale,
+                        epsilon,
+                        tokens,
+                        iterations=iterations,
+                        tokens_per_program=32,
+                        out_dtype_code={torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}[out_dtype],
+                        num_warps=1,
+                        enable_fp_fusion=False,
+                    )
+                else:
+                    # MUSA keeps the #7261 tile kernel: the bit-exact unrolled
+                    # form is one ULP off the eager formula on S5000 and runs
+                    # roughly 15x slower there.
+                    _mhc_post_residual_tile_kernel[(tokens,)](
+                        *tensors,
+                        post_out,
+                        residual_out,
+                        post_logits.stride(0),
+                        residual_logits.stride(0),
+                        scale,
+                        epsilon,
+                        iterations=iterations,
+                        num_warps=1,
+                        enable_fp_fusion=False,
+                    )
             except Exception as error:
                 if _is_mhc_oom_error(error):
                     raise
