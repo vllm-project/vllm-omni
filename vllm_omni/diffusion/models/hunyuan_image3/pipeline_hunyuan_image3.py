@@ -391,6 +391,9 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
+        shared_group = getattr(od_config, "weight_sharing", None)
+        # The AR adapter's router contract is FP32; ordinary DiT stays unchanged.
+        shared_router_dtype = torch.float32 if shared_group is not None and shared_group.role == "consumer" else None
         if backbone_meta:
             from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
 
@@ -398,9 +401,13 @@ class HunyuanImage3Pipeline(
             # Only the shared backbone is constructed on meta; private
             # components below are built on the worker's target device.
             with torch.device("meta"):
-                self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+                self.model = HunyuanImage3Model(
+                    self.hf_config, quant_config=quant_config, shared_router_dtype=shared_router_dtype
+                )
         else:
-            self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+            self.model = HunyuanImage3Model(
+                self.hf_config, quant_config=quant_config, shared_router_dtype=shared_router_dtype
+            )
         self.transformer = self.model
         # Lazy import to break circular dependency:
         # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan

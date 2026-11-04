@@ -1655,6 +1655,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         layer_id: int = -1,
         prefix: str = "",
         enable_eplb: bool = False,
+        shared_router_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1686,12 +1687,14 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
 
+        # None preserves the ordinary model dtype and autocast behavior.
+        self._shared_router_dtype = shared_router_dtype
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
             quant_config=quant_config,
-            params_dtype=torch.float32,
+            params_dtype=shared_router_dtype,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1736,15 +1739,12 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts). The router is FP32 to match
-        # the HF reference and the AR stage; run the gate outside bf16 autocast
-        # so the FP32 weight is not downcast, and cast the input to float. A
-        # BF16 checkpoint router is cast to FP32 on load by the ReplicatedLinear.
-        if hidden_states.device.type == "cuda":
-            with torch.autocast(device_type="cuda", enabled=False):
-                router_logits, _ = self.gate(hidden_states.float())
+        # Only shared routers override the ordinary dtype/autocast contract.
+        if self._shared_router_dtype is not None:
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                router_logits, _ = self.gate(hidden_states.to(dtype=self._shared_router_dtype))
         else:
-            router_logits, _ = self.gate(hidden_states.float())
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         return final_hidden_states.view(orig_shape)
@@ -1907,7 +1907,12 @@ class HunYuanAttention(nn.Module):
 
 class HunyuanImage3DecoderLayer(nn.Module):
     def __init__(
-        self, config: HunyuanImage3Config, quant_config: QuantizationConfig | None, layer_idx: int, prefix: str = ""
+        self,
+        config: HunyuanImage3Config,
+        quant_config: QuantizationConfig | None,
+        layer_idx: int,
+        prefix: str = "",
+        shared_router_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1951,7 +1956,11 @@ class HunyuanImage3DecoderLayer(nn.Module):
             or (isinstance(config.num_experts, list) and max(config.num_experts) > 1)
         ) and layer_idx >= config.moe_layer_num_skipped:
             self.mlp = HunYuanSparseMoeBlock(
-                config, quant_config=quant_config, layer_id=layer_idx, prefix=f"{prefix}.mlp"
+                config,
+                quant_config=quant_config,
+                layer_id=layer_idx,
+                prefix=f"{prefix}.mlp",
+                shared_router_dtype=shared_router_dtype,
             )
         else:
             self.mlp = HunYuanMLP(
@@ -2139,7 +2148,13 @@ class HunyuanImage3Model(nn.Module):
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        config: HunyuanImage3Config,
+        quant_config=None,
+        prefix: str = "",
+        shared_router_dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         lora_config = None
         self.num_redundant_experts = 0
@@ -2169,6 +2184,7 @@ class HunyuanImage3Model(nn.Module):
                 quant_config=quant_config,
                 layer_idx=int(prefix.split(".")[-1]),
                 prefix=prefix,
+                shared_router_dtype=shared_router_dtype,
             ),
             prefix=f"{prefix}.layers" if prefix else "layers",
         )

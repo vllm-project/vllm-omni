@@ -314,6 +314,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         if load_format == "dummy":
             return
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A weight-sharing load was already attempted; tear down the sharing group before retrying."
+            )
 
         # Resolve environment overrides before model loading. Rank-local
         # prompt-cache hits cannot safely skip text-encoder collectives.
@@ -349,6 +353,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return nullcontext()
 
         # Load model within forward context
+        weight_sharing_backend = None
+        shared_group = getattr(self.od_config, "weight_sharing", None)
+        if shared_group is not None:
+            if shared_group.role != "consumer":
+                raise ValueError("diffusion weight sharing requires role='consumer'")
+            from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
+
+            weight_sharing_backend = TorchCudaIpcBackend()
+            # Own uncertain imports even when the loader never returns a pipeline.
+            self._weight_share_backend = weight_sharing_backend
+            self._weight_share_session_id = shared_group.session_id
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
@@ -360,6 +375,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     load_format=load_format,
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
+                    weight_sharing_backend=weight_sharing_backend,
                 )
                 if initialize_lora is not None and getattr(self.pipeline, "requires_early_lora_init", False) is True:
                     initialize_lora()

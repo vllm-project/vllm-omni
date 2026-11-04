@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Consumer load ownership: production runner/loader methods with CPU IPC tokens."""
+
+import importlib
+import sys
+import time
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from tests.distributed.weight_sharing.helpers import FakeCodec, load_class_methods, make_context, make_weights
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class LoadError(RuntimeError):
+    pass
+
+
+@pytest.fixture
+def consumer_load(weight_sharing, contracts, monkeypatch):
+    codec = FakeCodec(contracts)
+    provider = weight_sharing.TorchCudaIpcBackend(codec=codec)
+    backend = weight_sharing.TorchCudaIpcBackend(codec=codec)
+    context = make_context(contracts)
+    bindings, spec = make_weights(contracts, two_storages=True)
+    exported = provider.prepare_export(bindings, spec, context)
+    payload = provider.claim_export(exported)
+    group = SimpleNamespace(role="consumer", session_id="session", payload=payload)
+    factory = Mock(return_value=backend)
+    monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing", weight_sharing)
+    monkeypatch.setattr(weight_sharing, "TorchCudaIpcBackend", factory)
+    adapter = importlib.import_module(f"{weight_sharing.__name__}.adapters.hunyuan_image3")
+    monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3", adapter)
+    # Model binding is outside this test; imported views still have real backend lifetimes.
+    monkeypatch.setattr(adapter, "shared_param_full_names", lambda model: [])
+    model = SimpleNamespace(
+        named_parameters=lambda: [], named_buffers=lambda: [], named_modules=lambda: [], eval=lambda: model
+    )
+
+    def attach(received_backend, received_payload, received_group, device_index):
+        assert received_backend is runner._weight_share_backend is backend
+        assert received_group is group
+        assert runner._weight_share_session_id == "session"
+        imported = backend.open_import(received_payload, spec, context)
+        model.views = list(imported.values())  # Model-owned aliases make close_import return HELD.
+        return imported
+
+    model.attach_shared_backbone = Mock(side_effect=attach)
+    loader_cls = load_class_methods(
+        "vllm_omni/diffusion/model_loader/diffusers_loader.py",
+        "DiffusersPipelineLoader",
+        ["load_model", "_get_shared_weight_group", "_load_model_with_shared_backbone"],
+        {
+            "torch": SimpleNamespace(device=lambda _: SimpleNamespace(index=0)),
+            "set_default_torch_dtype": lambda _: nullcontext(),
+        },
+    )
+    loader = loader_cls()
+    loader.od_config = SimpleNamespace(weight_sharing=group, dtype="float32")
+    loader.quant_config = None
+    loader.parallel_config = SimpleNamespace(use_hsdp=False)
+    loader._init_from_load_format = Mock(return_value=model)
+    loader.load_weights = Mock()
+    loader._process_weights_after_loading = Mock()
+    loader._attach_offload_startup_state = Mock()
+    namespace = {
+        "resolve_prompt_embed_cache_config": lambda **_: (False, 0),
+        "resolve_offload": lambda _: None,
+        "offload_enabled": lambda _: False,
+        "current_omni_platform": Mock(),
+        "LoadConfig": Mock(),
+        "DiffusersPipelineLoader": Mock(return_value=loader),
+        "time": time,
+        "nullcontext": nullcontext,
+        "DeviceMemoryProfiler": nullcontext,
+    }
+    runner_cls = load_class_methods(
+        "vllm_omni/diffusion/worker/diffusion_model_runner.py",
+        "DiffusionModelRunner",
+        ["load_model"],
+        namespace,
+    )
+    runner = runner_cls()
+    runner.od_config = loader.od_config
+    runner.vllm_config = SimpleNamespace()
+    runner.device = "cuda:0"
+    return SimpleNamespace(runner=runner, loader=loader, model=model, backend=backend, codec=codec, factory=factory)
+
+
+@pytest.mark.parametrize("failure", ["preflight", "partial_import", "private_weights", "postprocess"])
+def test_load_failure_retains_backend_and_blocks_retry(consumer_load, contracts, failure):
+    r = consumer_load
+    if failure == "preflight":
+        r.model.attach_shared_backbone.side_effect = LoadError("preflight failed")
+    elif failure == "partial_import":
+        r.codec.failures["import"] = (2, RuntimeError("import failed"))
+    elif failure == "private_weights":
+        r.loader.load_weights.side_effect = LoadError("private weights failed")
+    else:
+        r.loader._process_weights_after_loading.side_effect = LoadError("postprocess failed")
+
+    with pytest.raises((LoadError, contracts.WeightSharingError)):
+        r.runner.load_model()
+    assert not hasattr(r.runner, "pipeline")
+    assert r.runner._weight_share_backend is r.backend
+    assert r.runner._weight_share_session_id == "session"
+    if failure == "preflight":
+        with pytest.raises(contracts.WeightSharingError, match="unknown session"):
+            r.backend.session_status("session")
+    else:
+        snapshot = r.backend.session_status("session")
+        assert snapshot.state == contracts.SessionState.POISONED
+        if failure == "partial_import":
+            assert snapshot.imported_storage_ids == ("storage-0",)
+            assert snapshot.active_storage_id == "storage-1"
+        else:
+            assert all(not lease.expired() for lease in r.codec.leases)
+
+    calls = list(r.codec.calls)
+    with pytest.raises(RuntimeError, match="already attempted"):
+        r.runner.load_model()
+    assert r.codec.calls == calls
+    r.factory.assert_called_once_with()
+    r.model.attach_shared_backbone.assert_called_once()
+
+
+def test_pipeline_return_keeps_same_backend_on_runner(consumer_load):
+    r = consumer_load
+    r.model.requires_early_lora_init = True
+    # Stop after pipeline assignment, before unrelated compilation/cache setup.
+    with pytest.raises(LoadError, match="after load"):
+        r.runner.load_model(initialize_lora=Mock(side_effect=LoadError("after load")))
+    assert r.runner.pipeline is r.model
+    assert r.model._weight_share_backend is r.runner._weight_share_backend is r.backend
+    assert r.model._weight_share_import.session_id == r.runner._weight_share_session_id
+    r.factory.assert_called_once_with()
+
+
+def test_loader_requires_caller_owned_backend(consumer_load):
+    r = consumer_load
+    with pytest.raises(ValueError, match="runner-owned"):
+        r.loader.load_model("cuda:0")
+    r.loader._init_from_load_format.assert_not_called()
+    r.factory.assert_not_called()
+
+
+def test_disabled_sharing_does_not_create_backend(consumer_load):
+    r = consumer_load
+    r.runner.od_config.weight_sharing = None
+    r.loader.load_model = Mock(side_effect=LoadError("ordinary load"))
+    with pytest.raises(LoadError, match="ordinary load"):
+        r.runner.load_model()
+    assert r.loader.load_model.call_args.kwargs.get("weight_sharing_backend") is None
+    assert not hasattr(r.runner, "_weight_share_backend")
+    r.factory.assert_not_called()
+
+
+@pytest.mark.parametrize("declared", [False, None])
+def test_unsupported_postload_is_rejected_before_import(consumer_load, monkeypatch, declared):
+    r = consumer_load
+    method = SimpleNamespace()
+    if declared is not None:
+        method.supports_pre_processed_weights = declared
+    r.model.named_parameters = lambda: [("shared.weight", object())]
+    r.model.named_modules = lambda: [("shared", SimpleNamespace(quant_method=method))]
+    adapter = sys.modules["vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3"]
+    monkeypatch.setattr(adapter, "shared_param_full_names", lambda _: ["shared.weight"])
+    monkeypatch.setitem(r.loader._load_model_with_shared_backbone.__globals__, "QuantizeMethodBase", SimpleNamespace)
+    with pytest.raises(ValueError, match="does not support preprocessed shared weights"):
+        r.runner.load_model()
+    r.model.attach_shared_backbone.assert_not_called()
+    assert not r.codec.imports

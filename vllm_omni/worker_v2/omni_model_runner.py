@@ -420,6 +420,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
         if getattr(self, "_weight_share_session", None) is not None:
             return  # Already published; step-3 owns teardown, do not re-export.
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A previous weight-sharing publish attempt did not complete; "
+                "tear down the sharing group before retrying."
+            )
         publish = getattr(self.model, "publish_shared_backbone", None)
         if publish is None:
             raise ValueError(
@@ -437,11 +442,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             device_index = int(index)
         backend = TorchCudaIpcBackend()
-        # Assign both handles only after publish succeeds, so a failed publish
-        # leaves neither a dangling backend nor a half-set session behind.
-        session = publish(backend, group, device_index)
+        # Retain partial exports and their diagnostics if publish raises. The
+        # session ID remains queryable once the backend registers the session.
         self._weight_share_backend = backend
-        self._weight_share_session = session
+        self._weight_share_session_id = group.session_id
+        self._weight_share_session = publish(backend, group, device_index)
         logger.info("Published shared backbone weights for sharing group %s", getattr(group, "group_id", None))
 
     def _adopt_model_logits_vocab(self, model: Any) -> None:

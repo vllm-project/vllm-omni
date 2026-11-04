@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import huggingface_hub
 import torch
@@ -66,6 +66,9 @@ from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.weight_sharing.contracts import WeightSharingBackend
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -727,8 +730,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         load_format: str | None = "default",
         custom_pipeline_name: str | type[nn.Module] | None = None,
         device: torch.device | None = None,
+        weight_sharing_backend: "WeightSharingBackend | None" = None,
     ) -> nn.Module:
-        """Load a model with the given configurations."""
+        """Load a model, using the runner-owned backend when weight sharing is enabled.
+
+        The caller retains the backend and session identity across load failures;
+        a failed shared load must not be replayed with a replacement backend.
+        """
         self.host_weight_plan = None
         self._hwr_state = None
         self._last_load_request = {
@@ -763,7 +771,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         shared_group = self._get_shared_weight_group()
         if shared_group is not None:
-            return self._load_model_with_shared_backbone(shared_group, load_format, custom_pipeline_name, target_device)
+            if weight_sharing_backend is None:
+                raise ValueError("shared-backbone loading requires a runner-owned weight-sharing backend")
+            return self._load_model_with_shared_backbone(
+                shared_group, load_format, custom_pipeline_name, target_device, weight_sharing_backend
+            )
 
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
@@ -1092,13 +1104,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model: nn.Module,
         target_device: torch.device,
         *,
-        skip_module_names: frozenset[str] = frozenset(),
+        preprocessed_module_names: frozenset[str] = frozenset(),
     ) -> None:
         """Process weights after loading for quantization methods.
 
         This handles vLLM's quantization methods that need to process weights
         after loading (e.g., FP8 online quantization from BF16/FP16 weights).
+        Shared modules must pass the preprocessed-weight capability check before
+        import; they initialize local kernels without transforming shared tensors.
         """
+        if preprocessed_module_names:
+            from vllm.model_executor.utils import weights_already_processed
+
         # Newer upstream vLLM online-quant methods (uses_meta_device=True) create
         # weights on the ``meta`` device and materialize them just-in-time as each
         # layer's weights finish loading (via the layerwise online-process loader).
@@ -1124,10 +1141,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             finalize_layerwise_processing(model, model_config=None)
 
         for module_name, module in model.named_modules():
-            if module_name in skip_module_names:
-                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                continue
+
+            if module_name in preprocessed_module_names:
+                with weights_already_processed():
+                    quant_method.process_weights_after_loading(module)
                 continue
 
             # Layers finished during loading would only be staged onto the target
@@ -1350,6 +1370,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         load_format: str | None,
         custom_pipeline_name: str | type[nn.Module] | None,
         target_device: torch.device,
+        backend: "WeightSharingBackend",
     ) -> nn.Module:
         """Build a consumer pipeline with a meta backbone and bind the provider.
 
@@ -1359,7 +1380,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         stage-private weights from disk.  It intentionally bypasses the
         ordinary (whole-backbone) load path to avoid a second backbone peak.
         """
-        from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
         from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import (
             is_shared_checkpoint_name,
             shared_param_full_names,
@@ -1395,46 +1415,41 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         payload = getattr(shared_group, "payload", None)
         if payload is None:
             raise ValueError("consumer weight sharing requires the provider's claimed payload")
-        backend = TorchCudaIpcBackend()
-        # Retain session ownership before import so any later failure can still
-        # close or mark the session on this (owner) thread for step-3 teardown.
+        # Reject unsupported finalization before creating any IPC mappings.
+        shared = shared_param_full_names(model)
+        shared_module_names = frozenset(name.rsplit(".", 1)[0] for name in shared)
+        shared_set = set(shared)
+        for full_name, _param in model.named_parameters():
+            if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
+                raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
+        for full_name, _buffer in model.named_buffers():
+            owner_name = full_name.rsplit(".", 1)[0]
+            if owner_name not in shared_module_names:
+                continue
+            owner = model.get_submodule(owner_name) if owner_name else model
+            if full_name.rsplit(".", 1)[1] not in owner._non_persistent_buffers_set:
+                raise ValueError(f"shared-backbone module owns a persistent buffer: {full_name}")
+        for name, module in model.named_modules():
+            if name not in shared_module_names:
+                continue
+            method = getattr(module, "quant_method", None)
+            if method is not None and (
+                not isinstance(method, QuantizeMethodBase)
+                or not getattr(method, "supports_pre_processed_weights", False)
+            ):
+                raise ValueError(f"{name}: {type(method).__name__} does not support preprocessed shared weights")
+
+        # The runner already owns the backend; keep the successful pipeline's
+        # lifecycle handles here too for normal teardown.
         model._weight_share_backend = backend
         model._weight_share_import = None
         try:
             imported = attach(backend, payload, shared_group, device_index)
             model._weight_share_import = imported
 
-            shared = shared_param_full_names(model)
             params_by_name = dict(model.named_parameters())
-            # The imported views are finalized; post-load processing must not
-            # touch them at all: an in-place repack corrupts the provider's
-            # live weights and a swap silently drops the sharing. Skip the
-            # modules that own them.
+            # Local kernel initialization must preserve the imported bindings.
             shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
-            shared_module_names = set(name.rsplit(".", 1)[0] for name in shared)
-            # The FusedMoE quant_method lives on ``...mlp.experts`` while its
-            # weights live one level deeper (``experts.routed_experts``); skip
-            # that container too so post-load conversion never repacks shared
-            # experts in place.
-            for name in shared:
-                parts = name.split(".")
-                if "experts" in parts:
-                    shared_module_names.add(".".join(parts[: parts.index("experts") + 1]))
-            shared_module_names = frozenset(shared_module_names)
-            shared_set = set(shared)
-            for full_name in params_by_name:
-                if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
-                    raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
-            for full_name, _buffer in model.named_buffers():
-                owner_name = full_name.rsplit(".", 1)[0]
-                if owner_name not in shared_module_names:
-                    continue
-                owner = model.get_submodule(owner_name) if owner_name else model
-                # Non-persistent buffers are runtime state (e.g. inv_freq), not
-                # quant scales/zero_point; they are fine to leave untouched.
-                if full_name.rsplit(".", 1)[1] in getattr(owner, "_non_persistent_buffers_set", ()):
-                    continue
-                raise ValueError(f"shared-backbone module owns a persistent buffer: {full_name}")
 
             # Mark shared params as planned and drop checkpoint keys that feed
             # them. disallow_weights is a backstop that fails loudly if the
@@ -1445,7 +1460,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 weight_name_filter=is_shared_checkpoint_name,
                 disallow_weights=shared,
             )
-            self._process_weights_after_loading(model, target_device, skip_module_names=shared_module_names)
+            self._process_weights_after_loading(model, target_device, preprocessed_module_names=shared_module_names)
 
             params_by_name = dict(model.named_parameters())
             for name in shared:
