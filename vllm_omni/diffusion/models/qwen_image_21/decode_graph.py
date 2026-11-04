@@ -48,6 +48,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.diffusion.layers.device_gates import TRITON_FASTPATH_DEVICE_TYPES
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ logger = init_logger(__name__)
 
 # Device types this decode path runs on: CUDA (ROCm reports the same device
 # type) and MUSA, where torchada provides the CUDA entry points it calls.
-_DECODE_GRAPH_DEVICE_TYPES = ("cuda", "musa")
+_DECODE_GRAPH_DEVICE_TYPES = TRITON_FASTPATH_DEVICE_TYPES
 
 
 def _graph_capture_capable() -> bool:

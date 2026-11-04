@@ -15,6 +15,22 @@ from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer a
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+class _CudaDevice:
+    """A device that still reports ``cuda`` where torchada remaps ``torch.device``.
+
+    On a MUSA build ``torch.device("cuda", 1)`` becomes ``musa:1``, so these
+    unqualified-CUDA cases would silently exercise the MUSA branch instead. The
+    code under test only reads ``type``/``index`` and hands the object to a mocked
+    ``torch.get_device_module``, so a stand-in keeps the CUDA coverage portable.
+    """
+
+    type = "cuda"
+    index = 1
+
+    def __repr__(self) -> str:
+        return "device(type='cuda', index=1)"
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     "version,hip,device,expected",
@@ -31,9 +47,10 @@ def test_exact_rope_stack_and_input_device(monkeypatch, version, hip, device, ex
     monkeypatch.setattr(torch, "get_device_module", Mock(return_value=backend))
     monkeypatch.setattr(torch, "__version__", version)
     monkeypatch.setattr(torch.version, "hip", hip)
-    assert pointwise.supports_exact_rope(torch.device(device)) is expected
+    resolved = _CudaDevice() if device.startswith("cuda") else torch.device(device)
+    assert pointwise.supports_exact_rope(resolved) is expected
     if expected:
-        backend.get_device_capability.assert_called_once_with(torch.device(device))
+        backend.get_device_capability.assert_called_once_with(resolved)
     else:
         backend.get_device_capability.assert_not_called()
 
@@ -43,7 +60,7 @@ def test_exact_rope_stack_and_input_device(monkeypatch, version, hip, device, ex
 @pytest.mark.parametrize("path", ["rotary", "qk_rotary"])
 @torch.no_grad()
 def test_unqualified_device_declines_before_allocation(monkeypatch, capability, path):
-    device = torch.device("cuda", 1)
+    device = _CudaDevice()
 
     def tensor(shape, dtype=torch.bfloat16):
         value = Mock(device=device, dtype=dtype, shape=shape, ndim=len(shape))

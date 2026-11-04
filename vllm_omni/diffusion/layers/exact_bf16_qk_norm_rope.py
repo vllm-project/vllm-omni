@@ -7,6 +7,7 @@ import os
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.layers.device_gates import TRITON_FASTPATH_DEVICE_TYPES
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import supports_exact_rope
 
 if HAS_TRITON:
@@ -187,7 +188,7 @@ def qk_rotary(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if (
         not HAS_TRITON
-        or q.device.type not in ("cuda", "musa")
+        or q.device.type not in TRITON_FASTPATH_DEVICE_TYPES
         or q.dtype != torch.bfloat16
         or q.ndim != 4
         or q.shape != k.shape

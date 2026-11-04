@@ -5,6 +5,8 @@
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.layers.device_gates import TRITON_FASTPATH_DEVICE_TYPES
+
 
 def eligible(*values: torch.Tensor) -> bool:
     first = values[0]
@@ -179,7 +181,7 @@ def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
     if (
         not HAS_TRITON
         or torch.version.hip is not None
-        or x.device.type not in ("cuda", "musa")
+        or x.device.type not in TRITON_FASTPATH_DEVICE_TYPES
         or x.dtype != torch.bfloat16
         or x.ndim != 4
         or x.shape[-1] != 128

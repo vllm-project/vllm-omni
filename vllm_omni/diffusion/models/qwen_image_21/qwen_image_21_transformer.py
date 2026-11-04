@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.device_gates import TRITON_FASTPATH_DEVICE_TYPES
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
@@ -107,7 +108,7 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
 # MUSA lands on the fallback that Inductor turns into one ~353 us kernel per
 # projection. The fused kernel keeps that fallback's arithmetic (unfused products),
 # so it is bit-exact with it.
-_FUSED_ROPE_DEVICE_TYPES = ("cuda", "musa")
+_FUSED_ROPE_DEVICE_TYPES = TRITON_FASTPATH_DEVICE_TYPES
 
 
 def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:

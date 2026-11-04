@@ -161,7 +161,7 @@ def _launch(
     return residual, output
 
 
-if HAS_TRITON and hasattr(torch.library, "custom_op"):
+if HAS_TRITON:
     # Inductor cannot inline a custom op, which is the point: it keeps the fused
     # kernel instead of re-deriving the expression and re-fusing it its own way.
     @torch.library.custom_op("vllm_omni::fused_residual_layer_norm", mutates_args=())
@@ -282,7 +282,7 @@ def _launch_norm_scale(x: torch.Tensor, multiplier: torch.Tensor, eps: float) ->
     return output
 
 
-if HAS_TRITON and hasattr(torch.library, "custom_op"):
+if HAS_TRITON:
 
     @torch.library.custom_op("vllm_omni::fused_layer_norm_scale", mutates_args=())
     def _fused_layer_norm_scale_op(x: torch.Tensor, multiplier: torch.Tensor, eps: float) -> torch.Tensor:
