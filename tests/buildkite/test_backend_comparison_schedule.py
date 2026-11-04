@@ -31,7 +31,8 @@ def comparison_runner(tmp_path: Path):
     git.chmod(0o755)
     entry = yaml.safe_load(ENTRY.read_text())
     command = next(step for step in entry["steps"] if step["key"] == "upload-backend-comparison")["commands"][0]
-    # The existing initial upload unescapes $$ before this command executes.
+    # Every dollar in the routing command is interpreted at job time, including the regex end anchor.
+    assert "$" not in command.replace("$$", ""), "Unescaped dollar in Buildkite upload command"
     command = command.replace("$$", "$")
     env = {
         "PATH": f"{bindir}:/usr/bin:/bin",

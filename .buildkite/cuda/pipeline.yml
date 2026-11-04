@@ -38,7 +38,7 @@ steps:
               exit 1
             fi
           done
-          if [[ ! "$${BUILDKITE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+          if [[ ! "$${BUILDKITE_COMMIT}" =~ ^[0-9a-f]{40}$$ ]] ||
              [[ "$$(git rev-parse HEAD)" != "$${BUILDKITE_COMMIT}" ]]; then
             echo "Backend comparison requires an immutable commit matching the checkout." >&2
             exit 1
