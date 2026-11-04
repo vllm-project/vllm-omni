@@ -50,6 +50,9 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
         self._reference_force_compute = False
         self._reference_state = None
         self._reference_phase_key = None
+        self._reference_phase_keys: dict[str, tuple] = {}
+        self._primary_cache_context = self.cache_context
+        self._phase_contexts_available = True
         self._reference_skips_notified = False
         self.context_manager = _ReferenceCacheManager(self.context_manager, self)
 
@@ -85,22 +88,62 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
             self._notify_reference_skips()
         return super().call_Bn_blocks(hidden_states, *args, **kwargs)
 
+    def _activate_phase_context(self, phase: str) -> None:
+        """Point cache_context at this phase's own context, creating it on first use.
+
+        pattern_base re-activates ``self.cache_context`` inside its own forward, so the
+        name has to be swapped on the instance rather than by calling set_context here.
+        """
+        name = self._primary_cache_context if phase == "refresh" else f"{self._primary_cache_context}::{phase}"
+        manager = self.context_manager
+        if name not in manager._cached_context_manager:
+            base = manager._cached_context_manager[self._primary_cache_context]
+            try:
+                manager.set_context(name, *base._init_args, **base._init_kwargs)
+            except Exception as exc:
+                # Creation needs persistent_context; without it there is one context to
+                # share, which is the pre-feature behaviour. Say so rather than guess.
+                logger.warning_once(
+                    "MiniMax-H3 reference-KV phase contexts unavailable, falling back to a "
+                    "single shared cache context: %s",
+                    exc,
+                )
+                self._phase_contexts_available = False
+                self.cache_context = self._primary_cache_context
+                return
+        self.cache_context = name
+
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         state = kwargs.get("reference_kv_state")
         if state is None:
             self._reference_phase_key = None
+            self.cache_context = self._primary_cache_context
             return super().forward(hidden_states, *args, **kwargs)
 
+        compact = bool(kwargs.get("reference_kv_compact", False))
+        phase_contexts = bool(getattr(state, "phase_contexts", False)) and self._phase_contexts_available
+        self.cache_context = self._primary_cache_context
         self.context_manager.set_context(self.cache_context)
-        phase_key = (
+        geometry = (
             ref(state),
-            state.reference_epoch,
-            bool(kwargs.get("reference_kv_compact", False)),
+            compact,
             tuple(hidden_states.shape),
             hidden_states.dtype,
             hidden_states.device,
         )
-        changed = phase_key != self._reference_phase_key
+        if phase_contexts:
+            # The epoch is deliberately not part of the key: a refresh updates the
+            # reference KV the reuse phase reads, but reuse is built on that KV being
+            # slowly varying, so its residual history stays valid across one.
+            phase = "reuse" if compact else "refresh"
+            changed = geometry != self._reference_phase_keys.get(phase)
+            self._activate_phase_context(phase)
+            self.context_manager.set_context(self.cache_context)
+            self._reference_phase_keys[phase] = geometry
+            phase_key = (phase, geometry)
+        else:
+            phase_key = (ref(state), state.reference_epoch, *geometry[1:])
+            changed = phase_key != self._reference_phase_key
         self._reference_force_compute = (
             state.is_reference_refresh_step or changed or not state.supports_block_cache_reuse
         )
@@ -117,7 +160,9 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
             return result
         except Exception:
             self._reference_phase_key = None
+            self._reference_phase_keys.clear()
             self._clear_reference_history()
+            self.cache_context = self._primary_cache_context
             raise
         finally:
             self._reference_state = None

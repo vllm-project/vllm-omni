@@ -14,6 +14,7 @@ class ReferenceKVConfig:
     kv_refresh_interval: int = 2
     kv_host_quantization: str = "none"
     kv_cache_location: str = "host"
+    kv_cache_phase_contexts: bool = False
 
 
 def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig | None:
@@ -21,7 +22,7 @@ def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig
         return None
     if not isinstance(value, dict):
         raise ValueError("kv_offload_config must be a JSON object")
-    allowed = {"mode", "kv_refresh_interval", "kv_host_quantization", "kv_cache_location"}
+    allowed = {"mode", "kv_refresh_interval", "kv_host_quantization", "kv_cache_location", "kv_cache_phase_contexts"}
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"unknown kv_offload_config keys: {sorted(unknown)}")
@@ -37,4 +38,7 @@ def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig
     location = value.get("kv_cache_location", "host")
     if location not in ("host", "device"):
         raise ValueError("kv_cache_location must be host or device")
-    return ReferenceKVConfig(mode, interval, quantization, location)
+    phase_contexts = value.get("kv_cache_phase_contexts", False)
+    if type(phase_contexts) is not bool:
+        raise ValueError("kv_cache_phase_contexts must be a boolean")
+    return ReferenceKVConfig(mode, interval, quantization, location, phase_contexts)

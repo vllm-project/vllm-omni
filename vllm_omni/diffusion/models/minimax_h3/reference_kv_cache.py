@@ -62,6 +62,7 @@ class _MiniMaxH3ReferenceKVBase:
         self.device = torch.device(device)
         self.refresh_interval = int(refresh_interval)
         self.pin_memory = bool(pin_memory)
+        self.phase_contexts = False
         if host_quantization not in {"none", "fp8", "int8"}:
             raise ValueError(f"host_quantization must be one of none, fp8, int8, got {host_quantization!r}")
         self.host_quantization = host_quantization
@@ -249,6 +250,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             refresh_interval=config.kv_refresh_interval,
             host_quantization=config.kv_host_quantization,
         )
+        state.phase_contexts = bool(config.kv_cache_phase_contexts)
         _log.info(
             "MiniMax-H3 reference-KV enabled: layers=%d, global_ref_rows=%d, "
             "refresh_interval=%d, device=%s, ring_size=%d, "
@@ -831,6 +833,7 @@ class MiniMaxH3ReferenceKVDeviceState(MiniMaxH3ReferenceKVTier2State):
             refresh_interval=config.kv_refresh_interval,
             host_quantization=config.kv_host_quantization,
         )
+        state.phase_contexts = bool(config.kv_cache_phase_contexts)
         _log.info(
             "MiniMax-H3 reference-KV enabled: layers=%d, global_ref_rows=%d, "
             "refresh_interval=%d, device=%s, location=device, storage_quantization=%s, "
