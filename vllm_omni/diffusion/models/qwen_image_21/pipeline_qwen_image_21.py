@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -158,8 +159,13 @@ def _should_encode_negative_prompt(true_cfg_scale: float | None, negative_prompt
     An absent negative prompt does not imply an empty/default negative prompt.
     Explicit empty strings do request negative conditioning when CFG is enabled.
     """
-    if true_cfg_scale is not None and not isinstance(true_cfg_scale, Real):
-        raise ValueError("true_cfg_scale must be a real number or None.")
+    if true_cfg_scale is not None:
+        try:
+            valid_scale = isinstance(true_cfg_scale, Real) and math.isfinite(true_cfg_scale)
+        except OverflowError:
+            valid_scale = False
+        if not valid_scale:
+            raise ValueError("true_cfg_scale must be a finite real number or None.")
     if true_cfg_scale is None or true_cfg_scale <= 1 or negative_prompt is None:
         return False
     if isinstance(negative_prompt, list):
@@ -240,15 +246,22 @@ def get_qwen_image_21_pre_process_func(
                 raw_image = multi_modal_data.get("img2img")
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
+        else:
+            # CFG sweeps and fan-out can share a caller-owned prompt dict.
+            # Copy its top-level fields without cloning conditioning tensors.
+            prompt = dict(prompt)
         encode_negative_prompt = _should_encode_negative_prompt(
             request.sampling_params.true_cfg_scale, prompt.get("negative_prompt")
         )
-        if not encode_negative_prompt:
+        if encode_negative_prompt and not isinstance(prompt.get("negative_prompt"), str):
+            raise ValueError("A single request's negative_prompt must be a string or None.")
+        if not encode_negative_prompt and prompt.get("negative_prompt") is not None:
             # Preserve CFG-off ignore semantics beyond encoding: compatibility
             # keys, cache preparation and role handoff must not see placeholders.
             prompt["negative_prompt"] = None
-        if "additional_information" not in prompt:
-            prompt["additional_information"] = {}
+        # Image preparation writes into this container. Keep its fields local
+        # to the request, while retaining references to tensor payloads.
+        prompt["additional_information"] = dict(prompt.get("additional_information") or {})
 
         metadata = DiffusionRequestBatch.get_prompt_field(prompt, "qwen_image_21_metadata")
         conditioning = DiffusionRequestBatch.get_prompt_field(prompt, "qwen_image_21_conditioning")

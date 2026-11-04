@@ -82,6 +82,7 @@ def test_text_input_forms_share_compatibility_key(preprocess, prompt):
     empty_list_request = preprocess(make_request("empty-list", []))
     assert processed.batch_compatibility_key is not None
     assert processed.batch_compatibility_key == empty_list_request.batch_compatibility_key
+    assert "negative_prompt" not in processed.prompt
 
 
 @pytest.mark.parametrize("image_type", ["numpy", "tensor"])
@@ -178,14 +179,68 @@ def test_preprocess_clears_unused_negative_prompt(preprocess, true_cfg_scale, ne
     request = make_request("cfg-off", [])
     request.sampling_params.true_cfg_scale = true_cfg_scale
     request.prompt["negative_prompt"] = negative_prompt
+    original_prompt = request.prompt
 
     processed = preprocess(request)
     reference = preprocess(make_request("no-negative", []))
 
     assert processed.prompt["negative_prompt"] is None
+    assert original_prompt["negative_prompt"] is negative_prompt
     assert processed.batch_compatibility_key == reference.batch_compatibility_key
     # Even non-serializable placeholders must disappear before role handoff.
     json.dumps(processed.prompt)
+
+
+@pytest.mark.parametrize("order", [("off", "on"), ("on", "off")])
+def test_preprocess_preserves_negative_prompt_shared_by_cfg_requests(preprocess, order):
+    shared_prompt = {"prompt": "A ceramic teapot", "negative_prompt": "blurry"}
+    requests = {name: make_request(name, []) for name in order}
+    for name, request in requests.items():
+        request.prompt = shared_prompt
+        request.sampling_params.true_cfg_scale = 1.0 if name == "off" else 3.0
+
+    processed = {name: preprocess(requests[name]) for name in order}
+
+    assert shared_prompt == {"prompt": "A ceramic teapot", "negative_prompt": "blurry"}
+    assert processed["off"].prompt["negative_prompt"] is None
+    assert processed["on"].prompt["negative_prompt"] == "blurry"
+    assert processed["off"].batch_compatibility_key[-1] is False
+    assert processed["on"].batch_compatibility_key[-1] is True
+
+
+@pytest.mark.parametrize("negative_prompt", [["blurry"], ["blurry", "artifacts"]])
+def test_preprocess_rejects_negative_prompt_batches_for_a_single_request(preprocess, negative_prompt):
+    request = make_request("negative-batch", [])
+    request.sampling_params.true_cfg_scale = 3.0
+    request.prompt["negative_prompt"] = negative_prompt
+
+    with pytest.raises(ValueError, match="single request.*negative_prompt"):
+        preprocess(request)
+
+
+def test_preprocess_isolates_shared_additional_information(preprocess):
+    import torch
+
+    payload = torch.ones(1, 2, 4)
+    shared_info = {"custom_payload": payload}
+    first = make_request("square", [(64, 64)], color="red")
+    second = make_request("wide", [(128, 64)], color="blue")
+    first.prompt["additional_information"] = shared_info
+    second.prompt["additional_information"] = shared_info
+
+    first, second = preprocess(first), preprocess(second)
+
+    first_info = first.prompt["additional_information"]
+    second_info = second.prompt["additional_information"]
+    assert first_info is not second_info
+    assert first_info is not shared_info and second_info is not shared_info
+    assert set(shared_info) == {"custom_payload"}
+    assert first_info["custom_payload"] is second_info["custom_payload"] is payload
+    assert first_info["prompt_image"][0].getpixel((0, 0)) == (255, 0, 0)
+    assert second_info["prompt_image"][0].getpixel((0, 0)) == (0, 0, 255)
+    assert tuple(first_info["input_image_sizes"]) == first.batch_compatibility_key[1]
+    assert tuple(second_info["input_image_sizes"]) == second.batch_compatibility_key[1]
+    assert first_info["input_image_sizes"] != second_info["input_image_sizes"]
 
 
 @pytest.mark.parametrize("handoff_uses_original_prompt", [False, True])
@@ -212,21 +267,35 @@ def test_cfg_off_negative_prompt_is_cleared_across_role_handoff(preprocess, hand
 
     processed = preprocess(downstream)
 
-    assert processed.prompt["negative_prompt"] is None
+    assert processed.prompt.get("negative_prompt") is None
+    assert ("negative_prompt" in processed.prompt) is handoff_uses_original_prompt
     assert processed.prompt[payload_key] is payload
     assert processed.batch_compatibility_key == encoded.batch_compatibility_key
     json.dumps(processed.prompt)
 
 
-@pytest.mark.parametrize("true_cfg_scale", ["bad", "1.0", [], {}])
+@pytest.mark.parametrize(
+    "true_cfg_scale",
+    [
+        "bad",
+        "1.0",
+        [],
+        {},
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        pytest.param(10**400, id="huge-int"),
+        pytest.param(-(10**400), id="huge-negative-int"),
+    ],
+)
 @pytest.mark.parametrize("encoded", [False, True])
-def test_preprocess_rejects_non_numeric_cfg_scale(preprocess, true_cfg_scale, encoded):
+def test_preprocess_rejects_invalid_cfg_scale(preprocess, true_cfg_scale, encoded):
     request = make_request("bad-cfg", [])
     request.sampling_params.true_cfg_scale = true_cfg_scale
     if encoded:
         request.prompt["qwen_image_21_metadata"] = {"height": 1024, "width": 1024}
 
-    with pytest.raises(ValueError, match="true_cfg_scale must be a real number"):
+    with pytest.raises(ValueError, match="true_cfg_scale"):
         preprocess(request)
 
 

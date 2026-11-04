@@ -577,7 +577,7 @@ def test_sigma_comparison_does_not_round_reference_values_to_tensor_dtype():
         QwenImage21Pipeline._validate_stage_batch_settings(DiffusionRequestBatch(requests=requests), ("sigmas",))
 
 
-@pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])
+@pytest.mark.parametrize("true_cfg_scale", [None, False, True, 1.0, 3.0, np.float32(3.0)])
 @pytest.mark.parametrize("negative_prompt", [None, "", "blurry", [""], ["blurry", ""]])
 def test_negative_conditioning_presence_accepts_explicit_string_batches(true_cfg_scale, negative_prompt):
     assert _should_encode_negative_prompt(true_cfg_scale, negative_prompt) is (
@@ -585,11 +585,25 @@ def test_negative_conditioning_presence_accepts_explicit_string_batches(true_cfg
     )
 
 
-@pytest.mark.parametrize("true_cfg_scale", ["bad", "1.0", [], {}])
-def test_encode_conditioning_rejects_non_numeric_cfg_scale_before_encoding(mocker, true_cfg_scale):
+@pytest.mark.parametrize(
+    "true_cfg_scale",
+    [
+        "bad",
+        "1.0",
+        [],
+        {},
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        torch.tensor(3.0),
+        pytest.param(10**400, id="huge-int"),
+        pytest.param(-(10**400), id="huge-negative-int"),
+    ],
+)
+def test_encode_conditioning_rejects_invalid_cfg_scale_before_encoding(mocker, true_cfg_scale):
     pipeline = _toy_pipeline()
     encoder = mocker.patch.object(pipeline, "encode_prompt")
-    with pytest.raises(ValueError, match="true_cfg_scale must be a real number"):
+    with pytest.raises(ValueError, match="true_cfg_scale"):
         pipeline._encode_conditioning(["prompt"], None, [], true_cfg_scale, 128)
     encoder.assert_not_called()
 

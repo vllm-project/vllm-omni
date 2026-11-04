@@ -377,7 +377,7 @@ contains normalized latents, and G passes them to `prepare_latents()` with
 | `true_cfg_scale` | 1.0 | Disables the negative-prompt branch by default. Set above 1 with a `negative_prompt` to enable true CFG. Qwen-Image 2.1 supports true CFG only — there is no `guidance_scale` parameter. |
 | `num_inference_steps` | 50 | Number of denoising steps. |
 | `height` / `width` | 1024×1024 | Must be multiples of 32. For image-conditioned requests, leaving them unset derives the output size from the last condition image's aspect ratio at ~1024×1024. |
-| `negative_prompt` | None | When `true_cfg_scale <= 1`, model preprocessing clears this field to `None` without validating it, before admission, cache preparation and role handoff. Used and validated only when `true_cfg_scale > 1`. HTTP request schemas still apply. |
+| `negative_prompt` | None | When `true_cfg_scale <= 1`, model preprocessing clears a supplied value to `None` in a shallow copy of the prompt, before admission, cache preparation and role handoff. An absent field stays absent. Used and validated only when `true_cfg_scale > 1`. HTTP request schemas still apply. |
 | condition images | — | Up to 4 input images per request; more than 4 raises an error. |
 | `seed` | — | Fix for reproducible outputs. |
 
@@ -387,9 +387,15 @@ denoising step. To enable negative-prompt guidance, explicitly set
 negative prompt. This changes the generated output as well as compute cost.
 
 The image HTTP API validates `true_cfg_scale` as a numeric field. Direct Python
-callers must also pass a real number or `None`; model preprocessing rejects
-non-numeric values with `ValueError`, including when receiving an encoded stage
-payload. An omitted scale defaults to 1.0.
+callers must pass a finite real scalar or `None`; model preprocessing rejects
+non-numeric values, NaN, infinity and tensor scalars with `ValueError`, including
+when receiving an encoded stage payload. An omitted scale defaults to 1.0.
+
+With CFG enabled, a single request's `negative_prompt` must be a string or
+`None`; the internal batch encoder accepts one string per request. Preprocessing
+shallow-copies both the prompt and its `additional_information` container so
+shared caller dictionaries cannot overwrite another request's negative prompt
+or prepared image conditions. Tensor payloads remain shared by reference.
 
 ### Prefix KV cache
 
