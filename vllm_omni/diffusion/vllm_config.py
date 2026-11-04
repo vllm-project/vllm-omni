@@ -234,9 +234,18 @@ def _supports_native_online_mxfp4_moe() -> bool:
     return ops.mxfp4_experts_quant_supported(capability.to_int())
 
 
+def _uses_explicit_lora_capable_moe_backend(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the requested MoE backend keeps LoRA available."""
+    moe_backend = getattr(od_config, "moe_backend", "auto")
+    moe_backend = getattr(moe_backend, "value", moe_backend)
+    return moe_backend == "marlin"
+
+
 def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
     """Return whether the model uses online MXFP4 MoE on a native backend."""
     if not od_config.is_moe:
+        return False
+    if _uses_explicit_lora_capable_moe_backend(od_config):
         return False
 
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig

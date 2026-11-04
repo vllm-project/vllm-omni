@@ -531,8 +531,10 @@ class DiffusionLoRAManager:
             if isinstance(component, nn.Module):
                 yield component_name, component
 
-    def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
-        self._ensure_max_lora_rank(peft_helper.r)
+    def _validate_adapter_targets(self, peft_helper: PEFTHelper) -> None:
+        """Reject MoE adapters before cache or layer state is mutated."""
+        if self._max_num_batched_tokens is not None:
+            return
 
         target_modules = getattr(peft_helper, "target_modules", None)
         target_modules_list: list[str] | None = None
@@ -551,18 +553,38 @@ class DiffusionLoRAManager:
                 return True
             return _match_target_modules(module_name, target_modules_list)
 
-        if self._max_num_batched_tokens is None:
-            from vllm.model_executor.layers.fused_moe import MoERunner
+        from vllm.model_executor.layers.fused_moe import MoERunner
 
-            for component_name, component in self._iter_lora_components():
-                for module_name, module in component.named_modules(remove_duplicate=False):
-                    if not isinstance(module, MoERunner):
-                        continue
-                    full_module_name = f"{component_name}.{module_name}"
-                    if _matches_target(full_module_name) or any(
-                        _matches_target(name) for name in _moe_lora_target_names(full_module_name, module)
-                    ):
-                        raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
+        for component_name, component in self._iter_lora_components():
+            for module_name, module in component.named_modules(remove_duplicate=False):
+                if not isinstance(module, MoERunner):
+                    continue
+                full_module_name = f"{component_name}.{module_name}"
+                if _matches_target(full_module_name) or any(
+                    _matches_target(name) for name in _moe_lora_target_names(full_module_name, module)
+                ):
+                    raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
+
+    def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
+        self._validate_adapter_targets(peft_helper)
+        self._ensure_max_lora_rank(peft_helper.r)
+
+        target_modules = getattr(peft_helper, "target_modules", None)
+        target_modules_list: list[str] | None = None
+        target_modules_pattern: str | None = None
+        if isinstance(target_modules, str) and target_modules:
+            target_modules_pattern = target_modules
+        elif isinstance(target_modules, list) and target_modules:
+            target_modules_list = target_modules
+
+        def _matches_target(module_name: str) -> bool:
+            if target_modules_pattern is not None:
+                import regex as re
+
+                return re.search(target_modules_pattern, module_name) is not None
+            if target_modules_list is None:
+                return True
+            return _match_target_modules(module_name, target_modules_list)
 
         # dummy lora config
         lora_config = LoRAConfig(
@@ -1297,11 +1319,12 @@ class DiffusionLoRAManager:
 
         logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
 
-        # evict if cache full before adding the new adapter
-        # so that we don't go over capacity on the new load
-        self._evict_for_new_adapter()
-
         lora_model, peft_helper = self._load_adapter(lora_request)
+        self._validate_adapter_targets(peft_helper)
+
+        # Evict only after validation so a rejected adapter cannot displace a
+        # working cached adapter.
+        self._evict_for_new_adapter()
         self._touch_adapter_info(adapter_id)
 
         self._registered_adapters[adapter_id] = lora_model

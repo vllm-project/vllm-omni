@@ -286,6 +286,34 @@ def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
 
 
 @pytest.mark.parametrize(
+    ("moe_backend", "expects_lora"),
+    [
+        ("auto", False),
+        ("marlin", True),
+    ],
+)
+def test_online_mxfp4_moe_lora_respects_requested_backend(moe_backend, expects_lora, monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: True)
+
+    config = diffusion_vllm_config.create_diffusion_vllm_config(
+        torch.device("cpu"),
+        _od_config(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            is_moe=True,
+            lora_backend="peft",
+            lora_path=None,
+            moe_backend=moe_backend,
+            quantization_config=build_quant_config({"method": "online", "moe": "mxfp4"}),
+        ),
+    )
+
+    assert config.kernel_config.moe_backend == moe_backend
+    assert (config.lora_config is not None) is expects_lora
+
+
+@pytest.mark.parametrize(
     ("is_cuda", "is_xpu", "capability", "quant_supported", "expected"),
     [
         (True, False, DeviceCapability(10, 0), True, True),
