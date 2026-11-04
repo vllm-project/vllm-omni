@@ -177,6 +177,13 @@ and step selectors are configured, step-wise batches at different indices are
 evaluated separately and restored to request order. Retaining a step selector
 with `diffusion_kv_cache_dtype` set to `None`, `auto`, or `float` does not split
 batches by step; existing prefix-length compatibility grouping still applies.
+
+Linear W4A8 step fallback independently requires same-step groups, including
+when Attention uses native precision. The scalar context always describes a
+real common step; it is never a representative for different steps. Different
+steps with identical precision remain separate when a step selector is active.
+Merging those groups requires an explicit shared execution-policy context.
+
 Without the explicit step-0 exclusion, structural prefill still fails rather
 than silently changing precision. Padded decode batches carrying a mask are
 also unsupported by quantized NPU attention. Validate output quality against

@@ -126,7 +126,14 @@ When step selectors control an enabled `diffusion_kv_cache_dtype`
 quantization policy, heterogeneous step batches are split so one request cannot
 inherit another request's precision policy. With `None`, `auto`, or `float`,
 retaining a step selector does not introduce step-based splitting. Existing
-prefix-length compatibility grouping still applies. Explicit backend quant
+prefix-length compatibility grouping still applies.
+
+Linear W4A8 step fallback independently requires same-step groups, including
+when Attention uses native precision. The scalar context always describes a
+real common step; it is never a representative for different steps. Different
+steps with identical precision remain separate when a step selector is active.
+Merging those groups requires an explicit shared execution-policy context.
+ Explicit backend quant
 specs are not controlled by this step selector.
 The shared `is_quantized_attention_dtype` predicate classifies the unified
 precision knob for configuration validation, `Attention`, and pipeline batching;

@@ -1491,15 +1491,17 @@ class QwenImage21Pipeline(
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
 
-        # A single Attention call has one scalar step selector. Requests at
-        # different steps must not inherit the first request's precision policy.
-        # Skip selectors affect the unified quantization knob only; native
-        # precision and explicit backend quant specs do not vary with this step.
-        split_by_step = (
-            is_quantized_attention_dtype(getattr(self.od_config, "diffusion_kv_cache_dtype", None))
-            and bool(getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None))
-            and len({state.step_index for state in states}) > 1
-        )
+        if len({self._kv_cache_phase(state.extra.get("kv_cache")) for state in states}) > 1:
+            raise ValueError("Cannot batch requests at mixed KV-cache phases. Schedule them separately.")
+
+        # Keep the scalar context truthful for both Attention step selectors and
+        # Linear step fallback. Equal-precision mixed steps need a separate
+        # execution-policy context before they can safely share a forward.
+        attention_uses_step = is_quantized_attention_dtype(
+            getattr(self.od_config, "diffusion_kv_cache_dtype", None)
+        ) and bool(getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None))
+        linear_uses_step = bool(getattr(getattr(self.transformer, "quant_config", None), "w4a8_fallback_steps", None))
+        split_by_step = (attention_uses_step or linear_uses_step) and len({state.step_index for state in states}) > 1
         if self._needs_decode_seq_len_split(states) or split_by_step:
             # Local import: InputBatch is only TYPE_CHECKING at module scope.
             from vllm_omni.diffusion.worker.input_batch import InputBatch as _InputBatch

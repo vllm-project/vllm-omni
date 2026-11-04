@@ -364,3 +364,90 @@ def test_step_mode_accepts_config_without_parsed_step_selector(monkeypatch):
         result = pipe.denoise_step(InputBatch.make_batch([_state("a", 1, 1.0), _state("b", 2, 2.0)]))
     assert calls == [2]
     torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0]))
+
+
+def _decode_states():
+    states = [_state("a", 1, 1.0), _state("b", 2, 2.0, rows=2), _state("c", 3, 3.0)]
+    for state in states:
+        state.extra["prefill_prompt_seq_len"] = 1
+        state.extra["kv_cache"] = [
+            {"cond": {part: torch.zeros(state.latents.shape[0], 1, 4) for part in ("key", "value")}}
+        ]
+    return states
+
+
+@pytest.mark.parametrize("dtype,skip", [("mxfp8", "0"), ("mxfp8", None), (None, "0"), ("float", None)])
+def test_grouping_preserves_linear_fallback_independently_of_attention(monkeypatch, dtype, skip):
+    from vllm_omni.quantization import mxfp4_config
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+    from vllm_omni.quantization.mxfp8_config import MXFPLinearMethodBase
+
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype=dtype, diffusion_kv_cache_skip_steps=skip)
+    pipe = _step_pipeline(config)
+    quant = DiffusionMXFP4Config(w4a8_fallback_steps=[2])
+    pipe.transformer.quant_config = quant
+    attention = _attention(config)
+    linear = mxfp4_config.NPUMxfp4LinearMethod(quant)
+    layer = nn.Linear(4, 4, bias=False)
+    layer.weight_scale = torch.ones(1)
+    branches = []
+
+    def a4(self, layer, x, bias, ori_dtype):
+        branches.append("A4")
+        return x + 4
+
+    def a8(x, weight, scale, bias, ori_dtype):
+        branches.append("A8")
+        return x + 8
+
+    # Keep the real Linear branch selection; replace only device execution.
+    monkeypatch.setattr(MXFPLinearMethodBase, "_apply_inner", a4)
+    monkeypatch.setattr(mxfp4_config, "_npu_w4a8_matmul", a8)
+    seen = []
+
+    def predict(*args, **kwargs):
+        hidden = args[2]["hidden_states"]
+        metadata = attention._with_kv_cache_dtype(None)
+        seen.append((get_forward_context().denoise_step_idx, metadata.extra["kv_cache_dtype"] if metadata else None))
+        return linear._apply_inner(layer, hidden, None, hidden.dtype)
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9):
+        result = pipe.denoise_step(InputBatch.make_batch(_decode_states()))
+        assert get_forward_context().denoise_step_idx == 9
+    expected_dtype = "mxfp8" if dtype == "mxfp8" else None
+    assert seen == [(1, expected_dtype), (2, expected_dtype), (3, expected_dtype)]
+    assert branches == ["A4", "A8", "A4"]
+    torch.testing.assert_close(result[:, 0, 0], torch.tensor([5.0, 10.0, 10.0, 7.0]))
+
+
+@pytest.mark.parametrize("fallback_steps", [None, []])
+def test_linear_without_step_fallback_keeps_native_mixed_batch(monkeypatch, fallback_steps):
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    config = OmniDiffusionConfig(diffusion_kv_cache_skip_steps="0")
+    pipe = _step_pipeline(config)
+    pipe.transformer.quant_config = DiffusionMXFP4Config(w4a8_fallback_steps=fallback_steps)
+    seen = []
+
+    def predict(*args, **kwargs):
+        seen.append(get_forward_context().denoise_step_idx)
+        torch.testing.assert_close(args[2]["timestep"], torch.tensor([0.7, 0.2, 0.2, 0.001]))
+        return args[2]["hidden_states"]
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9):
+        result = pipe.denoise_step(InputBatch.make_batch(_decode_states()))
+        assert get_forward_context().denoise_step_idx == 9
+    assert seen == [None]
+    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0]))
+
+
+def test_step_grouping_rejects_mixed_kv_phases():
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
+    pipe = _step_pipeline(config)
+    states = _decode_states()
+    states[0].extra["kv_cache"] = None
+    with set_forward_context(omni_diffusion_config=config):
+        with pytest.raises(ValueError, match="mixed KV-cache phases"):
+            pipe.denoise_step(InputBatch.make_batch(states))
