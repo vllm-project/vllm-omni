@@ -63,7 +63,7 @@ def _stage_configs(count: int) -> list[SimpleNamespace]:
     return [
         SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=4096, use_v2_model_runner=False),
-            scheduler_config=SimpleNamespace(async_scheduling=False),
+            scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=64, max_num_active_seqs=None),
             cache_config=SimpleNamespace(enable_prefix_caching=True),
             speculative_config=None,
         )
@@ -135,6 +135,47 @@ async def test_qwen_continuation_defaults_follow_engine_configuration(unsupporte
         assert session is not None
         assert session.capabilities.supports_turn_kv_continuation is (unsupported is None)
     finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sessions,per_replica,slots,active_slots,v2,rejected",
+    [
+        (2, None, 1, None, False, True),
+        (2, None, 4, 1, False, True),
+        (2, None, 2, None, False, False),
+        (4, 2, 2, None, False, False),
+        (4, 3, 2, None, False, True),
+        (1, 3, 2, None, False, False),
+        (2, None, 1, None, True, False),
+    ],
+)
+async def test_resident_thinker_session_capacity(sessions, per_replica, slots, active_slots, v2, rejected):
+    configs = _stage_configs(1)
+    configs[0].scheduler_config.max_num_seqs = slots
+    configs[0].scheduler_config.max_num_active_seqs = active_slots
+    configs[0].model_config.use_v2_model_runner = v2
+    runtime = DuplexSessionRuntimeConfig(
+        max_sessions=sessions,
+        replica_policy="least_sessions" if per_replica is not None else "legacy",
+        max_sessions_per_replica=per_replica,
+    )
+
+    def build():
+        return _build(
+            plugin=Qwen3OmniDuplexPlugin(_encode_audio),
+            runtime_config=runtime,
+            stage_configs=configs,
+            async_chunk=True,
+            replicas=2 if per_replica is not None else 1,
+        )
+
+    if rejected:
+        with pytest.raises(ValueError, match="resident Thinker.*capacity"):
+            build()
+    else:
+        orchestrator, *_ = build()
         await orchestrator.session_manager.shutdown()
 
 
