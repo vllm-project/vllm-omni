@@ -3,18 +3,28 @@
 
 from __future__ import annotations
 
-import base64
 import binascii
 import io
 import math
 import wave
+from collections.abc import Callable
 
 import numpy as np
+import pybase64 as base64
 
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
+alaw2lin: Callable[[bytes, int], bytes] | None
+lin2alaw: Callable[[bytes, int], bytes] | None
+lin2ulaw: Callable[[bytes, int], bytes] | None
+ulaw2lin: Callable[[bytes, int], bytes] | None
 try:
-    from audioop import alaw2lin, lin2alaw, lin2ulaw, ulaw2lin
+    from audioop import alaw2lin as _alaw2lin
+    from audioop import lin2alaw as _lin2alaw
+    from audioop import lin2ulaw as _lin2ulaw
+    from audioop import ulaw2lin as _ulaw2lin
+
+    alaw2lin, lin2alaw, lin2ulaw, ulaw2lin = _alaw2lin, _lin2alaw, _lin2ulaw, _ulaw2lin
 except ImportError:  # pragma: no cover - audioop is removed in newer Python.
     alaw2lin = lin2alaw = lin2ulaw = ulaw2lin = None
 
@@ -149,6 +159,21 @@ def encode_float32_mono_wav_base64(
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def pcm_f32le_payload_to_wav(audio: str, sample_rate_hz: int | float) -> tuple[str, str, int]:
+    """Validate raw mono float PCM and wrap it with the shared WAV encoder."""
+    rate = validate_input_sample_rate_hz(sample_rate_hz)
+    try:
+        raw = base64.b64decode(audio.strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("audio payload is not valid base64") from exc
+    if not raw or len(raw) % 4:
+        raise ValueError("pcm_f32le audio payload must contain complete samples")
+    samples = np.frombuffer(raw, dtype="<f4")
+    if not np.isfinite(samples).all():
+        raise ValueError("pcm_f32le audio payload contains non-finite samples")
+    return encode_float32_mono_wav_base64(samples, sample_rate_hz=rate), "wav", rate
+
+
 def convert_input_audio_with_rate(
     audio: object,
     fmt: object,
@@ -159,7 +184,7 @@ def convert_input_audio_with_rate(
     if not isinstance(audio, str) or not isinstance(fmt, str):
         return audio, fmt, sample_rate_hz
     normalized = fmt.lower()
-    if normalized not in {"pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"}:
+    if normalized not in {"pcm_f32le", "pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"}:
         return audio, fmt, sample_rate_hz
     if isinstance(sample_rate_hz, int | float):
         sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
@@ -167,6 +192,28 @@ def convert_input_audio_with_rate(
         raw = base64.b64decode(audio.strip(), validate=False)
     except (binascii.Error, ValueError):
         return audio, fmt, sample_rate_hz
+    if normalized == "pcm_f32le":
+        if not raw or len(raw) % 4:
+            return audio, fmt, sample_rate_hz
+        samples = np.frombuffer(raw, dtype="<f4")
+        if not np.isfinite(samples).all():
+            raise ValueError("pcm_f32le audio payload contains non-finite samples")
+        source_rate = int(sample_rate_hz) if sample_rate_hz is not None else target_sample_rate_hz
+        if source_rate != target_sample_rate_hz:
+            rate_gcd = math.gcd(source_rate, target_sample_rate_hz)
+            if max(source_rate // rate_gcd, target_sample_rate_hz // rate_gcd) > (
+                StreamingAudioResampler.max_polyphase_factor
+            ):
+                target_size = max(1, round(samples.size * target_sample_rate_hz / source_rate))
+                samples = np.interp(
+                    np.linspace(0.0, 1.0, num=target_size),
+                    np.linspace(0.0, 1.0, num=samples.size),
+                    samples,
+                )
+            else:
+                samples = StreamingAudioResampler(source_rate, target_sample_rate_hz).process(samples, final=True)
+        encoded = base64.b64encode(np.ascontiguousarray(samples, dtype="<f4").tobytes()).decode("ascii")
+        return encoded, "pcm_f32le", target_sample_rate_hz
     if normalized == "g711_ulaw":
         raw = decode_g711_ulaw(raw)
         sample_rate_hz = sample_rate_hz if isinstance(sample_rate_hz, int | float) else 8_000

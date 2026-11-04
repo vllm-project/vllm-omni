@@ -66,6 +66,7 @@ test('Qwen enables camera and playback ACK only for the duplex VAD profile', () 
     assert.equal(url.searchParams.has('native_duplex'), false);
     assert.equal(url.searchParams.has('minicpmo45_native_duplex'), false);
     assert.equal(p.append('PCM', 'JPEG').video_frames, undefined);
+    p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
     assert.equal(plain(p.imageMessages('JPEG')).length, turnMode === 'vad' ? 1 : 0);
     assert.equal(p.ack('r', 100)?.type || null, turnMode === 'vad' ? 'playback.ack' : null);
     assert.equal(p.camera, turnMode === 'vad');
@@ -725,6 +726,7 @@ test('late interruption cursor acknowledges old response without finishing the n
 
 test('Qwen camera frames ride the OpenAI image interface, not the audio append', () => {
   const p = profiles['qwen3-turn']({ ...config, turnMode: 'vad' });
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
   assert.deepEqual(plain(p.append('PCM', 'JPEG')), { type: 'input_audio_buffer.append', audio: 'PCM' });
 
   const [created] = plain(p.imageMessages('JPEG'));
@@ -737,6 +739,7 @@ test('Qwen camera frames ride the OpenAI image interface, not the audio append',
 
 test('the camera retires its oldest image instead of exhausting the session budget', () => {
   const p = profiles['qwen3-turn']({ ...config, turnMode: 'vad' });
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
   const ids = [];
   for (let i = 0; i < 8; i++) {
     const messages = plain(p.imageMessages('JPEG'));
@@ -751,7 +754,15 @@ test('the camera retires its oldest image instead of exhausting the session budg
 
   // A new call reopens the budget; stale ids from the old one must not linger.
   assert.equal(plain(p.initialMessages(config, 'x')).length > 0, true);
+  assert.deepEqual(plain(p.imageMessages('JPEG')), [], 'a new session waits for its own capabilities');
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
   assert.equal(plain(p.imageMessages('JPEG')).length, 1);
+});
+
+test('Qwen fallback does not send camera items without image capability', () => {
+  const p = profiles['qwen3-turn']({ ...config, turnMode: 'vad' });
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: false } } });
+  assert.deepEqual(plain(p.imageMessages('JPEG')), []);
 });
 
 test('AURA PTT profile sets duplex, is_speech append, commit on release, and shell flags', () => {

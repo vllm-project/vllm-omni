@@ -161,6 +161,32 @@ method the base calls at the right moment: `OmniBase.__init__` calls
 are initialized. `DuplexOmniEngine._create_orchestrator` passes the loaded
 plugin and the session runtime config to `DuplexOrchestrator` directly.
 
+### Chat-fallback response path
+
+The opt-in Qwen3 chat-fallback pipeline still commits input and owns its
+conversation history in `DuplexSessionRunner`. At response start the runner
+emits a fallback request carrying the session, request, response and epoch
+identity, a history snapshot and model policy. `DuplexOmni` routes that message
+to the websocket handler, which starts one task for the session and invokes the
+ordinary chat service. The handler sends started, projected output and failure
+messages back through the engine queue; the runner accepts them only for the
+current identity and epoch. Separate text/audio streams are unaligned, so
+ACK-gated history retains assistant text only after complete audio generation
+and playback.
+
+On interruption, close or expiry the engine emits a cancellation with the same
+full identity. The handler cancels the matching provider task, while stale
+results cannot cross the runner's identity fence. A newer task is not cancelled
+by an older cancellation. Handler shutdown cancels its remaining tasks and
+unregisters the provider sink.
+
+This provider is installed by the WebSocket serving handler for `/v1/duplex`
+and `/v1/realtime?duplex=1`. An in-process client that opens the fallback
+pipeline without such a provider does not execute fallback requests. Native
+duplex plugins continue to use the stage port rather than this provider path.
+The default fallback profile disables async chunking; its separate streaming
+profile enables incremental chat output without changing commit-based input.
+
 ### Design rules
 
 1. **One session authority.** The whole duplex session (config, epoch/turn,
@@ -190,9 +216,11 @@ plugin and the session runtime config to `DuplexOrchestrator` directly.
    the plugin declares `DuplexCapabilities.supports_chat_completions`.
    Turn-based deployments use the ordinary API initialization and retain
    model capability checks and endpoint restrictions.
-5. **Serving is transport only.** The websocket handler does socket I/O,
-   wire-envelope validation, command translation, event rendering and the
-   attachment/resume/replay bookkeeping; it holds no session state.
+5. **Serving adapts transport and the opt-in chat fallback.** The websocket
+   handler does socket I/O, wire-envelope validation, command translation,
+   event rendering and attachment/resume/replay bookkeeping. For a fallback
+   plugin it also owns the provider task, while the engine remains the session,
+   history, playback and response-identity authority.
 6. **No `typing.Protocol`** in the duplex surfaces: the plugin, data plane,
    session state, PCM buffer, stage port and client transport seams are ABCs.
 7. **The wire codec is not duplex, and a wire type is not a mailbox message.**

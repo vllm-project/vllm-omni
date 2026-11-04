@@ -61,6 +61,20 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     }'
 ```
 
+### Opt-in duplex chat fallback
+
+Use `--deploy-config vllm_omni/deploy/qwen3_omni_chat_fallback.yaml` to serve
+committed audio/text turns through chat completions on `/v1/duplex`. This profile
+disables async chunking and reports `implementation_level: chat_fallback`.
+It supports one session and excludes images and reference voices. The
+engine-managed `qwen3_omni_duplex.yaml` profile remains available.
+
+For an interruption smoke test, use
+`examples/online_serving/barge_in_client.py --preset none` with mono 16 kHz
+question and follow-up WAVs. See the
+[deployment recipe](../../../recipes/Qwen/Qwen3-Omni.md#verification) for the
+complete server and client commands.
+
 ### Launch individual stages (stage-based CLI)
 
 Use the stage-based CLI when you want to run one stage per process.

@@ -98,7 +98,7 @@ async def test_auto_response_commit_consumes_retained_pcm(
         turn_id=0,
         epoch=0,
         state=DuplexSessionState.OPEN,
-        capabilities=SimpleNamespace(chunk_period_ms=1000),
+        capabilities=SimpleNamespace(chunk_period_ms=1000, supports_chat_fallback=False),
         release_input_bytes=lambda count: None,
     )
     model = _Model()
@@ -132,6 +132,7 @@ async def test_auto_response_commit_consumes_retained_pcm(
         _start_append=start_append,
     )
     for name in (
+        "_supports_chat_fallback",
         "_reserve_commit_prefixes",
         "_rollback_commit_reservations",
         "_hold_commit_prefixes",

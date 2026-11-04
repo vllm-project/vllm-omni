@@ -561,6 +561,8 @@ class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):
     tokenizer_mode: str = "auto"
     config_format: str | None = None
     skip_mm_profiling: bool | None = None
+    # EngineArgs resolves this weight-loading budget into vLLM OffloadConfig.
+    cpu_offload_gb: float | None = Field(default=None, ge=0.0)
 
 
 @_enforce_keyword_only_init
@@ -1289,7 +1291,7 @@ _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 # explicit engine argument(s) with no structured config owner"). It joins the
 # two pass-through fields already listed.
 _DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
-_LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values()) | {"cpu_offload_gb"}
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_PARALLEL_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1348,6 +1350,7 @@ _PARALLEL_CONFIG_FIELDS_BY_EXECUTION_TYPE = {
 _LOAD_STAGE_ENGINE_FIELD_MAP = {
     **{name: name for name in _LOAD_ENGINE_FIELDS},
     **_LOAD_CONFIG_ENGINE_FIELD_MAP,
+    "cpu_offload_gb": "cpu_offload_gb",
 }
 _CACHE_STAGE_ENGINE_FIELD_MAP = {
     **{name: name for name in _CACHE_ENGINE_FIELDS},
