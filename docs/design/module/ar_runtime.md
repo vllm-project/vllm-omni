@@ -98,6 +98,23 @@ construction snapshots those inputs. Both paths reuse the request IDs already
 copied by upstream bookkeeping; connector collection stays on the main thread
 because it can run a tensor-parallel collective.
 
+## GPU memory accounting and output snapshots
+
+Workers size the KV cache from model weights, persistent runner buffers
+allocated before profiling starts (torch allocations beyond the weights at
+that point), the profiling-window peak increase and non-torch memory, then
+reserve CUDA graph and auxiliary graph memory separately. Upstream
+profiling's `non_kv_cache_memory` is not used, because it also counts memory
+the caching allocator reserves without allocating, such as graph pools
+captured at model load; co-located stage budgets are tuned without it.
+
+MRv2 asynchronous output snapshots reuse one capacity buffer per dtype/device
+group in each ring slot. The slot waits for its previous device-to-host copy
+event before reuse or growth. Shorter outputs publish and copy only the live
+prefix. Retained GPU storage is bounded by each slot's largest payload rather
+than accumulating a buffer for every prefill length; published CPU outputs
+own their storage independently of subsequent slot reuse.
+
 ## Request-local model errors
 
 MRV2 model states can return an owned, step-local failure mask from

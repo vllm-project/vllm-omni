@@ -723,14 +723,22 @@ def thinker2talker_full_payload(
         output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
-    # Drop the terminal stop-token row only when more than one row was
-    # accumulated; trimming a single row would ship 0 conditioning tensors
-    # while ids still has tokens and break talker prefill alignment.
-    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] > 1:
+    model_config = (
+        transfer_manager._get_model_config()
+        if hasattr(transfer_manager, "_get_model_config")
+        else getattr(transfer_manager, "config", None)
+    )
+    # MRv2 fences outputs at the step that samples the stop token. Captured
+    # rows describe that step's INPUT, so its last row is still spoken text,
+    # not the sampled stop. V1's full-payload path retains its terminal row.
+    # Preserve V1's trimming, but do not delete MRv2's last word (or its only
+    # word for a one-token answer).
+    trim_terminal_row = not getattr(model_config, "use_v2_model_runner", False)
+    if trim_terminal_row and isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] > 1:
         thinker_emb_prefill = thinker_emb[:-1]
     else:
         thinker_emb_prefill = thinker_emb
-    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] > 1:
+    if trim_terminal_row and isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] > 1:
         thinker_hid_prefill = thinker_hid[:-1]
     else:
         thinker_hid_prefill = thinker_hid
