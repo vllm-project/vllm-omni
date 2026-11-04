@@ -36,27 +36,48 @@ Code outside `vllm_omni/diffusion/cache` must import Cache-DiT symbols from the
 package-level API: `vllm_omni.diffusion.cache.cachedit`.
 
 | Method/Class | Purpose | Behavior |
-|--------------|---------|----------|
+| -------------- | --------- | ---------- |
 | `CacheDiTBackend` | Unified backend interface | Automatically handles enabler selection and cache refresh |
 | `enable_cache_for_dit()` | Apply caching to transformer | Configures DBCache on transformer blocks |
+| `set_separate_cfg()` | Set request-specific CFG accounting | Matches the number of forwards per denoising step on each rank |
 
 **Key APIs from Cache-DiT:**
 
 [Cache-DiT API Reference](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)
 
 | API | Description |
-|-----|-------------|
+| ----- | ------------- |
 | `BlockAdapter` | Core abstraction for applying cache-dit to transformers. Specifies transformer module(s), block list(s), and forward signature pattern(s). |
 | `ForwardPattern` | Defines block forward signature patterns: `Pattern_0`, `Pattern_1`, `Pattern_2` |
 | `ParamsModifier` | Per-transformer or per-block-list cache configuration customization |
 | `DBCacheConfig` | Configuration for DBCache parameters (warmup steps, cached steps, thresholds) |
-| `refresh_context()` | Update cache context | Called at every generation boundary |
+| `refresh_context()` | Update cache context at every generation boundary |
+
+### Request-dependent CFG
+
+Cache-DiT's separate-CFG mode counts a conditional and an unconditional
+transformer forward as one denoising step. When a pipeline can disable CFG
+per request, a static `has_separate_cfg=True` would count two actual steps as
+one for those requests.
+
+Such pipelines can call the package API `set_separate_cfg(transformer,
+do_true_cfg)` once per request, after the runner refreshes the step count and
+before the denoising loop. It enables separate accounting only for sequential
+CFG; without CFG or under CFG parallel, each rank makes one call per step.
+It preserves the request's other cache settings and does nothing when
+Cache-DiT is disabled. Call it for every request, including when switching
+CFG off; refreshing inside the denoising loop would discard cached residuals.
+
+`LongCatImageEditPipeline` uses this API with its actual CFG condition:
+`guidance_scale > 1 and negative_prompt is not None`. Both of its block lists
+therefore count the requested number of steps while retaining no-CFG caching.
 
 ---
 
 ## Standard Models: Automatic Support
 
 Most DiT models follow this pattern:
+
 - Single transformer with one `ModuleList` of blocks
 - Standard forward signature
 - Compatible with cache-dit's automatic detection
@@ -287,6 +308,7 @@ images = omni.generate(
 - **Cache parameters too aggressive:**
 
 **Solution:**
+
 ```python
 cache_config={
     "residual_diff_threshold": 0.12,  # Lower from 0.24 (try 0.12-0.18)
@@ -304,7 +326,7 @@ Check the [user guide for cache_dit](../../user_guide/diffusion/cache_accelerati
 Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
+| ------- | ------ | --------- | ------- |
 | **Standard DiT** | `cachedit.backend::enable_cache_for_dit` | Default enabler | Single transformer, automatic |
 | **Wan2.2** | `cachedit.model_specific::enable_cache_for_wan22` | Single or dual-transformer | Auto-detects mode based on transformer_2 presence |
 | **LongCat** | `cachedit.config::CacheDiTAdapterConfig` | Declarative block adapter | Two block lists in one transformer |
