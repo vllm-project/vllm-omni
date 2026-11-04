@@ -4043,15 +4043,16 @@ def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
     assert '"rocm": "MI325"' in _hardware_decorator(source, "test_text_to_audio_001")
     assert '"rocm": 1' in _hardware_decorator(source, "test_text_to_audio_001")
     for name in _DRAMA3_EXCLUDED:
-        assert "rocm" not in _hardware_decorator(source, name)
-    assert source.count('"rocm": "MI325"') == 1
+        assert '"rocm": "MI325"' in _hardware_decorator(source, name)
+        assert "@pytest.mark.core_model" not in _hardware_decorator(source, name)
+    assert source.count('"rocm": "MI325"') == 4
 
 
 def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     """MERGE runs the READY node at advanced_model. READY stays core_model.
 
     ``--run-level advanced_model`` drops dummy weights and enables the shared
-    speech transcript check. Voice-clone nodes stay unmarked for ROCm.
+    speech transcript check. Voice-clone nodes run in their own MERGE job.
     """
     ready = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
     step = _find_step("MERGE · Drama 3 Text-to-Audio", AMD_MERGE_PIPELINE)
@@ -4083,7 +4084,7 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert command.count('--run-level "advanced_model"') == 2
     assert "core_model" not in command
     assert "full_model" not in command
-    assert command.count(_DRAMA3_READY_NODE) == 1
+    assert command.count(_DRAMA3_READY_NODE) == 3
     assert "diff -u /tmp/drama3-merge-expected.txt" in command
     assert "Expected exactly one executed Drama 3 MERGE test" in command
     assert "@pytest.mark.core_model" in selected
@@ -4095,7 +4096,7 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert "_delete_dummy_load_format" in weight_selector
     for name in _DRAMA3_EXCLUDED:
         assert name not in command
-        assert "rocm" not in _hardware_decorator(source, name)
+        assert '"rocm": "MI325"' in _hardware_decorator(source, name)
 
 
 _DEVICE_REDUCTION_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
