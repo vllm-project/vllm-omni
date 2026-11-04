@@ -84,13 +84,13 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
     from vllm.sampling_params import SamplingParams
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 
     from tests.core.sched.test_omni_recompute_preemption import _scheduler
     from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
         VoxtralTTSForConditionalGeneration,
     )
     from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 
     class FakeAudioGeneration:
         next_frames: list[torch.Tensor] = []
@@ -119,7 +119,10 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
     state._suspended_feedback_history = {}
     state._mtp_generators = {}
     state._mtp_seeded = set()
-    state._eager_state = EagerMTPState(state)
+    state.device = torch.device("cpu")
+    state._embed_dim = 0
+    state._has_mtp = False
+    state._mtp_state = MTPState(state)
 
     scheduler = _scheduler("allow", block_size=4, num_blocks=4)
     scheduler.use_v2_model_runner = True
