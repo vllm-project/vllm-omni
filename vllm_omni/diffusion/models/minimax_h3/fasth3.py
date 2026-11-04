@@ -129,7 +129,7 @@ _BLOCK_TARGETS = {
 # The attention role MiniMaxH3Attention gives its 50 DiT blocks. The
 # compression gates live on exactly these layers, so this is the role whose
 # resolved backend decides whether the artifact runs sparse.
-_H3_DIT_ATTENTION_ROLE = "self"
+_H3_DIT_ATTENTION_ROLE = "minimax_h3.dit"
 
 # Adapter block prefix -> native block prefix.
 _BLOCK_PREFIXES = (
@@ -138,24 +138,21 @@ _BLOCK_PREFIXES = (
 )
 
 
-def _resolve_dit_attention_backend(od_config: Any) -> str:
-    """The backend the 50-block H3 DiT will actually resolve to.
-
-    The DiT's attention layers carry role ``"self"``, so a ``per_role`` entry
-    overrides the default for exactly the layers the compression gates live on.
-    Reading only the default would accept a config that runs the sparse student
-    dense, and reject a per-role-only config that is correct.
-    """
+def _resolve_dit_attention_spec(od_config: Any):
+    """Resolve the same exact role and category as the DiT attention layers."""
     attention_config = getattr(od_config, "diffusion_attention_config", None)
-    per_role = getattr(attention_config, "per_role", None) or {}
-    spec = per_role.get(_H3_DIT_ATTENTION_ROLE)
+    if attention_config is None:
+        return None
+    spec, _ = attention_config.resolve_with_source(_H3_DIT_ATTENTION_ROLE, "self")
+    return spec
+
+
+def _resolve_dit_attention_backend(od_config: Any) -> str:
+    """The DiT's resolved backend, with support for legacy backend-only configs."""
+    spec = _resolve_dit_attention_spec(od_config)
     if spec is not None:
         return str(getattr(spec, "backend", "") or "").upper()
-    backend = str(getattr(od_config, "diffusion_attention_backend", "") or "").upper()
-    if backend:
-        return backend
-    default_spec = getattr(attention_config, "default", None)
-    return str(getattr(default_spec, "backend", "") or "").upper()
+    return str(getattr(od_config, "diffusion_attention_backend", "") or "").upper()
 
 
 class FastH3AdapterError(ValueError):

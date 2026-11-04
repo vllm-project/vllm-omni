@@ -360,6 +360,8 @@ class MiniMaxH3Attention(nn.Module):
             "max_seqlen_q": max_seqlen,
             "max_seqlen_k": kv_max_seqlen,
             "valid_kv_length": used_kv,
+            # Conditioning remains eligible for pruning in the sparse experiment.
+            "protected_kv_prefix": 0,
             "npu_attn_varlen": not use_ring,
             "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
             **({"vsa_h3_sparsity": self.vsa_sparsity} if self.vsa_sparsity is not None else {}),
@@ -708,6 +710,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            role="minimax_h3.dit",
+            role_category="self",
         )
         self.mlp = MiniMaxH3MLP(
             arch,
