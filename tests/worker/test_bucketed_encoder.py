@@ -567,6 +567,22 @@ def test_covo_processor_carries_bucket_frames():
     assert "encoder_bucket_frames" in fields
 
 
+def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch):
+    """The length-publishing processor hook must be installable from the
+    frontend (which builds the processor and runs request preprocessing), not
+    only from the worker that wraps the encoder module. ``install_bucketed_processor_hook``
+    is the env-gated, idempotent entry point the frontend calls."""
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", raising=False)
+    assert install_bucketed_processor_hook() is False
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
+    assert install_bucketed_processor_hook() is True
+    assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
+
+
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
     """A short clip (100 frames < 128 mel bins) must still bucket along the
     channels-first time axis — the Whisper recipe implies (B, mel, T) by

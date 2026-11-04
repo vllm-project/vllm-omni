@@ -38,6 +38,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "LengthBucketingConfig",
+    "install_bucketed_processor_hook",
     "install_bucketed_encoders",
 ]
 
@@ -474,6 +475,21 @@ def _frames_from_mm_items(mm_items) -> list[int] | None:
         samples = int(shape[-1]) if shape is not None and len(shape) else int(len(item))
         frames.append(max(1, samples * _FRAMES_PER_SECOND // 16000))
     return frames
+
+
+def install_bucketed_processor_hook() -> bool:
+    """Install the length-publishing processor hook in the current process.
+
+    Request preprocessing (and therefore ``_apply_hf_processor_main``) runs in
+    the frontend/orchestrator process, not in the worker that wraps the encoder,
+    so the hook must be registered where the frontend builds its multimodal
+    processor. Idempotent; returns True when bucketing is enabled (the hook is
+    installed or already was).
+    """
+    if _rungs_from_env() is None:
+        return False
+    _install_processor_hook()
+    return True
 
 
 def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder]) -> None:
