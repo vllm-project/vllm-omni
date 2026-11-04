@@ -186,6 +186,11 @@ def spy(monkeypatch, name):
     return launches
 
 
+def post_residual_kernel_name(device_name):
+    """MUSA dispatches to the #7261 tile kernel; CUDA runs the bit-exact one."""
+    return "_mhc_post_residual_tile_kernel" if device_name == "musa" else "_mhc_post_residual_kernel"
+
+
 @pytest.mark.parametrize("device_name", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens,iterations", [(0, 20), (1, 0), (17, 20)])
@@ -197,7 +202,7 @@ def test_coefficients_gpu(monkeypatch, device_name, dtype, tokens, iterations):
     packed[:, 4:8] = args[0].to(dev)
     packed[:, 8:] = args[1].reshape(tokens, 16).to(dev)
     args = (packed[:, 4:8], packed[:, 8:].view(tokens, 4, 4), *(x.to(dev) for x in args[2:]))
-    launches = spy(monkeypatch, "_mhc_post_residual_kernel")
+    launches = spy(monkeypatch, post_residual_kernel_name(device_name))
     actual = mhc.MHCPostResidual()(*args, scale=0.125, iterations=iterations, out_dtype=dtype)
     getattr(torch, device_name).synchronize()
     assert len(launches) == bool(tokens)
@@ -276,6 +281,7 @@ def test_gpu_unsupported_layout_falls_back(monkeypatch, device_name):
             pytest.fail("unsupported layouts must not launch the kernel")
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", Forbidden())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", Forbidden())
     monkeypatch.setattr(mhc, "_mhc_mix_kernel", Forbidden())
     args = tuple(x.to(dev) for x in coefficients(streams=3))
     actual = mhc.MHCPostResidual()(*args, scale=0.125, out_dtype=torch.float32)
@@ -330,6 +336,7 @@ def test_kernel_failure_is_cached_and_falls_back(monkeypatch):
             return launch
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", Broken())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", Broken())
     args = tuple(x.contiguous() for x in coefficients(tokens=2))
     op = mhc.MHCPostResidual()
     expected = reference(args)
@@ -355,6 +362,7 @@ def test_kernel_oom_is_propagated_without_caching(monkeypatch):
             return launch
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", OutOfMemory())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", OutOfMemory())
     args = tuple(x.contiguous() for x in coefficients(tokens=2))
     with pytest.raises(RuntimeError, match="out of memory"):
         mhc.MHCPostResidual().forward_cuda(*args, scale=0.125, out_dtype=torch.float32)
@@ -370,6 +378,7 @@ def test_gpu_compiled_parameters_do_not_get_cached(monkeypatch, device_name):
             pytest.fail("compilation must retain the native expression")
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", Forbidden())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", Forbidden())
     op = torch.compile(mhc.MHCPostResidual(), backend="eager", fullgraph=True)
     args = list(x.to(dev) for x in coefficients())
     for bias in (0.0, 2.0, -1.0):
