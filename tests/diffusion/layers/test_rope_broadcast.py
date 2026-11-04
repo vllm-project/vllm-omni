@@ -5,7 +5,7 @@ Shape broadcasting regression tests for RotaryEmbedding.forward_native.
 
 Covers the batch-dimension shape mismatch fix: forward_native now strips the
 batch dim from 3D cos/sin before applying RoPE, consistent with forward_cuda,
-forward_hip, and apply_rotary_emb_mindiesd paths.
+forward_hip, and apply_rotary_emb_torch_npu paths.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import torch
 from vllm_omni.diffusion.layers.rope import (
     RotaryEmbedding,
     RotaryEmbeddingWan,
-    apply_rotary_emb_mindiesd,
+    apply_rotary_emb_torch_npu,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -284,48 +284,78 @@ def test_cuda_paths_fall_back_without_vendored_rotary_kernel() -> None:
     assert output.shape == x.shape
 
 
-def test_mindie_full_dim_rope_keeps_h3_cos_sin_layout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """H3 passes complete rotary dims to MindIE instead of the CUDA half-dim layout."""
+def test_torch_npu_full_dim_rope_keeps_h3_cos_sin_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """H3 passes complete rotary dims to the fused kernel instead of the CUDA half-dim layout."""
     captured: dict[str, object] = {}
 
-    def rotary_position_embedding(x, cos, sin, **kwargs):
-        captured.update(cos=cos, sin=sin, kwargs=kwargs)
+    def npu_rotary_mul(x, cos, sin, mode=None):
+        captured.update(x=x, cos=cos, sin=sin, mode=mode)
         return x
 
     monkeypatch.setitem(
         sys.modules,
-        "mindiesd",
-        types.SimpleNamespace(rotary_position_embedding=rotary_position_embedding),
+        "torch_npu",
+        types.SimpleNamespace(npu_rotary_mul=npu_rotary_mul),
     )
     x = torch.randn(11, 3, 96, dtype=torch.bfloat16)
     cos = torch.randn(11, 96, dtype=torch.bfloat16)
     sin = torch.randn(11, 96, dtype=torch.bfloat16)
 
-    apply_rotary_emb_mindiesd(x, cos, sin, interleaved=False, half_head_dim=False)
+    apply_rotary_emb_torch_npu(x, cos, sin, interleaved=False, half_head_dim=False)
 
-    assert captured["cos"] is cos
-    assert captured["sin"] is sin
-    assert captured["kwargs"] == {
-        "rotated_mode": "rotated_half",
-        "head_first": False,
-        "fused": True,
-    }
+    # A 2D (S, D) table is lifted to (1, S, 1, D) so it broadcasts against
+    # the kernel's BSND axes; values pass through unchanged.
+    assert captured["cos"].shape == (1, 11, 1, 96)
+    assert torch.equal(captured["cos"].reshape(cos.shape), cos)
+    assert torch.equal(captured["sin"].reshape(sin.shape), sin)
+    assert captured["mode"] is None
 
 
-def test_mindie_rope_restores_3d_layout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """mindiesd rotary_position_embedding only accepts 4D ``x``."""
+def test_torch_npu_rope_normalizes_4d_wan_angles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wan passes shared angles as (B, S, 1, D/2); the kernel path flattens them.
+
+    Regression guard for the E2E failure where a 4-D table reached the
+    interleaved expansion and crashed the unsqueeze/expand chain.
+    """
+    captured: dict[str, object] = {}
+
+    def npu_rotary_mul(x, cos, sin, mode=None):
+        captured.update(x=x, cos=cos, sin=sin, mode=mode)
+        return x
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        types.SimpleNamespace(npu_rotary_mul=npu_rotary_mul),
+    )
+    B, S, H, D = 2, 11, 3, 96
+    x = torch.randn(B, S, H, D, dtype=torch.bfloat16)
+    angles = torch.randn(1, S, 1, D // 2)
+    cos = angles.cos().to(torch.bfloat16)
+    sin = angles.sin().to(torch.bfloat16)
+
+    apply_rotary_emb_torch_npu(x, cos, sin, interleaved=True, half_head_dim=True)
+
+    assert captured["x"].shape == (B, S, H, D)
+    # The (S, D/2) table is interleave-expanded to (1, S, 1, D).
+    assert captured["cos"].shape == (1, S, 1, D)
+    assert captured["mode"] == "interleave"
+
+
+def test_torch_npu_rope_restores_3d_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fused rotary kernel only accepts 4D ``x``."""
     captured: dict[str, torch.Tensor] = {}
 
-    def rotary_position_embedding(x, cos, sin, **kwargs):
-        # Mirror mindiesd's own input guard.
-        assert x.dim() == 4, f"mindiesd requires 4D x, got {x.dim()}"
+    def npu_rotary_mul(x, cos, sin, mode=None):
+        # Mirror the kernel's own input guard.
+        assert x.dim() == 4, f"npu_rotary_mul requires 4D x, got {x.dim()}"
         captured.update(x=x)
         return x
 
     monkeypatch.setitem(
         sys.modules,
-        "mindiesd",
-        types.SimpleNamespace(rotary_position_embedding=rotary_position_embedding),
+        "torch_npu",
+        types.SimpleNamespace(npu_rotary_mul=npu_rotary_mul),
     )
 
     S, H, D = 11, 3, 96
@@ -333,7 +363,7 @@ def test_mindie_rope_restores_3d_layout(monkeypatch: pytest.MonkeyPatch) -> None
     cos = torch.randn(S, D, dtype=torch.bfloat16)
     sin = torch.randn(S, D, dtype=torch.bfloat16)
 
-    actual = apply_rotary_emb_mindiesd(x, cos, sin, interleaved=False, half_head_dim=False)
+    actual = apply_rotary_emb_torch_npu(x, cos, sin, interleaved=False, half_head_dim=False)
 
     assert captured["x"].shape == (1, S, H, D)
     assert actual.shape == (S, H, D)
