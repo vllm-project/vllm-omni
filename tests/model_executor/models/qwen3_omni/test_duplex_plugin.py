@@ -1639,6 +1639,61 @@ async def test_image_limit_rejects_atomically_and_delete_reclaims_capacity():
         await h.manager.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_resident_image_replacement_rebuilds_after_admission_limit(mocker):
+    """A full image context cannot grow via deltas; deletion invalidates it."""
+    from vllm_omni.engine.duplex.commands import DeleteItem
+
+    h = await open_qwen()
+    can_append = mocker.AsyncMock(return_value=True)
+    h.port.can_append_turn = can_append
+    snapshot = mocker.spy(h.session, "history_snapshot")
+    try:
+        for i in range(MAX_PROMPT_IMAGES):
+            await h.run(CreateItem(item=image_item(f"camera_{i}")))
+        await h.run(CreateResponse())
+        first = h.port.submissions[-1]
+        request_id = first.context.request_id
+        assert len(first.prompt["multi_modal_data"]["image"]) == MAX_PROMPT_IMAGES
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.active_response_id is None
+
+        events = await h.run(CreateItem(item=image_item("overflow")))
+        assert any(getattr(event, "code", None) == "input_backpressure" for event in events)
+        assert len(h.port.submissions) == 1
+
+        await h.run(DeleteItem(item_id="camera_0"))
+        replacement = image_item("replacement")
+        # Distinguish the replacement media from all retained red images.
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), "blue").save(buf, format="PNG")
+        replacement["content"][0]["image_url"] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        await h.run(CreateItem(item=replacement))
+        snapshot.reset_mock()
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 2
+        second = h.port.submissions[-1]
+        assert second.context.request_id == request_id
+        assert second.already_submitted and second.resume_from_full_prompt
+        assert "_qwen_turn_delta" not in second.prompt
+        assert snapshot.call_count == 1
+        can_append.assert_not_awaited()
+        images = second.prompt["multi_modal_data"]["image"]
+        assert len(images) == MAX_PROMPT_IMAGES
+        assert images[-1].getpixel((0, 0)) == (0, 0, 255)
+        assert all(image.getpixel((0, 0))[0] > 250 for image in images[:-1])
+        assert second.prompt["prompt"].count("{'type': 'image'}") == MAX_PROMPT_IMAGES
+    finally:
+        await h.manager.shutdown()
+
+
 def test_prompt_holds_stored_images_to_the_stage_limit():
     """The prompt is the last guard before ``limit_mm_per_prompt``.
 
