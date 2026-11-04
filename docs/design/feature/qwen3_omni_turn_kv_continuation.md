@@ -146,6 +146,16 @@ Omni 的阶段输出缓存重放已缓存的历史 hidden states，供本轮新�
 驻留请求在空闲期间仍占用 GPU KV 和上游 active-request 名额。
 启动校验每副本会话上限不超过 `max_num_active_seqs`，未设置时使用 `max_num_seqs`。
 
+Talker 或 Code2Wav 的提前结束不代表 Thinker 已完成。最终音频包先由 orchestrator
+暂存，直到 Thinker 的 segment stop 和最后文本进入会话队列，再交付轮次结束。
+等待期间不阻塞会话 mailbox，取消和关闭仍可处理；同 ID 的完整快照回退也不能跳过此边界。
+
+轮次结束后，先停止下游请求，再通过各绑定副本的 `omni_finish_turn` RPC 确认旧传输已退役。
+V1 在发送线程完成 SHM 回收及其后续清理任务后确认；MRv2 只退役 native transport，
+拒绝旧账本所属的排队输出并回收未消费 SHM，不释放 Thinker scheduler KV。
+只有全部确认成功后才允许下一轮复用 ID；超时或失败不得继续复用。
+这里不能使用普通请求结束时的异步 best-effort 清理，否则迟到的清理可能删除下一轮 chunk。
+
 ## 适用范围与 MiniCPM 对比
 
 续写能力由现有引擎设置决定：V1 或 CUDA MRv2、APC、async-chunk，且无 speculative decoding。

@@ -666,6 +666,21 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             return 0
         return connector.cleanup_prefix(f"{external_req_id}_{self._stage_id}_")
 
+    def finish_turn(self, request_id: str) -> None:
+        """Fence old publications and reclaim unread chunks before ID reuse.
+
+        Scheduler KV and worker model state have independent owners. Retiring
+        only the transport also rejects queued batches through their captured
+        request-state identity, including results from async lookahead.
+        """
+        with self._native_output_lock:
+            state = self._native_requests.get(request_id)
+            external_req_id = (
+                state.external_req_id if state is not None else self._request_ids_mapping.get(request_id, request_id)
+            )
+            self.abort_requests({request_id})
+            self.release_shm_resources([external_req_id])
+
     def release_shm_resources(self, request_ids: list[str]) -> int:
         """Unlink segments these requests left unconsumed; return the count.
 

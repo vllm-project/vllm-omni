@@ -364,6 +364,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         return 0 if plane is None else plane.release_shm_resources(request_ids)
 
+    def finish_omni_turn(self, request_id: str) -> None:
+        """Retire a completed turn's transport without releasing resident KV."""
+        plane = getattr(self, "_omni_data_plane", None)
+        if plane is not None:
+            plane.finish_turn(request_id)
+
     def _reserve_native_data_plane_outputs(self, req_ids: list[str]) -> None:
         plane = getattr(self, "_omni_data_plane", None)
         if plane is not None:

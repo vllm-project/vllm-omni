@@ -1040,3 +1040,33 @@ def test_old_turn_batch_cannot_publish_into_reinstalled_request(plane):
     _complete(plane, [{"codes.audio": torch.tensor([[1]])}], token=21)
     assert plane._native_requests["internal"].output_token_ids == [21]
     assert not plane._native_outputs_in_flight
+
+
+def test_turn_retirement_reclaims_unread_shm_before_same_id_reuse(plane):
+    ext_id = f"turn_{uuid.uuid4().hex}"
+    connector = SharedMemoryConnector({"stage_id": 0})
+    plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
+    request = _new_request(external_req_id=ext_id)
+    plane.register_request(request)
+    old_state = plane._native_requests["internal"]
+    plane.reserve_outputs(["internal"])
+    try:
+        assert connector.put("0", "1", f"{ext_id}_0_0", "unread old turn")[0]
+        plane.finish_turn("internal")
+        assert "internal" not in plane._native_requests
+        assert not connector._pending_keys
+        assert not plane._deferred_shm_releases
+        plane.register_request(request)
+        plane.reserve_outputs(["internal"])
+        before = len(plane.record.batches)
+        plane.complete_outputs(
+            req_ids=["internal"],
+            inter_stage_outputs=[{"codes.audio": torch.tensor([[99]])}],
+            sampled_token_ids=[[99]],
+            request_states={"internal": old_state},
+        )
+        assert len(plane.record.batches) == before
+        assert plane._native_outputs_in_flight["internal"] == 1
+        assert connector.get("0", "1", f"{ext_id}_0_0") is None
+    finally:
+        connector.close()
