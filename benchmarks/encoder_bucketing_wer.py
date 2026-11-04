@@ -302,6 +302,15 @@ def main(args) -> None:
             tot += len(rw)
         print(f"WER({label}) unfiltered: {dist / tot:.4f}  ({dist}/{tot})")
 
+    # WER(on vs off) unfiltered: the on/off text delta over all common clips,
+    # including the rambles/truncations the clean filter drops.
+    dist = tot = 0
+    for idx in common:
+        ow = normalize(off[idx])
+        dist += levenshtein(ow, normalize(on[idx]))
+        tot += len(ow)
+    print(f"WER(on vs off) unfiltered: {dist / tot:.4f}  ({dist}/{tot})")
+
     if not clean:
         # Every clip was filtered as over/under-generated; there is nothing to
         # clean-score, and WER would divide by zero.
