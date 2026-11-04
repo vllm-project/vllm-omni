@@ -229,6 +229,11 @@ class AudioEncoder(nn.Module):
     Optimized for 25s audio chunks at 25Hz
     """
 
+    # padding_mels reports ``s.size(1) - 2`` as the valid length but keeps the
+    # two trailing mel frames in the tensor; conv1/conv2 read those frames, so
+    # the length-bucketed wrapper must copy them (not zero them) to stay exact.
+    bucketing_context_margin = 2
+
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
         super().__init__()
         self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)

@@ -190,6 +190,11 @@ class _BucketedEncoder:
         self._disabled = False
         self._truncation_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
+        # Extra feature frames the encoder's front conv reads beyond the
+        # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
+        # Bucketing and copying add this margin; the attention mask length is
+        # unchanged (it still uses the reported valid length).
+        self._context_margin = 0
 
     def publish(self, lengths: tuple[int, ...] | None) -> None:
         self._lengths = lengths
@@ -246,7 +251,9 @@ class _BucketedEncoder:
 
         # An over-long item cannot be bucketed without truncating its tail,
         # which would silently change that item's output length downstream.
-        if max(lengths) > self.ladder.max_length:
+        # The front conv still reads the context margin, so an item whose
+        # reported length plus margin exceeds the largest rung is over-long.
+        if max(lengths) + self._context_margin > self.ladder.max_length:
             return self._original(*args, **kwargs)
 
         try:
@@ -296,7 +303,7 @@ class _BucketedEncoder:
     def _bucketed(self, features, lengths, mask, length_arg):
         groups: dict[int, list[int]] = {}
         for index, length in enumerate(lengths):
-            groups.setdefault(self.ladder.padded_length(length), []).append(index)
+            groups.setdefault(self.ladder.padded_length(length + self._context_margin), []).append(index)
 
         container: torch.Tensor | None = None
         aux_container: torch.Tensor | None = None
@@ -351,12 +358,12 @@ class _BucketedEncoder:
         if self._axis == 2:
             batch = features.new_zeros((padded, features.size(1), rung))
             for row, index in enumerate(chunk):
-                take = min(lengths[index], rung)
+                take = min(lengths[index] + self._context_margin, rung)
                 batch[row, :, :take] = features[index, :, :take]
         else:
             batch = features.new_zeros((padded, rung, features.size(2)))
             for row, index in enumerate(chunk):
-                take = min(lengths[index], rung)
+                take = min(lengths[index] + self._context_margin, rung)
                 batch[row, :take] = features[index, :take]
         if mask is not None:
             return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))
@@ -507,6 +514,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
+        encoder._context_margin = int(getattr(module, "bucketing_context_margin", 0) or 0)
         for klass in type(module).__mro__:
             shim = _FORWARD_SHIMS.get(klass.__name__)
             if shim is not None:

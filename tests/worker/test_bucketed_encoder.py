@@ -319,6 +319,54 @@ def test_length_returning_encoder_shim_nontuple_falls_back(bucket_env):
     torch.testing.assert_close(out[1], eager_lens, rtol=0, atol=1e-6)
 
 
+def test_context_margin_preserves_conv_tail(bucket_env):
+    """A conv front that reads ``length + bucketing_context_margin`` frames must
+    not have its context tail zeroed: the wrapper copies the extra frames, so the
+    bucketed output matches the eager conv over the full real window."""
+    from torch.nn import functional as F
+
+    class ConvContextEncoder(nn.Module):
+        # Mirrors StepAudio2's padding_mels: the reported length is 2 less than
+        # the number of real mel frames, which the 3-tap conv still reads.
+        bucketing_context_margin = 2
+
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            pad = F.pad(x, (0, 0, 1, 1))  # zero-pad the time axis by 1 each side
+            out = pad[:, : x.size(1)] + pad[:, 1 : x.size(1) + 1] + pad[:, 2 : x.size(1) + 2]
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ConvContextEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    # Real content is [0, length + margin); garbage tail after the conv context.
+    lengths = [40, 120, 150, 75]  # max + margin <= largest rung (200)
+    feats = torch.randn(len(lengths), T, D, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, length + 2 :] += 3.0
+    lens = torch.tensor(lengths, dtype=torch.long)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
+        out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert out.shape[0] == len(lengths)
+    for row, length in enumerate(lengths):
+        # The eager reference feeds the full real window (length + context margin).
+        solo, solo_len = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
+        torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
 def test_module_pattern_env_override(bucket_env, monkeypatch):
     """VLLM_OMNI_AUDIO_BUCKET_MODULES selects which module names wrap."""
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_MODULES", r"(?:^|\.)my_frontend$")
