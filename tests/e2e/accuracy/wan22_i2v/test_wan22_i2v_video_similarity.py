@@ -23,7 +23,9 @@ from tests.e2e.accuracy.helpers import (
     send_video_request_with_timeout,
     validate_image_source,
     video_artifact_dir,
+    write_json_artifact,
 )
+from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
 from tests.e2e.accuracy.wan22_i2v.wan22_i2v_video_similarity_common import (
     FLOW_SHIFT,
     FPS,
@@ -195,7 +197,7 @@ def _generate_offline_video(*, image_source: str) -> tuple[Path, Path]:
 
 @pytest.mark.benchmark
 @pytest.mark.full_model
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_wan22_i2v_diffusers_offline_generates_video(
     wan22_i2v_image_source: str | None,
 ) -> None:
@@ -217,7 +219,7 @@ def test_wan22_i2v_diffusers_offline_generates_video(
 
 @pytest.mark.benchmark
 @pytest.mark.full_model
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_wan22_i2v_online_serving_generates_video(
     omni_server,
@@ -244,7 +246,7 @@ def test_wan22_i2v_online_serving_generates_video(
 
 @pytest.mark.benchmark
 @pytest.mark.full_model
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 def test_wan22_i2v_serving_matches_diffusers_video_similarity(
     wan22_i2v_image_source: str | None,
 ) -> None:
@@ -259,15 +261,7 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
     image_source = _resolve_image_source(wan22_i2v_image_source)
     validate_image_source(image_source)
     online_path, offline_path, offline_metadata_path = _artifact_paths(image_source)
-
-    if not online_path.exists():
-        pytest.skip(f"Missing online artifact from prerequisite test: {online_path}")
-    if not offline_path.exists() or not offline_metadata_path.exists():
-        pytest.skip(f"Missing offline artifacts from prerequisite test: {offline_path}, {offline_metadata_path}")
-
-    assert online_path.exists(), f"Expected online video artifact at {online_path}"
-    assert offline_path.exists(), f"Expected offline video artifact at {offline_path}"
-    assert offline_metadata_path.exists(), f"Expected offline metadata artifact at {offline_metadata_path}"
+    require_similarity_artifacts([online_path, offline_path, offline_metadata_path])
 
     online_metadata = probe_video(online_path)
     offline_metadata = probe_video(offline_path)
@@ -285,11 +279,26 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
         f"wan22_i2v similarity thresholds: device_profile={device_profile}, "
         f"ssim>={thresholds.ssim:.6f}, psnr>={thresholds.psnr:.6f}"
     )
-    assert_video_similarity_metrics(
+    ssim, psnr = assert_video_similarity_metrics(
         label="wan22_i2v",
         online_path=online_path,
         offline_path=offline_path,
         ssim_threshold=thresholds.ssim,
         psnr_threshold=thresholds.psnr,
     )
-    print(f"offline_metadata={offline_metadata_path}")
+    score_path = offline_path.with_name("similarity.json")
+    write_json_artifact(
+        score_path,
+        {
+            "label": "wan22_i2v",
+            "device_profile": device_profile,
+            "ssim": ssim,
+            "psnr": psnr,
+            "ssim_threshold": thresholds.ssim,
+            "psnr_threshold": thresholds.psnr,
+            "online_video": str(online_path),
+            "offline_video": str(offline_path),
+            "offline_metadata": str(offline_metadata_path),
+        },
+    )
+    print(f"similarity_result={score_path}")

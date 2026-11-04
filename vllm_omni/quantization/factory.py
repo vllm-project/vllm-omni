@@ -81,11 +81,39 @@ from .component_config import ComponentQuantizationConfig  # noqa: E402
 logger = init_logger(__name__)
 
 
+def _build_fp8(**kw: Any) -> QuantizationConfig:
+    if kw.get("weight_scheme") == "per_channel":
+        from .fp8_config import SerializedPerChannelFp8Config
+
+        return SerializedPerChannelFp8Config.from_config(kw)
+    if kw.get("is_checkpoint_fp8_serialized", False):
+        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+        return Fp8Config(**kw)
+    from .fp8_config import DiffusionFp8Config
+
+    return DiffusionFp8Config(**kw)
+
+
 def _build_int8(**kw: Any) -> QuantizationConfig:
     """Lazy import for Int8 diffusion config (supports CUDA + NPU)."""
     from .int8_config import DiffusionInt8Config
 
     return DiffusionInt8Config(**kw)
+
+
+def _build_convrot_int8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W8A8 diffusion config (CUDA only)."""
+    from .convrot_config import DiffusionConvRotInt8Config
+
+    return DiffusionConvRotInt8Config(**kw)
+
+
+def _build_convrot_int4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W4A4 (+ optional INT8 layers) diffusion config (CUDA only)."""
+    from .convrot_config import DiffusionConvRotInt4Config
+
+    return DiffusionConvRotInt4Config(**kw)
 
 
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
@@ -168,7 +196,10 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
 
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
+    "fp8": _build_fp8,
     "int8": _build_int8,
+    "convrot_int8": _build_convrot_int8,
+    "convrot_int4": _build_convrot_int4,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
@@ -329,6 +360,17 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
     config_cls = get_quantization_config(method)
+
+    from vllm.config.quantization import resolve_quantization_config
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+    if config_cls is OnlineQuantizationConfig:
+        if "args" in kwargs:
+            return config_cls(**kwargs)
+        args = resolve_quantization_config(method, kwargs or None)
+        if args is None:
+            raise ValueError("Online quantization requires quantization config arguments")
+        return config_cls(args)
 
     try:
         return config_cls(**kwargs)

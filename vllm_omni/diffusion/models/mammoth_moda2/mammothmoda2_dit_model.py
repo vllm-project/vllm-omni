@@ -1,20 +1,133 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from typing import TYPE_CHECKING
+
 import torch
-import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import nn
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.model_executor.models.utils import maybe_prefix
 
 from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+# On the measured RTX 4090, fusion won even for the shortest tested tables;
+# deployments can tune the crossover with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS.
+_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS = 0
+
+RotaryEmbedding = tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+
+
+def _with_packed_rope_table(rotary_emb: tuple[torch.Tensor, torch.Tensor], min_tokens: int | None) -> RotaryEmbedding:
+    """Pack a model-produced adjacent-pair RoPE table once for all layers.
+
+    A third element of ``None`` records that the support or token gate chose
+    the eager path, so attention layers need not resolve that gate again.
+    """
+    cos, sin = rotary_emb
+    if min_tokens is None or cos.shape[0] * cos.shape[1] < min_tokens:
+        return cos, sin, None
+    packed = torch.cat((cos[..., 0::2], sin[..., 0::2]), dim=-1)
+    return cos, sin, packed.reshape(-1, cos.shape[-1]).float()
+
+
+def _apply_qk_norm_rope(
+    attn: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    image_rotary_emb: RotaryEmbedding | None,
+    *,
+    rope_repeats_pairs: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Mammoth's per-head Q/K norm and adjacent-pair real RoPE."""
+    batch_size, sequence_length, _, head_dim = query.shape
+    cos, sin = (image_rotary_emb[0], image_rotary_emb[1]) if image_rotary_emb is not None else (None, None)
+    prepared = image_rotary_emb is not None and len(image_rotary_emb) == 3
+    packed = image_rotary_emb[2] if prepared else None
+    use_fused = (
+        rope_repeats_pairs
+        and cos is not None
+        and sin is not None
+        and attn.norm_q is not None
+        and attn.norm_k is not None
+        and attn.norm_q.variance_epsilon == attn.norm_k.variance_epsilon
+        and key.shape[0] == batch_size
+        and key.shape[1] == sequence_length
+        and key.shape[-1] == head_dim
+        and _fused_cuda_supported(query, key, head_dim, head_dim, interleaved=True)
+        and cos.shape[-2:] == (sequence_length, head_dim)
+        and sin.shape == cos.shape
+        and cos.ndim in (2, 3)
+        and (cos.ndim == 2 or cos.shape[0] in (1, batch_size))
+        and cos.device == query.device
+        and cos.dtype in (query.dtype, torch.float32)
+        and sin.device == query.device
+        and sin.dtype == cos.dtype
+        and (
+            packed is not None
+            if prepared
+            else batch_size * sequence_length >= fused_qk_norm_rope_min_tokens(_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS)
+        )
+    )
+    if use_fused:
+        assert cos is not None and sin is not None
+        if prepared:
+            assert packed is not None
+            rope_table = packed
+        else:
+            if cos.ndim == 2:
+                cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+            if cos.shape[0] == 1 and batch_size > 1:
+                cos = cos.expand(batch_size, -1, -1)
+                sin = sin.expand(batch_size, -1, -1)
+            rope_table = torch.cat((cos[..., 0::2], sin[..., 0::2]), dim=-1).reshape(
+                batch_size * sequence_length, head_dim
+            )
+        query, key = fused_qk_norm_rope(
+            query.reshape(batch_size * sequence_length, query.shape[2], head_dim),
+            key.reshape(batch_size * sequence_length, key.shape[2], head_dim),
+            attn.norm_q.weight,
+            attn.norm_k.weight,
+            rope_table,
+            attn.norm_q.variance_epsilon,
+            head_dim=head_dim,
+            rotary_dim=head_dim,
+            interleaved=True,
+        )
+        return (
+            query.reshape(batch_size, sequence_length, query.shape[1], head_dim),
+            key.reshape(batch_size, sequence_length, key.shape[1], head_dim),
+        )
+
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+    if attn.norm_k is not None:
+        key = attn.norm_k(key)
+    if image_rotary_emb is not None:
+        query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
+        key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
+    return query, key
 
 
 class LuminaRMSNormZero(nn.Module):
@@ -59,6 +172,8 @@ class LuminaFeedForward(nn.Module):
         inner_dim: int,
         multiple_of: int | None = 256,
         ffn_dim_multiplier: float | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -67,28 +182,29 @@ class LuminaFeedForward(nn.Module):
             inner_dim = int(ffn_dim_multiplier * inner_dim)
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
 
-        self.linear_1 = nn.Linear(
-            dim,
-            inner_dim,
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=dim,
+            output_sizes=[inner_dim, inner_dim],
             bias=False,
-        )
-        self.linear_2 = nn.Linear(
-            inner_dim,
-            dim,
-            bias=False,
-        )
-        self.linear_3 = nn.Linear(
-            dim,
-            inner_dim,
-            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "gate_up_proj"),
         )
 
-    def swiglu(self, x, y):
-        return F.silu(x.float(), inplace=False).to(x.dtype) * y
+        self.linear_2 = RowParallelLinear(
+            input_size=inner_dim,
+            output_size=dim,
+            bias=False,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "linear_2"),
+        )
+
+        self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        h1, h2 = self.linear_1(x), self.linear_3(x)
-        return self.linear_2(self.swiglu(h1, h2))
+        gate_up, _ = self.gate_up_proj(x)
+        output, _ = self.linear_2(self.act_fn(gate_up))
+        return output
 
 
 class LuminaLayerNormContinuous(nn.Module):
@@ -275,13 +391,18 @@ class AttnProcessor:
     head count first.
     """
 
+    def __init__(self, *, rope_repeats_pairs: bool = False) -> None:
+        # Only the model's RotaryPosEmbedReal producer guarantees equal adjacent
+        # lanes. Generic processors retain the native four-lane arithmetic.
+        self.rope_repeats_pairs = rope_repeats_pairs
+
     def __call__(
         self,
         attn: Attention,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor | None = None,
+        image_rotary_emb: RotaryEmbedding | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -301,20 +422,14 @@ class AttnProcessor:
             # cu_seqlens with arange(step=seq_len) and rejects step 0. Nothing
             # to attend to either way, so hand the projection an empty input.
             empty = query.new_zeros(batch_size, sequence_length, attn.heads * head_dim)
-            return attn.to_out[1](attn.to_out[0](empty))
+            empty = attn.to_out[0](empty)
+            return attn.to_out[1](empty)
 
         query = query.view(batch_size, -1, attn.heads, head_dim)
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        if image_rotary_emb is not None:
-            query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
-            key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
+        query, key = _apply_qk_norm_rope(attn, query, key, image_rotary_emb, rope_repeats_pairs=self.rope_repeats_pairs)
 
         query, key = query.to(dtype), key.to(dtype)
 
@@ -347,13 +462,18 @@ class TransformerBlock(nn.Module):
         ffn_dim_multiplier: float,
         norm_eps: float,
         modulation: bool = True,
+        *,
+        rope_repeats_pairs: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         """Initialize the transformer block."""
         super().__init__()
         self.head_dim = dim // num_attention_heads
+        kv_dim = num_kv_heads * self.head_dim
         self.modulation = modulation
 
-        processor = AttnProcessor()
+        processor = AttnProcessor(rope_repeats_pairs=rope_repeats_pairs)
 
         # Initialize attention layer
         self.attn = Attention(
@@ -368,7 +488,44 @@ class TransformerBlock(nn.Module):
             out_bias=False,
             processor=processor,
         )
-        # Set the QK norms here instead of letting diffusers build its own RMSNorm via qk_norm.
+
+        self.attn.to_q = ReplicatedLinear(
+            input_size=dim,
+            output_size=dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_q"),
+            return_bias=False,
+        )
+        self.attn.to_k = ReplicatedLinear(
+            input_size=dim,
+            output_size=kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_k"),
+            return_bias=False,
+        )
+
+        self.attn.to_v = ReplicatedLinear(
+            input_size=dim,
+            output_size=kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_v"),
+            return_bias=False,
+        )
+
+        self.attn.to_out[0] = ReplicatedLinear(
+            input_size=dim,
+            output_size=dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_out.0"),
+            return_bias=False,
+        )
+
+        # Set the QK norms here instead of letting diffusers build its own
+        # RMSNorm via qk_norm.
         self.attn.norm_q = RMSNorm(self.head_dim, eps=1e-5)
         self.attn.norm_k = RMSNorm(self.head_dim, eps=1e-5)
         # The kernel itself runs through the shared Omni attention layer: backend
@@ -386,12 +543,21 @@ class TransformerBlock(nn.Module):
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
-            dim=dim, inner_dim=4 * dim, multiple_of=multiple_of, ffn_dim_multiplier=ffn_dim_multiplier
+            dim=dim,
+            inner_dim=4 * dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "feed_forward"),
         )
 
         # Initialize normalization layers
         if modulation:
-            self.norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True)
+            self.norm1 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                norm_elementwise_affine=True,
+            )
         else:
             self.norm1 = RMSNorm(dim, eps=norm_eps)
 
@@ -403,7 +569,7 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        image_rotary_emb: torch.Tensor,
+        image_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.modulation:
@@ -456,6 +622,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         axes_lens: tuple[int, int, int] = (300, 512, 512),
         text_feat_dim: int = 1024,
         timestep_scale: float = 1.0,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         """Initialize the  transformer model."""
         super().__init__()
@@ -505,8 +673,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"noise_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -520,8 +691,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"ref_image_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -535,8 +709,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=False,
+                    rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"context_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -551,8 +728,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"layers.{i}"),
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -705,14 +885,18 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         self,
         text_hidden_states: torch.Tensor,
         text_attention_mask: torch.Tensor,
-        context_rotary_emb: torch.Tensor,
+        context_rotary_emb: RotaryEmbedding,
         img_tokens: torch.Tensor,
         img_mask: torch.Tensor,
-        noise_rotary_emb: torch.Tensor,
+        noise_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor,
     ):
-        for layer in self.context_refiner:
-            text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+        # Online-FP8 GEMM kernels do not accept M=0. The default CFG
+        # unconditional branch has zero text tokens when no negative prompt
+        # embeddings are available, so skip the entire context refiner.
+        if text_hidden_states.shape[1] > 0:
+            for layer in self.context_refiner:
+                text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
 
         for layer in self.noise_refiner:
             img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
@@ -743,7 +927,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         ar_image_hidden_states: torch.Tensor | None = None,
         ar_image_attention_mask: torch.Tensor | None = None,
         return_dict: bool = False,
+        teacache_branch: str | None = None,
     ) -> torch.Tensor:
+        # Consumed by TeaCacheHook/extractor before this plain forward runs.
+        del teacache_branch
+
         batch_size, height, width = self._validate_inputs(
             hidden_states, text_hidden_states, text_attention_mask, ref_image_hidden_states, return_dict
         )
@@ -772,6 +960,20 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             ar_image_hidden_states,
             ar_image_attention_mask,
         )
+
+        # The producer repeats each frequency across adjacent lanes. Resolve
+        # support and the token gate once, then share each of the three packed
+        # tables across its refiner or transformer layers. Keep preparation in
+        # forward so embedding-only callers retain the producer's return values.
+        head_dim = rotary_emb[0].shape[-1]
+        min_tokens = (
+            fused_qk_norm_rope_min_tokens(_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS)
+            if _fused_cuda_supported(hidden_states, hidden_states, head_dim, head_dim, interleaved=True)
+            else None
+        )
+        context_rotary_emb = _with_packed_rope_table(context_rotary_emb, min_tokens)
+        noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb, min_tokens)
+        rotary_emb = _with_packed_rope_table(rotary_emb, min_tokens)
 
         text_hidden_states, img_tokens = self._apply_refiners(
             text_hidden_states,

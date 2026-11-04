@@ -54,7 +54,8 @@ class PrefixCacheConfig:
 
     num_blocks: int
     block_size: int
-    # GPU-clone byte budget for JOIN_ON_FINISH; exceeding it forces a copy.
+    # GPU-byte budget for device rows awaiting a host copy: step clones,
+    # deferred rows and the runner's decode buffer. Exceeding it forces a copy.
     gpu_staging_bytes: int = 512 * 1024 * 1024
     # Device→host staging: circular slots, one whole step each (not per request).
     # Host memory per key ≈ staging_depth * staging_capacity_tokens * width * dtype.
@@ -146,6 +147,25 @@ class ModelCachePolicy:
     # clone until finish/abort (JOIN_ON_FINISH). Also skipped by the
     # immediate on-device clone / device→host path.
     deferred_keys: frozenset[TensorName] = frozenset()
+    # The model appends its multimodal outputs in sample(), after the step
+    # was saved (YuE2 ships the finished song there), so the step's mm
+    # snapshot is missing them. The runner then discards the step snapshot
+    # and builds the payload from the live outputs, which carry no
+    # full-prompt hidden states.
+    mm_outputs_written_in_sample: bool = False
+
+    # Token-only stages may reuse native KV/recurrent state without replaying
+    # prefix hidden states or multimodal outputs.
+    native_kv_cache_only: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mm_outputs_written_in_sample and self.needs_full_hidden_states:
+            raise OmniPrefixCacheUnmatchError(
+                "mm_outputs_written_in_sample needs requires_full_prefix_cached_hidden_states = False: "
+                "the payload is built from the live outputs, which carry no full-prompt hidden states"
+            )
+        if self.native_kv_cache_only and (self.needs_full_hidden_states or self.deferred_keys):
+            raise ValueError("native KV-only caching cannot replay prefix hidden states or multimodal outputs")
 
     @property
     def hidden_key(self) -> TensorName | None:
@@ -168,4 +188,6 @@ class ModelCachePolicy:
         return cls(
             needs_full_hidden_states=bool(getattr(model, "requires_full_prefix_cached_hidden_states", True)),
             deferred_keys=deferred,
+            mm_outputs_written_in_sample=bool(getattr(model, "mm_outputs_written_in_sample", False)),
+            native_kv_cache_only=bool(getattr(model, "uses_native_kv_cache_only", False)),
         )

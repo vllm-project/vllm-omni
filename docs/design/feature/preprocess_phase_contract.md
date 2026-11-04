@@ -94,6 +94,11 @@ Every such row has `_omni_is_prefill == False`. The optional earlier
 `preprocess_batch` hook is a separate whole-batch preparation hook; these freshly
 computed per-row fields are not promised at that earlier boundary.
 
+Models retaining request-owned prompt tensors across prefill chunks must release
+them in `on_requests_finished`, including cancellation before the final prompt
+chunk. A wrapper owning such tensors must clean them before forwarding completion
+to its inner model; model-specific MRV2 state should reuse that cleanup entry.
+
 ### Routing guarantee
 
 With `has_preprocess=True`, the batched decode hook is eligible only when it is

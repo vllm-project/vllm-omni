@@ -3,31 +3,33 @@
 
 from __future__ import annotations
 
-import functools
+from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.data_entry_keys import to_struct
+from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.worker import gpu_ar_model_runner
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-if TYPE_CHECKING:
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-
-
-@functools.lru_cache(maxsize=1)
-def _cosyvoice3_model_and_runner():
-    """Defer heavy Omni/vLLM imports until a test runs (avoids duplicate CustomOp init)."""
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    return CosyVoice3Model, GPUARModelRunner
 
 
 class _DummyCode2Wav:
@@ -89,7 +91,6 @@ def _make_code2wav_model(
     num_samples: int = 32,
     outputs: list[tuple[torch.Tensor, dict[str, object] | None]] | None = None,
 ) -> CosyVoice3Model:
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_code2wav"
@@ -115,9 +116,10 @@ def _make_code2wav_model(
 
 
 def _make_talker_model() -> CosyVoice3Model:
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model._pending_rejection_rng = None
+    model._sampled_token_feedback = None
     model.model_stage = "cosyvoice3_talker"
     model.config = SimpleNamespace(
         llm={
@@ -140,24 +142,181 @@ def _make_sampling_metadata(
     output_token_ids: list[list[int]],
     repetition_penalty: float = 2.0,
 ) -> SamplingMetadata:
+    batch_size = len(output_token_ids)
     return SamplingMetadata(
-        temperature=torch.tensor([1.0], dtype=torch.float32),
+        temperature=torch.ones(batch_size, dtype=torch.float32),
         all_greedy=False,
         all_random=True,
-        top_p=torch.tensor([0.8], dtype=torch.float32),
-        top_k=torch.tensor([25], dtype=torch.int32),
+        top_p=torch.full((batch_size,), 0.8, dtype=torch.float32),
+        top_k=torch.full((batch_size,), 25, dtype=torch.int32),
         generators={},
         max_num_logprobs=None,
         no_penalties=False,
         prompt_token_ids=None,
-        frequency_penalties=torch.zeros(1, dtype=torch.float32),
-        presence_penalties=torch.zeros(1, dtype=torch.float32),
-        repetition_penalties=torch.tensor([repetition_penalty], dtype=torch.float32),
+        frequency_penalties=torch.zeros(batch_size, dtype=torch.float32),
+        presence_penalties=torch.zeros(batch_size, dtype=torch.float32),
+        repetition_penalties=torch.full((batch_size,), repetition_penalty, dtype=torch.float32),
         output_token_ids=output_token_ids,
         allowed_token_ids_mask=None,
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
+
+
+@pytest.fixture
+def output_payload_vllm_config(tmp_path, request):
+    hf_config = CosyVoice3Config()
+    hf_config.llm.update(llm_input_size=16, llm_output_size=16, speech_token_size=32)
+    # Exercise the real config fields without model downloads or engine setup.
+    model_config = object.__new__(OmniModelConfig)
+    model_config.hf_config = hf_config
+    model_config.model_stage = "cosyvoice3_talker"
+    model_config.model = str(tmp_path)
+    model_config.async_chunk = getattr(request, "param", True)
+    model_config.enable_return_routed_experts = False
+    model_config.engine_output_type = "latent"
+    model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {"role": "sender"}}
+    vllm_config = object.__new__(VllmConfig)
+    vllm_config.model_config = model_config
+    return vllm_config
+
+
+@pytest.fixture
+def output_payload_talker(monkeypatch, output_payload_vllm_config):
+    class DummyEncoder(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def forward(self, inputs_embeds, positions):
+            return inputs_embeds
+
+    class DummyTalker(nn.Module):
+        def __init__(self, *, llm: nn.Module, **kwargs):
+            super().__init__()
+            self.llm = llm
+
+    monkeypatch.setattr(cosyvoice3_talker, "VLLMQwen2Encoder", DummyEncoder)
+    monkeypatch.setattr(cosyvoice3_talker, "CosyVoice3LM", DummyTalker)
+    monkeypatch.setattr(CosyVoice3Model, "_create_llm_vllm_config", lambda self, config: config)
+
+    return CosyVoice3Model(vllm_config=output_payload_vllm_config)
+
+
+@pytest.mark.parametrize(
+    "output_payload_vllm_config", [True, False], indirect=True, ids=["async_chunks", "sync_chunks"]
+)
+@pytest.mark.parametrize("async_scheduling", [True, False], ids=["async_scheduling", "sync_scheduling"])
+def test_talker_skips_unused_hidden_payload_without_async_materialization(
+    output_payload_talker, output_payload_vllm_config, async_scheduling
+):
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = async_scheduling
+    runner.omni_prefix_cache = None
+    runner.speculative_config = None
+    runner.model_config = output_payload_vllm_config.model_config
+    runner.model = output_payload_talker
+    # load_model caches this policy before the output path runs.
+    runner._pooler_payload_include_hidden_flag = bool(getattr(runner.model, "omni_pooler_payload_include_hidden", True))
+
+    assert runner._model_omni_pooler_payload_include_hidden() is (not runner.model_config.async_chunk)
+    assert runner._should_use_async_omni_output() is False
+
+
+@pytest.mark.parametrize("is_prefill", [True, False], ids=["prefill", "decode"])
+@pytest.mark.parametrize(
+    "output_payload_vllm_config", [True, False], indirect=True, ids=["async_chunks", "sync_chunks"]
+)
+def test_talker_inline_output_preserves_conditioning_and_tokens(
+    output_payload_talker, output_payload_vllm_config, monkeypatch, mocker, is_prefill
+):
+    """Token-only output retains prefill conditioning and sampled codec IDs."""
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = output_payload_talker
+    runner._pooler_payload_include_hidden_flag = bool(getattr(runner.model, "omni_pooler_payload_include_hidden", True))
+    runner.vllm_config = output_payload_vllm_config
+    runner.model_config = output_payload_vllm_config.model_config
+    runner._async_chunk = runner.model_config.async_chunk
+    runner.omni_prefix_cache = None
+    runner.supports_mm_inputs = False
+    runner.routed_experts_initialized = False
+    runner.model_intermediate_buffer = {}
+    runner.input_batch = object.__new__(InputBatch)
+    runner.input_batch._req_ids = ["r1", "r2"]
+    runner.input_batch.req_id_to_index = {"r1": 0, "r2": 1}
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    conditioning = {
+        "speech_token": torch.tensor([[11, 12], [21, 0]], dtype=torch.long),
+        "speech_token_len": torch.tensor([2, 1], dtype=torch.long),
+        "speech_feat": torch.arange(16, dtype=torch.float32).reshape(2, 4, 2),
+        "embedding": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+    }
+    expected = {key: value.clone() for key, value in conditioning.items()}
+    hidden_states = output_payload_talker.forward(
+        input_ids=torch.tensor([1, 2, 3]),
+        positions=torch.arange(3),
+        inputs_embeds=torch.ones(3, 16),
+        **(conditioning if is_prefill else {}),
+    )
+    model_output = output_payload_talker.make_omni_output(hidden_states, **(conditioning if is_prefill else {}))
+
+    cpu_materialization = mocker.spy(gpu_ar_model_runner, "_to_cpu_contiguous")
+    scheduler_output = object.__new__(SchedulerOutput)
+    scheduler_output.total_num_scheduled_tokens = 3
+    scheduler_output.num_scheduled_tokens = {"r1": 2, "r2": 1}
+    output = runner._build_omni_model_runner_output_from_snapshot(
+        scheduler_output=scheduler_output,
+        hidden_states=model_output.text_hidden_states,
+        staged_hidden_states_cpu=None,
+        multimodal_outputs=model_output.multimodal_outputs,
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101], [102]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=torch.tensor([2, 1], dtype=torch.int32).numpy(),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
+    )
+    assert output.req_ids == ["r1", "r2"]
+    assert output.sampled_token_ids == [[101], [102]]
+    hidden_storage = model_output.text_hidden_states.untyped_storage().data_ptr()
+    hidden_copied = any(
+        call.args[0].untyped_storage().data_ptr() == hidden_storage for call in cpu_materialization.call_args_list
+    )
+    assert hidden_copied is (not runner._async_chunk)
+    if runner._async_chunk:
+        assert output.multimodal_outputs is None
+    if not is_prefill and runner._async_chunk:
+        assert not output.inter_stage_outputs or all(not item for item in output.inter_stage_outputs)
+        return
+
+    assert len(output.inter_stage_outputs) == 2
+    for idx, prompt_len in enumerate([2, 1]):
+        item = output.inter_stage_outputs[idx]
+        assert ("hidden" not in item) is runner._async_chunk
+        if not is_prefill:
+            continue
+        # The downstream processor removes padding using speech_token_len.
+        torch.testing.assert_close(item["embed.speech_token"], expected["speech_token"][idx : idx + 1])
+        torch.testing.assert_close(item["embed.speech_feat"], expected["speech_feat"][idx : idx + 1])
+        assert item["embed.speech_token_len"].item() == prompt_len
+        torch.testing.assert_close(item["embed.embedding"], expected["embedding"][idx : idx + 1])
+
+
+def test_talker_preserves_packed_payload_policy(output_payload_talker, output_payload_vllm_config, monkeypatch):
+    output_payload_vllm_config.model_config.async_chunk = False
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
+    model = CosyVoice3Model(vllm_config=output_payload_vllm_config)
+
+    assert model.omni_pooler_payload_include_hidden is False
+    assert not getattr(model, "use_async_omni_output", False)
 
 
 def test_forward_prefers_token_offset_when_present():
@@ -448,21 +607,21 @@ def test_sample_uses_ras_rejection_for_recent_repetition():
     assert out.sampled_token_ids.tolist() == [[2]]
 
 
-def test_sample_tolerates_padded_rows_without_history():
+@pytest.mark.parametrize("history_rows,mixed,win_size", [(1, False, 10), (2, True, 10), (4, False, 10), (1, True, 0)])
+def test_sample_aligns_history_with_active_rows(history_rows, mixed, win_size):
     model = _make_talker_model()
-    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
-    logits = torch.tensor(
-        [
-            [-1e9, 10.0, 0.0],
-            [-1e9, 0.0, 10.0],
-        ],
-        dtype=torch.float32,
-    )
-
+    model.config.llm["sampling"]["win_size"] = win_size
+    metadata = _make_sampling_metadata(output_token_ids=[[], [], []])
+    metadata.output_token_ids = [[1] * 10] + [[] for _ in range(history_rows - 1)]
+    metadata.all_random = not mixed
+    if mixed:
+        metadata.temperature[0] = 0.0
+    # Every primary draw is forced to token 1. Only row 0 owns that history.
+    metadata.top_k.fill_(1)
+    logits = torch.tensor([[-float("inf"), 10.0, 0.0]] * 3)
     out = model.sample(logits, metadata)
-
-    assert out is not None
-    assert out.sampled_token_ids.shape == (2, 1)
+    expected_first = 2 if win_size and not mixed else 1
+    assert out.sampled_token_ids.tolist() == [[expected_first], [1], [1]]
 
 
 def test_sample_excludes_non_finite_logits():
@@ -511,6 +670,34 @@ def test_sample_keeps_only_finite_token_after_ras_rejection():
     assert out.sampled_token_ids.tolist() == [[1]]
 
 
+def _reference_param(param, row, default):
+    if param is None or param.numel() == 0:
+        return default
+    value = param.reshape(-1)[min(row, param.numel() - 1)].item()
+    return int(value) if isinstance(default, int) else float(value)
+
+
+def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_r, generator):
+    """Serial RAS oracle from the pre-B1 implementation, including RNG draws."""
+    native_sample = getattr(random_sample, "__wrapped__", random_sample)
+    probs, ids = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
+    keep = probs.cumsum(dim=0) - probs < top_p
+    if top_k > 0:
+        keep &= torch.arange(probs.numel(), device=probs.device) < top_k
+    generators = {} if generator is None else {0: generator}
+    draw = native_sample((probs * keep).unsqueeze(0), generators).reshape(())
+    token = int(ids[draw].item())
+    if win_size > 0 and history:
+        recent = torch.tensor(history[-win_size:], device=probs.device)
+        if int((recent == token).sum().item()) >= win_size * tau_r:
+            scores = weighted_scores.clone()
+            original = scores[token].clone()
+            scores[token] = float("-inf")
+            scores[token] = torch.where(torch.isfinite(scores).any(), scores[token], original)
+            token = int(native_sample(scores.softmax(dim=0).unsqueeze(0), generators).item())
+    return token
+
+
 def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
     model = _make_talker_model()
     logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, 3.0, 1.0, -2.0], [1.0, 0.0, 2.0, -1.0]])
@@ -525,7 +712,7 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
         for i in range(3):
             scores = torch.log_softmax(logits[i] / metadata.temperature[i], dim=0)
             expected.append(
-                model._ras_sample_one(
+                _reference_ras_one(
                     scores,
                     metadata.output_token_ids[i],
                     top_p=float(metadata.top_p[i]),
@@ -540,6 +727,134 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
         for i, token in enumerate(expected):
             assert torch.equal(metadata.generators[i].get_state(), reference_generators[i].get_state())
             metadata.output_token_ids[i].append(token)
+
+
+@pytest.mark.parametrize(
+    "parameters,seeded_rows,use_host_params",
+    [
+        ("mixed", (0, 1, 2, 3), True),
+        ("mixed", (0, 2), True),
+        ("mixed", (0, 1, 2, 3), False),
+        ("defaults", (0, 2), True),
+        ("all_random", (0, 1, 2, 3), True),
+    ],
+)
+def test_mixed_ras_preserves_seeded_trajectories_and_greedy_rng(parameters, seeded_rows, use_host_params, device="cpu"):
+    model = _make_talker_model()
+    logits = torch.tensor([[4.0, 1.0, 0.0, -1.0], [0.0, 2.0, 1.0, -2.0]] * 2, device=device)
+    if torch.device(device).type == "cuda":
+        logits = torch.nn.functional.pad(logits, (0, 6761 - logits.shape[1]), value=-float("inf"))
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [1], [], [1] * 10])
+    metadata.all_random = parameters == "all_random"
+    # Include a greedy row between random rows to exercise both compactions.
+    temperatures = [0.6, 0.7, 1.2, 1.1] if metadata.all_random else [0.0, 0.7, 1.2, 0.0]
+    metadata.temperature = torch.tensor(temperatures)
+    host_params = [SamplingParams(temperature=t) for t in temperatures]
+    metadata.top_p = torch.tensor([0.8, 0.6, 0.9, 1.0])
+    metadata.top_k = torch.tensor([1, 1, -1, 4], dtype=torch.int32)
+    if parameters == "defaults":
+        metadata.top_p = metadata.top_k = None
+    for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties"):
+        value = getattr(metadata, name)
+        if value is not None:
+            setattr(metadata, name, value.to(device))
+    metadata.generators = {i: torch.Generator(device=device).manual_seed(800 + i) for i in seeded_rows}
+    reference_generators = {i: torch.Generator(device=device).manual_seed(800 + i) for i in seeded_rows}
+    for step in range(12):
+        if step == 6:
+            # A previously greedy request must start from its untouched RNG.
+            temperatures = [1.0, 0.9, 1.1, 0.5] if metadata.all_random else [1.0, 0.0, 0.0, 0.5]
+            metadata.temperature = torch.tensor(temperatures, device=device)
+            for params, temperature in zip(host_params, temperatures):
+                params.temperature = temperature
+        expected = {}
+        for i in range(len(logits)):
+            temperature = _reference_param(metadata.temperature, i, 1.0)
+            if temperature < model._sampling_eps:
+                expected[i] = int(logits[i].argmax())
+            elif i in seeded_rows:
+                expected[i] = _reference_ras_one(
+                    torch.log_softmax(logits[i] / temperature, dim=0),
+                    metadata.output_token_ids[i],
+                    top_p=_reference_param(metadata.top_p, i, 0.8),
+                    top_k=_reference_param(metadata.top_k, i, 25),
+                    win_size=10,
+                    tau_r=0.1,
+                    generator=reference_generators[i],
+                )
+        out = model.sample(logits.clone(), metadata, per_req_sampling_params=host_params if use_host_params else None)
+        assert out.sampled_token_ids.dtype == torch.int32
+        assert out.sampled_token_ids.shape == (4, 1)
+        tokens = out.sampled_token_ids[:, 0].tolist()
+        for i, token in enumerate(tokens):
+            if i in expected:
+                assert token == expected[i]
+            assert 0 <= token < logits.shape[1]
+            metadata.output_token_ids[i].append(token)
+        for i in seeded_rows:
+            assert torch.equal(metadata.generators[i].get_state(), reference_generators[i].get_state())
+
+
+def test_mixed_ras_request_reordering_preserves_generator_ownership():
+    model = _make_talker_model()
+    logits = torch.tensor([[1.0, 4.0, 0.0], [3.0, 0.0, 1.0], [0.0, 2.0, 5.0]])
+    temperatures = torch.tensor([0.7, 0.0, 1.2])
+    histories = [[1] * 10, [], [2]]
+    actual_generators = [torch.Generator().manual_seed(90 + i) for i in range(3)]
+    reference_generators = [torch.Generator().manual_seed(90 + i) for i in range(3)]
+    for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0]):
+        metadata = _make_sampling_metadata(output_token_ids=[histories[i] for i in order])
+        metadata.all_random = False
+        metadata.temperature = temperatures[order]
+        metadata.generators = {row: actual_generators[req] for row, req in enumerate(order)}
+        expected = []
+        for req in order:
+            if float(temperatures[req]) < model._sampling_eps:
+                expected.append(int(logits[req].argmax()))
+            else:
+                expected.append(
+                    _reference_ras_one(
+                        torch.log_softmax(logits[req] / float(temperatures[req]), dim=0),
+                        histories[req],
+                        top_p=float(metadata.top_p[0]),
+                        top_k=25,
+                        win_size=10,
+                        tau_r=0.1,
+                        generator=reference_generators[req],
+                    )
+                )
+        out = model.sample(logits[order].clone(), metadata)
+        assert out.sampled_token_ids[:, 0].tolist() == expected
+        for req, token in zip(order, expected):
+            histories[req].append(token)
+            assert torch.equal(actual_generators[req].get_state(), reference_generators[req].get_state())
+
+
+def test_mixed_ras_restores_single_valid_token_and_handles_empty_history():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [1] * 10, []])
+    metadata.all_random = False
+    metadata.temperature = torch.tensor([0.0, 1.0, 1.0])
+    metadata.allowed_token_ids_mask = torch.tensor([[False, True], [True, False], [True, False]])
+    logits = torch.tensor([[3.0, 1.0], [0.0, 2.0], [float("nan"), 1.0]])
+    out = model.sample(logits, metadata)
+    assert out.sampled_token_ids.tolist() == [[0], [1], [1]]
+
+
+def test_mixed_ras_applies_processors_before_greedy_and_random_selection():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[], []])
+    metadata.all_random = False
+    metadata.temperature = torch.tensor([0.0, 1.0])
+
+    class OnlyLastToken:
+        def apply(self, logits):
+            logits[:, :-1] = float("-inf")
+            return logits
+
+    metadata.logitsprocs.non_argmax_invariant.append(OnlyLastToken())
+    out = model.sample(torch.tensor([[10.0, 1.0], [10.0, 1.0]]), metadata)
+    assert out.sampled_token_ids.tolist() == [[1], [1]]
 
 
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
@@ -561,9 +876,9 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
             # runs for all sampling paths
             self.updated = True
 
-    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+    runner.requests = {}
 
     def model_sample(logits, sampling_metadata):
         calls.append(logits.clone())
@@ -602,9 +917,9 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
             # runs for all sampling paths
             self.update_async_called = True
 
-    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+    runner.requests = {}
 
     def model_sample(logits, sampling_metadata):
         seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
@@ -649,9 +964,9 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
             # runs for all sampling paths (model sampler + fallback sampler)
             self.update_async_called = True
 
-    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+    runner.requests = {}
 
     def model_sample(logits, sampling_metadata):
         seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
@@ -722,8 +1037,6 @@ def test_embed_input_ids_preserves_interleaved_request_boundaries(order):
 
 
 def test_mrv2_conditioning_follows_encoded_prompts_to_batch_rows():
-    from collections import OrderedDict
-
     model = _make_talker_model()
     speech = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4))
     text = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4) + 1000)
@@ -791,10 +1104,8 @@ def test_embed_input_ids_rejects_cross_request_placeholder_block():
 
 
 def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
-
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
-    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
     model = _make_code2wav_model()
     model.forward(
         input_ids=torch.tensor([0, 1, 2]),
@@ -816,10 +1127,6 @@ def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
 
 
 def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
     model = _make_talker_model()
     hidden = torch.ones(2, 4)
     runner = object.__new__(OmniGPUModelRunner)
@@ -840,13 +1147,11 @@ def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
 
 
 def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monkeypatch):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
-
     model = _make_code2wav_model()
     model._code2wav_trt_done = False
-    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
-    monkeypatch.setattr(module, "_cosyvoice3_trt_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "_cosyvoice3_trt_enabled", lambda: True)
 
     def unexpected_estimator_resolution():
         raise AssertionError("Packed Flow must not resolve or replace its torch estimator")
@@ -904,21 +1209,18 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 
 
 def test_cancelled_stream_releases_only_its_vocoder_state():
-    model_cls, _ = _cosyvoice3_model_and_runner()
     model = SimpleNamespace(
         _stream_audio_cache_lock=Lock(),
         _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
     )
-    model_cls.on_requests_finished(model, {"cancelled", "unknown"})
-    model_cls.on_requests_finished(model, {"cancelled"})
+    CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
+    CosyVoice3Model.on_requests_finished(model, {"cancelled"})
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
 def test_talker_output_contract(monkeypatch, mrv2, packed):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
-
-    monkeypatch.setattr(mod, "cosyvoice3_packed_inference_enabled", lambda: packed)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: packed)
     model = _make_talker_model()
     hidden = torch.zeros(2, 4)
     model.model = SimpleNamespace(llm=lambda embeddings, positions: embeddings)
@@ -928,4 +1230,106 @@ def test_talker_output_contract(monkeypatch, mrv2, packed):
         model._sampling_eps = 1e-6
         model.mrv2_custom_sampler(SimpleNamespace(penalties_state=None))
     output = model.forward(torch.ones(2, dtype=torch.long), torch.arange(2), inputs_embeds=hidden)
-    assert output is (hidden if mrv2 or packed else sentinel)
+    assert output is hidden
+
+
+def test_request_conditioning_normalizes_singletons_without_changing_schema():
+    token = torch.tensor([[7, 8]], dtype=torch.int32)
+    feat = torch.randn(1, 4, 80)
+    speaker = torch.randn(1, 192)
+    length = torch.tensor([[2]], dtype=torch.int32)
+    raw = {"embed": {"speech_token": token, "speech_feat": feat, "embedding": speaker, "speech_token_len": [length]}}
+    result = to_struct(_normalize_request_conditioning(raw))
+    assert result.embed.speech_token is token
+    assert result.embed.speech_feat is feat
+    assert result.embed.embedding is speaker
+    assert result.embed.speech_token_len is length
+    assert raw["embed"]["speech_token_len"] == [length]
+
+
+def test_request_conditioning_rejects_unsplit_voices():
+    with pytest.raises(ValueError, match="unsplit batch"):
+        _normalize_request_conditioning({"embed": {"embedding": [torch.ones(1, 192), torch.zeros(1, 192)]}})
+
+
+def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
+    model = _make_code2wav_model()
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.arange(2),
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[3, 2, 0, 0]], dtype=torch.int32),
+                    "speech_feat": torch.randn(1, 8, 80),
+                    "embedding": torch.randn(1, 192),
+                    "speech_token_len": [torch.tensor([[2]], dtype=torch.int32)],
+                },
+                "meta": {"req_id": ["voice"]},
+            }
+        ],
+    )
+    call = model.code2wav.forward_calls[0]
+    assert call["prompt_token"].shape == (1, 2)
+    assert call["prompt_feat"].shape == (1, 4, 80)
+    assert output.multimodal_outputs
+
+
+@pytest.mark.parametrize("stage", ["cosyvoice3_talker", "cosyvoice3_code2wav"])
+@pytest.mark.parametrize("owned", [False, True])
+def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owned):
+    model = object.__new__(CosyVoice3Model)
+    nn.Module.__init__(model)
+    model.model_stage = stage
+    if stage == "cosyvoice3_code2wav":
+        model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
+    assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
+
+
+@pytest.mark.parametrize(
+    "route,has_commit",
+    [("custom", True), ("decline", True), ("default", True), ("speculative", True), ("default", False)],
+)
+def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_commit):
+    events = []
+    expected = object()
+    metadata = SimpleNamespace()
+    runner = object.__new__(GPUARModelRunner)
+    runner.requests = {}
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=metadata,
+        update_async_output_token_ids=lambda: events.append("history"),
+    )
+
+    def custom(logits, sampling_metadata):
+        events.append("custom")
+        return None if route == "decline" else expected
+
+    runner.model = SimpleNamespace(prefer_model_sampler=route in ("custom", "decline"), sample=custom)
+    if has_commit:
+        runner.model.commit_deferred_sampling = lambda: events.append("commit")
+
+    def fallback(**kwargs):
+        events.append("default")
+        return expected
+
+    def speculative(*args):
+        events.append("speculative")
+        return expected
+
+    runner.sampler = fallback
+    runner._sampling_metadata_for_model_sampler = lambda smd: smd
+    runner._apply_duplex_sampling = lambda *args: events.append("duplex")
+    mocker.patch.object(GPUModelRunner, "_sample", side_effect=speculative)
+    result = runner._sample(torch.zeros(1, 2), object() if route == "speculative" else None)
+    expected_events = ["commit"] if has_commit else []
+    if route == "speculative":
+        expected_events += ["speculative"]
+    else:
+        expected_events += ["history"]
+        if route in ("custom", "decline"):
+            expected_events += ["duplex", "custom"]
+        if route in ("default", "decline"):
+            expected_events += ["default"]
+    assert result is expected
+    assert events == expected_events

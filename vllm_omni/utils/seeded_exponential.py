@@ -12,25 +12,12 @@ every value and every generator state afterwards matches the per-request loop.
 """
 
 import torch
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _generator_exponential_kernel(
-    out_ptr,
-    rows_ptr,
-    seed_ptr,
-    offset_ptr,
-    numel,
-    threads,
-    HAS_ROWS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    request = tl.program_id(0)
-    elements = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = elements < numel
-    seed = tl.load(seed_ptr + request).to(tl.uint64)
-    offset = tl.load(offset_ptr + request).to(tl.uint64)
+def torch_exponential_noise(seed, offset, elements, threads):
     # torch's grid-stride kernel: thread t draws curand_uniform4 once per grid
     # stride and element j = t + threads * (4 * call + component).
     thread = (elements % threads).to(tl.uint64)
@@ -51,8 +38,28 @@ def _generator_exponential_kernel(
         -5.960464477539063e-08,
         tl.extra.cuda.libdevice.fast_logf(uniform),
     )
+    return -log
+
+
+@triton.jit
+def _generator_exponential_kernel(
+    out_ptr,
+    rows_ptr,
+    seed_ptr,
+    offset_ptr,
+    numel,
+    threads,
+    HAS_ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    elements = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = elements < numel
+    seed = tl.load(seed_ptr + request).to(tl.uint64)
+    offset = tl.load(offset_ptr + request).to(tl.uint64)
+    noise = torch_exponential_noise(seed, offset, elements, threads)
     row = tl.load(rows_ptr + request).to(tl.int64) if HAS_ROWS else request.to(tl.int64)
-    tl.store(out_ptr + row * numel + elements, -log, mask=mask)
+    tl.store(out_ptr + row * numel + elements, noise, mask=mask)
 
 
 _POLICY_CACHE: dict[tuple[int, int], tuple[int, int]] = {}
@@ -73,10 +80,18 @@ def torch_exponential_policy(numel: int, device: torch.device) -> tuple[int, int
 def fill_exponential_rows(out: torch.Tensor, generators: list, rows: list[int] | None = None) -> torch.Tensor:
     """Draw ``out[rows[i]].exponential_(generator=generators[i])`` for all ``i`` in one launch.
 
-    ``out`` is a contiguous float32 CUDA matrix; ``rows`` defaults to
-    ``range(len(generators))``. ``None`` generators use the default CUDA
-    generator in order. Each generator is advanced exactly as torch would.
+    ``out`` is a contiguous float32 matrix. Without ``rows``, each generator
+    owns an equal contiguous slice of the flattened output (which may span
+    several codebook rows). ``None`` generators use the default generator in
+    order. NVIDIA uses the batched CUDA kernel; other platforms retain
+    ordered Torch draws, including direct Higgs Audio callers.
     """
+    if not current_platform.is_cuda():
+        targets = out.reshape(len(generators), -1) if rows is None else [out[row] for row in rows]
+        for target, generator in zip(targets, generators):
+            target.exponential_(generator=generator)
+        return out
+
     numel = int(out.shape[-1]) if rows is not None else int(out.numel()) // len(generators)
     device = out.device
     threads, increment = torch_exponential_policy(numel, device)
@@ -109,9 +124,15 @@ def fill_exponential_rows(out: torch.Tensor, generators: list, rows: list[int] |
 
 
 def batched_seeded_exponential_supported(q: torch.Tensor, generators: dict) -> bool:
-    """Whether ``fill_exponential_rows`` reproduces the per-row loop for ``q``."""
+    """Whether the NVIDIA CUDA kernel reproduces the per-row loop for ``q``.
+
+    ROCm tensors also report ``is_cuda``, but HIP uses a different distribution
+    implementation and cannot compile the CUDA libdevice transform above.
+    Keep those draws on Torch's original per-row path, including RNG state.
+    """
     return (
-        len(generators) > 1
+        current_platform.is_cuda()
+        and len(generators) > 1
         and q.is_cuda
         and q.dtype == torch.float32
         and q.dim() == 2

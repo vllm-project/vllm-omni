@@ -10,6 +10,7 @@ from torch.nn.utils import parametrize
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
 
 pytestmark = [
+    pytest.mark.usefixtures("single_threaded_cpu"),
     pytest.mark.core_model,
     pytest.mark.cpu,
     # The legacy weight_norm API warns on construction; the "legacy" params

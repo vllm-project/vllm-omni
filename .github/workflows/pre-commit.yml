@@ -2,9 +2,10 @@ name: pre-commit
 
 on:
   pull_request:
-    branches: [main]
+    # Base branch filter. release/v* covers release/vX.Y.Z and release/vX.Y.ZrcN.
+    branches: [main, "release/v*"]
   push:
-    branches: [main]
+    branches: [main, "release/v*"]
   workflow_dispatch: # for manual trigger
 
 concurrency:
@@ -19,10 +20,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
+      - name: Validate marks in changed tests
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff -z --name-only --diff-filter=ACMR "$BASE_SHA...$HEAD_SHA" -- tests \
+            | xargs -0 -r python tools/pre_commit/check_test_marks.py
       - uses: pre-commit/action@v3.0.1
         # Don't run historical-debt hooks against the whole tree in CI yet.
         # They still run locally on changed files.
