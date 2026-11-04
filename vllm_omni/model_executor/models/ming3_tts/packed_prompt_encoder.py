@@ -17,9 +17,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm_omni.model_executor.models.common.ming.packed_qwen2 import PackedQwen2
 from vllm_omni.utils.device_copy import to_device_nonblocking
-
-from .packed_qwen2 import PackedQwen2
 
 # Graphs of the packed multi-clip pass: frames of all clips in one pass, and
 # the clips a pass may hold (unused sequences are empty).

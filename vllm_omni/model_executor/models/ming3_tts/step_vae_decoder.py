@@ -31,9 +31,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm_omni.model_executor.models.common.ming.packed_qwen2 import PackedQwen2, PagedKV
 from vllm_omni.utils.cuda_stream import create_cuda_stream
-
-from .packed_qwen2 import PackedQwen2, PagedKV
 
 # Decoder tokens one stream may reach (``scale`` per latent).
 MAX_STREAM_POSITIONS = 16384

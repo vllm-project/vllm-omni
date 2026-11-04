@@ -6,7 +6,7 @@ import torch
 
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
-from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder
+from vllm_omni.model_executor.models.common.ming.batched_vae_decoder import BatchedStreamingVAEDecoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 cuda = pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="NVIDIA CUDA required")
