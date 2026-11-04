@@ -54,7 +54,6 @@ Bucketing env vars (applied automatically for the "on" pass)
   frames = seconds x 100).
 * ``--bucket-modules encoder`` — which encoder modules to bucket.
 * ``--bucket-time-axis 2`` — the time axis of the feature tensor.
-* ``--bucket-context-margin 2`` — extra conv-context frames (StepAudio2 = 2).
 
 ``--max-seconds 29`` drops clips longer than 29 s: Step-Audio-2's positional
 embedding caps at 30 s (``n_audio_ctx=1500`` at 100 fps), so longer clips crash.
@@ -66,7 +65,6 @@ Usage (StepAudio2):
         --model-type stepaudio2 --model-name /path/to/Step-Audio-2-mini \
         --deploy-config vllm_omni/deploy/step_audio_2_asr.yaml \
         --audio-dir /path/to/clips --ref ref.tsv --max-seconds 29 \
-        --bucket-context-margin 2 \
         --prompt "Please transcribe the audio content."
 
 Usage (Covo — add ``--thinker-only`` to skip the code2wav vocoder):
@@ -94,7 +92,6 @@ _BUCKET_ENV = (
     "VLLM_OMNI_AUDIO_BUCKET_SECONDS",
     "VLLM_OMNI_AUDIO_BUCKET_MODULES",
     "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS",
-    "VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN",
 )
 
 
@@ -199,7 +196,6 @@ def transcribe(args, clips: list[str], on: bool) -> dict[str, str]:
         os.environ["VLLM_OMNI_AUDIO_BUCKET_SECONDS"] = args.bucket_seconds
         os.environ["VLLM_OMNI_AUDIO_BUCKET_MODULES"] = args.bucket_modules
         os.environ["VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"] = args.bucket_time_axis
-        os.environ["VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN"] = str(args.bucket_context_margin)
     else:
         for k in _BUCKET_ENV:
             os.environ.pop(k, None)
@@ -359,7 +355,6 @@ def parse_args():
     parser.add_argument("--bucket-seconds", type=str, default="2,4,8,16,30")
     parser.add_argument("--bucket-modules", type=str, default="encoder")
     parser.add_argument("--bucket-time-axis", type=str, default="2")
-    parser.add_argument("--bucket-context-margin", type=int, default=0)
     parser.add_argument(
         "--max-extra",
         type=int,

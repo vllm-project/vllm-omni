@@ -229,11 +229,6 @@ class AudioEncoder(nn.Module):
     Optimized for 25s audio chunks at 25Hz
     """
 
-    # Length bucketing is driven by deployment env vars, not per-model code:
-    #   VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS=2       — channels-first (B, mel, T)
-    #   VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN=2  — conv1/conv2 read 2 extra frames
-    #                                              beyond padding_mels' T-2 length
-
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
         super().__init__()
         self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
@@ -256,9 +251,6 @@ class AudioEncoder(nn.Module):
             x: encoded features, shape (batch_size, T//4, n_state)
             x_len: updated lengths, shape (batch_size,)
         """
-        # Accept a host-side length so the length-bucketed encoder wrapper can
-        # read it without a D2H sync; move it to the feature device here.
-        x_len = x_len.to(x.device)
         T = x.size(-1)
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
@@ -503,7 +495,7 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
 
         return dict(
             audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", lens_tensor),
-            audio_lens=MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
+            audio_lens=MultiModalFieldConfig.batched("audio"),
         )
 
     def _get_prompt_updates(
@@ -743,13 +735,9 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_mels = audio_input["audio_mels"]
         audio_lens = audio_input["audio_lens"]
         if not isinstance(audio_lens, torch.Tensor):
-            audio_lens = torch.tensor(audio_lens, dtype=torch.long)
+            audio_lens = torch.tensor(audio_lens, device=self.device)
         else:
-            # The field config marks audio_lens keep_on_cpu=True, so this is
-            # already host-side and `.cpu()` is a no-op (no D2H sync). The
-            # length-bucketed encoder wrapper reads it here without a sync, and
-            # AudioEncoder.forward moves it to the feature device.
-            audio_lens = audio_lens.cpu()
+            audio_lens = audio_lens.to(self.device)
 
         audio_features, audio_lens = self.encoder(audio_mels, audio_lens)
 

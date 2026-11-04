@@ -155,7 +155,12 @@ def _context_margin_from_env() -> int | None:
 # in the PipelineConfig when registering a model, so the reference table and the
 # whitelist share one name.
 _VERIFIED_MODELS: dict[str, dict[str, int]] = {
-    "step_audio_2": {"context_margin": 2, "time_axis": 2},
+    # StepAudio2's log_mel_spectrogram right-pads 479 samples before the STFT, so
+    # its real mel frame count T = (samples + 479) // 160 is 2..3 frames longer
+    # than the processor-published samples // 160. A context margin of 3 covers
+    # the worst case: the bucketed window copies at most 1 zero-padding frame,
+    # which is harmless, so the output stays bit-identical.
+    "step_audio_2": {"context_margin": 3, "time_axis": 2},
     "covo_audio": {"context_margin": 0, "time_axis": 2},
 }
 
@@ -351,13 +356,16 @@ class _BucketedEncoder:
 
     def _host_lengths(self, features, extra):
         mask = None
+        length_arg = None
         if extra and torch.is_tensor(extra[0]):
             second = extra[0]
             if second.dim() == 1:
-                if second.device.type == "cpu":
-                    return [int(v) for v in second.tolist()], None, second
-                return None, None, None
-            if second.dim() == 2:
+                # A positional 1-D tensor is the encoder's own length argument.
+                # It is passed through unchanged to the encoder, but it is NOT
+                # the bucketing length — the processor-published length is, so
+                # no device readback is ever introduced.
+                length_arg = second
+            elif second.dim() == 2:
                 # A padding mask is an input, never a length source (its values
                 # live on the device and must not be read back). Published host
                 # lengths still apply alongside the mask, for call sites that
@@ -366,7 +374,11 @@ class _BucketedEncoder:
                 mask = second
         published = self._lengths
         if published is not None and len(published) == features.size(0):
-            return [int(v) for v in published], mask, None
+            return [int(v) for v in published], mask, length_arg
+        # No published length: fall back to the positional arg, which must then
+        # be host-side so the wrapper can read it without a sync.
+        if length_arg is not None and length_arg.device.type == "cpu":
+            return [int(v) for v in length_arg.tolist()], mask, length_arg
         return None, mask, None
 
     def _bucketed(self, features, lengths, mask, length_arg):
@@ -427,12 +439,15 @@ class _BucketedEncoder:
         if self._axis == 2:
             batch = features.new_zeros((padded, features.size(1), rung))
             for row, index in enumerate(chunk):
-                take = min(lengths[index] + self._context_margin, rung)
+                # Clamp to the padded input's time dim: the margin may over-copy
+                # past the real content (harmless — those frames are already
+                # zero padding), but must never read past the tensor.
+                take = min(lengths[index] + self._context_margin, rung, features.size(2))
                 batch[row, :, :take] = features[index, :, :take]
         else:
             batch = features.new_zeros((padded, rung, features.size(2)))
             for row, index in enumerate(chunk):
-                take = min(lengths[index] + self._context_margin, rung)
+                take = min(lengths[index] + self._context_margin, rung, features.size(1))
                 batch[row, :take] = features[index, :take]
         if mask is not None:
             return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))

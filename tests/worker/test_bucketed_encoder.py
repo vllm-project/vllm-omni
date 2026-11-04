@@ -439,6 +439,63 @@ def test_context_margin_env_override(bucket_env, monkeypatch):
         assert out_lens[row].item() == solo_len.item()
 
 
+def test_published_length_margin_3_covers_variable_offset(bucket_env, monkeypatch):
+    """The processor-published length (samples//160) is 2..3 frames shorter than
+    a model's real mel frame count (e.g. StepAudio2's 479-sample right pad). A
+    context margin of 3 covers the worst case: the bucketed window copies at
+    most one zero-padding frame beyond the real content, which is harmless, so
+    the output stays bit-identical to the full-window eager forward."""
+    from torch.nn import functional as F
+
+    from vllm_omni.worker import bucketed_encoder
+
+    class ConvContextEncoder(nn.Module):
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            pad = F.pad(x, (0, 0, 1, 1))
+            out = pad[:, : x.size(1)] + pad[:, 1 : x.size(1) + 1] + pad[:, 2 : x.size(1) + 2]
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ConvContextEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    # Verified knobs for a hop-160 model whose mel extraction is 2..3 frames
+    # longer than samples//160: margin 3 covers the worst case.
+    monkeypatch.setattr(
+        bucketed_encoder,
+        "_verified_knobs",
+        lambda vllm_config: {"context_margin": 3, "time_axis": 1},
+    )
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+    assert wrapper._context_margin == 3
+
+    lengths = [40, 120, 150, 75]  # conv-valid length (audio_lens = T - 2)
+    full = [length + 2 for length in lengths]  # real mel frames T
+    feats = torch.randn(len(lengths), max(full), D, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, length + 2 :] += 3.0  # garbage after the real window
+    lens = torch.tensor(lengths, dtype=torch.long)
+    # Published length: offset 2 (== audio_lens) for even rows, offset 3 for odd.
+    pub = torch.tensor([length - (row % 2) for row, length in enumerate(lengths)], dtype=torch.int64)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens, encoder_bucket_frames=pub)  # prime
+        out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens, encoder_bucket_frames=pub)
+
+    for row, length in enumerate(lengths):
+        solo, solo_len = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
+        torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
 def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
     """A channels-first encoder (mel on dim 1, time on dim 2) must keep
     bucketing for an all-short batch via its declared ``bucketing_time_axis=2``.
