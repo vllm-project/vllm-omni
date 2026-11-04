@@ -316,8 +316,14 @@ def test_preprocess_derives_output_size_from_condition_aspect(preprocess, size, 
     assert info["calculated_width"] == width
 
 
-def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess):
+@pytest.mark.parametrize("with_prepopulated_info", [False, True])
+def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess, with_prepopulated_info):
     request = make_request("staged", [(96, 64)])
+    caller_list = ["caller-owned"]
+    caller_mapping = {"items": ["unchanged"]}
+    caller_info = {"caller_list": caller_list, "caller_mapping": caller_mapping}
+    if with_prepopulated_info:
+        request.prompt["additional_information"] = caller_info
     original_prompt = request.prompt
     processed = preprocess(request)
     info = processed.prompt["additional_information"]
@@ -332,7 +338,16 @@ def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess)
     assert isinstance(prompt_image, Image.Image)
     (width, height) = info["input_image_sizes"][0]
     assert prompt_image.size == (width, height)
-    assert "additional_information" not in original_prompt
+    if with_prepopulated_info:
+        assert original_prompt["additional_information"] is caller_info
+        assert caller_info == {"caller_list": ["caller-owned"], "caller_mapping": {"items": ["unchanged"]}}
+        assert caller_info["caller_list"] is caller_list
+        assert caller_info["caller_mapping"] is caller_mapping
+        assert info is not caller_info
+        assert info["caller_list"] is caller_list
+        assert info["caller_mapping"] is caller_mapping
+    else:
+        assert "additional_information" not in original_prompt
     assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),), None, False)
 
 
