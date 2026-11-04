@@ -1017,11 +1017,13 @@ def _paged_write_attn_impl(
     stage_first_block: int = 0,
     npu_lengths: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    key_pool[video_slots] = k_curr.to(key_pool.dtype)
-    value_pool[video_slots] = v_curr.to(value_pool.dtype)
+    from vllm_omni.experimental.ar_diffusion.kv_cache.slot_write import write_kv_slots
+
+    write_kv_slots(key_pool, video_slots, k_curr)
+    write_kv_slots(value_pool, video_slots, v_curr)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        key_pool[action_slots] = k_act.to(key_pool.dtype)
-        value_pool[action_slots] = v_act.to(value_pool.dtype)
+        write_kv_slots(key_pool, action_slots, k_act)
+        write_kv_slots(value_pool, action_slots, v_act)
     key_cache = key_pool.unflatten(0, (-1, block_size))
     value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(
