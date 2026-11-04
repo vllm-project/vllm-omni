@@ -129,7 +129,7 @@ def test_plain_chat_handoff_without_reply_rows_hands_over_nothing() -> None:
         "model_intermediate_buffer"
     ]
 
-    assert info["ids"]["tts"] is None
+    assert "tts" not in info.get("ids", {})
 
 
 def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:
