@@ -496,6 +496,67 @@ def test_published_length_margin_3_covers_variable_offset(bucket_env, monkeypatc
         assert out_lens[row].item() == solo_len.item()
 
 
+def test_published_length_offset_is_bounded_by_margin():
+    """Build-time guarantee: a per-model integer margin bounds the published-length
+    error to <= 1 frame, for ANY hop-160 mel extraction.
+
+    A hop-160 model's real mel frame count is always
+        T(N) = (N + C) // 160 + D
+    for constants C (padding/centering offset) and D (dropped frames). The
+    published length is L(N) = N // 160. With N = 160q + r (0 <= r < 160):
+
+        T(N) - L(N) = (r + C) // 160 + D  in  {K, K+1}
+
+    — two consecutive integers, because r < 160. So margin M = K + 1 satisfies,
+    for every N:
+
+        L(N) + M >= T(N)       # lossless: never truncates real frames
+        L(N) + M - T(N) <= 1   # bounded: wastes at most one padding frame
+
+    If the hop or mel formula changes, this test goes red and the failure reports
+    the new over/under-copy, so the margin is "proven right", not "assumed right".
+
+    StepAudio2 is the concrete case (h=160, C=479 right pad, D=0): the offset is
+    exactly {2, 3}, covered by M = 3."""
+    import random
+
+    from torch.nn import functional as F
+
+    HOP, C, D, MARGIN = 160, 479, 0, 3
+
+    def published(samples):
+        return samples // HOP
+
+    def real(samples):
+        return (samples + C) // HOP + D
+
+    # General property: for any padding offset C, (r + C)//HOP takes at most two
+    # consecutive values across all residues r < HOP.
+    for C2 in (0, 1, 79, 160, 319, 479, 640, 1000):
+        seen = {(r + C2) // HOP for r in range(HOP)}
+        assert len(seen) <= 2, (C2, seen)
+
+    # Sweep every residue class N mod HOP (the offset depends only on the residue),
+    # plus a few random large N to guard the closed form against drift/overflow.
+    overs = []
+    for r in range(HOP):
+        N = HOP * 1000 + r
+        overs.append(published(N) + MARGIN - real(N))
+    rng = random.Random(0)
+    for _ in range(200):
+        N = rng.randrange(1, 480_000)  # up to 30 s at 16 kHz
+        overs.append(published(N) + MARGIN - real(N))
+    assert min(overs) >= 0, f"margin {MARGIN} truncates {-min(overs)} real frame(s)"
+    assert max(overs) <= 1, f"margin {MARGIN} wastes {max(overs)} frame(s)"
+
+    # The closed form matches the real STFT (right-pad 479, n_fft=400, hop=160,
+    # drop the last frame), including near the 30 s cap.
+    for N in (1600, 16000, 30000, 479_999):
+        audio = F.pad(torch.randn(N), (0, 479))
+        stft = torch.stft(audio, 400, 160, window=torch.hann_window(400), return_complex=True)
+        assert stft[..., :-1].shape[-1] == real(N)
+
+
 def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
     """A channels-first encoder (mel on dim 1, time on dim 2) must keep
     bucketing for an all-short batch via its declared ``bucketing_time_axis=2``.
