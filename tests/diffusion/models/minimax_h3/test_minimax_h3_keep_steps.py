@@ -726,8 +726,15 @@ def test_request_path_normalizes_video_first_references(monkeypatch: pytest.Monk
 # ---------------------------------------------------------------------------
 
 
-def test_encoder_stage_rejects_keep_steps_at_intake():
-    from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt
+def test_encoder_stage_rejects_keep_steps_before_encoder_preparation(monkeypatch: pytest.MonkeyPatch):
+    """Split-stage clients get the 400 before any encoder-stage work runs."""
+    from vllm_omni.model_executor.stage_input_processors import minimax_h3 as processor
 
+    def forbidden(*args, **kwargs):
+        raise AssertionError("keep_steps must be rejected before any encoder-stage preparation")
+
+    # If the intake check is bypassed or reordered, the media-preparation
+    # call fires and this bomb fails the test.
+    monkeypatch.setattr(processor, "prepare_encoder_inputs", forbidden)
     with pytest.raises(OmniClientError, match="separate encoder stage"):
-        prepare_encoder_prompt({"prompt": "p"}, [_local_sampling(keep_steps=2)])
+        processor.prepare_encoder_prompt({"prompt": "p"}, [_local_sampling(keep_steps=2)])
