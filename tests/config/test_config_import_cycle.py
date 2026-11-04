@@ -29,8 +29,8 @@ def _top_level_import_modules(path: Path) -> set[str]:
 
 def _assert_isolated_import_succeeds(script: str) -> None:
     env = os.environ.copy()
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,

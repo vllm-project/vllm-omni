@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -670,7 +670,13 @@ class OmniServeCommand(CLISubcommand):
             "--lora-scale",
             type=float,
             default=None,
-            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+            help=(
+                "Multiplier on top of a startup PEFT LoRA's own alpha/rank scaling; "
+                "effective strength = lora_scale * lora_alpha / r. Pass the same "
+                "value the reference framework uses (e.g. LightX2V's --lora-scale), "
+                "not the pre-multiplied scale * alpha / rank. Distilled LoRAs are "
+                "fused at their checkpoint scale."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
