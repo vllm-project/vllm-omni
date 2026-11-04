@@ -56,3 +56,51 @@ def test_npu_fallback_factors_the_singular_plus_ridge_covariance(
     assert factor.dtype == torch.float32
     assert torch.isfinite(factor).all()
     torch.testing.assert_close(factor[-1, -1], torch.tensor(2e-4), rtol=1e-4, atol=0)
+
+
+def test_npu_fallback_uses_numpy_when_torch_lacks_lapack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    def fail_with_missing_lapack(*_args, **_kwargs):
+        raise RuntimeError(
+            "Calling torch.linalg.cholesky on a CPU tensor requires compiling PyTorch with LAPACK. "
+            "Please use PyTorch built with LAPACK support."
+        )
+
+    monkeypatch.setattr(torch.linalg, "cholesky", fail_with_missing_lapack)
+
+    factor = _block_noise_cholesky_factor(4, 1 / 3, torch.device("cpu"))
+
+    assert factor.dtype == torch.float32
+    assert torch.isfinite(factor).all()
+    torch.testing.assert_close(factor[-1, -1], torch.tensor(2e-4), rtol=1e-4, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("is_npu", "error_message"),
+    [
+        (True, "solver exploded for another reason"),
+        (
+            False,
+            "Calling torch.linalg.cholesky on a CPU tensor requires compiling PyTorch with LAPACK.",
+        ),
+    ],
+)
+def test_block_noise_cholesky_reraises_out_of_scope_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    is_npu: bool,
+    error_message: str,
+) -> None:
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+
+    def fail_with_unrelated_error(*_args, **_kwargs):
+        raise RuntimeError(error_message)
+
+    monkeypatch.setattr(torch.linalg, "cholesky", fail_with_unrelated_error)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _block_noise_cholesky_factor(4, 1 / 3, torch.device("cpu"))
+
+    assert str(exc_info.value) == error_message

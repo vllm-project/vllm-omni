@@ -166,6 +166,13 @@ def _ensure_thinker_architecture(config: PretrainedConfig) -> None:
         config.architectures = [_THINKER_ARCHITECTURE]
 
 
+# Eager ViT attention runs one temporal chunk at a time. Frames do not attend
+# to each other, so this matches a single full-video forward. 8192 patches keeps
+# the FlashAttention workspace inside the activation headroom left after KV cache
+# (a 60x22x40 video is 52800 patches and does not).
+_MAX_EAGER_VISION_TOKENS = 8192
+
+
 class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
     """Subclass that fixes Qwen2_5_VisionAttention.forward() compatibility.
 
@@ -224,12 +231,53 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
             metadata["sequence_lengths"] = sequence_lengths
         return metadata
 
+    @staticmethod
+    def _eager_vision_chunks(grid_thw: torch.Tensor, max_tokens: int) -> list[tuple[int, int, int, int, int]]:
+        """Patch spans ``(offset, count, frames, height, width)`` along time.
+
+        A span never crosses a video, and never splits a frame. One frame that
+        is already larger than ``max_tokens`` is returned as its own span.
+        """
+        chunks: list[tuple[int, int, int, int, int]] = []
+        offset = 0
+        for raw_t, raw_h, raw_w in grid_thw.detach().to(device="cpu", dtype=torch.int64).tolist():
+            frames, height, width = int(raw_t), int(raw_h), int(raw_w)
+            frame_tokens = height * width
+            if frames <= 0 or frame_tokens <= 0:
+                continue
+            frames_per_chunk = max(1, max_tokens // frame_tokens)
+            for start in range(0, frames, frames_per_chunk):
+                taken = min(frames_per_chunk, frames - start)
+                count = taken * frame_tokens
+                chunks.append((offset, count, taken, height, width))
+                offset += count
+        return chunks
+
     def forward(
         self, x: torch.Tensor, grid_thw, *, encoder_metadata: dict[str, torch.Tensor] | None = None
     ) -> torch.Tensor:
-        if encoder_metadata is None:
-            encoder_metadata = self.prepare_encoder_metadata(grid_thw)
-        return self.forward_with_encoder_metadata(x, encoder_metadata)
+        # CUDA-graph replay passes metadata for one captured budget. Chunk only
+        # the eager path, whose videos are not bounded by that budget.
+        if encoder_metadata is not None:
+            return self.forward_with_encoder_metadata(x, encoder_metadata)
+        if not isinstance(grid_thw, torch.Tensor):
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.int32)
+        chunks = self._eager_vision_chunks(grid_thw, _MAX_EAGER_VISION_TOKENS)
+        covered = sum(count for _, count, _, _, _ in chunks)
+        if covered != x.shape[0]:
+            raise RuntimeError(f"vision grid covers {covered} patches, input has {x.shape[0]}")
+        if len(chunks) <= 1:
+            return self.forward_with_encoder_metadata(x, self.prepare_encoder_metadata(grid_thw))
+        outputs = []
+        for offset, count, frames, height, width in chunks:
+            grid = torch.tensor([[frames, height, width]], dtype=torch.int32)
+            outputs.append(
+                self.forward_with_encoder_metadata(
+                    x[offset : offset + count],
+                    self.prepare_encoder_metadata(grid),
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
     def forward_with_encoder_metadata(self, x: torch.Tensor, metadata: dict[str, torch.Tensor]) -> torch.Tensor:
         """Run patch embedding, vision blocks and all DeepStack mergers."""
@@ -443,31 +491,73 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
             dtype=torch.get_default_dtype(),
         )
 
+    def prepare_encoder_metadata(self, feature_lens: Sequence[int]) -> dict[str, object]:
+        """Chunk and attention layout for ``forward_with_encoder_metadata``.
+
+        Everything is derived from host-side mel lengths, so the forward pass
+        never reads a device value back.
+        """
+        chunk_size = self.n_window * 2
+        chunk_lengths: list[int] = []
+        aftercnn_lens: list[int] = []
+        for length in feature_lens:
+            length = int(length)
+            num_chunks = -(-length // chunk_size)
+            chunk_lengths += [chunk_size] * (num_chunks - 1) + [length - chunk_size * (num_chunks - 1)]
+            aftercnn_lens.append(int(_get_feat_extract_output_lengths(length)))
+        chunk_lens_after_cnn = self._get_cnn_output_lengths(np.asarray(chunk_lengths, dtype=np.int64))
+        max_len_after_cnn = int(chunk_lens_after_cnn.max())
+
+        # Row-major positions of the valid frames in the padded [chunk, time]
+        # grid, the order boolean-mask indexing would produce.
+        offsets = np.arange(len(chunk_lengths), dtype=np.int64) * max_len_after_cnn
+        valid_index = np.concatenate(
+            [offset + np.arange(n, dtype=np.int64) for offset, n in zip(offsets, chunk_lens_after_cnn)]
+        )
+
+        window_aftercnn = max_len_after_cnn * (self.n_window_infer // chunk_size)
+        cu_chunk_lens = [0]
+        for cnn_len in aftercnn_lens:
+            cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+            if cnn_len % window_aftercnn:
+                cu_chunk_lens.append(cnn_len % window_aftercnn)
+        cu_seqlens_host = torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(-1, dtype=torch.int32)
+
+        valid_index_host = torch.from_numpy(valid_index)
+        device = self.conv2d1.weight.device
+        if device.type != "cpu":
+            valid_index_host = async_tensor_h2d(valid_index_host, device=device)
+            cu_seqlens = async_tensor_h2d(cu_seqlens_host, device=device)
+        else:
+            cu_seqlens = cu_seqlens_host
+        return {
+            "chunk_lengths": chunk_lengths,
+            "valid_index": valid_index_host,
+            "cu_seqlens": cu_seqlens,
+            # Attention reads this scalar on the host.
+            "max_seqlen": self.compute_attn_mask_seqlen(cu_seqlens_host),
+            "aftercnn_lens": aftercnn_lens,
+        }
+
     def forward(
         self,
         input_features: torch.Tensor,
         feature_lens: torch.Tensor,
-        aftercnn_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor | None = None,
     ):
-        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+        return self.forward_with_encoder_metadata(input_features, self.prepare_encoder_metadata(feature_lens.tolist()))
 
-        chunk_lengths = torch.tensor(
-            [self.n_window * 2] * chunk_num.sum(),
-            dtype=torch.long,
-            device=feature_lens.device,
-        )
-        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
-        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
-        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+    def forward_with_encoder_metadata(self, input_features: torch.Tensor, metadata: dict[str, object]) -> torch.Tensor:
+        return self.forward_chunks(self.pad_chunks(input_features, metadata["chunk_lengths"]), metadata)
 
-        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
-        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+    @staticmethod
+    def pad_chunks(input_features: torch.Tensor, chunk_lengths: list[int]) -> torch.Tensor:
+        """Split ``[mel, frames]`` features into zero-padded ``[chunk, mel, frames]`` chunks."""
+        chunk_list = input_features.T.split(chunk_lengths, dim=0)
+        return nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
 
-        feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
-        max_len_after_cnn = feature_lens_after_cnn.max().item()
-        indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
-        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
-
+    def forward_chunks(self, padded_feature: torch.Tensor, metadata: dict[str, object]) -> torch.Tensor:
+        """Encode padded chunks; reads ``valid_index``, ``cu_seqlens`` and ``max_seqlen``."""
         padded_feature = padded_feature.unsqueeze(1)
 
         if padded_feature.size(0) <= self.conv_chunksize:
@@ -493,19 +583,9 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
         )
         padded_embed = padded_embed + positional_embedding
 
-        hidden_states = padded_embed[padded_mask_after_cnn]
-
-        cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
-        for cnn_len in aftercnn_lens.tolist():
-            num_full_chunks = cnn_len // window_aftercnn
-            remainder = cnn_len % window_aftercnn
-            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
-            if remainder:
-                cu_chunk_lens.append(remainder)
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
-
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        hidden_states = padded_embed.flatten(0, 1).index_select(0, metadata["valid_index"])
+        cu_seqlens = metadata["cu_seqlens"]
+        max_seqlen = metadata["max_seqlen"]
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
@@ -1031,20 +1111,13 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         audio_input: Qwen2_5OmniAudioFeatureInputs,
     ) -> tuple[torch.Tensor, ...]:
         input_features = audio_input["input_features"]
-        # vLLM 0.29 marks audio_feature_lengths keep_on_cpu, and the audio tower
-        # derives device placement from feature_lens, so move it explicitly.
-        # Mirrors upstream Qwen3OmniMoeThinker._process_audio_input.
-        audio_feature_lengths = audio_input["audio_feature_lengths"].to(input_features.device, non_blocking=True)
-
-        audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
-
-        audio_outputs = self.audio_tower(
-            input_features.to(self.audio_tower.dtype),
-            feature_lens=audio_feature_lengths,
-            aftercnn_lens=audio_output_lengths,
+        # audio_feature_lengths is kept on the CPU, so the chunk layout is
+        # built without reading anything back from the device.
+        metadata = self.audio_tower.prepare_encoder_metadata(audio_input["audio_feature_lengths"].tolist())
+        audio_features = self.audio_tower.forward_with_encoder_metadata(
+            input_features.to(self.audio_tower.dtype), metadata
         )
-        audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
-        return audio_features.split(audio_output_lengths.tolist())
+        return audio_features.split(metadata["aftercnn_lens"])
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1191,6 +1264,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 self.deepstack_input_embeds_num_tokens = 0
 
         self._enable_image_encoder_cudagraph()
+        self._enable_audio_encoder_cudagraph(vllm_config)
 
         with self._mark_language_model(vllm_config):
             lm_vllm_config = vllm_config.with_hf_config(

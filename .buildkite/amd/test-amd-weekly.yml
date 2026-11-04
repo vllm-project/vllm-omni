@@ -1,5 +1,8 @@
-# AMD MI300 weekly reliability. Nightly owns functional and accuracy smokes.
-# This file owns fault injection and invalid-parameter contracts.
+# AMD MI300 weekly. Nightly owns functional and accuracy smokes.
+# Reliability owns fault injection and invalid-parameter contracts.
+# Omni E2E owns full-weight cases that already have MI325 marks.
+# HunyuanImage process-kill coverage uses a generated ROCm expert-parallel-off config.
+# One separate job keeps full-model expert-parallel startup and health visible.
 # main + WEEKLY=1 selects it. A PR weekly-test label selects it.
 # NIGHTLY=1 and NON_CRITICAL=1 do not.
 
@@ -42,10 +45,65 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_hunyuan_image3_reliability
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuan-image-reliability/**/*
         commands:
-          - >-
-            pytest -s -v tests/dfx/reliability/test_hunyuan_image.py
-            -m "slow and rocm and MI325 and cards_4"
+          - export ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuan-image-reliability"
+          - mkdir -p "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_hunyuan_image.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_4" \
+              > "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 16 ]]; then
+              echo "Expected exactly 16 HunyuanImage reliability nodes, found $$count." >&2
+              cat "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/dfx/reliability/test_hunyuan_image.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_4" \
+                --junitxml="$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 16 or skipped != 0:
+                print(
+                    f"Expected exactly 16 executed HunyuanImage reliability tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
       - label: "Reliability Test · Invalid parameters · MI300 · 2-GPU"
         agent_pool: mi300_2
@@ -59,3 +117,246 @@ steps:
             pytest -s -v
             tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py
             -m "slow and rocm and MI325 and cards_2"
+
+  # CUDA weekly Omni H100 full_model sweeps. Only the ROCm-marked cases run
+  # here. Ming online is skipped for 4x H100, and Covo has no MI325 mark.
+  - group: "Omni E2E Weekly"
+    steps:
+      - label: "MiMo-Audio · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: omni_mimo_audio_function
+        artifact_paths:
+          - artifacts/rocm-mimo-audio-weekly/**/*
+        commands:
+          - export ROCM_MIMO_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-mimo-audio-weekly"
+          - mkdir -p "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR"
+          - |
+            node="tests/e2e/online_serving/test_mimo_audio_expansion.py::test_text_to_text_001"
+            pytest --collect-only -q "$$node" \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and omni and cards_1" \
+              --run-level full_model \
+              > "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one MiMo-Audio ROCm node, found $$count." >&2
+              cat "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if ! grep -Fq "$$node" "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+              echo "MiMo-Audio node was not collected: $$node" >&2
+              cat "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              node="tests/e2e/online_serving/test_mimo_audio_expansion.py::test_text_to_text_001"
+              timeout --signal=TERM --kill-after=2m 105m \
+                pytest -s -v -ra "$$node" \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and omni and cards_1" \
+                --run-level full_model --durations=20 \
+                --junitxml="$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed MiMo-Audio test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "Ming-flash-omni offline · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_ming_flash_omni_function
+        artifact_paths:
+          - artifacts/rocm-ming-flash-omni-weekly/**/*
+        commands:
+          - export ROCM_MING_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-ming-flash-omni-weekly"
+          - mkdir -p "$$ROCM_MING_WEEKLY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_text_to_text"
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_image_to_text"
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_audio_to_text"
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_video_to_text"
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_mixed_to_text"
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_text_to_audio"
+              "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_image_to_audio"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and omni and cards_4" \
+              --run-level full_model \
+              > "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Ming-flash-omni offline ROCm nodes, found $$count." >&2
+              cat "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+                echo "Ming-flash-omni node was not collected: $$node" >&2
+                cat "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_text_to_text"
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_image_to_text"
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_audio_to_text"
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_video_to_text"
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_mixed_to_text"
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_text_to_audio"
+                "tests/e2e/offline_inference/test_ming_flash_omni_expansion.py::test_image_to_audio"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and omni and cards_4" \
+                --run-level full_model --durations=20 \
+                --junitxml="$$ROCM_MING_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 7 or skipped != 0:
+                print(
+                    f"Expected exactly seven executed Ming-flash-omni offline tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MING_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  - group: "HunyuanImage Expert Parallel"
+    steps:
+      - label: "HunyuanImage Expert Parallel Startup"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 45
+        source_file_dependencies: diffusion_hunyuan_image3_reliability
+        artifact_paths:
+          - artifacts/rocm-hunyuan-image-ep-startup/**/*
+        commands:
+          - |
+            export ROCM_HUNYUAN_EP_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuan-image-ep-startup"
+            mkdir -p "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR"
+            pytest --collect-only -q \
+              tests/dfx/reliability/test_hunyuan_image_ep_startup.py::test_hunyuan_image_rocm_ep_startup \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and slow and diffusion and rocm and MI325 and cards_4" \
+              > "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one HunyuanImage expert-parallel startup node, found $$count." >&2
+              cat "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if ! grep -Fq "test_hunyuan_image_rocm_ep_startup" \
+              "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt"; then
+              echo "HunyuanImage expert-parallel startup node was not collected." >&2
+              cat "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 30m \
+                pytest -s -v -ra \
+                tests/dfx/reliability/test_hunyuan_image_ep_startup.py::test_hunyuan_image_rocm_ep_startup \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and slow and diffusion and rocm and MI325 and cards_4" \
+                --junitxml="$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed HunyuanImage expert-parallel startup test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")

@@ -41,7 +41,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
 from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
@@ -215,8 +215,16 @@ class OmniModelState(DefaultModelState):
 
     def prepare_streaming_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
-    ) -> StreamingAudioOutput | None:
+    ) -> StreamingAudioSnapshot | None:
         return self._mtp_state.prepare_audio_output(input_batch, req_states, outputs)
+
+    def get_request_errors(self) -> tuple[torch.Tensor, str] | None:
+        """Optional owned per-row failure mask and reason for the current step.
+
+        The runner copies the mask with its other outputs and only reads it
+        after D2H completes. A failure terminates that request, not the batch.
+        """
+        return None
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._mtp_state.finish_audio(req_ids)
@@ -833,10 +841,12 @@ class OmniModelState(DefaultModelState):
             )
             for entry, updates in zip(decode_entries, updates_by_req, strict=True):
                 i, req_idx, start, _, _, _ = entry
-                decode_mtp_rows.append((i, start))
+                if self._has_mtp:
+                    decode_mtp_rows.append((i, start))
                 batched_indices.add(i)
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
-            text_step_batches.append(batch_text_step.reshape(batch_size, -1))
+            if self._has_mtp:
+                text_step_batches.append(batch_text_step.reshape(batch_size, -1))
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:
             if i in batched_indices:
