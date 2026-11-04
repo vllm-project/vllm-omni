@@ -1891,7 +1891,13 @@ class WorkerProc:
         Uses a side stream so the D2H transfer does not block the default
         stream where the next forward runs.
         """
-        device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
+        # init_device() already selected the worker's device. gpu_id is the
+        # worker rank, which need not be the device index on every platform.
+        # Platforms whose get_torch_device() omits the index (e.g. TPU) use
+        # the index that set_device() selected.
+        device = self.worker.device
+        if device.index is None and device.type != "cpu":
+            device = torch.device(device.type, torch.accelerator.current_device_index())
         d2h_stream = torch.Stream(device=device)
         transport_options = {}
         if self.od_config.video_output_transport.enable_registered_shm is True:

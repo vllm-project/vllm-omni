@@ -32,6 +32,11 @@ from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class _WorkerWithDevice:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+
+
 def _make_worker_proc(step_execution=False):
     """Create a minimal WorkerProc-like object with async output state."""
     proc = object.__new__(WorkerProc)
@@ -39,6 +44,7 @@ def _make_worker_proc(step_execution=False):
     proc.od_config.step_execution = step_execution
     proc.od_config.video_output_transport = SimpleNamespace(enable_registered_shm=False)
     proc.gpu_id = 0
+    proc.worker = _WorkerWithDevice(torch.device("cpu", 0))
     proc.result_mq = MagicMock()
     proc._running = True
     proc._async_output_queue = queue.Queue() if not step_execution else None
@@ -379,6 +385,70 @@ class TestAsyncOutputLoopLogic:
         assert output.trajectory_latents is original_latents
         with pytest.raises(FileNotFoundError):
             shared_memory.SharedMemory(name=str(created_handles[0]["name"]))
+
+
+class TestAsyncOutputLoopStreamDevice:
+    """The D2H stream must live on the device the worker selected."""
+
+    @staticmethod
+    def _make_mock_torch(mocker, *, current_device_index: int = 0) -> MagicMock:
+        mock_torch = mocker.MagicMock()
+        mock_torch.device = torch.device
+        mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+        mock_torch.accelerator.current_device_index.return_value = current_device_index
+        return mock_torch
+
+    @classmethod
+    def _run_loop(cls, mocker, proc: WorkerProc, mock_torch: MagicMock | None = None) -> MagicMock:
+        if mock_torch is None:
+            mock_torch = cls._make_mock_torch(mocker)
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+
+        proc._async_output_queue.put(None)
+        proc._async_output_loop()
+        return mock_torch.Stream
+
+    def test_uses_worker_device_when_it_differs_from_gpu_id(self, mocker):
+        # e.g. a platform whose worker selects device index 0 in every process.
+        proc = _make_worker_proc(step_execution=False)
+        proc.gpu_id = 1
+        proc.worker = _WorkerWithDevice(torch.device("cpu", 0))
+
+        stream_cls = self._run_loop(mocker, proc)
+
+        stream_cls.assert_called_once_with(device=torch.device("cpu", 0))
+
+    def test_uses_indexed_accelerator_device_without_current_device_index(self, mocker):
+        proc = _make_worker_proc(step_execution=False)
+        proc.gpu_id = 0
+        proc.worker = _WorkerWithDevice(torch.device("cuda", 1))
+        mock_torch = self._make_mock_torch(mocker)
+
+        stream_cls = self._run_loop(mocker, proc, mock_torch)
+
+        stream_cls.assert_called_once_with(device=torch.device("cuda", 1))
+        mock_torch.accelerator.current_device_index.assert_not_called()
+
+    def test_resolves_unindexed_accelerator_device_via_current_device_index(self, mocker):
+        proc = _make_worker_proc(step_execution=False)
+        proc.gpu_id = 1
+        proc.worker = _WorkerWithDevice(torch.device("privateuseone"))
+        mock_torch = self._make_mock_torch(mocker, current_device_index=0)
+
+        stream_cls = self._run_loop(mocker, proc, mock_torch)
+
+        stream_cls.assert_called_once_with(device=torch.device("privateuseone", 0))
+        mock_torch.accelerator.current_device_index.assert_called_once_with()
+
+    def test_uses_unindexed_cpu_device_without_current_device_index(self, mocker):
+        proc = _make_worker_proc(step_execution=False)
+        proc.worker = _WorkerWithDevice(torch.device("cpu"))
+        mock_torch = self._make_mock_torch(mocker)
+
+        stream_cls = self._run_loop(mocker, proc, mock_torch)
+
+        stream_cls.assert_called_once_with(device=torch.device("cpu"))
+        mock_torch.accelerator.current_device_index.assert_not_called()
 
 
 class TestDrainAsyncOutputs:
