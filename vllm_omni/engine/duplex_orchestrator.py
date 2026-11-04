@@ -12,6 +12,7 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import time as _time
 from collections.abc import Coroutine
@@ -37,7 +38,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexPromptTokenizer, validate_duplex_replica_policy
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -67,6 +68,7 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    turn_prompt_tokenizer: DuplexPromptTokenizer | None = None
     # Session stats (RFC #8325): per stage, the chunks with spans since its last
     # session output, and the chunk of its latest producing step.
     pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
@@ -589,6 +591,65 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         ).supports_core_resumable_request and not isinstance(request, OmniEngineCoreRequest):
             request = OmniEngineCoreRequest.from_request(request)
         return request
+
+    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+        request_id = kwargs.get("request_id")
+        state = self.request_states.get(request_id) if isinstance(request_id, str) else None
+        prompt = kwargs.get("prompt")
+        if (
+            stage_id == 0
+            and self.plugin.supports_turn_kv_continuation
+            and isinstance(state, DuplexOrchestratorRequestState)
+            and isinstance(prompt, dict)
+            and isinstance(prompt.get("prompt"), str)
+            and "prompt_token_ids" not in prompt
+            and not kwargs.get("tokenization_kwargs")
+        ):
+            processor = self._get_stage_input_processor(stage_id)
+            tokenizer = getattr(processor, "tokenizer", None)
+            renderer = getattr(processor, "renderer", None)
+            defaults = getattr(renderer, "default_cmpl_tok_params", None)
+            if state.turn_prompt_tokenizer is None:
+                if (
+                    tokenizer is not None
+                    and not getattr(defaults, "do_lower_case", False)
+                    and getattr(defaults, "add_special_tokens", True)
+                ):
+                    state.turn_prompt_tokenizer = self.plugin.create_turn_prompt_tokenizer(tokenizer)
+            if state.turn_prompt_tokenizer is not None:
+                prompt_tokenizer = state.turn_prompt_tokenizer
+
+                def tokenize() -> list[int]:
+                    text = prompt["prompt"]
+                    if defaults is not None:
+                        # Preserve upstream's character-length validation and
+                        # pre-truncation before replacing text with token IDs.
+                        text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
+                    return prompt_tokenizer.tokenize(text)
+
+                task = asyncio.create_task(asyncio.to_thread(tokenize))
+                try:
+                    tokens = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Finish updating this request-owned cache before another
+                    # append can acquire the stage's input submission guard.
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not task.cancelled():
+                        task.exception()
+                    raise
+                prepared = dict(prompt)
+                prepared.pop("prompt")
+                prepared["prompt_token_ids"] = tokens
+                # Still visit every media item through the upstream processor:
+                # bypassing it desynchronizes sender/receiver cache touches.
+                kwargs["prompt"] = prepared
+        return await super()._process_stage_inputs(stage_id, **kwargs)
 
     async def _build_next_stage_request(self, req_id, next_stage_id, next_input, params, **kwargs):
         state = self.request_states.get(req_id)

@@ -693,8 +693,11 @@ before worker delivery state is reset; other sessions remain schedulable. The
 `supports_turn_kv_continuation` capability is resolved from engine settings;
 unsupported configurations log a reason and use per-turn requests with ordinary
 prefix caching where available. No separate deployment or session switch is
-required. Commit, playback and VAD policy remain turn-based. Full prompt
-snapshots go through normal multimodal preprocessing before scheduler-side
+required. Commit, playback and VAD policy remain turn-based. A request-owned
+Qwen tokenizer reuses unchanged text prefixes at special-token boundaries;
+history edits fall back to full tokenization. Its lifetime follows the resident
+request epoch, and cancellation joins tokenization before releasing the input
+submission guard. Full prompt snapshots still go through normal multimodal preprocessing before scheduler-side
 prefix validation. `DuplexStagePort.finish_turn` releases only downstream turn
 state. Cancel, close and expiry still clean up every owned stage, including the
 resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#resident-thinker-kv-continuation)
