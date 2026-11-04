@@ -1574,6 +1574,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """
         return SimpleNamespace(model=SimpleNamespace(embed_tokens=self.emb_code[0]))
 
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """A Talker drafter is trained on specific layers, so its config has to name them."""
+        raise ValueError(
+            "MiniCPM-o 4.5 Talker has no default drafter layers; the draft config must name its target "
+            "layers (target_layer_ids, dspark_target_layer_ids, dflash_config.target_layer_ids or "
+            "eagle_aux_hidden_state_layer_ids)"
+        )
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         # Draft codes are verified per row for turn sessions only; the native
         # duplex chunk budget and turn-end drain advance one code per step.

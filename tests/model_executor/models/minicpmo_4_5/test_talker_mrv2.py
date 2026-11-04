@@ -708,6 +708,16 @@ def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):
     assert draft.model.embed_tokens is talker.emb_code[0]
 
 
+def test_draft_config_without_target_layers_gets_a_readable_error(mocker):
+    from vllm.v1.worker.gpu.spec_decode.eagle import eagle3_utils
+
+    talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    spec_config = SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()))
+    mocker.patch.object(eagle3_utils, "supports_eagle3", return_value=True)
+    with pytest.raises(ValueError, match="draft config must name its target layers"):
+        eagle3_utils.set_eagle3_aux_hidden_state_layers(talker, spec_config)
+
+
 @pytest.mark.parametrize(
     "use_v2,spec,ok",
     [
