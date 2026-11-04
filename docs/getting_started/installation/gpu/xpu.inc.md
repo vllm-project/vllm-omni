@@ -68,4 +68,23 @@ docker run -it -d --shm-size 10g \
 
 # --8<-- [start:pre-built-images]
 
+Official Intel XPU images are published to
+[vllm/vllm-omni-xpu](https://hub.docker.com/r/vllm/vllm-omni-xpu/tags).
+The `nightly` tag tracks the latest nightly build; `nightly-<commit>` pins an
+image to a specific commit. Release images use `v<version>` and `latest`.
+These images target Linux x86_64 with a supported Intel GPU.
+
+```bash
+docker run --rm -it \
+  --net=host \
+  --ipc=host \
+  --privileged \
+  -v /dev/dri/by-path:/dev/dri/by-path \
+  --device /dev/dri:/dev/dri \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  vllm/vllm-omni-xpu:nightly \
+  --model Qwen/Qwen2.5-Omni-3B --port 8091
+```
+
 # --8<-- [end:pre-built-images]
