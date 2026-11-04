@@ -105,6 +105,7 @@ _IMAGE_DEPENDENCY_PATHS = (
     "pyproject.toml",
     "setup.py",
     "tools/install_torchcodec_rocm.sh",
+    "tools/build_gradio_pillow13.py",
 )
 _READ_SIZE = 1024 * 1024
 _MAX_HTTP_BYTES = 2 * 1024 * 1024
@@ -389,7 +390,11 @@ def dependency_identity(root: Path) -> str:
     if not requirement_dir.is_dir():
         return ""
     requirement_files = sorted(path for path in requirement_dir.glob("*.txt") if path.is_file())
+    backport_files = sorted((root / "tools/gradio_pillow13").glob("*"))
+    if not backport_files:
+        return ""
     files = [root / relative for relative in _IMAGE_DEPENDENCY_PATHS]
+    files.extend(backport_files)
     files.extend(requirement_files)
     if any(not path.is_file() for path in files):
         return ""
