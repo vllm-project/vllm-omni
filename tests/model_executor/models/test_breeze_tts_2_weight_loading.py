@@ -17,18 +17,17 @@ from vllm.distributed import (
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
+    model_parallel_is_initialized,
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from vllm.model_executor.models.qwen3 import Qwen3Model
 
-from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
+from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import (
+    _PACKED_BACKBONE_PROJECTIONS,
+    BreezeForConditionalGeneration,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-_PROJECTIONS = {
-    "self_attn.qkv_proj.weight": ("q_proj", "k_proj", "v_proj"),
-    "mlp.gate_up_proj.weight": ("gate_proj", "up_proj"),
-}
 
 
 class _EmptyReferenceEncoder(nn.Module):
@@ -39,6 +38,17 @@ class _EmptyReferenceEncoder(nn.Module):
 
 @pytest.fixture(scope="module")
 def cpu_distributed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    # Borrow compatible groups without initializing or destroying another
+    # fixture's state. A bare process group cannot safely be cleaned up by vLLM.
+    if torch.distributed.is_initialized():
+        if (
+            torch.distributed.get_world_size() != 1
+            or torch.distributed.get_backend() != "gloo"
+            or not model_parallel_is_initialized()
+        ):
+            pytest.skip("Breeze CPU loading requires single-rank Gloo and initialized vLLM model-parallel groups")
+        yield
+        return
     rendezvous = tmp_path_factory.mktemp("breeze-distributed") / "rendezvous"
     with set_current_vllm_config(VllmConfig()):
         try:
@@ -56,8 +66,8 @@ def cpu_distributed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
             destroy_distributed_environment()
 
 
-@pytest.fixture
-def talker(cpu_distributed: None) -> Iterator[BreezeForConditionalGeneration]:
+@pytest.fixture(params=[False, True], ids=["bias-free", "attention-bias"])
+def talker(cpu_distributed: None, request: pytest.FixtureRequest) -> Iterator[BreezeForConditionalGeneration]:
     config = VllmConfig()
     with set_current_vllm_config(config), torch.device("cpu"):
         model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
@@ -71,7 +81,7 @@ def talker(cpu_distributed: None) -> Iterator[BreezeForConditionalGeneration]:
             layer.self_attn = nn.Module()
             # Unequal Q/K/V sizes exercise GQA shard offsets as well as names.
             layer.self_attn.qkv_proj = QKVParallelLinear(
-                8, 2, 4, 2, bias=False, params_dtype=torch.float32, disable_tp=True
+                8, 2, 4, 2, bias=request.param, params_dtype=torch.float32, disable_tp=True
             )
             layer.self_attn.o_proj = nn.Linear(8, 8, bias=False)
             layer.mlp = nn.Module()
@@ -102,12 +112,13 @@ def _checkpoint(
         value = torch.arange(parameter.numel(), dtype=torch.float32).reshape(parameter.shape) + index * 1000
         expected[name] = value
         source = name.replace("model.", "backbone_model.", 1) if name.startswith("model.") else name
-        for packed, parts in _PROJECTIONS.items():
-            if source.endswith(packed) and (layout == "split" or (layout == "mixed" and ".1." in source)):
+        kind = source.rsplit(".", 1)[-1]
+        for packed, parts in _PACKED_BACKBONE_PROJECTIONS.items():
+            if source.endswith(f".{packed}.{kind}") and (layout == "split" or (layout == "mixed" and ".1." in source)):
                 prefix = source.rsplit(".", 2)[0] + "."
                 sizes = (8, 4, 4) if len(parts) == 3 else (12, 12)
                 for part, shard in zip(parts, value.split(sizes), strict=True):
-                    weights[prefix + part + ".weight"] = shard.clone()
+                    weights[prefix + part + "." + kind] = shard.clone()
                 break
         else:
             weights[source] = value.clone()
@@ -132,19 +143,43 @@ def test_missing_split_projection_is_rejected(
     module = "self_attn" if projection in ("q", "k", "v") else "mlp"
     source = f"backbone_model.layers.{layer}.{module}.{projection}_proj.weight"
     del weights[source]
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match="Missing Breeze backbone projections") as error:
         talker.load_weights(iter(weights.items()))
     assert source.removeprefix("backbone_model.") in str(error.value)
 
 
-@pytest.mark.parametrize("packed", list(_PROJECTIONS))
+@pytest.mark.parametrize("layer", [0, 1])
+@pytest.mark.parametrize("projection", ["q", "k", "v"])
+@pytest.mark.parametrize("talker", [True], indirect=True, ids=["attention-bias"])
+def test_missing_split_projection_bias_is_rejected(
+    talker: BreezeForConditionalGeneration, layer: int, projection: str
+) -> None:
+    weights, _ = _checkpoint(talker)
+    source = f"backbone_model.layers.{layer}.self_attn.{projection}_proj.bias"
+    del weights[source]
+    with pytest.raises(ValueError, match="Missing Breeze backbone projections") as error:
+        talker.load_weights(iter(weights.items()))
+    assert source.removeprefix("backbone_model.") in str(error.value)
+
+
+@pytest.mark.parametrize("talker", [True], indirect=True, ids=["attention-bias"])
+def test_packed_weight_does_not_cover_missing_bias(talker: BreezeForConditionalGeneration) -> None:
+    weights, _ = _checkpoint(talker, "fused")
+    del weights["backbone_model.layers.1.self_attn.qkv_proj.bias"]
+    with pytest.raises(ValueError, match="Missing Breeze backbone projections") as error:
+        talker.load_weights(iter(weights.items()))
+    for projection in ("q", "k", "v"):
+        assert f"layers.1.self_attn.{projection}_proj.bias" in str(error.value)
+
+
+@pytest.mark.parametrize("packed", list(_PACKED_BACKBONE_PROJECTIONS))
 def test_missing_projection_group_is_rejected(talker: BreezeForConditionalGeneration, packed: str) -> None:
     weights, _ = _checkpoint(talker)
-    module = packed.split(".")[0]
+    module = "self_attn" if packed == "qkv_proj" else "mlp"
     prefix = f"backbone_model.layers.1.{module}."
-    for part in _PROJECTIONS[packed]:
+    for part in _PACKED_BACKBONE_PROJECTIONS[packed]:
         del weights[prefix + part + ".weight"]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Missing Breeze backbone projections"):
         talker.load_weights(iter(weights.items()))
 
 
@@ -168,5 +203,8 @@ def test_projection_shape_check_is_preserved(talker: BreezeForConditionalGenerat
 def test_unexpected_backbone_parameter_is_rejected(talker: BreezeForConditionalGeneration) -> None:
     weights, _ = _checkpoint(talker)
     weights["backbone_model.layers.1.self_attn.unexpected.weight"] = torch.zeros(8, 8)
-    with pytest.raises(ValueError, match="unexpected"):
+    with pytest.raises(
+        ValueError,
+        match=r"There is no module or parameter named 'layers\.1\.self_attn\.unexpected' in Qwen3Model\.",
+    ):
         talker.load_weights(iter(weights.items()))
