@@ -49,6 +49,7 @@ def _make_update_sched(scheduler_cls) -> MagicMock:
     """MagicMock scheduler driving the real ``update_from_output`` with an
     empty batch; only the fence state carries real values."""
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None
