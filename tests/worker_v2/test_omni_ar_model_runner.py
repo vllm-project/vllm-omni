@@ -392,6 +392,35 @@ def test_fresh_per_step_outputs_are_not_repacked() -> None:
 
 
 @pytest.mark.cpu
+def test_variable_length_snapshots_reuse_capacity_without_retaining_every_prefill() -> None:
+    """A long multimodal workload must retain four peaks, not every shape."""
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace()
+    runner.main_stream = MagicMock()
+    runner._async_mm_snapshot_slots = [{} for _ in range(4)]
+    runner._async_mm_snapshot_events = [None] * 4
+    runner._async_mm_snapshot_pending = [False] * 4
+    runner._async_mm_snapshot_cursor = 0
+    runner._last_multimodal_snapshot_slot = None
+    published = []
+    # Revisit smaller prefills after growth, as well as decode-sized outputs.
+    lengths = list(range(32, 96)) + [1, 32, 8, 64] * 4
+    for step, length in enumerate(lengths):
+        source = torch.full((length, 16), float(step))
+        snapshot = runner._retain_multimodal_outputs({"hidden_states": {"layers": {0: source, 24: source}}})
+        published.append(snapshot.copy_to_cpu(lambda tensor: tensor.clone()))
+        runner._release_multimodal_snapshot(runner._last_multimodal_snapshot_slot, object())
+        source.fill_(-1)
+
+    retained = sum(t.numel() for slot in runner._async_mm_snapshot_slots for t in slot.values())
+    assert retained <= 4 * max(lengths) * 16 * 2
+    for step, (length, host) in enumerate(zip(lengths, published)):
+        assert host["hidden_states"]["layers"][0].shape == (length, 16)
+        assert torch.all(host["hidden_states"]["layers"][0] == step)
+
+
+@pytest.mark.cpu
 def test_snapshot_slots_bounded_by_shape_and_packed_grouping_isolation(monkeypatch) -> None:
     slot: dict[tuple[Any, ...], torch.Tensor] = {}
     omni_ar_model_runner._copy_mm_to_snapshot_slot(torch.ones(1, 2), slot)

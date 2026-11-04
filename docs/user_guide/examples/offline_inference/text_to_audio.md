@@ -2,17 +2,14 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_audio>.
 
-
-A unified script for text-to-audio generation. Supported models:
-
-| Model | Tasks | Notes |
-| ------- | ------- | ------- |
-| `stabilityai/stable-audio-open-1.0` | text-to-audio | gated; uses `--audio-length` |
-| `Lightricks/LTX-2` | text-to-audio | use `--model-class-name LTX2TextToAudioPipeline`; defaults to 40 steps |
-| `diffusers/LTX-2.3-Diffusers` | text-to-audio | use `--model-class-name LTX2TextToAudioPipeline`; defaults to 30 steps |
-| `Lightricks/LTX-2.5-Diffusers` | text-to-audio | use `--model-class-name LTX2TextToAudioPipeline`; defaults to 30 steps |
-
 The `stabilityai/stable-audio-open-1.0` pipeline generates audio from text prompts.
+
+`stabilityai/stable-audio-3-medium` (`StableAudio3Pipeline`) is the recommended
+successor: a 1.4B DiT that generates stereo 44.1 kHz audio up to 380 s. It is gated
+the same way; prepare it with
+`tools/download_stable_audio_3.py` (which also
+writes the `model_index.json` / `transformer/config.json` the engine needs), then
+point `--model` at the prepared directory.
 
 ## Prerequisites
 
