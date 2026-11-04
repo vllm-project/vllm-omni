@@ -12,9 +12,12 @@ Add the following to an existing [H3 serving command](gh-file:recipes/MiniMaxAI/
 --additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
 ```
 
-Use the standard, non-INT8 H3 Lite decoder safetensors checkpoint. It must be
-available locally to every decoding process; it is not downloaded automatically.
-The original native H3 VAE assets and `--trust-remote-code` are still required.
+Download the standard, non-INT8 H3 Lite decoder checkpoint,
+[`lightvae-lite-h3-decoder.safetensors`](https://huggingface.co/lightx2v/LightVAE/blob/main/lightvae-lite-h3-decoder.safetensors),
+from [lightx2v/LightVAE](https://huggingface.co/lightx2v/LightVAE).
+The checkpoint must be available locally to every decoding process; it is
+not downloaded automatically. The original native H3 VAE assets and
+`--trust-remote-code` are still required.
 
 Merge the key into any existing `--additional-config` JSON object. This is a
 service-startup setting, not a per-request parameter. To restore the existing

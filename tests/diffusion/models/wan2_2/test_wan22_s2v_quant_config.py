@@ -16,7 +16,6 @@ transformer linear was built with ``quant_config=None``. These tests cover:
 All tests are pure-CPU and do not load model weights.
 """
 
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -217,8 +216,9 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
+    assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
     initialize_model_parallel()
     yield

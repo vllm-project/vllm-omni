@@ -2825,6 +2825,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         else (output.finish_reason if output.finish_reason else "stop")
                     ),
                     stop_reason=output.stop_reason,
+                    weight_versions=(
+                        getattr(output, "weight_versions", None) if request.return_weight_versions else None
+                    ),
                 )
                 choices.append(choice_data)
                 continue
@@ -2962,6 +2965,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ),
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                weight_versions=(getattr(output, "weight_versions", None) if request.return_weight_versions else None),
             )
             choices.append(choice_data)
 
