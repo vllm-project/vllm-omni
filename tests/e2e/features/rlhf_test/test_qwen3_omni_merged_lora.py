@@ -65,9 +65,8 @@ async def test_qwen3_omni_merged_lora_ipc_preserves_graph_storage_and_restores_o
         (projection,) = before
         name = projection["name"]
         assert name.startswith("thinker.language_model.model.")
-        checkpoint_name = (
-            name.replace("thinker.language_model.model.", "thinker.model.", 1)
-            .replace(".qkv_proj", ".q_proj")
+        checkpoint_name = name.replace("thinker.language_model.model.", "thinker.model.", 1).replace(
+            ".qkv_proj", ".q_proj"
         )
         prefix = f"base_model.model.{checkpoint_name}"
         a = torch.ones(1, projection["input_size"], dtype=torch.float16)
