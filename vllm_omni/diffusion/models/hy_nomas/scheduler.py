@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Tencent-Hunyuan/Hy-Nomas and Diffusers (Apache-2.0).
+# Copyright 2024 Stability AI, Katherine Crowson and the HuggingFace Team.
 
 from types import SimpleNamespace
 

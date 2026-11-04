@@ -5,7 +5,8 @@ Diffusion attention backend selector.
 
 This module resolves diffusion attention backends from:
 1. per-role AttentionConfig
-2. platform default
+2. optional model default
+3. platform default
 """
 
 from __future__ import annotations
@@ -104,6 +105,7 @@ def get_attn_backend_for_role(
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
     allow_trtllm_default: bool = True,
+    default_backend: str | None = None,
 ) -> tuple[type[AttentionBackend], AttentionSpec | None]:
     """
     Get attention backend for a specific attention role.
@@ -112,7 +114,8 @@ def get_attn_backend_for_role(
       1. attention_config.per_role[role]           — exact match
       2. attention_config.per_role[role_category]   — category fallback
       3. attention_config.default                   — global default
-      4. Platform default                           — hardware-specific
+      4. default_backend                            — model default, when provided
+      5. Platform default                           — hardware-specific
 
     Args:
         role: Attention role string (e.g. "self", "cross", "joint",
@@ -122,6 +125,7 @@ def get_attn_backend_for_role(
             If None, falls back to platform default behavior.
         role_category: Optional category for fallback (e.g. "cross" for
             "ltx2.audio_to_video")
+        default_backend: Model default used only when no explicit spec resolves.
 
     Returns:
         Tuple of (backend_class, AttentionSpec or None).
@@ -145,6 +149,17 @@ def get_attn_backend_for_role(
             source=source or "attention_config",
         )
         return backend_cls, spec
+
+    # Model defaults remain below explicit per-role/global configuration.
+    if default_backend is not None:
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        backend_cls = DiffusionAttentionBackendEnum[default_backend].get_class()
+        backend_cls.validate_available()
+        if not backend_cls.supports_head_size(head_size):
+            raise ValueError(f"{default_backend} does not support head size {head_size}")
+        _log_backend_resolution(role, role_category, backend_cls.get_name(), "model default")
+        return backend_cls, None
 
     # 2. Platform default
     backend_cls = _cached_get_backend_cls(None, head_size, allow_trtllm_default)

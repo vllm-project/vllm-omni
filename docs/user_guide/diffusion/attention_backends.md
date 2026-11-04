@@ -29,6 +29,7 @@ For the internal selector, registry, and platform contract, see
 | Value | Family | Primary use | Detail |
 | --- | --- | --- | --- |
 | `TORCH_SDPA` | Dense | Conservative reference; always available | [Dense Backends](attention_backends/dense_backends.md#torch_sdpa) |
+| `FLEX_ATTENTION` | Exact masks | Rectangle unions or prebuilt PyTorch block masks, including GQA | [FlexAttention](attention_backends/dense_backends.md#flex_attention) |
 | `FLASH_ATTN` | Dense | FlashAttention 4/3/2 depending on the installed package and GPU | [Dense Backends](attention_backends/dense_backends.md#flash_attn) |
 | `CUDNN_ATTN` | Dense | Mask-heavy DiTs on Blackwell with cuDNN 9.5 or newer | [Dense Backends](attention_backends/dense_backends.md#cudnn_attn) |
 | `FLASHINFER_ATTN` | Dense or quantized | FlashInfer batch prefill; optional mixed Q/K and V dtypes | [Dense Backends](attention_backends/dense_backends.md#flashinfer_attn) |
@@ -49,7 +50,8 @@ Backend selection is resolved in this order:
 1. `--diffusion-attention-config` per-role configuration.
 2. `--diffusion-attention-backend` or `DIFFUSION_ATTENTION_BACKEND` as a
    global default.
-3. The current platform's default.
+3. The model's default for that attention site, when provided.
+4. The current platform's default.
 
 `--diffusion-attention-backend` is shorthand for
 `--diffusion-attention-config.default.backend`. Do not pass it together with an
@@ -73,7 +75,8 @@ Roles are declared by each diffusion model. Common categories are `self` and
 1. Exact `per_role[role]` match.
 2. Category `per_role[role_category]` match.
 3. `default`.
-4. Platform default.
+4. Model default, when provided.
+5. Platform default.
 
 ```bash
 # Dotted flags

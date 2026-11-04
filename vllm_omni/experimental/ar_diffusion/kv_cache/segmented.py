@@ -127,6 +127,17 @@ class ARDiffusionSegmentedKVState:
         self._prepared = (int(media_tokens), int(condition_tokens))
         self._assembled.clear()
 
+    def layer_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expose prepared storage; assemble() initializes the current rows before attention."""
+        self._check_open()
+        self._validate_layer(layer_idx)
+        staging = self._staging()
+        if self._prepared is None or staging.owner is not self or staging.revision != self._revision:
+            raise RuntimeError("prepare_layer_views() must precede segmented layer_view()")
+        length = self.history_tokens + sum(self._prepared)
+        key, value = staging.layers[layer_idx]
+        return key[:length], value[:length]
+
     def assemble(
         self,
         layer_idx: int,

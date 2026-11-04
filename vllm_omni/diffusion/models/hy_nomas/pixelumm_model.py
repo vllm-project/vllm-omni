@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Tencent-Hunyuan/Hy-Nomas and nv-tlabs/PixelUMM (Apache-2.0 code).
-# See SOURCES.md for pinned sources and original notices.
+# Source: Hy-Nomas@911cea6458; Copyright 2026 Tencent.
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionRanges
 from vllm_omni.diffusion.attention.layer import Attention
 
 TUBELET = (4, 16, 16)
@@ -111,7 +111,6 @@ def apply_mrope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, sections)
 
 
 _LOCAL_LAYOUTS: OrderedDict = OrderedDict()
-_COMPILED_FLEX = None
 
 
 def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
@@ -154,23 +153,6 @@ def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
     return _LOCAL_LAYOUTS[key]
 
 
-def _flex_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_mask) -> torch.Tensor:
-    """[B,heads,N,D] x GQA [B,kv,N,D]. Compiled (fused Triton kernel) on CUDA; eager elsewhere.
-
-    The compile is required, not an optimization: eager flex materializes the full score matrix.
-    """
-    from torch.nn.attention.flex_attention import flex_attention
-
-    global _COMPILED_FLEX
-    if q.device.type != "cuda" or torch.compiler.is_compiling():
-        return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-    if _COMPILED_FLEX is None:
-        # One graph per call shape; past the default limit dynamo would fall back to eager flex.
-        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 128)
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
-    return _COMPILED_FLEX(q, k, v, block_mask=block_mask, enable_gqa=True)
-
-
 class RMSNorm(nn.Module):
     """Qwen3RMSNorm: normalize in fp32, cast back to the input dtype, then scale."""
 
@@ -184,18 +166,6 @@ class RMSNorm(nn.Module):
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return self.weight * x.to(dtype)
-
-
-class PixelAttentionKernel(nn.Module):
-    def forward(self, query, key, value, attn_metadata):
-        block_mask = attn_metadata.extra["block_mask"]
-        if block_mask is not None:
-            result = _flex_attention(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask)
-        else:
-            repeat = query.shape[2] // key.shape[2]
-            key, value = key.repeat_interleave(repeat, dim=2), value.repeat_interleave(repeat, dim=2)
-            result = F.scaled_dot_product_attention(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
-        return result.transpose(1, 2)
 
 
 class GenAttention(nn.Module):
@@ -213,15 +183,25 @@ class GenAttention(nn.Module):
         self.q_norm_hw = RMSNorm(dim // 2, arch.rms_norm_eps)
         self.k_norm_t = RMSNorm(dim // 2, arch.rms_norm_eps)
         self.k_norm_hw = RMSNorm(dim // 2, arch.rms_norm_eps)
-        self.attn = Attention(
+        self.local_attn = Attention(
             num_heads=heads,
             num_kv_heads=kv,
             head_size=dim,
             causal=False,
             softmax_scale=dim**-0.5,
-            role="hy_nomas.decoder",
+            role="hy_nomas.decoder.local",
             skip_sequence_parallel=True,
-            custom_attention=PixelAttentionKernel(),
+            default_backend="FLEX_ATTENTION",
+        )
+        self.full_attn = Attention(
+            num_heads=heads,
+            num_kv_heads=heads,
+            head_size=dim,
+            causal=False,
+            softmax_scale=dim**-0.5,
+            role="hy_nomas.decoder.full",
+            skip_sequence_parallel=True,
+            default_backend="TORCH_SDPA",
         )
 
     @staticmethod
@@ -257,7 +237,14 @@ class GenAttention(nn.Module):
         # PixelUMM's generation path keeps q/k in fp32 through QK-norm and RoPE.
         q = self._prepare_qk(q, cos, sin, self.q_norm_t, self.q_norm_hw, v.dtype)
         k = self._prepare_qk(k, cos, sin, self.k_norm_t, self.k_norm_hw, v.dtype)
-        out = self.attn(q, k, v, AttentionMetadata(extra={"block_mask": block_mask}))
+        if block_mask is not None:
+            out = self.local_attn(
+                q, k, v, AttentionMetadata(range_mask=AttentionRanges(), extra={"block_mask": block_mask})
+            )
+        else:
+            repeat = arch.num_heads // arch.num_kv_heads
+            k, v = k.repeat_interleave(repeat, dim=2), v.repeat_interleave(repeat, dim=2)
+            out = self.full_attn(q, k, v)
         return self.o_proj(out.reshape(batch, count, arch.num_heads * arch.head_dim))
 
 

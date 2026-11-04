@@ -144,6 +144,13 @@ class PipelineWithCPUComponents(HyNomasPipeline):
                 mask[:, start : start + image] = True
                 if kwargs["cache_txt"]:
                     mask[:, start + image :] = kwargs["text_mask"].bool()
+                state = kwargs.get("kv_cache_state")
+                if state is not None:
+                    key, value = view["k"][0, start : start + count], view["v"][0, start : start + count]
+                    condition = key.new_full(
+                        (kwargs["text_states"].shape[1] if not kwargs["cache_txt"] else 0, *key.shape[1:]), layer + 1
+                    )
+                    state.assemble(layer, condition, -condition, key, value)
                 if self.fail_clean and layer == 0:
                     raise RuntimeError("injected clean-forward failure")
         return torch.ones_like(hidden) * 0.25, count if kwargs["update_cache"] else 0

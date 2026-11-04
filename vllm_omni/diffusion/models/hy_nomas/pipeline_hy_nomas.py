@@ -40,10 +40,8 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
-    commit_cache,
     load_component_weights,
     load_transformer_weights,
-    reference_cache_views,
     validate_sequence_parallelism,
 )
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasInteractionSession, validate_camera_payload
@@ -709,7 +707,12 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         if cache is not None:
             if cache.history_tokens != history:
                 raise RuntimeError("Hy-Nomas KV history and text visibility mask disagree.")
-            views = reference_cache_views(cache, current_tokens)
+            condition_tokens = state.prompt_embeds.shape[1] if commit and not first else 0
+            cache.prepare_layer_views(current_tokens, condition_tokens)
+            views = []
+            for layer in range(cache.cache.num_layers):
+                key, value = cache.layer_view(layer)
+                views.append({"k": key[None, : history + current_tokens], "v": value[None, : history + current_tokens]})
         else:
             if session.offline_cache is None:
                 raise RuntimeError("Hy-Nomas offline KV cache is not initialized.")
@@ -774,6 +777,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     intra_seg_txt_offsets=state.extra["hy_nomas_intra_offsets"],
                     intra_seg_vid_windows=state.extra["hy_nomas_intra_windows"],
                     camera_rope_time_offset=0,
+                    kv_cache_state=cache,
                 )
             if commit:
                 if cache is not None:
@@ -802,7 +806,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                             budget = self.ar_config.history_latent_frames * (image_tokens // latents.shape[2])
                             frames, cut = recent_history(frames, budget)
                             retained = tuple(frame.handle for frame in frames)
-                        commit_cache(cache, views)
+                        for layer in range(len(views)):
+                            cache.stage(layer)
                         cache.validate_commit(retain=retained)
                     except Exception as exc:
                         error = exc

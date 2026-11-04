@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# Adapted from Tencent-Hunyuan/Hy-Nomas@16a4c228; see SOURCES.md.
+# Adapted from Tencent-Hunyuan/Hy-Nomas@16a4c228 (Copyright 2026 Tencent).
 
 from __future__ import annotations
 

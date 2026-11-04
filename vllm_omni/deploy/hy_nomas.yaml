@@ -1,4 +1,4 @@
-# Isolate the reference components' process-global state.
+# Keep decoder backend policy inside isolated inference workers.
 distributed_executor_backend: mp
 dtype: bfloat16
 

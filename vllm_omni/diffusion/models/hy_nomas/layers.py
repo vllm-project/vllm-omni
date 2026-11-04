@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Adapted from Tencent-Hunyuan/Hy-Nomas@911cea6458 (Copyright 2026 Tencent).
 
 import math
-import os
 
 import torch
 from torch import nn
@@ -91,45 +91,6 @@ class FinalLayer(nn.Module):
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
 
-def get_flash_attention2():
-    from flash_attn import flash_attn_varlen_func
-
-    return flash_attn_varlen_func
-
-
-class TextRefinerAttention(nn.Module):
-    def forward(self, query, key, value, attn_metadata):
-        mask = attn_metadata.attn_mask.bool()
-        if query.device.type == "cpu":
-            pair_mask = mask[:, None, :, None] & mask[:, None, None, :]
-            return nn.functional.scaled_dot_product_attention(
-                query.transpose(1, 2),
-                key.transpose(1, 2),
-                value.transpose(1, 2),
-                attn_mask=pair_mask,
-            ).transpose(1, 2)
-        from flash_attn.bert_padding import pad_input, unpad_input
-
-        batch, length, heads, dim = query.shape
-        query, key, value = torch.stack((query, key, value), dim=2).unbind(2)
-        q, indices, cu_q, max_q, _ = unpad_input(query.reshape(batch, length, -1), mask)
-        k, _, cu_k, _, _ = unpad_input(key.reshape(batch, length, -1), mask)
-        v, _, _, _, _ = unpad_input(value.reshape(batch, length, -1), mask)
-        out = get_flash_attention2()(
-            q.reshape(-1, heads, dim),
-            k.reshape(-1, heads, dim),
-            v.reshape(-1, heads, dim),
-            cu_q,
-            cu_k,
-            max_q,
-            max_q,
-            dropout_p=0.0,
-            causal=False,
-            deterministic=os.environ.get("FLASH_ATTENTION_DETERMINISTIC_MODE", "0") == "1",
-        )
-        return pad_input(out.reshape(-1, heads * dim), indices, batch, length).view(batch, length, heads, dim)
-
-
 class TokenRefinerBlock(nn.Module):
     def __init__(self, hidden, heads, **kwargs):
         super().__init__()
@@ -147,7 +108,9 @@ class TokenRefinerBlock(nn.Module):
             softmax_scale=(hidden // heads) ** -0.5,
             role="hy_nomas.text_refiner",
             skip_sequence_parallel=True,
-            custom_attention=TextRefinerAttention(),
+            default_backend="FLASH_ATTN"
+            if torch.device(kwargs.get("device") or "cpu").type == "cuda"
+            else "TORCH_SDPA",
         )
 
     def forward(self, x, c, mask):
@@ -155,6 +118,7 @@ class TokenRefinerBlock(nn.Module):
         batch, length, hidden = x.shape
         q, k, v = self.self_attn_qkv(self.norm1(x)).view(batch, length, 3, self.heads_num, -1).unbind(2)
         output = self.attn(q, k, v, AttentionMetadata(attn_mask=mask)).reshape(batch, length, hidden)
+        output = output.masked_fill(~mask[:, :, None], 0)
         x = x + self.self_attn_proj(output) * gate_attention.unsqueeze(1)
         return x + self.mlp(self.norm2(x)) * gate_mlp.unsqueeze(1)
 

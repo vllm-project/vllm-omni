@@ -105,19 +105,25 @@ Selecting `vae` is unsupported and raises an error.
 
 ## Software and checkpoints
 
-Validation used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
+Historical adapter validation used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
 vLLM 0.32.0, Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3.
 The NVIDIA driver was 570.133.20.
 
-Install vLLM-Omni and the Hy-Nomas text-refiner kernel dependency for the
-environment's PyTorch/CUDA versions:
+Install vLLM-Omni with its standard platform dependencies. The native text
+refiner uses the shared `FLASH_ATTN` backend and its available implementation;
+it does not require a separate pinned FlashAttention 2 package. Cached DiT and
+camera attention use the shared `FLEX_ATTENTION` backend for exact range masks.
 
 ```bash
-python -m pip install --no-build-isolation 'flash-attn==2.8.3'
+python -m pip install -e .
 ```
 
 Generation does not import `hymm` or the reference repository's `configs`.
 The pinned upstream source is needed only for independent comparison tests.
+Model math and camera presets follow `Tencent-Hunyuan/Hy-Nomas@911cea6458`;
+rolling decoding follows `wtz2333/Hy-Nomas@16a4c228`. Source attribution remains
+in the implementation headers. PixelUMM code is Apache-2.0; upstream identifies
+released PixelUMM weights/derivatives separately as NVIDIA One-Way Noncommercial.
 AR sessions use native stable-prefix rolling decoding without retained output
 history. Verify the runtime modules before loading weights:
 

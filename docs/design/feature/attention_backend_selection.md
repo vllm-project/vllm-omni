@@ -27,10 +27,11 @@ The selection path has four responsibilities:
 1. exact `per_role[role]`;
 2. category `per_role[role_category]`;
 3. `default`;
-4. platform default.
+4. the optional model `default_backend` supplied to `Attention`;
+5. platform default.
 
 An explicit resolution returns both the backend class and its
-`AttentionSpec`. A platform-default resolution returns the class and `None`.
+`AttentionSpec`. Model-default and platform-default resolutions return the class and `None`.
 Layers must therefore treat the spec as optional and must not infer that a
 missing spec means SDPA.
 
