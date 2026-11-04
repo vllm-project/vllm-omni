@@ -117,6 +117,21 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     "Thinker KV continuation unavailable (%s); using per-turn requests",
                     ", ".join(unsupported),
                 )
+            else:
+                # Upstream counts WAITING_FOR_STREAMING_REQ against active
+                # slots even after a turn ends. Admission must not promise
+                # more resident sessions than one replica can keep alive.
+                scheduler = config.scheduler_config
+                capacity = scheduler.max_num_active_seqs or scheduler.max_num_seqs
+                sessions_per_replica = min(
+                    duplex_session_config.max_sessions, duplex_session_config.worker_max_sessions
+                )
+                if sessions_per_replica > capacity:
+                    raise ValueError(
+                        f"resident Thinker session limit ({sessions_per_replica} per replica) exceeds "
+                        f"stage-0 active-request capacity ({capacity}); lower duplex_session.max_sessions "
+                        "or max_sessions_per_replica, or increase stage-0 max_num_seqs/max_num_active_seqs"
+                    )
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":

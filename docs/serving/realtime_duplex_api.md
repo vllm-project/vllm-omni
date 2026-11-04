@@ -61,6 +61,14 @@ matching blocks in that fallback path. Disabling stage-0 prefix caching also
 disables resident continuation because Talker needs cached hidden-state rows.
 Non-CUDA profile overrides keep prefix caching disabled.
 
+Idle resident Thinker requests still occupy upstream active-request slots.
+Startup rejects continuation configurations whose per-replica session limit
+exceeds stage 0's `max_num_active_seqs` (or `max_num_seqs` when unset).
+For `least_sessions`, the limit is the smaller of `max_sessions_per_replica`
+and global `max_sessions`; otherwise it is `max_sessions`. Lower the session
+limit or increase the existing scheduler capacity to avoid accepting sessions
+that cannot run while earlier sessions remain idle.
+
 Prefix caching does not eliminate multimodal preprocessing or Talker/Code2Wav
 work. Budget host RAM for the
 [stage-output cache](../design/feature/prefix_caching.md) as well as GPU memory
