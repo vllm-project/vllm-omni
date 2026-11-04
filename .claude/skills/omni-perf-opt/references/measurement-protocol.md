@@ -108,7 +108,8 @@ python3 .claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py /tmp/omni_pr
    commands for every column.
 2. Change one variable per column. For runtime switches, run base, head
    with the switch off, and head with the switch on.
-3. Warm up; exclude cold-start samples from every reported number.
+3. Warm up; exclude cold-start samples from steady-state numbers. Report
+   startup, compilation, and capture costs separately when relevant.
 4. Use hundreds of requests for P99; repeat noisy runs and report spread.
 5. Hold sanity rows constant across columns: generated text tokens, audio
    duration, failure count.
@@ -124,3 +125,29 @@ Nightly omni perf cases live in `tests/dfx/perf/tests/` (for example
 `benchmark_params` with per-hardware `baseline` thresholds. Update the
 baseline only with A/B evidence on the named hardware; wiring and markers
 belong to the `vllm-omni-test` skill.
+
+## Backend, experiment, and lifecycle checks
+
+- Freeze the physical device allocation and record other device activity. On
+  shared hardware, use the site's reservation mechanism (for example `npu run`
+  where provided). Record Ascend model, driver/CANN, torch-npu, vllm-ascend,
+  attention backend, and graph switches for NPU results. NVIDIA MPS, CUDA
+  profiling tools, and CUDA graph support do not transfer automatically to NPU.
+- For a new model unsupported on base, label the control as the same integration
+  with optimization switches off; do not call it an upstream-main measurement.
+- Prefer independent process repetitions in AB/BA order to reduce ordering bias.
+  State the statistical unit and spread: requests from one process are not
+  independent process repetitions. Do not infer tail latency from tiny samples.
+- Preflight the benchmark consumer with metadata-only and empty final payloads.
+  Count first audio only on a nonempty audio payload, while still processing
+  completion events. Keep failed attempts and their logs. If the harness changes
+  or an arm fails, rerun the complete affected comparison; do not combine partial
+  arms into a speedup claim.
+- Check completed/failed requests, output duration and quality, and clean exit
+  separately. Wait for all stage workers to close; a successful request or parent
+  exit code alone does not establish clean shutdown. Record forced termination,
+  orphan workers, and timeout errors; an incomplete arm is inconclusive.
+- A smoke run that skips multimodal memory profiling does not validate deployment
+  capacity. Exercise normal profiling at the configured modality limits and
+  measure headroom at target concurrency. Distinguish sampled device memory from
+  allocator peak memory.

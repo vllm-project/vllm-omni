@@ -14,7 +14,8 @@ final latency number.
 
 Ask for anything not already known:
 
-- Hardware: GPU model and count, NVLink, whether stages may share a GPU.
+- Hardware: accelerator model and count, interconnect, device sharing, and
+  backend software stack (for Ascend: CANN, torch-npu, and vllm-ascend).
 - Model, checkpoint, vLLM and vLLM-Omni commits, and the deploy YAML actually
   loaded (default or `--deploy-config`, its `base_config` chain, platform
   section, `--stage-overrides`).
@@ -98,7 +99,8 @@ Every optimization needs correctness evidence on the same workload, including
   `audio_continuity_ok_rate` not worse.
 - Concurrency: per-request outputs at concurrency 2+ equal single-request
   outputs.
-- Graphs: graph mode matches `--enforce-eager` for touched stages.
+- Graphs: graph mode matches a control with outer and model-internal graphs
+  explicitly disabled for touched stages; verify the effective switches.
 - Precision changes (TF32, fused kernels, cuDNN algorithm search, short KV,
   quantization) must state that rounding changes and show the metric delta.
 
@@ -125,7 +127,8 @@ only on P0 measurement or instrumentation fixes.
 - Streaming output and `async_chunk` depend on each other: without
   `async_chunk` streaming cannot start early, and without streaming the
   client does not see the earlier first packet.
-- Put the thinker on its own GPU first; talker and code2wav are smaller.
+- For the three-stage CUDA examples, start with a dedicated thinker GPU;
+  verify stage costs before applying this placement to a different topology.
   When the talker saturates, add talker replicas before raising thinker batch
   limits.
 - Prefix caching stays off for the full Qwen3-Omni and MiniCPM-o pipelines;
@@ -149,7 +152,7 @@ only on P0 measurement or instrumentation fixes.
 [Outcome, primary metric delta, and the stage it came from]
 
 ## Setup
-- vllm-omni <sha>, vllm <sha>, <GPU x N>, driver/CUDA
+- vllm-omni <sha>, vllm <sha>, <accelerator x N>, driver/backend versions
 - Deploy: <yaml> + <overrides>; session mode <turn|duplex>
 - Commands: serve / request / bench (scripts or exact lines)
 

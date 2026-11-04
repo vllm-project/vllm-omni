@@ -1,6 +1,6 @@
 ---
 name: add-omni-model
-description: Integrate a new multi-stage autoregressive omni model (thinker/talker/code2wav style, multimodal input with text and speech output) into vLLM-Omni, from the Hugging Face reference through stage separation, pipeline and deploy config, stage input processors, async_chunk streaming, parity validation, tests, and recipe. Use when adding a model like Qwen3-Omni, Qwen2.5-Omni, or MiniCPM-o, splitting an omni checkpoint into stages, writing `pipeline.py` or `stage_input_processors/<model>.py`, wiring `_OMNI_MODELS` / `OMNI_PIPELINES`, or debugging parity of a newly integrated omni model. Not for diffusion models (`add-diffusion-model`) or TTS-only models (`add-tts-model`).
+description: Integrate a new multi-stage autoregressive omni model (thinker/talker/code2wav style, multimodal input with text and speech output) into vLLM-Omni, from the Hugging Face reference through stage separation, pipeline and deploy config, stage input processors, async_chunk streaming, parity validation, tests, and recipe. Use when adding a model like Qwen3-Omni, Qwen2.5-Omni, or MiniCPM-o, splitting an omni checkpoint into stages, writing `pipeline.py` or `stage_input_processors/` hooks, wiring `_OMNI_MODELS` / `OMNI_PIPELINES`, or debugging parity of a newly integrated omni model. Not for diffusion models (`add-diffusion-model`) or TTS-only models (`add-tts-model`).
 ---
 
 # Add a Multi-Stage Omni Model
@@ -58,7 +58,9 @@ Check these at the end of every phase.
    image+text, audio+text, and a speech-output request).
 2. Save golden artifacts: thinker text (greedy), talker codec ids for a fixed
    seed, and the code2wav waveform for those ids.
-3. Record the architecture: sub-models, which hidden layers the talker
+3. Freeze the reference environment and numerical contract (dtype, attention
+   backend, buffer initialization, and RNG behavior); see the parity reference.
+4. Record the architecture: sub-models, which hidden layers the talker
    consumes, special tokens, codec codebooks and frame rate, hop length,
    sample rate, and the HF `config.json` sub-config names.
 
@@ -66,6 +68,13 @@ Deliverable: a reference script and golden files you can diff against at
 every later phase.
 
 ## Phase 2: Stage split and model package
+
+Map the dependency graph before splitting processes. Keep modules with per-step
+feedback together unless the runtime supports that feedback edge; sub-model names
+do not imply stage boundaries. For example, a temporal decoder that consumes its
+depth head's audio frame on the next step can share an AR stage with that head,
+with only code2wav downstream. See the
+[LFM3 integration case](references/lfm3-omni.md).
 
 Create `vllm_omni/model_executor/models/<name>/`:
 
@@ -119,8 +128,10 @@ effective `async_chunk`. Reference: `stage_input_processors/qwen3_omni.py`.
 Create `vllm_omni/deploy/<name>.yaml` with a header comment naming the
 verified hardware. Start conservative and correct:
 
-- Thinker on its own GPU; talker and code2wav share one GPU; per-GPU
-  `gpu_memory_utilization` sums to at most 1.0.
+- Choose placement from the actual stage topology and device memory budget.
+  For a three-stage CUDA model, a starting point is a dedicated thinker GPU
+  and a second GPU shared by talker and code2wav. Budget co-located stages
+  together, including weights, KV, encoder peaks, and graph buffers.
 - `enable_prefix_caching: false` on every stage unless the pipeline has been
   validated with it.
 - Connector block (`SharedMemoryConnector` on a single node) with codec chunk
@@ -141,11 +152,13 @@ comparison methods: [references/parity-and-validation.md](references/parity-and-
 2. Talker codec ids match HF for a fixed seed and identical conditioning.
 3. Code2wav waveform matches HF for identical codec ids (within tolerance).
 4. Full pipeline, `async_chunk` off: audio matches rung 3.
-5. `async_chunk` on: audio equals non-streaming output apart from chunk
-   boundaries; no truncation, repetition, or clicks.
+5. `async_chunk` on: compare against the reference streaming decoder with
+   matching chunk settings; measure any reference full/stream difference
+   separately. Check duration, truncation, repetition, and continuity.
 6. Concurrency of at least 2: per-request outputs equal their single-request
    outputs (no crosstalk).
-7. CUDA graphs on versus `--enforce-eager`: matching output.
+7. Graphs on versus all relevant graphs off: matching output.
+   `--enforce-eager` alone may leave model-internal graphs enabled.
 
 ## Phase 7: Tests and CI
 

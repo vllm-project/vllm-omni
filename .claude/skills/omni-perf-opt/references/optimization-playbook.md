@@ -72,7 +72,11 @@ Knobs: per-stage `max_num_seqs`, `max_num_batched_tokens`,
 
 Graph caches have fixed budgets; when full, other shapes run eagerly. After
 changing batch sizes or caps, read startup capture logs and the precapture
-budget warning. Always compare with `--enforce-eager` for correctness.
+budget warning. For correctness, disable both outer graphs and each touched
+model-internal graph in the control; `--enforce-eager` alone is insufficient.
+Record effective flags and capture/replay/fallback counts. CUDA examples do not
+establish NPU graph support: validate capture safety and eager fallback on the
+actual backend before applying them.
 
 ## Streaming hand-off (async_chunk and codec chunking)
 

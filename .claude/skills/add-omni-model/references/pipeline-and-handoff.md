@@ -177,3 +177,24 @@ tensors) copy from `qwen3_omni/qwen3_omni.py` rather than this sketch.
 
 Out-of-tree pipelines can use `register_pipeline(...)` from the same module
 instead of editing `OMNI_PIPELINES`.
+
+## Streaming and termination contract
+
+Before long parity or performance runs, verify that one full-payload request and
+one streaming request reach the consumer and finish. Processor dispatch may
+inspect parameter names; wrappers used for tracing must preserve the runtime's
+recognized signature (check `_connector_payload_kwarg`), not just positional
+arity.
+
+Define text-end, audio-end, and request-end separately. A text-end token may
+switch to audio generation rather than terminate the request; an audio sentinel
+may be feedback state rather than a decodable codec frame. Test each transition
+against the reference generation loop.
+
+Exercise metadata-only payloads, an empty final chunk, and multiple producer
+chunks coalesced into one transport payload. Preserve completion through any
+metadata filtering, flush the decoder exactly once, and validate serialization
+of empty tensors. The consumer must not assume that every payload has audio.
+When codec numerics or recurrent state depend on chunk shape, restore the intended
+decoder chunk schedule after transport coalescing. Free request state on both
+normal completion and cancellation; verify that the next request starts cleanly.

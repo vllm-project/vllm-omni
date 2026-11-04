@@ -4,21 +4,53 @@ Climb the ladder in order. Each rung isolates one stage or one runtime
 feature, so a failure points to a small area.
 
 ## Contents
+- Reference contract
 - Parity ladder
 - Common failure causes
 - Evidence to attach to the PR
+
+## Reference contract
+
+Pin the checkpoint and reference code revisions, Transformers and backend
+versions, dtype, attention implementation, and generation settings. Keep an
+isolated reference environment when its dependencies differ from the supported
+serving stack; validate the serving stack within its declared version bounds.
+
+Weights alone do not define the reference. Record where nonpersistent buffers
+(such as rotary frequencies) are constructed and when modules are cast or moved
+to the target device. CPU construction followed by a device move can differ
+numerically from direct device construction. At the first divergent token or
+codec frame, compare conditioning, buffers, hidden states, and logits before
+changing tolerances. Diagnostic hooks can synchronize; remove them for timing.
+
+For stochastic parity, match generator device, per-request RNG state, random
+operation order and shapes, and sampling/reveal schedules as well as the seed.
+Vectorizing random draws or sharing a generator across requests can change codes.
 
 ## Parity ladder
 
 | Rung | How | Pass criterion |
 |------|-----|----------------|
 | 1. Thinker text | `"modalities": ["text"]`, `temperature: 0`, same prompt and media as HF | Token-identical, or first divergence explained (kernel numerics) and downstream answer unchanged |
-| 2. Talker codec ids | Feed the same thinker conditioning; fix the talker `seed` | Identical ids for greedy; for sampling, identical under the same seed and sampler |
+| 2. Talker codec ids | Feed the same thinker conditioning; fix the talker `seed` | Identical ids for greedy; for sampling, identical under the matched RNG and sampler contract |
 | 3. Code2wav waveform | Feed HF codec ids directly | Waveform within tolerance (report max abs diff, SNR or cosine) and same length |
 | 4. Full pipeline, `--no-async-chunk` | Default deploy, one request | Audio matches rung 3 output for the same codes |
-| 5. Full pipeline, `--async-chunk` | Same request | Same duration; audio equal apart from chunk boundaries; no clicks, gaps, truncation, or repetition |
+| 5. Full pipeline, `--async-chunk` | Same request and reference streaming chunk settings | Matches reference streaming audio within stated tolerance; same duration; no clicks, gaps, truncation, or repetition |
 | 6. Concurrency | 2 and 4+ different prompts at once | Each output equals its single-request output |
-| 7. Graph check | Same request with `--enforce-eager` | Matches graph-mode output |
+| 7. Graph check | Same request with outer and model-internal graphs explicitly disabled | Matches graph-mode output; verify capture/replay and eager fallback actually occurred |
+
+Record the reference decoder's own full-versus-streaming difference separately;
+chunk shapes can change floating-point results. A measured reference difference
+is not permission to ignore additional integration error. Exercise transport
+coalescing without silently changing the decoder's intended chunk schedule.
+
+Inventory graph controls in stage config, model overrides, and environment
+variables: `--enforce-eager` may disable only outer graphs. Test supported shape
+buckets and fallback paths with the same dtype and autocast settings.
+
+Use different prompts, seeds, and lengths for concurrency checks, and exercise
+cancellation followed by a new request to detect leaked state. Fixed fixtures
+and repeated copies of one prompt do not replace dataset or crosstalk validation.
 
 Then run one accuracy dataset that covers the claimed modalities, for example
 Daily-Omni or Video-MME for understanding and Seed-TTS WER for speech, through
