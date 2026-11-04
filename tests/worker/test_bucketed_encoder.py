@@ -367,6 +367,59 @@ def test_context_margin_preserves_conv_tail(bucket_env):
         assert out_lens[row].item() == solo_len.item()
 
 
+def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
+    """A channels-first encoder (mel on dim 1, time on dim 2) must keep
+    bucketing for an all-short batch via its declared ``bucketing_time_axis=2``.
+    The length-scale heuristic would otherwise guess axis 1 (longest <= mel bins)
+    and hand the conv the wrong channel count, disabling the wrapper."""
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS", raising=False)
+
+    class ChannelsFirstConvEncoder(nn.Module):
+        bucketing_time_axis = 2  # (B, mel, T): time on dim 2
+
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv1d(128, 16, kernel_size=3, padding=1)
+
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            out = self.conv(x)  # (B, 128, T) -> (B, 16, T)
+            out = out.transpose(1, 2)  # (B, T, 16) time-major output
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ChannelsFirstConvEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    # All items shorter than the 128 mel bins: the heuristic (longest > dim1)
+    # would wrongly pick axis 1 and conv1 would see rung channels, not 128.
+    mel, T_feat = 128, 120
+    lengths = [30, 60, 40, 80]
+    feats = torch.randn(len(lengths), mel, T_feat, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, :, length:] += 3.0
+    lens = torch.tensor(lengths, dtype=torch.long)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
+        out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert wrapper._disabled is False, "an all-short batch must not disable bucketing"
+    assert wrapper._axis == 2, "declared bucketing_time_axis=2 must win over the heuristic"
+    for row, length in enumerate(lengths):
+        solo, solo_len = wrapper._original(feats[row : row + 1, :, :length], lens[row : row + 1])
+        torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
 def test_module_pattern_env_override(bucket_env, monkeypatch):
     """VLLM_OMNI_AUDIO_BUCKET_MODULES selects which module names wrap."""
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_MODULES", r"(?:^|\.)my_frontend$")

@@ -201,10 +201,15 @@ class _BucketedEncoder:
 
     def _resolve_time_axis(self, features, lengths) -> int:
         """1 = time on dim 1 (B, T, D); 2 = time on dim 2 (B, mel, T).
-        Explicit env wins; "auto" infers from the length scale."""
+        Explicit env wins; a per-module ``bucketing_time_axis`` contract wins
+        over the length-scale heuristic (which is unreliable for all-short
+        batches), and the heuristic is the last-resort fallback."""
         spec = os.environ.get(_ENV_TIME_AXIS, "auto").strip().lower()
         if spec in ("1", "2"):
             return int(spec)
+        declared = getattr(self.module, "bucketing_time_axis", None)
+        if declared in (1, 2):
+            return declared
         # The fixed-window Whisper recipe operates on the module's native
         # channels-first (B, mel, T) layout by construction — mel bins on
         # dim 1, padded time on dim 2 — regardless of how short the true
