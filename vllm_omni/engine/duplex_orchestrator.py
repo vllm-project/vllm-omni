@@ -309,7 +309,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if stage_id == 0 and isinstance(req_state, DuplexOrchestratorRequestState):
             continuation = req_state.turn_prompt_tokenizer
             if isinstance(continuation, DuplexTurnContinuation):
-                continuation.record_output(list(eco.new_token_ids), bool(eco.is_segment_finished))
+                continuation.record_output(eco.new_token_ids, bool(eco.is_segment_finished))
 
     def _collect_duplex_stage_work(
         self,
@@ -640,14 +640,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     # Tokenizer instances can be shared by stage processors.
                     # Use the same worker-thread lock as upstream preprocessing.
                     with self._prompt_processing_lock:
-                        prepared, prefix = prepare_turn(prompt) if prepare_turn is not None else (dict(prompt), None)
+                        prepared, prefix = prepare_turn(prompt) if prepare_turn is not None else (prompt, None)
                         prepared = dict(prepared)
-                        text = prepared["prompt"]
+                        text = prepared.pop("prompt")
                         if defaults is not None:
                             # Preserve upstream's character-length validation
                             # and pre-truncation before replacing text with IDs.
                             text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
-                        prepared.pop("prompt")
                         prepared["prompt_token_ids"] = prompt_tokenizer.tokenize(text)
                         return prepared, prefix
 
