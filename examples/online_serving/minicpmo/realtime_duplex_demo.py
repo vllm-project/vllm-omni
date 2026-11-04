@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni.clients.duplex import (  # noqa: E402
+    DEFINITIVE_REFUSAL_CODES,
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
     AudioFormat,
@@ -33,6 +34,7 @@ from vllm_omni.clients.duplex import (  # noqa: E402
     DuplexClientError,
     DuplexConnectionError,
     DuplexSessionClosedError,
+    ErrorEvent,
     EventCollector,
     acknowledge_collected_playback,
     read_pcm16_wav,
@@ -214,37 +216,45 @@ def _response_done_is_terminal(event: dict[str, object]) -> bool:
     return not isinstance(response, dict) or response.get("status") != "cancelled"
 
 
-def _error_code(event: dict[str, object]) -> object | None:
-    """The error code of an ``error`` event, nested (wire form) or top-level."""
-    code = event.get("code")
-    if code is None:
-        error = event.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-    return code
-
-
 def _post_commit_definitive_refusal(
     events: list[dict[str, object]],
     committed_index: int | None,
 ) -> bool:
     """Whether the server definitively refused the forced post-commit create.
 
-    ``response_create_without_input`` and ``text_only_turn_unsupported`` are
-    terminal answers to ``response.create``: the committed turn holds nothing
-    the model can answer. Only the fallback re-ask can trigger them (the demo
-    sends no other create, and a server that already answered commits with a
-    precreated response never refuses), so a post-commit event with one of
-    these codes means the mandatory final answer, if any, was delivered by an
-    earlier response and the recognition judging -- not this timeout -- is
-    what decides whether that answer covers the input.
+    ``DEFINITIVE_REFUSAL_CODES`` are terminal answers to ``response.create``:
+    the committed turn holds nothing the model can answer. Only the fallback
+    re-ask can trigger them (the demo sends no other create, and a server that
+    already answered commits with a precreated response never refuses), so a
+    post-commit event with one of these codes means the mandatory final
+    answer, if any, was delivered by an earlier response and the recognition
+    judging -- not this timeout -- is what decides whether that answer covers
+    the input.
     """
     if committed_index is None:
         return False
     return any(
-        event.get("type") == "error" and _error_code(event) in _FORCED_RESPONSE_DEFINITIVE_REFUSAL_CODES
+        event.get("type") == "error" and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES
         for event in events[committed_index + 1 :]
     )
+
+
+def _post_commit_refusal_ids(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> set[int]:
+    """Identities of the refusal errors that answered the forced create.
+
+    Scoped to the post-commit window on purpose: an earlier refusal came from
+    some other ask and must keep failing the run.
+    """
+    if committed_index is None:
+        return set()
+    return {
+        id(event)
+        for event in events[committed_index + 1 :]
+        if event.get("type") == "error" and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES
+    }
 
 
 def _post_commit_forced_response_settled(
@@ -399,19 +409,6 @@ _FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S = 15.0
 
 #: Interval between fallback ``response.create`` retries.
 _FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S = 1.0
-
-#: Server refusals that answer a forced ``response.create`` with "there is
-#: nothing left to answer": the commit retained no answerable audio, so the
-#: final answer was already given by an earlier response (or the trailing
-#: input was not answerable at all -- the scene-coverage judging downstream
-#: is what tells those apart). Either way no further waiting can produce the
-#: missing response, so the drain treats these codes as settled.
-_FORCED_RESPONSE_DEFINITIVE_REFUSAL_CODES = frozenset(
-    {
-        "response_create_without_input",
-        "text_only_turn_unsupported",
-    }
-)
 
 #: Response lifecycle signals that can precede a promoted forced create.
 _RESPONSE_SIGNAL_TYPES = frozenset(
@@ -1049,9 +1046,11 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             # refusal -- the commit retained nothing answerable, so the final
             # answer was already given by an earlier response (or the input
             # was not answerable at all, which the recognition report
-            # judges). Only that pair of codes is forgiven; every other
-            # error still fails the run.
-            errors = [event for event in errors if _error_code(event) not in _FORCED_RESPONSE_DEFINITIVE_REFUSAL_CODES]
+            # judges). Only refusals that arrived after the commit are
+            # forgiven: an earlier one came from some other ask and still
+            # fails the run, as does every other error.
+            forgiven_ids = _post_commit_refusal_ids(collector.events, committed_index)
+            errors = [event for event in errors if id(event) not in forgiven_ids]
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:

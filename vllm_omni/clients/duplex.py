@@ -510,6 +510,13 @@ _FATAL_RESUME_CODES = frozenset(
     }
 )
 
+#: Error codes a duplex server uses to refuse a ``response.create``: the
+#: committed turn holds nothing the model can answer, so no response will ever
+#: be produced for that ask. A caller waiting on such a request should treat
+#: these as a definitive answer rather than as a failure -- and, symmetrically,
+#: must not read them as a health signal about the session.
+DEFINITIVE_REFUSAL_CODES = frozenset({"response_create_without_input", "text_only_turn_unsupported"})
+
 
 def wrap_event(raw: dict[str, object]) -> DuplexEvent:
     event_type = raw.get("type")

@@ -2529,26 +2529,21 @@ class DuplexSessionRunner:
         """
         session = self.session
         model_state = self.model_state
+        # A listen stream can still hold the data-plane claim with nothing
+        # committed -- in a native session that claim survives its input on
+        # purpose (model_channel deliberately keeps the stream bound for the
+        # next turn). It is not counted as pending work below, otherwise it
+        # would strand the create forever: no later append releases it once
+        # the input has stopped, and the client only finds out when its drain
+        # times out. The nothing-to-answer refusals further down answer it
+        # immediately instead.
         if helpers.response_in_progress(self.session, self.tasks) or self.tasks.append_tasks:
-            # NOTE: a listen stream can still hold the data-plane claim here
-            # with nothing committed -- in a native session that claim
-            # survives its input on purpose (model_channel deliberately keeps
-            # the stream bound for the next turn). Treating it as pending
-            # work would strand the create forever: no later append releases
-            # it once the input has stopped, and the client only finds out
-            # when its drain times out. Fall through instead, so the
-            # nothing-to-answer refusals below answer it immediately.
             if session.active_response_id is None and (
-                session.active_request_id is not None
-                or self.tasks.append_tasks
-                or self.run.stream_request_id is not None
+                session.active_request_id is not None or self.tasks.append_tasks
             ):
+                # An append is in flight: its terminal append follows in the
+                # same wire order and carries the turn this create asks for.
                 return
-            self._emit_error(
-                "response_already_active", "response.create cannot start while another response is active."
-            )
-            session.discard_response_options()
-            return
             self._emit_error(
                 "response_already_active", "response.create cannot start while another response is active."
             )

@@ -480,6 +480,24 @@ def test_forced_response_keeps_waiting_after_other_server_errors():
     assert sent == [{"type": "response.create"}]
 
 
+def test_refusal_forgiveness_is_scoped_to_the_post_commit_window():
+    demo = _load_demo_module()
+    pre_commit_refusal = {"type": "error", "error": {"code": "response_create_without_input"}}
+    post_commit_refusal = {"type": "error", "error": {"code": "text_only_turn_unsupported"}}
+    other_error = {"type": "error", "error": {"code": "bad_event"}}
+    events = [
+        pre_commit_refusal,
+        {"type": "input_audio_buffer.committed"},
+        post_commit_refusal,
+        other_error,
+    ]
+
+    # Only the refusal that answered the forced create is forgiven; the
+    # earlier one came from some other ask and other codes stay errors.
+    assert demo._post_commit_refusal_ids(events, 1) == {id(post_commit_refusal)}
+    assert demo._post_commit_refusal_ids(events, None) == set()
+
+
 def test_forced_response_does_not_reask_while_a_response_is_active():
     demo = _load_demo_module()
     collector = demo.EventCollector()

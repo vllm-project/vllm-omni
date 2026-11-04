@@ -4354,3 +4354,32 @@ async def test_later_commit_keeps_earlier_retained_vision_units_in_wire_order(sc
         assert not h.runner.model_state.commit_prefix_payloads
     finally:
         await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_create_waits_while_a_held_prefix_is_still_submitting() -> None:
+    """A create with an in-flight append behind it must wait, not be refused.
+
+    ``_submit_held_commit_prefixes`` admits one retained listen-only unit at a
+    time before the terminal payload. During that window the only trace of the
+    pending turn is the tracked append task, so the nothing-to-answer refusals
+    must not fire -- the terminal append that follows answers the create.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        release = asyncio.Event()
+
+        async def _pending_append() -> bool:
+            await release.wait()
+            return True
+
+        task = asyncio.create_task(_pending_append())
+        h.runner.tasks.track_append_task(task, epoch=h.session.epoch, final=False, response_bound=False)
+        try:
+            events = await h.run(commands.CreateResponse(event_id="evt-create"))
+            assert types(events) == [], events
+        finally:
+            release.set()
+            await task
+    finally:
+        await close_harness(h)

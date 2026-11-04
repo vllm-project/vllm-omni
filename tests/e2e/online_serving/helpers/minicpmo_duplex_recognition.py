@@ -14,27 +14,10 @@ from pathlib import Path
 
 import regex as re
 
+from vllm_omni.clients.duplex import DEFINITIVE_REFUSAL_CODES, ErrorEvent
+
 ASSETS = Path(__file__).resolve().parents[3] / "assets/minicpmo_4_5/duplex_recognition"
 CHINESE_NUMBERS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
-
-#: Answers a forced ``response.create`` gives when the commit retained nothing
-#: answerable. The demo asks for one mandatory final response; when the model
-#: already answered every scene while the input was still streaming, the
-#: buffer holds only trailing silence and the server refuses instead of
-#: opening a response it could never fill. That refusal is the protocol
-#: working as intended -- the scenes are judged by the transcripts below --
-#: so it must not count as a protocol error.
-DEFINITIVE_REFUSAL_CODES = frozenset({"response_create_without_input", "text_only_turn_unsupported"})
-
-
-def _error_code(event: dict) -> object | None:
-    """The error code of an ``error`` event, nested (wire form) or top-level."""
-    code = event.get("code")
-    if code is None:
-        error = event.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-    return code
 
 
 def load_manifest() -> dict:
@@ -90,10 +73,19 @@ def evaluate_session(transcript: str, events: list[dict], scenes: list[dict]) ->
     created: list[str] = []
     done: list[str] = []
     errors = []
-    for event in events:
+    last_commit_index = max(
+        (index for index, event in enumerate(events) if event.get("type") == "input_audio_buffer.committed"),
+        default=-1,
+    )
+    for index, event in enumerate(events):
         kind = event.get("type", "")
         if kind in {"error", "client.timeout", "client.error"}:
-            if kind == "error" and _error_code(event) in DEFINITIVE_REFUSAL_CODES:
+            # A definitive refusal that answered a create after the commit is
+            # the protocol working as intended (the model already answered
+            # every scene and only trailing silence was retained). One that
+            # predates the commit came from another ask and stays a protocol
+            # error.
+            if kind == "error" and index > last_commit_index and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES:
                 continue
             errors.append(event)
         if kind in {"response.created", "response.done"}:
