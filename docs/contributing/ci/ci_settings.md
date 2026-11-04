@@ -93,6 +93,8 @@ Canonical layout (prefer these paths for new changes):
 
     **Simple · CPU Coverage Test** is in `test-nightly.yml` and runs when `NIGHTLY=1`.
 
+    **L1 Simple CPU steps are parallel:** `Simple · Engine&Entrypoints Test` and `Simple · Diffusion Test` in `test-ready.yml` run pytest with `-n 4 --dist loadgroup`, the same flags as the nightly CPU coverage job. `tests/helpers/fixtures/pytest_collection.py` gives every `cpu` module its own xdist group and pins the unmarked tests to one worker, so `--dist loadgroup` is required — `--dist loadfile` would split one module across workers.
+
     **`--e2e`:** when uploading ready/merge on a release line (`main` or `release/vX.Y.Z`) with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
 
     **Upload:** `upload_pipeline.py --upload` expands uploader-only keys before Buildkite upload.
