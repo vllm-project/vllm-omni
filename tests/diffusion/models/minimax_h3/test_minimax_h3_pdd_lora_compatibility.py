@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reject competing final-head ownership before mutating live adapters."""
 
+import gc
+import weakref
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -213,3 +216,142 @@ def test_rejected_pdd_load_preserves_head_objects_and_metadata(already_registere
     assert pipeline._pdd_adapter_ids == metadata[1]
     assert pipeline._pdd_active_adapters == metadata[2]
     _assert_unchanged(pipeline.transformer, before)
+
+
+def _stage_pdd(pipeline, adapter_id):
+    """Tiny CPU artifacts at the boundary after parsing and registration."""
+    pipeline._pdd_adapters[adapter_id] = {
+        "cfg": PDDConfig(),
+        "head_weights": {name: torch.ones(32, 1, 2) for name in ("video_out", "audio_out")},
+        "head_biases": {name: torch.zeros(32, 1) for name in ("video_out", "audio_out")},
+    }
+    pipeline._pdd_adapter_ids.add(adapter_id)
+
+
+def _cache_manager(pipeline, adapter_ids):
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline, manager._closed = pipeline, False
+    manager.max_cached_adapters = len(adapter_ids)
+    manager._registered_adapters = {aid: LoRAModel(aid, 1, {}) for aid in adapter_ids}
+    manager._active_adapter_id = manager._suspended_adapter_id = None
+    manager._fixed_adapter_request = None
+    manager._merged_adapters, manager._lora_modules = {}, {}
+    manager._adapter_scales = dict.fromkeys(adapter_ids, 1.0)
+    manager._adapter_access_order = OrderedDict((aid, 0) for aid in adapter_ids)
+    manager._pinned_adapters = set()
+    return manager
+
+
+@pytest.mark.parametrize("existing_adapter", [False, True])
+@pytest.mark.parametrize("cleanup", ["remove", "evict", "close"])
+def test_failed_pdd_bank_install_restores_heads_and_can_retry(existing_adapter, cleanup, monkeypatch):
+    pipeline = _Pipeline()
+    if existing_adapter:
+        _stage_pdd(pipeline, _PDD_ID)
+        pipeline._ensure_pdd_heads(_PDD_ID)
+    before = _snapshot(pipeline.transformer)
+    other_dit = _snapshot(pipeline.transformers_ref)
+    adapters_before = dict(pipeline._pdd_active_adapters)
+    attempt_id = _PDD_ID + 1
+    _stage_pdd(pipeline, attempt_id)
+    metadata = pipeline._pdd_adapters[attempt_id]
+    manager = _cache_manager(pipeline, [attempt_id, *adapters_before])
+    failed_banks = []
+    load_bank = PDDParallelHead.load_bank
+
+    def fail_audio(head, adapter_id, weight, bias, plans):
+        if head is pipeline.transformer.final_layer.audio_out:
+            raise torch.OutOfMemoryError("injected audio bank allocation failure")
+        load_bank(head, adapter_id, weight, bias, plans)
+        failed_banks.append(weakref.ref(head.banks[str(adapter_id)]))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PDDParallelHead, "load_bank", fail_audio)
+        with pytest.raises(torch.OutOfMemoryError, match="audio bank"):
+            pipeline._ensure_pdd_heads(attempt_id)
+
+    gc.collect()
+    assert failed_banks and all(ref() is None for ref in failed_banks)
+    assert pipeline._pdd_active_adapters == adapters_before
+    assert pipeline._pdd_adapters[attempt_id] is metadata
+    _assert_unchanged(pipeline.transformer, before)
+    _assert_unchanged(pipeline.transformers_ref, other_dit)
+    for name in ("video_out", "audio_out"):
+        head = getattr(pipeline.transformer.final_layer, name)
+        if isinstance(head, PDDParallelHead):
+            assert str(attempt_id) not in head.banks
+
+    adapter = pipeline._ensure_pdd_heads(attempt_id)
+    assert pipeline._ensure_pdd_heads(attempt_id) is adapter
+    live_banks = []
+    for name, (_, base, _) in zip(("video_out", "audio_out"), before):
+        head = getattr(pipeline.transformer.final_layer, name)
+        torch.testing.assert_close(head(torch.ones(1, 2))[0], base)
+        torch.testing.assert_close(head(torch.ones(1, 2), 0, attempt_id)[0], torch.full((1, 1), 2.0))
+        live_banks.append(weakref.ref(head.banks[str(attempt_id)]))
+
+    if cleanup == "close":
+        manager.close()
+    elif cleanup == "evict":
+        manager._evict_for_new_adapter()
+    else:
+        assert manager.remove_adapter(attempt_id)
+    gc.collect()
+    assert all(ref() is None for ref in live_banks)
+    assert attempt_id not in pipeline._pdd_adapter_ids
+    assert attempt_id not in pipeline._pdd_adapters
+    assert attempt_id not in pipeline._pdd_active_adapters
+    if existing_adapter and cleanup != "close":
+        _assert_unchanged(pipeline.transformer, before)
+    for name, (_, base, _) in zip(("video_out", "audio_out"), before):
+        torch.testing.assert_close(getattr(pipeline.transformer.final_layer, name)(torch.ones(1, 2))[0], base)
+
+
+def test_failed_pdd_head_construction_restores_original_projections(monkeypatch):
+    pipeline = _Pipeline()
+    _stage_pdd(pipeline, _PDD_ID)
+    before = _snapshot(pipeline.transformer)
+    init_head = PDDParallelHead.__init__
+    constructed = []
+
+    def fail_audio(head, source, num_steps):
+        if source is before[1][0]:
+            raise torch.OutOfMemoryError("injected audio head allocation failure")
+        init_head(head, source, num_steps)
+        constructed.append(weakref.ref(head))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PDDParallelHead, "__init__", fail_audio)
+        with pytest.raises(torch.OutOfMemoryError, match="audio head"):
+            pipeline._ensure_pdd_heads(_PDD_ID)
+
+    gc.collect()
+    assert constructed and all(ref() is None for ref in constructed)
+    _assert_unchanged(pipeline.transformer, before)
+    assert not pipeline._pdd_active_adapters
+    pipeline._ensure_pdd_heads(_PDD_ID)
+
+
+def test_failed_pdd_reinstall_preserves_preexisting_same_id_banks(monkeypatch):
+    pipeline = _Pipeline()
+    _stage_pdd(pipeline, _PDD_ID)
+    pipeline._ensure_pdd_heads(_PDD_ID)
+    # Exercise recovery when the model already owns this ID's banks.
+    pipeline._pdd_active_adapters.pop(_PDD_ID)
+    before = _snapshot(pipeline.transformer)
+    layer = pipeline.transformer.final_layer
+    original_banks = [getattr(layer, name).banks[str(_PDD_ID)] for name in ("video_out", "audio_out")]
+    load_bank = PDDParallelHead.load_bank
+
+    def fail_audio(head, adapter_id, weight, bias, plans):
+        if head is layer.audio_out:
+            raise torch.OutOfMemoryError("injected audio bank allocation failure")
+        load_bank(head, adapter_id, weight, bias, plans)
+
+    monkeypatch.setattr(PDDParallelHead, "load_bank", fail_audio)
+    with pytest.raises(torch.OutOfMemoryError, match="audio bank"):
+        pipeline._ensure_pdd_heads(_PDD_ID)
+
+    _assert_unchanged(pipeline.transformer, before)
+    for name, bank in zip(("video_out", "audio_out"), original_banks):
+        assert getattr(layer, name).banks[str(_PDD_ID)] is bank

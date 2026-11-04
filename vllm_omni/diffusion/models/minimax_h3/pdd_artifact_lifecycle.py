@@ -223,9 +223,29 @@ class MiniMaxH3PDDLifecycleMixin:
             )
         if lora_id in self._pdd_active_adapters:
             return adapter
-        adapter.install_heads(dit)
-        adapter.load_head_bank(dit, info["head_weights"], info["head_biases"])
-        self._pdd_active_adapters[lora_id] = adapter
+        layer = dit.final_layer
+        original_heads = {name: getattr(layer, name) for name in ("video_out", "audio_out")}
+        bank_key = str(lora_id)
+        original_banks = {
+            name: head.banks[bank_key]
+            for name, head in original_heads.items()
+            if isinstance(head, PDDParallelHead) and bank_key in head.banks
+        }
+        try:
+            adapter.install_heads(dit)
+            adapter.load_head_bank(dit, info["head_weights"], info["head_biases"])
+            self._pdd_active_adapters[lora_id] = adapter
+        except Exception:
+            # Either head construction or bank transfer can fail after video
+            # succeeds. Roll back before publishing this adapter as installed;
+            # removal/eviction must never have to discover an untracked bank.
+            self._pdd_active_adapters.pop(lora_id, None)
+            adapter.remove_heads(dit)
+            for name, head in original_heads.items():
+                setattr(layer, name, head)
+                if name in original_banks:
+                    head.banks[bank_key] = original_banks[name]
+            raise
         return adapter
 
     def _remove_diffusion_lora_adapter(self, adapter_id: int) -> None:

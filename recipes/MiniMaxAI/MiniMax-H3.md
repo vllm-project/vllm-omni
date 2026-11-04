@@ -108,6 +108,11 @@ Cached artifact banks consume resident FP32 memory until adapter eviction or
 manager close. A scheduled batch still shares the worker's existing LoRA key;
 different trunk adapters are not combined into one batch.
 
+Head installation is transactional across video and audio. If either head or
+bank allocation fails, the worker restores the prior heads and banks before
+propagating the error. Other cached adapters remain intact, and the failed
+adapter's CPU artifact can be retried or removed through the normal cache lifecycle.
+
 Use separate workers for PDD and generic PEFT adapters targeting the same
 DiT's `final_layer.video_out` or `audio_out`. Their output-layer wrappers are
 incompatible in either loading order, including after adapter eviction. Native
