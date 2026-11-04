@@ -343,14 +343,21 @@ from it yields a `PrefixCacheDelivery`:
 - start below it (a resume that recomputes delivered rows): `trim` leading
   rows of this step's slice are dropped from the merged output.
 
-Only TP rank 0 retains step ids for output rewrites: the executor consumes
-async outputs from that rank on the last PP stage. Other TP ranks discard
-the read-side step context in `sample_tokens`, including on a prefix hit.
-Discarding releases the step holder; cache writes retain their own staging
-holders until they complete, so the slot cannot be reused too early.
+With the multiprocessing executor (including Ray V2), only TP rank 0
+retains step ids for output rewrites when no KV/EC output aggregation is
+configured. Other TP ranks discard the read-side step context in
+`sample_tokens`, including on a prefix hit, because their async outputs are
+not consumed. With KV/EC aggregation, UniProc/external launcher, or legacy
+Ray, every worker's async output is consumed locally, so each rank retains
+its rewrite until materialization. Executor classes and qualified names are
+resolved through vLLM's executor selection. Custom multiprocessing subclasses
+must preserve the inherited output-consumption contract. MRv2 currently
+rejects PP>1 and PCP>1; stage-output prefix caching also rejects DCP>1.
+Discarding releases only the step holder; cache writes retain their own
+staging holders until they complete, so the slot cannot be reused too early.
 
-On the output rank, only steps with a hit, replay or trim keep their step id
-(`step_rewrite_req_ids`). The rewrite rides the async output's existing
+On ranks whose outputs are consumed, only steps with a hit, replay or trim
+keep their step id (`step_rewrite_req_ids`). The rewrite rides the async output's existing
 `finalize_output` hook: once the host payloads are built, and before they are
 published to the next stage, it materializes the step with
 `include_uncached=False` and replaces the cached keys in the rewritten
