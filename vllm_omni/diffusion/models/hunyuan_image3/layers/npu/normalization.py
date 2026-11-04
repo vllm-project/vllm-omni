@@ -8,7 +8,7 @@ Independent VAE tiles normalize locally; spatial shards share statistics.
 import torch
 import torch.nn.functional as F
 
-from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.vae_context import VAE_SPATIAL_CONTEXT
+from vllm_omni.diffusion.models.hunyuan_image3.layers.native.vae_context import VAE_SPATIAL_CONTEXT
 
 
 def global_group_norm(x: torch.Tensor, norm: torch.nn.GroupNorm, activation: str = "swish") -> torch.Tensor:

@@ -16,12 +16,12 @@ from vllm_omni.diffusion.models.hunyuan_image3.layers.native.autoencoder_blocks 
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.autoencoder_blocks import (
     ResnetBlock as NativeResnetBlock,
 )
+from vllm_omni.diffusion.models.hunyuan_image3.layers.native.vae_context import VAE_SPATIAL_CONTEXT
 from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.normalization import (
     global_group_norm,
     vae_group_norm_for_conv,
     vae_group_norm_silu,
 )
-from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.vae_context import VAE_SPATIAL_CONTEXT
 
 
 class VaeConv3d(nn.Conv3d):

@@ -13,8 +13,8 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import all_gather_along_dim
+from vllm_omni.diffusion.models.hunyuan_image3.layers.native.vae_context import VAE_SPATIAL_CONTEXT, VaeSpatialContext
 from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.autoencoder_blocks import VaeConv3d
-from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.vae_context import VAE_SPATIAL_CONTEXT, VaeSpatialContext
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan import DistributedAutoencoderKLHunyuan
@@ -35,13 +35,19 @@ def spatial_vae_forward(
         return None
     if vae.distributed_executor.parallel_mode != "spatial_shard_height":
         return None
-    if x.device.type not in ("npu", "privateuseone") or torch.is_grad_enabled() or torch.compiler.is_compiling():
+    if x.device.type not in ("npu", "privateuseone"):
+        logger.warning_once("HunyuanImage3 spatial VAE decode requires NPU input; using tile execution")
+        return None
+    if torch.is_grad_enabled() or torch.compiler.is_compiling():
+        logger.warning_once(
+            "HunyuanImage3 spatial VAE decode requires eager inference without gradients; using tile execution"
+        )
         return None
     executor = vae.distributed_executor
     group = executor.group
     world = dist.get_world_size(group)
     network = vae.decoder
-    if world <= 1 or executor.parallel_size != world or executor.parallel_mode != "spatial_shard_height":
+    if world <= 1 or executor.parallel_size != world:
         logger.warning_once("HunyuanImage3 spatial VAE requires a matching VAE device group; using tile execution")
         return None
     if x.ndim != 5 or x.shape[3] % world or not x.numel():
@@ -72,8 +78,6 @@ def run_spatial_vae(
     """Execute equal-height, prevalidated shards; also used by the component benchmark."""
     world = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    if not x.numel() or x.ndim != 5 or x.shape[3] % world:
-        raise ValueError("Spatial VAE requires nonempty, equal-height NCTHW shards")
     token = VAE_SPATIAL_CONTEXT.set(VaeSpatialContext(group))
     try:
         with torch.autocast("npu", dtype=torch.bfloat16):

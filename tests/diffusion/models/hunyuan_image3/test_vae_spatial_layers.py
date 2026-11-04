@@ -19,9 +19,9 @@ from torch import nn
 
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.autoencoder_blocks import AttnBlock as NativeAttnBlock
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.autoencoder_blocks import ResnetBlock as NativeResnetBlock
+from vllm_omni.diffusion.models.hunyuan_image3.layers.native.vae_context import VAE_SPATIAL_CONTEXT, VaeSpatialContext
 from vllm_omni.diffusion.models.hunyuan_image3.layers.npu import spatial_vae
 from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.autoencoder_blocks import AttnBlock, ResnetBlock, VaeConv3d
-from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.vae_context import VAE_SPATIAL_CONTEXT, VaeSpatialContext
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -55,6 +55,9 @@ def test_npu_dispatch_selects_typed_layers(monkeypatch):
     assert exported["ResnetBlock"] is ResnetBlock
     assert exported["AttnBlock"] is AttnBlock
     assert exported["VaeConv3d"] is VaeConv3d
+    from vllm_omni.diffusion.models.hunyuan_image3.layers.native import ResBlock
+
+    assert exported["ResBlock"] is ResBlock
 
 
 @pytest.mark.parametrize("native,accelerated", [(NativeResnetBlock, ResnetBlock), (NativeAttnBlock, AttnBlock)])
@@ -146,7 +149,9 @@ def _check_encoder_decoder_shards(rank):
     from unittest.mock import patch
 
     from vllm_omni.diffusion.models.hunyuan_image3 import autoencoder as ae
-    from vllm_omni.diffusion.models.hunyuan_image3.layers.native.vae import vae_group_norm_for_conv as native_norm
+    from vllm_omni.diffusion.models.hunyuan_image3.layers.native.normalization import (
+        vae_group_norm_for_conv as native_norm,
+    )
     from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.normalization import vae_group_norm_for_conv as npu_norm
 
     x = torch.randn(1, 3, 2, 16, 8)
@@ -228,3 +233,93 @@ def _cpu_group_norm_operator(
     if activation == "swish":
         y = torch.nn.functional.silu(y)
     return y.chunk(world, dim=3)[dist.get_rank(device_group)].contiguous()
+
+
+@pytest.mark.parametrize(
+    "stage,distributed,spatial_result",
+    [
+        ("encode", False, False),
+        ("encode", True, False),
+        ("decode", False, False),
+        ("decode", True, False),
+        ("decode", True, True),
+    ],
+)
+def test_distributed_vae_dispatch_reaches_serial_spatial_and_tile_paths(
+    monkeypatch, stage, distributed, spatial_result
+):
+    from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_hunyuan as entry
+
+    cls = entry.DistributedAutoencoderKLHunyuan
+    vae = cls.__new__(cls)
+    nn.Module.__init__(vae)
+    vae.is_distributed_enabled = lambda: distributed
+    x = torch.zeros(1)
+    serial_output = torch.ones(1)
+    tile_output = torch.full((1,), 2)
+    spatial_output = torch.full((1,), 3)
+    calls = []
+
+    def serial(actual, actual_x):
+        assert actual is vae and actual_x is x
+        calls.append("serial")
+        return serial_output
+
+    def spatial(actual, actual_x, actual_stage):
+        assert actual is vae and actual_x is x
+        assert actual_stage == "decode"
+        calls.append("spatial")
+        return spatial_output if spatial_result else None
+
+    def tile(actual_x, operator, broadcast_result):
+        assert actual_x is x and broadcast_result
+        expected = vae.encode_tile_exec if stage == "encode" else vae.tile_exec
+        assert operator.exec == expected
+        calls.append("tile")
+        return tile_output
+
+    vae.distributed_executor = SimpleNamespace(execute=tile)
+    monkeypatch.setattr(entry.AutoencoderKLConv3D, "spatial_tiled_" + stage, serial)
+    monkeypatch.setattr(entry, "spatial_vae_forward", spatial)
+    actual = getattr(vae, "spatial_tiled_" + stage)(x)
+    if not distributed:
+        assert actual is serial_output
+        assert calls == ["serial"]
+    elif stage == "encode":
+        assert actual is tile_output
+        assert calls == ["tile"]
+    elif spatial_result:
+        assert actual is spatial_output
+        assert calls == ["spatial"]
+    else:
+        assert actual is tile_output
+        assert calls == ["spatial", "tile"]
+
+
+@pytest.mark.parametrize("stage", ["encode", "decode"])
+@pytest.mark.parametrize("mode", ["tile", "spatial_shard_height"])
+def test_native_spatial_fallback_reports_unsupported_decode(monkeypatch, stage, mode):
+    from vllm_omni.diffusion.models.hunyuan_image3.layers.native import spatial_vae as native_spatial
+
+    messages = []
+    monkeypatch.setattr(native_spatial.logger, "warning_once", lambda message: messages.append(message))
+    vae = SimpleNamespace(distributed_executor=SimpleNamespace(parallel_mode=mode))
+    assert native_spatial.spatial_vae_forward(vae, object(), stage) is None
+    if stage == "decode" and mode == "spatial_shard_height":
+        assert len(messages) == 1
+        assert "supported only on Ascend NPU" in messages[0]
+    else:
+        assert not messages
+
+
+@pytest.mark.parametrize("reason", ["grad", "compile"])
+def test_npu_spatial_fallback_reports_unsupported_execution(monkeypatch, reason):
+    messages = []
+    monkeypatch.setattr(spatial_vae.logger, "warning_once", lambda message: messages.append(message))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: reason == "compile")
+    vae = SimpleNamespace(distributed_executor=SimpleNamespace(parallel_mode="spatial_shard_height"))
+    x = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    with torch.set_grad_enabled(reason == "grad"):
+        assert spatial_vae.spatial_vae_forward(vae, x, "decode") is None
+    assert len(messages) == 1
+    assert "requires eager inference without gradients" in messages[0]

@@ -120,11 +120,6 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
         return self.tile_merge(coord_tensor_map, grid_spec)
 
     def spatial_tiled_encode(self, x: torch.Tensor):
-        if self.is_distributed_enabled():
-            result = spatial_vae_forward(self, x, "encode")
-            if result is not None:
-                return result
-
         if not self.is_distributed_enabled():
             return super().spatial_tiled_encode(x)
 
@@ -140,14 +135,15 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
         )
 
     def spatial_tiled_decode(self, z: torch.Tensor):
-        if self.is_distributed_enabled():
-            result = spatial_vae_forward(self, z, "decode")
-            if result is not None:
-                return result
-
         if not self.is_distributed_enabled():
             return super().spatial_tiled_decode(z)
 
+        result = spatial_vae_forward(self, z, "decode")
+        if result is not None:
+            return result
+
+        # Spatial execution exchanges activations and GN statistics per layer;
+        # the tile executor distributes independent overlapping tile tasks.
         logger.debug("Decode running with distributed executor")
         return self.distributed_executor.execute(
             z,

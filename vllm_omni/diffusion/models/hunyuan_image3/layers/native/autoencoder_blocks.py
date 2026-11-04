@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
 
+VaeConv3d = nn.Conv3d
+
 
 class ResnetBlock(nn.Module):
     conv_cls = nn.Conv3d
@@ -83,4 +85,4 @@ class AttnBlock(nn.Module):
         return x + self.proj_out(self.attention(x))
 
 
-__all__ = ["AttnBlock", "ResnetBlock"]
+__all__ = ["AttnBlock", "ResnetBlock", "VaeConv3d"]

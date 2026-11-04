@@ -30,7 +30,9 @@ consistency and do not establish that every numerical change affects semantics.
 
 Decode latent height must divide by the group size. Unsupported
 inputs/configurations retain the tile path. The default `tile` mode retains
-independent-tile statistics and never activates cross-rank GN.
+independent-tile statistics and never activates cross-rank GN. Requesting spatial
+decode on a non-NPU backend logs a warning and retains tile execution; unsupported
+NPU shapes or execution modes also log their fallback reason.
 
 Spatial execution uses BF16 activations and convolutions with FP32 global GN
 statistics; precision and normalization domains differ from FP16 independent
