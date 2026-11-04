@@ -1515,7 +1515,6 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             "cards_2",
             "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py",
             (
-                "test_mix_to_text_audio_001[omni_server0]",
                 "test_audio_in_video_boundaries[False-omni_server0]",
                 "test_audio_in_video_boundaries[True-omni_server0]",
                 "test_text_to_text_001[omni_server0]",
@@ -1525,9 +1524,9 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
                 "test_text_to_text[omni_runner0-rocm]",
             ),
             "artifacts/rocm-qwen25-omni-weekly/**/*",
-            "Expected exactly eight Qwen2.5-Omni weekly ROCm nodes",
+            "Expected exactly seven Qwen2.5-Omni weekly ROCm nodes",
             "omni_qwen2_5_omni_expansion",
-            "Expected exactly eight executed Qwen2.5-Omni weekly tests",
+            "Expected exactly seven executed Qwen2.5-Omni weekly tests",
         ),
     }
 
@@ -1576,7 +1575,10 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
     ):
         assert dependency in qwen_deps
     qwen_weekly = "\n".join(_find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)["commands"])
+    known_red = "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]"
     assert 'collection_status="$${PIPESTATUS[0]}"' in qwen_weekly
+    assert qwen_weekly.count(f"--deselect='{known_red}'") == 2
+    assert qwen_weekly.count(known_red) == 2
     merge_qwen = "\n".join(_find_step("Omni Model Test Qwen2-5-Omni", AMD_MERGE_PIPELINE)["commands"])
     assert len(re.findall(r"--run-level\s+['\"]?core_model['\"]?", merge_qwen)) == 2
     merge_text = AMD_MERGE_PIPELINE.read_text(encoding="utf-8")
@@ -1590,11 +1592,11 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
 @pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
-        (0, 8, 0, None, 0),
-        (0, 8, 1, None, 5),
+        (0, 7, 0, None, 0),
+        (0, 7, 1, None, 5),
         (0, 0, 0, None, 5),
-        (1, 8, 0, None, 1),
-        (0, 8, 0, 124, 124),
+        (1, 7, 0, None, 1),
+        (0, 7, 0, 124, 124),
     ],
     ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
 )
@@ -1611,7 +1613,7 @@ def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
         pipeline_path=AMD_WEEKLY_PIPELINE,
         step_label="Qwen2.5-Omni expansion · 2-GPU",
         command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly eight executed Qwen2.5-Omni weekly tests",
+        expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
         artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
         job_id_prefix="qwen25-omni-weekly-guard",
         pytest_status=pytest_status,
