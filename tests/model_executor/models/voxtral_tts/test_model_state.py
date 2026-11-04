@@ -117,9 +117,8 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
     state.prompt_embeds_state = None
     state.intermediate_buffer = OmniIntermediateBuffer(4)
     state._suspended_feedback_history = {}
-    state._mtp_generators = {}
-    state._mtp_seeded = set()
     state.device = torch.device("cpu")
+    # Keep this CPU scheduler test focused on Voxtral frame-history restore, not MTP buffers.
     state._embed_dim = 0
     state._has_mtp = False
     state._mtp_state = MTPState(state)
