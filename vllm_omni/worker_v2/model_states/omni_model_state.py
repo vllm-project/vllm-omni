@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
@@ -1055,10 +1056,16 @@ class OmniModelState(DefaultModelState):
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             if isinstance(model_output, (list, tuple)) or self.have_multimodal_outputs:
                 buffer_list = self.intermediate_buffer.gather(input_batch)
-                make_output_kwargs = {
+                make_output_kwargs: dict[str, Any] = {
                     "model_intermediate_buffer": buffer_list,
                     "request_token_spans": self._request_token_spans(input_batch),
                 }
+                if requires_request_sample_eligibility(self.model):
+                    n = input_batch.num_reqs
+                    done = input_batch.num_computed_prefill_tokens_np[:n] + np.asarray(
+                        input_batch.num_scheduled_tokens[:n]
+                    )
+                    make_output_kwargs["request_sample_eligible"] = (done >= input_batch.prefill_len_np[:n]).tolist()
                 make_output_kwargs["runtime_additional_information"] = buffer_list
                 model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 

@@ -3239,6 +3239,7 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
             ("moss_tts_local.yaml", "moss_tts_local"),
+            ("moss_tts_realtime.yaml", "moss_tts_realtime"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3392,8 +3393,12 @@ class TestPlatformOverrides:
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
         assert "inductor_compile_config" not in compilation
-        for variant in ("moss_tts_delay", "moss_tts_realtime"):
-            assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
+        assert not any(
+            stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages
+        )
+        assert all(
+            stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_realtime").stages
+        )
 
     def test_platform_mps_rejects_non_boolean(self):
         deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
