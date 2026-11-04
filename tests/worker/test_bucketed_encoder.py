@@ -319,6 +319,107 @@ def test_length_returning_encoder_shim_nontuple_falls_back(bucket_env):
     torch.testing.assert_close(out[1], eager_lens, rtol=0, atol=1e-6)
 
 
+def test_context_margin_preserves_conv_tail(bucket_env):
+    """A conv front that reads ``length + bucketing_context_margin`` frames must
+    not have its context tail zeroed: the wrapper copies the extra frames, so the
+    bucketed output matches the eager conv over the full real window."""
+    from torch.nn import functional as F
+
+    class ConvContextEncoder(nn.Module):
+        # Mirrors StepAudio2's padding_mels: the reported length is 2 less than
+        # the number of real mel frames, which the 3-tap conv still reads.
+        bucketing_context_margin = 2
+
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            pad = F.pad(x, (0, 0, 1, 1))  # zero-pad the time axis by 1 each side
+            out = pad[:, : x.size(1)] + pad[:, 1 : x.size(1) + 1] + pad[:, 2 : x.size(1) + 2]
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ConvContextEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    # Real content is [0, length + margin); garbage tail after the conv context.
+    lengths = [40, 120, 150, 75]  # max + margin <= largest rung (200)
+    feats = torch.randn(len(lengths), T, D, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, length + 2 :] += 3.0
+    lens = torch.tensor(lengths, dtype=torch.long)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
+        out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert out.shape[0] == len(lengths)
+    for row, length in enumerate(lengths):
+        # The eager reference feeds the full real window (length + context margin).
+        solo, solo_len = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
+        torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
+def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
+    """A channels-first encoder (mel on dim 1, time on dim 2) must keep
+    bucketing for an all-short batch via its declared ``bucketing_time_axis=2``.
+    The length-scale heuristic would otherwise guess axis 1 (longest <= mel bins)
+    and hand the conv the wrong channel count, disabling the wrapper."""
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS", raising=False)
+
+    class ChannelsFirstConvEncoder(nn.Module):
+        bucketing_time_axis = 2  # (B, mel, T): time on dim 2
+
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv1d(128, 16, kernel_size=3, padding=1)
+
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            out = self.conv(x)  # (B, 128, T) -> (B, 16, T)
+            out = out.transpose(1, 2)  # (B, T, 16) time-major output
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ChannelsFirstConvEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    # All items shorter than the 128 mel bins: the heuristic (longest > dim1)
+    # would wrongly pick axis 1 and conv1 would see rung channels, not 128.
+    mel, T_feat = 128, 120
+    lengths = [30, 60, 40, 80]
+    feats = torch.randn(len(lengths), mel, T_feat, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, :, length:] += 3.0
+    lens = torch.tensor(lengths, dtype=torch.long)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
+        out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert wrapper._disabled is False, "an all-short batch must not disable bucketing"
+    assert wrapper._axis == 2, "declared bucketing_time_axis=2 must win over the heuristic"
+    for row, length in enumerate(lengths):
+        solo, solo_len = wrapper._original(feats[row : row + 1, :, :length], lens[row : row + 1])
+        torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
 def test_module_pattern_env_override(bucket_env, monkeypatch):
     """VLLM_OMNI_AUDIO_BUCKET_MODULES selects which module names wrap."""
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_MODULES", r"(?:^|\.)my_frontend$")
@@ -464,6 +565,57 @@ def test_covo_processor_carries_bucket_frames():
 
     fields = proc._get_mm_fields_config(hf, {})
     assert "encoder_bucket_frames" in fields
+
+
+def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch):
+    """The length-publishing processor hook must be installable from the
+    frontend (which builds the processor and runs request preprocessing), not
+    only from the worker that wraps the encoder module. ``install_bucketed_processor_hook``
+    is the env-gated, idempotent entry point the frontend calls."""
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", raising=False)
+    assert install_bucketed_processor_hook() is False
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
+    assert install_bucketed_processor_hook() is True
+    assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
+
+
+def test_processor_hook_adds_encoder_bucket_frames(monkeypatch):
+    """After install_bucketed_processor_hook, the generic OmniMultiModalProcessor
+    path adds encoder_bucket_frames from the raw audio sample counts (the field
+    the worker's embed_multimodal wrapper reads back)."""
+    import numpy as np
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from transformers import BatchFeature
+    from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
+    install_bucketed_processor_hook()
+
+    class Processor(OmniMultiModalProcessor):
+        def _get_mm_fields_config(self, *args):
+            return {}
+
+        def _get_prompt_updates(self, *args):
+            return []
+
+    processor = object.__new__(Processor)
+    processor.dummy_inputs = SimpleNamespace(get_dummy_text=Mock(return_value="dummy"))
+    processor._call_hf_processor = Mock(return_value=BatchFeature({"features": "processed"}))
+
+    audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 s -> 300 mel frames at 100 fps
+    items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
+    result = processor._apply_hf_processor_main(items, {})
+
+    assert "encoder_bucket_frames" in result
+    assert torch.equal(result["encoder_bucket_frames"], torch.tensor([300], dtype=torch.int64))
 
 
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):

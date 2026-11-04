@@ -38,6 +38,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "LengthBucketingConfig",
+    "install_bucketed_processor_hook",
     "install_bucketed_encoders",
 ]
 
@@ -190,16 +191,26 @@ class _BucketedEncoder:
         self._disabled = False
         self._truncation_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
+        # Extra feature frames the encoder's front conv reads beyond the
+        # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
+        # Bucketing and copying add this margin; the attention mask length is
+        # unchanged (it still uses the reported valid length).
+        self._context_margin = 0
 
     def publish(self, lengths: tuple[int, ...] | None) -> None:
         self._lengths = lengths
 
     def _resolve_time_axis(self, features, lengths) -> int:
         """1 = time on dim 1 (B, T, D); 2 = time on dim 2 (B, mel, T).
-        Explicit env wins; "auto" infers from the length scale."""
+        Explicit env wins; a per-module ``bucketing_time_axis`` contract wins
+        over the length-scale heuristic (which is unreliable for all-short
+        batches), and the heuristic is the last-resort fallback."""
         spec = os.environ.get(_ENV_TIME_AXIS, "auto").strip().lower()
         if spec in ("1", "2"):
             return int(spec)
+        declared = getattr(self.module, "bucketing_time_axis", None)
+        if declared in (1, 2):
+            return declared
         # The fixed-window Whisper recipe operates on the module's native
         # channels-first (B, mel, T) layout by construction — mel bins on
         # dim 1, padded time on dim 2 — regardless of how short the true
@@ -246,7 +257,9 @@ class _BucketedEncoder:
 
         # An over-long item cannot be bucketed without truncating its tail,
         # which would silently change that item's output length downstream.
-        if max(lengths) > self.ladder.max_length:
+        # The front conv still reads the context margin, so an item whose
+        # reported length plus margin exceeds the largest rung is over-long.
+        if max(lengths) + self._context_margin > self.ladder.max_length:
             return self._original(*args, **kwargs)
 
         try:
@@ -296,7 +309,7 @@ class _BucketedEncoder:
     def _bucketed(self, features, lengths, mask, length_arg):
         groups: dict[int, list[int]] = {}
         for index, length in enumerate(lengths):
-            groups.setdefault(self.ladder.padded_length(length), []).append(index)
+            groups.setdefault(self.ladder.padded_length(length + self._context_margin), []).append(index)
 
         container: torch.Tensor | None = None
         aux_container: torch.Tensor | None = None
@@ -351,12 +364,12 @@ class _BucketedEncoder:
         if self._axis == 2:
             batch = features.new_zeros((padded, features.size(1), rung))
             for row, index in enumerate(chunk):
-                take = min(lengths[index], rung)
+                take = min(lengths[index] + self._context_margin, rung)
                 batch[row, :, :take] = features[index, :, :take]
         else:
             batch = features.new_zeros((padded, rung, features.size(2)))
             for row, index in enumerate(chunk):
-                take = min(lengths[index], rung)
+                take = min(lengths[index] + self._context_margin, rung)
                 batch[row, :take] = features[index, :take]
         if mask is not None:
             return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))
@@ -464,6 +477,21 @@ def _frames_from_mm_items(mm_items) -> list[int] | None:
     return frames
 
 
+def install_bucketed_processor_hook() -> bool:
+    """Install the length-publishing processor hook in the current process.
+
+    Request preprocessing (and therefore ``_apply_hf_processor_main``) runs in
+    the frontend/orchestrator process, not in the worker that wraps the encoder,
+    so the hook must be registered where the frontend builds its multimodal
+    processor. Idempotent; returns True when bucketing is enabled (the hook is
+    installed or already was).
+    """
+    if _rungs_from_env() is None:
+        return False
+    _install_processor_hook()
+    return True
+
+
 def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder]) -> None:
     original = getattr(model, "embed_multimodal", None)
     if original is None:
@@ -507,6 +535,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
+        encoder._context_margin = int(getattr(module, "bucketing_context_margin", 0) or 0)
         for klass in type(module).__mro__:
             shim = _FORWARD_SHIMS.get(klass.__name__)
             if shim is not None:
