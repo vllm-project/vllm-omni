@@ -19,7 +19,7 @@ _TORCH_STFT = torch.stft
 _TORCH_ISTFT = torch.istft
 _TORCH_HANN_WINDOW = torch.hann_window
 _PATCHED = False
-_ENVELOPE_CACHE: dict[tuple, tuple[torch.Tensor, int, bool]] = {}
+_ENVELOPE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, bool]] = {}
 _ENVELOPE_CACHE_MAX = 16
 _WARNED: set[str] = set()
 
@@ -209,6 +209,8 @@ def stft(
             onesided,
             return_complex,
         )
+    except torch.OutOfMemoryError:
+        raise
     except (RuntimeError, NotImplementedError) as error:
         _warn_fallback("STFT", error)
         return _stft_on_cpu(
@@ -265,18 +267,17 @@ def _istft_envelope(
     offset = n_fft // 2 if center else 0
     available = min(target_len, expected_len - offset)
     key = (
+        id(window),
+        window._version,
         n_frames,
         n_fft,
         hop_length,
-        window.device,
-        window.dtype,
-        window.data_ptr(),
         center,
         target_len,
     )
     cached = _ENVELOPE_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] is window:
+        return cached[1], cached[2], cached[3]
     envelope = torch.ops.aten.unfold_backward(
         window.square().expand(n_frames, n_fft),
         [expected_len],
@@ -288,9 +289,9 @@ def _istft_envelope(
     valid = envelope.numel() > 0 and bool(envelope.abs().min() > 1e-11)
     if len(_ENVELOPE_CACHE) >= _ENVELOPE_CACHE_MAX:
         _ENVELOPE_CACHE.pop(next(iter(_ENVELOPE_CACHE)))
-    result = (envelope, available, valid)
+    result = (window, envelope, available, valid)
     _ENVELOPE_CACHE[key] = result
-    return result
+    return envelope, available, valid
 
 
 def _istft_fft(
@@ -420,6 +421,8 @@ def istft(
             length,
             return_complex,
         )
+    except torch.OutOfMemoryError:
+        raise
     except (RuntimeError, NotImplementedError) as error:
         _warn_fallback("ISTFT", error)
         return _istft_on_cpu(

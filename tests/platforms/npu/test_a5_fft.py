@@ -289,6 +289,72 @@ def test_istft_fft_matches_torch_length_beyond_reconstruction() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_istft_envelope_cache_recomputes_after_window_mutation() -> None:
+    module = _load_module()
+    torch.manual_seed(7)
+    audio = torch.randn(1, 64)
+    window = torch.hann_window(16)
+    spec = torch.stft(audio, 16, 4, 16, window=window, return_complex=True)
+    expected = torch.istft(spec, 16, 4, 16, window=window)
+    actual = module._istft_fft(spec, 16, 4, 16, window, True, False, None, None, False)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+    window.mul_(0.5)
+    expected = torch.istft(spec, 16, 4, 16, window=window)
+    actual = module._istft_fft(spec, 16, 4, 16, window, True, False, None, None, False)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_stft_falls_back_on_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_WARNED", set())
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("unsupported op")
+
+    monkeypatch.setattr(module, "_stft_fft", fail)
+    monkeypatch.setattr(module, "_stft_on_cpu", lambda *_args, **_kwargs: torch.empty(0))
+    with pytest.warns(RuntimeWarning, match="A5 FFT STFT failed"):
+        result = module.stft(torch.empty(0, device="meta"), 16, 4, 16)
+    assert result.numel() == 0
+
+
+def test_istft_falls_back_on_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_WARNED", set())
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("unsupported op")
+
+    monkeypatch.setattr(module, "_istft_fft", fail)
+    monkeypatch.setattr(module, "_istft_on_cpu", lambda *_args, **_kwargs: torch.empty(0))
+    with pytest.warns(RuntimeWarning, match="A5 FFT ISTFT failed"):
+        result = module.istft(torch.empty(0, device="meta"), 16, 4, 16)
+    assert result.numel() == 0
+
+
+def test_stft_propagates_oom(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_module()
+
+    def fail(*_args, **_kwargs):
+        raise torch.OutOfMemoryError("oom")
+
+    monkeypatch.setattr(module, "_stft_fft", fail)
+    with pytest.raises(torch.OutOfMemoryError):
+        module.stft(torch.empty(0, device="meta"), 16, 4, 16)
+
+
+def test_istft_propagates_oom(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_module()
+
+    def fail(*_args, **_kwargs):
+        raise torch.OutOfMemoryError("oom")
+
+    monkeypatch.setattr(module, "_istft_fft", fail)
+    with pytest.raises(torch.OutOfMemoryError):
+        module.istft(torch.empty(0, device="meta"), 16, 4, 16)
+
+
 def test_install_patches_torch_ops() -> None:
     module = _load_module()
     saved = _save_torch_ops()
