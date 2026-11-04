@@ -923,6 +923,21 @@ def _turn_hidden_rows(
     return thinker_hidden_states[rows].to(torch.float32).contiguous()
 
 
+def _turn_has_reply_rows(
+    mm_output: Mapping[str, object], thinker_hidden_states: torch.Tensor, reply_start: int
+) -> bool:
+    """Whether the Thinker forwarded a row at or after ``reply_start``.
+
+    A prefix-cache hit on Model Runner V2 forwards no rows for the cached
+    tokens, so the row count says nothing about where the reply starts; the row
+    ledger does.
+    """
+    row_positions = mm_output.get("latent_positions")
+    if isinstance(row_positions, torch.Tensor) and row_positions.numel() == thinker_hidden_states.shape[0]:
+        return bool((row_positions >= reply_start).any())
+    return thinker_hidden_states.shape[0] > reply_start
+
+
 def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
@@ -1100,7 +1115,7 @@ def llm2tts(
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
         if not is_native_duplex_handoff:
-            if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
+            if tts_bos_idx is not None and _turn_has_reply_rows(mm_output, thinker_hidden_states, tts_bos_idx):
                 end_idx = tts_eos_idx if tts_eos_idx is not None else len(full_token_ids)
                 tts_hidden_slice = _turn_hidden_rows(
                     mm_output, thinker_hidden_states, full_token_ids, tts_bos_idx, end_idx, llm_output.request_id

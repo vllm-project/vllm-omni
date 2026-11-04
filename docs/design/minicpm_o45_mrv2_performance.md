@@ -114,6 +114,29 @@ Duplex sessions keep their own sampler and are not covered, and platforms
 whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
+## Thinker prefix cache
+
+`minicpmo_4_5_turn_mrv2.yaml` turns stage-0 prefix caching on. The Thinker does
+not set `supports_mrv2_prefix_cache_outputs`, so it reuses native KV alone: no
+output rows are saved or merged and no host cache is allocated. `llm2tts` picks
+the Talker's rows from the row ledger (`latent_input_ids`, `latent_positions`),
+and the reply's rows are never in a cached prefix, because the prompt's last
+token is always forwarded and `<|tts_bos|>` is the last prompt token. A template
+that places the reply start earlier in the prompt gets the "Thinker rows stop"
+warning and a shorter reply on a hit, so it needs the overlay below. Set
+`enable_prefix_caching: false` on stage 0 to turn it off:
+
+```yaml
+base_config: minicpmo_4_5_turn_mrv2.yaml
+stages:
+  - stage_id: 0
+    enable_prefix_caching: false
+```
+
+Native reuse also runs with a stage-0 `speculative_config`. A hit changes which
+tokens share a prefill step, so greedy text on a hit can differ from a miss at
+near-tied tokens in BF16, as it does on the V1 turn profile.
+
 ## Code2Wav batching across reference audio
 
 With CUDA ragged Whole-Euler enabled, ready requests with different reference
