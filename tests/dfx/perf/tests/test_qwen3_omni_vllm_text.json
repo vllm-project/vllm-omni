@@ -37,7 +37,8 @@
           8,
           32
         ],
-        "random_input_len": 2500,
+        "random_prefix_len": 1024,
+        "random_input_len": 1024,
         "random_output_len": 900,
         "ignore_eos": true,
         "extra_body": {
@@ -67,7 +68,8 @@
         "request_rate": [
           0.1
         ],
-        "random_input_len": 100,
+        "random_prefix_len": 1024,
+        "random_input_len": 1024,
         "random_output_len": 100,
         "random_range_ratio": 0.0,
         "ignore_eos": true,
@@ -104,7 +106,8 @@
         "request_rate": [
           1.0
         ],
-        "random_input_len": 100,
+        "random_prefix_len": 1024,
+        "random_input_len": 1024,
         "random_output_len": 100,
         "random_range_ratio": 0.0,
         "ignore_eos": true,
