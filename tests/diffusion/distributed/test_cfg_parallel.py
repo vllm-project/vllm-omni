@@ -1314,3 +1314,53 @@ def test_cfg_branch_stamp_is_restored_when_predict_noise_raises():
 
     assert pipeline.transformer.seen_branches == ["positive"]
     assert pipeline.transformer.cfg_branch is None
+
+
+class _PackedListTransformer(torch.nn.Module):
+    """Returns one tensor per request, like a packed MixFusion forward."""
+
+    def forward(self, *, preds: list[torch.Tensor]) -> list[torch.Tensor]:
+        return list(preds)
+
+
+class _PackedListPipeline(CFGParallelMixin):
+    """Uses the base ``predict_noise``, which must keep the list intact."""
+
+    def __init__(self) -> None:
+        self.transformer = _PackedListTransformer()
+
+
+def _packed_list_inputs(seed: int = 11) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    _set_random_seeds(seed)
+    positive = [torch.randn(1, 4, 4), torch.randn(2, 4, 4)]
+    _set_random_seeds(seed + 1)
+    negative = [torch.randn(1, 4, 4), torch.randn(2, 4, 4)]
+    return positive, negative
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("cfg_normalize", [False, True])
+def test_sequential_cfg_keeps_packed_list_predictions(cfg_normalize: bool):
+    """Sequential CFG must return a per-request list so the runner can index it."""
+    pipeline = _PackedListPipeline()
+    positive, negative = _packed_list_inputs()
+
+    with torch.no_grad():
+        combined = pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=5.0,
+            positive_kwargs={"preds": positive},
+            negative_kwargs={"preds": negative},
+            cfg_normalize=cfg_normalize,
+        )
+
+    assert isinstance(combined, list)
+    assert len(combined) == len(positive)
+    for pos, neg, actual in zip(positive, negative, combined, strict=True):
+        expected = neg + 5.0 * (pos - neg)
+        if cfg_normalize:
+            expected = pipeline.cfg_normalize_function(pos, expected)
+        torch.testing.assert_close(actual, expected)
+    assert pipeline.transformer.cfg_branch is None

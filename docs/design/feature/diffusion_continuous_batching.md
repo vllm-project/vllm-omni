@@ -193,6 +193,159 @@ also applies here.
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
 
+### MixFusion (Mixed-Resolution Step Batching)
+
+`StepBatchSamplingParamsKey` includes height/width/resolution, so plain step
+batching never co-schedules mixed resolutions. MixFusion relaxes those three
+fields out of the key so different resolutions can share one step batch, at the
+cost of a pipeline contract the scheduler must not assume generically:
+
+- A pipeline opts in with `supports_mixfusion: ClassVar[bool] = True`
+  (read via `getattr`, not part of the runtime protocol check). Currently
+  only `QwenImagePipeline` sets it.
+- The engine resolves the capability through the registry at startup and
+  rejects server-level `enable_mixfusion` on pipelines without it. Because
+  resolution only leaves the step-batch key under the `StepScheduler`,
+  server-level `enable_mixfusion` also enables step execution automatically
+  (same coupling as `streaming_output`).
+- The scheduler resolves the capability in `initialize()` and only then
+  applies the shape relaxation. On an unsupported pipeline, a request-level
+  `extra_args={"enable_mixfusion": True}` degrades to a no-op: resolution
+  stays in the key and per-prompt `additional_information` requests keep
+  their key.
+
+With the capability present, the model runner hands every denoise step to
+`pipeline.mixfusion_driver`, a model-agnostic `MixFusionDriver` that
+`registry._apply_mixfusion_if_enabled` mounts at model load. The driver
+dispatches on the batch: dense (tensor) latents go straight to
+`pipeline.denoise_step`; list latents return `None` when the pipeline is
+interrupted and otherwise take one packed forward only when
+`MixFusionDriver.admit` accepts them. Rejected batches fall back to `serial_ragged`, which rebuilds one
+single-request dense batch per request and calls the same `denoise_step`
+with flattened latents, so per-image conditioning stays aligned.
+
+Admission rejects, in order:
+
+- a transformer without a `mixfusion_adapter`;
+- a transformer whose `_mixfusion_plan` hooks were not applied
+  (`_mixfusion_hooks_applied`);
+- a non-empty `pipeline.attention_kwargs` (the packed forward has no
+  `attention_kwargs` channel, so the serial path threads them into every
+  block instead);
+- `sequence_parallel_size > 1` (packing already splits and stacks the image
+  stream; SP would shard rows a second time);
+- `do_true_cfg` and image latents (edit path);
+- foreign forward hooks on any module the plan touches, reported by
+  `plan_foreign_hooks` as `<plan name>:torch-native` (layerwise offload,
+  FSDP2 or cache hooks would see a layout they were not written for);
+- a chunk policy the layout cannot meet: the greatest common divisor of the
+  per-request sequence lengths is the chunk size, which must be at least
+  `mixfusion_min_chunk_tokens`, and the total chunk count must not exceed
+  `mixfusion_max_chunks`. Per-request extras are aggregated conservatively
+  (max of the minimums, min of the maximums; defaults 256 and 128), so no
+  request's limits are violated by fusing the batch.
+
+Backends without packed varlen support (e.g. NPU)
+are served by the attention layer's automatic fallback: documents are grouped
+by length into mask-free dense forwards, so the packed dispatch stays active
+and documents remain isolated without a per-request loop.
+
+Known limitation: the packed path does not thread `attention_kwargs`
+into the packed forward. To keep them from being dropped silently, the
+driver falls back to the serial ragged path when they are set; features
+that rely on them (e.g. LoRA scales, TeaCache) therefore lose MixFusion
+batching until the packed call grows an `attention_kwargs` channel.
+
+#### Adapter / driver layering
+
+MixFusion is split into three layers so that adding a model touches only the
+model-specific one:
+
+| Layer | Location | Owns |
+|---|---|---|
+| Driver | `vllm_omni/diffusion/mixfusion/driver.py` (`MixFusionDriver`) | Step dispatch, admission, chunk-policy aggregation, arming/restoring `MixFusionStep`, serial-ragged fallback |
+| Hooks + execution plan | `vllm_omni/diffusion/hooks/mixfusion.py`, `mixfusion/plan.py`, `mixfusion/execution_plan.py` | Applying `_mixfusion_plan` at module boundaries, the chunk-stacked layout (`PackedExecutionPlan`, gather/scatter, chunk split/reassembly), carrying opaque `PackedInputs` payloads |
+| Adapter | `vllm_omni/diffusion/models/<model>/mixfusion_adapter.py` | Model-specific admission limits, attention-stream declaration, packing/preparation and output restoration |
+
+Framework responsibilities:
+
+- `registry._apply_mixfusion_if_enabled` mounts the driver and calls
+  `apply_mixfusion(transformer, plan)`; the hooks stay inert unless the
+  driver arms a `MixFusionStep`.
+- The driver never interprets the model-specific payloads it carries
+  (`PackedInputs.boundary_outputs` / `adapter_state`); it only moves them
+  between the hooks the plan declares.
+- The layout primitives (`gcd_chunk_size`, `plan_chunk_size`,
+  `build_execution_plan`, `split_sequence_chunks`, `expand_per_chunk`,
+  `reassemble_chunk_rows`) know only `AttentionLayout`/`StreamSpec` and
+  tensors.
+
+Model responsibilities:
+
+- Implement the `MixFusionAdapter` protocol: `can_pack` (model-specific
+  admission limits, asked once per step by the driver), `pack_inputs` and
+  `restore_output`. The protocol is structural (`runtime_checkable`): an
+  adapter only needs the methods, not a base class.
+- Declare `_mixfusion_plan` on the transformer and register the adapter as
+  `mixfusion_adapter`.
+- Build the `AttentionLayout` and the `PackedExecutionPlan` (which carries
+  it) inside `pack_inputs`; step-invariant work is reused through the
+  `cache` bundle the root hook hands back per CFG branch.
+- Keep mixed-resolution attention in the model's attention leaf, which reads
+  the plan (and its stream layout) from the armed step instead of a forward
+  argument.
+
+`QwenImageMixFusionAdapter` is the reference implementation. Porting a model
+therefore means adding `models/<model>/mixfusion_adapter.py`, registering the
+adapter and `_mixfusion_plan` in `transformer.py`, adding a model test under
+`tests/diffusion/models/<model>/`, and declaring
+`supports_mixfusion: ClassVar[bool] = True` on the pipeline (the engine and
+scheduler resolve that capability before the model is loaded; it carries no
+runtime logic). The driver, hooks, execution plan and runner stay unchanged:
+the per-request ragged/chunk-policy opt-in is stamped from the runner.
+
+#### Layout abstraction
+
+The sequence chunking/restoration primitives are model-agnostic and live in
+`vllm_omni/diffusion/mixfusion/execution_plan.py` (`PackedExecutionPlan`,
+`build_execution_plan`, `gcd_chunk_size`, `plan_chunk_size`,
+`split_sequence_chunks`, `reassemble_chunk_rows`, `expand_per_chunk`),
+analogous to how `_sp_plan` centralizes sequence-parallel layout. A model
+adopts the layout by declaring `_mixfusion_plan`, the MixFusion counterpart
+of `_sp_plan`, and does not branch on MixFusion in its forward code:
+
+```python
+_mixfusion_plan = {
+    "": MixFusionRoot(),
+    "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
+    "transformer_blocks.*.img_mod": MixFusionExpandRows(),
+    "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
+}
+```
+
+- `apply_mixfusion` registers the hooks at the declared module boundaries;
+  they stay inert unless the driver arms a `MixFusionStep` on the forward
+  context.
+- `MixFusionDriver.armed` arms that step for exactly the packed transformer
+  call and restores the previous value afterwards (CFG may call the
+  transformer twice per step). The root hook then asks the adapter to pack
+  the per-request latent list, `MixFusionReplaceOutput` hands `forward` the
+  adapter-computed packed value for that boundary (e.g. the packed hidden
+  states and RoPE tables), and the expand hooks map per-request conditioning
+  rows to per-chunk rows. Without an armed step the model runs its serial
+  forward unchanged.
+- Attention remains the one layout-aware leaf: the packed layout has
+  image-batch = num-chunks versus text-batch = num-requests, so joint
+  attention reassembles the per-request logical domain itself instead of
+  relying on a shared batch dimension. It reads the plan from the armed
+  step instead of a forward argument.
+- Paths the packed layout cannot express are refused by the driver's
+  admission guards (above); model-specific refusals live in the adapter.
+  For Qwen-Image, `can_pack` refuses `zero_cond_t` (editing) and batches
+  without `img_shapes` / `txt_seq_lens`. The fused joint
+  QK-norm-RoPE table is disabled while a step is armed, because text
+  (per-request) and image rows (per-chunk) cannot share one table.
+
 ## Model Author Guidelines
 
 When converting a request-level pipeline:
@@ -228,6 +381,9 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
   request-mode extras remain unsupported.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
+- MixFusion shape relaxation requires the pipeline `supports_mixfusion`
+  capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, active
+  forward hooks, and `do_true_cfg` fall back to serial ragged execution.
 
 ## Related Implementation
 

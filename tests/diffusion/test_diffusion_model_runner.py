@@ -508,6 +508,81 @@ def test_update_states_carries_prepared_layout() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_update_states_stamps_mixfusion_request_extras() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline.supports_mixfusion = True
+    runner.od_config.enable_mixfusion = True
+    runner.od_config.mixfusion_min_chunk_tokens = 64
+    runner.od_config.mixfusion_max_chunks = 16
+    request = _make_request()
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    states, _ = DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    assert states[0].extra["use_ragged_latents"] is True
+    assert states[0].extra["mixfusion_min_chunk_tokens"] == 64
+    assert states[0].extra["mixfusion_max_chunks"] == 16
+
+    # A pipeline without the capability never gets the ragged opt-in, even
+    # when the server-level default is on.
+    unsupported = _make_runner(cache_backend=None, cache_backend_name=None)
+    unsupported.od_config.enable_mixfusion = True
+    states, _ = DiffusionModelRunner._update_states(unsupported, scheduler_output)
+
+    assert "use_ragged_latents" not in states[0].extra
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_update_states_after_list_latents_releases_finished_step_requests():
+    """Ragged (list-latent) batches must retire finished requests through
+    ``release_step_requests`` so the pipeline sees ``release_step_request``
+    and the cached batch is invalidated, matching the tensor branch."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    released = []
+    runner.pipeline = SimpleNamespace(release_step_request=lambda state: released.append(state.request_id))
+
+    finished_state = StepRequestState(
+        request_id="finished-request",
+        sampling=OmniDiffusionSamplingParams(),
+        latents=torch.zeros(1, 2),
+        timesteps=torch.ones(2),
+        step_index=1,
+        extra={"use_ragged_latents": True},
+    )
+    active_state = StepRequestState(
+        request_id="active-request",
+        sampling=OmniDiffusionSamplingParams(),
+        latents=torch.zeros(1, 3),
+        timesteps=torch.ones(2),
+        step_index=1,
+    )
+    runner.state_cache = {state.request_id: state for state in (finished_state, active_state)}
+    input_batch = InputBatch.make_batch([finished_state, active_state])
+    assert isinstance(input_batch.latents, list)
+    runner.input_batch = input_batch
+    # step_scheduler() advanced the first request past its last timestep.
+    finished_state.step_index = 2
+
+    runner._update_states_after([finished_state, active_state], input_batch)
+
+    assert released == ["finished-request"]
+    assert runner.state_cache == {"active-request": active_state}
+    # The retired request was still in the cached batch, so it must be dropped.
+    assert runner.input_batch is None
+    # Surviving requests keep their scattered latents.
+    assert active_state.latents.shape == (1, 3)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("use_hsdp", [False, True])
 def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
     runner = _make_compile_runner(use_hsdp=use_hsdp)

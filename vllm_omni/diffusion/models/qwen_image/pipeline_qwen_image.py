@@ -278,6 +278,10 @@ class QwenImagePipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
     supports_step_execution: ClassVar[bool] = True
+    # Opt-in: this pipeline packs mixed-resolution requests into one denoise
+    # step via ragged latents, so the scheduler may relax height/width out of
+    # the batch key when MixFusion is enabled.
+    supports_mixfusion: ClassVar[bool] = True
 
     supports_weight_reload: ClassVar[bool] = True
 
@@ -834,7 +838,7 @@ class QwenImagePipeline(
 
     def _build_denoise_kwargs(
         self,
-        latents: torch.Tensor,
+        latents: torch.Tensor | list[torch.Tensor],
         timestep: torch.Tensor,
         guidance: torch.Tensor | None,
         prompt_embeds: torch.Tensor,
@@ -850,15 +854,20 @@ class QwenImagePipeline(
     ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
         """Build positive/negative kwargs and output_slice for one denoise step.
 
+        ``latents`` may be one tensor per request (a packed MixFusion step);
+        the list is forwarded unchanged and the transformer's root hook packs
+        it. The driver never packs image-conditioned batches.
+
         Returns:
             (positive_kwargs, negative_kwargs, output_slice)
         """
         extra_transformer_kwargs = extra_transformer_kwargs or {}
 
         # Broadcast timestep to match batch size
-        t_for_model = timestep.expand(latents.shape[0]).to(
-            device=latents.device,
-            dtype=latents.dtype,
+        rows = latents if isinstance(latents, list) else [latents]
+        t_for_model = timestep.expand(sum(row.shape[0] for row in rows)).to(
+            device=rows[0].device,
+            dtype=rows[0].dtype,
         )
 
         # Concatenate image latents if available (editing pipelines)
@@ -928,7 +937,7 @@ class QwenImagePipeline(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
 
         Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,

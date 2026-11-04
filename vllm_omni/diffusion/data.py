@@ -1146,6 +1146,13 @@ class OmniDiffusionConfig:
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
 
+    # Mixed-resolution batch packing (MixFusion). Server-level default for the
+    # scheduler shape-relaxation and the pipeline ragged-latent pass; requests
+    # can still opt in/out per-request via extra_args.
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
+
     # Step mode settings
     step_execution: bool = False
 

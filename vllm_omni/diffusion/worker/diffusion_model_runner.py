@@ -46,6 +46,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
+from vllm_omni.diffusion.mixfusion.request import mixfusion_request_extras
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
@@ -1150,6 +1151,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                 )
+                # Stamp the per-request MixFusion opt-in here so pipelines
+                # never carry it; unsupported pipelines get an empty dict.
+                new_state.extra.update(
+                    mixfusion_request_extras(
+                        new_state.sampling,
+                        self.od_config,
+                        supported=getattr(self.pipeline, "supports_mixfusion", False),
+                    )
+                )
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
                     and getattr(self.od_config, "kv_transfer_config", None) is not None
@@ -1293,15 +1303,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         interrupted: bool = False,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
+        if isinstance(input_batch.latents, list):
+            input_batch.latents = [state.latents for state in states]
         else:
-            input_batch.latents = gathered_latents.clone()
+            gathered_latents = torch.cat([state.latents for state in states], dim=0)
+            if (
+                input_batch.latents.size() == gathered_latents.size()
+                and input_batch.latents.dtype == gathered_latents.dtype
+                and input_batch.latents.device == gathered_latents.device
+            ):
+                input_batch.latents.copy_(gathered_latents)
+            else:
+                input_batch.latents = gathered_latents.clone()
 
         self.input_batch = input_batch
         scatter_latents(states, input_batch)
@@ -1465,7 +1478,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                driver = getattr(pipeline, "mixfusion_driver", None)
+                if driver is not None:
+                    # The driver forwards dense batches to the same
+                    # ``denoise_step`` and owns the packed/ragged paths.
+                    noise_pred = driver.run(input_batch, states, pipeline.denoise_step)
+                else:
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
@@ -1487,14 +1506,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 else:
                     offset = 0
-                    for req in states:
+                    for req_idx, req in enumerate(states):
                         if req.latents is None:
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if isinstance(noise_pred, list):
+                                req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
+                            else:
+                                req_noise_pred = (
+                                    noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                )
+                            pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
@@ -1563,7 +1586,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 )
                             )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    if isinstance(noise_pred, list):
+                        expected = len(states)
+                        if len(noise_pred) != expected:
+                            raise ValueError(
+                                f"Stepwise noise_pred list has {len(noise_pred)} entries, expected {expected}."
+                            )
+                    elif noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."

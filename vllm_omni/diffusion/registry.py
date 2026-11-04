@@ -7,6 +7,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
@@ -14,7 +15,9 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
 
@@ -477,6 +480,47 @@ DiffusionModelRegistry = _ModelRegistry(
     }
 )
 
+
+def resolve_diffusion_pipeline_cls(od_config: OmniDiffusionConfig) -> type | None:
+    """Resolve the pipeline class ``od_config`` selects, without instantiating it.
+
+    Resolution order mirrors model-load time: an explicit
+    ``custom_pipeline_args['pipeline_class']``, then the diffusers adapter,
+    then the native registry lookup by ``model_class_name``. Returns ``None``
+    when no class can be resolved.
+    """
+    custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
+    if custom_pipeline_args and "pipeline_class" in custom_pipeline_args:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+        if isinstance(pipeline_cls, type):
+            return pipeline_cls
+        if isinstance(pipeline_cls, str):
+            try:
+                return resolve_obj_by_qualname(pipeline_cls)
+            except (AttributeError, ImportError, ValueError) as exc:
+                raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+        raise TypeError(
+            "custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+            f"got {type(pipeline_cls).__name__}"
+        )
+
+    if uses_diffusers_adapter(od_config):
+        return DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+
+    return DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+
+
+def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the resolved pipeline opts into MixFusion packed batching.
+
+    Pipelines declare the capability with the optional class attribute
+    ``supports_mixfusion = True``; anything without it (or unresolvable) is
+    treated as unsupported.
+    """
+    model_cls = resolve_diffusion_pipeline_cls(od_config)
+    return model_cls is not None and bool(getattr(model_cls, "supports_mixfusion", False))
+
+
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
@@ -581,6 +625,11 @@ def initialize_model(
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
+
+        # Apply the MixFusion packed-layout hooks declared by _mixfusion_plan.
+        # They are the MixFusion counterpart of _sp_plan and stay inert unless
+        # the MixFusionDriver arms a MixFusionStep on the forward context.
+        _apply_mixfusion_if_enabled(model, od_config)
 
         # Install the Wan VAE decoder fast path once the VAE parallel mode is
         # known. This runs inside the weight-loading memory pool, so any weight
@@ -723,6 +772,65 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
     except Exception as e:
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+
+
+def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Apply MixFusion packed-layout hooks if MixFusion is enabled.
+
+    This is the MixFusion counterpart of :func:`_apply_sequence_parallel_if_enabled`:
+    it applies the ``_mixfusion_plan`` hooks to transformer models that declare
+    one. The hooks pack per-request latents into the chunk-stacked layout at the
+    module boundaries only while the pipeline has armed a ``MixFusionStep`` on
+    the forward context, so a model with the hooks installed still runs its
+    serial forward unchanged when MixFusion is not requested.
+
+    It also mounts the model-agnostic
+    :class:`~vllm_omni.diffusion.mixfusion.driver.MixFusionDriver`, the entry
+    point for ragged batches even without a plan: its serial fallback has to
+    run because the dense path cannot accept list latents. A request may opt in
+    on any ``supports_mixfusion`` pipeline (the server flag only sets the
+    default), so the driver is mounted for every capable pipeline.
+
+    Args:
+        model: The pipeline model (e.g., QwenImagePipeline).
+        od_config: The OmniDiffusion configuration.
+    """
+
+    if not (getattr(od_config, "enable_mixfusion", False) or supports_mixfusion(od_config)):
+        return
+
+    # Prefer the pipeline's declared DiT components so custom component names
+    # receive the same hooks as conventional transformer names.
+    transformer_attrs = getattr(model, "_dit_modules", None) or ("transformer", "transformer_2", "dit", "unet")
+    transformers = []
+    search_root = model
+    for attr in transformer_attrs:
+        if not hasattr(search_root, attr):
+            # Some pipelines nest the module that owns the transformer.
+            module = find_module_with_attr(search_root, attr)
+            if module is None:
+                continue
+            search_root = module
+        transformer = getattr(search_root, attr)
+        if transformer is not None:
+            transformers.append((attr, transformer))
+    if not transformers:
+        return
+
+    # The driver only knows the model through its adapter, and one step packs
+    # one DiT: mount the first DiT that declares both a plan and an adapter.
+    # Without one, the driver still serves ragged batches serially. Admission
+    # rejects SP per step, so the hooks stay inert there.
+    for attr, transformer in transformers:
+        plan = getattr(transformer, "_mixfusion_plan", None)
+        adapter = getattr(transformer, "mixfusion_adapter", None)
+        if plan is not None and adapter is not None:
+            logger.info(f"Applying MixFusion hooks to {transformer.__class__.__name__} ({attr}): {', '.join(plan)}")
+            apply_mixfusion(transformer, plan)
+            model.mixfusion_driver = MixFusionDriver(model, transformer, adapter)
+            return
+    logger.warning("No transformer declares a _mixfusion_plan and adapter; MixFusion requests run serially.")
+    model.mixfusion_driver = MixFusionDriver(model, transformers[0][1], None)
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {
