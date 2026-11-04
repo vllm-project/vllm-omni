@@ -555,16 +555,19 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("turn_kv_continuation", [False, True])
-async def test_two_committed_turns_stream_text_and_audio_and_release_requests(turn_kv_continuation):
+async def test_two_committed_turns_stream_text_and_audio_and_release_requests(turn_kv_continuation, mocker):
     h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
+    bind_request = mocker.spy(h.session, "bind_request")
     try:
         ids = []
         for i in range(2):
+            bind_request.reset_mock()
             await h.run(append_audio())
             assert len(h.port.submissions) == i
             await h.run(Commit(final=True, create_response=True))
             assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
             request_id = h.port.submissions[-1].context.request_id
+            assert bind_request.call_args_list[0].args == (request_id,)
             ids.append(request_id)
             assert h.port.submissions[-1].resume_from_full_prompt is turn_kv_continuation
             assert h.port.submissions[-1].already_submitted is (turn_kv_continuation and i > 0)
