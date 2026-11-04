@@ -523,8 +523,8 @@ def test_refusal_forgiveness_is_scoped_to_the_post_commit_window():
 
     # Only the refusal that answered the forced create is forgiven; the
     # earlier one came from some other ask and other codes stay errors.
-    assert demo._post_commit_refusal_ids(events, 1) == {id(post_commit_refusal)}
-    assert demo._post_commit_refusal_ids(events, None) == set()
+    assert demo._post_commit_refusal_indexes(events, 1) == frozenset({2})
+    assert demo._post_commit_refusal_indexes(events, None) == frozenset()
 
 
 def test_forced_response_does_not_reask_while_a_response_is_active():

@@ -4357,6 +4357,38 @@ async def test_later_commit_keeps_earlier_retained_vision_units_in_wire_order(sc
 
 
 @pytest.mark.asyncio
+async def test_response_create_with_only_a_surviving_stream_claim_is_refused() -> None:
+    """A listen claim that outlived its input is not pending work.
+
+    A native session keeps the stream bound after the input stops, and the
+    last unit leaves ``active_request_id`` pointing at it. Neither owns the
+    turn, so the create must reach the nothing-to-answer refusal instead of
+    ``response_already_active`` (nothing is active) or a silent drop.
+    """
+    h = await open_harness(auto_response=True)
+    try:
+        await h.run(append_audio(is_speech=False))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        await h.run(commands.Commit(create_response=True))
+        assert h.runner.run.stream_request_id is not None
+        assert not h.runner.tasks.append_tasks
+        assert h.session.active_response_id is None
+
+        events = await h.run(commands.CreateResponse(event_id="evt-create"))
+        assert types(events) == ["error"], events
+        assert events[0].code == "response_create_without_input"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_response_create_waits_while_a_held_prefix_is_still_submitting() -> None:
     """A create with an in-flight append behind it must wait, not be refused.
 

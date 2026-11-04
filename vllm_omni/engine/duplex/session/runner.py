@@ -2532,11 +2532,16 @@ class DuplexSessionRunner:
         # A listen stream can still hold the data-plane claim with nothing
         # committed -- in a native session that claim survives its input on
         # purpose (model_channel deliberately keeps the stream bound for the
-        # next turn). It is not counted as pending work below, otherwise it
-        # would strand the create forever: no later append releases it once
-        # the input has stopped, and the client only finds out when its drain
-        # times out. The nothing-to-answer refusals further down answer it
-        # immediately instead.
+        # next turn). Neither guard here looks at it: ``response_in_progress``
+        # only reports an active response, unplayed assistant audio, a live
+        # response task or a response-bound append, and ``append_tasks`` only
+        # tracks appends. Counting the surviving claim as pending work would
+        # strand the create forever -- no later append releases it once the
+        # input has stopped, and the client only finds out when its drain
+        # times out -- so a create that finds nothing else in flight falls
+        # through to the nothing-to-answer refusals below, which answer it
+        # immediately. Only a turn that still owns the model reaches the
+        # response_already_active branch.
         if helpers.response_in_progress(self.session, self.tasks) or self.tasks.append_tasks:
             if session.active_response_id is None and (
                 session.active_request_id is not None or self.tasks.append_tasks

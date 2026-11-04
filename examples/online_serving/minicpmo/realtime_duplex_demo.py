@@ -232,30 +232,26 @@ def _post_commit_definitive_refusal(
     judging -- not this timeout -- is what decides whether that answer covers
     the input.
     """
-    if committed_index is None:
-        return False
-    return any(
-        event.get("type") == "error" and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES
-        for event in events[committed_index + 1 :]
-    )
+    return bool(_post_commit_refusal_indexes(events, committed_index))
 
 
-def _post_commit_refusal_ids(
+def _post_commit_refusal_indexes(
     events: list[dict[str, object]],
     committed_index: int | None,
-) -> set[int]:
-    """Identities of the refusal errors that answered the forced create.
+) -> frozenset[int]:
+    """Positions of the refusal errors that answered the forced create.
 
     Scoped to the post-commit window on purpose: an earlier refusal came from
-    some other ask and must keep failing the run.
+    some other ask and must keep failing the run. Positions rather than object
+    identities keep the filter correct even if a collector hands back copies.
     """
     if committed_index is None:
-        return set()
-    return {
-        id(event)
-        for event in events[committed_index + 1 :]
-        if event.get("type") == "error" and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES
-    }
+        return frozenset()
+    return frozenset(
+        index
+        for index in range(committed_index + 1, len(events))
+        if events[index].get("type") == "error" and ErrorEvent(events[index]).code in DEFINITIVE_REFUSAL_CODES
+    )
 
 
 def _post_commit_forced_response_settled(
@@ -1053,17 +1049,23 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             input_committed_at_s=commit_sent_at_s,
             response_id=response_id,
         )
-        errors = collector.errors()
-        if final_create_response and committed_index is not None:
-            # The forced final create can be answered by a definitive
-            # refusal -- the commit retained nothing answerable, so the final
-            # answer was already given by an earlier response (or the input
-            # was not answerable at all, which the recognition report
-            # judges). Only refusals that arrived after the commit are
-            # forgiven: an earlier one came from some other ask and still
-            # fails the run, as does every other error.
-            forgiven_ids = _post_commit_refusal_ids(collector.events, committed_index)
-            errors = [event for event in errors if id(event) not in forgiven_ids]
+        # The forced final create can be answered by a definitive refusal --
+        # the commit retained nothing answerable, so the final answer was
+        # already given by an earlier response (or the input was not
+        # answerable at all, which the recognition report judges). Only
+        # refusals that arrived after the commit are forgiven: an earlier one
+        # came from some other ask and still fails the run, as does every
+        # other error.
+        forgiven_indexes = (
+            _post_commit_refusal_indexes(collector.events, committed_index)
+            if final_create_response and committed_index is not None
+            else frozenset()
+        )
+        errors = [
+            event
+            for index, event in enumerate(collector.events)
+            if event.get("type") == "error" and index not in forgiven_indexes
+        ]
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:

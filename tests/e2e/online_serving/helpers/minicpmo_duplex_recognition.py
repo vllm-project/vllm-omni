@@ -73,6 +73,10 @@ def evaluate_session(transcript: str, events: list[dict], scenes: list[dict]) ->
     created: list[str] = []
     done: list[str] = []
     errors = []
+    # The fixture streams one turn and commits once, so the last commit is the
+    # forced one and the window matches the driver's committed_index. A
+    # multi-commit session would need this to key off the same commit the
+    # driver's final create answered, not simply the last one.
     last_commit_index = max(
         (index for index, event in enumerate(events) if event.get("type") == "input_audio_buffer.committed"),
         default=-1,
