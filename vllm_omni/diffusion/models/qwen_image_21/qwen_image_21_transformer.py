@@ -37,6 +37,10 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.fused_residual_layer_norm import (
+    fused_layer_norm_scale,
+    fused_residual_layer_norm,
+)
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -96,10 +100,13 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
     )
 
 
-# Devices whose fused interleaved RoPE reproduces the reference rotation. MUSA has no
-# complex-tensor kernel, so the reference path there is the native multiply/add
-# sequence; the fused kernel keeps that arithmetic (unfused products) and matches it
-# bit for bit.
+# Devices whose fused interleaved RoPE reproduces the reference rotation. MUSA is
+# listed for speed, not for capability: complex tensors and their kernels work there
+# (only the ``Tensor.view_as_complex`` method binding is missing, the function form is
+# fine), but the rotary kernel is CUDA/SM103-only and returns None under compile, so
+# MUSA lands on the fallback that Inductor turns into one ~353 us kernel per
+# projection. The fused kernel keeps that fallback's arithmetic (unfused products),
+# so it is bit-exact with it.
 _FUSED_ROPE_DEVICE_TYPES = ("cuda", "musa")
 
 
@@ -722,15 +729,24 @@ class QwenImage21TransformerBlock(nn.Module):
             prefix=f"{prefix}.img_mlp",
         )
 
+    @staticmethod
+    def _select_modulation(
+        mod_params: torch.Tensor,
+        target_token_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scale, gate = mod_params.chunk(2, dim=-1)
+        return (
+            _select_modulation_rows(scale, target_token_mask),
+            _select_modulation_rows(gate, target_token_mask),
+        )
+
     def _modulate(
         self,
         hidden_states: torch.Tensor,
         mod_params: torch.Tensor,
         target_token_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scale, gate = mod_params.chunk(2, dim=-1)
-        scale = _select_modulation_rows(scale, target_token_mask)
-        gate = _select_modulation_rows(gate, target_token_mask)
+        scale, gate = self._select_modulation(mod_params, target_token_mask)
         return hidden_states * (1 + scale), gate
 
     def forward(
@@ -750,11 +766,18 @@ class QwenImage21TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         if prepared_modulation is None:
             mod1, mod2 = modulation.chunk(2, dim=-1)
-            img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+            selected_scale1, img_gate1 = self._select_modulation(mod1, target_token_mask)
             img_gate1 = img_gate1.tanh()
+            fused_modulation = fused_layer_norm_scale(hidden_states, 1 + selected_scale1, self.img_norm1.eps)
+            img_modulated = (
+                fused_modulation
+                if fused_modulation is not None
+                else self.img_norm1(hidden_states) * (1 + selected_scale1)
+            )
         else:
             scale1, img_gate1, scale2, img_gate2 = prepared_modulation
-            img_modulated = self.img_norm1(hidden_states) * scale1
+            fused_modulation = fused_layer_norm_scale(hidden_states, scale1, self.img_norm1.eps)
+            img_modulated = fused_modulation if fused_modulation is not None else self.img_norm1(hidden_states) * scale1
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -776,19 +799,30 @@ class QwenImage21TransformerBlock(nn.Module):
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         )
-        if use_inplace_residual:
-            # Mutate only the fresh projection output, preserving input ownership
-            # and the BF16 rounding between multiplication and addition.
-            attn_output.mul_(img_gate1).add_(hidden_states)
-            hidden_states = attn_output
+        # Opt-in MUSA path: one kernel for the attention residual and the modulated
+        # norm that consumes it. Returns None unless its env gate is open, in which
+        # case the reference statements below run unchanged.
+        fused_norm = (
+            fused_residual_layer_norm(hidden_states, attn_output, img_gate1, scale2, self.img_norm2.eps)
+            if prepared_modulation is not None and not use_inplace_residual
+            else None
+        )
+        if fused_norm is not None:
+            hidden_states, img_modulated2 = fused_norm
         else:
-            hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
+            if use_inplace_residual:
+                # Mutate only the fresh projection output, preserving input ownership
+                # and the BF16 rounding between multiplication and addition.
+                attn_output.mul_(img_gate1).add_(hidden_states)
+                hidden_states = attn_output
+            else:
+                hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
-        if prepared_modulation is None:
-            img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
-            img_gate2 = img_gate2.tanh()
-        else:
-            img_modulated2 = self.img_norm2(hidden_states) * scale2
+            if prepared_modulation is None:
+                img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
+                img_gate2 = img_gate2.tanh()
+            else:
+                img_modulated2 = self.img_norm2(hidden_states) * scale2
         mlp_output = (
             self.img_mlp(img_modulated2, _pointwise_validated=True)
             if _pointwise_validated
