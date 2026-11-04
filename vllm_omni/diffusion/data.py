@@ -114,17 +114,6 @@ def normalize_omni_diffusion_kwargs(
             fastvideo_vsa_topk=fastvideo_vsa_topk,
         )
 
-    auxiliary_text_encoder = config_kwargs.pop("auxiliary_text_encoder", None)
-    if auxiliary_text_encoder is not None:
-        extras = dict(config_kwargs.get("extras") or {})
-        if extras.get("auxiliary_text_encoder") is not None:
-            raise ValueError(
-                "Diffusion engine field 'auxiliary_text_encoder' cannot be provided both at the top level and in "
-                "'extras'."
-            )
-        extras["auxiliary_text_encoder"] = auxiliary_text_encoder
-        config_kwargs["extras"] = extras
-
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
     if "cache_backend" not in config_kwargs and apply_defaults:
@@ -900,6 +889,12 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str | None = None
     nccl_port: int | None = None
 
+    # Weight transfer configuration for RL training (pipeline-wide deploy
+    # field). A dict matching upstream vLLM ``WeightTransferConfig`` fields
+    # (e.g. ``{"backend": "ipc"}``); converted to the typed config when the
+    # diffusion VllmConfig is built. ``None`` disables weight transfer.
+    weight_transfer_config: dict[str, Any] | None = None
+
     # Engine backend selection, resolved by ``DiffusionEngine.resolve_engine_class``
     # (mirrors ``DiffusionExecutor.get_class``). Config files use a string:
     # "default" -> DiffusionEngine, or an import path (set e.g. by a deploy
@@ -934,6 +929,8 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float | list[float] = 1.0
     lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
@@ -945,6 +942,7 @@ class OmniDiffusionConfig:
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
     # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
@@ -961,6 +959,7 @@ class OmniDiffusionConfig:
     # This avoids AllGather synchronization, while host memory follows the
     # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
     # Final-layout Host Weight Runtime policy. The loader only activates this
@@ -1241,6 +1240,12 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
+
+        parse_reference_kv_config(self.kv_offload_config)
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
@@ -1451,6 +1456,7 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1885,9 +1891,13 @@ class DiffusionOutput:
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)
+    coalesced_event_ids: list[str] = field(default_factory=list)
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # Engine-side async materialization wait (seconds), separate from model stages.
+    output_ready_wait_time: float = 0.0
 
     # memory usage info
     peak_memory_mb: float = 0.0
@@ -2086,6 +2096,45 @@ class AttnQuantSpec:
         return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
+@dataclass
+class SpargeAttnSpec:
+    """Typed controls for SPARGE INT8 sparse attention on XPU.
+
+    ``topk`` is the fraction of logical K blocks retained per query block.
+    ``q_block_tokens``, ``k_block_tokens``, and ``q_tile_override`` tune the
+    sparse routing and prefill tiling. ``None`` keeps the backend's
+    head-dimension-specific default.
+    """
+
+    topk: float = 0.5
+    q_block_tokens: int | None = None
+    k_block_tokens: int | None = None
+    q_tile_override: int | None = None
+
+    _VALID_Q_BLOCK_TOKENS = frozenset({64, 256})
+    _VALID_Q_TILE_OVERRIDES = frozenset({0, 64, 128, 256})
+
+    def __post_init__(self) -> None:
+        topk = _in_range(self.topk, "sparge.topk", 0.0, 1.0)
+        if topk is None:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        self.topk = topk
+        if self.topk <= 0.0:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        if self.q_block_tokens is not None and self.q_block_tokens not in self._VALID_Q_BLOCK_TOKENS:
+            raise ValueError(
+                f"sparge.q_block_tokens={self.q_block_tokens!r} unsupported; "
+                f"use one of {sorted(self._VALID_Q_BLOCK_TOKENS)}."
+            )
+        if self.k_block_tokens is not None and self.k_block_tokens != 64:
+            raise ValueError("sparge.k_block_tokens must be 64 when set.")
+        if self.q_tile_override is not None and self.q_tile_override not in self._VALID_Q_TILE_OVERRIDES:
+            raise ValueError(
+                f"sparge.q_tile_override={self.q_tile_override!r} unsupported; "
+                f"use one of {sorted(self._VALID_Q_TILE_OVERRIDES)}."
+            )
+
+
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
@@ -2147,6 +2196,7 @@ class AttentionSpec:
     fastvideo_vsa_topk: int | None = None
     fastvideo_vsa_provider: str = "auto"
     fastvideo_vsa_precision: str = "bf16"
+    sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -2155,6 +2205,7 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
@@ -2166,11 +2217,11 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
-        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer"):
-            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo or flashinfer")
+        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton"):
+            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo, flashinfer, cudnn or triton")
         if self.fastvideo_vsa_precision not in ("bf16", "sage"):
             raise ValueError("fastvideo_vsa_precision must be bf16 or sage")
-        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider == "fastvideo":
+        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider in ("fastvideo", "cudnn", "triton"):
             raise ValueError("Sage VSA precision requires the FlashInfer provider")
         if self.backend.upper() != "FASTVIDEO_VSA" and (
             self.fastvideo_vsa_provider not in ("auto", "fastvideo") or self.fastvideo_vsa_precision != "bf16"
@@ -2181,6 +2232,11 @@ class AttentionSpec:
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
             if self.fastvideo_vsa_topk <= 0:
                 raise ValueError("fastvideo_vsa_topk must be positive.")
+        if self.sparge is not None and self.backend.upper() != "SPARGE_ATTN":
+            raise ValueError(
+                f"sparge is only supported by the SPARGE_ATTN backend, but backend={self.backend!r}. "
+                "Remove sparge or set backend to SPARGE_ATTN."
+            )
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
@@ -2229,6 +2285,15 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.sparge is not None:
+            sp = self.sparge
+            kw["sparge_topk"] = sp.topk
+            if sp.q_block_tokens is not None:
+                kw["sparge_q_block_tokens"] = sp.q_block_tokens
+            if sp.k_block_tokens is not None:
+                kw["sparge_k_block_tokens"] = sp.k_block_tokens
+            if sp.q_tile_override is not None:
+                kw["sparge_q_tile_override"] = sp.q_tile_override
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
@@ -2314,6 +2379,7 @@ class AttentionConfig:
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
+            "sparge",
             "block_sparse",
         }
         node_dict = dict(node)
@@ -2445,6 +2511,31 @@ def build_attention_config(
         {k: v.backend for k, v in normalized.per_role.items()},
     )
     return normalized
+
+
+def validate_kv_cache_dtype_vs_attention_specs(
+    kv_cache_dtype: str | None,
+    attention_config: "AttentionConfig | None",
+) -> None:
+    """Reject a global attention-quant knob combined with per-backend quant specs.
+
+    ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
+    an explicit ``quant`` spec is the advanced per-backend override. Setting both
+    is contradictory intent — fail fast instead of picking one silently. A pure
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    """
+    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+        return
+    specs = [attention_config.default, *attention_config.per_role.values()]
+    for spec in specs:
+        if spec is None or spec.quant is None:
+            continue
+        if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
+            raise ValueError(
+                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                "the unified knob already requests quantized attention. Remove the explicit "
+                "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
+            )
 
 
 @dataclass

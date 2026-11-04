@@ -128,7 +128,8 @@ def _load_qwen3_tts_code2wav_patch(
 def test_is_a5_detects_a5_device(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_npu_init(monkeypatch)
     _install_fake_module(monkeypatch, "vllm_ascend")
-    _install_fake_module(monkeypatch, "vllm_ascend.utils", is_950=lambda: True)
+    _install_fake_module(monkeypatch, "vllm_ascend.device")
+    _install_fake_module(monkeypatch, "vllm_ascend.device.device_config", is_950=lambda: True)
 
     assert module.is_a5() is True
 

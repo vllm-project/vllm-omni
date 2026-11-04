@@ -44,7 +44,7 @@ class HybridNoisyKVState:
             raise ValueError("chunk tokens do not fit the KV specification")
         self._chunk_tokens[req] = chunk_tokens
         self.plan = BlockPlan(plan)
-        groups, stages = plan.schedule.layer_groups, plan.schedule.stages
+        groups, stages = plan.schedule.layer_groups, plan.schedule.step_replicas
         self.pages = LayerMajorPages(self.plan, spec, chunk_tokens, self.device, self.dtype, self.group)
         push = self.pages
         self.capacity = push.capacity * stages

@@ -181,7 +181,7 @@ def main():
                     device=device,
                     layer_groups=args.groups,
                     max_batch_size=1,
-                    stages=args.steps + 1,
+                    step_replicas=args.steps + 1,
                     layer_offset=model.start_layer,
                     blocks_per_rank=model.local_num_layers,
                 )

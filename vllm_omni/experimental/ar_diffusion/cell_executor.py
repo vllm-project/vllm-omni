@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,8 +17,10 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
     Inflight,
+    Ordering,
     can_admit,
     is_group_boundary,
+    rank_of_block,
     rank_work,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
@@ -44,12 +46,12 @@ def _consumer_stash_meta(
 ) -> tuple[str, int, int]:
     """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
 
-    Producer schedule meta alone is wrong across denoise stages: consumer step is
-    ``producer_step + 1``. Same-stage layer-group boundaries keep the step.
+    Producer schedule meta alone is wrong across step replicas: consumer step is
+    ``producer_step + 1``. Same-step layer-group boundaries keep the step.
     """
     _req, cell = src_tasks[0]
     chunk, step, _block = cell
-    if topology.is_stage_last(src):
+    if topology.is_layer_group_last(src):
         step = int(step) + 1
     return ("", int(chunk), int(step))
 
@@ -63,8 +65,28 @@ def _activation_edges(
 ) -> list[tuple[int, int, tuple[tuple[str, Cell], ...]]]:
     """Identical edge list on every rank for this tick."""
     edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]] = []
+    if schedule.ordering is Ordering.SAME_STEP:
+        for item in inflight:
+            plan = item.plan
+            for src in range(topology.world):
+                task = plan.task(slot - item.t0, src)
+                if task is None or not is_group_boundary(task, plan.schedule):
+                    continue
+                chunk, step, block = task
+                if block + 1 < plan.schedule.num_blocks:
+                    next_step, next_block = step, block + 1
+                elif step + 1 < plan.schedule.num_denoise_steps or (
+                    chunk == 0 and plan.schedule.chunks > 1 and step < plan.schedule.num_denoise_steps
+                ):
+                    next_step, next_block = step + 1, 0
+                else:
+                    continue
+                dst = rank_of_block(next_step, next_block, plan.schedule)
+                if src != dst:
+                    edges.append((src, dst, ((item.req, task),)))
+        return edges
     last_rank = topology.world - 1
-    if topology.stages == 1:
+    if topology.step_replicas == 1:
         peer_tasks = rank_work(inflight, slot, last_rank)
         if _tasks_need_activation_send(peer_tasks, schedule):
             edges.append((last_rank, 0, peer_tasks))
@@ -110,7 +132,7 @@ def _post_activations_ws(
 
     for src, dst, src_tasks in edges:
         batch = max(1, len(src_tasks))
-        include_hidden = not topology.is_stage_last(src)
+        include_hidden = not topology.is_layer_group_last(src)
         spec_list = adapter.activation_spec(batch=batch, include_hidden=include_hidden)
         if not spec_list:
             continue
@@ -151,23 +173,25 @@ def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
 
 @dataclass(frozen=True)
 class CellTopology:
-    stages: int
+    step_replicas: int
     layer_groups: int
 
     @property
     def world(self) -> int:
-        return self.stages * self.layer_groups
+        return self.step_replicas * self.layer_groups
 
     def split_rank(self, rank: int) -> tuple[int, int]:
-        if self.stages == 1:
+        if self.step_replicas == 1:
             return 0, rank
         return rank // self.layer_groups, rank % self.layer_groups
 
-    def is_stage_first(self, rank: int) -> bool:
+    def is_layer_group_first(self, rank: int) -> bool:
+        """``g == 0`` for this rank's step replica."""
         _, g = self.split_rank(rank)
         return g == 0
 
-    def is_stage_last(self, rank: int) -> bool:
+    def is_layer_group_last(self, rank: int) -> bool:
+        """``g == G-1`` for this rank's step replica."""
         _, g = self.split_rank(rank)
         return g == self.layer_groups - 1
 
@@ -185,6 +209,7 @@ class PendingAdmit:
     req: str
     plan: CellPlan
     chunk_tokens: int
+    retain: frozenset[Cell] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -194,17 +219,46 @@ class ARDiffusionCellContext:
     inflight: list[Inflight] = field(default_factory=list)
     pending: list[PendingAdmit] = field(default_factory=list)
 
-    def enqueue(self, req: str, plan: CellPlan, *, chunk_tokens: int) -> None:
-        self.pending.append(PendingAdmit(req=req, plan=plan, chunk_tokens=chunk_tokens))
+    def enqueue(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        retain: Collection[Cell] | None = None,
+    ) -> None:
+        self.pending.append(
+            PendingAdmit(
+                req=req,
+                plan=plan,
+                chunk_tokens=chunk_tokens,
+                retain=frozenset(retain or ()),
+            )
+        )
 
-    def admit(self, req: str, plan: CellPlan, *, chunk_tokens: int, slot: int) -> bool:
+    def admit(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        slot: int,
+        retain: Collection[Cell] | None = None,
+    ) -> bool:
         pending = tuple(self.inflight)
+        # Sink bootstrap contains a replica-local wrap. Keep its activation
+        # packets request-local until mixed-bootstrap batching is supported.
+        if pending and (
+            plan.schedule.ordering is Ordering.SAME_STEP
+            or any(item.plan.schedule.ordering is Ordering.SAME_STEP for item in pending)
+        ):
+            return False
         if not can_admit(pending, slot, plan, max_batch_size=self.spec.max_batch_size):
             return False
         inflight_tokens = {self.kv._chunk_tokens[item.req] for item in self.inflight}
         if inflight_tokens and chunk_tokens not in inflight_tokens:
             return False
-        self.kv.begin_request(req, plan, chunk_tokens=chunk_tokens, t0=slot)
+        self.kv.begin_request(req, plan, chunk_tokens=chunk_tokens, t0=slot, retain=retain)
         self.inflight.append(Inflight(req=req, t0=slot, plan=plan))
         self.kv.set_inflight(tuple(self.inflight))
         return True
@@ -212,7 +266,8 @@ class ARDiffusionCellContext:
     def drop(self, req: str) -> None:
         self.inflight = [item for item in self.inflight if item.req != req]
         self.pending = [item for item in self.pending if item.req != req]
-        self.kv.end_request(req)
+        # Fail-closed: drop session history for this id as well as temporary cells.
+        self.kv.end_request(req, retain=())
         self.kv.set_inflight(tuple(self.inflight))
 
     def admit_pending(self, slot: int) -> None:
@@ -221,7 +276,13 @@ class ARDiffusionCellContext:
             if still:
                 still.append(item)
                 continue
-            if self.admit(item.req, item.plan, chunk_tokens=item.chunk_tokens, slot=slot):
+            if self.admit(
+                item.req,
+                item.plan,
+                chunk_tokens=item.chunk_tokens,
+                slot=slot,
+                retain=item.retain,
+            ):
                 continue
             still.append(item)
         self.pending = still
@@ -305,8 +366,8 @@ def run_cell_pipeline(
     kv.bind_rank(spec.rank, spec.pp_group)
     pp = spec.pp_group
     logger.info(
-        "[chunk_pipeline] start: stages=%d layer_groups=%d rank=%d inflight=%d pending=%d",
-        spec.topology.stages,
+        "[chunk_pipeline] start: step_replicas=%d layer_groups=%d rank=%d inflight=%d pending=%d",
+        spec.topology.step_replicas,
         spec.topology.layer_groups,
         spec.rank,
         len(ctx.inflight),
@@ -336,6 +397,9 @@ def run_cell_pipeline(
         while (ctx.inflight or ctx.pending) and slot < limit:
             ctx.admit_pending(slot)
             kv.set_inflight(tuple(ctx.inflight))
+            # Prior-history handoffs for requests that start on this global slot must
+            # complete before their first prepare (exchange normally runs after forward).
+            kv.exchange_and_await_prior_handoffs(slot)
             tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
             _assert_i8(tasks)
             schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
@@ -347,7 +411,16 @@ def run_cell_pipeline(
                 contexts = kv.prepare(tasks)
                 output = adapter.forward(tasks, contexts, hidden=pending_hidden)
                 kv.publish(tasks)
-                if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
+                # A local clean successor consumes the chunk-0 final latent here.
+                # The executor owns this handoff; adapters need no latent cache.
+                keep_clean_input = (
+                    schedule is not None
+                    and schedule.ordering is Ordering.SAME_STEP
+                    and schedule.chunks > 1
+                    and rank_of_block(schedule.num_denoise_steps, 0, schedule) == spec.rank
+                    and tasks[0][1] == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
+                )
+                if schedule is not None and (keep_clean_input or not _tasks_need_activation_send(tasks, schedule)):
                     pending_hidden = output
                 else:
                     pending_hidden = None

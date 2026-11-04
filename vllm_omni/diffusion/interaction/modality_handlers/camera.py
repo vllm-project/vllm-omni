@@ -20,6 +20,7 @@ from typing_extensions import Self, override
 from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHandler
 from vllm_omni.diffusion.interaction.types import (
     MAX_PENDING_INTERACTION_EVENTS,
+    InteractionBoundaryContext,
     InteractionChunkMetadata,
     InteractionEvent,
     InteractionMode,
@@ -84,7 +85,9 @@ class QueuedCameraEvent(InteractionEvent):
     # Absolute pose for ``target``; per-frame SE3 delta for ``velocity``.
     pose: CameraPose = field(default_factory=CameraPose.identity)
     # Integer frame progress for ``target`` lerps (avoids float reciprocal drift).
-    elapsed_transition_frames: int = 0
+    elapsed_transition_frames: float = 0.0
+    # Remaining media time for an eligible event that did not fit its window.
+    deferred_offset_s: float | None = None
 
 
 @dataclass
@@ -234,13 +237,23 @@ class SE3DeltaCameraHandler(InteractionHandler):
         session = state.interaction_sessions.setdefault("camera", CameraSession())
         assert isinstance(session, CameraSession)
         with session.lock:
-            poses, started, active, completed = self._step_one_chunk(
-                session,
-                num_media_frames=num_media_frames,
-                fps=fps,
-                num_latent_frames=num_latent_frames,
-                boundary_at=boundary_at,
-            )
+            context = state.interaction_boundary
+            coalesced: list[str] = []
+            if context is not None and context.window_opened_at is not None and context.window_end_at is not None:
+                poses, started, active, completed, coalesced = self._step_paced_chunk(
+                    session,
+                    context=context,
+                    num_latent_frames=num_latent_frames,
+                    control_step_seconds=num_media_frames / fps / num_latent_frames,
+                )
+            else:
+                poses, started, active, completed = self._step_one_chunk(
+                    session,
+                    num_media_frames=num_media_frames,
+                    fps=fps,
+                    num_latent_frames=num_latent_frames,
+                    boundary_at=boundary_at,
+                )
             if poses:
                 session.last_absolute_poses = torch.stack([p.as_matrix() for p in poses], dim=0)
             else:
@@ -250,7 +263,132 @@ class SE3DeltaCameraHandler(InteractionHandler):
             started_event_ids=started,
             active_event_ids=active,
             completed_event_ids=completed,
+            coalesced_event_ids=coalesced,
         )
+
+    def _step_paced_chunk(
+        self,
+        session: CameraSession,
+        *,
+        context: InteractionBoundaryContext,
+        num_latent_frames: int,
+        control_step_seconds: float,
+    ) -> tuple[list[CameraPose], list[str], list[str], list[str], list[str]]:
+        """Integrate all control types on one timeline, bounded by media time."""
+        window_start, window_end = context.window_opened_at, context.window_end_at
+        assert window_start is not None and window_end is not None
+        boundary_at = context.boundary_at
+        eligible: list[QueuedCameraEvent] = []
+        future: list[QueuedCameraEvent] = []
+        coalesced: list[str] = []
+        for event in sorted(session.pending_events, key=lambda item: item.received_at):
+            cutoff = boundary_at if event.mode == "target" else window_end
+            if event.received_at >= cutoff:
+                future.append(event)
+            elif event.mode == "target" and eligible and eligible[-1].mode == "target":
+                coalesced.append(eligible[-1].event_id)
+                eligible[-1] = event
+            else:
+                eligible.append(event)
+
+        late_targets = [event for event in eligible if event.received_at >= window_end]
+        timed = [event for event in eligible if event.received_at < window_end]
+        slot_duration = (window_end - window_start) / num_latent_frames
+        # Backlog and fresh input use separate clocks within this media window.
+        # Preserve their intervals and carry overflow instead of collapsing it.
+        mapped: list[tuple[QueuedCameraEvent, float]] = []
+        backlog_shift: float | None = None
+        fresh_shift: float | None = None
+        last_mapped_at = window_start
+        for event in timed:
+            if event.deferred_offset_s is not None:
+                event_at = window_start + event.deferred_offset_s
+            elif event.received_at < window_start:
+                if backlog_shift is None:
+                    backlog_shift = last_mapped_at - event.received_at
+                event_at = event.received_at + backlog_shift
+            else:
+                if fresh_shift is None:
+                    fresh_shift = max(0.0, last_mapped_at - event.received_at)
+                event_at = event.received_at + fresh_shift
+            event_at = max(last_mapped_at, event_at)
+            last_mapped_at = event_at
+            if event_at >= window_end:
+                event.deferred_offset_s = event_at - window_end
+                future.append(event)
+            else:
+                event.deferred_offset_s = None
+                mapped.append((event, event_at))
+        if late_targets:
+            # An absolute target supersedes older, not-yet-applied controls so
+            # those controls cannot resurrect on the following chunk.
+            last_target = late_targets[-1]
+            coalesced.extend(event.event_id for event in future if event.received_at < last_target.received_at)
+            future = [event for event in future if event.received_at >= last_target.received_at]
+        session.pending_events = future
+        started: list[str] = []
+        completed: list[str] = []
+        poses: list[CameraPose] = []
+        event_index = 0
+
+        def activate(event: QueuedCameraEvent) -> None:
+            cancelled = self._activate_event(session, event)
+            if cancelled is not None:
+                completed.append(cancelled)
+            started.append(event.event_id)
+            if event.mode == "target" and event.transition_chunks == 0:
+                completed.append(self._clear_active_target(session))
+
+        def advance(duration: float) -> None:
+            event = session.active_event
+            if event is None or duration <= 0:
+                return
+            if event.mode == "velocity":
+                fraction = duration / control_step_seconds
+                whole_steps = int(fraction)
+                for _ in range(whole_steps):
+                    session.current_pose = _compose_pose(session.current_pose, event.pose)
+                remainder = fraction - whole_steps
+                if remainder > 0:
+                    # Fractional velocity is a power of one SE(3) delta. Using
+                    # quaternion nlerp here makes the result depend on where an
+                    # event happens to be split across control segments.
+                    session.current_pose = _compose_pose(session.current_pose, _pose_power(event.pose, remainder))
+            else:
+                event.elapsed_transition_frames += duration / slot_duration
+                event.elapsed_transition_chunks = event.elapsed_transition_frames / num_latent_frames
+                source = session.target_source or session.current_pose
+                alpha = min(1.0, event.elapsed_transition_chunks / event.transition_chunks)
+                session.current_pose = _lerp_pose(source, event.pose, alpha)
+                if math.isclose(alpha, 1.0, rel_tol=1e-12):
+                    completed.append(self._clear_active_target(session))
+
+        for latent_idx in range(num_latent_frames):
+            slot_start = window_start + latent_idx * slot_duration
+            slot_end = window_start + (latent_idx + 1) * slot_duration
+            cursor = slot_start
+            while event_index < len(mapped) and mapped[event_index][1] < slot_end:
+                event, mapped_at = mapped[event_index]
+                event_at = max(cursor, mapped_at)
+                advance(event_at - cursor)
+                activate(event)
+                cursor = event_at
+                event_index += 1
+            advance(slot_end - cursor)
+            poses.append(session.current_pose.clone())
+
+        # Late targets become visible in this chunk's last control sample;
+        # the extra wall-clock wait never advances a held velocity.
+        for event in late_targets:
+            activate(event)
+            if session.active_event is not None:
+                just_completed = self._step_one_frame(session, num_latent_frames)
+                if just_completed is not None:
+                    completed.append(just_completed)
+            poses[-1] = session.current_pose.clone()
+        session.last_boundary_at = boundary_at
+        active = [session.active_event.event_id] if session.active_event is not None else []
+        return poses, started, active, list(dict.fromkeys(completed)), coalesced
 
     def _step_one_chunk(
         self,
@@ -416,6 +554,67 @@ def _lerp_pose(source: CameraPose, target: CameraPose, alpha: float) -> CameraPo
 def _compose_pose(base: CameraPose, delta: CameraPose) -> CameraPose:
     """Apply ``delta`` after ``base`` in the session frame (T_new = T_base @ T_delta)."""
     return CameraPose.from_matrix(base.as_matrix() @ delta.as_matrix())
+
+
+def _pose_power(delta: CameraPose, fraction: float) -> CameraPose:
+    """Return the fractional SE(3) exponential of a per-step camera delta."""
+    fraction = min(1.0, max(0.0, fraction))
+    rotation = _quat_to_rotmat(delta.rotation)
+    omega = _so3_log(rotation)
+    theta = float(torch.linalg.vector_norm(omega))
+    omega_hat = _skew(omega)
+    theta_sq = theta * theta
+    if theta < 1e-8:
+        v_inv = torch.eye(3, dtype=torch.float64) - 0.5 * omega_hat + (1.0 / 12.0) * (omega_hat @ omega_hat)
+    else:
+        half = 0.5 * theta
+        cot_half = math.cos(half) / math.sin(half)
+        v_inv = (
+            torch.eye(3, dtype=torch.float64)
+            - 0.5 * omega_hat
+            + ((1.0 - half * cot_half) / theta_sq) * (omega_hat @ omega_hat)
+        )
+    rho = v_inv @ torch.tensor(delta.translation, dtype=torch.float64)
+    scaled_omega = fraction * omega
+    scaled_hat = _skew(scaled_omega)
+    scaled_theta = fraction * theta
+    if scaled_theta < 1e-8:
+        scaled_v = torch.eye(3, dtype=torch.float64) + 0.5 * scaled_hat + (1.0 / 6.0) * (scaled_hat @ scaled_hat)
+    else:
+        scaled_theta_sq = scaled_theta * scaled_theta
+        scaled_v = (
+            torch.eye(3, dtype=torch.float64)
+            + ((1.0 - math.cos(scaled_theta)) / scaled_theta_sq) * scaled_hat
+            + ((scaled_theta - math.sin(scaled_theta)) / (scaled_theta_sq * scaled_theta)) * (scaled_hat @ scaled_hat)
+        )
+    scaled_rotation = torch.linalg.matrix_exp(scaled_hat)
+    scaled_translation = scaled_v @ (fraction * rho)
+    return CameraPose.from_matrix(
+        torch.cat(
+            [
+                torch.cat([scaled_rotation, scaled_translation.reshape(3, 1)], dim=1),
+                torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=torch.float64),
+            ],
+            dim=0,
+        )
+    )
+
+
+def _skew(vector: torch.Tensor) -> torch.Tensor:
+    x, y, z = (float(value) for value in vector)
+    return torch.tensor([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=torch.float64)
+
+
+def _so3_log(rotation: torch.Tensor) -> torch.Tensor:
+    """Return the principal rotation vector for a 3x3 rotation matrix."""
+    x, y, z, w = _rotmat_to_quat(rotation)
+    if w < 0.0:
+        x, y, z, w = -x, -y, -z, -w
+    vector = torch.tensor((x, y, z), dtype=torch.float64)
+    norm = float(torch.linalg.vector_norm(vector))
+    if norm < 1e-8:
+        return 2.0 * vector
+    return vector * (2.0 * math.atan2(norm, w) / norm)
 
 
 def _quat_normalize(q: Quat) -> Quat:

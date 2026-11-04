@@ -17,9 +17,10 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
+@pytest.mark.cpu
 def test_batch_preprocess_projects_new_non_streaming_texts_once():
     torch.manual_seed(0)
     text_embedding = torch.nn.Embedding(64, 4)
@@ -106,6 +107,7 @@ def _prompt_builder() -> Qwen3TTSPromptEmbedsBuilder:
     return builder
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("task_type", ["CustomVoice", "VoiceDesign"])
 @pytest.mark.parametrize("non_streaming", [False, True])
 @pytest.mark.parametrize("instruct", ["Speak calmly", ""])
@@ -143,7 +145,7 @@ def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: s
         assert not batched._batched_text_embeds
 
 
-@hardware_test(res={"cuda": ["L4", "H100", "H200"]})
+@hardware_test(res={"cuda": ["L4", "H100", "H200"], "rocm": "MI325"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("allow_table", [False, True])
 @torch.inference_mode()

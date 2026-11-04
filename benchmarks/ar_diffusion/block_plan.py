@@ -26,11 +26,11 @@ class BlockPlan:
         schedule = native.schedule
         groups = schedule.layer_groups
         blocks = schedule.num_blocks
-        if blocks % groups or schedule.stages != schedule.num_denoise_steps + 1:
+        if blocks % groups or schedule.step_replicas != schedule.num_denoise_steps + 1:
             raise ValueError("block transport requires equal partitions and one rank per stage/group")
         if schedule.ordering is not Ordering.LATEST_KV or schedule.kv_history_chunks < 1:
             raise ValueError("block transport requires Latest-KV execution with positive history")
-        self.blocks, self.stages, self.chunks = blocks, schedule.stages, schedule.chunks
+        self.blocks, self.stages, self.chunks = blocks, schedule.step_replicas, schedule.chunks
         self.world, self.history = native.world, schedule.kv_history_chunks
         self.blocks_per_rank = blocks // groups
         self.by_key, self.by_tick, self.reads, self.destinations = {}, {}, {}, {}

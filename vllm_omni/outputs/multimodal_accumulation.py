@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 import torch
@@ -34,6 +37,61 @@ def replace_snapshot_keys(
         if _is_chunk_metadata_key(key):
             accumulated.tensors.pop(key, None)
             accumulated.metadata.pop(key, None)
+
+
+# NemotronVoiceChat talker snapshots for the client-facing accumulator.
+#
+# Each talker wake re-ships the whole reply so far instead of a per-step delta:
+# ``codes.audio`` is the cumulative [frames, Q] code stack and the meta counters
+# are that wake's values. Appending them as deltas stores the sum of every
+# prefix seen (storage grows with stream length and the emitted tensor repeats
+# historical rows), so a wake carrying the talker's marker replaces its own
+# previous snapshot values, leaving storage proportional to the current prefix.
+# The marker keeps this scoped to Nemotron: other producers emitting genuine
+# per-chunk deltas under the same keys keep accumulating.
+#
+# Mirrors ``_FULL_PAYLOAD_REPLACE_KEYS`` in
+# ``vllm_omni/model_executor/stage_input_processors/nemotron_voicechat.py``;
+# duplicated because the client-side output process never imports the model's
+# worker-side stage input processor.
+_NEMOTRON_SNAPSHOT_MARKER = "nvc_logical_prompt_len"
+_NEMOTRON_SNAPSHOT_KEYS = frozenset(
+    {
+        "codes.audio",
+        # Talker emits these per wake as tensors (talker.py _emit / preprocess
+        # meta), so they would otherwise concatenate across wakes.
+        "meta.nvc_tts_step",
+        "meta.nvc_logical_prompt_len",
+        "meta.codec_streaming",
+    }
+)
+
+
+def _has_meta_marker(payload: MultimodalPayload, marker: str) -> bool:
+    """Whether *payload* carries *marker* in nested or flattened form."""
+    if marker in payload or f"meta.{marker}" in payload:
+        return True
+    meta = payload.metadata.get("meta")
+    return isinstance(meta, dict) and marker in meta
+
+
+def replace_nemotron_snapshot_keys(
+    accumulated: MultimodalPayload,
+    incoming: MultimodalPayload,
+) -> None:
+    """Drop prior Nemotron snapshot values for keys present in *incoming*.
+
+    Only payloads carrying the talker's marker take REPLACE semantics, and keys
+    absent from *incoming* are left untouched so a metadata-only wake does not
+    erase content accumulated by an earlier one.
+    """
+    if not _has_meta_marker(incoming, _NEMOTRON_SNAPSHOT_MARKER):
+        return
+    for key in _NEMOTRON_SNAPSHOT_KEYS:
+        if key not in incoming:
+            continue
+        accumulated.tensors.pop(key, None)
+        accumulated.metadata.pop(key, None)
 
 
 def drain_delta_payload(payload: MultimodalPayload) -> None:
