@@ -72,7 +72,7 @@ COVO_AUDIO_THINKER_ONLY_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
-            engine_output_type="latent",
+            engine_output_type="text",
             sampling_constraints={
                 "detokenize": True,
                 "stop_token_ids": [151645],
