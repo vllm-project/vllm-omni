@@ -58,6 +58,9 @@ EXCLUDED_MODELS = [
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
+    # Loads a single upstream model.safetensors + T5Gemma, no diffusers tiny
+    # config; covered by the gated-checkpoint offline/online E2E tests.
+    "StableAudio3Pipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
     "WanT2VDMD2Pipeline",
@@ -116,6 +119,15 @@ EXCLUDED_MODELS = [
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Segmentation, not generation: the tiny-model suite checks generated
+    # images/videos. Covered by tests/diffusion/models/sam3 and the
+    # /v1/images/segmentations endpoint tests.
+    "Sam3Model",
+    "Sam3VideoModel",
+    # Depth estimation, not generation. Covered by
+    # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
+    # endpoint tests.
+    "VideoDepthAnythingPipeline",
 ]
 
 

@@ -10,8 +10,8 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
-import threading
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -54,6 +54,7 @@ from vllm_omni.utils.mm_outputs import (
     partition_payload_list,
     snapshot_mm_payload,
 )
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
@@ -98,7 +99,9 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
         return {k: _clone_cuda_tensor_payload(v, sources) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         if (
-            value
+            # A single tensor needs only a clone/copy. Packing it adds cat,
+            # flattening, and CPU view construction without batching any work.
+            len(value) > 1
             and all(
                 isinstance(v, torch.Tensor)
                 and v.is_cuda
@@ -221,6 +224,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self,
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        output_executor: Executor,
         cuda_device: torch.device | int | str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -265,15 +269,8 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self.async_copy_ready_event.record()
 
         self._model_runner_output_builder: Callable[[], OmniModelRunnerOutput] | None = model_runner_output_builder
-        self._background_exception: BaseException | None = None
-        self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
-        self._background_thread = threading.Thread(
-            target=self._build_output_in_background,
-            daemon=True,
-            name="omni-async-output-builder",
-        )
-        self._background_thread.start()
+        self._background_future: Future[None] = output_executor.submit(self._build_output_in_background)
 
     def _build_model_runner_output_once(self) -> None:
         if self._model_runner_output is not None:
@@ -284,21 +281,15 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._model_runner_output_builder = None
 
     def _build_output_in_background(self) -> None:
-        try:
-            if self._cuda_device is not None:
-                torch.cuda.set_device(self._cuda_device)
-            self._build_model_runner_output_once()
-        except BaseException as exc:  # noqa: BLE001 - re-raised by get_output().
-            self._background_exception = exc
+        if self._cuda_device is not None:
+            torch.cuda.set_device(self._cuda_device)
+        self._build_model_runner_output_once()
 
     def get_output(self) -> OmniModelRunnerOutput:
-        background_thread = getattr(self, "_background_thread", None)
-        if background_thread is not None:
-            background_thread.join()
-            self._background_thread = None
-            background_exception = getattr(self, "_background_exception", None)
-            if background_exception is not None:
-                raise background_exception
+        background_future = getattr(self, "_background_future", None)
+        if background_future is not None:
+            # Future.result preserves the builder exception for repeated reads.
+            background_future.result()
         self._build_model_runner_output_once()
         # Upstream AsyncGPUModelRunnerOutput.get_output() accesses
         # self._has_fault for EP all2all fault tolerance (PR #43637).
@@ -390,6 +381,7 @@ class GPUARModelRunner(
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._omni_output_executor: ThreadPoolExecutor | None = None
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -490,6 +482,10 @@ class GPUARModelRunner(
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
 
+    def initialize_kv_cache(self, *args, **kwargs) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        validate_duplex_kv_cache(self)
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
@@ -498,44 +494,7 @@ class GPUARModelRunner(
 
     def _maybe_apply_duplex_window_reanchor(self, scheduler_output: SchedulerOutput | None = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
-        reanchor_hook = getattr(getattr(self, "model", None), "apply_duplex_kv_reanchor", None)
-        if callable(reanchor_hook):
-            try:
-                reanchor_hook(self, scheduler_output=scheduler_output)
-            except TypeError:
-                reanchor_hook(self)
-            return
-
-        helper = getattr(self, "_duplex_window_helper", None)
-        if helper is not None and hasattr(helper, "maybe_apply_reanchor"):
-            try:
-                helper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
-            except TypeError:
-                helper.maybe_apply_reanchor(self)
-            return
-
-        # Fallback for dynamic runner inspection without hardcoding model classes
-        if not hasattr(self, "input_batch") or self.input_batch is None:
-            return
-        num_reqs = getattr(self.input_batch, "num_reqs", 0)
-        req_ids = self.input_batch.req_ids[:num_reqs]
-        has_reanchor = False
-        for req_id in req_ids:
-            info = self.model_intermediate_buffer.get(req_id)
-            if isinstance(info, dict) and isinstance(info.get("duplex"), dict):
-                if "stage0_reanchor" in info["duplex"]:
-                    has_reanchor = True
-                    break
-        if not has_reanchor:
-            return
-
-        model_module = getattr(getattr(self, "model", None), "__module__", "")
-        if "minicpmo_4_5" in model_module:
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-                MiniCPMO45DuplexWorkerHelper,
-            )
-
-            MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
+        apply_duplex_window_reanchor(self, scheduler_output)
 
     def _maybe_apply_stage0_reanchor(self) -> None:
         """Backward-compatible alias for _maybe_apply_duplex_window_reanchor."""
@@ -674,6 +633,13 @@ class GPUARModelRunner(
         exit that can trigger GPU OOM signals when the parent process
         concurrently cleans up its own GPU state.
         """
+        # Builders retain runner-owned connector state and GPU snapshots.
+        # Drain them before tearing down either resource.
+        output_executor = getattr(self, "_omni_output_executor", None)
+        if output_executor is not None:
+            output_executor.shutdown(wait=True)
+            self._omni_output_executor = None
+
         # 1. Unfreeze GC so model weights and GPU tensors are collected
         #    immediately when references are dropped (upstream Worker.shutdown
         #    also does this before any teardown).
@@ -2479,8 +2445,15 @@ class GPUARModelRunner(
                 num_nans=num_nans,
             )
             if use_async_omni_output:
+                if self._omni_output_executor is None:
+                    # One worker preserves step submission order and avoids
+                    # creating a Python thread for every decode step.
+                    self._omni_output_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="omni-async-output-builder"
+                    )
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
+                    output_executor=self._omni_output_executor,
                     cuda_device=self.device,
                     **async_output_kwargs,
                 )

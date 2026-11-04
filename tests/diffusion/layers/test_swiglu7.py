@@ -7,7 +7,7 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers import swiglu7 as kernel_module
 from vllm_omni.diffusion.layers.swiglu7 import SwiGLU7
-from vllm_omni.diffusion.models.magi2 import layers as magi2_layers
+from vllm_omni.diffusion.models.magi2 import common_layers as magi2_layers
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 

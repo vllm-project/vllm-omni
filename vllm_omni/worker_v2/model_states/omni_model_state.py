@@ -41,7 +41,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
 from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
@@ -102,6 +102,7 @@ class OmniModelState(DefaultModelState):
     _decode_preprocess_is_identity = False
     _has_mtp = False
     preprocess_keeps_mm_inputs = False
+    _supports_prefill_token_mask = False
 
     def __init__(
         self,
@@ -147,6 +148,7 @@ class OmniModelState(DefaultModelState):
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
+        self._supports_prefill_token_mask = bool(getattr(model, "supports_prefill_token_mask", False))
         self._decode_preprocess = self._resolve_decode_preprocess(model)
         self._decode_preprocess_is_identity = bool(getattr(model, "mrv2_decode_preprocess_is_identity", False))
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
@@ -213,8 +215,16 @@ class OmniModelState(DefaultModelState):
 
     def prepare_streaming_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
-    ) -> StreamingAudioOutput | None:
+    ) -> StreamingAudioSnapshot | None:
         return self._mtp_state.prepare_audio_output(input_batch, req_states, outputs)
+
+    def get_request_errors(self) -> tuple[torch.Tensor, str] | None:
+        """Optional owned per-row failure mask and reason for the current step.
+
+        The runner copies the mask with its other outputs and only reads it
+        after D2H completes. A failure terminates that request, not the batch.
+        """
+        return None
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._mtp_state.finish_audio(req_ids)
@@ -357,6 +367,38 @@ class OmniModelState(DefaultModelState):
             model_specific_attn_metadata=model_specific_attn_metadata,
         )
 
+    @staticmethod
+    def _build_prefill_token_mask(input_batch: InputBatch) -> bool | torch.Tensor:
+        """Use CPU phase metadata, including one-token and resumed prefills.
+
+        Query boundaries describe the actual flattened tokens, unlike scheduled
+        counts which can be upper bounds under adaptive verification. Tokens
+        within each row must be contiguous; sparse scheduling needs an explicit
+        token-position-aligned mask instead.
+        """
+        if not input_batch.has_prefill:
+            return False
+        # These CPU arrays are already reordered into batch order. prefill_len
+        # also includes safe codec output tokens replayed after preemption.
+        starts = input_batch.query_start_loc_np[: input_batch.num_reqs + 1]
+        counts = np.diff(starts)
+        num_prefill = np.minimum(
+            np.maximum(
+                input_batch.prefill_len_np[: input_batch.num_reqs]
+                - input_batch.num_computed_prefill_tokens_np[: input_batch.num_reqs],
+                0,
+            ),
+            counts,
+        )
+        if not np.any(num_prefill):
+            return False
+        if np.array_equal(num_prefill, counts):
+            return True
+        mask = np.zeros(input_batch.num_tokens, dtype=np.bool_)
+        for start, count in zip(starts[:-1], num_prefill):
+            mask[start : start + count] = True
+        return torch.from_numpy(mask).to(device=input_batch.input_ids.device)
+
     def prepare_inputs_embeds(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
@@ -374,6 +416,8 @@ class OmniModelState(DefaultModelState):
         self.execute_mm_encoder(scheduled_encoder_inputs)
         mm_embeds, is_mm_embed = self.gather_mm_embeddings(input_batch)
         kwargs: dict[str, Any] = {"multimodal_embeddings": mm_embeds, "is_multimodal": is_mm_embed}
+        if self._supports_prefill_token_mask:
+            kwargs["prefill_token_mask"] = self._build_prefill_token_mask(input_batch)
         if mm_embeds:
             kwargs["query_start_loc"] = input_batch.query_start_loc_np[: input_batch.num_reqs + 1].tolist()
         embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens], **kwargs)
@@ -797,10 +841,12 @@ class OmniModelState(DefaultModelState):
             )
             for entry, updates in zip(decode_entries, updates_by_req, strict=True):
                 i, req_idx, start, _, _, _ = entry
-                decode_mtp_rows.append((i, start))
+                if self._has_mtp:
+                    decode_mtp_rows.append((i, start))
                 batched_indices.add(i)
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
-            text_step_batches.append(batch_text_step.reshape(batch_size, -1))
+            if self._has_mtp:
+                text_step_batches.append(batch_text_step.reshape(batch_size, -1))
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:
             if i in batched_indices:

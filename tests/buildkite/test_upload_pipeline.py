@@ -494,53 +494,47 @@ def _iter_steps(doc: dict):
 
 
 @pytest.mark.parametrize(
-    "pipeline_path,legacy_keys,seed_tts_key",
+    "pipeline_path,legacy_keys",
     [
         (
             NIGHTLY_YAML,
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
-            "nightly-omni-performance-qwen3-seed-tts",
         ),
         (
             Path(".buildkite/cuda/test-weekly.yml"),
             {"weekly-omni-performance-vllm-text", "weekly-omni-performance-multi-replicas"},
-            None,
         ),
         (
             Path(".buildkite/npu/test-npu-nightly.yml"),
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
-            None,
         ),
     ],
 )
 @pytest.mark.parametrize(
-    "changed_file,select_legacy,select_seed_tts",
+    "changed_file,select_legacy",
     [
-        ("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json", False, True),
-        ("vllm_omni/benchmarks/realtime_seed_tts.py", False, True),
-        ("vllm_omni/benchmarks/patch/patch.py", False, True),
-        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False, True),
-        ("vllm_omni/clients/duplex.py", False, True),
-        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False, True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True, False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True, False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True, False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True, False),
-        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True, True),
-        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True, True),
-        ("tests/dfx/perf/scripts/run_benchmark.py", True, True),
+        ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
+        ("vllm_omni/clients/duplex.py", False),
+        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
+        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
+        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
+        ("tests/dfx/perf/scripts/run_benchmark.py", True),
     ],
 )
 def test_qwen3_perf_pipeline_selection(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_path: Path,
     legacy_keys: set[str],
-    seed_tts_key: str | None,
     changed_file: str,
     select_legacy: bool,
-    select_seed_tts: bool,
 ) -> None:
-    """Isolate Seed-TTS inputs across real CUDA/NPU pipelines, retaining shared model inputs."""
+    """Keep realtime-only inputs from selecting legacy CUDA/NPU perf jobs."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     _load_source_file_dependencies.cache_clear()
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -549,11 +543,8 @@ def test_qwen3_perf_pipeline_selection(
 
     # Compare the dependency-filtered Qwen perf jobs. The weekly random job has
     # no source dependencies and remains unconditional under source filtering.
-    tracked_keys = legacy_keys | ({seed_tts_key} if seed_tts_key else set())
     expected_keys = set(legacy_keys) if select_legacy else set()
-    if select_seed_tts and seed_tts_key:
-        expected_keys.add(seed_tts_key)
-    assert surviving_keys & tracked_keys == expected_keys
+    assert surviving_keys & legacy_keys == expected_keys
 
 
 def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
