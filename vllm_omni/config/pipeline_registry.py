@@ -33,6 +33,9 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
+from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
+from vllm_omni.diffusion.models.physis.wan.pipeline_config import PHYSIS_WAN_PIPELINE
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
@@ -80,6 +83,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
+from vllm_omni.model_executor.models.kokoro.pipeline import KOKORO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
@@ -188,6 +192,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
+    "kokoro": KOKORO_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     # Public Ming-3.0-tts-tiny still serializes the former config name.
@@ -223,6 +228,9 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "nemotron_voicechat": NEMOTRON_VOICECHAT_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
+    "physis_h3": PHYSIS_H3_PIPELINE,
+    "physis_ltx": PHYSIS_LTX_PIPELINE,
+    "physis_wan": PHYSIS_WAN_PIPELINE,
     "pi0": PI0_PIPELINE,
     "pi05": PI05_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,

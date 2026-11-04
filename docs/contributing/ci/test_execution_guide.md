@@ -15,12 +15,23 @@ vLLM-Omni is built based on vLLM. You can follow [install guide](../../getting_s
 
 ### Test Case Dependencies
 
-When running test cases, you may need to install the following dependencies:
+After installing the matching platform runtime, run from the repository root.
+The `[dev]` extra includes VoxCPM 2.0.3 and its Gradio dependency; use the
+[temporary source backport](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+in the same dependency install. These setup commands do not establish CI or
+native model acceptance.
 
 ```bash
-uv pip install ".[dev]"
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install ".[dev]" \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 apt-get install -y espeak-ng jq
 ```
+
+The CUDA CI image verifies the vLLM 0.33 runtime and imports the rebuilt
+`lmcache.cuda_ops` before model tests. See the installation guide for the
+base-image dependency repairs; metadata checks alone do not verify native ABI.
 
 ## Running Tests
 

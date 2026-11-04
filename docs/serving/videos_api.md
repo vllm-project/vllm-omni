@@ -375,6 +375,28 @@ The server streams source files to temporary request-scoped storage and removes
 them after synchronous or asynchronous generation finishes. Models that do not
 declare latent-mask editing support reject these fields.
 
+### MiniMax H3 Regenerate
+
+A server started with the
+[Open-H3-Regenerate-2K](gh-file:recipes/Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md)
+release re-renders a 768P H3 draft at a higher resolution. Send the draft as
+`source_video` with `extra_params` `{"regenerate": true}` and no noise masks;
+`width`, `height` and the frame count describe the draft canvas, and
+`latent_upscale` the output size (2560x1440 by default):
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=The prompt the draft was generated from" \
+  -F "width=1344" -F "height=768" -F "aspect_ratio=16:9" -F "num_frames=124" -F "fps=24" \
+  -F 'extra_params={"task":"t2va","regenerate":true}' \
+  -F "source_video=@draft.mp4;type=video/mp4" \
+  -o regenerated.mp4
+```
+
+The output is refined at the upscaled size, so `latent_upscale` must land on
+the 32-pixel grid (`align` 32, the default). A regenerated video is not cached
+for `continue_from`: continue the draft, then regenerate the result.
+
 ### MiniMax H3 Timeline Guides
 
 MiniMax H3 accepts ordered timeline guides: a still image or a clip, optionally

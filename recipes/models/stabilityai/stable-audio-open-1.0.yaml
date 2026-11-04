@@ -29,8 +29,8 @@ omni:
     - t2a
 
 dependencies:
-  - note: "vLLM 0.22.0 or newer"
-    command: "uv pip install 'vllm>=0.22.0'"
+  - note: "Final vLLM 0.33.0 for this source checkout"
+    command: "uv pip install --torch-backend=cu130 vllm==0.33.0"
   - note: "vllm-omni provides the audio generation backend"
     command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
   - note: "soundfile (recommended) or scipy for WAV output"

@@ -93,3 +93,38 @@ def test_partial_profiler_start_attempts_cleanup_and_preserves_error(cleanup: st
         assert not active_stages
     else:
         assert "cleanup failed" in caplog.text
+
+
+@pytest.mark.parametrize("failed_stage", [False, True])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "profile_prefix": "benchmark",
+            "delay_iterations": 2,
+            "max_iterations": 3,
+            "profiler_kwargs": {"record_shapes": False},
+        },
+        {"profile_prefix": "", "delay_iterations": 0, "max_iterations": 0, "profiler_kwargs": {}},
+    ],
+)
+def test_profiler_session_overrides_preserve_rpc_error_handling(overrides, failed_stage, mocker) -> None:
+    engine_client = mocker.AsyncMock(spec=api_server.AsyncOmni)
+    detail = "stage 1: bad trace directory"
+    engine_client.start_profile.return_value = [None, {"supported": False, "error": detail}] if failed_stage else [None]
+    engine_client.stop_profile.return_value = [None]
+    app = FastAPI()
+    app.include_router(api_server.profiler_router)
+    app.state.engine_client = engine_client
+
+    response = TestClient(app).post("/start_profile", json={"stages": [0, 1], **overrides})
+
+    engine_client.start_profile.assert_awaited_once_with(stages=[0, 1], **overrides)
+    if failed_stage:
+        assert response.status_code == 500
+        assert response.json() == {"detail": f"Failed to start profiler: {detail}"}
+        engine_client.stop_profile.assert_awaited_once_with(stages=[0, 1])
+    else:
+        assert response.status_code == 200
+        assert response.json() == {"status": "SUCCESS"}
+        engine_client.stop_profile.assert_not_awaited()
