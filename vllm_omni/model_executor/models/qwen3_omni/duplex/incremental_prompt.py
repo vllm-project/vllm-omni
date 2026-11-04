@@ -98,7 +98,7 @@ class QwenIncrementalPrompt:
     def complete_turn(self, prompt: dict, request: OmniEngineCoreRequest, prefix: list[int] | None) -> None:
         if prefix is not None:
             request.append_prefix_length = len(prefix)
-            request.prompt_token_ids = prefix + list(request.prompt_token_ids or ())
+            request.prompt_token_ids = prefix + (request.prompt_token_ids or [])
         self._history = prompt.get(HISTORY_KEY)
         self._prompt_text = prompt["prompt"]
         self._prompt_ids = list(request.prompt_token_ids or ())
