@@ -29,13 +29,25 @@ def _voice_prompt(path):
     )
 
 
-def _candidate(enabled=True):
+def _candidate(enabled=True, *, mixed_history=False):
     model, core = _model(setup_cache_size=16)
     core._prepare_prompt = _voice_prompt
     core.flow.decoder.rand_noise = torch.zeros(1, 1, 1024)
     model._npu_cross_reference_batching = enabled
+    model._npu_mixed_history_batching = mixed_history
     backend = model.backend
     backend._ragged_fused_body = True
+    if mixed_history:
+        # This fixture exercises dispatch/state ownership with a synthetic
+        # estimator, not real DiT blocks. Its output and cache markers depend
+        # only on the first valid frame, so padding does not change them.
+        # Trained-weight NPU tests validate the actual ragged fused kernel.
+        def fake_ragged_body(estimator, inputs, time, mask, cnn, att, cnn_out, att_out, lengths):
+            assert len(lengths) == inputs.shape[0]
+            assert all(0 < length <= inputs.shape[-1] for length in lengths)
+            return estimator.blocks_forward_chunk(inputs, time, mask, cnn, att, cnn_out, att_out)
+
+        backend._ragged_body = fake_ragged_body
     calls = []
 
     def replay(**kwargs):
@@ -43,7 +55,7 @@ def _candidate(enabled=True):
         # Real NPUGraph numerical parity is covered by the NPU test file.
         if kwargs.get("prompt_lengths") is not None:
             caches = kwargs["att_cache"]
-            if isinstance(caches, list):
+            if isinstance(caches, list) and not mixed_history:
                 assert len({int(cache.shape[4]) for cache in caches}) == 1
             calls.append(int(kwargs["x"].shape[0]))
         return None
@@ -482,3 +494,59 @@ def test_existing_npu_mixed_history_guard_is_preserved(monkeypatch):
     )
 
     test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch)
+
+
+@pytest.mark.parametrize("batch", [2, 3, 4])
+def test_ragged_npu_inputs_match_independent_streams(batch):
+    model, core, calls = _candidate(mixed_history=True)
+    independent_pairs = [_candidate(False) for _ in range(batch)]
+    independent = [value[0] for value in independent_pairs]
+
+    def variable_prompt(path):
+        values = list(_voice_prompt(path))
+        row = int(path.rsplit("-", 1)[-1].split(".")[0])
+        values[0] = torch.arange(5, 7 + row).reshape(1, -1)
+        values[1] = torch.tensor([2 + row], dtype=torch.int32)
+        values[3] = torch.full((1, 4 + row, 1), float(row + 1))
+        values[4] = torch.tensor([4 + row], dtype=torch.int32)
+        return tuple(values)
+
+    core._prepare_prompt = variable_prompt
+    for _, single_core, _ in independent_pairs:
+        single_core._prepare_prompt = variable_prompt
+    for chunk in range(10):
+        infos = [_request(row, chunk, count=12 + 2 * row, last=chunk == 9) for row in range(batch)]
+        calls.clear()
+        actual = _forward(model, infos)
+        assert calls == [batch], "Encoder subgroups must converge into one CFM solve"
+        for row, single in enumerate(independent):
+            expected = _forward(single, [infos[row]])
+            torch.testing.assert_close(
+                actual.multimodal_outputs["model_outputs"][row],
+                expected.multimodal_outputs["model_outputs"][0],
+            )
+            if chunk != 9:
+                state = model._states[f"voice-{row}"].token2wav
+                reference = single._states[f"voice-{row}"].token2wav
+                for name, cache in reference.flow_cache.items():
+                    torch.testing.assert_close(state.flow_cache[name], cache)
+                for name, cache in reference.hift_cache.items():
+                    torch.testing.assert_close(state.hift_cache[name], cache)
+    assert not model._states
+
+
+def test_ragged_npu_groups_allow_lengths_but_keep_hift_boundary():
+    items, states, features = _prepared_rows()
+    states[1].flow_cache["conformer_att_cache"] = torch.cat([states[1].flow_cache["conformer_att_cache"]] * 2, dim=3)
+    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=4)
+    features[1] = replace(
+        features[1],
+        speech_tokens=torch.cat([features[1].speech_tokens] * 2, dim=1),
+        mels=torch.cat([features[1].mels] * 2, dim=1),
+    )
+    items[1] = replace(items[1], tokens=items[1].tokens[:3], last_chunk=True)
+    group = MiniCPMO45Code2Wav._npu_same_shape_groups
+    assert group(items, states, features, cross_turn=False, mixed_history=True) == [[0, 1]]
+    assert group(items, states, features, cross_turn=False) == [[0], [1]]
+    states[1].hift_cache["mel"] = torch.nn.functional.pad(states[1].hift_cache["mel"], (0, 1))
+    assert group(items, states, features, cross_turn=False, mixed_history=True) == [[0], [1]]
