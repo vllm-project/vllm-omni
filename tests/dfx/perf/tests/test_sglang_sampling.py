@@ -60,6 +60,8 @@ def test_chat_ignore_eos_reaches_thinker_sampler(ignore_eos: bool | None) -> Non
             "attention_mask": torch.ones(3),
         }
     )
-    thinker = build_sglang_thinker_request(state, params=params, tokenizer=None, vocab_size=256)
+    thinker = build_sglang_thinker_request(
+        state, params=params, tokenizer=None, vocab_size=256, capture_prompt_hidden_states=False
+    )
     assert thinker.req.sampling_params.ignore_eos is (ignore_eos is True)
     assert thinker.req.sampling_params.max_new_tokens == 100
