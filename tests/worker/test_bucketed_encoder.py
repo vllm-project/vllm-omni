@@ -605,40 +605,6 @@ def test_qwen2audio_keyword_call_keeps_pooling_and_true_fallback(bucket_env):
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
-def test_covo_processor_carries_bucket_frames():
-    """P2: the concrete CovoAudio processor emits encoder_bucket_frames (from
-    raw audio sample counts) and registers it, so lengths survive the
-    raw-audio -> concrete-processor boundary."""
-    import numpy as np
-
-    from vllm_omni.model_executor.models.covo_audio.covo_audio import CovoAudioMultiModalProcessor
-
-    class _Tok:
-        def encode(self, s):
-            return [1, 2, 3]
-
-    class _FeatExt:
-        def __call__(self, raw_audios, sampling_rate, return_tensors):
-            return {"input_features": torch.zeros(len(raw_audios), 128, 3000)}
-
-    class _Info:
-        def get_tokenizer(self):
-            return _Tok()
-
-        def get_feature_extractor(self):
-            return _FeatExt()
-
-    proc = CovoAudioMultiModalProcessor.__new__(CovoAudioMultiModalProcessor)
-    proc.info = _Info()
-    proc.dummy_inputs = None
-
-    hf = proc._call_hf_processor("hi", {"audios": [(np.zeros(16000 * 3, dtype=np.float32), 16000)]}, {}, {})
-    assert torch.equal(hf["encoder_bucket_frames"], torch.tensor([300], dtype=torch.int64)), hf["encoder_bucket_frames"]
-
-    fields = proc._get_mm_fields_config(hf, {})
-    assert "encoder_bucket_frames" in fields
-
-
 def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch, restore_processor_hook):
     """The length-publishing processor hook must be installable from the
     frontend (which builds the processor and runs request preprocessing), not
@@ -809,35 +775,11 @@ def test_empty_batch_falls_back_to_original(bucket_env):
     assert out.shape == (0, 240, D), out.shape
 
 
-def test_encoder_bucket_frames_keep_on_cpu(bucket_env):
-    """encoder_bucket_frames must be registered keep_on_cpu, so the serving path
-    never moves it to device and frames.tolist() stays a CPU op (no D2H sync)."""
+def test_encoder_bucket_frames_d2h_sync(bucket_env):
+    """The bucketed wrapper reads encoder_bucket_frames on the host without a
+    D2H sync. The keep_on_cpu field config is declared by the processor hook
+    (not the model). CPU frames must not sync; CUDA frames do."""
 
-    from vllm_omni.model_executor.models.covo_audio.covo_audio import CovoAudioMultiModalProcessor
-
-    class _Tok:
-        def encode(self, s):
-            return [1, 2, 3]
-
-    class _FeatExt:
-        def __call__(self, raw_audios, sampling_rate, return_tensors):
-            return {"input_features": torch.zeros(len(raw_audios), 128, 3000)}
-
-    class _Info:
-        def get_tokenizer(self):
-            return _Tok()
-
-        def get_feature_extractor(self):
-            return _FeatExt()
-
-    # Concrete CovoAudio processor registers the field keep_on_cpu.
-    proc = CovoAudioMultiModalProcessor.__new__(CovoAudioMultiModalProcessor)
-    proc.info = _Info()
-    proc.dummy_inputs = None
-    fields = proc._get_mm_fields_config({}, {})
-    assert fields["encoder_bucket_frames"].field.keep_on_cpu is True
-
-    # The D2H hazard this avoids: .tolist() on a CUDA tensor syncs.
     model = ToyModel().cuda()
     install_bucketed_encoders(model)
     feats = make_features()
