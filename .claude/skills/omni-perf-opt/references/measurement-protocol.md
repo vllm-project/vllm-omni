@@ -131,9 +131,10 @@ belong to the `vllm-omni-test` skill.
 - Freeze the physical device allocation and record other device activity. On
   shared hardware, use the site's reservation mechanism. `npu run`, where
   provided, is a site-specific reservation wrapper, not a CANN or torch-npu
-  command; confirm the local wrapper before invoking it. Record Ascend model, driver/CANN, torch-npu, vllm-ascend,
-  attention backend, and graph switches for NPU results. NVIDIA MPS, CUDA
-  profiling tools, and CUDA graph support do not transfer automatically to NPU.
+  command; confirm the local wrapper before invoking it. Record Ascend model,
+  driver/CANN, torch-npu, vllm-ascend, attention backend, and graph switches for
+  NPU results. NVIDIA MPS, CUDA profiling tools, and CUDA graph support do not
+  transfer automatically to NPU.
 - For a new model unsupported on base, label the control as the same integration
   with optimization switches off; do not call it an upstream-main measurement.
 - Prefer independent process repetitions in AB/BA order to reduce ordering bias.
