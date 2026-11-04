@@ -205,8 +205,11 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
         clip_score = clip_scorer.image_image_score(image, reference)
         metrics[label] = {"clip_score": clip_score, "ssim": ssim, "psnr": psnr}
         print(f"{label} clip_score: {clip_score:.6f}, required >= {_ACCURACY_THRESHOLDS['clip_score']}")
-        if clip_score < _ACCURACY_THRESHOLDS["clip_score"]:
-            clip_failures.append(f"{label}: clip_score={clip_score:.6f} < {_ACCURACY_THRESHOLDS['clip_score']}")
+        # Fail closed on NaN/Inf: ``nan < threshold`` is False, but ``not nan >= threshold`` is True.
+        if not clip_score >= _ACCURACY_THRESHOLDS["clip_score"]:
+            clip_failures.append(
+                f"{label}: clip_score={clip_score:.6f} does not meet >= {_ACCURACY_THRESHOLDS['clip_score']}"
+            )
     metrics_path = output_dir / "quality_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
     write_accuracy_result(

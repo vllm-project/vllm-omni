@@ -487,6 +487,26 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     ]
     print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
 
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={
+            "ssim": ssim_value,
+            "psnr": psnr_value,
+            "clip_score": image_clip_score,
+            "cot_semantic_sim": cot_results["cot_semantic_sim"],
+            "text_prefix_match_count": cot_results["text_prefix_match_count"],
+        },
+        baseline={
+            "ssim": thresholds["ssim"],
+            "psnr": thresholds["psnr"],
+            "clip_score": thresholds["clip_score"],
+            "cot_semantic_sim": thresholds["cot_semantic_sim"],
+            "text_prefix_match_count": thresholds["text_prefix_match"],
+        },
+        extra={"label": "online_vs_reference"},
+    )
+
     _assert_cot_structural_markers(online_cot, "ONLINE")
 
     assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
@@ -497,17 +517,6 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     )
     assert image_clip_score >= thresholds["clip_score"], (
         f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {thresholds['clip_score']}"
-    )
-    write_accuracy_result(
-        model_id=MODEL_NAME,
-        dataset="image_similarity",
-        metrics={"ssim": ssim_value, "psnr": psnr_value, "clip_score": image_clip_score},
-        baseline={
-            "ssim": thresholds["ssim"],
-            "psnr": thresholds["psnr"],
-            "clip_score": thresholds["clip_score"],
-        },
-        extra={"label": "online_vs_reference"},
     )
     assert_similarity_metrics(
         model_name=model_label,
@@ -624,6 +633,26 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
 
     print(tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
 
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={
+            "ssim": ssim_value,
+            "psnr": psnr_value,
+            "clip_score": image_clip_score,
+            "cot_semantic_sim": cot_results["cot_semantic_sim"],
+            "text_prefix_match_count": cot_results["text_prefix_match_count"],
+        },
+        baseline={
+            "ssim": thresholds["ssim"],
+            "psnr": thresholds["psnr"],
+            "clip_score": thresholds["clip_score"],
+            "cot_semantic_sim": thresholds["cot_semantic_sim"],
+            "text_prefix_match_count": thresholds["text_prefix_match"],
+        },
+        extra={"label": "offline_vs_reference"},
+    )
+
     _assert_cot_structural_markers(omni_cot, "OFFLINE")
 
     assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
@@ -634,17 +663,6 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     )
     assert image_clip_score >= thresholds["clip_score"], (
         f"Image-Image similarity{image_clip_score:.4f} is below threshold {thresholds['clip_score']}"
-    )
-    write_accuracy_result(
-        model_id=MODEL_NAME,
-        dataset="image_similarity",
-        metrics={"ssim": ssim_value, "psnr": psnr_value, "clip_score": image_clip_score},
-        baseline={
-            "ssim": thresholds["ssim"],
-            "psnr": thresholds["psnr"],
-            "clip_score": thresholds["clip_score"],
-        },
-        extra={"label": "offline_vs_reference"},
     )
     assert_similarity_metrics(
         model_name=model_label,
