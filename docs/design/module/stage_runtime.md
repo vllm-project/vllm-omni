@@ -116,6 +116,11 @@ declared lost.
 **Rule:** Repeated shutdown or cleanup signals MUST NOT leak stage clients,
 process managers, or membership registrations.
 
+On POSIX, a local LLM stage wakes its input queue when it receives a signal.
+This lets an idle worker's main thread run its shutdown handler even when
+another thread received SIGTERM. The stage process manager allows 15 seconds
+for cleanup by default and preserves an explicitly supplied timeout.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for
