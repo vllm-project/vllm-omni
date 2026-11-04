@@ -319,6 +319,7 @@ async def test_streaming_speech_does_not_finalize_continuity_on_validation_error
 
     adapter = SimpleNamespace(
         validates_generation=True,
+        entry_stage_id=0,
         validate_generation=reject_generation,
         validate_stream_audio=lambda **_kwargs: None,
     )

@@ -113,7 +113,7 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_type", ["dummy", "drvexo_speech_8b"])
+@pytest.mark.parametrize("model_type", ["dummy", "drvexo_speech_8b", "drvexo_speech_qwen35_4b"])
 @pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
 async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_type, tracing_mode):
     import httpx
@@ -179,7 +179,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
-        if model_type == "drvexo_speech_8b":
+        if model_type in ("drvexo_speech_8b", "drvexo_speech_qwen35_4b"):
             assert app.state.drvexo_decision_limiter.total_tokens == 1
             assert app.state.drvexo_speech_tokenizer is tokenizer
             assert loaded == ["local-bundle"]

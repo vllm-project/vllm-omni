@@ -87,7 +87,7 @@ class DRVEXOSpeech8BTalker(Qwen3TTSTalkerForConditionalGeneration):
 
             if not self.source_tokenizer_path:
                 raise ValueError("Generated-token routing requires the source tokenizer")
-            self._lexical_router = GeneratedTokenRouter(
+            self._lexical_router = self._make_lexical_router(
                 AutoTokenizer.from_pretrained(self.source_tokenizer_path, local_files_only=True),
                 self._prompt_builder.get_text_tokenizer(),
             )
@@ -117,21 +117,25 @@ class DRVEXOSpeech8BTalker(Qwen3TTSTalkerForConditionalGeneration):
                         provenance,
                         len(ids) - 8,
                     )
-            info.setdefault(
-                "voice_clone_prompt",
-                [
-                    {
-                        "ref_spk_embedding": self.drvexo_speaker,
-                        "x_vector_only_mode": True,
-                        "icl_mode": False,
-                    }
-                ],
-            )
+            if not info.get("ref_audio"):
+                info.setdefault(
+                    "voice_clone_prompt",
+                    [
+                        {
+                            "ref_spk_embedding": self.drvexo_speaker,
+                            "x_vector_only_mode": True,
+                            "icl_mode": False,
+                        }
+                    ],
+                )
         return super().preprocess_batch(
             req_ids=req_ids,
             model_intermediate_buffer=model_intermediate_buffer,
             device=device,
         )
+
+    def _make_lexical_router(self, source_tokenizer, target_tokenizer):
+        return GeneratedTokenRouter(source_tokenizer, target_tokenizer)
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         self._ensure_quantized_pad_embed()

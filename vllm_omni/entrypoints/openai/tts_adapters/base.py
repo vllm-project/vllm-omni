@@ -263,6 +263,8 @@ class TTSModelAdapter(ABC):
     detect_priority: ClassVar[int] = 100
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
+    #: Direct speech may bypass an earlier comprehension stage in an omni pipeline.
+    entry_stage_id: ClassVar[int] = 0
     #: Whether streaming entrypoints must retain terminal metrics for validation.
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.

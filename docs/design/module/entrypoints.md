@@ -220,7 +220,7 @@ stage lifecycle ownership in the parent composition root.
 
 ## DRVEXO opt-in extensions
 
-For a `drvexo_speech_8b` chat config the composition root mounts explicit
+For a `drvexo_speech_8b` or `drvexo_speech_qwen35_4b` chat config the composition root mounts explicit
 speech and General candidate-scoring routes after initializing serving state.
 Other model configurations do not expose these routes. Ordinary chat does
 not call a device classifier or replace model generation with fixed replies.
@@ -243,3 +243,12 @@ IPv4/IPv6 listening socket and end-to-end auth/tracing headers, excluding
 transport/proxy-forwarding headers. Direct TLS and Unix socket listeners are
 explicitly unsupported for that wrapper (503); standard endpoints are unchanged.
 See [DRVEXO](../../models/drvexo_speech_8b.md) for schemas and limits.
+The 4B prefix/candidate limits are 4096/384 tokens; 8B retains 1536/384.
+Both Talker architectures select the DRVEXO TTS adapter for explicit caller-text
+reference speech. Other Qwen3-TTS deployments keep their existing adapter.
+The speech adapter owns the entry stage: direct speech skips the Thinker and
+targets Talker; token budgets, request sampling and EOS validation use that same
+stage. The default remains stage zero for dedicated TTS pipelines.
+Chat JSON Schema constraints apply to the comprehension stage only. Forced and
+required native-format tool calls use the configured tool parser rather than
+passing XML through as JSON function arguments.

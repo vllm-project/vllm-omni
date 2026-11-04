@@ -472,7 +472,9 @@ async def omni_run_server_worker(
 
         chat = getattr(app.state, "openai_serving_chat", None)
         config = getattr(getattr(chat, "model_config", None), "hf_config", None)
-        if chat is not None and getattr(config, "model_type", None) == "drvexo_speech_8b":
+        from vllm_omni.transformers_utils.configs.drvexo import DRVEXO_MODEL_TYPES
+
+        if chat is not None and getattr(config, "model_type", None) in DRVEXO_MODEL_TYPES:
             from .drvexo_routes import router as drvexo_router
             from .drvexo_speech import load_speech_tokenizer
 

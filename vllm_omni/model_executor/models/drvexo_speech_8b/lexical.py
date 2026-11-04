@@ -76,3 +76,30 @@ class GeneratedTokenRouter:
         if source_text != expected_text or target_text != expected_text:
             raise ValueError("Generated tokens disagree with the displayed reply")
         return self.prefix + mapped + self.suffix
+
+
+class RetokenizedTextRouter(GeneratedTokenRouter):
+    """Verify actual source output, then tokenize unchanged text for Talker.
+
+    Different vocabularies cannot map every generated token one-to-one. This
+    edge preserves exact text, not the Thinker's segmentation. It neither
+    rewrites text nor substitutes a fixed answer for the model output.
+    """
+
+    def __init__(self, source_tokenizer, target_tokenizer):
+        super().__init__(source_tokenizer, target_tokenizer)
+        self.valid_source_ids = set(source_tokenizer.get_vocab().values()) - control_token_ids(source_tokenizer)
+
+    def prepare(self, generated_ids, expected_text):
+        if not isinstance(generated_ids, (list, tuple)) or not generated_ids:
+            raise ValueError("Missing actual Thinker-generated token IDs")
+        ids = list(generated_ids)
+        if any(type(value) is not int for value in ids):
+            raise ValueError("Generated token IDs must be integers")
+        if ids[-1] in self.stop_ids:
+            ids.pop()
+        if not ids or any(value not in self.valid_source_ids for value in ids):
+            raise ValueError("Empty, special, or invalid generated lexical token")
+        if self.source.decode(ids, skip_special_tokens=False) != expected_text:
+            raise ValueError("Generated tokens disagree with the displayed reply")
+        return self.prepare_fixed(expected_text)

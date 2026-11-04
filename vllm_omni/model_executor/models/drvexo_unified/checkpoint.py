@@ -106,6 +106,6 @@ class UnifiedBF16Checkpoint:
                     yield key.removeprefix(prefix), handle.get_tensor(key)
 
     def iter_thinker_weights(self) -> Iterator[tuple[str, "torch.Tensor"]]:
-        """Expose both HF language and visual names to a future native loader."""
+        """Expose HF language and visual names to the native Thinker loader."""
         yield from self.iter_component("language_model")
         yield from self.iter_component("vision_model")

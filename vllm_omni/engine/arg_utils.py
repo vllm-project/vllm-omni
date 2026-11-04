@@ -96,6 +96,7 @@ def _register_omni_hf_configs() -> None:
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.drvexo_speech_8b import DRVEXOSpeech8BConfig
+        from vllm_omni.transformers_utils.configs.drvexo_unified import DRVEXOUnifiedConfig
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
             BailingMoeV3AudioConfig,
@@ -131,6 +132,7 @@ def _register_omni_hf_configs() -> None:
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("drvexo_speech_8b", DRVEXOSpeech8BConfig),
+        ("drvexo_speech_qwen35_4b", DRVEXOUnifiedConfig),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),

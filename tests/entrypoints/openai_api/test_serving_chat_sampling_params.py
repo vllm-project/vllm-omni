@@ -23,6 +23,42 @@ from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("supports_json", [False, True])
+@pytest.mark.parametrize("choice", ["auto", "required", "none", "named"])
+def test_native_tool_format_is_parsed_for_forced_calls(mock_engine_client, supports_json, choice):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    instance.enable_auto_tools = True
+    instance.parser_cls = SimpleNamespace(tool_parser_cls=SimpleNamespace(supports_required_and_named=supports_json))
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "杭州天气"}],
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+        tool_choice={"type": "function", "function": {"name": "weather"}} if choice == "named" else choice,
+    )
+    expected = choice == "auto" or (not supports_json and choice in ("named", "required"))
+    assert instance._should_stream_with_auto_tool_parsing(request) is expected
+
+
+def test_response_schema_is_kept_only_on_comprehension_stage(mock_engine_client):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": False,
+    }
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "杭州"}],
+        response_format={"type": "json_schema", "json_schema": {"name": "city", "schema": schema}},
+    )
+    params = serving_chat._build_sampling_params_list_from_request(request)
+    assert params[0].structured_outputs is not None
+    assert params[0].structured_outputs.json == schema
+    assert params[1].structured_outputs is None
+    assert mock_engine_client.default_sampling_params_list[0].structured_outputs is None
+
+
 @pytest.fixture
 def mock_comprehension_stage(mocker: MockerFixture):
     """Create a mock comprehension stage with is_comprehension=True."""

@@ -15,6 +15,7 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool
 
 from vllm_omni.model_executor.models.drvexo_speech_8b.general_input import BranchTokenizer
+from vllm_omni.transformers_utils.configs.drvexo import decision_token_limits
 
 
 class Candidate(BaseModel):
@@ -89,7 +90,9 @@ async def _score_candidates(body: GeneralRequest, raw_request: Request):
     tokenizer = serving.renderer.get_tokenizer()
     if tokenizer is None:
         tokenizer = await serving.engine_client.get_tokenizer()
-    branch = BranchTokenizer(tokenizer, 1536, 384)
+    config = getattr(getattr(serving, "model_config", None), "hf_config", None)
+    prefix_limit, candidate_limit = decision_token_limits(getattr(config, "model_type", "drvexo_speech_8b"))
+    branch = BranchTokenizer(tokenizer, prefix_limit, candidate_limit)
     try:
         prefix = branch.prefix(row)
         suffixes = [branch.candidate(c) for c in row["candidates"]]
@@ -159,7 +162,7 @@ async def _score_candidates(body: GeneralRequest, raw_request: Request):
         "shared_thinker": True,
         "input_scope": "explicit instruction/state/candidates only",
         "executable": False,
-        "token_limits": {"prefix": 1536, "candidate": 384},
+        "token_limits": {"prefix": prefix_limit, "candidate": candidate_limit},
         "truncation_policy": (
             "fixed training protocol; instruction/state token budgets are shared; candidate is head-truncated"
         ),

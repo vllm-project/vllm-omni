@@ -3,6 +3,7 @@
 
 """vLLM loader for stage views into the single DRVEXO checkpoint."""
 
+import json
 import time
 from pathlib import Path
 
@@ -20,8 +21,23 @@ class DRVEXOUnifiedModelLoader(DefaultModelLoader):
             directory /= source.subfolder
         if self.counter_before_loading_weights == 0:
             self.counter_before_loading_weights = time.perf_counter()
+        config_path = directory / "config.json"
+        # Codec/tokenizer tensor-view subfolders intentionally have no HF config.
+        config = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        if config.get("model_type") == "drvexo_speech_qwen35_4b":
+            from vllm_omni.model_executor.models.drvexo_unified.checkpoint import UnifiedBF16Checkpoint
+
+            checkpoint = UnifiedBF16Checkpoint(directory)
+            return ((source.prefix + name, value) for name, value in checkpoint.iter_thinker_weights())
         return ((source.prefix + name, value) for name, value in iter_view(directory / "weights.json"))
 
     def download_model(self, model_config):
         # Deliberately local-only: the complete bundle must be downloaded first.
-        open_view(Path(model_config.model) / "weights.json")
+        directory = Path(model_config.model)
+        config = json.loads((directory / "config.json").read_text())
+        if config.get("model_type") == "drvexo_speech_qwen35_4b":
+            from vllm_omni.model_executor.models.drvexo_unified.checkpoint import UnifiedBF16Checkpoint
+
+            UnifiedBF16Checkpoint(directory)
+        else:
+            open_view(directory / "weights.json")

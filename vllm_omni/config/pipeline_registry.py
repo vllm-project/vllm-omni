@@ -65,6 +65,10 @@ from vllm_omni.model_executor.models.drvexo_speech_8b.pipeline import (
     DRVEXO_SPEECH_8B_PIPELINE,
     DRVEXO_SPEECH_8B_THINKER_ONLY_PIPELINE,
 )
+from vllm_omni.model_executor.models.drvexo_unified.pipeline import (
+    DRVEXO_UNIFIED_PIPELINE,
+    DRVEXO_UNIFIED_THINKER_ONLY_PIPELINE,
+)
 from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
@@ -166,6 +170,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "drvexo_speech_8b": DRVEXO_SPEECH_8B_PIPELINE,
     "drvexo_speech_8b_thinker_only": DRVEXO_SPEECH_8B_THINKER_ONLY_PIPELINE,
+    "drvexo_speech_qwen35_4b": DRVEXO_UNIFIED_PIPELINE,
+    "drvexo_speech_qwen35_4b_thinker_only": DRVEXO_UNIFIED_THINKER_ONLY_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,

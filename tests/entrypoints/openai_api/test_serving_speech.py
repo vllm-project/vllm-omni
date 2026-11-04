@@ -6202,6 +6202,8 @@ class TestTTSAsyncOffloading:
         adapter_model_type = "adapter_dummy_tts"
 
         class FakeAdapter:
+            entry_stage_id = 0
+
             def normalize(self, request):
                 return
 

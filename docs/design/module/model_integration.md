@@ -78,7 +78,13 @@ The Thinker
 reuses upstream Qwen3 execution and adds an audio encoder/input projector
 and explicit final-prefill candidate scoring. Stage transitions remain owned
 by the pipeline/orchestrator. See [DRVEXO](../../models/drvexo_speech_8b.md)
-for runtime restrictions and validation scope.
+for runtime restrictions and validation scope. The merged 4B family member uses
+the same loader and speech transport, a strict eight-component checkpoint reader,
+the native Qwen3.5 hybrid/vision Thinker and a temporal audio connector. Its
+different Thinker/Talker vocabularies require text-preserving retokenization;
+the 8B token router remains unchanged. See the
+[4B integration](../feature/drvexo_unified_4b.md) for normalization, head binding
+and actual validation limits.
 
 ### Runner payloads at downstream entry stages
 
