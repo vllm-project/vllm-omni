@@ -295,19 +295,21 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
-        for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
-            if is_warmup_request(request_data.req_id):
-                continue
-            plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
-        if not getattr(self.model_config, "async_chunk", False):
-            plane.recv_full_payload_inputs(scheduler_output)
         natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:
             plane.request_terminal(natural_terminal_req_ids)
         if aborted_req_ids:
             plane.abort_requests(aborted_req_ids)
+        # A continued turn retires and reinstalls the same request ID in one
+        # step. Retire its old transport before registering the new ledger.
+        for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
+            if is_warmup_request(request_data.req_id):
+                continue
+            plane.register_request(request_data)
+        if not getattr(self.model_config, "async_chunk", False):
+            plane.recv_full_payload_inputs(scheduler_output)
 
     def _sync_native_data_plane_payloads(
         self,

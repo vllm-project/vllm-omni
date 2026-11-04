@@ -12,8 +12,7 @@
 # docs/configuration/stage_configs.md); startup warns when no MPS server is found.
 #
 # Turn-based sessions use this profile. Duplex sessions use
-# qwen3_omni_duplex_mrv2.yaml. Resumable streaming input uses the V1 chunk
-# adapter.
+# qwen3_omni_duplex_mrv2.yaml, whose Thinker can retain KV across turns.
 base_config: qwen3_omni_moe.yaml
 
 connectors:

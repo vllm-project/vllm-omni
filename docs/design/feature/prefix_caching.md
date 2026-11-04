@@ -48,9 +48,9 @@ Host footprint: each cached key costs `num_blocks × block_size × D × dtype_by
 The existing CUDA `qwen3_omni_duplex.yaml` profile defaults to a resident
 resumable Thinker request across committed turns. No extra deployment file or
 session switch is required. The capability is resolved from existing engine
-options: V1, prefix caching, async-chunk transport and
+options: V1 or CUDA MRv2, prefix caching, async-chunk transport and
 no speculative decoding. Other combinations log the unsupported condition and
-use fresh per-turn requests, including the MRv2 profile. APC can still reuse
+use fresh per-turn requests. APC can still reuse
 matching prefixes in that path. Non-CUDA profile overrides disable caching.
 Talker and Code2Wav remain per-turn, with caching disabled.
 
@@ -436,6 +436,12 @@ in and reuses native KV only, since `llm2tts` takes the reply rows from the
 row ledger. MiniCPM-o duplex keeps prefix caching disabled because its mutable
 KV window cannot share cached blocks; the Talker does not opt into output
 replay.
+
+Qwen3-Omni duplex on CUDA MRv2 retains the Thinker request across turns.
+At continuation, retirement precedes re-admission under the same request ID,
+resetting delivery watermarks while retaining matching scheduler KV blocks.
+The native data plane terminates each downstream turn separately and fences
+queued outputs against the request state that owned them.
 
 Duplex models that commit each utterance as a fresh request can use this path
 when their KV and model-state contracts permit reuse. The NPU MRv2 runner does

@@ -1373,8 +1373,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished = not finished
                 if finished:
                     request.resumable = False
-                    if self._native_data_plane:
-                        self._pending_data_plane_terminal_req_ids.add(req_id)
+                if self._native_data_plane and (finished or getattr(request, "resume_from_full_prompt", False)):
+                    # Finish the per-turn downstream stream while the Thinker
+                    # request and its KV remain parked for the next append.
+                    self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -2511,11 +2513,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
-        return self._has_pending_kv_work() or super().has_requests()
+        return (
+            bool(getattr(self, "_pending_data_plane_terminal_req_ids", ()))
+            or self._has_pending_kv_work()
+            or super().has_requests()
+        )
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
-        return self._has_pending_kv_work() or super().has_finished_requests()
+        return (
+            bool(getattr(self, "_pending_data_plane_terminal_req_ids", ()))
+            or self._has_pending_kv_work()
+            or super().has_finished_requests()
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Check if there are any unfinished requests (including those needing KV transfer)."""

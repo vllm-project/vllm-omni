@@ -52,12 +52,12 @@ Talker and Code2Wav remain per-turn and do not enable prefix caching.
 ### Resident Thinker KV continuation
 
 Continuation is selected from the resolved engine configuration: stage 0 must
-use Model Runner V1, prefix caching, async-chunk transport and no speculative
+use Model Runner V1 or CUDA MRv2, prefix caching, async-chunk transport and no speculative
 decoding. The existing V1 profile enables asynchronous scheduling; synchronous
 scheduling also supports continuation. At a turn boundary, only the continued
 request waits for its previous in-flight outputs to drain before resetting
-worker delivery state. Other sessions continue to run. Unsupported combinations,
-including MRv2, retain fresh per-turn Thinker requests; startup logs the reason and the session reports
+worker delivery state. Other sessions continue to run. Unsupported combinations
+retain fresh per-turn Thinker requests; startup logs the reason and the session reports
 `supports_turn_kv_continuation: false`. Where enabled, ordinary APC still reuses
 matching blocks in that fallback path. Disabling stage-0 prefix caching also
 disables resident continuation because Talker needs cached hidden-state rows.

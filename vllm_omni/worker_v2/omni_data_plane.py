@@ -101,6 +101,7 @@ class _NativeRequestState:
 
 @dataclass(frozen=True)
 class _NativeOutputBatch:
+    request_states: dict[str, _NativeRequestState]
     req_ids: list[str]
     inter_stage_outputs: list[Any | None] | None
     sampled_token_ids: list[list[int]] | None
@@ -202,6 +203,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     continue
                 assert isinstance(batch, _NativeOutputBatch)
                 self.complete_outputs(
+                    request_states=batch.request_states,
                     req_ids=batch.req_ids,
                     inter_stage_outputs=batch.inter_stage_outputs,
                     sampled_token_ids=batch.sampled_token_ids,
@@ -236,7 +238,12 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._raise_output_error()
         if self._native_output_closed:
             raise RuntimeError("native output worker is closed")
+        with self._native_output_lock:
+            request_states = {
+                req_id: self._native_requests[req_id] for req_id in req_ids if req_id in self._native_requests
+            }
         batch = _NativeOutputBatch(
+            request_states=request_states,
             req_ids=req_ids,
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=sampled_token_ids,
@@ -309,7 +316,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 model_intermediate_buffer=getattr(request_data, "model_intermediate_buffer", None),
                 sampling_params=getattr(request_data, "sampling_params", None),
                 num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
-                resumable=bool(getattr(request_data, "resumable", False)),
+                # Resident Thinker KV is scheduler-owned. Its downstream
+                # transport still has an independent terminal for each turn.
+                resumable=bool(getattr(request_data, "resumable", False))
+                and not bool(getattr(request_data, "resume_from_full_prompt", False)),
             )
 
     def reserve_outputs(self, req_ids: list[str]) -> None:
@@ -376,10 +386,27 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        request_states: dict[str, _NativeRequestState] | None = None,
     ) -> int:
         """Commit one deferred output batch, then release its lifecycle holds."""
         send_lock_held = False
         with self._native_output_lock:
+            if request_states is None:
+                request_states = {
+                    req_id: self._native_requests[req_id] for req_id in req_ids if req_id in self._native_requests
+                }
+            # A queued old-turn batch must not attach to a newly registered
+            # request with the same ID, or consume that turn's reservations.
+            rows = [
+                i
+                for i, req_id in enumerate(req_ids)
+                if req_id in request_states and self._native_requests.get(req_id) is request_states[req_id]
+            ]
+            req_ids = [req_ids[i] for i in rows]
+            if inter_stage_outputs is not None:
+                inter_stage_outputs = [inter_stage_outputs[i] if i < len(inter_stage_outputs) else None for i in rows]
+            if sampled_token_ids is not None:
+                sampled_token_ids = [sampled_token_ids[i] if i < len(sampled_token_ids) else [] for i in rows]
             entries, finished_req_ids = self._build_chunk_entries(
                 req_ids=req_ids,
                 inter_stage_outputs=inter_stage_outputs,
@@ -403,6 +430,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         with self._native_output_lock:
             self._cleanup_finished_entries(finished_req_ids)
             for req_id in dict.fromkeys(req_ids):
+                if self._native_requests.get(req_id) is not request_states.get(req_id):
+                    continue
                 in_flight = self._native_outputs_in_flight.get(req_id, 0)
                 if in_flight > 1:
                     self._native_outputs_in_flight[req_id] = in_flight - 1

@@ -248,6 +248,38 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip(warmup_r
     plane.abort_requests.assert_called_once_with({"aborted"})
 
 
+@pytest.mark.parametrize("natural", [False, True])
+def test_turn_reinstallation_retires_transport_before_same_id_arrives(natural):
+    from tests.worker_v2.test_omni_data_plane import _make_plane, _new_request
+
+    runner = _make_runner()
+    runner.model_config = SimpleNamespace(async_chunk=True)
+    plane = _make_plane(replace_send=True)
+    plane.register_receivers = MagicMock()
+    runner._omni_data_plane = plane
+    old = _new_request()
+    old.resume_from_full_prompt = True
+    plane.register_request(old)
+    new = _new_request()
+    new.resume_from_full_prompt = True
+    new.prompt_token_ids = [10, 11, 21, 2150, 12]
+    runner._prepare_native_data_plane(
+        SimpleNamespace(
+            scheduled_new_reqs=[new],
+            pending_input_registrations=[],
+            data_plane_terminal_req_ids={"internal"} if natural else set(),
+            finished_req_ids={"internal"},
+        )
+    )
+    assert plane._native_requests["internal"].prompt_token_ids == new.prompt_token_ids
+    assert plane._native_requests["internal"].output_token_ids == []
+    assert not plane._native_requests["internal"].aborted
+    assert plane.record.cleaned == ["internal"]
+    [(terminal, _)] = plane.record.batches[0]
+    assert terminal.prompt_token_ids == old.prompt_token_ids
+    assert terminal.is_finished()
+
+
 def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()

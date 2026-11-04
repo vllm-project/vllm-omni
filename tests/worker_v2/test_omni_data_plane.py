@@ -135,13 +135,15 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert not plane._pending_full_payload_send
 
 
+@pytest.mark.parametrize("turn_continuation", [False, True])
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize("stop", ["token", "length"])
-def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop):
+def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop, turn_continuation):
     plane._async_chunk = async_chunk
     plane._full_payload_replace_keys_cached = frozenset()
     request = _new_request()
-    request.resumable = False
+    request.resumable = turn_continuation
+    request.resume_from_full_prompt = turn_continuation
     request.sampling_params = SamplingParams(stop_token_ids=[2150], max_tokens=2 if stop == "length" else 10)
     plane.register_request(request)
     first, last, stale = (torch.tensor([[value]]) for value in (1, 2, 99))
@@ -163,6 +165,7 @@ def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk
     terminal, _ = plane.record.batches[-1][0]
     assert terminal.is_finished()
     assert terminal.output_token_count == 2
+    assert terminal.resumable is False
     assert plane.record.cleaned == ["internal"]
     assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
 
@@ -1009,3 +1012,31 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         assert plane.release_shm_resources([ext_id, "unknown"]) == 1
     finally:
         connector.close()
+
+
+def test_old_turn_batch_cannot_publish_into_reinstalled_request(plane):
+    plane._start_output_worker(max_pending_batches=2)
+    request = _new_request()
+    request.resume_from_full_prompt = True
+    plane.register_request(request)
+    # Hold the consumer until the same ID has been reinstalled. The queued
+    # publication must retain its old owner, not look up the new turn by ID.
+    with plane._native_output_lock:
+        plane.reserve_outputs(["internal"])
+        plane.enqueue_outputs(
+            req_ids=["internal"],
+            inter_stage_outputs=[{"codes.audio": torch.tensor([[99]])}],
+            sampled_token_ids=[[99]],
+        )
+        plane.abort_requests({"internal"})
+        request.prompt_token_ids = [10, 11, 21, 2150, 12]
+        plane.register_request(request)
+        plane.reserve_outputs(["internal"])
+        before = len(plane.record.batches)
+    plane.drain_outputs()
+    assert len(plane.record.batches) == before
+    assert plane._native_requests["internal"].output_token_ids == []
+    assert plane._native_outputs_in_flight["internal"] == 1
+    _complete(plane, [{"codes.audio": torch.tensor([[1]])}], token=21)
+    assert plane._native_requests["internal"].output_token_ids == [21]
+    assert not plane._native_outputs_in_flight

@@ -25,7 +25,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _scheduler():
+def _scheduler(*, native=False):
     config = VllmConfig()
     # Only model configuration and worker results are synthetic; scheduling,
     # block allocation, hashing, cancellation and output accounting are real.
@@ -61,7 +61,10 @@ def _scheduler():
             )
         ],
     )
-    return OmniARAsyncScheduler(config, kv_config, Mock(spec=StructuredOutputManager), 16)
+    scheduler = OmniARAsyncScheduler(config, kv_config, Mock(spec=StructuredOutputManager), 16)
+    scheduler.use_v2_model_runner = native
+    scheduler._native_data_plane = native
+    return scheduler
 
 
 def _request(tokens, request_id="resident"):
@@ -102,9 +105,10 @@ def _stop_with_in_flight_decode(scheduler, request):
     return lookahead
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("change", ["append", "edit", "shrink"])
-def test_async_continuation_drains_then_reinstalls_worker(change):
-    scheduler = _scheduler()
+def test_async_continuation_drains_then_reinstalls_worker(change, native):
+    scheduler = _scheduler(native=native)
     request = _request(list(range(33)))
     lookahead = _stop_with_in_flight_decode(scheduler, request)
     previous_blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)[0][:2]
@@ -188,3 +192,28 @@ def test_stale_turn_delta_fails_only_its_request(missing):
     assert "resident" in scheduler._streaming_context_overflow
     scheduler.add_request(_request([10, 11], request_id="other"))
     assert scheduler.schedule().num_scheduled_tokens["other"] == 2
+
+
+def test_native_turn_stop_emits_transport_terminal_without_freeing_kv():
+    scheduler = _scheduler(native=True)
+    request = _request(list(range(33)))
+    lookahead = _stop_with_in_flight_decode(scheduler, request)
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert request.request_id in scheduler.requests
+    assert scheduler.has_requests() and scheduler.has_finished_requests()
+    assert scheduler._pending_data_plane_terminal_req_ids == {request.request_id}
+    terminal = scheduler.schedule()
+    assert terminal.data_plane_terminal_req_ids == {request.request_id}
+    assert request.request_id not in terminal.finished_req_ids
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == blocks
+    assert not scheduler.update_from_output(lookahead, _output(request, 777))
+    update = _request([999, 100, 101])
+    update.append_prefix_length = 34
+    scheduler.add_request(update)
+    resumed = scheduler.schedule()
+    [arrival] = resumed.scheduled_new_reqs
+    assert arrival.resumable and arrival.resume_from_full_prompt
+    assert arrival.num_computed_tokens == 32
+    assert arrival.prefill_token_ids == request.prompt_token_ids
+    assert request.request_id in resumed.finished_req_ids
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id)[0][:2] == blocks[0][:2]
