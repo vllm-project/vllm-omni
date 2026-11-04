@@ -164,6 +164,12 @@ native camera frame). WASD key tokens are not admitted by the engine:
 `velocity` (hold a per-frame SE3 delta until replaced). Prompt and camera may
 be combined in one interaction event.
 
+The example client's `--prompt-updates` and `--camera-updates` schedules assign
+a distinct `event_id` to each entry within the session, including entries with
+equal timestamps or timestamps less than a millisecond apart. These IDs are
+opaque identifiers; `at` still determines the scheduled send time. The server
+continues to reject repeated IDs with `event_id_conflict`.
+
 This feature is pipeline-dependent. An enabled endpoint does not imply that
 the loaded model supports midway prompt or camera updates.
 
