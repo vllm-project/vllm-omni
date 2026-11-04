@@ -150,3 +150,80 @@ class TestResumePath:
         assert len(remaining) == 1
         assert remaining[0].sampling_params.resume_latents is not None
         assert torch.equal(remaining[0].sampling_params.resume_latents, torch.full((2, 2), 2.0))
+
+
+class TestEnableGuards:
+    def test_tiled_vae_disables_backend(self):
+        from types import SimpleNamespace
+
+        from vllm_omni.diffusion.data import DiffusionCacheConfig
+
+        b = InterRequestCacheBackend(DiffusionCacheConfig())
+        pipeline = SimpleNamespace(
+            od_config=SimpleNamespace(vae_patch_parallel_size=2, model="m"),
+            register_diffuse_step_hook=lambda hook: None,
+        )
+        b.enable(pipeline)
+        assert b.enabled is False
+        # disabled backend passes requests through untouched
+        hits, remaining = b.short_circuit_requests([make_req()], target_device=None)
+        assert hits == [] and len(remaining) == 1
+
+
+class TestPostForwardStoreGuards:
+    def test_empty_tensor_placeholder_not_stored(self, backend):
+        req = make_req()
+        out = DiffusionOutput(output=torch.zeros(0))  # non-owner rank placeholder
+        backend.post_forward_store([req], [out], target_device=None, runner=None)
+        hits, remaining = backend.short_circuit_requests([make_req()], target_device=None)
+        assert hits == [] and len(remaining) == 1
+
+    def test_media_output_not_stored(self, backend):
+        # Media-typed outputs carry output=None (payload on .media); the store
+        # guard must skip them. DiffusionOutput validates .media's type, so we
+        # exercise the output=None path directly.
+        req = make_req()
+        out = DiffusionOutput(output=None)
+        backend.post_forward_store([req], [out], target_device=None, runner=None)
+        hits, remaining = backend.short_circuit_requests([make_req()], target_device=None)
+        assert hits == [] and len(remaining) == 1
+
+
+class TestCollateResumeState:
+    def _batch(self, specs):
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+        reqs = []
+        for i, (step, latents) in enumerate(specs):
+            sp = SimpleNamespace(
+                resume_from_step=step,
+                resume_latents=latents,
+                generator=None,
+            )
+            reqs.append(SimpleNamespace(request_id=f"r{i}", prompt="p", sampling_params=sp))
+        return DiffusionRequestBatch(requests=reqs)
+
+    def test_single_resume(self):
+        batch = self._batch([(3, torch.zeros(1, 2, 2))])
+        step, latents = batch.collate_resume_state()
+        assert step == 3
+        assert latents.shape == (1, 2, 2)
+
+    def test_all_zero_returns_none(self):
+        batch = self._batch([(0, None), (0, None)])
+        assert batch.collate_resume_state() == (0, None)
+
+    def test_equal_steps_collate(self):
+        batch = self._batch([(3, torch.zeros(1, 2, 2)), (3, torch.ones(1, 2, 2))])
+        step, latents = batch.collate_resume_state()
+        assert step == 3
+        assert latents.shape == (2, 2, 2)
+        assert torch.equal(latents[1], torch.ones(2, 2))
+
+    def test_mixed_steps_fallback_to_full(self):
+        batch = self._batch([(3, torch.zeros(1, 2, 2)), (0, None)])
+        assert batch.collate_resume_state() == (0, None)
+
+    def test_missing_latents_fallback(self):
+        batch = self._batch([(3, None), (3, torch.zeros(1, 2, 2))])
+        assert batch.collate_resume_state() == (0, None)

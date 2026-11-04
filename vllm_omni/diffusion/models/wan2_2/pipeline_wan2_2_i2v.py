@@ -723,6 +723,7 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
+        resume_from_step, resume_latents = req.collate_resume_state()
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -736,8 +737,8 @@ class Wan22I2VPipeline(
             attention_kwargs=attention_kwargs,
             condition=condition,
             first_frame_mask=first_frame_mask,
-            resume_from_step=getattr(req.sampling_params, "resume_from_step", 0) or 0,
-            resume_latents=getattr(req.sampling_params, "resume_latents", None),
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos

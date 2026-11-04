@@ -275,3 +275,171 @@ class TestPersistenceRoundTrip:
         # restored embeddings remain searchable
         latents, _, _, prompt, _ = store2.semantic_search(emb, threshold=0.5)
         assert prompt == "persist me"
+
+
+class TestMatrixGrowthAlignment:
+    def test_row_keys_aligned_past_chunk_growth(self):
+        """Rows must stay aligned with _row_keys after capacity growth (P1).
+
+        _ROW_CHUNK is 512; the 513rd insertion grows the matrices and pads
+        _row_keys. Keys must be assigned by matrix row, not appended.
+        """
+        store = DiTCacheStore(max_entries=10_000, max_memory_gb=1.0)
+
+        def basis(i, dim=600):
+            t = torch.zeros(dim)
+            t[i] = 1.0
+            return t
+
+        keys = []
+        for i in range(530):
+            k = make_key(prompt=f"p{i}")
+            store.put(k, torch.zeros(2, 2), clip_embedding=basis(i))
+            keys.append(k)
+        assert store._next_row == 530
+        assert len(store._row_keys) == store._capacity
+        # Every key sits at its matrix row.
+        for row, k in enumerate(keys):
+            assert store._row_keys[row] == k.to_hash()
+            assert store._key_rows[k.to_hash()] == row
+        # The 513rd entry (first after growth) is searchable and matches itself.
+        q = basis(512)
+        latents, _, sim, prompt, _ = store.semantic_search(q, threshold=0.9)
+        assert prompt == "p512"
+        assert sim > 0.99
+
+
+class TestKeyIdentity:
+    def _req(self, **over):
+        return make_req(**over)
+
+    def test_lora_digest_separates_keys(self):
+        from types import SimpleNamespace
+
+        lora = SimpleNamespace(lora_name="style", lora_int_id=7)
+        k_plain = build_cache_key_from_request(self._req(), FakePipeline())
+        k_lora = build_cache_key_from_request(
+            self._req(),
+            FakePipeline(),
+        )
+        # same request → same key
+        assert k_plain.to_hash() == k_lora.to_hash()
+        req = make_req()
+        req.sampling_params.lora_request = lora
+        req.sampling_params.lora_scale = 0.8
+        k_with = build_cache_key_from_request(req, FakePipeline())
+        assert k_with.lora_digest == "style:7:0.8"
+        assert k_with.to_hash() != k_plain.to_hash()
+
+    def test_output_type_separates_keys(self):
+        req_img = make_req()
+        req_img.sampling_params.output_type = "default"
+        req_lat = make_req()
+        req_lat.sampling_params.output_type = "latent"
+        k_img = build_cache_key_from_request(req_img, FakePipeline())
+        k_lat = build_cache_key_from_request(req_lat, FakePipeline())
+        assert k_img.output_type == "default"
+        assert k_lat.output_type == "latent"
+        assert k_img.to_hash() != k_lat.to_hash()
+
+
+class TestSemanticScheduleAndLoraFilters:
+    def _store(self):
+        store = DiTCacheStore(max_entries=10, max_memory_gb=1.0)
+
+        def emb(v):
+            t = torch.zeros(8)
+            t[0] = v
+            return t / t.norm()
+
+        return store, emb
+
+    def test_different_step_count_rejected(self):
+        store, emb = self._store()
+        store.put(make_key(prompt="a", num_inference_steps=40), torch.zeros(2), clip_embedding=emb(1.0))
+        # 20-step request must NOT match a 40-step trajectory anymore
+        lat, _, _, _, _ = store.semantic_search(emb(1.0), threshold=0.5, required_num_inference_steps=20)
+        assert lat is None
+        # same step count still matches
+        lat, _, _, prompt, _ = store.semantic_search(emb(1.0), threshold=0.5, required_num_inference_steps=40)
+        assert prompt == "a"
+
+    def test_sigmas_mismatch_rejected(self):
+        store, emb = self._store()
+        store.put(
+            make_key(prompt="a", sigmas=tuple([0.9, 0.5, 0.1])),
+            torch.zeros(2),
+            clip_embedding=emb(1.0),
+        )
+        lat, _, _, _, _ = store.semantic_search(
+            emb(1.0),
+            threshold=0.5,
+            required_num_inference_steps=40,
+            required_sigmas=(0.9, 0.5, 0.2),
+        )
+        assert lat is None
+        lat, _, _, prompt, _ = store.semantic_search(
+            emb(1.0),
+            threshold=0.5,
+            required_num_inference_steps=40,
+            required_sigmas=(0.9, 0.5, 0.1),
+        )
+        assert prompt == "a"
+
+    def test_lora_digest_mismatch_rejected(self):
+        store, emb = self._store()
+        store.put(
+            make_key(prompt="a", lora_digest="loraA:1:0.5"),
+            torch.zeros(2),
+            clip_embedding=emb(1.0),
+        )
+        lat, _, _, _, _ = store.semantic_search(emb(1.0), threshold=0.5, required_lora_digest="loraB:2:0.5")
+        assert lat is None
+        lat, _, _, prompt, _ = store.semantic_search(emb(1.0), threshold=0.5, required_lora_digest="loraA:1:0.5")
+        assert prompt == "a"
+
+
+class TestTieredReadNonRetention:
+    def test_get_demotes_recovered_final(self, tmp_path):
+        engine = FakeLMCache()
+        store = DiTCacheStore(
+            max_entries=10,
+            max_memory_gb=1.0,
+            lmcache_engine=engine,
+            final_disk_dir=str(tmp_path),
+        )
+        key = make_key(prompt="x")
+        store.put(key, torch.full((2, 2), 7.0))
+        store._final_write_executor.shutdown(wait=True)  # flush torch.save
+
+        entry = store._store[key.to_hash()]
+        entry.latents = None  # simulate eviction to shell
+
+        out = store.get(key)
+        assert out is not None and torch.equal(out, torch.full((2, 2), 7.0))
+        # must NOT stay resident in tiered mode
+        assert entry.latents is None
+
+    def test_get_step_latents_demotes_recovered_steps(self):
+        engine = FakeLMCache()
+        store = DiTCacheStore(max_entries=10, max_memory_gb=1.0, lmcache_engine=engine)
+        steps = [StepLatentData(step_index=0, timestep=40.0, latent=torch.ones(2, 2))]
+        key = make_key(prompt="vid")
+        store.put(key, torch.zeros(2, 2), step_latents=steps)
+        entry = store._store[key.to_hash()]
+        entry.step_latents = None
+
+        recovered = store.get_step_latents(key)
+        assert recovered is not None and len(recovered) == 1
+        assert entry.step_latents is None  # demoted after recovery
+
+
+class TestBoundedSimilarityStats:
+    def test_stats_bounded(self):
+        from vllm_omni.diffusion.cache.inter_request.cache_store import _SIM_STATS_MAX_SAMPLES
+
+        store = DiTCacheStore(max_entries=10, max_memory_gb=1.0)
+        store._all_sims.extend([0.5] * (_SIM_STATS_MAX_SAMPLES + 5000))
+        assert len(store._all_sims) == _SIM_STATS_MAX_SAMPLES
+        stats = store.get_similarity_stats()
+        assert stats["final_sim"]["total_comparisons"] == _SIM_STATS_MAX_SAMPLES

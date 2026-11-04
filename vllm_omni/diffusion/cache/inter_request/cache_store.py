@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ---- Module constants ----
 _MB = 1024**2
+_SIM_STATS_MAX_SAMPLES = 100_000  # per-metric sliding window for similarity stats
 _GB = 1024**3
 _SIM_STATS_FLUSH_INTERVAL = 50  # flush similarity stats to file every N searches
 
@@ -40,6 +41,13 @@ class CacheKey:
     # Fingerprint of model checkpoint + TP world size; namespaces persisted
     # caches so a dir written by a different model/topology never matches.
     model_digest: str = ""
+    # Active LoRA adapter identity + scale; requests differing only in the
+    # adapter must not share cache entries (different adapted weights).
+    lora_digest: str = ""
+    # Requested output representation ("default", "latent", ...); reusing an
+    # entry stored under a different representation would hand decoded
+    # images to latent consumers or vice versa.
+    output_type: str = "default"
 
     def to_hash(self) -> str:
         data = {
@@ -56,6 +64,8 @@ class CacheKey:
             "num_images_per_prompt": self.num_images_per_prompt,
             "num_frames": self.num_frames,
             "model_digest": self.model_digest,
+            "lora_digest": self.lora_digest,
+            "output_type": self.output_type,
         }
         serialized = json.dumps(data, sort_keys=True)
         return hashlib.sha256(serialized.encode()).hexdigest()
@@ -95,8 +105,11 @@ class DiTCacheStore:
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
-        self._all_sims: list[float] = []  # all final_sim values across all queries
-        self._all_t2t_sims: list[float] = []  # all t2t_sim values across all queries
+        # Bounded sliding window of similarity samples. Unbounded retention
+        # would grow as O(entries * queries) independently of the memory
+        # budget and eventually exhaust host memory on a long-running service.
+        self._all_sims: deque[float] = deque(maxlen=_SIM_STATS_MAX_SAMPLES)
+        self._all_t2t_sims: deque[float] = deque(maxlen=_SIM_STATS_MAX_SAMPLES)
         self._search_count: int = 0  # throttle for _flush_sim_stats_to_file
         self._use_t2i_penalty: bool = True  # enable t2i sigmoid penalty in hybrid matching
 
@@ -155,11 +168,12 @@ class DiTCacheStore:
             # first allocation
             self._txt_matrix = torch.zeros(new_cap, self._emb_dim)
             self._img_matrix = torch.zeros(new_cap, self._emb_dim)
+            self._row_keys = [None] * new_cap
         else:
             pad = new_cap - self._capacity
             self._txt_matrix = torch.cat([self._txt_matrix, torch.zeros(pad, self._emb_dim)], dim=0)
             self._img_matrix = torch.cat([self._img_matrix, torch.zeros(pad, self._emb_dim)], dim=0)
-            # extend row_keys list
+            # keep the row-key array the same length as the matrices
             self._row_keys.extend([None] * pad)
         self._capacity = new_cap
 
@@ -179,7 +193,11 @@ class DiTCacheStore:
         self._ensure_capacity(1)
         row = self._next_row
         self._txt_matrix[row] = emb
-        self._row_keys.append(key_hash)
+        # Assign by matrix row (append would desync after capacity growth:
+        # _ensure_capacity pads _row_keys to matrix length, so appending
+        # would place the key past the padded region while its embedding
+        # lands at `row`).
+        self._row_keys[row] = key_hash
         self._key_rows[key_hash] = row
         self._next_row += 1
 
@@ -448,6 +466,7 @@ class DiTCacheStore:
                 return None
 
             # LMCache recovery: if heavy tensors were evicted from CPU, recover.
+            was_shell = entry.latents is None
             if not self._recover_latents_from_lmcache(entry, key_hash):
                 self._misses += 1
                 logger.warning("LMCache miss for key %s, treating as miss", key_hash[:8])
@@ -461,6 +480,14 @@ class DiTCacheStore:
                 latents = latents.to(device=target_device)
             else:
                 latents = latents.clone()
+
+            # In tiered mode, a recovered final must not stay resident: reads
+            # alone would otherwise pull every entry back into RAM with no
+            # put() to trigger eviction. Demote the entry back to a shell —
+            # the returned copy keeps this hit valid.
+            if was_shell and self._lmcache is not None:
+                self._current_memory_bytes -= self._estimate_tensor_bytes(entry.latents)
+                entry.latents = None
 
             logger.debug(
                 "Cache HIT for key %s (hits=%d, misses=%d, hit_rate=%.2f%%)",
@@ -491,6 +518,8 @@ class DiTCacheStore:
         required_width: int | None = None,
         required_num_inference_steps: int | None = None,
         required_num_frames: int | None = None,
+        required_sigmas: tuple[float, ...] | None = None,
+        required_lora_digest: str | None = None,
     ) -> tuple[torch.Tensor | None, list[StepLatentData] | None, float, str | None, str | None]:
         if query_embedding.dim() == 1:
             query_embedding = query_embedding.unsqueeze(0)
@@ -536,8 +565,18 @@ class DiTCacheStore:
                         continue
                     if (
                         required_num_inference_steps is not None
-                        and entry.cache_key.num_inference_steps < required_num_inference_steps
+                        and entry.cache_key.num_inference_steps != required_num_inference_steps
                     ):
+                        # Resume indices map to noise levels via the schedule;
+                        # a trajectory from a different-length schedule would
+                        # resume at the wrong noise level.
+                        continue
+                    if required_sigmas is not None and entry.cache_key.sigmas != required_sigmas:
+                        # Custom sigmas define a different schedule entirely.
+                        continue
+                    if required_lora_digest is not None and entry.cache_key.lora_digest != required_lora_digest:
+                        # Entries cached under a different (or no) LoRA adapter
+                        # come from different adapted weights.
                         continue
                     if required_num_frames is not None and entry.cache_key.num_frames != required_num_frames:
                         continue
@@ -631,6 +670,7 @@ class DiTCacheStore:
             entry = self._store[best_key_hash]
 
             # LMCache recovery: if heavy tensors were evicted from CPU, recover.
+            was_shell = entry.latents is None
             if not self._recover_latents_from_lmcache(entry, best_key_hash):
                 self._misses += 1
                 logger.warning(
@@ -646,6 +686,12 @@ class DiTCacheStore:
                 latents = latents.to(device=target_device)
             else:
                 latents = latents.clone()
+
+            # Tiered mode: demote a recovered final back to a shell so reads
+            # don't accumulate resident tensors (same rationale as get()).
+            if was_shell and self._lmcache is not None:
+                self._current_memory_bytes -= self._estimate_tensor_bytes(entry.latents)
+                entry.latents = None
 
             step_latents = None
             if entry.step_latents is not None and target_device is not None:
@@ -694,9 +740,11 @@ class DiTCacheStore:
                 return None
 
             # LMCache recovery: if step_latents were evicted from CPU, recover.
+            recovered_now = False
             if entry.step_latents is None:
                 if self._lmcache is None:
                     return None
+                recovered_now = True
                 # Recover final latent first (to ensure entry is warm).
                 self._recover_latents_from_lmcache(entry, key_hash)
                 # Recover step latents from LMCache using the meta tensor.
@@ -722,7 +770,7 @@ class DiTCacheStore:
             self._store.move_to_end(key_hash)
 
             if target_device is not None:
-                return [
+                result = [
                     StepLatentData(
                         step_index=s.step_index,
                         timestep=s.timestep,
@@ -730,14 +778,21 @@ class DiTCacheStore:
                     )
                     for s in entry.step_latents
                 ]
-            return [
-                StepLatentData(
-                    step_index=s.step_index,
-                    timestep=s.timestep,
-                    latent=s.latent.clone(),
-                )
-                for s in entry.step_latents
-            ]
+            else:
+                result = [
+                    StepLatentData(
+                        step_index=s.step_index,
+                        timestep=s.timestep,
+                        latent=s.latent.clone(),
+                    )
+                    for s in entry.step_latents
+                ]
+
+            # Tiered mode: a recovered step trajectory must not stay resident
+            # (same read-path accumulation rationale as get()).
+            if recovered_now and self._lmcache is not None:
+                entry.step_latents = None
+            return result
 
     @property
     def hit_rate(self) -> float:
@@ -1196,6 +1251,17 @@ def build_cache_key_from_request(
         num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
         num_frames = getattr(sampling, "num_frames", 1) or 1
 
+        # Active LoRA adapter identity + scale (requests differing only in the
+        # adapter run different adapted weights and must not share entries).
+        lora_request = getattr(sampling, "lora_request", None)
+        lora_digest = ""
+        if lora_request is not None:
+            lora_name = getattr(lora_request, "lora_name", "") or ""
+            lora_id = getattr(lora_request, "lora_int_id", None)
+            lora_scale = getattr(sampling, "lora_scale", None)
+            lora_digest = f"{lora_name}:{lora_id}:{lora_scale}"
+        output_type = getattr(sampling, "output_type", None) or "default"
+
         return CacheKey(
             prompt=prompt_text,
             negative_prompt=negative_prompt_text,
@@ -1210,6 +1276,8 @@ def build_cache_key_from_request(
             num_images_per_prompt=num_images_per_prompt,
             num_frames=num_frames,
             model_digest=model_digest,
+            lora_digest=lora_digest,
+            output_type=output_type,
         )
     except Exception as e:
         logger.warning("Failed to build cache key: %s", e)

@@ -145,6 +145,51 @@ class DiffusionRequestBatch:
     def is_dummy_run(self) -> bool:
         return self.requests[0].is_dummy_run_request_id(self.request_id)
 
+    def collate_resume_state(self) -> tuple[int, torch.Tensor | None]:
+        """Batch-compatible inter-request resume state.
+
+        Returns ``(0, None)`` when no request resumes. When every request
+        resumes from the same step with batchable latents, returns that step
+        and the latents collated along the batch dimension (same convention as
+        ``collate_request_tensors``). Requests with mixed or missing resume
+        state fall back to ``(0, None)`` — those requests then run full
+        denoising (correct output, just without resume acceleration).
+
+        ``resume_from_step``/``resume_latents`` are optional sampling-param
+        fields populated by the inter-request cache backend; absent fields
+        count as "not resuming".
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        steps = [getattr(sampling, "resume_from_step", 0) or 0 for sampling in self.sampling_params_list]
+        if not any(steps):
+            return 0, None
+
+        if len(set(steps)) != 1:
+            logger.warning(
+                "Inter-request resume requested at different steps across a "
+                "%d-request batch (%s); running full denoising for the batch.",
+                self.num_reqs,
+                sorted(set(steps)),
+            )
+            return 0, None
+
+        latents = [getattr(sampling, "resume_latents", None) for sampling in self.sampling_params_list]
+        try:
+            validated = self._validate_tensor_sequence(latents, "resume_latents")
+        except ValueError:
+            validated = None
+        if validated is None:
+            logger.warning(
+                "Inter-request resume requested but resume latents are "
+                "missing on some requests; running full denoising for the batch."
+            )
+            return 0, None
+        assert steps[0] > 0
+        return steps[0], torch.cat(validated, dim=0)
+
     def get(self, request_id: str) -> OmniDiffusionRequest | None:
         for req in self.requests:
             if req.request_id == request_id:

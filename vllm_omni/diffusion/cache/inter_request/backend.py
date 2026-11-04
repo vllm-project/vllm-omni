@@ -160,8 +160,25 @@ class InterRequestCacheBackend(CacheBackend):
 
     def enable(self, pipeline: Any) -> None:
         self._pipeline = pipeline
-        self.enabled = True
         self._model_digest = self._compute_model_digest(pipeline)
+
+        # Tiled/sharded VAE decode (vae_patch_parallel_size > 1) returns the
+        # real output only on the owning rank; other ranks get placeholders.
+        # Rank-divergent cache-hit decisions would desynchronize the
+        # collectives inside pipeline.forward (owner short-circuits, peers
+        # block) — refuse inter-request reuse in that topology.
+        vae_patch_parallel_size = getattr(getattr(pipeline, "od_config", None), "vae_patch_parallel_size", 1)
+        if vae_patch_parallel_size and vae_patch_parallel_size > 1:
+            logger.warning(
+                "InterRequestCacheBackend disabled: vae_patch_parallel_size=%d "
+                "shards outputs across ranks; cross-request reuse would "
+                "desynchronize collectives on a hit.",
+                vae_patch_parallel_size,
+            )
+            self.enabled = False
+            return
+
+        self.enabled = True
         self._recorder = StepLatentsRecorder()
         # Register as a general-purpose denoising-step hook (see
         # ProgressBarMixin). Kept also as an attribute for backwards compat.
@@ -207,6 +224,11 @@ class InterRequestCacheBackend(CacheBackend):
             if isinstance(val, str) and val:
                 parts.append(val)
                 break
+        # QwenImagePipeline / Wan22Pipeline keep the checkpoint identity in
+        # od_config.model and populate none of the attributes above.
+        od_model = getattr(getattr(pipeline, "od_config", None), "model", None)
+        if isinstance(od_model, str) and od_model:
+            parts.append(od_model)
         try:
             import torch.distributed as dist
 
@@ -411,6 +433,8 @@ class InterRequestCacheBackend(CacheBackend):
             required_width=cache_key.width,
             required_num_inference_steps=cache_key.num_inference_steps,
             required_num_frames=cache_key.num_frames,
+            required_sigmas=cache_key.sigmas,
+            required_lora_digest=cache_key.lora_digest,
         )
         return latents, step_latents, sim, cached_prompt, match_type
 
@@ -636,7 +660,15 @@ class InterRequestCacheBackend(CacheBackend):
         # been reset by the pipeline between short_circuit and here.
         recorder_resumed = self._recorder is not None and self._recorder.resume_from_step > 0
         for req, output in zip(reqs, outputs):
-            if output.output is None or is_dummy:
+            if output.output is None:
+                # Media-typed outputs (decoded video on DiffusionOutput.media)
+                # have no cacheable tensor representation; bypass silently.
+                continue
+            if is_dummy:
+                continue
+            if not hasattr(output.output, "numel") or output.output.numel() == 0:
+                # Placeholder tensors (e.g. non-owner ranks under sharded
+                # decode) must not poison the cache.
                 continue
             # Skip step latents when this was a resume (incomplete step history).
             step_latents_data = None

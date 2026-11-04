@@ -790,8 +790,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             # Inter-request cache: check for exact/semantic hits before forward.
             # Exact-hit requests are removed from the batch and their cached
             # outputs are returned directly; semantic hits set resume_from_step.
+            # cache_backend may be None (no cache configured / request-scoped
+            # cache-dit adoption cleared it) — hooks are no-ops then.
+            cache_backend = self.cache_backend
             original_reqs = reqs
-            inter_request_outputs, reqs = self.cache_backend.short_circuit_requests(reqs, target_device=self.device)
+            inter_request_outputs: list[tuple[int, DiffusionOutput]] = []
+            if cache_backend is not None:
+                inter_request_outputs, reqs = cache_backend.short_circuit_requests(reqs, target_device=self.device)
 
             # If all requests were exact hits, skip forward entirely.
             if not reqs:
@@ -813,7 +818,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 current_omni_platform.reset_peak_memory_stats()
 
             is_dummy = any(r.is_dummy_run() for r in reqs)
-            self.cache_backend.before_diffuse(is_dummy=is_dummy)
+            if cache_backend is not None:
+                cache_backend.before_diffuse(is_dummy=is_dummy)
 
             paged_kv_runtime = None
             paged_kv_context: AbstractContextManager[Any] = nullcontext()
@@ -858,17 +864,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     output.peak_memory_mb = max(output.peak_memory_mb, batch_peak_memory_mb)
 
             # Inter-request cache: store computed outputs for future reuse.
-            outputs = self.cache_backend.post_forward_store(
-                reqs,
-                outputs,
-                target_device=self.device,
-                runner=self,
-                is_dummy=is_dummy,
-            )
-            self.cache_backend.after_diffuse(is_dummy=is_dummy)
+            if cache_backend is not None:
+                outputs = cache_backend.post_forward_store(
+                    reqs,
+                    outputs,
+                    target_device=self.device,
+                    runner=self,
+                    is_dummy=is_dummy,
+                )
+                cache_backend.after_diffuse(is_dummy=is_dummy)
 
-            # Merge exact-hit outputs back into position.
-            outputs = self.cache_backend.merge_hit_outputs(outputs, inter_request_outputs)
+                # Merge exact-hit outputs back into position.
+                outputs = cache_backend.merge_hit_outputs(outputs, inter_request_outputs)
 
             # Log prompt-embed cache activity; hits/misses accumulate across requests.
             prompt_embed_cache = getattr(self, "prompt_embed_cache", None)
