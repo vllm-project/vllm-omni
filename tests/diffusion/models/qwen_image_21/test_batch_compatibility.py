@@ -339,6 +339,8 @@ def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess,
     (width, height) = info["input_image_sizes"][0]
     assert prompt_image.size == (width, height)
     if with_prepopulated_info:
+        # Nested values intentionally remain shared; this checks preprocessing,
+        # not whether downstream consumers preserve them.
         assert original_prompt["additional_information"] is caller_info
         assert caller_info == {"caller_list": ["caller-owned"], "caller_mapping": {"items": ["unchanged"]}}
         assert caller_info["caller_list"] is caller_list
