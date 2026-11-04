@@ -35,10 +35,16 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
+from vllm_omni.cudagraph.moe_routing_dispatcher import with_moe_routing_key
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+    MoERoutingKey,
+    moe_routing_key_from_input_ids,
+    moe_routing_key_scope,
+)
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -995,6 +1001,80 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return torch.tensor([])
         return super()._dummy_sampler_run(hidden_states=hidden_states)
 
+    def _moe_routing_specialize_enabled(self) -> bool:
+        return bool(getattr(self.compilation_config, "cudagraph_specialize_moe_routing", False))
+
+    def _resolve_moe_routing_key(
+        self,
+        *,
+        force_moe_routing_key: int | None = None,
+        num_tokens: int | None = None,
+    ) -> MoERoutingKey:
+        if force_moe_routing_key is not None:
+            return MoERoutingKey(int(force_moe_routing_key))
+        if not self._moe_routing_specialize_enabled():
+            return MoERoutingKey.BLEND
+        model = getattr(self, "model", None)
+        gen_start = getattr(model, "gen_vocab_start_index", None)
+        if gen_start is None:
+            language_model = getattr(model, "language_model", None)
+            gen_start = getattr(language_model, "gen_vocab_start_index", None)
+        if gen_start is None or num_tokens is None:
+            return MoERoutingKey.BLEND
+        input_ids = self.input_ids.gpu[:num_tokens]
+        return moe_routing_key_from_input_ids(input_ids, int(gen_start))
+
+    def _warmup_and_capture(
+        self,
+        desc,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+        profiler=None,
+    ):
+        """Capture one graph; honour ``desc.moe_routing_key`` when specializing (#9865)."""
+        from contextlib import nullcontext
+
+        if profiler is None:
+            profiler = nullcontext()
+        if num_warmups is None:
+            num_warmups = self.compilation_config.cudagraph_num_of_warmups
+        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        moe_key = int(getattr(desc, "moe_routing_key", MoERoutingKey.BLEND))
+        for _ in range(num_warmups):
+            self._dummy_run(
+                desc.num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                force_attention=force_attention,
+                uniform_decode=desc.uniform,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=desc.num_active_loras,
+                profile_seq_lens=profile_seq_lens,
+                force_moe_routing_key=moe_key,
+            )
+        if num_warmups > 0:
+            torch.accelerator.synchronize()
+        with (
+            profiler,
+            torch.profiler.record_function(f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}_moe{moe_key}"),
+            moe_routing_key_scope(MoERoutingKey(moe_key)),
+        ):
+            self._dummy_run(
+                desc.num_tokens,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                uniform_decode=desc.uniform,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=desc.num_active_loras,
+                is_graph_capturing=True,
+                profile_seq_lens=profile_seq_lens,
+                force_moe_routing_key=moe_key,
+            )
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -1011,6 +1091,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        force_moe_routing_key: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -1124,6 +1205,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 force_num_active_loras=num_active_loras,
             )
         )
+        # #9865: pin the MoE specialty on the graph key used for capture/replay.
+        moe_key = self._resolve_moe_routing_key(
+            force_moe_routing_key=force_moe_routing_key,
+            num_tokens=num_tokens_unpadded,
+        )
+        batch_desc = with_moe_routing_key(batch_desc, moe_key)
 
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
