@@ -2,40 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MixFusion packed-layout plan type definitions.
 
-Mirrors :mod:`vllm_omni.diffusion.distributed.sp_plan`: models only declare
-*where* the chunk-stacked MixFusion layout starts, ends and has to be
-expanded; the hooks in :mod:`vllm_omni.diffusion.hooks.mixfusion` implement
-*how*. The declaration keeps ``forward`` free of any MixFusion branching.
+Mirrors :mod:`vllm_omni.diffusion.distributed.sp_plan`: models declare *where*
+the chunk-stacked layout starts, ends and has to be expanded, while the hooks
+in :mod:`vllm_omni.diffusion.hooks.mixfusion` implement *how*.
 
-A ``_mixfusion_plan`` is a dictionary mapping module names (same syntax as
-``_sp_plan``: ``""`` for the root, dotted paths, one ``*`` for a ModuleList
-wildcard) to one of the declarative types below.
-
-Unlike an ``_sp_plan``, the packed layout is data-dependent per denoise step
-(chunk count and request shapes), so there is no static config object: the
-pipeline arms a :class:`~vllm_omni.diffusion.forward_context.MixFusionStep`
-on the forward context and the root hook asks the model's
-:class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter` to derive the
-concrete
-:class:`~vllm_omni.diffusion.mixfusion.execution_plan.PackedExecutionPlan`
-from the batch.
+A ``_mixfusion_plan`` maps module names (same syntax as ``_sp_plan``: ``""``
+for the root, dotted paths, one ``*`` per ModuleList wildcard) to the types
+below. The layout depends on the per-step batch, so the pipeline arms a
+:class:`~vllm_omni.diffusion.forward_context.MixFusionStep` and the root hook
+asks the model's :class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`
+for the concrete
+:class:`~vllm_omni.diffusion.mixfusion.execution_plan.PackedExecutionPlan`.
 
 Example::
 
-    class MyTransformer(nn.Module):
-        mixfusion_adapter = MyMixFusionAdapter()
-
-        _mixfusion_plan = {
-            # Pack the per-request latent list before forward, restore the
-            # per-request list after it.
-            "": MixFusionRoot(),
-            # Hand out the packed hidden states / RoPE tables produced by the
-            # adapter instead of recomputing them on the packed batch.
-            "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
-            # Expand per-request conditioning rows to per-chunk rows.
-            "transformer_blocks.*.img_mod": MixFusionExpandRows(),
-            "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
-        }
+    _mixfusion_plan = {
+        "": MixFusionRoot(),  # pack before forward, restore the list after
+        # Hand out adapter-computed packed hidden states / RoPE tables.
+        "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
+        "transformer_blocks.*.img_mod": MixFusionExpandRows(),  # per chunk
+        "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
+    }
 """
 
 from __future__ import annotations
@@ -51,12 +38,9 @@ from dataclasses import dataclass
 class MixFusionRoot:
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
-    The root is the only boundary that sees both the per-request latent list
-    and the text stream (whose padded width participates in every RoPE
-    table), so the packing work has to start there. ``pre_forward`` delegates
-    to the model's :class:`MixFusionAdapter`, which rewrites the bound forward
-    call; ``post_forward`` asks the adapter to reassemble the per-request
-    outputs.
+    It is the only boundary that sees both the per-request latent list and the
+    text stream (whose padded width participates in every RoPE table), so both
+    directions delegate to the model's :class:`MixFusionAdapter`.
     """
 
 
@@ -64,15 +48,9 @@ class MixFusionRoot:
 class MixFusionReplaceOutput:
     """Return an adapter-computed value instead of running this forward.
 
-    The value comes from ``PackedInputs.boundary_outputs[boundary]``: the
-    adapter computes it once at the root (where the text stream is still
-    visible) and the framework hands it back at this boundary, so the module's
-    original forward never runs on the packed batch.
-
-    Args:
-        boundary: Key into ``PackedInputs.boundary_outputs``; chosen by the
-            adapter, e.g. ``"rope"`` for the packed hidden states and RoPE
-            tables of an image-RoPE boundary.
+    The value is ``PackedInputs.boundary_outputs[boundary]``, computed once by
+    the adapter at the root where the text stream is still visible; the
+    module's original forward never runs on the packed batch.
     """
 
     boundary: str
@@ -82,8 +60,7 @@ class MixFusionReplaceOutput:
 class MixFusionExpandRows:
     """Output side: expand a per-request ``[B, ...]`` tensor to per-chunk rows.
 
-    Use on modules whose per-request output feeds chunk-level consumers
-    (e.g. AdaLN modulation parameters on the chunk-stacked image stream).
+    E.g. AdaLN modulation parameters consumed by the chunk-stacked image stream.
     """
 
 
@@ -91,17 +68,10 @@ class MixFusionExpandRows:
 class MixFusionExpandArg:
     """Input side: expand forward argument ``arg_name`` to per-chunk rows.
 
-    Use on modules that consume a per-request conditioning tensor alongside
-    chunk-stacked hidden states (e.g.
-    ``norm_out(x, conditioning_embedding)``).
-
-    Args:
-        arg_name: Name of the forward argument to expand. Bound by signature,
-            so it works whether the caller passed it positionally or by
-            keyword.
-        expected_dims: Rank the argument must have before expansion; guards
-            against signature drift turning the expansion into a silent
-            reshape of the wrong tensor.
+    E.g. ``norm_out(x, conditioning_embedding)`` consumes request-level
+    conditioning alongside chunk-stacked hidden states. The argument is bound
+    by signature; ``expected_dims`` rejects signature drift instead of silently
+    expanding the wrong tensor.
     """
 
     arg_name: str

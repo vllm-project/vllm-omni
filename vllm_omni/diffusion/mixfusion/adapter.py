@@ -2,20 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-side MixFusion adapter protocol.
 
-MixFusion is split into three layers:
+MixFusion has three layers: a common driver (admission and step lifecycle), a
+common layout/hook layer (:class:`PackedExecutionPlan` and the module-boundary
+hooks), and a model-side adapter implementing this protocol, which alone knows
+the model's forward signature, packed-call shape and output layout.
 
-- a common driver that decides *which* requests may be packed and owns the
-  step lifecycle (forward context, fallback to the serial path);
-- common hooks and :class:`~vllm_omni.diffusion.mixfusion.execution_plan.PackedExecutionPlan`
-  that implement the chunk-stacked layout at declared module boundaries;
-- a model-side adapter implementing this protocol, which alone knows the
-  model's forward signature, its packed-call shape and its output layout.
-
-The framework never interprets the model-specific payloads carried by
-:class:`PackedInputs` (``boundary_outputs`` and ``adapter_state``); it only
-moves them between the hooks that a model's ``_mixfusion_plan`` declares.
-Adding a model therefore needs a new adapter file and plan declaration, not
-changes in the driver or hooks.
+The framework never interprets the model-specific payloads in
+:class:`PackedInputs` (``boundary_outputs`` and ``adapter_state``); adding a
+model needs a new adapter and plan declaration, not driver or hook changes.
 """
 
 from __future__ import annotations
@@ -39,9 +33,8 @@ StreamKind = Literal["chunked", "request"]
 class StreamSpec:
     """One attention stream of a packed model call.
 
-    A model declares its streams through
-    :meth:`MixFusionAdapter.build_attention_layout`. Stream order is the token
-    order inside every packed request (e.g. text then image chunks).
+    Declared through :meth:`MixFusionAdapter.build_attention_layout`; stream
+    order is the token order inside every packed request.
     """
 
     name: str
@@ -76,12 +69,9 @@ class AttentionLayout:
 class PackedInputs:
     """Rewritten forward call plus the layout it runs under.
 
-    Produced by :meth:`MixFusionAdapter.pack_inputs` from the caller's bound
-    forward arguments. ``args`` / ``kwargs`` are what the model forward is
-    actually invoked with; ``boundary_outputs`` replaces the outputs of
-    boundaries that only the adapter can produce (keyed by the names its plan
-    declares), and ``adapter_state`` carries whatever the adapter wants to
-    reuse on the next denoise step (e.g. step-invariant RoPE tables).
+    Produced by :meth:`MixFusionAdapter.pack_inputs`. ``boundary_outputs``
+    replaces the outputs of boundaries only the adapter can compute;
+    ``adapter_state`` carries adapter-private reuse data for the next step.
     """
 
     args: tuple[Any, ...]
@@ -101,35 +91,26 @@ class PackedInputs:
 class MixFusionAdapter(Protocol):
     """Model-side contract for the MixFusion packed path.
 
-    The common root hook binds the model forward call, asks the adapter
-    whether it can pack, delegates packing to it, and asks it to restore the
-    per-request output list afterwards. Everything model-specific lives
-    behind these methods.
+    The root hook binds the forward call, asks the adapter whether it can
+    pack, delegates packing, and restores the per-request output list.
     """
 
     def build_packed_call(self, input_batch: Any) -> dict[str, Any]:
         """Build this model's packed forward keyword arguments.
 
         The driver calls ``transformer(**build_packed_call(input_batch))``
-        under an armed step; the root hook then turns that call into the
-        chunk-stacked layout. Only the adapter knows the model's forward
-        contract, so the driver never builds this call itself.
+        under an armed step; the root hook turns that call into the packed
+        layout. Only the adapter knows the model's forward contract.
         """
         ...
 
     def can_pack(self, module: nn.Module, bound: Any) -> tuple[bool, str]:
-        """Whether this call is packable.
+        """Whether this call is packable; return ``(False, reason)`` to stay serial.
 
         ``bound`` is an :class:`inspect.BoundArguments` over the model's
-        forward. Return ``(False, reason)`` to keep the serial path; the
-        reason is used in diagnostics.
-
-        The driver calls this during admission, binding
-        ``build_packed_call(input_batch)`` to the model's forward signature,
-        to decide between the packed and serial paths. The root hook then
-        calls it again on the real forward call as an assertion: once the
-        model is running it cannot fall back, so a False answer there raises
-        and aborts the packed step. Implementations must therefore be
+        forward. The driver calls this during admission to choose the path;
+        the root hook calls it again on the real call as an assertion (a False
+        answer there aborts the packed step), so implementations must be
         deterministic for equivalent arguments. Raise ``TypeError`` when the
         call lacks a required argument (e.g. ``hidden_states``); admission
         treats that as a refusal.
@@ -141,8 +122,7 @@ class MixFusionAdapter(Protocol):
 
         The layout is step-invariant, so ``plan`` may be ``None`` while the
         adapter is still building it. The packed-attention entry point reads
-        the layout off the armed step to know how to split the QKV inputs and
-        reassemble the outputs.
+        it off the armed step to split QKV and reassemble outputs.
         """
         ...
 
@@ -151,24 +131,18 @@ class MixFusionAdapter(Protocol):
     ) -> PackedInputs | None:
         """Rewrite the bound forward call into the packed layout.
 
-        ``cache`` is the bundle this adapter returned on the previous step (or
-        ``None``); use it to skip step-invariant work. Returning ``None``
-        keeps the serial path.
+        ``cache`` is the bundle from the previous step (or ``None``); use it to
+        skip step-invariant work. Returning ``None`` keeps the serial path.
         """
         ...
 
     def prepare_position_embeddings(self, module: nn.Module, plan: Any, cache: Any = None) -> Any:
         """Build the step-invariant position embeddings for a packed step.
 
-        The adapter's own ``pack_inputs`` path calls this (through its input
-        preparation), because only the root boundary sees every stream at
-        once; the framework (driver, hooks, execution plan) never calls it.
-        Keeping it on the protocol makes the model-side responsibility
-        explicit and testable instead of burying it in a hook or the driver.
-
-        ``plan``, ``cache`` and the return value are adapter-defined opaque
-        payloads: the framework only carries them and never inspects their
-        contents.
+        Only the adapter's own ``pack_inputs`` path calls and implements it;
+        the protocol entry keeps that model-side responsibility explicit and
+        testable. ``plan``, ``cache`` and the return value are opaque payloads
+        the framework only carries.
         """
         ...
 

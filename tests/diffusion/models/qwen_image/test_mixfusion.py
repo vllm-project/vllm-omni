@@ -13,8 +13,8 @@ model's point of view:
 * The block-hook guard refuses to pack while blocks carry hooks (layerwise
   offload / HSDP ``fully_shard``); the driver falls back to the serial path,
   whose per-request loops route every block through the hooked module call.
-* ``attention_kwargs`` must be threaded by the serial path or rejected loudly
-  at prepare, never silently dropped by the packed layout.
+* ``attention_kwargs`` must be threaded by the serial path or rejected at
+  admission (``can_pack``), never silently dropped by the packed layout.
 * The packed cross-attention flattens mixed requests into one
   ``forward_packed`` call, preserving the eager path's RoPE dtype contract
   (#7494) and per-document semantics on both the varlen route and the dense
@@ -264,32 +264,55 @@ def test_plan_foreign_hooks_reports_native_block_hooks():
     ]
 
 
-def _prepare_packed(transformer, **overrides):
-    kwargs = dict(
+def _bound(**arguments):
+    """A bound forward call as far as ``can_pack`` inspects it."""
+    return SimpleNamespace(arguments=arguments)
+
+
+def _packable_bound(**overrides):
+    arguments = dict(
         hidden_states=[torch.zeros(1, 8, 16)],
         encoder_hidden_states=torch.zeros(1, 4, 8),
         img_shapes=[(16, 2, 2)],
         txt_seq_lens=[4],
     )
-    kwargs.update(overrides)
-    QwenImageMixFusionAdapter().prepare_inputs(transformer, **kwargs)
+    arguments.update(overrides)
+    return _bound(**arguments)
 
 
-def test_packed_prepare_rejects_hooked_blocks():
-    with pytest.raises(ValueError, match="unvalidated semantics"):
-        _prepare_packed(_transformer([_hooked_block()]))
+def test_can_pack_rejects_hooked_blocks():
+    bound = _packable_bound()
+    assert QwenImageMixFusionAdapter().can_pack(_transformer([_hooked_block()]), bound) == (
+        False,
+        "foreign hooks on the packed path (transformer_blocks.*.img_mod:layerwise_offload)",
+    )
 
 
-def test_packed_prepare_rejects_native_hooked_blocks():
-    with pytest.raises(ValueError, match="unvalidated semantics"):
-        _prepare_packed(_transformer([_hsdp_like_block()]))
+def test_can_pack_rejects_native_hooked_blocks():
+    bound = _packable_bound()
+    assert QwenImageMixFusionAdapter().can_pack(_transformer([_hsdp_like_block()]), bound) == (
+        False,
+        "foreign hooks on the packed path (transformer_blocks.*.img_mod:torch-native)",
+    )
 
 
-def test_packed_prepare_passes_the_hook_guard_without_hooks():
-    # Without hooks the guard must not fire; execution continues to the
-    # regular input validation (empty hidden states).
-    with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        _prepare_packed(_transformer([_PlainBlock()]), hidden_states=[])
+def test_can_pack_passes_the_hook_guard_without_hooks():
+    adapter = QwenImageMixFusionAdapter()
+    assert adapter.can_pack(_transformer([_PlainBlock()]), _packable_bound()) == (True, "")
+    # An empty batch is rejected too, so the armed forward never sees it.
+    assert adapter.can_pack(_transformer([_PlainBlock()]), _packable_bound(hidden_states=[])) == (
+        False,
+        "no hidden-state tensors to pack",
+    )
+
+
+def test_can_pack_rejects_zero_cond_t_editing_path():
+    transformer = _transformer()
+    object.__setattr__(transformer, "zero_cond_t", True)
+    assert QwenImageMixFusionAdapter().can_pack(transformer, _packable_bound()) == (
+        False,
+        "zero_cond_t/editing path is not supported",
+    )
 
 
 def test_driver_falls_back_to_serial_when_blocks_are_hooked():
@@ -335,43 +358,25 @@ def test_driver_packs_when_blocks_are_not_hooked():
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_rejects_attention_kwargs_on_packed_input():
-    with pytest.raises(ValueError, match="does not consume attention_kwargs"):
-        QwenImageMixFusionAdapter().prepare_inputs(
-            _transformer(),
-            hidden_states=[torch.zeros(1, 8, 16)],
-            encoder_hidden_states=torch.zeros(1, 4, 8),
-            img_shapes=[(16, 2, 2)],
-            txt_seq_lens=[4],
-            attention_kwargs=dict(SENTINEL_KWARGS),
-        )
+def test_can_pack_rejects_attention_kwargs():
+    bound = _packable_bound(attention_kwargs=dict(SENTINEL_KWARGS))
+    assert QwenImageMixFusionAdapter().can_pack(_transformer(), bound) == (
+        False,
+        "attention_kwargs is set",
+    )
 
 
-def test_prepare_accepts_empty_attention_kwargs_on_packed_input():
-    # An empty dict carries no per-attention arguments, so the packed dispatch
-    # must proceed (here: into the regular input validation).
-    with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        QwenImageMixFusionAdapter().prepare_inputs(
-            _transformer(),
-            hidden_states=[],
-            encoder_hidden_states=torch.zeros(1, 4, 8),
-            img_shapes=[(16, 2, 2)],
-            txt_seq_lens=[4],
-            attention_kwargs={},
-        )
+def test_can_pack_accepts_empty_attention_kwargs():
+    # An empty dict carries no per-attention arguments, so packing proceeds.
+    bound = _packable_bound(attention_kwargs={})
+    assert QwenImageMixFusionAdapter().can_pack(_transformer(), bound) == (True, "")
 
 
 def test_driver_falls_back_to_serial_with_attention_kwargs():
     transformer = _StubTransformer()
     driver, serial_inputs = _driver(transformer, QwenImageMixFusionAdapter())
     driver.pipeline.attention_kwargs = dict(SENTINEL_KWARGS)
-    input_batch = SimpleNamespace(
-        latents=[torch.zeros(1, 8, 16)],
-        do_true_cfg=False,
-        image_latents=None,
-        request_extras=None,
-        timesteps=torch.tensor([500.0]),
-    )
+    input_batch = _packed_input_batch()
 
     assert driver.run(input_batch, states=[], dense_step=_dense_step) == "serial"
     assert serial_inputs == [input_batch]

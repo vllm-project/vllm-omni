@@ -2,20 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MixFusion sequence-packing layout primitives.
 
-MixFusion treats chunked sequence packing the way Ulysses sequence
-parallelism treats shards: every non-attention computation is token-local
-and can run on sequence partitions (chunks stacked along the local batch
-dimension), while attention needs the complete logical sequence and is
-reassembled per request at the attention boundary. This module owns the
-layout side of that split: sequence-dim chunking with aligned tensors
-(hidden states and their RoPE frequencies) kept under the same partition,
-the chunk-to-request mapping, per-chunk conditioning expansion, and the
-packed varlen attention layout (cu_seqlens / max_seqlen). Models declare
-their stream relationships; attention modules adapt the layout back into
-their attention domain.
-
-This module is layout-only: no model-specific semantics, no nn.Module
-state.
+Every non-attention computation is token-local and runs on sequence chunks
+stacked along the local batch dimension; attention needs the complete logical
+sequence and is reassembled per request at the attention boundary. This module
+owns the layout side: sequence-dim chunking with aligned RoPE frequencies, the
+chunk-to-request mapping, per-chunk conditioning expansion, and the packed
+varlen layout (cu_seqlens / max_seqlen). Layout only: no model-specific
+semantics, no ``nn.Module`` state.
 """
 
 from __future__ import annotations
@@ -34,9 +27,8 @@ if TYPE_CHECKING:
 def gcd_chunk_size(latents: Sequence[torch.Tensor]) -> int:
     """Largest chunk length that divides every request's image sequence.
 
-    Chunks are the packed unit, so each request's ``[num_images, S, C]``
-    latents must split into equal chunks along ``S``; the GCD bounds the chunk
-    below and keeps every request on the same chunk length.
+    Each ``[num_images, S, C]`` latent must split into equal chunks along
+    ``S``; the GCD keeps every request on the same chunk length.
     """
     chunk_size = int(latents[0].shape[1])
     for sample in latents[1:]:
@@ -52,10 +44,8 @@ def plan_chunk_size(
 ) -> tuple[bool, str, int, int]:
     """Decide whether these per-request latents may be packed.
 
-    Common admission policy: the GCD chunk length must be at least
-    ``min_chunk_tokens`` (tokens per chunk below that make packing overhead
-    dominate) and the total chunk count must stay within ``max_chunks`` (the
-    stack length of the packed image stream). Returns
+    The GCD chunk length must reach ``min_chunk_tokens`` and the total chunk
+    count must stay within ``max_chunks``. Returns
     ``(accepted, reason, chunk_size, chunk_count)``.
     """
     chunk_size = gcd_chunk_size(latents)
@@ -71,11 +61,10 @@ def plan_chunk_size(
 class PackedExecutionPlan:
     """Per-step MixFusion packing layout, computed once and shared by all blocks.
 
-    Holds the flat varlen sequence layout (cu_seqlens / max_seq_len) plus the
-    index tensors that recover each attention stream's rows from the packed
-    attention output, so per-block work stays on-GPU. Which streams exist and
-    in what order they appear inside a request is the model's
-    ``AttentionLayout``; this plan only records their lengths and indices.
+    Holds the flat varlen layout (cu_seqlens / max_seq_len) and the index
+    tensors that recover each stream's rows, so per-block work stays on-GPU.
+    The stream set and order come from the model's ``AttentionLayout``; this
+    plan records their lengths and indices.
     """
 
     chunk_size: int
@@ -193,10 +182,9 @@ def split_sequence_chunks(
     """Split per-row states and their aligned RoPE frequencies into chunks.
 
     ``rows[i]`` is a ``[1, S_i, C]`` latent row and ``row_freqs[i]`` the
-    ``[S_i, D/2]`` RoPE frequency table for the same positions, so the two
-    tensors always land under the same partition. Returns the per-chunk
-    tensors for both (the caller stacks them along the local batch
-    dimension), the per-row chunk ranges, and the chunk-to-request mapping.
+    ``[S_i, D/2]`` frequency table for the same positions, so both land under
+    the same partition. Returns the per-chunk tensors of both, the per-row
+    chunk ranges and the chunk-to-request mapping.
     """
     chunks: list[torch.Tensor] = []
     freq_chunks: list[torch.Tensor] = []
@@ -218,8 +206,8 @@ def split_sequence_chunks(
 def expand_per_chunk(temb: torch.Tensor, chunk_to_request: torch.Tensor) -> torch.Tensor:
     """Expand per-request conditioning rows to per-chunk rows.
 
-    Chunk-level computations (AdaLN modulation on chunk-stacked image
-    streams) need request-level conditioning duplicated per chunk.
+    Chunk-level computations (AdaLN modulation) need request-level
+    conditioning duplicated per chunk.
     """
     return temb.index_select(0, chunk_to_request)
 
@@ -231,9 +219,9 @@ def reassemble_chunk_rows(
 ) -> list[torch.Tensor]:
     """Rebuild one output tensor per request from its contiguous chunk rows.
 
-    Request ``i`` owns ``row_counts[i]`` image rows whose chunks are
-    contiguous in ``request_chunk_ranges``; the output preserves the
-    external contract of one ``[num_images, S, C]`` tensor per request.
+    Request ``i`` owns ``row_counts[i]`` image rows whose chunks are contiguous
+    in ``request_chunk_ranges``; the result is one ``[num_images, S, C]``
+    tensor per request.
     """
     outputs: list[torch.Tensor] = []
     row_idx = 0

@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-side MixFusion half for the Qwen image transformer.
 
-Everything here is Qwen-specific: the packed-call surface, the text/image
-attention layout, and the preparation that turns a per-request latent list
-into the chunk-stacked layout the shared forward body consumes. The common
-driver and hooks only know the protocols in
-:mod:`vllm_omni.diffusion.mixfusion.adapter`, so a new model ports MixFusion
-by writing this file, registering the adapter and ``_mixfusion_plan`` on its
-transformer, and adding a model test.
+Qwen-specific pieces: the packed-call surface, the text/image attention
+layout, and the preparation that turns a per-request latent list into the
+chunk-stacked layout the shared forward body consumes. The common driver and
+hooks only know the protocols in
+:mod:`vllm_omni.diffusion.mixfusion.adapter`; porting a new model means
+writing this file, registering the adapter and ``_mixfusion_plan``, and
+adding a model test.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
+from vllm_omni.diffusion.hooks.mixfusion import packed_call_rejection
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, PackedInputs, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedExecutionPlan,
@@ -33,14 +33,11 @@ from vllm_omni.diffusion.mixfusion.execution_plan import (
 class MixFusionInputs:
     """Prepared packed-MixFusion inputs for one denoise step.
 
-    Built by :meth:`QwenImageMixFusionAdapter.prepare_inputs` from the
-    MixFusion root hook; the hook then hands the chunk-stacked
-    ``hidden_states`` and RoPE tables to ``forward``, which runs the packed
-    layout through the same body as a batched tensor input.
-
-    Only ``hidden_states`` changes across the denoise steps of one generation;
-    the remaining fields depend solely on the request shapes and are reused
-    via the ``cached`` fast path (``key`` records what they were built from).
+    Built by :meth:`QwenImageMixFusionAdapter.prepare_inputs` under the root
+    hook, which hands the chunk-stacked ``hidden_states`` and RoPE tables to
+    ``forward``. Only ``hidden_states`` changes across a generation's denoise
+    steps; the rest depends solely on the request shapes and is reused via the
+    ``cached`` path (``key`` records what it was built from).
     """
 
     hidden_states: torch.Tensor
@@ -60,9 +57,8 @@ class MixFusionInputs:
 class PositionPlan:
     """Model-private input bundle for :meth:`prepare_position_embeddings`.
 
-    The framework never inspects or constructs it; it exists so the Qwen
-    adapter can separate the step-invariant layout inputs from the per-step
-    latents and expose the position-embedding preparation on its own.
+    Opaque to the framework; it separates the step-invariant layout inputs
+    from the per-step latents.
     """
 
     image_rows: list[torch.Tensor]
@@ -75,11 +71,10 @@ class PositionPlan:
 class QwenImageMixFusionAdapter:
     """Model-side half of MixFusion for the Qwen image transformer.
 
-    The common root hook binds this model's forward call and delegates to the
-    adapter (see :mod:`vllm_omni.diffusion.mixfusion.adapter`): this class is
-    the only place that knows the forward signature (a per-request latent
-    list plus per-image prompts), the packed call's shape and how the packed
-    output maps back to one tensor per request.
+    The root hook binds this model's forward call and delegates here; this
+    class is the only place that knows the forward signature (a per-request
+    latent list plus per-image prompts), the packed call's shape and how the
+    packed output maps back to one tensor per request.
     """
 
     def build_attention_layout(self, plan: PackedExecutionPlan | None = None) -> AttentionLayout:
@@ -104,16 +99,35 @@ class QwenImageMixFusionAdapter:
         }
 
     def can_pack(self, module, bound) -> tuple[bool, str]:
-        if "hidden_states" not in bound.arguments:
-            # Contract: packing needs the per-request latent argument; keep
-            # the failure actionable rather than silently packing nothing.
+        # A ``**kwargs`` forward leaves them nested in the bound arguments
+        # (memory-profiling stubs); explicit params stay authoritative.
+        args = {**(bound.arguments.get("kwargs") or {}), **bound.arguments}
+        if "hidden_states" not in args:
+            # Contract: packing needs the per-request latent argument.
             raise TypeError(
                 f"MixFusion packing requires a `hidden_states` argument in the {type(module).__name__} forward call."
             )
-        if not isinstance(bound.arguments["hidden_states"], (list, tuple)):
+        if not isinstance(args["hidden_states"], (list, tuple)):
             # A batched tensor means a non-packed forward while the step is
             # armed (e.g. memory profiling): stay serial.
             return False, "hidden_states is a batched tensor (serial forward)"
+        rejection = packed_call_rejection(
+            module,
+            attention_kwargs=args.get("attention_kwargs"),
+            parallel_config=getattr(module, "parallel_config", None),
+        )
+        if rejection:
+            return False, rejection
+        # Model-side input contract. The driver preflights ``can_pack`` before
+        # arming, so rejecting here yields the serial fallback, not an exception.
+        if not args["hidden_states"]:
+            return False, "no hidden-state tensors to pack"
+        if args.get("img_shapes") is None or args.get("txt_seq_lens") is None:
+            return False, "img_shapes and txt_seq_lens are required"
+        if getattr(module, "zero_cond_t", False):
+            # The editing path passes per-token modulate indices that the
+            # packed layout does not build yet.
+            return False, "zero_cond_t/editing path is not supported"
         return True, ""
 
     def pack_inputs(self, module, bound, *, step, cache: PackedInputs | None) -> PackedInputs:
@@ -125,7 +139,6 @@ class QwenImageMixFusionAdapter:
             encoder_hidden_states_mask=bound.arguments.get("encoder_hidden_states_mask"),
             img_shapes=bound.arguments.get("img_shapes"),
             txt_seq_lens=bound.arguments.get("txt_seq_lens"),
-            attention_kwargs=bound.arguments.get("attention_kwargs"),
             cached=cached,
         )
         bound.arguments["hidden_states"] = packed.hidden_states
@@ -134,9 +147,8 @@ class QwenImageMixFusionAdapter:
             args=tuple(bound.args),
             kwargs=dict(bound.kwargs),
             plan=packed.plan,
-            # The rope boundary hands ``forward`` the root-computed packed
-            # triple (hidden_states, vid_freqs, txt_freqs) instead of
-            # recomputing it on the packed batch.
+            # The rope boundary hands ``forward`` the root-computed
+            # (hidden_states, vid_freqs, txt_freqs) triple.
             boundary_outputs={"rope": (packed.hidden_states, *packed.image_rotary_emb)},
             cache_key=packed.key,
             adapter_state={"prepare_inputs": packed},
@@ -150,12 +162,10 @@ class QwenImageMixFusionAdapter:
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], int]:
         """Build the per-image RoPE tables and chunk size for a packed step.
 
-        Called by :meth:`prepare_inputs` (and therefore by ``pack_inputs``);
-        the framework never calls it. Tables are computed per image row on the
-        full sequence so absolute positions are preserved. Everything returned
-        depends only on the request shapes recorded in ``plan.key``, so the
-        bundle from the previous denoise step can be passed as ``cache`` and
-        reused verbatim.
+        Called only by :meth:`prepare_inputs` (and therefore ``pack_inputs``).
+        Tables are computed per image row on the full sequence so absolute
+        positions are preserved; everything returned depends only on
+        ``plan.key``, so the previous bundle can be reused via ``cache``.
         """
         if cache is not None and cache.key == plan.key:
             return cache.row_vid_freqs, cache.text_freqs, cache.chunk_size
@@ -183,55 +193,28 @@ class QwenImageMixFusionAdapter:
         encoder_hidden_states_mask: torch.Tensor | None = None,
         img_shapes: list[tuple[int, int, int]] | None = None,
         txt_seq_lens: list[int] | None = None,
-        attention_kwargs: dict[str, Any] | None = None,
         attention_layout: AttentionLayout | None = None,
         cached: MixFusionInputs | None = None,
     ) -> MixFusionInputs:
         """Split per-request latents into the packed chunk layout and build its plan.
 
-        This is the entire mixfusion-specific preparation; the MixFusion root
-        hook calls it and hands the packed tensors to ``forward``, which runs
-        the packed layout through the same body as a batched tensor input.
-        The RoPE tables, packing plan and per-request image counts depend only
-        on the request shapes, so the bundle from the previous denoise step
-        can be handed back as ``cached`` to skip the rebuild (only the
-        per-step latents are re-split and re-projected).
+        Called by the root hook; ``forward`` then runs the packed layout
+        through the same body as a batched tensor input. The plan and RoPE
+        tables depend only on the request shapes, so ``cached`` from the
+        previous denoise step skips the rebuild. Callers must clear
+        :meth:`can_pack` first: rejections live there so they become the
+        serial fallback rather than an exception here.
         """
-        if attention_kwargs:
-            # The packed path has no ``attention_kwargs`` channel; refusing
-            # keeps a caller's per-attention arguments from being silently
-            # dropped.
-            raise ValueError(
-                "Qwen MixFusion packed forward does not consume attention_kwargs; "
-                "pass batched tensor hidden_states (the serial path threads "
-                "attention_kwargs into every block) or drop them."
-            )
-        if module.zero_cond_t:
-            raise ValueError("Qwen MixFusion does not support zero_cond_t/editing path yet.")
-        if module.parallel_config is not None and module.parallel_config.sequence_parallel_size > 1:
-            raise ValueError("Qwen MixFusion requires sequence parallel disabled.")
-        foreign_hooks = plan_foreign_hooks(module, getattr(module, "_mixfusion_plan", None))
-        if foreign_hooks:
-            raise ValueError(
-                "Qwen MixFusion packed forward runs modules on the chunk-stacked "
-                f"layout, but they carry hooks with unvalidated semantics ({', '.join(foreign_hooks)}); "
-                "fall back to the standard forward path."
-            )
-        if not hidden_states:
-            raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
-        if img_shapes is None or txt_seq_lens is None:
-            raise ValueError("Qwen MixFusion requires img_shapes and txt_seq_lens.")
         if attention_layout is None:
             attention_layout = self.build_attention_layout()
 
-        # Normalize the all-valid text mask early: the plan and the shared
-        # forward body follow this convention.
+        # Normalize the all-valid text mask: the plan and the shared forward
+        # body follow this convention.
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
-        # Expand each state's latents into one row per requested image so that
-        # every image gets its own prompt row (encoder_hidden_states / temb
-        # are already per-image) and its own chunk mapping.
+        # One row per requested image so every image gets its own prompt row
+        # (encoder_hidden_states / temb are already per-image) and chunk mapping.
         image_rows: list[torch.Tensor] = []
         image_row_states: list[int] = []
         total_images = 0
@@ -256,11 +239,9 @@ class QwenImageMixFusionAdapter:
         # Keep the per-request image counts for the final reassembly.
         image_row_counts = [int(sample.shape[0]) for sample in hidden_states]
 
-        # img_shapes / txt_seq_lens are per-state, and images of the same
-        # request share the same resolution and prompt. The position tables
-        # and chunk size are step-invariant, so they are keyed on the request
-        # shapes and reused verbatim from ``cached`` within a generation's
-        # denoise loop.
+        # Images of the same request share resolution and prompt. Position
+        # tables and chunk size are step-invariant, so ``cached`` is keyed on
+        # the request shapes and reused across a generation's denoise loop.
         layout_key = (
             tuple(sample.shape for sample in hidden_states),
             tuple(encoder_hidden_states.shape),
@@ -292,8 +273,8 @@ class QwenImageMixFusionAdapter:
         else:
             image_rotary_emb = (torch.stack(image_freq_chunks, dim=0), torch.stack(text_freqs, dim=0))
             # Per-stream token counts: request-level streams keep their real
-            # (masked) length and are padded to the caller-side width; chunked
-            # streams cover their chunks' rows.
+            # (masked) length, padded to the caller-side width; chunked streams
+            # cover their chunks' rows.
             request_stream_lens: dict[str, list[int]] = {}
             stream_padded_lens: dict[str, int] = {}
             for spec in attention_layout.streams:
@@ -304,9 +285,8 @@ class QwenImageMixFusionAdapter:
                     request_stream_lens[spec.name] = [
                         (chunk_end - chunk_start) * chunk_size for chunk_start, chunk_end in request_chunk_ranges
                     ]
-            # Packing layout is identical across blocks and steps: build it once
-            # per layout (cu_seqlens / out-gather indices as device tensors) so
-            # the 60 blocks run pure GPU work.
+            # Build the layout once per step (cu_seqlens / gather indices as
+            # device tensors) so all blocks run pure GPU work.
             mixfusion_plan = build_execution_plan(
                 layout=attention_layout,
                 chunk_size=chunk_size,

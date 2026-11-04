@@ -3,20 +3,12 @@
 """MixFusion module-boundary hooks.
 
 Mirrors :mod:`vllm_omni.diffusion.hooks.sequence_parallel`: the model declares
-a ``_mixfusion_plan`` (see
-:mod:`vllm_omni.diffusion.mixfusion.plan`) and the pipeline arms
-a :class:`~vllm_omni.diffusion.forward_context.MixFusionStep` on the forward
-context for each packed denoise step. These hooks execute the packed
-chunk-stacked layout at the declared module boundaries, keeping transformer
-and block ``forward`` code free of MixFusion branching.
-
-The hooks contain no model-specific knowledge: packing, boundary outputs and
-output restoration are delegated to the model's
-:class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`.
-
-All hooks are inert unless the forward context carries an armed
-``mixfusion_step``, so the same model runs its serial path unchanged when
-MixFusion is not active.
+a ``_mixfusion_plan`` and the pipeline arms a
+:class:`~vllm_omni.diffusion.forward_context.MixFusionStep` per packed denoise
+step. The hooks execute the chunk-stacked layout at those boundaries, so
+transformer and block ``forward`` code stays free of MixFusion branching.
+Packing, boundary outputs and output restoration are delegated to the model's
+adapter. All hooks are inert unless a ``mixfusion_step`` is armed.
 """
 
 from __future__ import annotations
@@ -60,12 +52,9 @@ MIXFUSION_HOOK_NAMES = (
 class MixFusionPackingError(RuntimeError):
     """An admitted call could not be packed at the root hook.
 
-    The driver preflights ``can_pack`` before admitting a batch, so this
-    signals the two answers disagreeing (admission accepted, the armed hook
-    then declined). It is a sentinel, not a user error: the driver catches it
-    and reruns the batch through the serial per-request fallback, because by
-    the time the hook runs the caller is inside ``transformer.forward`` with
-    list latents and cannot fall back itself.
+    The driver preflights ``can_pack``, so this sentinel means admission and
+    the armed hook disagreed. The driver catches it and reruns the batch
+    serially, since the hook runs inside ``transformer.forward``.
     """
 
 
@@ -97,25 +86,20 @@ def _resolve_adapter(module: nn.Module, step) -> MixFusionAdapter:
 class MixFusionRootHook(ModelHook):
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
-    ``pre_forward`` binds the model's forward call and delegates to the
-    adapter: it decides whether the call is packable and rewrites it into the
-    packed layout. ``post_forward`` asks the adapter to turn the packed output
-    back into one output per request.
+    ``pre_forward`` binds the forward call and delegates packing to the
+    adapter; ``post_forward`` restores one output per request.
     """
 
     #: Upper bound on retained branch bundles. Sequential CFG alternates the
-    #: positive and negative branch every step, so at least two slots are
-    #: needed; a small margin covers model variants that change layouts.
+    #: positive and negative branch every step and model variants may change
+    #: layouts, so a few slots are needed.
     MAX_CACHE_SLOTS = 4
 
     def __init__(self) -> None:
-        # Bundle from the previous call of the same CFG branch: the layout
-        # (RoPE tables, plan, row counts) depends only on the call's shapes,
-        # so the adapter reuses it through the ``cache`` argument. Keyed by
-        # branch because sequential true-CFG interleaves positive and negative
-        # calls within one step; a single slot would make them evict each
-        # other on every step. The adapter revalidates the layout key itself,
-        # so a stale entry for the same branch is a miss, never a wrong reuse.
+        # Bundle from the previous call of the same CFG branch. Keyed by branch
+        # because sequential true-CFG interleaves both branches within one
+        # step; the adapter revalidates the layout key, so a stale entry is a
+        # miss, never a wrong reuse.
         self._cached: OrderedDict[str | None, PackedInputs] = OrderedDict()
 
     def pre_forward(self, module, *args, **kwargs):
@@ -165,12 +149,10 @@ class MixFusionRootHook(ModelHook):
 
 
 class MixFusionReplaceOutputHook(ModelHook):
-    """Declared boundary: return the adapter-computed value for this module.
+    """Declared boundary: return ``PackedInputs.boundary_outputs`` for this module.
 
-    The value comes from ``PackedInputs.boundary_outputs``: the adapter
-    computes it once at the root, where the request list and text stream are
-    still visible. Recomputing it here would either run on the wrong layout or
-    repeat projection / ``pos_embed`` work.
+    The adapter computes it once at the root; recomputing here would run on the
+    wrong layout or repeat projection / ``pos_embed`` work.
     """
 
     def __init__(self, boundary: str) -> None:
@@ -192,8 +174,7 @@ class MixFusionReplaceOutputHook(ModelHook):
 class MixFusionExpandRowsHook(ModelHook):
     """Output side: expand a per-request ``[B, ...]`` tensor to per-chunk rows.
 
-    E.g. AdaLN modulation parameters computed per request but consumed by the
-    chunk-stacked image stream.
+    E.g. AdaLN modulation parameters consumed by the chunk-stacked stream.
     """
 
     def post_forward(self, module, output):
@@ -206,7 +187,7 @@ class MixFusionExpandRowsHook(ModelHook):
 class MixFusionExpandArgHook(ModelHook):
     """Input side: expand a named forward argument to per-chunk rows.
 
-    E.g. ``norm_out(x, conditioning_embedding)`` receives per-request
+    E.g. ``norm_out(x, conditioning_embedding)`` takes request-level
     conditioning alongside chunk-stacked hidden states.
     """
 
@@ -239,10 +220,9 @@ class MixFusionExpandArgHook(ModelHook):
 def _iter_module_path(root: nn.Module, name: str):
     """Yield the module(s) named by ``name`` plus their ancestors.
 
-    Names use the plan's ``""`` / dotted / ``*`` syntax. Yielding every
-    intermediate module covers hooks installed on containers between a plan
-    boundary and the root (e.g. a layerwise-offload hook on a transformer
-    block, whose ``img_mod`` is a boundary).
+    Names use the plan's ``""`` / dotted / ``*`` syntax. Intermediate modules
+    cover hooks on containers between a boundary and the root (e.g. a block
+    offload hook whose ``img_mod`` is the boundary).
     """
     if not name:
         yield root
@@ -267,15 +247,11 @@ def _iter_module_path(root: nn.Module, name: str):
 def plan_foreign_hooks(module: nn.Module, plan: dict | None) -> list[str]:
     """Hooks, other than MixFusion's own, on modules the packed path drives.
 
-    The packed forward bypasses some module calls (boundaries, block forwards)
-    and swaps the batch layout seen by the ones it keeps, so hooks installed
-    there run with semantics they were not written for: layerwise offload
-    would prefetch with a chunk-count step size, FSDP2's unshard pre-hook
-    would all-gather against a batch dimension that no longer matches the
-    request count, and cache hooks would build keys on the packed layout.
-    Returns ``"<plan name>:<hook name>"`` descriptions; empty means the
-    packed path can run. Both the Omni hook registry and PyTorch-native hook
-    dicts are scanned.
+    The packed forward bypasses some calls and swaps the batch layout for the
+    rest, so hooks there would run with unintended semantics (layerwise
+    offload step sizes, FSDP2 unshard all-gathers, cache keys). Returns
+    ``"<plan name>:<hook name>"``; empty means the packed path can run. Both
+    the Omni registry and PyTorch-native hook dicts are scanned.
     """
     foreign: set[str] = set()
 
@@ -296,6 +272,29 @@ def plan_foreign_hooks(module: nn.Module, plan: dict | None) -> list[str]:
                 continue
             scan(submodule, name)
     return sorted(foreign)
+
+
+def packed_call_rejection(
+    module: nn.Module,
+    *,
+    attention_kwargs: dict | None = None,
+    parallel_config: object | None = None,
+) -> str | None:
+    """Why the packed call cannot run, or ``None`` when it can.
+
+    Model-agnostic invariants shared by the driver's admission and any adapter
+    re-checking them in ``can_pack``. The packed forward has no
+    ``attention_kwargs`` channel, would shard rows again under sequence
+    parallelism, and runs foreign hooks on an unintended layout.
+    """
+    if attention_kwargs:
+        return "attention_kwargs is set"
+    if parallel_config is not None and getattr(parallel_config, "sequence_parallel_size", 1) > 1:
+        return "sequence parallelism is enabled"
+    foreign = plan_foreign_hooks(module, getattr(module, "_mixfusion_plan", None))
+    if foreign:
+        return f"foreign hooks on the packed path ({', '.join(foreign)})"
+    return None
 
 
 def _spec_hook_name(spec) -> str:
@@ -325,9 +324,8 @@ def _spec_hook(spec) -> ModelHook:
 def apply_mixfusion(module: nn.Module, plan: dict) -> None:
     """Register MixFusion boundary hooks on ``module`` per its plan.
 
-    Mirrors :func:`~vllm_omni.diffusion.hooks.sequence_parallel.apply_sequence_parallel`:
-    idempotent, resolves ``""`` / dotted / ``*`` wildcard module names, and
-    stamps ``_mixfusion_hooks_applied`` on the model for pipeline gating.
+    Idempotent; stamps ``_mixfusion_hooks_applied`` on the model for pipeline
+    gating.
     """
     if getattr(module, "_mixfusion_hooks_applied", False):
         return
@@ -344,10 +342,10 @@ def apply_mixfusion(module: nn.Module, plan: dict) -> None:
 
 
 def remove_mixfusion(module: nn.Module, plan: dict) -> None:
-    """Remove the MixFusion boundary hooks previously applied by ``apply_mixfusion``.
+    """Remove the hooks applied by :func:`apply_mixfusion`.
 
-    The root hook instance (and its cached bundle) is dropped with the hook, so
-    a later ``apply_mixfusion`` starts from a clean cache.
+    The root hook (and its cached bundle) is dropped, so a later
+    ``apply_mixfusion`` starts from a clean cache.
     """
     for name, spec in plan.items():
         hook_name = _spec_hook_name(spec)

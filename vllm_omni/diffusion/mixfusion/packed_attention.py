@@ -2,23 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Packed attention entry for MixFusion chunked layouts.
 
-The MixFusion layout stacks image chunks on a local batch dimension while
-text stays request-level, so the two streams cannot be concatenated by the
-model before attention (their batch dimensions differ). This module is the
-attention-layer boundary that turns the layout into the standard flat
-packed row: it gathers each request back into its logical ``text + image``
-token order, runs one packed forward, and scatters the result back to every
-declared stream layout -- the same pre/post boundary shape the
-sequence-parallel strategies use around their all-to-all.
+Image chunks are stacked on a local batch dimension while text stays
+request-level, so the model cannot concatenate them before attention. This
+attention-layer boundary gathers each request into its logical ``text +
+image`` order, runs one packed forward, and scatters back to every stream
+layout.
 
-The model declares its streams through
-:meth:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter.build_attention_layout`;
-the armed ``MixFusionStep`` carries that layout, the per-step packing plan
-travels in ``extra[MIXFUSION_PLAN_KEY]``, and every ``"request"``-kind stream
-passes its Q/K/V through ``extra[MIXFUSION_STREAMS_KEY]``. The positional
-``query``/``key``/``value`` arguments belong to the single ``"chunked"``
-stream, because that is the tensor shape the attention caller already has.
-The output is a ``dict`` keyed by stream name.
+The armed ``MixFusionStep`` carries the model's ``AttentionLayout``; the
+per-step plan travels in ``extra[MIXFUSION_PLAN_KEY]`` and ``"request"``-kind
+streams pass Q/K/V through ``extra[MIXFUSION_STREAMS_KEY]``. The positional
+``query``/``key``/``value`` belong to the single ``"chunked"`` stream. The
+output is a ``dict`` keyed by stream name.
 """
 
 from __future__ import annotations
@@ -37,9 +31,8 @@ MIXFUSION_STREAMS_KEY = "mixfusion_streams"
 def _backend_supports_attention_mask(attn) -> bool:
     """Whether the attention layer's backend can consume a dense mask.
 
-    ``Attention.attn_backend`` is the backend class and ``attn_spec`` its
-    resolved spec; custom attention modules carry no backend and therefore
-    report no mask support (mirroring ``Attention._assert_metadata_compatible``).
+    Custom attention modules carry no backend and report no mask support
+    (mirroring ``Attention._assert_metadata_compatible``).
     """
     backend = getattr(attn, "attn_backend", None)
     if backend is None:
@@ -108,14 +101,11 @@ def _packed_dense_with_text_mask(
 ) -> torch.Tensor:
     """Serve packed documents with one masked dense forward per image length.
 
-    Backends that cannot take cu_seqlens but can take a dense mask do not need
-    one forward per document: documents with the same chunked-stream length can
-    share a batch row, pad only their request-level streams (text) to the
-    group's longest, and keep every row the padding introduced out of attention
-    with a ``[group, L]`` Boolean key mask. Padded query rows are computed but
-    dropped by the per-request gather, so the result keeps the flat row count
-    and order of ``plan.cu_seqlens_tensor`` and the caller's output recovery
-    (``plan.output_indices``) is unchanged.
+    Documents sharing a chunked-stream length share a batch row; their
+    request-level streams are padded to the group's longest and a
+    ``[group, L]`` key mask hides the padding. Padded query rows are dropped
+    by the per-request gather, so the flat row count and order still match
+    ``plan.cu_seqlens_tensor`` and ``plan.output_indices`` is unchanged.
     """
     num_requests = len(flat_queries)
     groups: dict[int, list[int]] = {}
@@ -188,15 +178,11 @@ def run_mixfusion_packed_attention(
     """Run joint attention over the streams declared by the model's layout.
 
     ``query``/``key``/``value`` hold the single ``"chunked"`` stream as
-    ``[num_chunks, chunk_size, heads, head_dim]``; the other streams ride
-    ``attn_metadata.extra[MIXFUSION_STREAMS_KEY]`` as
-    ``{name: (q, k, v)}``; the packing layout is
-    ``attn_metadata.extra[MIXFUSION_PLAN_KEY]``.
-
-    Each request is recovered to its logical stream order right before the
-    kernel so the attention semantics match independent dense execution.
-    Returns the attention outputs keyed by stream name in each stream's input
-    layout (chunk-stacked or padded request-level).
+    ``[num_chunks, chunk_size, heads, head_dim]``; other streams ride
+    ``attn_metadata.extra[MIXFUSION_STREAMS_KEY]`` as ``{name: (q, k, v)}``.
+    Each request is recovered to its logical stream order before the kernel,
+    so attention matches independent dense execution. Returns outputs keyed by
+    stream name in each stream's input layout.
     """
     plan: PackedExecutionPlan = attn_metadata.extra[MIXFUSION_PLAN_KEY]
     layout = _active_layout()
@@ -244,11 +230,10 @@ def run_mixfusion_packed_attention(
         flat_values.append(req_value)
 
     if not attn.supports_multi_doc_packed_varlen() and _backend_supports_attention_mask(attn):
-        # A varlen-capable backend takes the whole flat packing in one kernel.
-        # A backend that only understands dense batches can still fuse
-        # documents of the same image length by padding their text stream and
-        # masking the padding, which keeps one forward per image shape instead
-        # of one per distinct text length.
+        # A varlen-capable backend takes the whole flat packing in one kernel;
+        # a dense-only backend fuses documents of the same image length by
+        # padding their text stream and masking it, one forward per image shape
+        # instead of one per distinct text length.
         packed_hidden_states = _packed_dense_with_text_mask(
             attn,
             flat_queries,
