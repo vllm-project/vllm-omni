@@ -8,22 +8,29 @@ This lives in its own module so the L3 merge job can run it *after*
 module-scoped OmniRunner / OmniServer instances until teardown; overlapping a
 CuMem sleep-mode engine with them kills StageEngineCoreProc at handshake
 (``Failed core proc(s): {}``).
+
+Both tests share one module-scoped AsyncOmni (the ``async_omni_runner``
+fixture, shadowed here only to wait for that teardown). ``wake_up`` /
+``resume_generation`` run between tests so the second case does not boot
+another engine. File order after the online module is what keeps CuMem off
+the other runners.
 """
 
 import asyncio
 import os
-from contextlib import ExitStack, suppress
+from contextlib import asynccontextmanager, suppress
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+import pytest_asyncio
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
 
 from tests.helpers.clean import wait_for_gpu_memory_to_clear
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import AsyncOmniParams
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.platforms import current_omni_platform
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -55,12 +62,88 @@ def _colocate_async_deploy() -> str:
     return get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml")
 
 
+_COLOCATE_ASYNC_PARAMS = [
+    pytest.param(
+        AsyncOmniParams(
+            model=MODEL,
+            deploy_config=_colocate_async_deploy(),
+            extra_omni_kwargs={"enable_sleep_mode": True},
+        ),
+        id="colocate_async",
+    )
+]
+
+
+@pytest.fixture(scope="module")
+def _gpu_idle_before_colocate_engine():
+    """Fail closed if the previous module's runner is still on the device.
+
+    ``clean_gpu_memory_between_tests`` only logs on timeout, and running it
+    between these two tests would reset the process under the shared engine.
+    """
+    device_count = current_omni_platform.device_count()
+    if device_count > 0:
+        wait_for_gpu_memory_to_clear(
+            devices=list(range(device_count)),
+            threshold_ratio=0.15,
+            timeout_s=120,
+        )
+    yield
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def async_omni_runner(_gpu_idle_before_colocate_engine, request, run_level: str):
+    """Plugin ``async_omni_runner``, after the GPU wait above.
+
+    Shadowed so the memory wait is a real fixture dependency of engine
+    construction. Behavior otherwise matches ``iter_async_omni``.
+    """
+    from tests.helpers.fixtures.runtime import omni_fixture_lock
+    from tests.helpers.runtime import iter_async_omni
+
+    runners = iter_async_omni(request, run_level, omni_fixture_lock)
+    try:
+        yield next(runners)
+        next(runners, None)
+    finally:
+        runners.close()
+
+
+@asynccontextmanager
+async def _release_colocate_engine(engine, request_ids: tuple[str, ...]):
+    """Abort this case's requests and leave the shared engine awake."""
+    try:
+        yield
+    finally:
+        # Wake before abort. Abort against a sleeping engine can sit in the
+        # admission gate; the next test needs the same process-wide engine.
+        with suppress(Exception):  # noqa: BLE001 - best-effort wake so the next test can reuse the engine
+            if await engine.is_sleeping():
+                await engine.wake_up()
+            if await engine.is_paused():
+                await engine.resume_generation()
+        for request_id in request_ids:
+            with suppress(Exception):  # noqa: BLE001 - in-flight generate may already be gone
+                await engine.abort(request_id)
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def colocate_engine(async_omni_runner):
+    """One AsyncOmni for both tests; reopen admission if the previous case slept."""
+    engine = async_omni_runner.engine
+    if await engine.is_sleeping():
+        await engine.wake_up()
+    if await engine.is_paused():
+        await engine.resume_generation()
+    yield engine
+
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
-@pytest.mark.asyncio
-async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("async_omni_runner", _COLOCATE_ASYNC_PARAMS, indirect=True)
+async def test_colocate_async_abort_tokens_and_sleep_admission(colocate_engine, async_omni_runner) -> None:
     """**required** regression. Control-plane APIs (``abort`` / ``sleep`` /
     ``wake_up`` / ``resume_generation``) are not in ``send_omni_request``.
 
@@ -76,24 +159,12 @@ async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
     holds ``generate()`` until wake + resume.
     """
     prompt = "What color is the sky? Write a long, detailed explanation."
-    device_count = current_omni_platform.device_count()
-    if device_count > 0:
-        # Fail closed if a prior module-scoped runner is still on the GPU.
-        # ``clean_gpu_memory_between_tests`` only logs a note on timeout.
-        wait_for_gpu_memory_to_clear(
-            devices=list(range(device_count)),
-            threshold_ratio=0.15,
-            timeout_s=120,
-        )
-
-    with ExitStack() as after:
-        engine = AsyncOmni(
-            model=MODEL,
-            deploy_config=_colocate_async_deploy(),
-            enable_sleep_mode=True,
-        )
-        after.callback(engine.shutdown)
-
+    engine = colocate_engine
+    assert engine is async_omni_runner.engine
+    async with _release_colocate_engine(
+        engine,
+        ("qwen3-abort-partial", "qwen3-abort-resume", "qwen3-sleep-admission"),
+    ):
         request_id = "qwen3-abort-partial"
         outputs: list = []
 
@@ -160,15 +231,14 @@ async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
         await asyncio.wait_for(sleep_task, timeout=180)
         assert outputs
         assert _finish_reason(outputs[-1]) != "abort"
-    await asyncio.sleep(5)
 
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
-@pytest.mark.asyncio
-async def test_colocate_async_resubmit_window_pause_sleep_cycle() -> None:
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("async_omni_runner", _COLOCATE_ASYNC_PARAMS, indirect=True)
+async def test_colocate_async_resubmit_window_pause_sleep_cycle(colocate_engine, async_omni_runner) -> None:
     """#8678 e2e: the abort -> resubmit -> pause -> sleep RL cycle must not wedge.
 
     Reproduces the issue's trigger on a real engine: an in-flight request is
@@ -192,21 +262,17 @@ async def test_colocate_async_resubmit_window_pause_sleep_cycle() -> None:
     watchdog enforces the deadline outside the blocked loop.
     """
     prompt = "What color is the sky? Write a long, detailed explanation."
-    device_count = current_omni_platform.device_count()
-    if device_count > 0:
-        wait_for_gpu_memory_to_clear(
-            devices=list(range(device_count)),
-            threshold_ratio=0.15,
-            timeout_s=120,
-        )
-
-    with ExitStack() as after:
-        engine = AsyncOmni(
-            model=MODEL,
-            deploy_config=_colocate_async_deploy(),
-            enable_sleep_mode=True,
-        )
-        after.callback(engine.shutdown)
+    engine = colocate_engine
+    assert engine is async_omni_runner.engine
+    async with _release_colocate_engine(
+        engine,
+        (
+            "qwen3-8678-first",
+            "qwen3-8678-resubmit",
+            "qwen3-8678-fresh",
+            "qwen3-8678-after-partial-wake",
+        ),
+    ):
 
         async def _generate(sink: list, max_tokens: int, req_id: str, gen_prompt) -> None:
             async for output in engine.generate(
@@ -294,4 +360,3 @@ async def test_colocate_async_resubmit_window_pause_sleep_cycle() -> None:
         with suppress(Exception):  # noqa: BLE001 - best-effort cleanup for the shared GPU
             await engine.wake_up()
             await engine.resume_generation()
-    await asyncio.sleep(5)
