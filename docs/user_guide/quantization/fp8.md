@@ -107,7 +107,15 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None | |
 | Cosmos3 | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | Yes | Not validated | All layers | None | |
 | MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
+| Nucleus-Image | `NucleusAI/Nucleus-Image` | Partial | Not validated | Eligible transformer linears only; routed SwiGLU expert weights stay in checkpoint precision | None | |
 | SenseNova-U1.5 | `sensenova/SenseNova-U1.5-8B-MoT` | Yes | Not validated | UND/GEN language-model linears only | None | |
+
+Nucleus-Image passes FP8 configuration to its attention projections, router,
+dense MLPs, and shared experts. Its routed `SwiGLUExperts` use ordinary
+parameters and `torch.matmul`, so `gate_up_proj` and `down_proj` are not
+quantized. The text encoder and VAE also remain in checkpoint precision.
+This is partial transformer quantization, not full MoE FP8; no end-to-end
+quality or memory-reduction result is established for this scope.
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -125,7 +133,7 @@ model-specific guide says otherwise.
 | ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
 | BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
 | GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
-| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Set `quantization: fp8` on stage 1 in the deploy YAML; keep the AR stage in BF16 |
+| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Set `quantization: fp8` on stage 1 in deploy YAML; keep the AR stage in BF16    |
 
 ## Configuration
 

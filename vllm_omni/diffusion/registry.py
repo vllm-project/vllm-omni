@@ -420,6 +420,11 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
+    "NucleusMoEImagePipeline": (
+        "nucleus_image",
+        "pipeline_nucleus_image",
+        "NucleusMoEImagePipeline",
+    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -541,7 +546,11 @@ def initialize_model(
     Raises:
         ValueError: If the model class is not found in the registry.
     """
-    model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    model_class = (
+        DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+        if od_config.model_class_name is not None
+        else None
+    )
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
         with set_current_diffusion_config(od_config):
@@ -799,6 +808,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Magi2Pipeline": "get_magi2_post_process_func",
     "SeedVR2Pipeline": "get_seedvr2_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "NucleusMoEImagePipeline": "get_nucleus_image_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
