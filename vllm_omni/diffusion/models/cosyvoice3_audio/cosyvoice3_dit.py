@@ -471,8 +471,8 @@ class DiT(nn.Module):
             attention_mask_mode = None
             if self._reads_unpublished_masks(attn_mask.device.type):
                 # FLASH_ATTN reads an unpublished mask back to the host in every
-                # layer; one read here lets all layers skip it for a full mask.
-                attention_mask_mode = "none" if bool(attn_mask.all()) else None
+                # layer; one read here classifies the mask for all layers.
+                attention_mask_mode = "none" if bool(attn_mask.all()) else "padding"
 
         if self.long_skip_connection is not None:
             residual = x

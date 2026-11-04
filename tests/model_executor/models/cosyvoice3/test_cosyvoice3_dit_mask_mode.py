@@ -82,15 +82,16 @@ def test_dit_reads_a_full_mask_once_per_forward_for_flash_attn(monkeypatch):
     assert torch.equal(output, expected)
 
 
-def test_dit_keeps_inspecting_a_padded_mask(monkeypatch):
+def test_dit_reads_a_padded_mask_once_per_forward_for_flash_attn(monkeypatch):
     dit, attention = _dit()
     mask = torch.ones(2, 1, 12)
     mask[1, :, 9:] = 0
-    expected, _ = _run(dit, mask, monkeypatch, reads_unpublished=False)
+    expected, layer_reads = _run(dit, mask, monkeypatch, reads_unpublished=False)
+    assert layer_reads == DEPTH and attention.modes == [None] * DEPTH
     attention.modes.clear()
     output, reads = _run(dit, mask, monkeypatch, reads_unpublished=True)
-    assert reads == 1 + DEPTH
-    assert attention.modes == [None] * DEPTH
+    assert reads == 1
+    assert attention.modes == ["padding"] * DEPTH
     assert torch.equal(output, expected)
 
 
