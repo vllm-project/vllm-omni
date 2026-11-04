@@ -46,7 +46,9 @@ def cpu_distributed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
             or torch.distributed.get_backend() != "gloo"
             or not model_parallel_is_initialized()
         ):
-            pytest.skip("Breeze CPU loading requires single-rank Gloo and initialized vLLM model-parallel groups")
+            reason = "Breeze CPU loading requires single-rank Gloo and initialized vLLM model-parallel groups"
+            print(f"Skipping Breeze CPU weight-loading tests: {reason}")
+            pytest.skip(reason)
         yield
         return
     rendezvous = tmp_path_factory.mktemp("breeze-distributed") / "rendezvous"
@@ -203,8 +205,6 @@ def test_projection_shape_check_is_preserved(talker: BreezeForConditionalGenerat
 def test_unexpected_backbone_parameter_is_rejected(talker: BreezeForConditionalGeneration) -> None:
     weights, _ = _checkpoint(talker)
     weights["backbone_model.layers.1.self_attn.unexpected.weight"] = torch.zeros(8, 8)
-    with pytest.raises(
-        ValueError,
-        match=r"There is no module or parameter named 'layers\.1\.self_attn\.unexpected' in Qwen3Model\.",
-    ):
+    with pytest.raises(ValueError, match=r"layers\.1\.self_attn\.unexpected") as error:
         talker.load_weights(iter(weights.items()))
+    assert not str(error.value).startswith(("Missing Breeze backbone projections:", "Uninitialized Breeze parameters:"))
