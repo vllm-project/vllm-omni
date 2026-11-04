@@ -49,6 +49,11 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    SEED_TTS_OFFICIAL_TTS_USER_PREFIX,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_EN,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_EN,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH,
     SeedTTSDataset,
     SeedTTSDesignDataset,
     SeedTTSSampleRequest,
@@ -229,15 +234,44 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     setattr(rfi, "seed_tts_system_prompt", sys_prompt)
     setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
     setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
+    ex = sample.seed_tts_speech_extra
+    ref_audio = ex.get("ref_audio") if isinstance(ex, dict) else None
+    if isinstance(ref_audio, str) and ref_audio and sys_prompt == SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT:
+        locale = (sample.seed_tts_locale or "").strip().lower()
+        if locale.startswith("zh"):
+            prefix, suffix = (
+                SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH,
+                SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH,
+            )
+        else:
+            prefix, suffix = (
+                SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_EN,
+                SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_EN,
+            )
+        # MiniCPMO's zero-shot TTS README requires the explicit read-aloud user prefix.
+        # Keep the same URI in extra_body so Token2Wav receives the identical waveform.
+        system_content = [
+            {"type": "text", "text": prefix},
+            {"type": "audio_url", "audio_url": {"url": ref_audio}},
+            {"type": "text", "text": suffix},
+        ]
+    else:
+        system_content = [{"type": "text", "text": sys_prompt}]
     setattr(
         rfi,
         "omni_chat_messages",
         [
-            {"role": "system", "content": [{"type": "text", "text": sys_prompt}]},
-            {"role": "user", "content": [{"type": "text", "text": sample.prompt}]},
+            {"role": "system", "content": system_content},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"{SEED_TTS_OFFICIAL_TTS_USER_PREFIX} {sample.prompt}"}
+                    if isinstance(ref_audio, str) and ref_audio and sys_prompt == SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
+                    else {"type": "text", "text": sample.prompt}
+                ],
+            },
         ],
     )
-    ex = sample.seed_tts_speech_extra
     if not ex:
         return  # voice comes from --extra-body in config; no ref_audio to merge
     base = dict(rfi.extra_body) if rfi.extra_body else {}
@@ -1555,8 +1589,10 @@ async def async_request_openai_realtime_duplex(
                 )
                 await client.send({"type": "response.create"})
                 await wait_for(
-                    lambda: client.events.count("response.done") > done_before
-                    or len(client.events.errors()) > errors_before,
+                    lambda: (
+                        client.events.count("response.done") > done_before
+                        or len(client.events.errors()) > errors_before
+                    ),
                     timeout_s=180.0,
                     label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
                 )

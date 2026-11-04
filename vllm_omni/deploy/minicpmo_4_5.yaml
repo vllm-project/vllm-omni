@@ -14,6 +14,9 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # Existing three-step candidate (47d770537); the code default is 10.
+      # Source: models/minicpmo_4_5/minicpmo_4_5_code2wav.py.
+      token2wav_n_timesteps: 3
 
 stages:
   - stage_id: 0
@@ -100,3 +103,9 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
+      # Preserve the Code2Wav compile candidate from commit 3e52826f7;
+      # cudagraph replay remains disabled for this stage.
+      - stage_id: 2
+        enforce_eager: false
+        compilation_config:
+          cudagraph_mode: NONE
