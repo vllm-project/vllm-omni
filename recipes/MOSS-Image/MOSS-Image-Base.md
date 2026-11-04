@@ -31,7 +31,7 @@ The eager CUDA path fuses RMSNorm/AdaLN, Q/K RMSNorm with RoPE, SiTU and gated r
 
 ## Environment
 
-Linux, Python 3.12, PyTorch 2.13.0+cu130, vLLM 0.31.0, Transformers 5.14.1 and Diffusers 0.40.0. See the [installation guide](../../docs/getting_started/installation/README.md).
+Historical reference environment: Linux, Python 3.12, PyTorch 2.13.0+cu130, vLLM 0.31.0, Transformers 5.14.1 and Diffusers 0.40.0. For this source checkout, use final vLLM 0.33.0 and its matching dependencies in the [installation guide](../../docs/getting_started/installation/README.md). The historical kernel and model results do not establish qualification for the new runtime.
 
 ## Deploy
 

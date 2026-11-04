@@ -1200,7 +1200,7 @@ def _project_omni_stage_engine_args(
     # silently disappeared here (no error) and showed up engine-side as
     # speculative_config=None. getattr(..., None) guards stage config types
     # that lack the field.
-    for name in ("compilation_config", "profiler_config", "speculative_config"):
+    for name in ("compilation_config", "kernel_config", "profiler_config", "speculative_config"):
         value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
