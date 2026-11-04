@@ -257,6 +257,25 @@ def test_playlist_makes_no_blocking_reload_claim(tmp_path: Path) -> None:
     assert "PART-HOLD-BACK=" in playlist
 
 
+def test_forged_trun_count_fails_fast() -> None:
+    """A count the fragment cannot hold is refused before it is walked."""
+    trun = box("trun", struct.pack(">IIi", 0x000001 | 0x000100, 0xFFFFFFFF, 0))  # no rows
+    tfhd = box("tfhd", struct.pack(">II", 0x020000, 1))
+    moof = box("moof", box("mfhd", struct.pack(">II", 0, 1)) + box("traf", tfhd + trun))
+    with pytest.raises(ValueError, match="ends before them"):
+        fragment_timing(moof + box("mdat", b""), TIMESCALE)
+
+
+def test_trun_without_per_sample_fields_uses_defaults() -> None:
+    """With no per-sample records, the total is count times the tfhd default."""
+    trun = box("trun", struct.pack(">IIi", 0x000001, 3, 0))  # data offset only
+    tfhd = box("tfhd", struct.pack(">III", 0x020000 | 0x000008, 1, SAMPLE_TICKS))
+    moof = box("moof", box("mfhd", struct.pack(">II", 0, 1)) + box("traf", tfhd + trun))
+    timing = fragment_timing(moof + box("mdat", b""), TIMESCALE)
+    assert timing.duration == pytest.approx(3 * SAMPLE_TICKS / TIMESCALE)
+    assert timing.independent is False
+
+
 def test_report_counts_every_part(tmp_path: Path) -> None:
     stream, _, frags = build_stream()
     packager = package(tmp_path, stream)

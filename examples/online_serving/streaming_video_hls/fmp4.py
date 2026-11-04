@@ -223,6 +223,24 @@ def _trun(buf: bytes, p0: int, default_duration: int | None, default_flags: int 
         first_flags = _u32(buf, pos)
         pos += 4
 
+    if count == 0:
+        return 0, False
+    # Each sample record is 4 bytes per per-sample field the flags name. Refuse a count
+    # the fragment cannot hold before walking it, so a forged count cannot stall us.
+    fields = sum(
+        1
+        for bit in (_TRUN_SAMPLE_DURATION, _TRUN_SAMPLE_SIZE, _TRUN_SAMPLE_FLAGS, _TRUN_SAMPLE_COMPOSITION)
+        if flags & bit
+    )
+    if pos + count * 4 * fields > len(buf):
+        raise ValueError(f"trun declares {count} samples but the fragment ends before them")
+    if not fields:
+        # Every sample takes the defaults, so the total is arithmetic, not a walk.
+        if default_duration is None:
+            raise ValueError("sample has no duration: no trun duration and no tfhd default")
+        sync = first_flags if first_flags is not None else default_flags
+        return count * default_duration, sync is not None and not (sync & _NON_SYNC)
+
     ticks = 0
     first_sync = False
     for n in range(count):
