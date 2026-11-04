@@ -45,6 +45,7 @@ file lists the ones multi-stage omni models normally set.
 | `async_chunk_prewarm_payload_func` | Optional | Lets a receiving stage warm up before chunk 0 (MiniCPM-o code2wav) |
 | `retains_state_across_chunks` | `True` when the model keeps per-request state between chunks | Parked request still consumes capacity |
 | `supports_native_mrv2_data_plane` | `True` only after MRv2 validation | Takes effect only when deploy sets `model_runner: v2` |
+| `supports_duplex_mrv2` | `True` only after duplex MRv2 validation | Required by `validate_native_mrv2_session` for a downstream native-data-plane stage on `model_runner: v2` with `session_mode: duplex`; defaults to `False` |
 
 `_select_processor_funcs` (same file) resolves the active pair: with
 `async_chunk` on, `async_chunk_process_next_stage_input_func` replaces
@@ -80,6 +81,11 @@ Rules:
   will prefill; a wrong length corrupts KV reservation silently.
 
 ## Skeletons
+
+The sketch leaves MRv2 capabilities at their defaults. Set
+`supports_native_mrv2_data_plane` only after validating that runtime path; duplex
+also needs `supports_duplex_mrv2` and its own validation. These flags declare
+implemented capabilities, not a way to bypass session checks.
 
 ```python
 # vllm_omni/model_executor/models/<name>/pipeline.py
@@ -183,8 +189,9 @@ instead of editing `OMNI_PIPELINES`.
 Before long parity or performance runs, verify that one full-payload request and
 one streaming request reach the consumer and finish. Processor dispatch may
 inspect parameter names; wrappers used for tracing must preserve the runtime's
-recognized signature (check `_connector_payload_kwarg`), not just positional
-arity.
+recognized signature, not just positional arity. Check `_connector_payload_kwarg`
+in `vllm_omni/distributed/omni_connectors/model_runner/omni_connector_runtime.py`
+and its caller in the adjacent `omni_connector_payload_transport.py`.
 
 Define text-end, audio-end, and request-end separately. A text-end token may
 switch to audio generation rather than terminate the request; an audio sentinel

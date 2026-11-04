@@ -8,7 +8,15 @@ Source: [LFM3-Omni integration PR #9827](https://github.com/vllm-project/vllm-om
 implementation snapshot `12db351fbbb55083b991032351185a871ed0bc0c`, with checkpoint
 `LiquidAI/LFM3-Omni-2B` at `21d75123f86c1f7ffb4bef1ea202710c4e7ebe67`.
 This is a contribution snapshot, not a claim that it is merged or universally
-validated. Recheck the implementation before reusing its controls.
+validated. The pinned snapshot remains reproducible if the PR changes; it does
+not automatically describe the eventual merged implementation. When #9827 merges,
+recheck the token IDs, reveal schedule, chunking and graph controls below against
+the merged code before updating this case's source pointer.
+
+For the pinned snapshot, the depth-head graph switch is
+`hf_overrides.lfm3_depth_graph` (set it to `false` for the control), consumed by
+[`lfm3_omni/model.py`](https://github.com/vllm-project/vllm-omni/blob/12db351fbbb55083b991032351185a871ed0bc0c/vllm_omni/model_executor/models/lfm3_omni/model.py).
+This is a snapshot-specific model override, not a generic in-tree stage field.
 
 | Observed integration constraint | Decision and reusable check |
 |---------------------------------|-----------------------------|

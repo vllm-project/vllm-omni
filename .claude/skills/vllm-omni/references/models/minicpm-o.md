@@ -32,6 +32,7 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
 | `minicpmo_4_5_{3,4}gpu_stage1_replicas.yaml` | Experimental tts replicas (2 or 3) |
 | `minicpmo_4_5_8x4090.yaml` (+ `_stage1_replicas`) | Thinker TP=4, `max_model_len: 4096`, mostly eager |
 | `minicpmo_4_5_duplex_h200.yaml` | Duplex with incremental fbank, fused vision, duplex audio-encoder graphs, stage-2 TF32 and fused CFM |
+| `minicpmo_4_5_duplex_mrv2.yaml` | Opt-in CUDA duplex MRv2 for all stages; NPU/XPU/ROCm/MUSA fall back to v1; measure duplex separately |
 | `minicpmo_4_5_turn.yaml` | `session_mode: turn` for ordinary HTTP chat |
 | `minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`) | Turn mode on MRv2; tts/code2wav `max_num_seqs` 8 (16 on H200) |
 
@@ -51,8 +52,12 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
   capture (`batched_token2wav.py`); replay outside it changed numerics. Regression
   test: `test_decode_replays_encoder_graph_in_capture_autocast` in
   `tests/model_executor/models/minicpmo_4_5/test_code2wav_batching.py`.
-- MRv2 applies to turn mode only; duplex stays on v1. Earlier MRv2 performance
-  numbers were invalidated; re-measure. TF32 for CFM is opt-in (HiFT stays FP32).
+- MRv2 has separate turn and duplex overlays; use
+  `minicpmo_4_5_duplex_mrv2.yaml` for CUDA duplex. MiniCPM-o stages declare
+  `supports_duplex_mrv2=True`; downstream native-data-plane stages without this
+  capability fail duplex MRv2 config validation. Earlier MRv2 performance
+  numbers were invalidated; re-measure each mode. TF32 for CFM is opt-in
+  (HiFT stays FP32).
 
 ## Benchmarks and tests
 

@@ -129,8 +129,9 @@ belong to the `vllm-omni-test` skill.
 ## Backend, experiment, and lifecycle checks
 
 - Freeze the physical device allocation and record other device activity. On
-  shared hardware, use the site's reservation mechanism (for example `npu run`
-  where provided). Record Ascend model, driver/CANN, torch-npu, vllm-ascend,
+  shared hardware, use the site's reservation mechanism. `npu run`, where
+  provided, is a site-specific reservation wrapper, not a CANN or torch-npu
+  command; confirm the local wrapper before invoking it. Record Ascend model, driver/CANN, torch-npu, vllm-ascend,
   attention backend, and graph switches for NPU results. NVIDIA MPS, CUDA
   profiling tools, and CUDA graph support do not transfer automatically to NPU.
 - For a new model unsupported on base, label the control as the same integration

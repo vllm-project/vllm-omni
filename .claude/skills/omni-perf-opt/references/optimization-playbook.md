@@ -109,7 +109,9 @@ Knob: `model_runner: v2` (top-level or per stage). Ready-made overlays:
   mode; duplex needs the dedicated overlay and separate measurement.
 - Enabling MRv2 for a new model is P2: it needs
   `supports_native_mrv2_data_plane=True` in the pipeline and a full parity
-  pass (see `add-omni-model`).
+  pass. Duplex additionally needs `supports_duplex_mrv2=True` on downstream
+  native-data-plane stages and separate duplex validation; declaring the flag
+  alone does not implement support (see `add-omni-model`).
 
 ## Talker and code predictor
 
