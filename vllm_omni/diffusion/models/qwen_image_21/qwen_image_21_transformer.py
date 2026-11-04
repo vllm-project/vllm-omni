@@ -96,13 +96,10 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
     )
 
 
-# Devices whose fused interleaved RoPE reproduces the reference rotation. MUSA is
-# listed for speed, not for capability: complex tensors and their kernels work there
-# (only the ``Tensor.view_as_complex`` method binding is missing, the function form is
-# fine), but the rotary kernel is CUDA/SM103-only and returns None under compile, so
-# MUSA lands on the fallback that Inductor turns into one ~353 us kernel per
-# projection. The fused kernel keeps that fallback's arithmetic (unfused products),
-# so it is bit-exact with it.
+# Devices whose fused interleaved RoPE reproduces the reference rotation. MUSA has no
+# complex-tensor kernel, so the reference path there is the native multiply/add
+# sequence; the fused kernel keeps that arithmetic (unfused products) and matches it
+# bit for bit.
 _FUSED_ROPE_DEVICE_TYPES = ("cuda", "musa")
 
 

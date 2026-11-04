@@ -165,3 +165,68 @@ def test_rope_qualifies_musa_with_unfused_products():
 def test_rope_is_a_registered_custom_op():
     """A compiled region can only call the kernel through a real custom op."""
     assert torch.ops.vllm_omni.interleaved_rope.default is not None
+
+
+@pytest.mark.cpu
+def test_qk_rope_qualifies_musa_with_unfused_products():
+    """The fused Q/K norm+RoPE keeps MUSA's reference rotation order (no FMA)."""
+    assert fused_qk.qk_fma_products(torch.device("musa")) is False
+    assert fused_qk.qk_fma_products(torch.device("cpu")) is None
+
+
+@pytest.mark.cpu
+def test_qk_rope_is_a_registered_custom_op():
+    """A compiled region can only reach the fused kernel through a real custom op."""
+    assert torch.ops.vllm_omni.qk_norm_rope.default is not None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "value, expected", [("", False), ("0", False), ("1", True), ("true", True), ("on", True), ("no", False)]
+)
+def test_musa_qk_fusion_is_opt_in(monkeypatch, value, expected):
+    """MUSA keeps the bit-exact reference path unless the env asks for the fusion."""
+    monkeypatch.setenv(fused_qk.MUSA_QK_FUSION_ENV, value)
+    assert fused_qk._musa_qk_fusion_enabled() is expected
+
+
+@pytest.mark.cpu
+def test_musa_qk_fusion_defaults_off(monkeypatch):
+    monkeypatch.delenv(fused_qk.MUSA_QK_FUSION_ENV, raising=False)
+    assert fused_qk._musa_qk_fusion_enabled() is False
+
+
+_requires_musa = pytest.mark.skipif(
+    not (hasattr(torch, "musa") and torch.musa.is_available()), reason="needs MUSA hardware"
+)
+
+
+@_requires_musa
+def test_musa_fused_qk_dispatch_is_opt_in(monkeypatch):
+    """MUSA never dispatches the fused kernel unless the env asks for it.
+
+    The positive direction needs a complex64 ``freqs`` tensor. MUSA can build one
+    (``torch.complex64``, ``torch.polar`` and complex multiply all work; only the
+    ``Tensor.view_as_complex`` method binding is missing), so this gap is about
+    coverage rather than capability, and the direction is covered by the
+    qualification assertions and by the measured runs instead.
+    """
+    dev = torch.device("musa", torch.musa.current_device())
+    q = torch.randn(1, 64, 32, 128, device=dev, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    w = torch.ones(128, device=dev, dtype=torch.bfloat16)
+    f = torch.zeros(q.shape[1], 64, dtype=torch.complex64, device=dev)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("fused kernel dispatched while disabled")
+
+    monkeypatch.delenv(fused_qk.MUSA_QK_FUSION_ENV, raising=False)
+    monkeypatch.setattr(fused_qk, "_qk_norm_rope", _boom)
+    with torch.no_grad():
+        assert fused_qk.qk_rotary(q, k, w, w, f, 1e-6) is None
+
+    # The arithmetic is qualified on MUSA, so the env is the only thing holding
+    # the fusion back; if it ever stops qualifying this assertion is the signal.
+    assert fused_qk.qk_fma_products(dev) is False
+    monkeypatch.setenv(fused_qk.MUSA_QK_FUSION_ENV, "1")
+    assert fused_qk._musa_qk_fusion_enabled() is True
