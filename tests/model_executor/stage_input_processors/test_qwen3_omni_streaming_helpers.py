@@ -811,6 +811,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
     model._batch_stats_decoded_frames = 0
     model._batch_stats_actual_frames = Counter()
     model._batch_stats_bucket_groups = Counter()
+    model._streaming_codec = None
 
     payload_codes = torch.tensor([1, 3, 2, 4], dtype=torch.long)
     out = model.forward(

@@ -804,7 +804,9 @@ async def test_terminal_stage_error_preserves_plugin_cleanup_policy(mocker, plug
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
     try:
         await orchestrator._report_duplex_session_request_error(0, 0, output, request_state)
-        cleanup.assert_awaited_once_with([request_state.request_id], abort=True, release_owners=close_session)
+        cleanup.assert_awaited_once_with(
+            [request_state.request_id], abort=True, release_owners=close_session, trace_error="RuntimeError"
+        )
     finally:
         await orchestrator.session_manager.shutdown()
 
