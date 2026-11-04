@@ -949,13 +949,18 @@ class ModelChannel:
         self._out.emit(payload)
         return True
 
-    async def _release_ephemeral_request(self, request_id: object, *, whole_turn: bool = False) -> None:
+    async def _release_ephemeral_request(
+        self, request_id: object, *, whole_turn: bool = False, abort_prewarmed: bool = False
+    ) -> None:
         """Drop orchestrator state for a finished non-resumable stage request.
 
         Resident Stage0 stays bound. Intermediate text must not call this;
         only a completed turn (final stage, silent short-circuit, or a
         draining TTS request) does. ``whole_turn`` also drops the other stage
         ids of this turn. A request still marked draining is left registered.
+        ``abort_prewarmed`` is for a turn that skipped its downstream stages:
+        their async-chunk prewarmed requests never get a chunk, so they are
+        aborted instead of waiting for the input-wait deadline.
         """
         if not isinstance(request_id, str) or not request_id:
             return
@@ -974,6 +979,8 @@ class ModelChannel:
         session.release_resources_for_request_ids(release_ids)
         if self._ctx.run.stream_request_id in release_ids:
             self._ctx.run.stream_request_id = None
+        if abort_prewarmed:
+            await self._abort_request(release_ids, notify=False)
         await self._ctx.stage_port.cleanup(release_ids)
 
     def _terminal_listen_turn_id(
@@ -1207,7 +1214,11 @@ class ModelChannel:
                     model_turn_id=coerce_int(model_result.get("model_turn_id")),
                     data_plane_request_id=data_plane_request_id,
                 )
-                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+                await self._release_ephemeral_request(
+                    data_plane_request_id,
+                    whole_turn=True,
+                    abort_prewarmed=model_result.get("abort_data_plane_request") is True,
+                )
             return close_reason, True
         function_call = _recognized_function_call(self._ctx.plugin, model_result)
         if function_call is _INVALID_FUNCTION_CALL:
@@ -1304,7 +1315,11 @@ class ModelChannel:
                 model_turn_id=model_turn_id,
                 data_plane_request_id=data_plane_request_id,
             )
-            await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+            await self._release_ephemeral_request(
+                data_plane_request_id,
+                whole_turn=True,
+                abort_prewarmed=model_result.get("abort_data_plane_request") is True,
+            )
             return close_reason, emitted_response
         if (
             draining_response_id is None
@@ -1532,7 +1547,11 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
-            await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+            await self._release_ephemeral_request(
+                data_plane_request_id,
+                whole_turn=True,
+                abort_prewarmed=model_result.get("abort_data_plane_request") is True,
+            )
         return close_reason, emitted_response
 
     def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:

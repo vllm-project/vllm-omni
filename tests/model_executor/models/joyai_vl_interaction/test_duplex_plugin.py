@@ -1273,6 +1273,63 @@ async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "last_response_text"),
+    [
+        ("</silence>", ""),
+        ("</response> The pot is smoking.", "The pot is smoking."),  # suppressed repeat
+        ("</response> Let me check.</delegation> What is in the pot?", ""),  # no delegate tool declared
+        ("</response> The pot is boiling.", ""),  # the harness session is text-only
+    ],
+    ids=["silence", "repeat", "undeclared-delegation", "text-only"],
+)
+async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker, text, last_response_text):
+    from tests.engine.test_duplex_orchestrator import _settle
+
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    plugin.max_images = 999
+    orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
+    orchestrator.async_chunk = True
+    clients[1].custom_process_input_func = joyai_action_to_tts
+
+    async def process_inputs(stage_id, *, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
+        runner.model_state.last_response_text = last_response_text
+        await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        request_id = clients[0].add_request_calls[-1][0].request_id
+        assert [call[0].request_id for call in clients[2].add_request_calls] == [request_id]
+        request = orchestrator.request_states[request_id]
+        runner.on_stage_output(
+            0,
+            tts_output(request_id, finished=True, text=text),
+            None,
+            request_id=request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=ORCHESTRATOR_SESSION_ID, fence=request.fence),
+                final_stage_id=2,
+                segment_finished=True,
+            ),
+        )
+        await _settle(orchestrator)
+        assert not clients[1].add_request_calls
+        # Nothing feeds the prewarmed Code2Wav request; abort it rather than let it
+        # wait out VLLM_OMNI_INPUT_WAIT_TIMEOUT_S.
+        assert any(request_id in ids for ids in clients[2].abort_calls)
+        assert request_id not in orchestrator.request_states
+        assert not runner.session.resource_request_ids()
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_late_asr_does_not_transcribe_recreated_audio_item():
     h = await open_joyai(asr=True, modalities=("text",))
     try:
@@ -1451,6 +1508,8 @@ async def test_streamed_audio_chunks_complete_on_empty_final_delta():
             stage_id=0,
             segment_finished=True,
         )
+        # A spoken turn hands its text to the Talker; the prewarmed Code2Wav request must survive.
+        assert not h.port.aborts
         # DELTA Code2Wav: each output carries only new samples, and the final one may carry none.
         await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
         await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
@@ -1803,7 +1862,8 @@ async def test_new_camera_commit_supersedes_queued_promotion():
         latest = h.port.submissions[-1]
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 128, 0)
         assert not any(abort for _, abort in h.port.cleanups)
-        assert not h.port.aborts
+        # A's silent terminal frees its own async-chunk prewarm; nothing else may be aborted.
+        assert all(ids == [request_id] for ids in h.port.aborts)
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(latest.context.request_id, text="</silence>", finished=True),

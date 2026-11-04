@@ -249,6 +249,9 @@ class JoyAIDataPlane(DuplexDataPlane):
                         event["end_of_turn"] = True
                         if observation.state is not None:
                             observation.state.last_response_text = action.text
+                # A turn that ends at JoyAI never reaches the Talker, so nothing feeds the
+                # Code2Wav request async-chunk prewarmed at submit; abort it.
+                event["abort_data_plane_request"] = event["end_of_turn"]
                 yield event
             elif stage_id == self.audio_stage_id:
                 completion = next(iter(output.outputs or ()), None)
@@ -327,6 +330,8 @@ class JoyAIDataPlane(DuplexDataPlane):
             # when its audio never completed, e.g. a cancel between projection
             # and the first Code2Wav output.
             text_requires_complete_audio=audio,
+            # A note that ends the turn here skips the Talker: free the prewarmed Code2Wav request.
+            abort_data_plane_request=not audio,
         )
         arguments = delegation_arguments(action)
         observation.call_sent = True
@@ -341,6 +346,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                     model_context_text="",
                     end_of_turn=True,
                     text_requires_complete_audio=False,
+                    abort_data_plane_request=True,
                 )
             yield note_event
             return
@@ -363,5 +369,7 @@ class JoyAIDataPlane(DuplexDataPlane):
             model_context_text="",
             end_of_turn=True,
             text_requires_complete_audio=False,
+            # No note means no Talker: free the prewarmed Code2Wav request.
+            abort_data_plane_request=True,
         )
         yield terminal_event
