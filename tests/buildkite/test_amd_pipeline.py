@@ -757,7 +757,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1416,
+        1420,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -3182,7 +3182,9 @@ def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
         assert step["artifact_paths"] == [f"{artifact}/**/*"]
         assert f"--kill-after=1m {command_timeout}" in command
         assert _MINICPMO_READY_MARKER in command
-        assert "--run-level core_model" in command
+        # The public client waits for a model-generated turn terminator.
+        run_level = "advanced_model" if label == "ROCm · MiniCPM-o 4.5 Duplex Coverage" else "core_model"
+        assert f"--run-level {run_level}" in command
         assert command.count("--shard-id=0 --num-shards=1") == 2
         assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
         assert "test_minicpmo_4_5_ready.json" not in command
@@ -3599,7 +3601,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    32 ids. R2-01 still collects 1416 model-executor nodes and does not run them.
+    32 ids. R2-01 still collects 1420 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3645,7 +3647,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "assert-pytest-collection.sh 1420" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -3856,7 +3858,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1416 model-executor nodes.
+    still collects 1420 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3908,7 +3910,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "assert-pytest-collection.sh 1420" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
