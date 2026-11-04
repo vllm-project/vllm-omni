@@ -78,6 +78,32 @@ def _sd3(od_config, g):
     return StableDiffusion3Pipeline, model, make
 
 
+def _sdxl(od_config, g):
+    from vllm_omni.diffusion.models.sdxl.pipeline_sdxl import StableDiffusionXLPipeline
+    from vllm_omni.diffusion.models.sdxl.sdxl_unet import SDXLUNet2DConditionModel
+
+    # The UNet has the fixed SDXL-base layout (~2.6B params); build it on the device.
+    with torch.device(g.device):
+        model = SDXLUNet2DConditionModel(od_config=od_config)
+
+    def make(batch):
+        latents, timestep = _randn(g, batch, 4, 16, 16), torch.full((batch,), 500.0, device=g.device)
+        # diffuse() shares one add_time_ids tensor between the branches.
+        time_ids = torch.tensor([[64.0, 64.0, 0.0, 0.0, 64.0, 64.0]], device=g.device).repeat(batch, 1)
+        return [
+            {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "encoder_hidden_states": _randn(g, batch, 77, 2048),
+                "added_cond_kwargs": {"text_embeds": _randn(g, batch, 1280), "time_ids": time_ids},
+                "return_dict": False,
+            }
+            for _ in range(2)
+        ]
+
+    return StableDiffusionXLPipeline, model, make
+
+
 def _flux(kontext: bool):
     def build(od_config, g):
         from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
@@ -217,14 +243,54 @@ def _wan(i2v: bool):
     return build
 
 
+def _wan_vace(od_config, g):
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import Wan22VACEPipeline
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETransformer3DModel
+
+    model = WanVACETransformer3DModel(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        in_channels=4,
+        out_channels=4,
+        text_dim=16,
+        freq_dim=16,
+        ffn_dim=64,
+        num_layers=2,
+        vace_layers=[0, 1],
+        vace_in_channels=8,
+    )
+
+    def make(batch):
+        latents, timestep = _randn(g, batch, 4, 3, 8, 8), torch.full((batch,), 500.0, device=g.device)
+        # diffuse() passes the same VACE condition and attention_kwargs to both branches.
+        vace_context, attention_kwargs = _randn(g, batch, 8, 3, 8, 8), {}
+        return [
+            {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "encoder_hidden_states": _randn(g, batch, 12, 16),
+                "attention_kwargs": attention_kwargs,
+                "vace_context": vace_context,
+                "vace_context_scale": 1.0,
+                "return_dict": False,
+                "current_model": model,
+            }
+            for _ in range(2)
+        ]
+
+    return Wan22VACEPipeline, model, make
+
+
 CASES: dict[str, Callable] = {
     "sd3": _sd3,
+    "sdxl": _sdxl,
     "flux": _flux(kontext=False),
     "flux-kontext": _flux(kontext=True),
     "flux2": _flux2(klein=False),
     "flux2-klein": _flux2(klein=True),
     "wan2.2-t2v": _wan(i2v=False),
     "wan2.2-i2v": _wan(i2v=True),
+    "wan2.2-vace": _wan_vace,
 }
 
 
@@ -252,7 +318,8 @@ def _pipeline(cls, model: torch.nn.Module, batched: bool):
     """The pipeline class around ``model`` only: no weights, encoders or scheduler."""
     pipe = cls.__new__(cls)
     torch.nn.Module.__init__(pipe)
-    pipe.transformer = model
+    # SDXL's denoiser is ``unet``; the others call it ``transformer``.
+    setattr(pipe, (getattr(cls, "_dit_modules", None) or ["transformer"])[0], model)
     pipe.od_config = SimpleNamespace(enable_cfg_batching=batched, cache_backend="none")
     return pipe
 
