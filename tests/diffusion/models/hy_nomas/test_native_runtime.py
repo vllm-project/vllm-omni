@@ -21,9 +21,11 @@ from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
+from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import HyNomasTransformer
 from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
 from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
+from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import prepare_camera
 from vllm_omni.diffusion.models.hy_nomas.scheduler import EulerSolver
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -49,6 +51,49 @@ _SMALL_TRANSFORMER_CONFIG = {
 def _small_transformer(sp_size=1, num_layers=1):
     config = {**_SMALL_TRANSFORMER_CONFIG, "num_layers": num_layers}
     return HyNomasTransformer(config, sp_size=sp_size, device="cpu", dtype=torch.float32).eval().requires_grad_(False)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("boundaries", [None, [0, 24, 49]])
+def test_camera_preset_preprocessing_accepts_extrinsics_only(boundaries):
+    model = _small_transformer()
+    config = pipeline_hy_nomas.build_model_config()
+    camera = prepare_camera_inputs(
+        "pan_left",
+        num_frames=49,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        normalize_relative_to_first_frame=True,
+        normalize_framewise=True,
+        normalize_displacement=True,
+        normalize_displacement_per_video=True,
+        segment_boundaries_pixel=boundaries,
+        translation_scale=1.0,
+        rotation_scale=2.5,
+    )
+    assert camera["norm_intrinsics"] is None and camera["action_onehot"] is None
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        expected = model._preprocess_camera(
+            norm_extrinsics=camera["norm_extrinsics"],
+            norm_intrinsics=None,
+            action_onehot=None,
+            oh=12,
+            ow=20,
+            img_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+    actual = prepare_camera(
+        model,
+        config,
+        "pan_left",
+        num_frames=49,
+        latent_h=12,
+        latent_w=20,
+        boundaries=boundaries,
+        device=torch.device("cpu"),
+    )
+    assert actual.shape == (1, 13, 64) and torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_production_package_has_no_reference_imports():

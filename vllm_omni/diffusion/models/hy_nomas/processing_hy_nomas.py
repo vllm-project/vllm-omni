@@ -272,8 +272,8 @@ def prepare_camera(
         embeddings = [
             transformer._preprocess_camera(
                 norm_extrinsics=camera["norm_extrinsics"][:, start:end],
-                norm_intrinsics=camera["norm_intrinsics"][:, start:end],
-                action_onehot=camera["action_onehot"][:, start:end],
+                norm_intrinsics=None,
+                action_onehot=None,
                 oh=latent_h,
                 ow=latent_w,
                 img_dtype=torch.bfloat16,
