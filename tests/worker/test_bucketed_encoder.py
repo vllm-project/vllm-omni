@@ -583,6 +583,41 @@ def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch):
     assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
 
 
+def test_processor_hook_adds_encoder_bucket_frames(monkeypatch):
+    """After install_bucketed_processor_hook, the generic OmniMultiModalProcessor
+    path adds encoder_bucket_frames from the raw audio sample counts (the field
+    the worker's embed_multimodal wrapper reads back)."""
+    import numpy as np
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from transformers import BatchFeature
+    from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
+    install_bucketed_processor_hook()
+
+    class Processor(OmniMultiModalProcessor):
+        def _get_mm_fields_config(self, *args):
+            return {}
+
+        def _get_prompt_updates(self, *args):
+            return []
+
+    processor = object.__new__(Processor)
+    processor.dummy_inputs = SimpleNamespace(get_dummy_text=Mock(return_value="dummy"))
+    processor._call_hf_processor = Mock(return_value=BatchFeature({"features": "processed"}))
+
+    audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 s -> 300 mel frames at 100 fps
+    items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
+    result = processor._apply_hf_processor_main(items, {})
+
+    assert "encoder_bucket_frames" in result
+    assert torch.equal(result["encoder_bucket_frames"], torch.tensor([300], dtype=torch.int64))
+
+
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
     """A short clip (100 frames < 128 mel bins) must still bucket along the
     channels-first time axis — the Whisper recipe implies (B, mel, T) by
