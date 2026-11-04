@@ -43,3 +43,13 @@ def test_shared_modulation_is_exact_and_request_owned(dtype, mask):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for original, result in zip(originals, prepared):
         torch.testing.assert_close(original, result, rtol=0, atol=0)
+
+
+def test_shared_modulation_gate_covers_musa():
+    """MUSA runs the CUDA-compatible path, so the hoist must not be gated away."""
+    from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
+
+    assert "musa" in transformer._SHARED_MODULATION_DEVICE_TYPES
+    # The gate is only about the device family; the cross-block exactness above
+    # is what guarantees the hoist does not change the result.
+    assert {"cuda", "npu"} <= set(transformer._SHARED_MODULATION_DEVICE_TYPES)

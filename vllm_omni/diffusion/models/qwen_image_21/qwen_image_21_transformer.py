@@ -170,6 +170,12 @@ def _resolve_qwen_image21_lookup_name(
     return lookup_name, None
 
 
+# Devices where the eager block loop may hoist the shared per-step modulation out
+# of the block loop. MUSA takes the same CUDA-compatible path as elsewhere in this
+# tree (`("cuda", "musa")`), so the allowlist has to name it.
+_SHARED_MODULATION_DEVICE_TYPES = ("cuda", "npu", "musa")
+
+
 def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
     r"""Broadcast per-sample modulation `params` over the token axis.
 
@@ -1368,7 +1374,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type in {"cuda", "npu"}
+            joint_hidden_states.device.type in _SHARED_MODULATION_DEVICE_TYPES
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
