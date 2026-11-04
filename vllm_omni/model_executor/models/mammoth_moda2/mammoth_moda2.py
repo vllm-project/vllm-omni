@@ -252,8 +252,8 @@ def moe_forward(
                 "MammothModa2 MoE CUDA-graph capture requires gen_token_mask; "
                 "keep input_ids on the mm graph path via requires_raw_input_tokens. "
                 "If capture still fails (for example under model_runner: v2 or a "
-                "PP path that drops the mask), set enforce_eager: true or use a "
-                "non-FULL cudagraph_mode such as FULL_DECODE_ONLY / PIECEWISE."
+                "PP path that drops the mask), set enforce_eager: true or "
+                "cudagraph_mode: PIECEWISE."
             )
         return _moe_blend(hidden_states, und_expert, gen_expert, gen_token_mask)
 
@@ -523,9 +523,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             dtype: torch.dtype,
             device: torch.device,
         ) -> IntermediateTensors:
-            return make_empty_intermediate_tensors_with_gen_mask(
-                batch_size, hidden_size, dtype, device
-            )
+            return make_empty_intermediate_tensors_with_gen_mask(batch_size, hidden_size, dtype, device)
 
         self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
         if get_pp_group().is_last_rank:

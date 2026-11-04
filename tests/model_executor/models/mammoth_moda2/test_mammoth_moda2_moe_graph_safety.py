@@ -75,11 +75,16 @@ def test_moe_forward_capturing_none_mask_fails_closed(monkeypatch: pytest.Monkey
     monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
     hidden = torch.randn(2, 3, 4)
 
-    with pytest.raises(RuntimeError, match="requires gen_token_mask.*enforce_eager"):
-        m.moe_forward(hidden, _und, _gen, None)
-
-    with pytest.raises(RuntimeError, match="requires gen_token_mask.*enforce_eager"):
-        m.moe_forward(hidden, _und, _gen, torch.zeros(0, dtype=torch.bool))
+    # FULL_DECODE_ONLY still captures decode as a full graph, so the only
+    # workarounds this guard can honestly offer are eager mode and PIECEWISE.
+    match = r"requires gen_token_mask.*enforce_eager.*PIECEWISE"
+    for mask in (None, torch.zeros(0, dtype=torch.bool)):
+        with pytest.raises(RuntimeError, match=match) as exc_info:
+            m.moe_forward(hidden, _und, _gen, mask)
+        message = str(exc_info.value)
+        assert "FULL_DECODE_ONLY" not in message
+        assert "enforce_eager" in message
+        assert "PIECEWISE" in message
 
 
 def test_moe_forward_capturing_all_false_mask_still_runs_both_experts(
@@ -112,25 +117,50 @@ def test_ar_wrappers_keep_raw_input_tokens() -> None:
     # requires_raw_input_tokens still feeds gen_token_mask under capture.
     assert issubclass(m.MammothModa2Qwen3ForCausalLM, m.MammothModa2Qwen2ForCausalLM)
     assert m.MammothModa2Qwen3ForCausalLM.forward is m.MammothModa2Qwen2ForCausalLM.forward
-    assert (
-        m.MammothModa2Qwen3ForCausalLM.get_input_embeddings
-        is m.MammothModa2Qwen2ForCausalLM.get_input_embeddings
-    )
+    assert m.MammothModa2Qwen3ForCausalLM.get_input_embeddings is m.MammothModa2Qwen2ForCausalLM.get_input_embeddings
 
 
-def test_empty_intermediate_tensors_seed_gen_token_mask() -> None:
-    """PP empty-tensor factory must seed gen_token_mask (not a hand-built dict)."""
+def test_empty_intermediate_tensors_seed_gen_token_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PP empty tensors must come from the factory the LM constructor installs.
+
+    Embeddings, logits, and decoder layers are stubbed so ``__init__`` can run
+    without a distributed runtime. The factory attribute is left as the closure
+    ``__init__`` assigns; replacing it would test the helper instead of that wiring.
+    """
+    from types import SimpleNamespace
+
     batch_size, hidden = 3, 8
-    # Bind the same factory the LM installs in __init__, then call it the way
-    # the runner / PP path does (batch_size, dtype, device).
-    lm = m.MammothModa2Qwen2ForCausalLM.__new__(m.MammothModa2Qwen2ForCausalLM)
-    lm.make_empty_intermediate_tensors = (
-        lambda batch_size, dtype, device: m.make_empty_intermediate_tensors_with_gen_mask(
-            batch_size, hidden, dtype, device
-        )
+    text = SimpleNamespace(
+        hidden_size=hidden,
+        num_hidden_layers=1,
+        vocab_size=32,
+        tie_word_embeddings=False,
+        extra_gen_vocab=False,
+        rms_norm_eps=1e-6,
+        layer_types=None,
+    )
+    text.get_text_config = lambda: text
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=text, hf_text_config=text),
+        cache_config=None,
+        quant_config=None,
+    )
+    monkeypatch.setattr(m, "VocabParallelEmbedding", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(m, "ParallelLMHead", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(m, "LogitsProcessor", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(m, "RMSNorm", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(m, "make_layers", lambda *args, **kwargs: (0, 0, nn.ModuleList()))
+    monkeypatch.setattr(
+        m,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
 
-    tensors = lm.make_empty_intermediate_tensors(batch_size, torch.float32, torch.device("cpu"))
+    lm = m.MammothModa2Qwen2ForCausalLM(vllm_config=vllm_config)
+    factory = lm.make_empty_intermediate_tensors
+    assert "make_empty_intermediate_tensors_with_gen_mask" in factory.__code__.co_names
+
+    tensors = factory(batch_size, torch.float32, torch.device("cpu"))
     assert "gen_token_mask" in tensors.tensors
     assert tensors.tensors["gen_token_mask"].dtype == torch.bool
     assert tuple(tensors.tensors["gen_token_mask"].shape) == (batch_size,)
