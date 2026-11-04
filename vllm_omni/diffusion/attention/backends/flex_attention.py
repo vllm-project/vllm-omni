@@ -13,8 +13,8 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, At
 
 
 @cache
-def compiled_flex():
-    return torch.compile(flex_attention, dynamic=True, fullgraph=True)
+def compiled_flex(dynamic: bool = True):
+    return torch.compile(flex_attention, dynamic=dynamic, fullgraph=True)
 
 
 def build_range_mask(q_length, k_length, ranges, device, query_mask, key_mask):
@@ -158,7 +158,8 @@ class FlexAttentionImpl(AttentionImpl):
                 or key_mask is not None
             ):
                 raise ValueError("Prebuilt Flex BlockMask cannot be combined with rectangle/token masks")
-            kernel = compiled_flex() if q.device.type == "cuda" else flex_attention
+            # Preserve static-shape numerics for caller-provided BlockMask kernels.
+            kernel = compiled_flex(dynamic=False) if q.device.type == "cuda" else flex_attention
             return kernel(
                 q.transpose(1, 2),
                 k.transpose(1, 2),

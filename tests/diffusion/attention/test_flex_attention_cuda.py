@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionRanges
@@ -41,3 +42,24 @@ def test_compiled_flex_ranges_match_fp32_sdpa(dtype, kv_heads):
     torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-2)
     assert torch.count_nonzero(actual[:, 2]) == 0
     assert torch.isfinite(actual).all()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.no_grad()
+def test_prebuilt_flex_mask_preserves_static_kernel_numerics():
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q = torch.randn(1, 9600, 32, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
+    k, v = [torch.randn(1, 9600, 8, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(2)]
+
+    def mask_mod(batch, head, query, key):
+        return (query // 640 - key // 640).abs() <= 1
+
+    mask = create_block_mask(mask_mod, None, None, 9600, 9600, device="cuda", _compile=True)
+    attention = Attention(
+        32, 128, causal=False, softmax_scale=128**-0.5, num_kv_heads=8, default_backend="FLEX_ATTENTION"
+    )
+    actual = attention(q, k, v, AttentionMetadata(range_mask=AttentionRanges(), extra={"block_mask": mask}))
+    expected = torch.compile(flex_attention, dynamic=False)(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=mask, enable_gqa=True
+    ).transpose(1, 2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
