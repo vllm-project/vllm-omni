@@ -17,7 +17,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
-from vllm_omni.diffusion.attention.ops.video_tiles import get_tile_metadata
+from vllm_omni.diffusion.attention.ops.video_tiles import get_tile_metadata, pack_video_tiles
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
@@ -371,21 +371,16 @@ class FastVideoVSAImpl(AttentionImpl):
             )
 
         try:
-            tile_partition_indices, variable_block_sizes, non_pad_index, untile_combined_index = get_tile_metadata(
+            _, variable_block_sizes, _, untile_combined_index = get_tile_metadata(
                 dit_seq_shape,
                 self.block_size,
                 self.block_elements,
                 query.device,
             )
 
-            padded_len = variable_block_sizes.numel() * self.block_elements
-            target_shape = (query.shape[0], padded_len, query.shape[2], query.shape[3])
-            query_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
-            key_tiled = torch.zeros_like(query_tiled)
-            value_tiled = torch.zeros_like(query_tiled)
-            query_tiled[:, non_pad_index] = query[:, tile_partition_indices]
-            key_tiled[:, non_pad_index] = key[:, tile_partition_indices]
-            value_tiled[:, non_pad_index] = value[:, tile_partition_indices]
+            query_tiled = pack_video_tiles(query, dit_seq_shape, self.block_size)
+            key_tiled = pack_video_tiles(key, dit_seq_shape, self.block_size)
+            value_tiled = pack_video_tiles(value, dit_seq_shape, self.block_size)
             # Gate behavior is checkpoint-driven, not user-configured.
             # Wan VSA layers always provide a gate projection. Its zero
             # initialization makes checkpoints without gate weights sparse-only;
@@ -397,9 +392,7 @@ class FastVideoVSAImpl(AttentionImpl):
                 gate_compress = gate_compress[:, :valid_seq_len]
             elif gate_compress.shape != query.shape:
                 raise ValueError(f"gate_compress shape {gate_compress.shape} must match query shape {query.shape}")
-            gate_tiled = torch.zeros_like(query_tiled)
-            gate_tiled[:, non_pad_index] = gate_compress[:, tile_partition_indices]
-            compress_attn_weight = gate_tiled
+            compress_attn_weight = pack_video_tiles(gate_compress, dit_seq_shape, self.block_size)
 
             output = _fastvideo_vsa_bshd_op(
                 query_tiled.contiguous(),
