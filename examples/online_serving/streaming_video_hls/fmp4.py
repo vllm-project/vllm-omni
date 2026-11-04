@@ -211,13 +211,21 @@ def _tfhd_defaults(buf: bytes, p0: int) -> tuple[int | None, int | None]:
     return default_duration, default_flags
 
 
-def _trun(buf: bytes, p0: int, default_duration: int | None, default_flags: int | None) -> tuple[int, bool]:
-    """Total ticks in one trun, and whether its first sample is a sync sample."""
+def _trun(buf: bytes, p0: int, end: int, default_duration: int | None, default_flags: int | None) -> tuple[int, bool]:
+    """Total ticks in one trun box, and whether its first sample is a sync sample.
+
+    Every read stays inside the box, [p0, end), so a trun cannot pull in the bytes
+    of the boxes after it.
+    """
+    if end - p0 < 8:
+        raise ValueError("trun box is shorter than its header")
     flags = _u32(buf, p0) & 0xFFFFFF
     count = _u32(buf, p0 + 4)
     pos = p0 + 8
     if flags & _TRUN_DATA_OFFSET:
         pos += 4
+    if pos + (4 if flags & _TRUN_FIRST_SAMPLE_FLAGS else 0) > end:
+        raise ValueError("trun header runs past its box")
     first_flags = None
     if flags & _TRUN_FIRST_SAMPLE_FLAGS:
         first_flags = _u32(buf, pos)
@@ -226,14 +234,14 @@ def _trun(buf: bytes, p0: int, default_duration: int | None, default_flags: int 
     if count == 0:
         return 0, False
     # Each sample record is 4 bytes per per-sample field the flags name. Refuse a count
-    # the fragment cannot hold before walking it, so a forged count cannot stall us.
+    # the box cannot hold before walking it, so a forged count cannot stall us.
     fields = sum(
         1
         for bit in (_TRUN_SAMPLE_DURATION, _TRUN_SAMPLE_SIZE, _TRUN_SAMPLE_FLAGS, _TRUN_SAMPLE_COMPOSITION)
         if flags & bit
     )
-    if pos + count * 4 * fields > len(buf):
-        raise ValueError(f"trun declares {count} samples but the fragment ends before them")
+    if pos + count * 4 * fields > end:
+        raise ValueError(f"trun declares {count} samples but its box ends before them")
     if not fields:
         # Every sample takes the defaults, so the total is arithmetic, not a walk.
         if default_duration is None:
@@ -285,11 +293,11 @@ def fragment_timing(fragment: bytes, timescale: int) -> FragmentTiming:
     first_sync: bool | None = None
     default_duration: int | None = None
     default_flags: int | None = None
-    for typ, p0, _ in _children(fragment, traf[0], traf[1]):
+    for typ, p0, end in _children(fragment, traf[0], traf[1]):
         if typ == "tfhd":
             default_duration, default_flags = _tfhd_defaults(fragment, p0)
         elif typ == "trun":
-            run_ticks, run_sync = _trun(fragment, p0, default_duration, default_flags)
+            run_ticks, run_sync = _trun(fragment, p0, end, default_duration, default_flags)
             ticks += run_ticks
             if first_sync is None:
                 first_sync = run_sync

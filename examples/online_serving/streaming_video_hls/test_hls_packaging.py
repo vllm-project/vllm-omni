@@ -266,6 +266,16 @@ def test_forged_trun_count_fails_fast() -> None:
         fragment_timing(moof + box("mdat", b""), TIMESCALE)
 
 
+def test_trun_cannot_read_rows_from_the_next_box() -> None:
+    """A count that only fits by reading the mdat after the trun is refused."""
+    trun = box("trun", struct.pack(">IIi", 0x000001 | 0x000100, 3, 0) + struct.pack(">I", SAMPLE_TICKS))
+    tfhd = box("tfhd", struct.pack(">II", 0x020000, 1))
+    moof = box("moof", box("mfhd", struct.pack(">II", 0, 1)) + box("traf", tfhd + trun))
+    mdat = box("mdat", struct.pack(">III", SAMPLE_TICKS, SAMPLE_TICKS, SAMPLE_TICKS))
+    with pytest.raises(ValueError, match="ends before them"):
+        fragment_timing(moof + mdat, TIMESCALE)
+
+
 def test_trun_without_per_sample_fields_uses_defaults() -> None:
     """With no per-sample records, the total is count times the tfhd default."""
     trun = box("trun", struct.pack(">IIi", 0x000001, 3, 0))  # data offset only
