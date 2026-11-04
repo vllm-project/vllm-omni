@@ -112,10 +112,6 @@ In `DiffusionParallelConfig`:
 | `tensor_parallel_size` | int  | 1       | Number of GPUs to shard model weights across. Must divide number of heads.                                                      |
 | `text_encoder_tp_size` | int  | 1       | Number of DiT ranks to shard the text encoder across (see [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism)). |
 
------------|------|---------|-------------|
-| `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
-| `text_encoder_tp_size` | int | 1 | Number of DiT ranks to shard the text encoder across (see [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism)). |
-
 ---
 
 ## Best Practices
