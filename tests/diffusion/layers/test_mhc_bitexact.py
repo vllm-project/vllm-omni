@@ -14,6 +14,10 @@ CUDA reductions and Triton libdevice (verified on torch 2.13.0, triton
 3.7.1); the tests re-derive the native reference on every run, so a future
 torch reduction-order change fails them — the trigger to re-derive the
 kernel's orders.
+
+The bit-exact contract is CUDA-only. MUSA keeps the #7261 tile kernel
+(``_mhc_post_residual_tile_kernel``), which is rtol-parity there; its
+dispatch is covered by ``test_mhc_post_residual_musa_uses_tile_kernel``.
 """
 
 from __future__ import annotations
@@ -23,11 +27,13 @@ import unittest.mock
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers import mhc
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
-DEVICES = [pytest.param("cuda", marks=pytest.mark.cuda), pytest.param("musa", marks=pytest.mark.musa)]
+CUDA_DEVICES = [pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1))]
+MUSA_DEVICES = [pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1))]
 
 _SCALE = 0.125
 _ITERATIONS = 20
@@ -89,9 +95,9 @@ def _reference(args, out_dtype):
     )
 
 
-def _launch_spy():
-    """Wrap the post-residual kernel so tests can count real launches."""
-    original = mhc._mhc_post_residual_kernel
+def _launch_spy(name: str = "_mhc_post_residual_kernel"):
+    """Wrap a post-residual kernel so tests can count real launches."""
+    original = getattr(mhc, name)
     launches = []
 
     class Spy:
@@ -99,7 +105,7 @@ def _launch_spy():
             launches.append(grid)
             return original[grid]
 
-    return unittest.mock.patch.object(mhc, "_mhc_post_residual_kernel", Spy()), launches
+    return unittest.mock.patch.object(mhc, name, Spy()), launches
 
 
 def _failing_kernel(error: Exception):
@@ -125,7 +131,7 @@ def _fused(args, out_dtype):
     )
 
 
-@pytest.mark.parametrize("device_name", DEVICES)
+@pytest.mark.parametrize("device_name", CUDA_DEVICES)
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "tokens",
@@ -144,7 +150,7 @@ def test_mhc_post_residual_bit_exact(device_name, out_dtype, tokens, seed):
     assert not mhc._FAILED_MHC_KERNELS
 
 
-@pytest.mark.parametrize("device_name", DEVICES)
+@pytest.mark.parametrize("device_name", CUDA_DEVICES)
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_mhc_post_residual_special_values(device_name, out_dtype):
     dev = _device(device_name)
@@ -170,7 +176,34 @@ def test_mhc_post_residual_special_values(device_name, out_dtype):
     assert not mhc._FAILED_MHC_KERNELS
 
 
-@pytest.mark.cuda
+@pytest.mark.parametrize("device_name", MUSA_DEVICES)
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_mhc_post_residual_musa_uses_tile_kernel(device_name, out_dtype):
+    """MUSA dispatches to the #7261 tile kernel (rtol parity, not bit-exact).
+
+    Regression for the #7545 S5000 review: the statically-unrolled bit-exact
+    kernel both missed bit-exactness by one ULP there and ran roughly 15x
+    slower than the tile kernel, so MUSA must keep the #7261 form.
+    """
+    dev = _device(device_name)
+    args = _make_inputs(97, 0, dev)
+    assert not args[1].is_contiguous()
+
+    tile_spy, tile_launches = _launch_spy("_mhc_post_residual_tile_kernel")
+    bitexact_spy, bitexact_launches = _launch_spy()
+    with tile_spy, bitexact_spy:
+        fused_post, fused_residual = _fused(args, out_dtype)
+    getattr(torch, device_name).synchronize()
+    assert len(tile_launches) == 1
+    assert not bitexact_launches  # the bit-exact kernel stays CUDA-only
+    assert not mhc._FAILED_MHC_KERNELS
+    ref_post, ref_residual = _reference(args, out_dtype)
+    tolerance = {torch.float32: 1e-5, torch.float16: 2e-3, torch.bfloat16: 1.6e-2}[out_dtype]
+    torch.testing.assert_close(fused_post, ref_post, rtol=tolerance, atol=1e-6)
+    torch.testing.assert_close(fused_residual, ref_residual, rtol=tolerance, atol=1e-6)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_mhc_post_residual_launches_the_kernel_on_strided_views():
     """compute_logits-style split views must take the fused path (T > 1)."""
     if not torch.cuda.is_available():
@@ -179,18 +212,20 @@ def test_mhc_post_residual_launches_the_kernel_on_strided_views():
     args = _make_inputs(97, 0, dev)
     assert not args[1].is_contiguous()
 
-    spy, launches = _launch_spy()
-    with spy:
+    bitexact_spy, launches = _launch_spy()
+    tile_spy, tile_launches = _launch_spy("_mhc_post_residual_tile_kernel")
+    with bitexact_spy, tile_spy:
         fused_post, fused_residual = _fused(args, torch.bfloat16)
     torch.accelerator.synchronize()
     assert len(launches) == 1
+    assert not tile_launches  # the #7261 tile kernel stays the MUSA path
     assert not mhc._FAILED_MHC_KERNELS
     ref_post, ref_residual = _reference(args, torch.bfloat16)
     assert torch.equal(_bits(fused_post), _bits(ref_post))
     assert torch.equal(_bits(fused_residual), _bits(ref_residual))
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_mhc_post_residual_propagates_out_of_memory():
     """A transient OOM must propagate, not permanently disable the kernel."""
     if not torch.cuda.is_available():
@@ -205,7 +240,7 @@ def test_mhc_post_residual_propagates_out_of_memory():
     assert not mhc._FAILED_MHC_KERNELS
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_mhc_post_residual_caches_runtime_failure():
     """One launch failure falls back to native (bit-exact) and stops retrying."""
     if not torch.cuda.is_available():
@@ -233,7 +268,7 @@ def test_mhc_post_residual_caches_runtime_failure():
     assert torch.equal(_bits(second_residual), _bits(ref_residual))
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("grad_context", [torch.inference_mode, torch.no_grad])
 def test_mhc_post_residual_accepts_parameters_without_active_autograd(grad_context):
     """nn.Parameter inputs under inference contexts must fuse (regression:
