@@ -252,8 +252,9 @@ def moe_forward(
                 "MammothModa2 MoE CUDA-graph capture requires gen_token_mask; "
                 "keep input_ids on the mm graph path via requires_raw_input_tokens. "
                 "If capture still fails (for example under model_runner: v2 or a "
-                "PP path that drops the mask), set enforce_eager: true or "
-                "cudagraph_mode: PIECEWISE."
+                "PP path that drops the mask), set enforce_eager: true. "
+                "PIECEWISE is not a workaround: MoE still hits this path whenever "
+                "the current stream is capturing."
             )
         return _moe_blend(hidden_states, und_expert, gen_expert, gen_token_mask)
 

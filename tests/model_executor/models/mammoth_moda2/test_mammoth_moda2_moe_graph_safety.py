@@ -75,16 +75,16 @@ def test_moe_forward_capturing_none_mask_fails_closed(monkeypatch: pytest.Monkey
     monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
     hidden = torch.randn(2, 3, 4)
 
-    # FULL_DECODE_ONLY still captures decode as a full graph, so the only
-    # workarounds this guard can honestly offer are eager mode and PIECEWISE.
-    match = r"requires gen_token_mask.*enforce_eager.*PIECEWISE"
+    # FULL_DECODE_ONLY / PIECEWISE still capture MoE when the stream is
+    # capturing, so the only honest workaround this guard can offer is eager.
+    match = r"requires gen_token_mask.*enforce_eager"
     for mask in (None, torch.zeros(0, dtype=torch.bool)):
         with pytest.raises(RuntimeError, match=match) as exc_info:
             m.moe_forward(hidden, _und, _gen, mask)
         message = str(exc_info.value)
         assert "FULL_DECODE_ONLY" not in message
         assert "enforce_eager" in message
-        assert "PIECEWISE" in message
+        assert "cudagraph_mode: PIECEWISE" not in message
 
 
 def test_moe_forward_capturing_all_false_mask_still_runs_both_experts(
