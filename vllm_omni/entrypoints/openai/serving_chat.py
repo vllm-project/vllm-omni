@@ -204,17 +204,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return False
 
     @staticmethod
-    def _minicpmo45_ref_audio_uri(
-        request: Any,
-        messages: list[ChatCompletionMessageParam],
-    ) -> str | None:
-        """Find the official MiniCPM-o reference-audio request forms.
-
-        The benchmark sends ``extra_body.ref_audio`` while the official demo
-        puts an ``audio_url`` content part in the system message. OpenAI
-        ``input_audio`` parts may also supply base64 data and a format; turn
-        those into a data URI before a media connector sees them.
-        """
+    def _minicpmo45_explicit_ref_audio_uri(request: Any) -> str | None:
+        """Find a separately supplied voice reference, if present."""
         for source in (
             getattr(request, "extra_body", None),
             getattr(request, "model_extra", None),
@@ -227,6 +218,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         value = getattr(request, "ref_audio", None)
         if isinstance(value, str) and value:
             return value
+        return None
+
+    @staticmethod
+    def _minicpmo45_ref_audio_uri(
+        request: Any,
+        messages: list[ChatCompletionMessageParam],
+    ) -> str | None:
+        """Find the explicit reference or the first message audio URI."""
+        explicit_ref = OmniOpenAIServingChat._minicpmo45_explicit_ref_audio_uri(request)
+        if explicit_ref is not None:
+            return explicit_ref
 
         for message in messages:
             content = message.get("content") if isinstance(message, dict) else None
@@ -272,6 +274,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return
 
         additional_information = self._ensure_prompt_additional_information(engine_prompt)
+        explicit_ref = self._minicpmo45_explicit_ref_audio_uri(request)
+        if explicit_ref is not None:
+            # A separate voice reference may differ from the question audio.
+            # Keep it separate from rendered/deferred input modalities.
+            media_connector = MediaConnector(
+                media_io_kwargs=getattr(request, "media_io_kwargs", None),
+                allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", "") or "",
+                allowed_media_domains=getattr(self.model_config, "allowed_media_domains", None),
+            )
+            fetch_audio = getattr(media_connector, "fetch_audio_async", None)
+            if fetch_audio is None:
+                raise ValueError("MiniCPM-o explicit reference audio requires asynchronous audio fetching")
+            waveform, sample_rate = await fetch_audio(explicit_ref)
+            additional_information["minicpmo45_ref_audio"] = torch.as_tensor(waveform)
+            additional_information["minicpmo45_ref_audio_sr"] = int(sample_rate)
+            return
+
         deferred = additional_information.get("deferred_multi_modal_data")
         if not isinstance(deferred, dict):
             deferred = {}

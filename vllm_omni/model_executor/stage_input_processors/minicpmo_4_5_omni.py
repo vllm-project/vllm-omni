@@ -722,8 +722,21 @@ def llm2tts(
         if isinstance(p, dict):
             request_mm_data = p.get("multi_modal_data")
             request_audio = request_mm_data.get("audio") if isinstance(request_mm_data, Mapping) else None
-            if request_audio is None or (isinstance(request_audio, (list, tuple)) and not request_audio):
-                additional_information = p.get("additional_information")
+            additional_information = p.get("additional_information")
+            explicit_audio = (
+                additional_information.get("minicpmo45_ref_audio")
+                if isinstance(additional_information, Mapping)
+                else None
+            )
+            explicit_sr = (
+                additional_information.get("minicpmo45_ref_audio_sr")
+                if isinstance(additional_information, Mapping)
+                else None
+            )
+            if explicit_audio is not None and explicit_sr is not None:
+                request_mm_data = dict(request_mm_data or {})
+                request_mm_data["audio"] = (explicit_audio, explicit_sr)
+            elif request_audio is None or (isinstance(request_audio, (list, tuple)) and not request_audio):
                 deferred_mm_data = (
                     additional_information.get("deferred_multi_modal_data")
                     if isinstance(additional_information, Mapping)

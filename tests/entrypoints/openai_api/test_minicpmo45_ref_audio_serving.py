@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -15,6 +16,8 @@ def serving_chat(monkeypatch):
 
         async def fetch_audio_async(self, uri):
             fetched_audio_uris.append(uri)
+            if uri == "file:///tmp/reference-b.wav":
+                return [0.75, -0.25], 22050
             return "wave", 24000
 
     fetched_audio_uris = []
@@ -150,3 +153,51 @@ async def test_fetches_input_audio_data_uri_when_renderer_did_not_materialize(se
 
     assert serving_chat.fetched_audio_uris == ["data:audio/wav;base64,AAAA"]
     assert prompt["additional_information"]["deferred_multi_modal_data"]["audio"] == [("wave", 24000)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["extra_body", "model_extra", "attribute"])
+@pytest.mark.parametrize("question_location", ["rendered", "deferred", "both"])
+async def test_explicit_reference_wins_over_distinct_question_audio(serving_chat, source, question_location):
+    from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
+
+    request = SimpleNamespace(media_io_kwargs=None, extra_body={}, model_extra={})
+    if source == "attribute":
+        request.ref_audio = "file:///tmp/reference-b.wav"
+    else:
+        getattr(request, source)["ref_audio"] = "file:///tmp/reference-b.wav"
+    question_audio = ([0.1, 0.2], 16000)
+    prompt = {"multi_modal_data": {"image": object()}, "additional_information": {}}
+    if question_location in {"rendered", "both"}:
+        prompt["multi_modal_data"]["audio"] = [question_audio]
+    if question_location in {"deferred", "both"}:
+        prompt["additional_information"]["deferred_multi_modal_data"] = {"audio": [question_audio]}
+
+    uri = serving_chat._minicpmo45_ref_audio_uri(request, [])
+    await serving_chat._attach_minicpmo45_ref_audio(request, uri, prompt)
+
+    info = prompt["additional_information"]
+    assert torch.equal(info["minicpmo45_ref_audio"], torch.tensor([0.75, -0.25]))
+    assert info["minicpmo45_ref_audio_sr"] == 22050
+    roundtrip = deserialize_additional_information(serialize_additional_information(info))
+    assert torch.equal(roundtrip["minicpmo45_ref_audio"], torch.tensor([0.75, -0.25]))
+    assert roundtrip["minicpmo45_ref_audio_sr"] == 22050
+    assert serving_chat.fetched_audio_uris == ["file:///tmp/reference-b.wav"]
+    if question_location in {"rendered", "both"}:
+        assert prompt["multi_modal_data"]["audio"] == [question_audio]
+    if question_location in {"deferred", "both"}:
+        assert info["deferred_multi_modal_data"]["audio"] == [question_audio]
+
+    completion = SimpleNamespace(
+        token_ids=[11, 12, 9002],
+        text="hello",
+        multimodal_output={
+            "latent": torch.arange(20, dtype=torch.float32).reshape(5, 4),
+            "meta": {"tts_bos_token_id": 9001, "tts_eos_token_id": 9002},
+        },
+    )
+    source_output = SimpleNamespace(request_id="req-1", prompt_token_ids=[101, 9001], outputs=[completion])
+    converted = llm2tts([source_output], prompt=[prompt])[0]["model_intermediate_buffer"]
+    assert converted["codes"]["ref"] == [0.75, -0.25]
+    assert converted["meta"]["ref_audio_sr"] == 22050
