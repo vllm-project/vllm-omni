@@ -19,7 +19,9 @@ IPC_INIT_INFO = {"packed": False}
 
 async def _generate_text(engine: AsyncOmni, request_id: str) -> tuple[int, ...]:
     tokens: tuple[int, ...] = ()
-    async for output in engine.generate("What is the capital of China?", request_id=request_id):
+    async for output in engine.generate(
+        "What is the capital of China?", request_id=request_id, output_modalities=["text"]
+    ):
         if output.final_output_type == "text" and output.outputs:
             tokens = tuple(output.outputs[0].token_ids)
     assert tokens, "Qwen3-Omni produced no thinker text"
