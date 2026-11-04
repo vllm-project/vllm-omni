@@ -236,13 +236,13 @@ def test_rewrite_consumes_step_once_even_when_materialize_fails(monkeypatch):
         "external_launcher",
         "external_launcher_async",
         "external_launcher_qualname",
-        "ray_v2",
+        "ray",
         "mp_kv",
         "mp_ec",
     ],
 )
 def test_tp_output_consumption_recycles_staging_slots(monkeypatch, caplog, tp_rank, backend):
-    """Exercise vLLM's reply gate and local-output consumers on CPU."""
+    """Exercise vLLM 0.33's reply gate and local-output consumers on CPU."""
     from vllm.distributed import parallel_state
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
     from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
@@ -256,12 +256,10 @@ def test_tp_output_consumption_recycles_staging_slots(monkeypatch, caplog, tp_ra
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     executor_backend = backend
     worker_cls = WorkerProc
-    if backend == "ray_v2":
+    if backend == "ray":
         pytest.importorskip("ray")
         from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
-        monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1")
-        executor_backend = "ray"
         worker_cls = RayWorkerProc
     elif backend == "mp_class":
         executor_backend = MultiprocExecutor
@@ -310,7 +308,7 @@ def test_tp_output_consumption_recycles_staging_slots(monkeypatch, caplog, tp_ra
     worker.rank = tp_rank
     worker.worker = SimpleNamespace(sample_tokens=sample_tokens)
     worker.handle_output = handle_output
-    all_ranks_consume = backend not in ("mp", "mp_class", "ray_v2")
+    all_ranks_consume = backend not in ("mp", "mp_class", "ray")
     if backend.startswith("external_launcher"):
         executor = ExecutorWithExternalLauncher.__new__(ExecutorWithExternalLauncher)
         executor.driver_worker = worker.worker
