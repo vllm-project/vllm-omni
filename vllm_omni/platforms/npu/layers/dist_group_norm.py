@@ -558,7 +558,7 @@ def dist_group_norm(
     bias: torch.Tensor | None,
     eps: float,
     activation: str = "identity",
-    device_group=None,
+    device_group: dist.ProcessGroup | None = None,
     local_only: bool = False,
     layout: str = "NHWC",
     output_dtype: torch.dtype | None = None,
@@ -568,7 +568,8 @@ def dist_group_norm(
     Args:
         x: ``(N, H, W, C)`` NHWC, contiguous; bf16/fp16/fp32 activations.
         num_groups: number of groups; ``C % num_groups == 0`` required.
-        weight/bias: ``(C,)`` affine gamma/beta (fp32 under VAE autocast) or None.
+        weight: ``(C,)`` affine gamma (fp32 under VAE autocast), or None.
+        bias: ``(C,)`` affine beta (fp32 under VAE autocast), or None.
         eps: variance epsilon.
         activation: ``"identity"`` or ``"swish"`` (fused into the norm).
         layout: explicit physical tensor layout: rank-4 NHWC or rank-5 NCTHW.
