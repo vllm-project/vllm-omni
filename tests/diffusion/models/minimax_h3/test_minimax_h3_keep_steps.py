@@ -240,6 +240,12 @@ def test_base_cond_rows_equal_image_only_anchor(pipeline):
         ({"base_text_embeddings": None}, "requires base text conditioning"),
         ({"base_text_tags": None}, "requires base text conditioning"),
         ({"ref_blocks": [_ref_blocks()[0]], "visual_condition_shapes": [IMAGE_SHAPE]}, "silent video reference"),
+        # The packer requires images before the video block; the encoder and
+        # the API layer normalize upload order into exactly this order.
+        (
+            {"ref_blocks": [_ref_blocks()[1], _ref_blocks()[0]], "visual_condition_shapes": [IMAGE_SHAPE, VIDEO_SHAPE]},
+            "silent video reference",
+        ),
         ({"visual_condition": None, "visual_condition_shapes": None}, "silent video reference"),
     ],
 )
@@ -361,7 +367,7 @@ def test_default_loop_never_calls_the_switch(monkeypatch: pytest.MonkeyPatch):
 
 def test_keep_steps_loop_rejects_invalid_switch_point():
     full, base = _full_branch(), _base_branch()
-    for keep_steps in (-1, 3, "2"):
+    for keep_steps in (-1, 0, 3, "2"):
         with pytest.raises(ValueError, match="keep_steps"):
             _run_loop(
                 _RecordingModel(),
@@ -465,6 +471,7 @@ def test_keep_steps_equal_to_step_count_degrades_to_full_video():
         ),
         ({"base_hidden_states": None, "base_token_tags": None}, {"keep_steps": 2}, "image-only"),
         (dict(), {"keep_steps": "2"}, "must be an integer"),
+        (dict(), {"keep_steps": 0}, "must be an integer"),
         (dict(), {"keep_steps": 5}, "must be an integer"),
         (dict(), {"keep_steps": -1}, "must be an integer"),
     ],
@@ -561,7 +568,8 @@ class _Prepared:
     media: Any
 
 
-def test_local_conditioning_encodes_image_only_presentation(monkeypatch: pytest.MonkeyPatch):
+def _local_pipeline(monkeypatch: pytest.MonkeyPatch):
+    """Patch a bare pipeline so ``_prepare_local_conditioning`` runs without models."""
     pipeline = _validation_pipeline()
     prepared = _Prepared(
         prompt="p",
@@ -597,23 +605,59 @@ def test_local_conditioning_encodes_image_only_presentation(monkeypatch: pytest.
     ]
     encode_prompt = Mock(side_effect=encoded)
     monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    return pipeline, prepared, encode_prompt
 
-    sampling = OmniDiffusionSamplingParams(
+
+def _local_sampling(**extra_args):
+    return OmniDiffusionSamplingParams(
         quality="lossless",
         fps=24,
         num_inference_steps=4,
-        extra_args={"task": "ref2va", "keep_steps": 2},
+        extra_args={"task": "ref2va", **extra_args},
     )
-    conditioning, window = pipeline._prepare_local_conditioning({"prompt": "p"}, sampling)
+
+
+def test_local_conditioning_encodes_image_only_presentation(monkeypatch: pytest.MonkeyPatch):
+    pipeline, prepared, encode_prompt = _local_pipeline(monkeypatch)
+    conditioning, window = pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
 
     assert window is None
     assert encode_prompt.call_count == 2
-    torch.testing.assert_close(conditioning.hidden_states, encoded[0][0])
-    torch.testing.assert_close(conditioning.base_hidden_states, encoded[1][0])
-    torch.testing.assert_close(conditioning.base_token_tags, encoded[1][1])
+    torch.testing.assert_close(conditioning.hidden_states, encode_prompt.side_effect[0][0])
+    torch.testing.assert_close(conditioning.base_hidden_states, encode_prompt.side_effect[1][0])
+    torch.testing.assert_close(conditioning.base_token_tags, encode_prompt.side_effect[1][1])
     base_prepared = encode_prompt.call_args_list[1].args[0]
     assert base_prepared is not prepared
     assert base_prepared.qwen_videos == []
     assert base_prepared.video_timestamps == []
     assert base_prepared.condition_labels == [("image", 1)]
     assert base_prepared.prompt == prepared.prompt
+
+
+def test_degenerate_keep_steps_skips_the_second_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    # keep_steps == num_inference_steps degrades to full-video conditioning
+    # during normalization, so the image-only presentation is never encoded.
+    pipeline, _, encode_prompt = _local_pipeline(monkeypatch)
+    conditioning, _ = pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=4))
+    assert encode_prompt.call_count == 1
+    assert conditioning.base_hidden_states is None
+    assert conditioning.base_token_tags is None
+
+
+def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    pipeline, _, encode_prompt = _local_pipeline(monkeypatch)
+    with pytest.raises(OmniClientError, match="must be an integer"):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=9))
+    assert encode_prompt.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Separate-encoder-stage intake
+# ---------------------------------------------------------------------------
+
+
+def test_encoder_stage_rejects_keep_steps_at_intake():
+    from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt
+
+    with pytest.raises(OmniClientError, match="separate encoder stage"):
+        prepare_encoder_prompt({"prompt": "p"}, [_local_sampling(keep_steps=2)])

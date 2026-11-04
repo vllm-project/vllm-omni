@@ -511,11 +511,17 @@ curl -s http://localhost:8091/v1/videos/sync \
 ```
 
 - `keep_steps` is the number of leading steps that keep the video reference;
-  the remaining steps run on an image-only packed layout (the running rows
-  transfer by index copy, so both layouts share the target geometry). Requests
-  without `keep_steps` keep the video reference for every step — the historical
-  behaviour, unchanged. `keep_steps == num_inference_steps` also degrades to
-  full-video conditioning.
+  it must be an integer in `[1, num_inference_steps]`. The remaining steps run
+  on an image-only packed layout (the running rows transfer by index copy, so
+  both layouts share the target geometry). Requests without `keep_steps` keep
+  the video reference for every step — the historical behaviour, unchanged —
+  and `keep_steps == num_inference_steps` also degrades to full-video
+  conditioning. `keep_steps=0` is rejected: the video would never condition a
+  step while the request still pays for its VAE encode and the
+  full-presentation encoder pass.
+- Reference upload order does not matter: the server splits `input_references`
+  by media kind and the encoder packs image references before the video
+  reference regardless of the order the files arrive in.
 - Measured on Atlas 800I A2 (910B3, TP4), a 20-step Ref2VA request with one
   image and one proxy video finished in 981.9 s instead of 1176.4 s (-16.5%)
   with an identical per-card memory profile; per-step time drops ≈24% after
@@ -531,8 +537,9 @@ curl -s http://localhost:8091/v1/videos/sync \
   media, `continue_from`/continuation, timeline guides, latent
   refine/upscale, `pad_seq_len`, reference-KV offload, Cache-DiT quality
   profiles, the AdaLN sidecar cache, turbo/native LoRA, FastH3, or step
-  execution. Serving deployments that use a separate encoder stage without a
-  local text encoder also reject `keep_steps` for now.
+  execution. Deployments that split the encoder into its own stage reject
+  `keep_steps` requests at intake (HTTP 400) until the second encoder pass is
+  wired there.
 
 ### Speech-to-Video
 

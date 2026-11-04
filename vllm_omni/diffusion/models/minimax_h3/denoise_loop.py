@@ -409,9 +409,9 @@ def minimax_h3_denoise_loop(
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
     if base is not None:
-        if type(keep_steps) is not int or not 0 <= keep_steps < num_steps:
+        if type(keep_steps) is not int or not 1 <= keep_steps < num_steps:
             raise ValueError(
-                f"keep_steps must be an integer in [0, {num_steps}) when a base branch is supplied"
+                f"keep_steps must be an integer in [1, {num_steps}) when a base branch is supplied"
             )
         if base_cond_rows is None:
             raise ValueError("keep_steps requires base_cond_rows (image-only condition anchor rows)")

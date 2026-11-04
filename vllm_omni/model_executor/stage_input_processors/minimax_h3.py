@@ -56,14 +56,21 @@ def prepare_encoder_prompt(
     omits the video from ``qwen_mm_data`` and ``condition_labels``, then merge
     its hidden states/tags into the encoder output payload under the two
     ``base_*`` keys before the payload is handed to the DiT stage.
-    Until this is wired, serving deployments reject keep_steps requests with
-    a clear error; the local-text-encoder path (tests/offline) already works
-    end to end via ``_prepare_local_conditioning``.
+    Until this is wired, keep_steps requests are rejected HERE, at intake, so
+    split-stage clients get the 400 without paying for the encoder stage; the
+    local-text-encoder path (tests/offline) already works end to end via
+    ``_prepare_local_conditioning``.
     """
+    sampling = _diffusion_sampling_params(sampling_params_list)
+    if (getattr(sampling, "extra_args", None) or {}).get("keep_steps") is not None:
+        raise OmniClientError(
+            "MiniMax H3 keep_steps is not supported across a separate encoder stage yet; it requires "
+            "the diffusion stage's local text encoder (see the TODO in this file)"
+        )
     multi_modal_data = prompt.get("multi_modal_data") if isinstance(prompt, Mapping) else None
     if isinstance(multi_modal_data, Mapping) and multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None:
         raise OmniClientError("MiniMax H3 timeline guides require the media encoder in the diffusion stage")
-    prepared = prepare_encoder_inputs(prompt, _diffusion_sampling_params(sampling_params_list))
+    prepared = prepare_encoder_inputs(prompt, sampling)
     if isinstance(prompt, str):
         prompt = {"prompt": prompt}
     text = prepared.prompt

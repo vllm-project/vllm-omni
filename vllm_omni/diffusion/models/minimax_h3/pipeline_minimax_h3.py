@@ -2181,10 +2181,10 @@ class MiniMaxH3Pipeline(
             ) != len(kinds):
                 raise ValueError("keep_steps expects image reference(s) plus exactly one silent video reference")
             image_shapes = [tuple(int(v) for v in shape) for shape in visual_condition_shapes[:n_images]]
-            base_image_rows = sum(
+            shape_image_rows = sum(
                 int(shape[0]) * (int(shape[1]) // 2) * (int(shape[2]) // 2) for shape in image_shapes
             )
-            if visual_anchor is None or int(visual_anchor.shape[0]) <= base_image_rows:
+            if visual_anchor is None or int(visual_anchor.shape[0]) <= shape_image_rows:
                 raise ValueError("keep_steps found no video reference rows to drop")
             base_ref_blocks = [
                 {"kind": "image", "latent_h": int(shape[1]), "latent_w": int(shape[2])}
@@ -2213,6 +2213,15 @@ class MiniMaxH3Pipeline(
                 raise ValueError("base branch target row count differs from the full branch")
             if int(base_branch.audio_pos.shape[0]) != int(branch.audio_pos.shape[0]):
                 raise ValueError("keep_steps branches must share the same audio row layout")
+            # The anchor prefix must cover exactly the base layout's condition
+            # rows; derive the count from the layout and cross-check it against
+            # the shape arithmetic so a future packing change fails loudly
+            # instead of slicing the wrong prefix.
+            base_image_rows = int((~base_branch.update_mask).sum())
+            if base_image_rows != shape_image_rows:
+                raise ValueError(
+                    "keep_steps image row count disagrees with the packed layout; the packer changed"
+                )
             base_cond_rows = visual_anchor[:base_image_rows].to(device=self.device, dtype=torch.float32)
 
         if locked_audio_rows is not None:
@@ -3004,6 +3013,52 @@ class MiniMaxH3Pipeline(
             shapes.append(self.video_vae.predict_video_latent_shape(frames))
         return tuple(shapes)
 
+    def _normalize_keep_steps(
+        self,
+        sampling: Any,
+        *,
+        num_steps: int,
+        task: str | None = None,
+        condition_labels: Sequence[tuple[str, int]] | None = None,
+        timeline_guides: bool = False,
+    ) -> int | None:
+        """Validate and normalize ``keep_steps`` before encoder work is spent.
+
+        Shared by ``_prepare_local_conditioning`` (before the optional second
+        Qwen pass over the image-only presentation) and
+        ``_prepare_encoder_conditioning_inputs`` (the authoritative check), so
+        requests that can never switch -- absent, degenerate, or malformed
+        ``keep_steps``, a non-ref2va task, or reference shapes the switch
+        rejects -- do not pay for that encode. Returns the validated integer,
+        or ``None`` when ``keep_steps`` is absent or equals the step count
+        (degenerate: the historical full-video path).
+
+        ``num_steps`` here is the request's step count; a pinned sigma
+        schedule can still shorten the effective schedule, which the
+        authoritative check in ``_prepare_encoder_conditioning_inputs``
+        re-validates against the resolved count.
+        """
+        keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
+        if keep_steps is None:
+            return None
+        # 0 is rejected on purpose: the video reference would never condition
+        # a single step, yet the request still pays for its VAE encode, the
+        # full-presentation Qwen pass, and the full branch.
+        if type(keep_steps) is not int or not 1 <= keep_steps <= num_steps:
+            raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [1, {num_steps}]")
+        if task is not None and task != "ref2va":
+            raise OmniClientError("MiniMax H3 keep_steps requires task ref2va")
+        if condition_labels is not None and any(label[0] == "audio" for label in condition_labels):
+            raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
+        if timeline_guides:
+            raise OmniClientError("MiniMax H3 keep_steps does not support timeline guides")
+        if keep_steps == num_steps:
+            # Degenerate request: keeping the video for every step is the
+            # historical behaviour, so drop the switch entirely.
+            logger.info("MiniMax H3 keep_steps equals the step count; using full-video conditioning")
+            return None
+        return keep_steps
+
     def _prepare_local_conditioning(
         self,
         raw_prompt: Any,
@@ -3061,13 +3116,18 @@ class MiniMaxH3Pipeline(
                     task=task,
                     prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
                 )
-                # CodeVideoModel keep_steps: the image-only presentation is
-                # encoded locally right after the full one when this request
-                # will drop its video reference after the leading steps.
+                # CodeVideoModel keep_steps: validate and normalize before any
+                # encoder work, then encode the image-only presentation only
+                # when the mid-loop switch will actually happen.
+                keep_steps = self._normalize_keep_steps(
+                    sampling,
+                    num_steps=int(sampling.num_inference_steps or 50),
+                    task=task,
+                    condition_labels=prepared.condition_labels,
+                    timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
+                )
                 base_encode_needed = (
-                    (sampling.extra_args or {}).get("keep_steps") is not None
-                    and bool(prepared.qwen_videos)
-                    and bool(prepared.images)
+                    keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
                 )
                 continuation = None
                 if prompts is not None or (request_context is not None and task == "ref2va"):
@@ -3451,21 +3511,14 @@ class MiniMaxH3Pipeline(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
                 "use sampler='euler' for this schedule."
             )
-        keep_steps = extra.get("keep_steps")
+        # CodeVideoModel-style early-only video conditioning: the video
+        # reference conditions only the first ``keep_steps`` denoise steps;
+        # the request then continues from an image-only presentation.
+        # Normalization runs before any encoder work (see
+        # _normalize_keep_steps); the checks below need the encoded
+        # conditioning and stay authoritative for external presentations.
+        keep_steps = self._normalize_keep_steps(sampling, num_steps=num_steps, task=task)
         if keep_steps is not None:
-            # CodeVideoModel-style early-only video conditioning: the video
-            # reference conditions only the first ``keep_steps`` denoise steps;
-            # the request then continues from an image-only presentation.
-            if type(keep_steps) is not int or not 0 <= keep_steps <= num_steps:
-                raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [0, {num_steps}]")
-            if keep_steps == num_steps:
-                # Degenerate request: keeping the video for every step is the
-                # historical behaviour, so drop the switch entirely.
-                logger.info("MiniMax H3 keep_steps equals the step count; using full-video conditioning")
-                keep_steps = None
-        if keep_steps is not None:
-            if task != "ref2va":
-                raise OmniClientError("MiniMax H3 keep_steps requires task ref2va")
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support continuation")
             if latent_continuation is not None:
