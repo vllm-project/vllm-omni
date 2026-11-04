@@ -258,6 +258,8 @@ def main(args) -> None:
     common = sorted(set(ref) & set(off) & set(on))
     clean: list[str] = []
     filtered_off = filtered_on = 0
+    off_clean_on_filtered = 0  # off clean, on filtered: bucketing degrades a good transcript
+    off_filtered_on_clean = 0  # off filtered, on clean: bucketing recovers a clip
     for idx in common:
         rw = normalize(ref[idx])
         off_clean = is_clean(rw, normalize(off[idx]), args.max_extra, args.min_ratio)
@@ -268,15 +270,34 @@ def main(args) -> None:
             filtered_on += 1
         if off_clean and on_clean:
             clean.append(idx)
+        elif off_clean and not on_clean:
+            off_clean_on_filtered += 1
+        elif not off_clean and on_clean:
+            off_filtered_on_clean += 1
 
     print(f"common clips: {len(common)}")
     print(f"filtered (over/under-generated): off={filtered_off}, on={filtered_on}")
     print(f"clean clips: {len(clean)}")
+    print(
+        f"clean<->filtered transitions: off_clean->on_filtered={off_clean_on_filtered}, "
+        f"off_filtered->on_clean={off_filtered_on_clean}"
+    )
+
+    # Unfiltered paired WER over all common clips keeps the clips where bucketing
+    # could turn a good transcript into truncation/rambling, so the quality cost
+    # of the lossy path stays visible (contrast with the clean-only WER below).
+    for label, hyp in (("off", off), ("on", on)):
+        dist = tot = 0
+        for idx in common:
+            rw = normalize(ref[idx])
+            dist += levenshtein(rw, normalize(hyp[idx]))
+            tot += len(rw)
+        print(f"WER({label}) unfiltered: {dist / tot:.4f}  ({dist}/{tot})")
 
     if not clean:
         # Every clip was filtered as over/under-generated; there is nothing to
-        # score, and WER would divide by zero.
-        print("no clean clips; skipping WER")
+        # clean-score, and WER would divide by zero.
+        print("no clean clips; skipping clean-only WER")
         return
 
     for label, hyp in (("off", off), ("on", on)):
