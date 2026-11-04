@@ -615,6 +615,9 @@ length because input is paced in real time.
 | `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
 | `duplex_client_ttft_ms` | client: `response.created` received | first non-empty text delta |
 | `duplex_client_ttfp_ms` | client: last `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when that send was recorded | first audio delta |
+| `duplex_client_rtf` | same append-send start as `duplex_client_ttfp_ms` | last audio delta, divided by emitted audio duration |
+| `duplex_busy_rtf` | server: union of the turn's stage work spans (RFC #8325) | that union divided by the turn's emitted audio |
+| `duplex_stall_ratio` | server: the turn span minus that union | the stall time divided by the turn's emitted audio |
 
 The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
 prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
@@ -633,6 +636,10 @@ measure the full user-speech-end to first-output latency. Per-response `client_r
 through the last audio packet, divided by emitted audio duration, when an append send was recorded. The server start
 point differs between model plugins, so compare server keys only within one model; client append keys are only
 comparable within one adapter / chunk size.
+`duplex_busy_rtf` and `duplex_stall_ratio` are not substitutes for `duplex_client_rtf`. They come from
+`session.stats` (RFC #8325): OmniInteract and Omni-DuplexEval ask once before close; Seed-TTS asks per turn.
+The keys appear only when serve has `duplex_session.collect_stats: true` and the turn is final; otherwise the
+flatten keys are omitted. Compare them only on a single-host deployment that collected stats.
 Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
 event later happens, so proactive and 1QnA scenarios score low by construction.
 
@@ -718,6 +725,7 @@ continues to use client receipt of `response.created` through the last audio pac
 When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
 before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
 `response.created`. Created-origin audio is `response_created_to_first_audio_ms` and is not copied into `client_ttfp_ms`.
+`busy_rtf` / `stall_ratio` are the RFC #8325 server-side ratios above, present when `duplex_session.collect_stats` is on.
 Global TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
 token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and

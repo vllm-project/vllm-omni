@@ -167,6 +167,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.0,
         description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
     )
+    token_count: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=_INT64_MAX,
+        description="Optional target for new audio, in codec frames (12.5/s), for MOSS-TTS Local. "
+        "Does not change max_new_tokens. Resolve automatic estimates on the client before sending.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
