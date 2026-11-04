@@ -7,8 +7,10 @@ handles each); they are registered under distinct model-type names.
 """
 
 import asyncio
+import copy
 import hashlib
 import threading
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from transformers import AutoModel, AutoTokenizer
@@ -47,25 +49,6 @@ class MossTTSCodecLimitError(TTSGenerationError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=True)
-
-
-def _propagate_seed(stage0_params: Any) -> None:
-    """Propagate the deploy/YAML stage seed to tts_local_seed.
-
-    Deep-copies ``extra_args`` so the shared defaults dict is not mutated.
-    The generic serving layer applies an explicit request.seed afterwards,
-    so the request value still has higher precedence.
-    """
-    import copy
-
-    default_seed = getattr(stage0_params, "seed", None)
-    if default_seed is None:
-        return
-    if stage0_params.extra_args is None:
-        stage0_params.extra_args = {}
-    else:
-        stage0_params.extra_args = copy.copy(stage0_params.extra_args)
-    stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
@@ -715,60 +698,62 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         Mirrors the Qwen3-TTS pattern: ``dynamic_cap = max(192, text_tokens × 12)``,
         clamped to the configured ``max_tokens``.
 
-        An explicit ``duration_seconds`` (SoundEffect) is *not* a text-scaled
-        estimate: it pins a target audio length. SoundEffect generates 16
-        delayed codebooks and then audio-end + EOS termination, so honoring the
-        duration costs more scheduler steps than the requested frame count
-        (``duration × 12.5``) alone. A cap sized to the frame count would end
-        with ``length`` before the requested audio completes and be retried
-        with the same insufficient budget. For these requests the configured
-        server budget is preserved instead of truncating them.
+        Excluded variants (configured budget preserved, no cap key written):
 
-        Nano (``_moss_variant is None``) is excluded: its outer scheduler
-        steps represent audio chunks, not codec frames, and the frame count
-        is controlled via ``additional_information["max_new_frames"]``
-        (default 375), not ``SamplingParams.max_tokens``.
+        - Nano (``_moss_variant is None``): its outer scheduler steps represent
+          audio chunks, not codec frames, and the frame count is controlled via
+          ``additional_information["max_new_frames"]`` (default 375), not
+          ``SamplingParams.max_tokens``.
+        - ``sound_effect``: ``input`` is optional free text and the sound is
+          described in ``ambient_sound``, so text length does not predict output
+          length. The 12 frames/token ratio is calibrated for speech, not for
+          these fields, and an explicit ``duration_seconds`` pins a target audio
+          length whose scheduler-step cost (16 delayed codebooks + audio-end +
+          EOS) exceeds the frame count. Capping here would either truncate a
+          valid request or false-reject a length finish, so the configured server
+          budget is preserved.
         """
         del request_id
 
         sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
 
         # Shallow-copy stage 0 so the shared defaults stay immutable.
-        import copy
-
         sampling_params_list = [copy.copy(params) for params in sampling_params_list]
         stage0_params = sampling_params_list[0]
 
-        # Nano's generation contract is frame-count based
-        # (additional_information["max_new_frames"]), not max_tokens. Applying
-        # a max_tokens cap there has no effect on the actual generator and
-        # causes validate_generation to misreport a length finish.
-        if self._moss_variant is None:
-            _propagate_seed(stage0_params)
+        # Nano and SoundEffect are excluded from the text-scaled ceiling (see
+        # docstring): the cap would not govern their actual generation and could
+        # only false-reject a length finish. Keep the configured budget untouched.
+        if self._moss_variant is None or self._moss_variant == "sound_effect":
             return sampling_params_list
 
         configured_cap = getattr(stage0_params, "max_tokens", None)
         effective_cap: int | None
         auto_budget = False
+        text_tokens: int | None = None
+        dynamic_cap: int | None = None
 
         if request.max_new_tokens is not None:
             # An explicit request budget is an opt-out from the dynamic ceiling.
             # A length finish under a caller budget returns the audio, matching
             # the Qwen3-TTS contract for explicit max_new_tokens.
             effective_cap = int(request.max_new_tokens)
-        elif self._moss_variant == "sound_effect" and request.duration_seconds is not None:
-            # A pinned duration is not a text-scaled estimate, and the frame
-            # count alone underbudgets the scheduler steps (16 delayed codebooks
-            # + audio-end + EOS). Preserve the configured server budget so the
-            # requested audio can complete and terminate, rather than truncate
-            # it at ``duration × 12.5`` frames and retry with the same cap.
-            effective_cap = int(configured_cap) if configured_cap is not None else None
         else:
             text_tokens = self.ctx.server._count_usage_text_tokens(request.input)
             if text_tokens > 0:
                 dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
-                effective_cap = min(dynamic_cap, int(configured_cap)) if configured_cap is not None else dynamic_cap
-                auto_budget = True
+                if configured_cap is not None:
+                    effective_cap = min(dynamic_cap, int(configured_cap))
+                    # Only the server-derived ceiling that actually bound the
+                    # request is treated as a degenerate-generation signal.
+                    # When the dynamic cap reaches or exceeds the configured
+                    # limit, the request is long-form and a length finish at the
+                    # configured budget must return the audio (otherwise two
+                    # full configured-budget decodes end in a 500).
+                    auto_budget = dynamic_cap < int(configured_cap)
+                else:
+                    effective_cap = dynamic_cap
+                    auto_budget = True
             else:
                 # Token counting is best-effort. If the tokenizer is missing or
                 # rejects the input, preserve the configured budget instead of
@@ -790,13 +775,15 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 if auto_budget:
                     additional_information[MOSS_TTS_AUTO_BUDGET_KEY] = [True]
 
-        _propagate_seed(stage0_params)
-
         logger.debug(
-            "MOSS-TTS codec budget: configured_cap=%s request_cap=%s effective_cap=%s",
+            "MOSS-TTS codec budget: text_tokens=%s dynamic_cap=%s configured_cap=%s "
+            "request_cap=%s effective_cap=%s auto_budget=%s",
+            text_tokens,
+            dynamic_cap,
             configured_cap,
             request.max_new_tokens,
             effective_cap,
+            auto_budget,
         )
         return sampling_params_list
 
@@ -820,8 +807,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         length finish returns the generated audio unchanged — matching the
         Qwen3-TTS contract for explicit caller budgets.
         """
-        from collections.abc import Mapping
-
         if not isinstance(tts_params, Mapping):
             return
         if MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
@@ -854,6 +839,9 @@ class MossTTSNanoAdapter(_MossTTSAdapterBase):
     stage_keys = frozenset({"moss_tts_nano"})
     name = "moss_tts_nano"
     accumulate_nonstreaming = True
+    # Nano never writes a cap key, so there is nothing to validate and no
+    # reason to charge the streaming generation counter.
+    validates_generation = False
 
 
 @register_tts_adapter

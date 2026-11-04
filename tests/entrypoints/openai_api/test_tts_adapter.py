@@ -1227,9 +1227,13 @@ def test_moss_tts_applies_text_scaled_codec_safety_limit(text_tokens, request_ca
 
     assert overridden[0].max_tokens == expected_cap
     assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [expected_cap]
-    # The auto budget flag is set only for the text-scaled path (no explicit
-    # request cap); an explicit max_new_tokens is the caller's own budget.
-    if request_cap is None and text_tokens > 0:
+    # The auto budget flag marks only a server-derived ceiling that actually
+    # bound the request below the configured limit. An explicit max_new_tokens
+    # is the caller's own budget, and a dynamic cap that reaches the configured
+    # limit is long-form (a length finish there must return the audio, not a
+    # 500 after two full configured-budget decodes).
+    auto_expected = request_cap is None and text_tokens > 0 and expected_cap < 4096
+    if auto_expected:
         assert prompt["additional_information"][MOSS_TTS_AUTO_BUDGET_KEY] == [True]
     else:
         assert MOSS_TTS_AUTO_BUDGET_KEY not in prompt["additional_information"]
@@ -1279,14 +1283,15 @@ def test_moss_tts_validate_generation_skips_without_cap_key(mocker):
 
 
 def test_moss_tts_sound_effect_duration_preserves_configured_budget(mocker):
-    """[important] An explicit duration_seconds must not be truncated by the cap.
+    """[important] SoundEffect is excluded from the text-scaled ceiling.
 
     SoundEffect generates 16 delayed codebooks and then audio-end + EOS
-    termination, so honoring a requested duration costs more scheduler steps
-    than the requested frame count (duration × 12.5). A cap equal to the frame
-    count ends with ``length`` before the requested audio completes and is
-    retried with the same insufficient budget. The configured server budget
-    must be preserved and must cover the frames plus termination overhead.
+    termination, so honoring a requested ``duration_seconds`` costs more
+    scheduler steps than the requested frame count (``duration × 12.5``). A
+    text-scaled cap would end with ``length`` before the requested audio
+    completes and be retried with the same insufficient budget. The configured
+    server budget is preserved unchanged and no cap key is written, so a length
+    finish returns the audio (the request is not false-rejected as degenerate).
     """
     server = mocker.Mock()
     server._count_usage_text_tokens.return_value = 10
@@ -1306,11 +1311,11 @@ def test_moss_tts_sound_effect_duration_preserves_configured_budget(mocker):
     # Conservative lower bound: n_vq (16) delayed codebooks + audio-end + EOS.
     termination_overhead = 16 + 2
 
-    # The configured budget wins over both the frame count and the text-scaled
-    # cap (max(192, 10 × 12) = 192).
+    # The configured budget is preserved untouched.
     assert overridden[0].max_tokens == configured_cap
-    assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [configured_cap]
-    # A pinned duration is the caller's own budget, not a server-derived cap.
+    # No cap key is written for SoundEffect, so a length finish returns audio
+    # instead of being rejected as a degenerate generation.
+    assert MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in prompt["additional_information"]
     assert MOSS_TTS_AUTO_BUDGET_KEY not in prompt["additional_information"]
     # Completion + termination must fit: the budget covers the requested frames
     # plus the delay/termination overhead, so generation can reach EOS.
@@ -1320,8 +1325,13 @@ def test_moss_tts_sound_effect_duration_preserves_configured_budget(mocker):
     assert stage_defaults[0].max_tokens == configured_cap
 
 
-def test_moss_tts_sound_effect_no_duration_uses_text_cap(mocker):
-    """SoundEffect without duration_seconds falls back to the text-scaled cap."""
+def test_moss_tts_sound_effect_excluded_from_text_cap(mocker):
+    """SoundEffect without duration_seconds is also excluded from the text cap.
+
+    ``input`` is optional free text for SoundEffect and the sound is described
+    in ``ambient_sound``, so text length does not predict output length. The
+    configured server budget is preserved and no cap key is written.
+    """
     server = mocker.Mock()
     server._count_usage_text_tokens.return_value = 10
     adapter = MossTTSAdapter(SpeechServingContext(server=server))
@@ -1332,9 +1342,10 @@ def test_moss_tts_sound_effect_no_duration_uses_text_cap(mocker):
 
     overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
 
-    # No duration → text-scaled: max(192, 10*12=120) = 192
-    assert overridden[0].max_tokens == 192
-    assert prompt["additional_information"][MOSS_TTS_AUTO_BUDGET_KEY] == [True]
+    # Configured budget preserved; no text-scaled cap, no cap key.
+    assert overridden[0].max_tokens == 4096
+    assert MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in prompt["additional_information"]
+    assert MOSS_TTS_AUTO_BUDGET_KEY not in prompt["additional_information"]
 
 
 def test_moss_tts_nano_excluded_from_dynamic_cap(mocker):
@@ -1358,23 +1369,11 @@ def test_moss_tts_nano_excluded_from_dynamic_cap(mocker):
     assert MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in prompt["additional_information"]
 
 
-def test_moss_tts_seed_does_not_mutate_shared_defaults(mocker):
-    """Shallow-copy must not leak tts_local_seed into the shared defaults dict."""
-    shared_extra_args = {"custom_arg": 1}
-    server = mocker.Mock()
-    server._count_usage_text_tokens.return_value = 10
-    adapter = MossTTSAdapter(SpeechServingContext(server=server))
-    adapter._moss_variant = "tts"
-    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2, seed=42, extra_args=shared_extra_args)]
-    request = OpenAICreateSpeechRequest(input="hello")
-    prompt: dict[str, Any] = {"additional_information": {}}
-
-    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
-
-    assert overridden[0].extra_args["tts_local_seed"] == 42
-    # The shared defaults dict must not be mutated
-    assert "tts_local_seed" not in shared_extra_args
-    assert shared_extra_args == {"custom_arg": 1}
+def test_moss_tts_nano_does_not_validate_generation(mocker):
+    """Nano never writes a cap key, so it must not charge the streaming
+    generation counter."""
+    adapter = MossTTSNanoAdapter(SpeechServingContext(server=mocker.Mock()))
+    assert adapter.validates_generation is False
 
 
 def test_indextts_adapters_are_versioned():
