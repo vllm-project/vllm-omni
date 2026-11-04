@@ -175,8 +175,8 @@ async def stream_reply(client, backend, payload, audio_output, speech_language="
                 for worker in workers:
                     worker.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
-        # A cancellation during an error-event put must skip the terminal put:
-        # the consumer has disconnected and a full queue can no longer drain.
+        # Keep the terminal put outside finally: a propagating CancelledError
+        # skips it when a disconnected consumer can no longer drain the queue.
         await events.put(None)
 
     job = asyncio.create_task(orchestrate())

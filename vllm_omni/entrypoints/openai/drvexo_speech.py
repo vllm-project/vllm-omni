@@ -16,10 +16,11 @@ def load_speech_tokenizer(model_directory):
     Match the native prompt builder's tokenizer settings, without loading weights.
     """
     import transformers
+    from packaging.version import Version
     from transformers import AutoTokenizer
 
     kwargs = dict(trust_remote_code=True, use_fast=True, local_files_only=True)
-    if transformers.__version__ < "5":
+    if Version(transformers.__version__).major < 5:
         kwargs["fix_mistral_regex"] = True
     tokenizer = AutoTokenizer.from_pretrained(str(Path(model_directory) / "talker"), **kwargs)
     tokenizer.padding_side = "left"

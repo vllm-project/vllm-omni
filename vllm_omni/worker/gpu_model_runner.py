@@ -1381,7 +1381,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             self._admit_request_payload(req_id, nr)
 
     def _admit_request_payload(self, req_id: str, request_data) -> None:
-        """Nonempty admissions replace a snapshot; absence preserves seeded state."""
+        """Replace an explicit snapshot; missing payload is not a reset signal.
+
+        Runner/model and connector updates may already have seeded this live
+        request's buffer. Preemption retains the cached request and its payload;
+        a streaming resume uses _update_streaming_input_additional_info instead.
+        _update_states clears both requests and model_intermediate_buffer for
+        finished/aborted IDs before admitting any new request, including reuse
+        of the same ID in the same scheduler step.
+        """
         model_buffer = getattr(request_data, "model_intermediate_buffer", None)
         payload = dict(model_buffer) if isinstance(model_buffer, dict) else {}
         info_payload = getattr(request_data, "additional_information", None)

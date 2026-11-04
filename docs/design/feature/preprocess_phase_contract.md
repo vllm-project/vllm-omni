@@ -194,6 +194,21 @@ platform remains separate from the shared Python routing tests.
 - [Adding an Omni model](../../contributing/model/adding_omni_model.md)
 - [Test writing guide](../../contributing/ci/test_writing_guide.md)
 
+## Request payload lifetime
+
+An explicit nonempty admission payload replaces the current request snapshot;
+missing payload does not erase state already seeded for that live request.
+Legacy metadata is decoded per request and overlays the current admission's
+payload. Invalid legacy metadata is logged and ignored, preserving the previous
+behavior; it does not fail unrelated admissions in the scheduler step.
+
+The runner owns cleanup: `_update_states` removes both cached request state and
+the intermediate buffer for finished or aborted IDs before processing new
+admissions. Reusing a finished ID in the same step therefore starts without the
+previous caller's payload. Preemption retains the same cached request and
+payload; streaming updates follow `_update_streaming_input_additional_info`.
+CPU scheduler tests exercise both preempted resume and finished-ID reuse.
+
 ## Final-prefill output consumers
 
 A model setting `requires_request_computed_tokens` receives
