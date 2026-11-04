@@ -379,6 +379,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return plane.attach_omni_connector_output(output)
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A weight-sharing load was already attempted; tear down the sharing group before retrying."
+            )
         import vllm.v1.worker.gpu.model_runner as _mr_module
 
         def _init_model_state(vllm_config: Any, model: Any, encoder_cache: Any, device: Any) -> Any:

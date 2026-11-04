@@ -3,7 +3,7 @@
 """CPU checks for mixed private/shared finalization and router precision."""
 
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -17,6 +17,47 @@ from tests.distributed.weight_sharing.helpers import load_class_methods
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 TRANSFORMER = "vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transformer.py"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_meta_attention_initializes_only_private_rope_on_execution_device(shared):
+    cached_rope = None
+
+    def get_rope(**kwargs):
+        nonlocal cached_rope
+        if cached_rope is None:
+            cached_rope = nn.Module()
+            cached_rope.register_buffer("cos_sin_cache", torch.arange(8).float().cos(), persistent=False)
+        return cached_rope
+
+    attention_cls = load_class_methods(
+        TRANSFORMER,
+        "HunYuanAttention",
+        ["__init__"],
+        {
+            "torch": torch,
+            "nullcontext": nullcontext,
+            "get_tensor_model_parallel_world_size": lambda: 1,
+            "get_rope": get_rope,
+            "QKVParallelLinear": lambda **_: nn.Linear(4, 4, bias=False),
+            "RowParallelLinear": lambda **_: nn.Linear(4, 4, bias=False),
+            **{
+                name: lambda **_: nn.Identity()
+                for name in ("Attention", "ImageKVCacheManager", "HunYuanRotary2DEmbedder")
+            },
+        },
+        base_class=nn.Module,
+    )
+    config = SimpleNamespace(num_key_value_heads=1, use_qk_norm=False)
+    with torch.device("meta"):
+        layers = [attention_cls(config, 4, 1, 1, rope_device=torch.device("cpu") if shared else None) for _ in range(2)]
+    for layer in layers:
+        assert layer.qkv_proj.weight.is_meta and layer.o_proj.weight.is_meta
+        cache = layer.rotary_emb.cos_sin_cache
+        assert cache.device.type == ("cpu" if shared else "meta")
+        if shared:
+            torch.testing.assert_close(cache, torch.arange(8).float().cos())
+    assert layers[0].rotary_emb is layers[1].rotary_emb
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -161,7 +202,7 @@ def test_backbone_propagates_router_dtype_through_all_layers(moe_block_cls, shar
         get_pp_group=lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
         VocabParallelEmbedding=lambda n, d, **_: nn.Embedding(n, d),
         RMSNorm=lambda *args, **kwargs: nn.Identity(),
-        HunYuanAttention=lambda **_: nn.Identity(),
+        HunYuanAttention=Mock(side_effect=lambda **_: nn.Identity()),
         HunyuanImagePreprocessor=nn.Identity,
         UnifiledCat=nn.Identity,
         HunyuanImagePostprocessor=nn.Identity,
@@ -189,12 +230,18 @@ def test_backbone_propagates_router_dtype_through_all_layers(moe_block_cls, shar
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("meta"):
-            model = model_cls(config, shared_router_dtype=torch.float32 if shared else None)
+            model = model_cls(
+                config,
+                shared_router_dtype=torch.float32 if shared else None,
+                rope_device=torch.device("cpu") if shared else None,
+            )
     finally:
         torch.set_default_dtype(previous_dtype)
     for layer in model.layers:
         assert layer.mlp.gate.weight.dtype == (torch.float32 if shared else torch.bfloat16)
         assert layer.mlp.gate.weight.device.type == "meta"
+    for call in namespace["HunYuanAttention"].call_args_list:
+        assert call.kwargs["rope_device"] == (torch.device("cpu") if shared else None)
 
 
 @pytest.mark.parametrize("shared", [False, True])
@@ -223,6 +270,7 @@ def test_pipeline_router_dtype_depends_on_sharing_not_meta(monkeypatch, shared, 
             "GenerationConfig": Mock(),
             "DiffusersPipelineLoader": Mock(),
             "HunyuanImage3Model": backbone,
+            "get_local_device": lambda: torch.device("cpu"),
         },
         base_class=PipelineBase,
     )
@@ -235,3 +283,4 @@ def test_pipeline_router_dtype_depends_on_sharing_not_meta(monkeypatch, shared, 
     with pytest.raises(RuntimeError, match="backbone constructor reached"):
         cls(od_config, backbone_meta=meta)
     assert backbone.call_args.kwargs["shared_router_dtype"] == (torch.float32 if shared else None)
+    assert backbone.call_args.kwargs.get("rope_device") == (torch.device("cpu") if meta else None)

@@ -3,7 +3,8 @@
 """Exercise the provider runner hook with the real backend and CPU codec."""
 
 import sys
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -15,12 +16,23 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture
 def provider_runner(weight_sharing, contracts, monkeypatch):
+    class UpstreamRunner:
+        load_model = Mock(side_effect=RuntimeError("upstream load reached"))
+
     runner_cls = load_class_methods(
         "vllm_omni/worker_v2/omni_model_runner.py",
         "OmniGPUModelRunner",
-        ["_publish_shared_backbone_if_configured"],
-        {"logger": Mock()},
+        ["load_model", "_publish_shared_backbone_if_configured"],
+        {"logger": Mock(), "_model_state_patch_lock": nullcontext()},
+        base_class=UpstreamRunner,
     )
+    for name in ("vllm", "vllm.v1", "vllm.v1.worker", "vllm.v1.worker.gpu", "vllm.v1.worker.gpu.model_runner"):
+        module = ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, module)
+        if "." in name:
+            parent, attr = name.rsplit(".", 1)
+            monkeypatch.setattr(sys.modules[parent], attr, module, raising=False)
+    monkeypatch.setattr(module, "init_model_state", Mock(), raising=False)
 
     codec = FakeCodec(contracts)
     backend = weight_sharing.TorchIpcBackend(codec=codec)
@@ -45,10 +57,34 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
         weight_sharing=SimpleNamespace(role="provider", session_id=context.identity.session_id, group_id="group")
     )
     runner.device = SimpleNamespace(index=0)
+    runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
     runner.adapter = SimpleNamespace(publish_backbone=Mock(side_effect=publish))
     runner.model = SimpleNamespace(get_weight_sharing_adapter=Mock(return_value=runner.adapter))
     runner.publish = runner._publish_shared_backbone_if_configured
     return runner, backend, codec, factory
+
+
+@pytest.mark.parametrize("previous_attempt", [None, "published", "failed"])
+def test_load_checks_sharing_before_upstream_load(provider_runner, previous_attempt):
+    runner, backend, codec, factory = provider_runner
+    if previous_attempt == "failed":
+        runner.adapter.publish_backbone.side_effect = RuntimeError("publish failed")
+        with pytest.raises(RuntimeError, match="publish failed"):
+            runner.publish()
+    elif previous_attempt == "published":
+        runner.publish()
+    original_model = runner.model
+    calls = list(codec.calls)
+    upstream_load = getattr(type(runner).__bases__[0], "load_model")
+
+    message = "upstream load reached" if previous_attempt is None else "already attempted"
+    with pytest.raises(RuntimeError, match=message):
+        runner.load_model()
+    assert runner.model is original_model
+    assert codec.calls == calls
+    assert upstream_load.call_count == (1 if previous_attempt is None else 0)
+    if previous_attempt == "published":
+        assert backend.release_export(runner._weight_share_session).status == "CLOSED"
 
 
 @pytest.mark.parametrize("failure", ["before_prepare", "second_storage"])

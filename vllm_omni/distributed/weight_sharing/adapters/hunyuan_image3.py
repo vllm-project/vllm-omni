@@ -189,7 +189,7 @@ def is_shared_checkpoint_name(name: str) -> bool:
             if (
                 tail[1] == "shared_mlp"
                 and len(tail) >= 3
-                and tail[2] in ("gate_proj", "gate_up_proj", "up_proj", "down_proj")
+                and tail[2] in ("gate_proj", "gate_up_proj", "up_proj", "down_proj", "gate_and_up_proj")
             ):
                 return True
     return False

@@ -10,6 +10,7 @@ package is never initialized.
 """
 
 import importlib
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,7 +18,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.distributed.weight_sharing.helpers import load_weight_sharing
+from tests.distributed.weight_sharing.helpers import load_class_methods, load_weight_sharing
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -245,6 +246,7 @@ def test_is_shared_checkpoint_name(adapter):
         "model.layers.0.mlp.down_proj.bias",
         "model.layers.0.mlp.shared_mlp.gate_proj.weight",
         "model.layers.0.mlp.shared_mlp.gate_up_proj.weight",
+        "model.layers.0.mlp.shared_mlp.gate_and_up_proj.weight",
         "model.layers.0.mlp.experts.0.gate_proj.weight",
         "model.layers.0.mlp.experts.3.down_proj.weight",
         "model.layers.0.mlp.gate_proj_bias",
@@ -263,6 +265,37 @@ def test_is_shared_checkpoint_name(adapter):
     )
     for name in private:
         assert not adapter.is_shared_checkpoint_name(name), name
+
+
+@pytest.mark.parametrize("suffix", ["weight", "bias"])
+def test_private_load_filters_fused_shared_mlp(adapter, suffix):
+    loader_cls = load_class_methods(
+        "vllm_omni/diffusion/model_loader/diffusers_loader.py",
+        "DiffusersPipelineLoader",
+        ["load_weights"],
+        {"time": time, "logger": Mock()},
+    )
+    shared = f"model.layers.0.mlp.shared_mlp.gate_up_proj.{suffix}"
+    checkpoint_key = f"model.layers.0.mlp.shared_mlp.gate_and_up_proj.{suffix}"
+    private = "model.final_layer.weight"
+    private_tensor = torch.tensor([7.0])
+    model = Mock()
+    model.named_parameters.return_value = []
+
+    def load_weights(weights):
+        received = dict(weights)
+        assert set(received) == {private}
+        assert received[private] is private_tensor
+        return {private}
+
+    model.load_weights.side_effect = load_weights
+    loader = loader_cls()
+    loader.counter_before_loading_weights = time.perf_counter()
+    loader._get_expected_parameter_names = Mock(return_value={shared, private})
+    loader.get_all_weights = Mock(return_value=iter([(checkpoint_key, torch.ones(1)), (private, private_tensor)]))
+    loader.load_weights(
+        model, planned_weights=[shared], disallow_weights=[shared], weight_name_filter=adapter.is_shared_checkpoint_name
+    )
 
 
 def test_attach_imported_weights_shares_storage(adapter, backbone):

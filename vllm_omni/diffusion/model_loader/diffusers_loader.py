@@ -1375,10 +1375,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """
         if getattr(shared_group, "role", None) != "consumer":
             raise ValueError("diffusion weight sharing requires role='consumer'")
+        if load_format != "default":
+            raise ValueError(f"shared-backbone loading requires load_format='default', got {load_format!r}")
         if self.quant_config is not None:
             raise ValueError("shared-backbone loading does not support quantization in v1")
         if self.parallel_config.use_hsdp:
             raise ValueError("shared-backbone loading does not support HSDP in v1")
+        resolved_offload = resolve_offload(self.od_config)
+        if resolved_offload.strategy is not OffloadStrategy.NONE and resolved_offload.offloads(DIT_COMPONENT):
+            raise ValueError("shared-backbone loading does not support DiT offload; imported weights must remain bound")
 
         with set_default_torch_dtype(self.od_config.dtype):
             model = self._init_from_load_format(

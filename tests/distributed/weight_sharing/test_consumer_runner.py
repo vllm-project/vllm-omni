@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Consumer load ownership: production runner/loader methods with CPU IPC tokens."""
 
+import runpy
 import sys
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -21,6 +23,9 @@ class LoadError(RuntimeError):
 
 @pytest.fixture
 def consumer_load(weight_sharing, contracts, monkeypatch):
+    offload_config = runpy.run_path(
+        str(Path(__file__).resolve().parents[3] / "vllm_omni/diffusion/offloader/config.py")
+    )
     codec = FakeCodec(contracts)
     provider = weight_sharing.TorchIpcBackend(codec=codec)
     backend = weight_sharing.TorchIpcBackend(codec=codec)
@@ -64,6 +69,7 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
         {
             "torch": SimpleNamespace(device=lambda _: SimpleNamespace(index=0)),
             "set_default_torch_dtype": lambda _: nullcontext(),
+            **{name: offload_config[name] for name in ("resolve_offload", "OffloadStrategy", "DIT_COMPONENT")},
         },
     )
     loader = loader_cls()
@@ -76,8 +82,8 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
     loader._attach_offload_startup_state = Mock()
     namespace = {
         "resolve_prompt_embed_cache_config": lambda **_: (False, 0),
-        "resolve_offload": lambda _: None,
-        "offload_enabled": lambda _: False,
+        "resolve_offload": offload_config["resolve_offload"],
+        "offload_enabled": offload_config["offload_enabled"],
         "current_omni_platform": platform,
         "LoadConfig": Mock(),
         "DiffusersPipelineLoader": Mock(return_value=loader),
@@ -137,12 +143,14 @@ def test_load_failure_retains_backend_and_blocks_retry(consumer_load, contracts,
     r.adapter.open_backbone_import.assert_called_once()
 
 
-def test_pipeline_return_keeps_same_backend_on_runner(consumer_load):
+@pytest.mark.parametrize("load_format", ["default", None])
+def test_pipeline_return_keeps_same_backend_on_runner(consumer_load, load_format):
     r = consumer_load
     r.model.requires_early_lora_init = True
     # Stop after pipeline assignment, before unrelated compilation/cache setup.
     with pytest.raises(LoadError, match="after load"):
-        r.runner.load_model(initialize_lora=Mock(side_effect=LoadError("after load")))
+        r.runner.load_model(load_format=load_format, initialize_lora=Mock(side_effect=LoadError("after load")))
+    assert r.loader._init_from_load_format.call_args.args[0] == "default"
     assert r.runner.pipeline is r.model
     assert r.model._weight_share_backend is r.runner._weight_share_backend is r.backend
     assert r.model._weight_share_import.session_id == r.runner._weight_share_session_id
@@ -150,6 +158,18 @@ def test_pipeline_return_keeps_same_backend_on_runner(consumer_load):
     r.adapter.shared_param_full_names.assert_called_once_with(r.model)
     assert r.loader.load_weights.call_args.kwargs["weight_name_filter"] is r.adapter.is_shared_checkpoint_name
     r.factory.assert_called_once_with()
+
+
+@pytest.mark.parametrize("load_format", ["diffusers", "custom_pipeline", "unknown"])
+def test_shared_backbone_rejects_load_format_before_construction(consumer_load, load_format):
+    r = consumer_load
+    r.loader._init_from_load_format.side_effect = AssertionError("must reject before model construction")
+    with pytest.raises(ValueError, match="shared-backbone loading requires load_format='default'"):
+        r.runner.load_model(load_format=load_format)
+    r.loader._init_from_load_format.assert_not_called()
+    r.adapter.open_backbone_import.assert_not_called()
+    r.loader.load_weights.assert_not_called()
+    assert not r.codec.imports
 
 
 def test_loader_requires_caller_owned_backend(consumer_load):
@@ -160,9 +180,11 @@ def test_loader_requires_caller_owned_backend(consumer_load):
     r.factory.assert_not_called()
 
 
-def test_disabled_sharing_does_not_create_backend(consumer_load):
+@pytest.mark.parametrize("offload", [False, True])
+def test_disabled_sharing_does_not_create_backend(consumer_load, offload):
     r = consumer_load
     r.runner.od_config.weight_sharing = None
+    r.runner.od_config.enable_layerwise_offload = offload
     r.loader.load_model = Mock(side_effect=LoadError("ordinary load"))
     with pytest.raises(LoadError, match="ordinary load"):
         r.runner.load_model()
@@ -195,3 +217,42 @@ def test_missing_adapter_is_rejected_before_import(consumer_load):
     r.adapter.open_backbone_import.assert_not_called()
     r.loader.load_weights.assert_not_called()
     assert not r.codec.imports
+
+
+@pytest.mark.parametrize(
+    "offload_settings",
+    [
+        {"enable_cpu_offload": True},
+        {"enable_layerwise_offload": True},
+        {"enable_distributed_layerwise_offload": True},
+        {"diffusion_offload_config": {"mode": "module", "components": ["dit"]}},
+        {"diffusion_offload_config": {"mode": "layer", "components": ["dit", "text_encoder"]}},
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            }
+        },
+    ],
+)
+def test_shared_backbone_rejects_offload_before_construction(consumer_load, offload_settings):
+    r = consumer_load
+    vars(r.loader.od_config).update(offload_settings)
+    r.loader._init_from_load_format.side_effect = AssertionError("must reject before model construction")
+    with pytest.raises(ValueError, match="shared-backbone loading does not support DiT offload"):
+        r.runner.load_model()
+    r.loader._init_from_load_format.assert_not_called()
+    r.adapter.open_backbone_import.assert_not_called()
+    assert not r.codec.imports
+
+
+@pytest.mark.parametrize("mode", ["module", "layer"])
+def test_shared_backbone_allows_private_encoder_offload(consumer_load, mode):
+    r = consumer_load
+    r.loader.od_config.diffusion_offload_config = {"mode": mode, "components": ["text_encoder"]}
+    r.model.requires_early_lora_init = True
+    with pytest.raises(LoadError, match="after load"):
+        r.runner.load_model(initialize_lora=Mock(side_effect=LoadError("after load")))
+    assert r.runner.pipeline is r.model
+    r.adapter.open_backbone_import.assert_called_once()

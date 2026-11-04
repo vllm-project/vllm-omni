@@ -4,6 +4,7 @@
 import inspect
 import logging
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -1765,6 +1766,7 @@ class HunYuanAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         layer_id: int = -1,
+        rope_device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1821,12 +1823,14 @@ class HunYuanAttention(nn.Module):
         if rope_scaling is not None:
             # for t2t, fallback rotary_emb type from 'custom' to default.
             rope_scaling["rope_type"] = "default"
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=rope_scaling,
-            is_neox_style=True,
-        )
+        # Shared weights stay on meta until attach; private RoPE caches need real data.
+        with rope_device if rope_device is not None else nullcontext():
+            self.rotary_emb = get_rope(
+                head_size=self.head_dim,
+                max_position=max_position_embeddings,
+                rope_parameters=rope_scaling,
+                is_neox_style=True,
+            )
         # which attention, from vllm or omni?
         # try use Atten from diffusion
         self.attn = Attention(
@@ -1913,6 +1917,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         layer_idx: int,
         prefix: str = "",
         shared_router_dtype: torch.dtype | None = None,
+        rope_device: torch.device | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1947,6 +1952,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 cache_config=None,
                 prefix=f"{prefix}.self_attn",
                 layer_id=layer_idx,
+                rope_device=rope_device,
             )
         else:
             raise RuntimeError(f"Unsupported attention type: {attention_type}")
@@ -2154,6 +2160,7 @@ class HunyuanImage3Model(nn.Module):
         quant_config=None,
         prefix: str = "",
         shared_router_dtype: torch.dtype | None = None,
+        rope_device: torch.device | None = None,
     ):
         super().__init__()
         lora_config = None
@@ -2185,6 +2192,7 @@ class HunyuanImage3Model(nn.Module):
                 layer_idx=int(prefix.split(".")[-1]),
                 prefix=prefix,
                 shared_router_dtype=shared_router_dtype,
+                rope_device=rope_device,
             ),
             prefix=f"{prefix}.layers" if prefix else "layers",
         )

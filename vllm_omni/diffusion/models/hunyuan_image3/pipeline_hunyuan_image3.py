@@ -399,11 +399,17 @@ class HunyuanImage3Pipeline(
             from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
 
             validate_supported_layout(self.hf_config)
+            # Shared loading currently assumes TP only, with EP disabled.
+            # RoPE caches are private and must be created on the execution device.
+            rope_device = get_local_device()
             # Only the shared backbone is constructed on meta; private
             # components below are built on the worker's target device.
             with torch.device("meta"):
                 self.model = HunyuanImage3Model(
-                    self.hf_config, quant_config=quant_config, shared_router_dtype=shared_router_dtype
+                    self.hf_config,
+                    quant_config=quant_config,
+                    shared_router_dtype=shared_router_dtype,
+                    rope_device=rope_device,
                 )
         else:
             self.model = HunyuanImage3Model(
