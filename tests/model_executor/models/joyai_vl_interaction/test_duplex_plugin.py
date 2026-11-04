@@ -1863,7 +1863,7 @@ async def test_new_camera_commit_supersedes_queued_promotion():
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 128, 0)
         assert not any(abort for _, abort in h.port.cleanups)
         # A's silent terminal frees its own async-chunk prewarm; nothing else may be aborted.
-        assert all(ids == [request_id] for ids in h.port.aborts)
+        assert h.port.aborts == [[request_id]]
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(latest.context.request_id, text="</silence>", finished=True),

@@ -959,8 +959,9 @@ class ModelChannel:
         draining TTS request) does. ``whole_turn`` also drops the other stage
         ids of this turn. A request still marked draining is left registered.
         ``abort_prewarmed`` is for a turn that skipped its downstream stages:
-        their async-chunk prewarmed requests never get a chunk, so they are
-        aborted instead of waiting for the input-wait deadline.
+        their async-chunk prewarmed requests never get a chunk. Every released
+        id of the turn is aborted; for the already finished ones that is a
+        no-op, and the prewarmed ones stop waiting for the input-wait deadline.
         """
         if not isinstance(request_id, str) or not request_id:
             return
@@ -968,6 +969,8 @@ class ModelChannel:
         if session.capabilities.supports_core_resumable_request:
             return
         if session.is_draining_request(request_id):
+            # A draining request is still feeding its TTS stages, so nothing it
+            # prewarmed is idle. Only sessions with concurrent turn requests drain.
             await self._ctx.stage_port.cleanup([request_id])
             return
         release_ids = [request_id]
@@ -979,9 +982,11 @@ class ModelChannel:
         session.release_resources_for_request_ids(release_ids)
         if self._ctx.run.stream_request_id in release_ids:
             self._ctx.run.stream_request_id = None
-        if abort_prewarmed:
-            await self._abort_request(release_ids, notify=False)
-        await self._ctx.stage_port.cleanup(release_ids)
+        try:
+            if abort_prewarmed:
+                await self._abort_request(release_ids, notify=False)
+        finally:
+            await self._ctx.stage_port.cleanup(release_ids)
 
     def _terminal_listen_turn_id(
         self,
