@@ -228,6 +228,10 @@ def test_terminal_requests_clear_soprano_failures_before_idle_return(monkeypatch
     }
     for request in requests.values():
         request.status = RequestStatus.WAITING_FOR_STREAMING_REQ if parked else RequestStatus.RUNNING
+    # __new__ skips constructor setup. These fields mirror the state read by
+    # OmniSchedulerMixin.finish_requests (queue cleanup) and vLLM Scheduler's
+    # _free_request/_free_request_blocks. If those paths gain a field dependency,
+    # update this CPU fixture; an AttributeError here can mean missing setup.
     scheduler = object.__new__(OmniGenerationScheduler)
     scheduler.requests = requests.copy()
     scheduler.running = [] if parked else list(requests.values())
