@@ -255,13 +255,13 @@ def test_a_forced_response_must_drain_before_the_session_closes():
     ]
 
     assert demo._post_commit_response_created(events, 0)
-    assert demo._post_commit_response_done(events, 0)
+    assert demo._post_commit_forced_response_settled(events, 0)
     # A listener decision or a cancelled generation is not a drained answer.
-    assert not demo._post_commit_response_done(
+    assert not demo._post_commit_forced_response_settled(
         [{"type": "input_audio_buffer.committed"}, {"type": "response.listen"}],
         0,
     )
-    assert not demo._post_commit_response_done(
+    assert not demo._post_commit_forced_response_settled(
         [
             {"type": "input_audio_buffer.committed"},
             {"type": "response.done", "response": {"status": "cancelled"}},
@@ -284,7 +284,7 @@ def test_forced_response_drains_an_opened_response_without_reasking():
 
     fallback = asyncio.run(
         demo._drain_forced_post_commit_response(
-            _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05
+            _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05, settle_quiet_s=0.0
         )
     )
 
@@ -305,7 +305,7 @@ def test_forced_response_falls_back_to_an_explicit_create_when_idle():
     with pytest.raises(TimeoutError):
         asyncio.run(
             demo._drain_forced_post_commit_response(
-                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05
+                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05, settle_quiet_s=0.0
             )
         )
 
@@ -328,7 +328,7 @@ def test_forced_response_does_not_reask_while_a_response_is_active():
     with pytest.raises(TimeoutError):
         asyncio.run(
             demo._drain_forced_post_commit_response(
-                _Client(), collector, committed_index=1, timeout_s=0.05, create_timeout_s=0.05
+                _Client(), collector, committed_index=1, timeout_s=0.05, create_timeout_s=0.05, settle_quiet_s=0.0
             )
         )
 
@@ -349,11 +349,191 @@ def test_forced_response_does_not_reask_after_a_commit_error():
     with pytest.raises(TimeoutError):
         asyncio.run(
             demo._drain_forced_post_commit_response(
-                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05
+                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05, settle_quiet_s=0.0
             )
         )
 
     assert sent == []
+
+
+def test_post_commit_settle_waits_for_the_promoted_response_after_a_pre_commit_one_settles():
+    demo = _load_demo_module()
+    # Deferred-create path: the commit is held behind an active response.
+    events = [
+        {"type": "response.created", "response": {"id": "resp-inflight"}},
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.done", "response": {"id": "resp-inflight"}},
+    ]
+
+    # The pre-commit response settling after the commit must not pose as the
+    # forced answer: no response has been created after the commit yet.
+    assert not demo._post_commit_forced_response_settled(events, 1)
+
+    events.append({"type": "response.created", "response": {"id": "resp-promoted"}})
+    assert not demo._post_commit_forced_response_settled(events, 1)
+
+    events.append({"type": "response.done", "response": {"id": "resp-promoted"}})
+    assert demo._post_commit_forced_response_settled(events, 1)
+
+
+def test_post_commit_settle_ignores_terminals_of_responses_created_before_the_commit():
+    demo = _load_demo_module()
+    events = [
+        {"type": "response.created", "response": {"id": "resp-pre"}},
+        {"type": "input_audio_buffer.committed"},
+        # A spontaneous response pairs its own creation, but cannot speak for
+        # the forced one: settled only once a post-commit creation exists and
+        # every post-commit creation is done.
+        {"type": "response.created", "response": {"id": "resp-spont"}},
+        {"type": "response.done", "response": {"id": "resp-pre"}},
+        {"type": "response.done", "response": {"id": "resp-spont"}},
+    ]
+
+    assert demo._post_commit_forced_response_settled(events, 1)
+
+
+def test_drain_holds_through_the_window_between_a_spontaneous_settle_and_the_promoted_create():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    collector.add({"type": "response.created", "response": {"id": "resp-spont"}})
+    collector.add({"type": "response.done", "response": {"id": "resp-spont"}})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    # Id-pairing alone settles here (the spontaneous response pairs with its
+    # own done); only the quiescence guard keeps the session open while the
+    # promoted forced create is still queued behind the settle.
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(
+                _Client(),
+                collector,
+                committed_index=0,
+                timeout_s=0.05,
+                create_timeout_s=0.05,
+                settle_quiet_s=1.0,
+            )
+        )
+
+    assert sent == []
+
+
+def test_drain_returns_once_the_promoted_response_settles_and_quiesces():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    collector.add({"type": "response.created", "response": {"id": "resp-spont"}})
+    collector.add({"type": "response.done", "response": {"id": "resp-spont"}})
+    quiet_ago_s = demo.time.monotonic() - 1.0
+    collector.add({"type": "response.created", "response": {"id": "resp-promoted"}}, received_at_s=quiet_ago_s)
+    collector.add({"type": "response.done", "response": {"id": "resp-promoted"}}, received_at_s=quiet_ago_s)
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    fallback = asyncio.run(
+        demo._drain_forced_post_commit_response(
+            _Client(),
+            collector,
+            committed_index=0,
+            timeout_s=0.05,
+            create_timeout_s=0.05,
+            settle_quiet_s=1.0,
+        )
+    )
+
+    assert fallback is False
+    assert sent == []
+
+
+def test_drain_does_not_reask_when_a_post_commit_response_already_settled():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    collector.add({"type": "response.done", "response": {"id": "resp-unknown"}})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    # The server already worked through a response after the commit, so the
+    # deferred promotion may still be in flight; re-asking could collide with
+    # it. The drain keeps waiting instead of sending response.create.
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(
+                _Client(), collector, committed_index=0, timeout_s=0.05, create_timeout_s=0.05, settle_quiet_s=0.0
+            )
+        )
+
+    assert sent == []
+
+
+def test_post_commit_done_statuses_record_terminal_states_for_triage():
+    demo = _load_demo_module()
+    events = [
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.done", "response": {"id": "resp-failed", "status": "failed"}},
+        {"type": "response.done", "response": {"id": "resp-cancelled", "status": "cancelled"}},
+        {"type": "response.done", "response": {"id": "resp-legacy"}},
+    ]
+
+    assert demo._post_commit_response_done_statuses(events, 0) == [
+        "failed",
+        "cancelled",
+        # The server defaults a missing status to "completed" on the wire.
+        "completed",
+    ]
+
+
+def test_post_commit_settle_lets_a_cancelled_response_close_without_blocking_the_drain():
+    demo = _load_demo_module()
+    # A cancelled spontaneous response must close its own creation (so its id
+    # cannot hang the drain) without counting as the drained answer.
+    events = [
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.created", "response": {"id": "resp-spont"}},
+        {"type": "response.done", "response": {"id": "resp-spont", "status": "cancelled"}},
+        {"type": "response.created", "response": {"id": "resp-forced"}},
+        {"type": "response.done", "response": {"id": "resp-forced"}},
+    ]
+
+    assert demo._post_commit_forced_response_settled(events, 0)
+
+
+def test_post_commit_settle_does_not_count_a_cancelled_response_as_the_answer():
+    demo = _load_demo_module()
+    events = [
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.created", "response": {"id": "resp-spont"}},
+        {"type": "response.done", "response": {"id": "resp-spont", "status": "cancelled"}},
+    ]
+
+    # Everything pairs, but the only terminal is cancelled: not drained.
+    assert not demo._post_commit_forced_response_settled(events, 0)
+
+
+def test_post_commit_anonymous_events_settle_best_effort():
+    demo = _load_demo_module()
+    # Accepted limitation (pinned here so nobody relies on it): without ids
+    # nothing pairs, so an id-less pre-commit settle can pass for the answer
+    # and only the quiescence guard holds the window open. The server always
+    # sends ids on the wire; this only matters for anonymous event shapes.
+    events = [
+        {"type": "response.created"},
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.done"},
+        {"type": "response.created"},
+    ]
+
+    assert demo._post_commit_forced_response_settled(events, 1)
 
 
 def test_streaming_collector_acks_each_finished_reply_like_the_web_client():

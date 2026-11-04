@@ -190,25 +190,111 @@ def _post_commit_response_created(
     return any(event.get("type") == "response.created" for event in events[committed_index + 1 :])
 
 
-def _post_commit_response_done(
+def _response_event_id(event: dict[str, object]) -> str | None:
+    """Response id of a response.* event, tolerating both wire shapes.
+
+    The server projects ``response.created``/``response.done`` with a nested
+    ``response.id``; a few legacy events only carry a top-level ``response_id``.
+    """
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("id"), str):
+        return response["id"]
+    response_id = event.get("response_id")
+    return response_id if isinstance(response_id, str) else None
+
+
+def _response_done_is_terminal(event: dict[str, object]) -> bool:
+    """Whether a ``response.done`` counts as a drained answer.
+
+    A cancelled generation is a terminal state, but it produced no answer, so
+    it must not satisfy the drain on its own.
+    """
+    response = event.get("response")
+    return not isinstance(response, dict) or response.get("status") != "cancelled"
+
+
+def _post_commit_forced_response_settled(
     events: list[dict[str, object]],
     committed_index: int | None,
 ) -> bool:
-    """Whether a post-commit response reached a non-cancelled terminal state.
+    """Whether every response created after the commit reached a terminal state.
 
     A forced commit must be drained before the session closes: closing while
     the requested response is still generating drops its transcript and audio,
     which is exactly the silent failure a mandatory final answer must not have.
+
+    The forced answer is always a response created after the commit -- the
+    server precreates it on an idle commit, or promotes the deferred create
+    once an in-flight response settles. So the drain matches ``response.created``
+    against ``response.done`` by response id: it settles when every post-commit
+    creation is closed by a done of the same id and at least one of those
+    terminals is a non-cancelled one. This is what keeps a pre-commit response
+    that settles after the commit, or a spontaneous one, from posing as the
+    answer while the promoted create is still queued; and it lets a cancelled
+    spontaneous response close its own creation without either counting as the
+    answer or hanging the drain behind the completed forced one.
     """
     if committed_index is None:
         return False
+    created: set[str] = set()
+    # Any done closes its creation, cancelled or not, so an interrupted
+    # response cannot block the drain forever.
+    done: set[str] = set()
+    # Only a non-cancelled terminal counts as a drained answer.
+    answered: set[str] = set()
+    anonymous_created = 0
+    anonymous_done = 0
+    anonymous_answered = 0
+    for event in events[committed_index + 1 :]:
+        event_type = event.get("type")
+        if event_type == "response.created":
+            response_id = _response_event_id(event)
+            if response_id is None:
+                anonymous_created += 1
+            else:
+                created.add(response_id)
+        elif event_type == "response.done":
+            response_id = _response_event_id(event)
+            answered_done = _response_done_is_terminal(event)
+            if response_id is None:
+                # Events without an id cannot pair; count them so an
+                # anonymous terminal still closes the matching anonymous
+                # creation instead of hanging the drain.
+                anonymous_done += 1
+                if answered_done:
+                    anonymous_answered += 1
+            else:
+                done.add(response_id)
+                if answered_done:
+                    answered.add(response_id)
+    # The drained answer must be one of the post-commit creations, so a
+    # pre-commit response settling after the commit still cannot pose as it;
+    # every post-commit creation is closed; at least one closed with a
+    # non-cancelled terminal. The anonymous branch is best-effort: without
+    # ids nothing pairs, so an id-less pre-commit settle can still pass for
+    # the answer and only the quiescence guard holds the window open. The
+    # server always sends ids on the wire, so this only matters for the
+    # synthetic/anonymous event shapes.
+    post_commit_answered = bool(answered & created) or (anonymous_created > 0 and anonymous_answered > 0)
+    return post_commit_answered and created <= done and anonymous_done >= anonymous_created
+
+
+def _post_commit_response_done_statuses(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> list[str]:
+    """Terminal statuses of every post-commit ``response.done``, for triage."""
+    if committed_index is None:
+        return []
+    statuses: list[str] = []
     for event in events[committed_index + 1 :]:
         if event.get("type") != "response.done":
             continue
         response = event.get("response")
-        if not isinstance(response, dict) or response.get("status") != "cancelled":
-            return True
-    return False
+        status = response.get("status") if isinstance(response, dict) else None
+        # The server defaults a missing status to "completed" on the wire.
+        statuses.append(status if isinstance(status, str) and status else "completed")
+    return statuses
 
 
 def _latest_model_decision(
@@ -278,6 +364,44 @@ def _event_count_after(
 #: acknowledgement, so this only absorbs a slow stage-0 schedule.
 _FORCED_RESPONSE_CREATE_TIMEOUT_S = 15.0
 
+#: Once every post-commit response looks settled, keep waiting this long for
+#: one more ``response.created`` before the drain returns. After a spontaneous
+#: (or pre-commit) response settles, there is a short window before the
+#: promoted forced create opens -- an id-paired predicate alone cannot see a
+#: promotion that is still queued, so the drain also requires a brief
+#: quiescence over ``response.created``/``response.done``/``response.listen``.
+_FORCED_RESPONSE_SETTLE_QUIET_S = 1.5
+
+#: Response lifecycle signals that can precede a promoted forced create.
+_RESPONSE_SIGNAL_TYPES = frozenset(
+    {
+        "response.created",
+        "response.done",
+        "response.listen",
+    }
+)
+
+
+def _last_post_commit_response_signal_at_s(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> float | None:
+    """Monotonic receive time of the last response signal after the commit.
+
+    ``EventCollector.add`` stamps every stored event with
+    ``_client_received_at_s`` on the monotonic clock, so the quiescence guard
+    measures real event times instead of the polling phase.
+    """
+    if committed_index is None:
+        return None
+    last: float | None = None
+    for event in events[committed_index + 1 :]:
+        if event.get("type") in _RESPONSE_SIGNAL_TYPES:
+            received_at_s = event.get("_client_received_at_s")
+            if isinstance(received_at_s, int | float):
+                last = float(received_at_s)
+    return last
+
 
 async def _drain_forced_post_commit_response(
     client: DuplexClient,
@@ -286,16 +410,32 @@ async def _drain_forced_post_commit_response(
     committed_index: int | None,
     timeout_s: float,
     create_timeout_s: float = _FORCED_RESPONSE_CREATE_TIMEOUT_S,
+    settle_quiet_s: float = _FORCED_RESPONSE_SETTLE_QUIET_S,
 ) -> bool:
     """Drain the commit-requested response, re-asking once if it never opens.
 
     The commit carries ``response_create``, so the server answers its retained
-    audio directly. If no response opened, ``response.create`` is the
-    protocol's second, explicit way to ask for the same answer -- but only on
-    an idle server: a commit held behind an active response is promoted with
-    its forced create once that response settles, and re-asking then just
-    yields ``response_already_active``. Errors reported after the commit
-    suppress the re-ask too, since the server is refusing rather than slow.
+    audio directly. The drain settles only when at least one response created
+    after the commit has reached a terminal state, every post-commit creation
+    is done -- matched by response id, so a pre-commit response settling after
+    the commit cannot pose as the answer -- and no further response signal has
+    arrived for ``settle_quiet_s`` seconds, which spans the window between a
+    spontaneous settle and the promoted forced create.
+
+    If no response opened, ``response.create`` is the protocol's second,
+    explicit way to ask for the same answer -- but only on a server that has
+    not seen any response activity since the commit: a commit held behind an
+    active response is promoted with its forced create once that response
+    settles, and re-asking then just yields ``response_already_active``. A
+    post-commit ``response.done`` -- even a cancelled one, or the settle of a
+    pre-commit response -- means the server is already working through its
+    queue and the promotion may still be in flight, so it suppresses the
+    re-ask as well. Errors reported after the commit suppress it too, since
+    the server is refusing rather than slow. The flip side for CI triage: if
+    the server drops the deferred create after such activity, the drain can
+    only end in ``TimeoutError`` -- no re-ask will have fired -- so a client
+    timeout in that situation points at a lost promotion on the server side,
+    not at a missing fallback.
 
     Returns whether the explicit fallback was sent. Raises ``TimeoutError``
     when the drain does not finish, so the caller records a client timeout
@@ -309,15 +449,30 @@ async def _drain_forced_post_commit_response(
             label="post-commit forced response.created",
         )
     except TimeoutError:
-        if _event_count_after(collector.events, "error", committed_index) == 0 and not _response_in_progress(
-            collector.events
+        if (
+            _event_count_after(collector.events, "error", committed_index) == 0
+            and _event_count_after(collector.events, "response.done", committed_index) == 0
+            and not _response_in_progress(collector.events)
         ):
             with suppress(DuplexClientError, DuplexSessionClosedError):
                 await client.send({"type": "response.create"})
                 fallback_sent = True
+
+    def _drained() -> bool:
+        if not (
+            _post_commit_forced_response_settled(collector.events, committed_index)
+            and not _response_in_progress(collector.events)
+        ):
+            return False
+        if settle_quiet_s <= 0:
+            return True
+        last_signal_at_s = _last_post_commit_response_signal_at_s(collector.events, committed_index)
+        if last_signal_at_s is None:
+            return True
+        return time.monotonic() - last_signal_at_s >= settle_quiet_s
+
     await wait_for_condition(
-        lambda: _post_commit_response_done(collector.events, committed_index)
-        and not _response_in_progress(collector.events),
+        _drained,
         timeout_s=timeout_s,
         label="post-commit forced response drain",
     )
@@ -847,6 +1002,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "response_done_count": _event_count_after(
                     collector.events,
                     "response.done",
+                    committed_index,
+                ),
+                "response_done_statuses": _post_commit_response_done_statuses(
+                    collector.events,
                     committed_index,
                 ),
             },
