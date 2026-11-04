@@ -29,7 +29,7 @@ class Qwen3OmniMergeProbe:
 
     def merged_q_projection(self) -> dict:
         for name, module in self.model_runner.model.named_modules():
-            if name.endswith("layers.0.self_attn.qkv_proj"):
+            if name == "thinker.language_model.model.layers.0.self_attn.qkv_proj":
                 weight = module.weight
                 return {
                     "name": name,
