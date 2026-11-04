@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.teacache.benchmark_glm_image import OmniSession, warm_and_time
+from tools.teacache.benchmark_glm_image import OmniSession, sampling_params_for_engine, warm_and_time
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -59,6 +59,25 @@ def test_omni_session_warms_before_timed_repeats_on_one_engine():
     assert _FakeOmni.constructions == 1
     assert _FakeOmni.closes == 1
     assert session.omni.closed is True
+
+
+def test_two_stage_generate_keeps_ar_params_and_replaces_dit():
+    class _TwoStage:
+        num_stages = 2
+        default_sampling_params_list = ["ar-default", "dit-default"]
+
+        def __init__(self):
+            self.seen = None
+
+        def generate(self, prompt, sampling_params):
+            self.seen = sampling_params
+            return []
+
+    omni = _TwoStage()
+    session = OmniSession(lambda **kwargs: omni)
+    session.generate("p", "dit-override")
+    assert omni.seen == ["ar-default", "dit-override"]
+    assert sampling_params_for_engine(SimpleNamespace(num_stages=1), "only") == "only"
 
 
 def test_omni_session_constructs_once_per_config():

@@ -109,7 +109,7 @@ class OmniSession:
 
     def generate(self, prompt: str, sampling_params: Any) -> Any:
         self.generate_calls += 1
-        return self.omni.generate(prompt, sampling_params)
+        return self.omni.generate(prompt, sampling_params_for_engine(self.omni, sampling_params))
 
     def close(self) -> None:
         if not self._closed:
@@ -121,6 +121,23 @@ class OmniSession:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+
+def sampling_params_for_engine(omni: Any, diffusion_params: Any) -> Any:
+    """GLM-Image is two stages; ``generate`` rejects a single params object.
+
+    A one-stage engine keeps the diffusion params as-is. A multi-stage engine
+    keeps the default AR (and any middle) params and replaces only the last
+    stage, which is the DiT.
+    """
+    num_stages = int(getattr(omni, "num_stages", 1) or 1)
+    if num_stages <= 1:
+        return diffusion_params
+    defaults = list(omni.default_sampling_params_list)
+    if len(defaults) != num_stages:
+        raise ValueError(f"Expected {num_stages} default sampling params, got {len(defaults)}")
+    defaults[-1] = diffusion_params
+    return defaults
 
 
 def warm_and_time(
@@ -149,7 +166,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--prompts", type=Path, required=True)
-    parser.add_argument("--prior-tokens", type=Path, required=True)
+    parser.add_argument(
+        "--prior-tokens",
+        type=Path,
+        default=None,
+        help="Optional torch dump of prior_token_ids. Omit to let the AR stage generate them.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Deploy YAML. Use a 2-GPU glm_image.yaml, or a single-GPU copy.",
+    )
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--steps", type=int, default=50)
@@ -169,9 +196,13 @@ def main() -> None:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     prompts = _load_prompts(args.prompts)[: args.max_prompts]
-    priors = torch.load(args.prior_tokens, map_location="cpu", weights_only=False)
+    priors = None
+    if args.prior_tokens is not None:
+        priors = torch.load(args.prior_tokens, map_location="cpu", weights_only=False)
 
     def prior_for(prompt: str, idx: int) -> Any:
+        if priors is None:
+            return None
         if isinstance(priors, dict) and prompt in priors:
             return priors[prompt]
         if isinstance(priors, dict) and "__list__" in priors:
@@ -181,12 +212,13 @@ def main() -> None:
         raise KeyError(f"No prior tokens for prompt index {idx}")
 
     def make_params(prior: Any) -> OmniDiffusionSamplingParams:
+        extra_args = {} if prior is None else {"prior_token_ids": prior}
         return OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
             num_inference_steps=args.steps,
             seed=args.seed,
-            extra_args={"prior_token_ids": prior},
+            extra_args=extra_args,
         )
 
     def engine_kwargs(cache_backend: str | None, thresh: float | None) -> dict[str, Any]:
@@ -194,6 +226,8 @@ def main() -> None:
             "model": args.model,
             "enable_diffusion_pipeline_profiler": True,
         }
+        if args.deploy_config:
+            kwargs["deploy_config"] = args.deploy_config
         if cache_backend is not None:
             kwargs["cache_backend"] = cache_backend
             kwargs["cache_config"] = {"rel_l1_thresh": thresh}
