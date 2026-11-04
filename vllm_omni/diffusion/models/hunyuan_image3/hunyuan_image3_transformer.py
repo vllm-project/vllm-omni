@@ -1691,6 +1691,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             config.num_experts,
             bias=False,
             quant_config=quant_config,
+            params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1735,8 +1736,15 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        # router_logits: (num_tokens, n_experts). The router is FP32 to match
+        # the HF reference and the AR stage; run the gate outside bf16 autocast
+        # so the FP32 weight is not downcast, and cast the input to float. A
+        # BF16 checkpoint router is cast to FP32 on load by the ReplicatedLinear.
+        if hidden_states.device.type == "cuda":
+            with torch.autocast(device_type="cuda", enabled=False):
+                router_logits, _ = self.gate(hidden_states.float())
+        else:
+            router_logits, _ = self.gate(hidden_states.float())
         final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         return final_hidden_states.view(orig_shape)

@@ -143,6 +143,23 @@ def test_collect_shared_bindings(adapter, backbone):
     assert bindings["layers.0.mlp.gate.weight"].dtype == torch.float32
 
 
+def test_collect_shared_bindings_detaches_parameter_subclasses(adapter):
+    from vllm.model_executor.parameter import ModelWeightParameter
+
+    backbone = nn.Module()
+    backbone.embed_tokens = nn.Module()
+    backbone.embed_tokens.register_parameter(
+        "weight", ModelWeightParameter.__new__(ModelWeightParameter, torch.randn(16, DIM))
+    )
+    backbone.norm = nn.Module()
+    backbone.norm.register_parameter("weight", ModelWeightParameter.__new__(ModelWeightParameter, torch.randn(DIM)))
+    assert any(type(param) is ModelWeightParameter for _, param in backbone.named_parameters())
+
+    bindings = adapter.collect_shared_bindings(backbone)
+    assert set(bindings) == {"embed_tokens.weight", "norm.weight"}
+    assert all(type(value) is torch.Tensor for value in bindings.values()), [type(value) for value in bindings.values()]
+
+
 def test_build_weight_spec(adapter, backbone):
     spec = adapter.build_weight_spec("model-id", "revision", backbone)
     assert spec.model_id == "model-id"

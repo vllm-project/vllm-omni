@@ -1396,56 +1396,81 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if payload is None:
             raise ValueError("consumer weight sharing requires the provider's claimed payload")
         backend = TorchCudaIpcBackend()
-        imported = attach(backend, payload, shared_group, device_index)
+        # Retain session ownership before import so any later failure can still
+        # close or mark the session on this (owner) thread for step-3 teardown.
+        model._weight_share_backend = backend
+        model._weight_share_import = None
+        try:
+            imported = attach(backend, payload, shared_group, device_index)
+            model._weight_share_import = imported
 
-        shared = shared_param_full_names(model)
-        params_by_name = dict(model.named_parameters())
-        # The imported views are finalized; post-load processing must not touch
-        # them at all: an in-place repack corrupts the provider's live weights
-        # and a swap silently drops the sharing. Skip the modules that own them.
-        shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
-        shared_module_names = frozenset(name.rsplit(".", 1)[0] for name in shared)
-        shared_set = set(shared)
-        for full_name in params_by_name:
-            if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
-                raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
-        for full_name, _buffer in model.named_buffers():
-            owner_name = full_name.rsplit(".", 1)[0]
-            if owner_name not in shared_module_names:
-                continue
-            owner = model.get_submodule(owner_name) if owner_name else model
-            # Non-persistent buffers are runtime state (e.g. inv_freq), not
-            # quant scales/zero_point; they are fine to leave untouched.
-            if full_name.rsplit(".", 1)[1] in getattr(owner, "_non_persistent_buffers_set", ()):
-                continue
-            raise ValueError(f"shared-backbone module owns a persistent buffer: {full_name}")
+            shared = shared_param_full_names(model)
+            params_by_name = dict(model.named_parameters())
+            # The imported views are finalized; post-load processing must not
+            # touch them at all: an in-place repack corrupts the provider's
+            # live weights and a swap silently drops the sharing. Skip the
+            # modules that own them.
+            shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
+            shared_module_names = set(name.rsplit(".", 1)[0] for name in shared)
+            # The FusedMoE quant_method lives on ``...mlp.experts`` while its
+            # weights live one level deeper (``experts.routed_experts``); skip
+            # that container too so post-load conversion never repacks shared
+            # experts in place.
+            for name in shared:
+                parts = name.split(".")
+                if "experts" in parts:
+                    shared_module_names.add(".".join(parts[: parts.index("experts") + 1]))
+            shared_module_names = frozenset(shared_module_names)
+            shared_set = set(shared)
+            for full_name in params_by_name:
+                if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
+                    raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
+            for full_name, _buffer in model.named_buffers():
+                owner_name = full_name.rsplit(".", 1)[0]
+                if owner_name not in shared_module_names:
+                    continue
+                owner = model.get_submodule(owner_name) if owner_name else model
+                # Non-persistent buffers are runtime state (e.g. inv_freq), not
+                # quant scales/zero_point; they are fine to leave untouched.
+                if full_name.rsplit(".", 1)[1] in getattr(owner, "_non_persistent_buffers_set", ()):
+                    continue
+                raise ValueError(f"shared-backbone module owns a persistent buffer: {full_name}")
 
-        # Mark shared params as planned and drop checkpoint keys that feed them.
-        # disallow_weights is a backstop that fails loudly if the predicate
-        # misses a key that would write into the provider's storage.
-        self.load_weights(
-            model,
-            planned_weights=shared,
-            weight_name_filter=is_shared_checkpoint_name,
-            disallow_weights=shared,
-        )
-        self._process_weights_after_loading(model, target_device, skip_module_names=shared_module_names)
+            # Mark shared params as planned and drop checkpoint keys that feed
+            # them. disallow_weights is a backstop that fails loudly if the
+            # predicate misses a key that would write into the provider storage.
+            self.load_weights(
+                model,
+                planned_weights=shared,
+                weight_name_filter=is_shared_checkpoint_name,
+                disallow_weights=shared,
+            )
+            self._process_weights_after_loading(model, target_device, skip_module_names=shared_module_names)
 
-        params_by_name = dict(model.named_parameters())
-        for name in shared:
-            param = params_by_name.get(name)
-            if param is None:
-                raise ValueError(f"shared backbone weight disappeared after import: {name}")
-            if param.data_ptr() != shared_data_ptrs[name]:
-                raise ValueError(f"shared backbone weight was repacked after import: {name}")
-        meta_left = [name for name in shared if params_by_name[name].device.type == "meta"]
-        if meta_left:
-            raise ValueError(f"shared backbone parameters remain on meta after attach: {meta_left[:16]}")
+            params_by_name = dict(model.named_parameters())
+            for name in shared:
+                param = params_by_name.get(name)
+                if param is None:
+                    raise ValueError(f"shared backbone weight disappeared after import: {name}")
+                if param.data_ptr() != shared_data_ptrs[name]:
+                    raise ValueError(f"shared backbone weight was repacked after import: {name}")
+            meta_left = [name for name in shared if params_by_name[name].device.type == "meta"]
+            if meta_left:
+                raise ValueError(f"shared backbone parameters remain on meta after attach: {meta_left[:16]}")
+        except Exception:
+            imported = model._weight_share_import
+            if imported is not None:
+                try:
+                    result = backend.close_import(imported)
+                except Exception:
+                    backend.mark_failed(imported)
+                else:
+                    if result.status != "CLOSED":
+                        backend.mark_failed(imported)
+            model._weight_share_failed = True
+            raise
 
         model = model.eval()
-        # Retain the backend and import handle for step-3 lifecycle teardown.
-        model._weight_share_backend = backend
-        model._weight_share_import = imported
         self._attach_offload_startup_state(model)
         return model
 

@@ -95,20 +95,35 @@ def shared_backbone_names(backbone: Any) -> list[str]:
 
 
 def collect_shared_bindings(backbone: Any) -> dict[str, Any]:
-    """Return ``{canonical_name: parameter}`` for the provider's final weights."""
+    """Return ``{canonical_name: tensor}`` for the provider's final weights.
+
+    Values are plain ``torch.Tensor`` views (``detach()``) sharing the original
+    storage: the codec rejects tensor subclasses such as vLLM's
+    ``ModelWeightParameter``, and a view avoids copying or mutating the model.
+    """
     params = dict(backbone.named_parameters())
     missing = [name for name in shared_backbone_names(backbone) if name not in params]
     if missing:
         raise CompatibilityError(f"shared backbone parameters are missing: {missing}")
-    return {name: params[name] for name in shared_backbone_names(backbone)}
+    return {name: params[name].detach() for name in shared_backbone_names(backbone)}
 
 
-def build_weight_spec(model_id: str, checkpoint_revision: str, backbone: Any) -> WeightSpec:
+def build_weight_spec(
+    model_id: str,
+    checkpoint_revision: str,
+    backbone: Any,
+    *,
+    layout: str = LAYOUT_ID,
+) -> WeightSpec:
     """Build the provider/consumer ``WeightSpec`` from backbone tensor metadata.
 
     Works on both CUDA (provider) and meta (consumer) backbones because it reads
-    only dtype/shape/stride.
+    only dtype/shape/stride. ``layout`` must encode the resolved backend and
+    sharding contract (the startup layer populates ``SharedWeightGroupConfig.layout``);
+    the backend rejects any provider/consumer mismatch.
     """
+    if not layout:
+        raise CompatibilityError("weight sharing requires a nonempty layout contract")
     params = dict(backbone.named_parameters())
     tensors: list[TensorSpec] = []
     for name in shared_backbone_names(backbone):
@@ -127,7 +142,7 @@ def build_weight_spec(model_id: str, checkpoint_revision: str, backbone: Any) ->
     return WeightSpec(
         model_id=model_id,
         checkpoint_revision=checkpoint_revision,
-        layout=LAYOUT_ID,
+        layout=layout,
         tensors=tuple(tensors),
     )
 
@@ -250,7 +265,7 @@ def publish_backbone(
     """Provider entry: export the AR model's finalized backbone weights."""
     backbone = getattr(model, BACKBONE_ATTR)
     bindings = collect_shared_bindings(backbone)
-    spec = build_weight_spec(group.model_id, group.checkpoint_revision, backbone)
+    spec = build_weight_spec(group.model_id, group.checkpoint_revision, backbone, layout=group.layout)
     context = build_session_context(group, device_index)
     return backend.prepare_export(bindings, spec, context)
 
@@ -273,10 +288,16 @@ def open_backbone_import(
 ) -> ImportedWeights:
     """Consumer entry: import and bind the shared backbone into a meta model."""
     backbone = getattr(model, BACKBONE_ATTR)
-    expected = build_weight_spec(group.model_id, group.checkpoint_revision, backbone)
+    expected = build_weight_spec(group.model_id, group.checkpoint_revision, backbone, layout=group.layout)
     context = build_session_context(group, device_index)
     imported = backend.open_import(payload, expected, context)
-    attach_imported_weights(backbone, imported)
+    try:
+        attach_imported_weights(backbone, imported)
+    except Exception:
+        # The import succeeded but binding failed; seal the uncertain mapping
+        # so the group can tear it down instead of leaking the IPC views.
+        backend.mark_failed(imported)
+        raise
     return imported
 
 
