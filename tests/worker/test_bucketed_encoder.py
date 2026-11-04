@@ -118,6 +118,21 @@ def bucket_env(monkeypatch):
         pytest.skip("bucketed encoder requires CUDA")
 
 
+@pytest.fixture()
+def restore_processor_hook():
+    """Undo install_bucketed_processor_hook's global class patch afterwards, so
+    later tests don't run against a patched OmniMultiModalProcessor."""
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+
+    saved_main = OmniMultiModalProcessor._apply_hf_processor_main
+    saved_fields = OmniMultiModalProcessor._get_mm_fields_config
+    saved_flag = getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
+    yield
+    OmniMultiModalProcessor._apply_hf_processor_main = saved_main
+    OmniMultiModalProcessor._get_mm_fields_config = saved_fields
+    OmniMultiModalProcessor._bucket_frames_installed = saved_flag
+
+
 def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 
@@ -567,7 +582,7 @@ def test_covo_processor_carries_bucket_frames():
     assert "encoder_bucket_frames" in fields
 
 
-def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch):
+def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch, restore_processor_hook):
     """The length-publishing processor hook must be installable from the
     frontend (which builds the processor and runs request preprocessing), not
     only from the worker that wraps the encoder module. ``install_bucketed_processor_hook``
@@ -583,16 +598,17 @@ def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch):
     assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
 
 
-def test_processor_hook_adds_encoder_bucket_frames(monkeypatch):
+def test_processor_hook_adds_encoder_bucket_frames(monkeypatch, restore_processor_hook):
     """After install_bucketed_processor_hook, the generic OmniMultiModalProcessor
     path adds encoder_bucket_frames from the raw audio sample counts (the field
     the worker's embed_multimodal wrapper reads back)."""
-    import numpy as np
     from types import SimpleNamespace
     from unittest.mock import Mock
 
+    import numpy as np
     from transformers import BatchFeature
     from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
     from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
 

@@ -209,8 +209,19 @@ class _BucketedEncoder:
         if spec in ("1", "2"):
             return int(spec)
         declared = getattr(self.module, "bucketing_time_axis", None)
-        if declared in (1, 2):
-            return declared
+        if declared is not None:
+            try:
+                axis = int(declared)
+            except (TypeError, ValueError):
+                axis = None
+            if axis in (1, 2):
+                return axis
+            logger.warning(
+                "Bucketed encoder %r declares invalid bucketing_time_axis %r; "
+                "falling back to the length-scale heuristic",
+                self.name,
+                declared,
+            )
         # The fixed-window Whisper recipe operates on the module's native
         # channels-first (B, mel, T) layout by construction — mel bins on
         # dim 1, padded time on dim 2 — regardless of how short the true

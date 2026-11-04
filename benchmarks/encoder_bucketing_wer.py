@@ -300,7 +300,7 @@ def main(args) -> None:
             rw = normalize(ref[idx])
             dist += levenshtein(rw, normalize(hyp[idx]))
             tot += len(rw)
-        print(f"WER({label}) unfiltered: {dist / tot:.4f}  ({dist}/{tot})")
+        print(f"WER({label}) unfiltered: {dist / tot:.4f}  ({dist}/{tot})" if tot else f"WER({label}) unfiltered: n/a")
 
     # WER(on vs off) unfiltered: the on/off text delta over all common clips,
     # including the rambles/truncations the clean filter drops.
@@ -309,7 +309,7 @@ def main(args) -> None:
         ow = normalize(off[idx])
         dist += levenshtein(ow, normalize(on[idx]))
         tot += len(ow)
-    print(f"WER(on vs off) unfiltered: {dist / tot:.4f}  ({dist}/{tot})")
+    print(f"WER(on vs off) unfiltered: {dist / tot:.4f}  ({dist}/{tot})" if tot else "WER(on vs off) unfiltered: n/a")
 
     if not clean:
         # Every clip was filtered as over/under-generated; there is nothing to
