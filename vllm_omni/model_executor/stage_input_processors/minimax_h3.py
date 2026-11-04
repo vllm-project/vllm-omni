@@ -56,17 +56,27 @@ def prepare_encoder_prompt(
     omits the video from ``qwen_mm_data`` and ``condition_labels``, then merge
     its hidden states/tags into the encoder output payload under the two
     ``base_*`` keys before the payload is handed to the DiT stage.
-    Until this is wired, keep_steps requests are rejected HERE, at intake, so
-    split-stage clients get the 400 without paying for the encoder stage; the
-    local-text-encoder path (tests/offline) already works end to end via
-    ``_prepare_local_conditioning``.
+    Until this is wired, keep_steps requests that would actually switch are
+    rejected HERE, at intake, so split-stage clients get the 400 without
+    paying for the encoder stage; the ``keep_steps == num_inference_steps``
+    no-op passes through (the diffusion stage normalizes it away), matching
+    the combined deployment's contract. A pinned distilled schedule can make
+    the effective step count smaller than ``num_inference_steps``; such a
+    request passes intake and the diffusion stage's authoritative check
+    rejects it. The local-text-encoder path (tests/offline) already works end
+    to end via ``_prepare_local_conditioning``.
     """
     sampling = _diffusion_sampling_params(sampling_params_list)
-    if (getattr(sampling, "extra_args", None) or {}).get("keep_steps") is not None:
-        raise OmniClientError(
-            "MiniMax H3 keep_steps is not supported across a separate encoder stage yet; it requires "
-            "the diffusion stage's local text encoder (see the TODO in this file)"
-        )
+    keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
+    if keep_steps is not None:
+        num_steps = int(sampling.num_inference_steps or 50)
+        if type(keep_steps) is not int or not 1 <= keep_steps <= num_steps:
+            raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [1, {num_steps}]")
+        if keep_steps != num_steps:
+            raise OmniClientError(
+                "MiniMax H3 keep_steps is not supported across a separate encoder stage yet; it requires "
+                "the diffusion stage's local text encoder (see the TODO in this file)"
+            )
     multi_modal_data = prompt.get("multi_modal_data") if isinstance(prompt, Mapping) else None
     if isinstance(multi_modal_data, Mapping) and multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None:
         raise OmniClientError("MiniMax H3 timeline guides require the media encoder in the diffusion stage")

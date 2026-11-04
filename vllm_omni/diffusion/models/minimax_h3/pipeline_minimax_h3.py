@@ -3018,24 +3018,31 @@ class MiniMaxH3Pipeline(
         sampling: Any,
         *,
         num_steps: int,
+        base_schedule: Sequence[float] | None = None,
         task: str | None = None,
         condition_labels: Sequence[tuple[str, int]] | None = None,
         timeline_guides: bool = False,
     ) -> int | None:
-        """Validate and normalize ``keep_steps`` before encoder work is spent.
+        """Validate and normalize ``keep_steps`` before the second encoder pass.
 
         Shared by ``_prepare_local_conditioning`` (before the optional second
         Qwen pass over the image-only presentation) and
         ``_prepare_encoder_conditioning_inputs`` (the authoritative check), so
-        requests that can never switch -- absent, degenerate, or malformed
-        ``keep_steps``, a non-ref2va task, or reference shapes the switch
-        rejects -- do not pay for that encode. Returns the validated integer,
-        or ``None`` when ``keep_steps`` is absent or equals the step count
-        (degenerate: the historical full-video path).
+        requests that can never switch -- malformed ``keep_steps``, the
+        degenerate ``== num_steps`` value, or a combination the switch rejects
+        -- do not pay for that pass. Rejection here happens after media
+        preparation (``prepare_encoder_inputs`` already decoded the
+        references) but before any Qwen/VAE model encode. Returns the
+        validated integer, or ``None`` when ``keep_steps`` is absent or
+        equals the step count (degenerate: the historical full-video path).
 
-        ``num_steps`` must come from ``_resolve_sigma_positions``; both call
-        sites resolve it that way, so a pinned sigma schedule or a fused
-        checkpoint cannot make the early and authoritative checks disagree.
+        ``num_steps`` and ``base_schedule`` must come from
+        ``_resolve_sigma_positions``; both call sites resolve them that way,
+        so a pinned sigma schedule or a fused checkpoint cannot make the
+        early and authoritative checks disagree. Switch-specific restrictions
+        (pinned schedules, task, audio, guides) only apply after the
+        degenerate ``== num_steps`` value is normalized away, preserving the
+        original semantics where such requests simply run full-video.
         """
         keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
         if keep_steps is None:
@@ -3045,17 +3052,24 @@ class MiniMaxH3Pipeline(
         # full-presentation Qwen pass, and the full branch.
         if type(keep_steps) is not int or not 1 <= keep_steps <= num_steps:
             raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [1, {num_steps}]")
+        if keep_steps == num_steps:
+            # Degenerate request: keeping the video for every step is the
+            # historical behaviour, so drop the switch entirely.
+            logger.info("MiniMax H3 keep_steps equals the step count; using full-video conditioning")
+            return None
+        if base_schedule is not None:
+            # Distilled checkpoints (and the fused FastH3 student, whose
+            # resolver branch also returns a pinned schedule) pin the sigma
+            # ladder; the switch has not been validated against them.
+            raise OmniClientError(
+                "MiniMax H3 keep_steps does not support pinned distilled sigma schedules in this revision"
+            )
         if task is not None and task != "ref2va":
             raise OmniClientError("MiniMax H3 keep_steps requires task ref2va")
         if condition_labels is not None and any(label[0] == "audio" for label in condition_labels):
             raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
         if timeline_guides:
             raise OmniClientError("MiniMax H3 keep_steps does not support timeline guides")
-        if keep_steps == num_steps:
-            # Degenerate request: keeping the video for every step is the
-            # historical behaviour, so drop the switch entirely.
-            logger.info("MiniMax H3 keep_steps equals the step count; using full-video conditioning")
-            return None
         return keep_steps
 
     def _prepare_local_conditioning(
@@ -3118,11 +3132,13 @@ class MiniMaxH3Pipeline(
                 # CodeVideoModel keep_steps: validate and normalize before any
                 # encoder work, then encode the image-only presentation only
                 # when the mid-loop switch will actually happen. Resolve the
-                # step count with the same resolver the authoritative check
+                # schedule with the same resolver the authoritative check
                 # uses, so pinned schedules cannot make the two disagree.
+                early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
                 keep_steps = self._normalize_keep_steps(
                     sampling,
-                    num_steps=self._resolve_sigma_positions(task, sampling)[1],
+                    num_steps=early_num_steps,
+                    base_schedule=early_base_schedule,
                     task=task,
                     condition_labels=prepared.condition_labels,
                     timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
@@ -3515,10 +3531,10 @@ class MiniMaxH3Pipeline(
         # CodeVideoModel-style early-only video conditioning: the video
         # reference conditions only the first ``keep_steps`` denoise steps;
         # the request then continues from an image-only presentation.
-        # Normalization runs before any encoder work (see
+        # Normalization runs before the second encoder pass (see
         # _normalize_keep_steps); the checks below need the encoded
         # conditioning and stay authoritative for external presentations.
-        keep_steps = self._normalize_keep_steps(sampling, num_steps=num_steps, task=task)
+        keep_steps = self._normalize_keep_steps(sampling, num_steps=num_steps, base_schedule=base_schedule, task=task)
         if keep_steps is not None:
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support continuation")

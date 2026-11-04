@@ -518,10 +518,14 @@ curl -s http://localhost:8091/v1/videos/sync \
   and `keep_steps == num_inference_steps` also degrades to full-video
   conditioning. `keep_steps=0` is rejected: the video would never condition a
   step while the request still pays for its VAE encode and the
-  full-presentation encoder pass.
-- Reference upload order does not matter: the server splits `input_references`
-  by media kind and the encoder packs image references before the video
-  reference regardless of the order the files arrive in.
+  full-presentation encoder pass (an interface choice for serving;
+  CodeVideoModel's reference implementation permits 0). Checkpoints with a
+  pinned distilled sigma schedule (including FastH3) are rejected as well.
+- Interleaving images and videos in the upload list does not change the
+  internal type-grouped order: the server splits `input_references` by media
+  kind and the encoder packs all image references before the video reference.
+  References of the same kind keep their upload order, which is what
+  `Picture 1`/`Video 1` in the prompt refer to.
 - Measured on Atlas 800I A2 (910B3, TP4), a 20-step Ref2VA request with one
   image and one proxy video finished in 981.9 s instead of 1176.4 s (-16.5%)
   with an identical per-card memory profile; per-step time drops ≈24% after
@@ -535,11 +539,12 @@ curl -s http://localhost:8091/v1/videos/sync \
   reference. Rejected with explicit client errors when combined with audio
   references (`audio_mode=lock_source` included), latent-mask editing, control
   media, `continue_from`/continuation, timeline guides, latent
-  refine/upscale, `pad_seq_len`, reference-KV offload, Cache-DiT quality
-  profiles, the AdaLN sidecar cache, turbo/native LoRA, FastH3, or step
-  execution. Deployments that split the encoder into its own stage reject
-  `keep_steps` requests at intake (HTTP 400) until the second encoder pass is
-  wired there.
+  refine/upscale, `pad_seq_len`, reference-KV offload, pinned distilled sigma
+  schedules, Cache-DiT quality profiles, the AdaLN sidecar cache, turbo/native
+  LoRA, FastH3, or step execution. Deployments that split the encoder into
+  its own stage reject `keep_steps` requests that would switch at intake
+  (HTTP 400) until the second encoder pass is wired there; the
+  `keep_steps == num_inference_steps` no-op passes through unchanged.
 
 ### Speech-to-Video
 

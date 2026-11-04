@@ -459,6 +459,26 @@ def test_keep_steps_equal_to_step_count_degrades_to_full_video():
     assert context["base_text_tags"] is None
 
 
+def test_degenerate_keep_steps_skips_switch_specific_restrictions():
+    """``== num_steps`` normalizes away before the switch-only checks, so a
+    t2va request carrying the no-op value runs as plain t2va instead of
+    being rejected (the original degeneration semantics)."""
+    pipeline = _validation_pipeline()
+    context = pipeline._prepare_encoder_conditioning_inputs(
+        _keep_steps_conditioning(task="t2va"), _sampling(task="t2va", keep_steps=4)
+    )
+    assert context["keep_steps"] is None
+
+
+def test_keep_steps_rejects_pinned_distilled_schedule():
+    pipeline = _validation_pipeline()
+    pipeline._base_schedule_by_partition["ref2va"] = SimpleNamespace(
+        num_inference_steps=4, base_schedule=(1.0, 0.6, 0.0)
+    )
+    with pytest.raises(OmniClientError, match="pinned distilled sigma schedules"):
+        pipeline._prepare_encoder_conditioning_inputs(_keep_steps_conditioning(), _sampling(keep_steps=2))
+
+
 @pytest.mark.parametrize(
     "conditioning_overrides,extra_args,match",
     [
@@ -736,5 +756,33 @@ def test_encoder_stage_rejects_keep_steps_before_encoder_preparation(monkeypatch
     # If the intake check is bypassed or reordered, the media-preparation
     # call fires and this bomb fails the test.
     monkeypatch.setattr(processor, "prepare_encoder_inputs", forbidden)
-    with pytest.raises(OmniClientError, match="separate encoder stage"):
+    with pytest.raises(OmniClientError, match="separate encoder stage") as exc_info:
         processor.prepare_encoder_prompt({"prompt": "p"}, [_local_sampling(keep_steps=2)])
+    assert exc_info.value.status_code == 400
+
+
+def test_encoder_stage_passes_degenerate_keep_steps(monkeypatch: pytest.MonkeyPatch):
+    """``keep_steps == num_inference_steps`` is a no-op and must pass intake.
+
+    Split-stage deployments keep the combined deployment's contract: the
+    degenerate value means "keep the video for every step", so no encoder
+    support is needed and the diffusion stage normalizes it away later.
+    """
+    from vllm_omni.model_executor.stage_input_processors import minimax_h3 as processor
+
+    prepared = _Prepared(
+        prompt="p",
+        images=[],
+        qwen_videos=[],
+        video_timestamps=[],
+        condition_labels=[],
+        media=SimpleNamespace(
+            task="ref2va",
+            num_frames=NUM_FRAMES,
+            to_mm_tensors=lambda: [],
+            to_metadata=lambda: {"task": "ref2va"},
+        ),
+    )
+    monkeypatch.setattr(processor, "prepare_encoder_inputs", lambda *args, **kwargs: prepared)
+    transformed = processor.prepare_encoder_prompt({"prompt": "p"}, [_local_sampling(keep_steps=4)])
+    assert transformed["prompt"] == "p"
