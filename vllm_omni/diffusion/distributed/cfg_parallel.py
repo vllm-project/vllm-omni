@@ -123,17 +123,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
             self._current_step_index = None
             self._current_sigma = None
 
-    def _predict_noise_with_cache_context(self, context_name: str, model_kwargs: dict[str, Any] | None):
-        # Only require kwargs for the branch executed on this rank.
-        assert model_kwargs is not None
-        context_factory = getattr(self, "_cache_context_factory", None)
-        # Cosmos3 owns explicitly named contexts in its predict_noise override,
-        # including transfer branches beyond ordinary cond/uncond CFG.
-        if not callable(context_factory) or "_cache_context" in model_kwargs:
-            return self.predict_noise(**model_kwargs)
-        with context_factory(context_name):
-            return self.predict_noise(**model_kwargs)
-
     def _set_transformer_do_true_cfg(self, do_true_cfg: bool) -> None:
         transformer = getattr(self, "transformer", None)
         if transformer is not None:
@@ -239,20 +228,18 @@ class CFGParallelMixin(metaclass=ABCMeta):
     def _predict_noise_for_cfg_branch(self, branch: str, predict_kwargs: dict[str, Any] | None) -> Any:
         """Call ``predict_noise`` with ``transformer.cfg_branch`` set to ``branch``.
 
-        SeaCache uses the corresponding cond/uncond context for the same call.
         The previous value is restored afterwards, also on error, so a stale
         stamp never leaks into calls made outside this helper.
         """
         if predict_kwargs is None:
             raise ValueError(f"predict_noise kwargs for the {branch} CFG branch are required when do_true_cfg=True")
-        context_name = "cond" if branch == "positive" else "uncond"
         transformer = getattr(self, "transformer", None)
         if transformer is None:
-            return self._predict_noise_with_cache_context(context_name, predict_kwargs)
+            return self.predict_noise(**predict_kwargs)
         previous = getattr(transformer, "cfg_branch", None)
         transformer.cfg_branch = branch
         try:
-            return self._predict_noise_with_cache_context(context_name, predict_kwargs)
+            return self.predict_noise(**predict_kwargs)
         finally:
             transformer.cfg_branch = previous
 

@@ -164,6 +164,45 @@ def _apply_test_hook(
     )
 
 
+def test_hook_consumes_cfg_branch_stamps() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    for step, branch, value in (
+        (0, "positive", 1.0),
+        (0, "negative", 10.0),
+        (1, "positive", 1.0),  # A non-CFG step must not flip the next branch.
+        (2, "positive", 1.0),
+        (2, "negative", 10.0),
+    ):
+        metadata.step = step
+        transformer.cfg_branch = branch
+        output = _run_step(transformer, 500, value)
+        torch.testing.assert_close(output, torch.full((1, 8, 2), 2 * value), rtol=0, atol=0)
+        assert hook.state_manager._current_context is None
+
+    assert set(hook.state_manager._states) == {"cond", "uncond"}
+    assert hook.full_count == 3  # The negative branch refreshes after its missing step.
+    assert hook.skip_count == 2
+
+
+def test_hook_inferred_context_restored_on_error(monkeypatch) -> None:
+    transformer = TinyCosmos3Transformer()
+    transformer.cfg_branch = "negative"
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+
+    def fail_negative(hidden):
+        assert hook.state_manager._current_context == "uncond"
+        raise RuntimeError("negative forward failed")
+
+    monkeypatch.setattr(transformer, "_run_gen_layers", fail_negative)
+    with pytest.raises(RuntimeError, match="negative forward failed"):
+        _run_step(transformer, 500, 1.0)
+
+    assert hook.state_manager._current_context is None
+
+
 def test_config_validation() -> None:
     assert SeaCacheConfig().threshold == 0.25
     with pytest.raises(ValueError, match="residual_order"):
@@ -481,6 +520,7 @@ def test_parameter_sharded_hook_fails_open_without_distributed_state(
 
 def test_hook_keeps_three_transfer_branches_separate() -> None:
     transformer = TinyCosmos3Transformer()
+    transformer.cfg_branch = "negative"  # Explicit transfer contexts take precedence.
     metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
     hook = _apply_test_hook(transformer, metadata)
     hook.refresh(transformer)
@@ -498,6 +538,7 @@ def test_hook_keeps_three_transfer_branches_separate() -> None:
     assert hook.skip_count == 3
     assert len(hook.state_manager._states["cond"].previous_indicator) == 2
     assert len(hook.state_manager._states["cond_no_control"].previous_indicator) == 1
+    assert hook.state_manager._current_context is None
 
 
 def test_hook_fails_open_without_noisy_vision() -> None:
@@ -537,13 +578,19 @@ def test_conditioning_only_model_failure_runs_forward_once(monkeypatch: pytest.M
     assert forward_calls == 1
 
 
-def test_hook_fails_open_without_explicit_context() -> None:
+@pytest.mark.parametrize("branch", [None, "unknown"])
+def test_hook_fails_open_without_context_or_valid_branch(branch) -> None:
     transformer = TinyCosmos3Transformer()
-    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=2)
+    transformer.cfg_branch = branch
+    transformer.do_true_cfg = True
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=3)
     hook = _apply_test_hook(transformer, metadata)
     hook.refresh(transformer)
 
-    _run_step(transformer, 1000, 1.0)
+    for step, value in enumerate((1.0, 2.0)):
+        metadata.step = step
+        output = _run_step(transformer, 500, value)
+        torch.testing.assert_close(output, torch.full((1, 8, 2), 2 * value), rtol=0, atol=0)
 
     assert hook.full_count == 0
     assert hook.skip_count == 0

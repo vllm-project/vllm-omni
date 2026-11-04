@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Cache branch and scheduler metadata contracts shared by image pipelines."""
+"""Scheduler metadata and pipeline-owned cache-context contracts."""
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -38,80 +38,8 @@ class _Pipeline(CFGParallelMixin):
         return torch.full((1, 2, 3), value)
 
 
-@pytest.mark.parametrize("world_size,rank", [(1, 0), (2, 0), (2, 1)])
-def test_cache_context_selects_executed_branch(monkeypatch, world_size, rank):
-    monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: world_size)
-    monkeypatch.setattr(cfg_parallel, "get_classifier_free_guidance_rank", lambda: rank)
-    monkeypatch.setattr(
-        cfg_parallel,
-        "get_cfg_group",
-        lambda: SimpleNamespace(all_gather=lambda prediction, **_: [prediction, prediction]),
-    )
-    pipeline = _Pipeline()
-
-    negative_kwargs = {"value": 1.0} if world_size > 1 else None
-    pipeline.predict_noise_maybe_with_cfg(world_size > 1, 3.0, {"value": 2.0}, negative_kwargs, False)
-
-    assert pipeline.contexts == [["cond"], ["uncond"]][rank]
-    assert pipeline.calls == [(["cond", "uncond"][rank], [2.0, 1.0][rank])]
-    assert pipeline.context is None
-
-
-@pytest.mark.parametrize(
-    "world_size,rank,do_true_cfg,expected",
-    [
-        (1, 0, False, [("cond", "positive", False)]),
-        (1, 0, True, [("cond", "positive", True), ("uncond", "negative", True)]),
-        (2, 0, True, [("cond", "positive", True)]),
-        (2, 1, True, [("uncond", "negative", True)]),
-    ],
-)
-def test_cache_context_and_transformer_branch_match(monkeypatch, world_size, rank, do_true_cfg, expected):
-    monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: world_size)
-    monkeypatch.setattr(cfg_parallel, "get_classifier_free_guidance_rank", lambda: rank)
-    monkeypatch.setattr(
-        cfg_parallel,
-        "get_cfg_group",
-        lambda: SimpleNamespace(all_gather=lambda prediction, **_: [prediction, prediction]),
-    )
-    pipeline = _Pipeline()
-    pipeline.transformer = SimpleNamespace(cfg_branch="outer")
-    observations = []
-
-    def predict_noise(*, value):
-        observations.append((pipeline.context, pipeline.transformer.cfg_branch, pipeline.transformer.do_true_cfg))
-        return torch.full((1, 2, 3), value)
-
-    monkeypatch.setattr(pipeline, "predict_noise", predict_noise)
-    pipeline.predict_noise_maybe_with_cfg(do_true_cfg, 3.0, {"value": 2.0}, {"value": 1.0}, False)
-
-    assert observations == expected
-    assert pipeline.context is None
-    assert pipeline.transformer.cfg_branch == "outer"
-
-
-def test_cache_context_and_transformer_branch_restore_on_failure(monkeypatch):
-    monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: 1)
-    pipeline = _Pipeline()
-    pipeline.context = "outer-cache"
-    pipeline.transformer = SimpleNamespace(cfg_branch="outer")
-    observations = []
-
-    def predict_noise(*, value):
-        observations.append((pipeline.context, pipeline.transformer.cfg_branch, pipeline.transformer.do_true_cfg))
-        raise RuntimeError("transformer failed")
-
-    monkeypatch.setattr(pipeline, "predict_noise", predict_noise)
-    with pytest.raises(RuntimeError, match="transformer failed"):
-        pipeline.predict_noise_maybe_with_cfg(True, 3.0, {"value": 2.0}, {"value": 1.0}, False)
-
-    assert observations == [("cond", "positive", True)]
-    assert pipeline.context == "outer-cache"
-    assert pipeline.transformer.cfg_branch == "outer"
-
-
 @pytest.mark.parametrize("world_size", [1, 2])
-def test_missing_negative_arguments_fail_before_entering_cache_context(monkeypatch, world_size):
+def test_missing_negative_arguments_fail_before_prediction(monkeypatch, world_size):
     monkeypatch.setattr(cfg_parallel, "_get_cfg_world_size_or_one", lambda: world_size)
     pipeline = _Pipeline()
 
@@ -174,7 +102,7 @@ def test_scheduler_metadata_uses_resolved_sigma_and_cleans_up_on_failure(monkeyp
         assert pipeline.current_sigma.item() == pytest.approx(0.17)
         pipeline.predict_noise_maybe_with_cfg(True, 3.0, {"value": 2.0}, {"value": 1.0, "fail": True})
 
-    assert pipeline.contexts == ["cond", "uncond"]
+    assert pipeline.calls == [(None, 2.0), (None, 1.0)]
     assert pipeline.context is None
     assert pipeline.current_step_index is None
     assert pipeline.current_sigma is None
@@ -198,7 +126,12 @@ def test_image_diffuse_publishes_scheduler_sigmas_and_actual_steps(monkeypatch, 
 
     def predict_noise(**kwargs):
         observations.append(
-            (pipeline.context, pipeline.current_step_index, float(pipeline.current_sigma), pipeline._num_timesteps)
+            (
+                pipeline.transformer.cfg_branch,
+                pipeline.current_step_index,
+                float(pipeline.current_sigma),
+                pipeline._num_timesteps,
+            )
         )
         return torch.ones_like(kwargs["hidden_states"])
 
@@ -238,10 +171,10 @@ def test_image_diffuse_publishes_scheduler_sigmas_and_actual_steps(monkeypatch, 
         )
 
     assert observations == [
-        ("cond", 0, pytest.approx(0.91), 2),
-        ("uncond", 0, pytest.approx(0.91), 2),
-        ("cond", 1, pytest.approx(0.17), 2),
-        ("uncond", 1, pytest.approx(0.17), 2),
+        ("positive", 0, pytest.approx(0.91), 2),
+        ("negative", 0, pytest.approx(0.91), 2),
+        ("positive", 1, pytest.approx(0.17), 2),
+        ("negative", 1, pytest.approx(0.17), 2),
     ]
     assert pipeline.current_step_index is None
     assert pipeline.current_sigma is None

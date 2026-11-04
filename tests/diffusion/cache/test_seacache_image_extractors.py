@@ -197,30 +197,81 @@ def test_image_cache_execution(image_model, threshold, full_count, skip_count, m
         expected = [module(**kwargs)[0] for _, kwargs in step_inputs] if threshold == 0 else None
         block = mocker.spy(module.transformer_blocks[0], "forward")
         hook = _apply_image_hook(module, adapter, metadata, threshold)
-        with hook.cache_context("cond"):
-            for step, (sigma, kwargs) in enumerate(step_inputs):
-                metadata.step, metadata.sigma = step, sigma
-                output = module(**kwargs)[0]
-                assert output.shape == inputs["hidden_states"].shape
-                assert torch.isfinite(output).all()
-                if expected is not None:
-                    torch.testing.assert_close(output, expected[step], rtol=0, atol=0)
-            state = hook.state_manager.get_state()
-            batch_size = inputs["hidden_states"].shape[0]
-            assert len(state.previous_indicator) == batch_size
-            assert all(residual.shape[0] == batch_size for _, residual in state.history)
+        module.cfg_branch = "positive"
+        for step, (sigma, kwargs) in enumerate(step_inputs):
+            metadata.step, metadata.sigma = step, sigma
+            output = module(**kwargs)[0]
+            assert output.shape == inputs["hidden_states"].shape
+            assert torch.isfinite(output).all()
+            if expected is not None:
+                torch.testing.assert_close(output, expected[step], rtol=0, atol=0)
+        state = hook.state_manager._states["cond"]
+        batch_size = inputs["hidden_states"].shape[0]
+        assert len(state.previous_indicator) == batch_size
+        assert all(residual.shape[0] == batch_size for _, residual in state.history)
     assert hook.full_count == block.call_count == full_count
     assert hook.skip_count == skip_count
 
 
-@pytest.mark.parametrize("image_model", ["flux2"], indirect=True)
-def test_missing_noisy_target_disables_the_indicator(image_model):
+@pytest.mark.parametrize("image_model", ["flux", "flux2", "klein"], indirect=True)
+def test_image_grid_is_reused_until_refresh(image_model, monkeypatch):
     module, adapter, inputs = image_model
-    inputs["img_ids"][..., 0] = 10
+    hook = _apply_image_hook(module, adapter, _StepMetadata())
+    reads = 0
+    original_item = torch.Tensor.item
+
+    def read_scalar(tensor, *args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original_item(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "item", read_scalar)
+    with torch.inference_mode():
+        contexts = []
+        for index, context in enumerate(("cond", "uncond", "cond")):
+            # FLUX.2 rebuilds the concatenated IDs tensor during denoising.
+            with hook.cache_context(context):
+                ctx = adapter(
+                    module,
+                    **{
+                        **inputs,
+                        "hidden_states": inputs["hidden_states"] + index,
+                        "img_ids": inputs["img_ids"].clone(),
+                    },
+                )
+            contexts.append(ctx)
+            assert ctx.extra_states["sea_cache_latents"][0].shape[-2:] == (2, 3)
+        assert reads == 2
+
+        # Equal token count, different aspect ratio: request refresh must invalidate the grid.
+        hook.refresh(module)
+        new_ids = inputs["img_ids"].clone()
+        ids = new_ids[0] if new_ids.ndim == 3 else new_ids
+        ids[:6, 1:3] = _image_ids(3, 2, ids.shape[-1])[:, 1:3]
+        ctx = adapter(module, **{**inputs, "img_ids": new_ids})
+        assert ctx.extra_states["sea_cache_latents"][0].shape[-2:] == (3, 2)
+        assert reads == 4
+        for ctx in [*contexts, ctx]:
+            features = ctx.extra_states["sea_cache_latents"][0]
+            torch.testing.assert_close(features.flatten(2).transpose(1, 2), ctx.modulated_input[:, :6], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("image_model", ["flux2"], indirect=True)
+@pytest.mark.parametrize("invalid_grid", ["missing_target", "non_rectangular"])
+def test_invalid_grid_does_not_poison_the_next_read(image_model, invalid_grid):
+    module, adapter, inputs = image_model
+    _apply_image_hook(module, adapter, _StepMetadata())
+    valid_ids = inputs["img_ids"].clone()
+    if invalid_grid == "missing_target":
+        inputs["img_ids"][..., 0] = 10
+    else:
+        inputs["img_ids"][..., :6, 2] = 0
     with torch.inference_mode():
         ctx = adapter(module, **inputs)
         assert ctx is not None
         assert ctx.extra_states["sea_cache_latents"] == []
+        ctx = adapter(module, **{**inputs, "img_ids": valid_ids})
+        assert ctx.extra_states["sea_cache_latents"][0].shape[-2:] == (2, 3)
 
 
 def _qwen_batch_inputs(inputs, batch_size=2):

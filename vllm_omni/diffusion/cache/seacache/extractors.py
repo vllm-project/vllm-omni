@@ -24,17 +24,27 @@ def _target_features(modulated_input: torch.Tensor, height: int, width: int) -> 
     return [target.reshape(batch, height, width, channels).permute(0, 3, 1, 2).unsqueeze(2)]
 
 
-def _target_features_from_ids(modulated_input: torch.Tensor, img_ids: torch.Tensor) -> list[torch.Tensor]:
-    ids = img_ids[0] if img_ids.ndim == 3 else img_ids
-    # The noisy target is first at T=0; FLUX.2 references use T=10,20,...
-    target_ids = ids[ids[:, 0] == 0]
-    if not len(target_ids):
-        return []
-    height = int(target_ids[:, 1].max().item()) + 1
-    width = int(target_ids[:, 2].max().item()) + 1
-    if height * width != len(target_ids):
-        return []
-    return _target_features(modulated_input, height, width)
+def _target_features_from_ids(
+    module: torch.nn.Module, modulated_input: torch.Tensor, img_ids: torch.Tensor
+) -> list[torch.Tensor]:
+    registry = getattr(module, "_hook_registry", None)
+    hook = registry.get_hook("sea_cache") if registry is not None else None
+    grid_shape = hook._image_grid_shape if hook is not None else None
+    if grid_shape is None:
+        ids = img_ids[0] if img_ids.ndim == 3 else img_ids
+        # The noisy target is first at T=0; FLUX.2 references use T=10,20,...
+        target_ids = ids[ids[:, 0] == 0]
+        if not len(target_ids):
+            return []
+        height = int(target_ids[:, 1].max().item()) + 1
+        width = int(target_ids[:, 2].max().item()) + 1
+        if height <= 0 or width <= 0 or height * width != len(target_ids):
+            return []
+        grid_shape = (height, width)
+        # IDs may be rebuilt each step; geometry is fixed until request refresh.
+        if hook is not None:
+            hook._image_grid_shape = grid_shape
+    return _target_features(modulated_input, *grid_shape)
 
 
 def _with_latents(ctx: CacheContext, latents: list[torch.Tensor]) -> CacheContext:
@@ -55,7 +65,7 @@ def extract_flux_seacache_context(
 ) -> CacheContext:
     extract = get_extractor("FluxTransformer2DModel")
     ctx = extract(module, hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, *args, **kwargs)
-    return _with_latents(ctx, _target_features_from_ids(ctx.modulated_input, img_ids))
+    return _with_latents(ctx, _target_features_from_ids(module, ctx.modulated_input, img_ids))
 
 
 def extract_flux2_seacache_context(
@@ -70,7 +80,7 @@ def extract_flux2_seacache_context(
     """Use the same complete dual/single-stream boundary for FLUX.2 and Klein."""
     extract = get_extractor("Flux2Transformer2DModel")
     ctx = extract(module, hidden_states, encoder_hidden_states, timestep, img_ids, *args, **kwargs)
-    return _with_latents(ctx, _target_features_from_ids(ctx.modulated_input, img_ids))
+    return _with_latents(ctx, _target_features_from_ids(module, ctx.modulated_input, img_ids))
 
 
 def extract_qwen_seacache_context(
