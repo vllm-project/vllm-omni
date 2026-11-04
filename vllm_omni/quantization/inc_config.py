@@ -264,7 +264,8 @@ class _MXFlattenedLinearMethod(INCLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if x.dim() <= 2:
-            return super().apply(layer, x, bias)
+            return super().apply(layer, x.contiguous(), bias)
         ori_shape = x.shape
-        output = super().apply(layer, x.reshape(-1, ori_shape[-1]), bias)
+        # Spatial-to-sequence permutations can leave the K dimension strided.
+        output = super().apply(layer, x.reshape(-1, ori_shape[-1]).contiguous(), bias)
         return output.reshape(*ori_shape[:-1], -1)

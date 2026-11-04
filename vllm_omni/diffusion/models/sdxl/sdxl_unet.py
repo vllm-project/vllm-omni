@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 from collections.abc import Iterable
@@ -12,8 +12,10 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -22,6 +24,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -81,11 +84,15 @@ class SDXLResnetBlock2D(nn.Module):
         out_channels: int,
         time_embed_dim: int,
         groups: int = 32,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.norm1 = nn.GroupNorm(groups, in_channels, eps=1e-5)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.time_emb_proj = nn.Linear(time_embed_dim, out_channels)
+        self.time_emb_proj = ReplicatedLinear(
+            time_embed_dim, out_channels, quant_config=quant_config, prefix=f"{prefix}.time_emb_proj"
+        )
         self.norm2 = nn.GroupNorm(groups, out_channels, eps=1e-5)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.nonlinearity = nn.SiLU()
@@ -102,7 +109,7 @@ class SDXLResnetBlock2D(nn.Module):
         hidden_states = self.conv1(hidden_states)
 
         temb = self.nonlinearity(temb)
-        temb = self.time_emb_proj(temb)
+        temb, _ = self.time_emb_proj(temb)
         hidden_states = hidden_states + temb[:, :, None, None]
 
         hidden_states = self.norm2(hidden_states)
@@ -116,9 +123,11 @@ class SDXLResnetBlock2D(nn.Module):
 
 
 class SDXLGEGLU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int):
+    def __init__(self, dim_in: int, dim_out: int, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
-        self.proj = MergedColumnParallelLinear(dim_in, [dim_out, dim_out], bias=True)
+        self.proj = MergedColumnParallelLinear(
+            dim_in, [dim_out, dim_out], bias=True, quant_config=quant_config, prefix=f"{prefix}.proj"
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, _ = self.proj(hidden_states)
@@ -127,10 +136,12 @@ class SDXLGEGLU(nn.Module):
 
 
 class SDXLFeedForward(nn.Module):
-    def __init__(self, dim: int, inner_dim: int):
+    def __init__(self, dim: int, inner_dim: int, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
-        self.geglu = SDXLGEGLU(dim, inner_dim)
-        self.out_proj = RowParallelLinear(inner_dim, dim, bias=True)
+        self.geglu = SDXLGEGLU(dim, inner_dim, quant_config=quant_config, prefix=f"{prefix}.net.0")
+        self.out_proj = RowParallelLinear(
+            inner_dim, dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.net.2"
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.geglu(hidden_states)
@@ -139,7 +150,14 @@ class SDXLFeedForward(nn.Module):
 
 
 class SDXLSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, prefix: str = ""):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
         self.to_qkv = QKVParallelLinear(
@@ -147,10 +165,12 @@ class SDXLSelfAttention(nn.Module):
             head_size=attention_head_dim,
             total_num_heads=num_attention_heads,
             bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
         self.to_out = nn.ModuleList(
             [
-                RowParallelLinear(inner_dim, dim, bias=True),
+                RowParallelLinear(inner_dim, dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_out.0"),
             ]
         )
         self.attention = Attention(
@@ -165,16 +185,26 @@ class SDXLSelfAttention(nn.Module):
 
 class SDXLCrossAttention(nn.Module):
     def __init__(
-        self, dim: int, cross_attention_dim: int, num_attention_heads: int, attention_head_dim: int, prefix: str = ""
+        self,
+        dim: int,
+        cross_attention_dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
-        self.to_q = ColumnParallelLinear(dim, inner_dim, bias=False)
-        self.to_k = ColumnParallelLinear(cross_attention_dim, inner_dim, bias=False)
-        self.to_v = ColumnParallelLinear(cross_attention_dim, inner_dim, bias=False)
+        self.to_q = ColumnParallelLinear(dim, inner_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_q")
+        self.to_k = ColumnParallelLinear(
+            cross_attention_dim, inner_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_k"
+        )
+        self.to_v = ColumnParallelLinear(
+            cross_attention_dim, inner_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_v"
+        )
         self.to_out = nn.ModuleList(
             [
-                RowParallelLinear(inner_dim, dim, bias=True),
+                RowParallelLinear(inner_dim, dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_out.0"),
             ]
         )
         self.attention = Attention(
@@ -196,6 +226,7 @@ class SDXLBasicTransformerBlock(nn.Module):
         attention_head_dim: int,
         cross_attention_dim: int,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -210,6 +241,7 @@ class SDXLBasicTransformerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             prefix=f"{prefix}.attn1",
+            quant_config=quant_config,
         )
         self.attn2 = SDXLCrossAttention(
             dim=dim,
@@ -217,10 +249,11 @@ class SDXLBasicTransformerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             prefix=f"{prefix}.attn2",
+            quant_config=quant_config,
         )
 
         # Feed-forward
-        self.ff = SDXLFeedForward(dim=dim, inner_dim=dim * 4)
+        self.ff = SDXLFeedForward(dim=dim, inner_dim=dim * 4, quant_config=quant_config, prefix=f"{prefix}.ff")
 
     def forward(
         self,
@@ -273,12 +306,13 @@ class SDXLTransformer2DModel(nn.Module):
         num_layers: int,
         cross_attention_dim: int,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
 
         self.norm = nn.GroupNorm(32, in_channels, eps=1e-6, affine=True)
-        self.proj_in = nn.Linear(in_channels, inner_dim)
+        self.proj_in = ReplicatedLinear(in_channels, inner_dim, quant_config=quant_config, prefix=f"{prefix}.proj_in")
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -288,12 +322,13 @@ class SDXLTransformer2DModel(nn.Module):
                     attention_head_dim=attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
                     prefix=f"{prefix}.transformer_blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(num_layers)
             ]
         )
 
-        self.proj_out = nn.Linear(inner_dim, in_channels)
+        self.proj_out = ReplicatedLinear(inner_dim, in_channels, quant_config=quant_config, prefix=f"{prefix}.proj_out")
 
     def forward(
         self,
@@ -305,12 +340,12 @@ class SDXLTransformer2DModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
-        hidden_states = self.proj_in(hidden_states)
+        hidden_states, _ = self.proj_in(hidden_states)
 
         for block in self.transformer_blocks:
             hidden_states = block(hidden_states, encoder_hidden_states)
 
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states, _ = self.proj_out(hidden_states)
         hidden_states = hidden_states.reshape(batch, height, width, channels).permute(0, 3, 1, 2)
 
         return hidden_states + residual
@@ -343,12 +378,18 @@ class SDXLDownBlock2D(nn.Module):
         time_embed_dim: int,
         num_layers: int = 2,
         add_downsample: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.resnets = nn.ModuleList()
         for i in range(num_layers):
             res_in = in_channels if i == 0 else out_channels
-            self.resnets.append(SDXLResnetBlock2D(res_in, out_channels, time_embed_dim))
+            self.resnets.append(
+                SDXLResnetBlock2D(
+                    res_in, out_channels, time_embed_dim, quant_config=quant_config, prefix=f"{prefix}.resnets.{i}"
+                )
+            )
 
         self.downsamplers = None
         if add_downsample:
@@ -383,6 +424,7 @@ class SDXLCrossAttnDownBlock2D(nn.Module):
         transformer_layers_per_block: int = 1,
         add_downsample: bool = True,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         attention_head_dim = out_channels // num_attention_heads
@@ -391,7 +433,11 @@ class SDXLCrossAttnDownBlock2D(nn.Module):
         self.attentions = nn.ModuleList()
         for i in range(num_layers):
             res_in = in_channels if i == 0 else out_channels
-            self.resnets.append(SDXLResnetBlock2D(res_in, out_channels, time_embed_dim))
+            self.resnets.append(
+                SDXLResnetBlock2D(
+                    res_in, out_channels, time_embed_dim, quant_config=quant_config, prefix=f"{prefix}.resnets.{i}"
+                )
+            )
             self.attentions.append(
                 SDXLTransformer2DModel(
                     num_attention_heads=num_attention_heads,
@@ -400,6 +446,7 @@ class SDXLCrossAttnDownBlock2D(nn.Module):
                     num_layers=transformer_layers_per_block,
                     cross_attention_dim=cross_attention_dim,
                     prefix=f"{prefix}.attentions.{i}",
+                    quant_config=quant_config,
                 )
             )
 
@@ -435,14 +482,19 @@ class SDXLUNetMidBlock2DCrossAttn(nn.Module):
         cross_attention_dim: int = 2048,
         transformer_layers_per_block: int = 10,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         attention_head_dim = in_channels // num_attention_heads
 
         self.resnets = nn.ModuleList(
             [
-                SDXLResnetBlock2D(in_channels, in_channels, time_embed_dim),
-                SDXLResnetBlock2D(in_channels, in_channels, time_embed_dim),
+                SDXLResnetBlock2D(
+                    in_channels, in_channels, time_embed_dim, quant_config=quant_config, prefix=f"{prefix}.resnets.0"
+                ),
+                SDXLResnetBlock2D(
+                    in_channels, in_channels, time_embed_dim, quant_config=quant_config, prefix=f"{prefix}.resnets.1"
+                ),
             ]
         )
         self.attentions = nn.ModuleList(
@@ -454,6 +506,7 @@ class SDXLUNetMidBlock2DCrossAttn(nn.Module):
                     num_layers=transformer_layers_per_block,
                     cross_attention_dim=cross_attention_dim,
                     prefix=f"{prefix}.attentions.0",
+                    quant_config=quant_config,
                 )
             ]
         )
@@ -480,6 +533,8 @@ class SDXLUpBlock2D(nn.Module):
         num_layers: int = 3,
         add_upsample: bool = True,
         resnet_in_channels_list: list[int] | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.resnets = nn.ModuleList()
@@ -489,7 +544,11 @@ class SDXLUpBlock2D(nn.Module):
             else:
                 skip_channels = prev_output_channel if i == 0 else out_channels
                 res_in = (in_channels if i == 0 else out_channels) + skip_channels
-            self.resnets.append(SDXLResnetBlock2D(res_in, out_channels, time_embed_dim))
+            self.resnets.append(
+                SDXLResnetBlock2D(
+                    res_in, out_channels, time_embed_dim, quant_config=quant_config, prefix=f"{prefix}.resnets.{i}"
+                )
+            )
 
         self.upsamplers = None
         if add_upsample:
@@ -527,6 +586,7 @@ class SDXLCrossAttnUpBlock2D(nn.Module):
         add_upsample: bool = True,
         prefix: str = "",
         resnet_in_channels_list: list[int] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         attention_head_dim = out_channels // num_attention_heads
@@ -539,7 +599,11 @@ class SDXLCrossAttnUpBlock2D(nn.Module):
             else:
                 skip_channels = prev_output_channel if i == 0 else out_channels
                 res_in = (in_channels if i == 0 else out_channels) + skip_channels
-            self.resnets.append(SDXLResnetBlock2D(res_in, out_channels, time_embed_dim))
+            self.resnets.append(
+                SDXLResnetBlock2D(
+                    res_in, out_channels, time_embed_dim, quant_config=quant_config, prefix=f"{prefix}.resnets.{i}"
+                )
+            )
             self.attentions.append(
                 SDXLTransformer2DModel(
                     num_attention_heads=num_attention_heads,
@@ -548,6 +612,7 @@ class SDXLCrossAttnUpBlock2D(nn.Module):
                     num_layers=transformer_layers_per_block,
                     cross_attention_dim=cross_attention_dim,
                     prefix=f"{prefix}.attentions.{i}",
+                    quant_config=quant_config,
                 )
             )
 
@@ -625,6 +690,8 @@ class SDXLUNet2DConditionModel(nn.Module):
     def __init__(self, *, od_config: OmniDiffusionConfig):
         super().__init__()
         self.od_config = od_config
+        # Checkpoint layer names below are relative to the UNet component.
+        quant_config = resolve_component_quant_config(od_config.quantization_config, "unet")
 
         # SDXL Base configuration
         model_channels = 320
@@ -664,6 +731,8 @@ class SDXLUNet2DConditionModel(nn.Module):
                 time_embed_dim=time_embed_dim,
                 num_layers=layers_per_block,
                 add_downsample=True,
+                quant_config=quant_config,
+                prefix="down_blocks.0",
             )
         )
         # Level 1: CrossAttnDownBlock2D
@@ -678,6 +747,7 @@ class SDXLUNet2DConditionModel(nn.Module):
                 transformer_layers_per_block=transformer_layers_per_block[1],
                 add_downsample=True,
                 prefix="down_blocks.1",
+                quant_config=quant_config,
             )
         )
         # Level 2: CrossAttnDownBlock2D (no downsampler)
@@ -692,6 +762,7 @@ class SDXLUNet2DConditionModel(nn.Module):
                 transformer_layers_per_block=transformer_layers_per_block[2],
                 add_downsample=False,
                 prefix="down_blocks.2",
+                quant_config=quant_config,
             )
         )
 
@@ -703,6 +774,7 @@ class SDXLUNet2DConditionModel(nn.Module):
             cross_attention_dim=cross_attention_dim,
             transformer_layers_per_block=transformer_layers_per_block[2],
             prefix="mid_block",
+            quant_config=quant_config,
         )
 
         # Up blocks (reversed, with skip connections)
@@ -727,6 +799,7 @@ class SDXLUNet2DConditionModel(nn.Module):
                 transformer_layers_per_block=transformer_layers_per_block[2],
                 add_upsample=True,
                 prefix="up_blocks.0",
+                quant_config=quant_config,
                 resnet_in_channels_list=[1280 + 1280, 1280 + 1280, 1280 + 640],
             )
         )
@@ -744,6 +817,7 @@ class SDXLUNet2DConditionModel(nn.Module):
                 transformer_layers_per_block=transformer_layers_per_block[1],
                 add_upsample=True,
                 prefix="up_blocks.1",
+                quant_config=quant_config,
                 resnet_in_channels_list=[1280 + 640, 640 + 640, 640 + 320],
             )
         )
@@ -758,6 +832,8 @@ class SDXLUNet2DConditionModel(nn.Module):
                 num_layers=layers_per_block + 1,
                 add_upsample=False,
                 resnet_in_channels_list=[640 + 320, 320 + 320, 320 + 320],
+                quant_config=quant_config,
+                prefix="up_blocks.2",
             )
         )
 
