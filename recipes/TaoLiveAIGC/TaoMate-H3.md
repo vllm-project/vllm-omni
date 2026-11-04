@@ -129,22 +129,20 @@ running. A subsequent request starts with fresh request-owned state.
 
 ### Measure ordinary request latency
 
-Use the serial job benchmark to time POST through receipt of the complete MP4.
-Its 50 ms poll interval avoids the two-second polling granularity of the general
-diffusion load benchmark. File writes and media decoding are outside the timer.
+Use the diffusion serving benchmark to measure serial video jobs through receipt
+of the complete MP4. Set a 50 ms polling interval for this comparison; job cleanup
+and media decoding are outside the reported request latency.
 
 ```bash
-cat > request.json <<'JSON'
-{
-  "prompt": "A friendly presenter in a quiet studio explains how to grow a small garden, speaking clearly with natural gestures.",
-  "size": "480x864", "num_frames": "124", "fps": "24",
-  "seed": "8301", "num_inference_steps": "3"
-}
-JSON
-python benchmarks/diffusion/benchmark_video_jobs.py \
-  --base-url http://127.0.0.1:8000 --request-json request.json \
-  --warmup 1 --requests 34 --poll-interval 0.05 \
-  --output block-a.json --save-first block-a.mp4
+cat > requests.jsonl <<'JSONL'
+{"prompt":"A friendly presenter in a quiet studio explains how to grow a small garden, speaking clearly with natural gestures.","size":"480x864","num_frames":124,"fps":24,"seed":8301,"num_inference_steps":3}
+JSONL
+python benchmarks/diffusion/diffusion_benchmark_serving.py \\
+  --base-url http://127.0.0.1:8000 --endpoint /v1/videos \\
+  --dataset custom --dataset-path requests.jsonl --task t2v \\
+  --num-prompts 34 --max-concurrency 1 --warmup-requests 1 \\
+  --warmup-num-inference-steps 3 --video-poll-interval 0.05 \\
+  --output-file block-a.json
 ```
 
 For an optimization comparison, keep the checkpoint, adapter, devices, inputs and
