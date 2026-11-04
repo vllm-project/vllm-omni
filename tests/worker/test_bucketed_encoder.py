@@ -602,46 +602,10 @@ def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch, resto
     assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
 
 
-def test_processor_hook_adds_encoder_bucket_frames(monkeypatch, restore_processor_hook):
-    """After install_bucketed_processor_hook, the generic OmniMultiModalProcessor
-    path adds encoder_bucket_frames from the raw audio sample counts (the field
-    the worker's embed_multimodal wrapper reads back)."""
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    import numpy as np
-    from transformers import BatchFeature
-    from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
-
-    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
-    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
-
-    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-    install_bucketed_processor_hook()
-
-    class Processor(OmniMultiModalProcessor):
-        def _get_mm_fields_config(self, *args):
-            return {}
-
-        def _get_prompt_updates(self, *args):
-            return []
-
-    processor = object.__new__(Processor)
-    processor.dummy_inputs = SimpleNamespace(get_dummy_text=Mock(return_value="dummy"))
-    processor._call_hf_processor = Mock(return_value=BatchFeature({"features": "processed"}))
-
-    audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 s -> 300 mel frames at 100 fps
-    items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
-    result = processor._apply_hf_processor_main(items, {})
-
-    assert "encoder_bucket_frames" in result
-    assert torch.equal(result["encoder_bucket_frames"], torch.tensor([300], dtype=torch.int64))
-
-
-def test_processor_hook_injects_field_config(monkeypatch, restore_processor_hook):
-    """The field config must be declared even when a model's _get_mm_fields_config
-    does not declare encoder_bucket_frames, otherwise from_hf_inputs silently
-    drops the field and it never reaches the worker's embed_multimodal."""
+def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_processor_hook):
+    """The hook must (1) add encoder_bucket_frames from the raw audio sample
+    counts and (2) declare its field config so from_hf_inputs carries it to the
+    worker, even when the model's _get_mm_fields_config does not declare it."""
     from contextlib import nullcontext
     from types import SimpleNamespace
     from unittest.mock import Mock
@@ -672,18 +636,22 @@ def test_processor_hook_injects_field_config(monkeypatch, restore_processor_hook
     processor._get_mm_hashes = Mock(return_value=[])
     processor._get_mm_prompt_updates = Mock(return_value=[])
 
-    audio = np.zeros(16000 * 3, dtype=np.float32)
+    audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 s -> 300 mel frames at 100 fps
     items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
     inputs = SimpleNamespace(mm_data_items=items, hf_processor_mm_kwargs={}, prompt="hi")
     timing_ctx = SimpleNamespace(record=Mock(return_value=nullcontext()))
 
     result = processor._apply_hf_processor(inputs, timing_ctx)
 
-    flat_fields = set()
+    bucket_values = []
     for items_list in result.kwargs.values():
         for item in items_list:
-            flat_fields.update(item.keys())
-    assert "encoder_bucket_frames" in flat_fields
+            if "encoder_bucket_frames" in item:
+                elems = item["encoder_bucket_frames"]
+                if not isinstance(elems, (list, tuple)):
+                    elems = [elems]
+                bucket_values.extend(int(e.data) for e in elems)
+    assert bucket_values == [300]
 
 
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
