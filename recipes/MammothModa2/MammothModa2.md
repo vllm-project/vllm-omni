@@ -136,6 +136,28 @@ Keeping layer 0 in BF16 restores them; keeping only layer 27, which has the
 largest key magnitude, does not. The H800 numbers above were measured with all 28
 layers in FP8; this preset has been run on A800 only.
 
+### CUDA graphs and AR MoE routing
+
+AR layers 14–27 route between understanding (`mlp`) and generation (`gen_mlp`)
+experts. Stock deploy configs keep stage-0 on `enforce_eager: true` so MoE
+runs a single expert.
+
+If you enable `compilation_config.cudagraph_mode: FULL` on the AR stage, the
+graph-safe path must record **both** experts and select per token with
+`torch.where` (see #9764 / #9851). That is a necessary cost of correct FULL
+replay (~+25% AR decode on H200 t2i), and the same dual-expert tax applies to
+understanding-only traffic that reuses those FULL graphs.
+
+| Workload | Recommended stage-0 preset |
+| --- | --- |
+| Understanding / AR-only chat | [`mammoth_moda2_ar.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar.yaml) (eager, default) or [`mammoth_moda2_ar_piecewise.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar_piecewise.yaml) |
+| Text-to-image (default) | [`mammoth_moda2.yaml`](../../vllm_omni/deploy/mammoth_moda2.yaml) (AR eager) |
+| Text-to-image with FULL AR graphs | [`mammoth_moda2_ar_graph_full.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar_graph_full.yaml) (accept dual-expert cost) |
+
+Do not point und-only serving at the FULL preset. Mask-keyed split graphs
+(all-und / all-gen / blend) that would drop the und-only tax under FULL are
+tracked in #9865.
+
 ### 1x L40S 48GB
 
 > **48 GB config adjustment:** the committed

@@ -1,4 +1,9 @@
 # MammothModa2 AR-only (image/video understanding and summarization).
+#
+# Keep enforce_eager: true (default) or switch to cudagraph_mode: PIECEWISE.
+# Do not use cudagraph_mode: FULL for und-only AR: FULL records both MoE
+# experts for graph-safe replay (#9764), which taxes understanding traffic.
+# For intentional FULL t2i AR graphs see mammoth_moda2_ar_graph_full.yaml.
 
 async_chunk: false
 pipeline: mammoth_moda2_ar
