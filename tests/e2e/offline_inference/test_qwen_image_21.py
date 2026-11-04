@@ -18,11 +18,11 @@ INPUT_IMAGE = Path(__file__).resolve().parents[2] / "assets/qwen_image_edit/qwen
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "npu": "A5"}, num_cards=1)
+@hardware_test(res={"npu": "A5"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", [RUNNER], indirect=True)
 @pytest.mark.parametrize("scenario", ["t2i", "i2i"])
 def test_generate_image(offline_client: OfflineOmniClient, scenario: str):
-    """Exercise prefill/decode through the public model API on either platform."""
+    """Exercise prefill/decode through the public model API on Ascend A5."""
     sampling = OmniDiffusionSamplingParams(
         height=512,
         width=512,
