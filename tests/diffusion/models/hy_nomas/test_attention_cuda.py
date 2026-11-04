@@ -8,8 +8,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionRanges
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.models.hy_nomas.attention import RangeAttention
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -18,17 +17,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("kv_heads", [2, 4])
 @torch.no_grad()
-def test_compiled_flex_ranges_match_fp32_sdpa(dtype, kv_heads):
+def test_compiled_ranges_match_fp32_sdpa(dtype, kv_heads):
     generator = torch.Generator(device="cuda").manual_seed(41)
     q = torch.randn(1, 19, 4, 128, device="cuda", dtype=dtype, generator=generator)
     k, v = [torch.randn(1, 23, kv_heads, 128, device="cuda", dtype=dtype, generator=generator) for _ in range(2)]
     qm, km = torch.ones(1, 19, device="cuda", dtype=torch.bool), torch.ones(1, 23, device="cuda", dtype=torch.bool)
     qm[:, 2], km[:, 5] = False, False
-    rectangles = [[(0, 10, 0, 13), (10, 19, 8, 23)]]
-    attention = Attention(
-        4, 128, causal=False, softmax_scale=128**-0.5, num_kv_heads=kv_heads, default_backend="FLEX_ATTENTION"
-    )
-    actual = attention(q, k, v, AttentionMetadata(range_mask=AttentionRanges(rectangles, qm, km)))
+    ranges = [[(0, 10, 0, 13), (10, 19, 8, 23)]]
+    actual = RangeAttention(128**-0.5)(q, k, v, ranges=ranges, query_mask=qm, key_mask=km)
     pair_mask = torch.zeros(1, 1, 19, 23, device="cuda", dtype=torch.bool)
     pair_mask[:, :, :10, :13], pair_mask[:, :, 10:, 8:] = True, True
     pair_mask &= qm[:, None, :, None] & km[:, None, None, :]
@@ -46,7 +42,7 @@ def test_compiled_flex_ranges_match_fp32_sdpa(dtype, kv_heads):
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.no_grad()
-def test_prebuilt_flex_mask_preserves_static_kernel_numerics():
+def test_prebuilt_mask_preserves_static_kernel_numerics():
     generator = torch.Generator(device="cuda").manual_seed(42)
     q = torch.randn(1, 9600, 32, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
     k, v = [torch.randn(1, 9600, 8, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(2)]
@@ -55,10 +51,7 @@ def test_prebuilt_flex_mask_preserves_static_kernel_numerics():
         return (query // 640 - key // 640).abs() <= 1
 
     mask = create_block_mask(mask_mod, None, None, 9600, 9600, device="cuda", _compile=True)
-    attention = Attention(
-        32, 128, causal=False, softmax_scale=128**-0.5, num_kv_heads=8, default_backend="FLEX_ATTENTION"
-    )
-    actual = attention(q, k, v, AttentionMetadata(range_mask=AttentionRanges(), extra={"block_mask": mask}))
+    actual = RangeAttention(128**-0.5)(q, k, v, block_mask=mask)
     expected = torch.compile(flex_attention, dynamic=False)(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=mask, enable_gqa=True
     ).transpose(1, 2)

@@ -376,32 +376,3 @@ def test_prepare_and_growth_reject_cuda_graph_capture_before_work(monkeypatch):
     with pytest.raises(RuntimeError, match="outside CUDA graph capture"):
         cache.ensure_segmented_staging("main", 1000)
     assert state._staging() is old and state.history_gathers == 0
-
-
-@pytest.mark.parametrize("cache_conditioning", [False, True])
-def test_public_kv_context_assembles_exact_rows_and_leaves_publication_to_owner(cache_conditioning):
-    from vllm_omni.experimental.ar_diffusion.kv_cache.attention import ARDiffusionKVLayerContext
-
-    cache = make_cache()
-    owner = make_state(cache)
-    state = owner.segmented("main")
-    with pytest.raises(RuntimeError, match="prepare_layer_views"):
-        state.layer_view(0)
-    old = append(state, (3, 5), offset=7)
-    current = rows(5, 31)[None]
-    media = 5 if cache_conditioning else 4
-    state.prepare_layer_views(media, 0 if cache_conditioning else 1)
-    pending = state.begin_commit((media,))
-    for layer in range(cache.num_layers):
-        key, value = state.layer_view(layer)
-        context = ARDiffusionKVLayerContext(layer, 8, 4, cache_conditioning, True, key[None], value[None], state)
-        actual_key, actual_value = context.assemble(current, -current)
-        expected = torch.cat((rows(8, 7 + 100 * layer)[None], current), 1)
-        torch.testing.assert_close(actual_key, expected)
-        torch.testing.assert_close(actual_value, -expected)
-        assert actual_key.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
-        state.stage(layer)
-    assert state.handles == old and state.history_tokens == 8
-    state.commit(retain=(*old, *pending))
-    assert state.history_tokens == 8 + media
-    owner.close()

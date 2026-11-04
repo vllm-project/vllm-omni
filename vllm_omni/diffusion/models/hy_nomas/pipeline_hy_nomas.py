@@ -538,9 +538,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                self.vae.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
-                if bound is not None
-                else None,
+                self.vae.create_streaming_decode_session() if bound is not None else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
             if recent:
@@ -709,10 +707,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 raise RuntimeError("Hy-Nomas KV history and text visibility mask disagree.")
             condition_tokens = state.prompt_embeds.shape[1] if commit and not first else 0
             cache.prepare_layer_views(current_tokens, condition_tokens)
-            views = []
-            for layer in range(cache.cache.num_layers):
-                key, value = cache.layer_view(layer)
-                views.append({"k": key[None, : history + current_tokens], "v": value[None, : history + current_tokens]})
+            views = None
         else:
             if session.offline_cache is None:
                 raise RuntimeError("Hy-Nomas offline KV cache is not initialized.")
@@ -771,7 +766,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     global_frame_counter=session.latent_frames,
                     guidance=None,
                     cache_txt=first,
-                    cache_mask_list=[mask] * len(views),
+                    cache_mask_list=[mask] * self.num_double_blocks,
                     camera_embedding=state.extra["hy_nomas_camera"],
                     camera_has_mask=state.extra["hy_nomas_camera_mask"],
                     intra_seg_txt_offsets=state.extra["hy_nomas_intra_offsets"],
@@ -806,7 +801,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                             budget = self.ar_config.history_latent_frames * (image_tokens // latents.shape[2])
                             frames, cut = recent_history(frames, budget)
                             retained = tuple(frame.handle for frame in frames)
-                        for layer in range(len(views)):
+                        for layer in range(self.num_double_blocks):
                             cache.stage(layer)
                         cache.validate_commit(retain=retained)
                     except Exception as exc:

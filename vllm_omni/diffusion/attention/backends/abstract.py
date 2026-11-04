@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, Protocol, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
@@ -19,7 +19,6 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
-    supports_range_mask: bool = False
     # A backend that supports this capability can consume the opaque paged-KV
     # context prepared by the diffusion Worker data plane.  Keeping the
     # capability on the backend class prevents a paged request from silently
@@ -236,21 +235,6 @@ class PackedPaddingMetadata:
     cu_seqlens_k: torch.Tensor
 
 
-@dataclass(frozen=True)
-class AttentionRanges:
-    """Exact Q/K rectangle unions and independent token visibility, without a dense QxK tensor."""
-
-    rectangles: list[list[tuple[int, int, int, int]]] | None = None
-    query_mask: torch.Tensor | None = None
-    key_mask: torch.Tensor | None = None
-
-
-class AttentionKVContext(Protocol):
-    """Prepare rank-local K/V after the shared parallel strategy has resharded Q/K/V."""
-
-    def assemble(self, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -308,8 +292,6 @@ class AttentionMetadata:
     cross_kv_rows_validated: bool = False
     cross_query_mask: torch.Tensor | None = None
     cross_pair_mask_validated: bool = False
-    range_mask: AttentionRanges | None = None
-    kv_context: AttentionKVContext | None = None
 
     @classmethod
     def for_cross_kv_mask(cls, mask: torch.Tensor, *, kv_slice: slice | None = None) -> "AttentionMetadata":

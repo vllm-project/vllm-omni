@@ -5,14 +5,11 @@ import json
 import os
 import subprocess
 import sys
-from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import load_file, save_file
 from torch import nn
@@ -103,14 +100,6 @@ def checkpoint(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config))
     return tmp_path
-
-
-def test_native_decoder_has_rolling_session():
-    from inspect import signature
-
-    from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-
-    assert "rolling" in signature(PixelUMMDCAELatentDecoder.create_streaming_decode_session).parameters
 
 
 def test_discovery_from_modular_index(checkpoint, monkeypatch):
@@ -744,30 +733,12 @@ def test_decoder_factory_places_every_parameter():
     )
 
 
-def _check_reference_parallelism(rank, rendezvous):
-    from vllm_omni.diffusion.models.hy_nomas import hy_nomas_transformer
-
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
-    try:
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setenv("RANK", "0")
-            group = Mock(ulysses_group=dist.group.WORLD, ulysses_world_size=2, world_size=2)
-            patch.setattr(hy_nomas_transformer, "get_sp_group", lambda: group)
-            hy_nomas_transformer.validate_sequence_parallelism(2)
-            value = torch.tensor(rank + 1)
-            dist.all_reduce(value, group=group.ulysses_group)
-            assert value.item() == 3
-
-            assert hy_nomas_transformer.validate_sequence_parallelism(1) is None
-            assert group.ulysses_group is dist.group.WORLD
-            assert dist.is_initialized()
-
-            group.ulysses_world_size = 4
-            with pytest.raises(ValueError, match="match ulysses_degree"):
-                hy_nomas_transformer.validate_sequence_parallelism(2)
-    finally:
-        dist.destroy_process_group()
-
-
-def test_native_validation_preserves_worker_process_group(tmp_path):
-    mp.spawn(_check_reference_parallelism, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+@pytest.mark.parametrize("sp_size,ulysses_size,world_size", [(1, 1, 1), (2, 2, 2), (2, 4, 2), (2, 2, 4)])
+def test_sequence_parallelism_matches_worker_group(monkeypatch, sp_size, ulysses_size, world_size):
+    group = SimpleNamespace(ulysses_world_size=ulysses_size, world_size=world_size)
+    monkeypatch.setattr("vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer.get_sp_group", lambda: group)
+    if sp_size == ulysses_size == world_size:
+        pipeline_hy_nomas.validate_sequence_parallelism(sp_size)
+    else:
+        with pytest.raises(ValueError, match="match ulysses_degree"):
+            pipeline_hy_nomas.validate_sequence_parallelism(sp_size)

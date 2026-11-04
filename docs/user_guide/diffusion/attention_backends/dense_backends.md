@@ -28,16 +28,6 @@ launches than the fused path; benchmark it separately when choosing a backend.
 Compiled execution, other attention backends, CPU, FP16, and ROCm retain the
 existing fused or activation-dtype rotary paths.
 
-## `FLEX_ATTENTION`
-
-`FLEX_ATTENTION` executes exact rectangle unions and independent Q/K validity,
-or a model-prepared PyTorch `BlockMask`. It supports inference on CPU and compiled
-CUDA FP16/BF16 tensors, including grouped-query heads. CPU is useful for small
-correctness checks. Models supply mask geometry through `AttentionMetadata`;
-the shared layer retains backend selection and Ulysses communication. Ring and
-Scheduler-paged execution reject this mask contract. Unsupported backends cannot
-silently ignore exact range masks.
-
 ## `FLASH_ATTN`
 
 `FLASH_ATTN` uses the installed FlashAttention implementation. On Blackwell it

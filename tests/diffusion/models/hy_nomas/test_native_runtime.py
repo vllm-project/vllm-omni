@@ -8,15 +8,11 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn import functional as F
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionRanges
-from vllm_omni.diffusion.attention.backends.flex_attention import FlexAttentionImpl, build_range_mask
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
@@ -137,8 +133,6 @@ assert not any(name.split('.')[0] in ('hymm', 'configs') for name in sys.modules
 def test_native_dit_cache_and_camera():
     torch.manual_seed(17)
     model = _small_transformer()
-    assert not model.attention._has_custom_attention and not model.camera_attention._has_custom_attention
-    assert not model.txt_in.individual_token_refiner.blocks[0].attn._has_custom_attention
     cache = [{"k": torch.zeros(1, 20, 4, 8), "v": torch.zeros(1, 20, 4, 8)}]
     mask = torch.zeros(1, 20, dtype=torch.bool)
     inputs = dict(
@@ -163,38 +157,47 @@ def test_native_dit_cache_and_camera():
     history = cache[0]["k"][:, :5].clone()
     next_output, _ = model.forward_with_cache(**inputs, cache_valid_len=5, global_frame_counter=2, cache_txt=False)
     assert torch.isfinite(next_output).all() and torch.equal(cache[0]["k"][:, :5], history)
-    assert len(model.attention.attention.masks) <= 32
+    assert len(model.attention.masks) <= 32
     model.clear_attention_cache()
-    assert not model.attention.attention.masks and not model.camera_attention.attention.masks
+    assert not model.attention.masks and not model.camera_attention.masks
 
 
 @torch.no_grad()
-def test_range_attention_holes_matches_dense_math():
-    torch.manual_seed(9)
-    q, k, v = torch.randn(1, 4, 2, 8), torch.randn(1, 6, 2, 8), torch.randn(1, 6, 2, 8)
-    qm, km = torch.tensor([[True, False, True, True]]), torch.tensor([[True, False, True, True, False, True]])
-    actual = FlexAttentionImpl(2, 8, 8**-0.5).forward(
-        q, k, v, AttentionMetadata(range_mask=AttentionRanges(query_mask=qm, key_mask=km))
-    )
-    expected = F.scaled_dot_product_attention(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=(qm[:, :, None] & km[:, None, :])[:, None]
-    ).transpose(1, 2)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-    assert torch.count_nonzero(actual[:, 1]) == 0
+def test_native_segmented_kv_matches_contiguous_storage():
+    from tests.diffusion.ar_diffusion.test_segmented_kv import make_cache, make_state
 
-
-def test_range_mask_exact_rectangles_and_padding():
-    mask = build_range_mask(
-        3, 4, [(0, 2, 0, 2), (2, 3, 2, 4)], "cpu", np.array([True, False, True]), np.array([True, True, False, True])
-    )
-    actual = mask.mask_mod(torch.tensor(0), torch.tensor(0), torch.arange(4)[:, None], torch.arange(5)[None])
-    expected = torch.tensor([[1, 1, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 0, 0]], dtype=torch.bool)
-    assert torch.equal(actual, expected)
-
-
-def test_range_mask_rejects_overlapping_rectangles():
-    with pytest.raises(ValueError, match="must not overlap"):
-        build_range_mask(3, 4, [(0, 2, 0, 2), (1, 3, 1, 3)], "cpu", np.ones(3, dtype=bool), np.ones(4, dtype=bool))
+    torch.manual_seed(23)
+    model = _small_transformer()
+    owner = make_state(make_cache(num_layers=1, num_kv_heads=4, head_size=8))
+    state = owner.segmented("main")
+    contiguous = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)}]
+    masks = [torch.zeros(1, 32, dtype=torch.bool) for _ in range(2)]
+    try:
+        for turn in range(2):
+            inputs = dict(
+                hidden_states=torch.randn(1, 4, 2, 1, 1),
+                timestep=torch.tensor([300.0]),
+                text_states=torch.randn(1, 3, 6),
+                text_mask=torch.tensor([[1, 1, 0]]),
+                cache_txt=turn == 0,
+                update_cache=True,
+                cache_valid_len=state.history_tokens,
+                global_frame_counter=turn * 2,
+                camera_embedding=torch.randn(1, 2, 64),
+            )
+            media = 5 if turn == 0 else 2
+            state.prepare_layer_views(media, 0 if turn == 0 else 3)
+            pending = state.begin_commit((media,))
+            expected, written = model.forward_with_cache(**inputs, kv_cache_list=contiguous, cache_mask_list=[masks[0]])
+            actual, actual_written = model.forward_with_cache(
+                **inputs, kv_cache_state=state, cache_mask_list=[masks[1]]
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert actual_written == written and torch.equal(masks[0], masks[1])
+            state.stage(0)
+            state.commit(retain=(*state.handles, *pending))
+    finally:
+        owner.close()
 
 
 @pytest.mark.parametrize(
@@ -220,7 +223,7 @@ def test_real_pixelumm_stream_matches_full_decode():
     ).eval()
     latent = torch.randn(1, 32, 7, 1, 1)
     full = model.decode(latent).sample
-    session = model.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
+    session = model.create_streaming_decode_session()
     parts = []
     for start, end in ((0, 2), (2, 4), (4, 7)):
         session.final_segment = end == 7
@@ -266,10 +269,10 @@ def _native_ulysses_worker(rank, rendezvous):
         ]
         with pytest.MonkeyPatch.context() as patch, torch.no_grad():
             patch.setattr(parallel_state, "_SP", group)
+            pipeline_hy_nomas.validate_sequence_parallelism(2)
             torch.manual_seed(17)
             with set_forward_context(omni_diffusion_config=configs[1]), set_current_diffusion_config(configs[1]):
                 model = _small_transformer(2, num_layers=2)
-            assert model.attention.parallel_strategy.name == "ulysses"
             reference = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)} for _ in range(2)]
             candidate = [{"k": torch.zeros(1, 32, 2, 8), "v": torch.zeros(1, 32, 2, 8)} for _ in range(2)]
             masks = [torch.zeros(1, 32, dtype=torch.bool) for _ in range(2)]
@@ -306,6 +309,7 @@ def _native_ulysses_worker(rank, rendezvous):
                         rtol=1e-5,
                         atol=1e-6,
                     )
+            assert dist.is_initialized() and dist.get_world_size() == 2
     finally:
         if group is not None:
             group.destroy()

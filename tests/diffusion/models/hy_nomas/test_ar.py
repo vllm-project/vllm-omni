@@ -17,6 +17,7 @@ from tests.diffusion.ar_diffusion.test_capability_runner import make_runner
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
+from vllm_omni.diffusion.models.hy_nomas.attention import assemble_kv
 from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import REQUIRED_FILES, HyNomasARConfig
 from vllm_omni.diffusion.models.hy_nomas.interaction import (
     HyNomasCameraInteractionHandler,
@@ -125,6 +126,32 @@ class PipelineWithCPUComponents(HyNomasPipeline):
         start = kwargs["cache_valid_len"]
         image = hidden.shape[2]
         count = image + (kwargs["text_states"].shape[1] if kwargs["cache_txt"] else 0)
+        history = None
+        for layer in range(self.num_double_blocks):
+            state = kwargs.get("kv_cache_state")
+            cache = state if state is not None else kwargs["kv_cache_list"][layer]
+            key = hidden.new_full(
+                (1, image + kwargs["text_states"].shape[1], 2, 4), layer + kwargs["global_frame_counter"] + 1
+            )
+            full_key, _ = assemble_kv(
+                cache,
+                layer,
+                key,
+                -key,
+                history=start,
+                media_tokens=image,
+                cache_text=kwargs["cache_txt"],
+                update=kwargs["update_cache"],
+            )
+            if layer == 0:
+                history = full_key[:, :start].clone()
+            if kwargs["update_cache"]:
+                mask = kwargs["cache_mask_list"][layer]
+                mask[:, start : start + image] = True
+                if kwargs["cache_txt"]:
+                    mask[:, start + image :] = kwargs["text_mask"].bool()
+                if self.fail_clean and layer == 0:
+                    raise RuntimeError("injected clean-forward failure")
         self.calls.append(
             {
                 "commit": kwargs["update_cache"],
@@ -133,26 +160,9 @@ class PipelineWithCPUComponents(HyNomasPipeline):
                 "text_length": kwargs["text_states"].shape[1],
                 "timestep_dtype": kwargs["timestep"].dtype,
                 "cache_txt": kwargs["cache_txt"],
-                "history": kwargs["kv_cache_list"][0]["k"][:, :start].clone(),
+                "history": history,
             }
         )
-        if kwargs["update_cache"]:
-            for layer, view in enumerate(kwargs["kv_cache_list"]):
-                view["k"][:, start:] = layer + kwargs["global_frame_counter"] + 1
-                view["v"][:, start:] = -view["k"][:, start:]
-                mask = kwargs["cache_mask_list"][layer]
-                mask[:, start : start + image] = True
-                if kwargs["cache_txt"]:
-                    mask[:, start + image :] = kwargs["text_mask"].bool()
-                state = kwargs.get("kv_cache_state")
-                if state is not None:
-                    key, value = view["k"][0, start : start + count], view["v"][0, start : start + count]
-                    condition = key.new_full(
-                        (kwargs["text_states"].shape[1] if not kwargs["cache_txt"] else 0, *key.shape[1:]), layer + 1
-                    )
-                    state.assemble(layer, condition, -condition, key, value)
-                if self.fail_clean and layer == 0:
-                    raise RuntimeError("injected clean-forward failure")
         return torch.ones_like(hidden) * 0.25, count if kwargs["update_cache"] else 0
 
     def _prepare_vae_decode_latents(self, latents):

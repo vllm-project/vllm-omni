@@ -8,7 +8,8 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
 
 def modulate(x, shift, scale):
@@ -101,23 +102,20 @@ class TokenRefinerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden, eps=1e-6, **kwargs)
         self.mlp = MLP(hidden, 4 * hidden, **kwargs)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 2 * hidden, **kwargs))
-        self.attn = Attention(
+        attention_impl = FlashAttentionImpl if torch.device(kwargs.get("device") or "cpu").type == "cuda" else SDPAImpl
+        self.attn = attention_impl(
             num_heads=heads,
             head_size=hidden // heads,
             causal=False,
             softmax_scale=(hidden // heads) ** -0.5,
-            role="hy_nomas.text_refiner",
-            skip_sequence_parallel=True,
-            default_backend="FLASH_ATTN"
-            if torch.device(kwargs.get("device") or "cpu").type == "cuda"
-            else "TORCH_SDPA",
+            qkv_layout="BSND",
         )
 
     def forward(self, x, c, mask):
         gate_attention, gate_mlp = self.adaLN_modulation(c).chunk(2, dim=1)
         batch, length, hidden = x.shape
         q, k, v = self.self_attn_qkv(self.norm1(x)).view(batch, length, 3, self.heads_num, -1).unbind(2)
-        output = self.attn(q, k, v, AttentionMetadata(attn_mask=mask)).reshape(batch, length, hidden)
+        output = self.attn.forward(q, k, v, AttentionMetadata(attn_mask=mask)).reshape(batch, length, hidden)
         output = output.masked_fill(~mask[:, :, None], 0)
         x = x + self.self_attn_proj(output) * gate_attention.unsqueeze(1)
         return x + self.mlp(self.norm2(x)) * gate_mlp.unsqueeze(1)

@@ -13,10 +13,11 @@ from torch import nn
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionRanges
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-from vllm_omni.diffusion.models.hy_nomas.attention import action_ranges
+from vllm_omni.diffusion.models.hy_nomas.attention import RangeAttention, action_ranges, assemble_kv
 from vllm_omni.diffusion.models.hy_nomas.layers import (
     MLP,
     FinalLayer,
@@ -29,7 +30,7 @@ from vllm_omni.diffusion.models.hy_nomas.layers import (
     modulate,
     rotary_tables,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.attention import ARDiffusionKVLayerContext
+from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
 _DIT_NAMES = WeightsMapper(
     orig_to_new_regex={
@@ -110,7 +111,7 @@ class MMDoubleStreamBlock(nn.Module):
         update,
         cache_txt,
         cache_mask,
-        kv_context,
+        layer_idx,
         attention,
         sp_size,
         offsets,
@@ -133,22 +134,20 @@ class MMDoubleStreamBlock(nn.Module):
         iq, ik, iv, im = streams[0]
         tq, tk, tv, tm = streams[1]
         dtype = iq.dtype
-        iq, ik, iv, tq, tk, tv = [value.to(cache["k"].dtype) for value in (iq, ik, iv, tq, tk, tv)]
-        image_mask = torch.ones((img.shape[0], kv_context.media_tokens), dtype=torch.bool, device=ik.device)
+        cache_dtype = cache.cache.dtype if isinstance(cache, ARDiffusionSegmentedKVState) else cache["k"].dtype
+        iq, ik, iv, tq, tk, tv = [value.to(cache_dtype) for value in (iq, ik, iv, tq, tk, tv)]
+        image_tokens = img.shape[1] * sp_size
+        image_mask = torch.ones((img.shape[0], image_tokens), dtype=torch.bool, device=ik.device)
         current_mask = torch.cat((image_mask, text_mask.bool()), 1)
         history_mask = cache_mask[:, :history]
         if update:
-            count = kv_context.media_tokens + (text_mask.shape[1] if cache_txt else 0)
+            count = image_tokens + (text_mask.shape[1] if cache_txt else 0)
             cache_mask[:, history : history + count] = current_mask if cache_txt else image_mask
         key_mask = torch.cat((history_mask, current_mask if cache_txt or update else image_mask), 1)
         ranges = None
         if cache_txt and offsets is not None and windows:
-            ranges = action_ranges(
-                history_mask, text_mask.bool(), kv_context.media_tokens, offsets, windows, tokens_per_frame
-            )
+            ranges = action_ranges(history_mask, text_mask.bool(), image_tokens, offsets, windows, tokens_per_frame)
         metadata = AttentionMetadata(
-            range_mask=AttentionRanges(ranges, current_mask, key_mask),
-            kv_context=kv_context,
             joint_query=tq if sp_size > 1 else None,
             joint_key=tk if sp_size > 1 else None,
             joint_value=tv if sp_size > 1 else None,
@@ -157,7 +156,18 @@ class MMDoubleStreamBlock(nn.Module):
         q, k, v = (
             (iq, ik, iv) if sp_size > 1 else (torch.cat((iq, tq), 1), torch.cat((ik, tk), 1), torch.cat((iv, tv), 1))
         )
-        hidden = attention(q, k, v, metadata)
+        strategy = (
+            UlyssesParallelAttention(get_sp_group(), scatter_idx=2, gather_idx=1, use_sync=False)
+            if sp_size > 1
+            else NoParallelAttention()
+        )
+        q, k, v, _, context = strategy.pre_attention(q, k, v, metadata)
+        k, v = assemble_kv(
+            cache, layer_idx, k, v, history=history, media_tokens=image_tokens, cache_text=cache_txt, update=update
+        )
+        hidden = strategy.post_attention(
+            attention(q, k, v, ranges=ranges, query_mask=current_mask, key_mask=key_mask), context
+        )
         image_attention, text_attention = hidden[:, : img.shape[1]], hidden[:, img.shape[1] :]
         results = []
         for name, x, attn, mods in (("img", img, image_attention, im), ("txt", txt, text_attention, tm)):
@@ -205,9 +215,7 @@ class ActionModule(nn.Module):
         # Preserve the reference D=128 padding and the original camera scale.
         if self.head_dim == 64:
             q, k, v = [nn.functional.pad(value, (0, 64)) for value in (q, k, v)]
-        out = attention(q, k, v, AttentionMetadata(range_mask=AttentionRanges([rectangles] * batch)))[
-            ..., : self.head_dim
-        ]
+        out = attention(q, k, v, ranges=[rectangles] * batch)[..., : self.head_dim]
         out = self.proj_keyboard(out.reshape(batch, length, -1))
         if camera_mask is not None:
             out = out * camera_mask.float()[:, None, None]
@@ -263,28 +271,9 @@ class HyNomasTransformer(nn.Module):
             for _ in range(self.config.num_layers)
         )
         self.final_layer = FinalLayer(self.hidden_size, self.out_channels, **kwargs)
-        self.attention = Attention(
-            num_heads=self.heads_num,
-            head_size=self.config.attention_head_dim,
-            causal=False,
-            softmax_scale=self.config.attention_head_dim**-0.5,
-            role="hy_nomas.cached",
-            default_backend="FLEX_ATTENTION",
-        )
+        self.attention = RangeAttention(self.config.attention_head_dim**-0.5)
         camera_dim = self.config.camera_attention_dim // self.config.camera_num_attention_heads
-        self.camera_attention = Attention(
-            num_heads=self.config.camera_num_attention_heads,
-            head_size=128 if camera_dim == 64 else camera_dim,
-            causal=False,
-            softmax_scale=camera_dim**-0.5,
-            role="hy_nomas.camera",
-            role_category="cross",
-            default_backend="FLEX_ATTENTION",
-            computation="cross",
-            qkv_layout="BSND",
-            cross_parallel_layout="local_q_replicated_kv",
-            skip_sequence_parallel=True,
-        )
+        self.camera_attention = RangeAttention(camera_dim**-0.5)
         self.action_modules = nn.ModuleList(
             ActionModule(model_config, self.hidden_size, **kwargs) for _ in range(self.config.num_layers)
         )
@@ -307,7 +296,7 @@ class HyNomasTransformer(nn.Module):
         timestep,
         text_states,
         text_mask,
-        kv_cache_list,
+        kv_cache_list=None,
         cache_valid_len=0,
         update_cache=False,
         global_frame_counter=0,
@@ -323,6 +312,8 @@ class HyNomasTransformer(nn.Module):
     ):
         if camera_rope_time_offset != 0:
             raise ValueError("Hy-Nomas uses local camera RoPE.")
+        if kv_cache_state is None and kv_cache_list is None:
+            raise ValueError("Hy-Nomas forward requires KV storage.")
         batch, _, frames, height, width = hidden_states.shape
         tables = rotary_tables(
             (frames, height, width),
@@ -339,28 +330,18 @@ class HyNomasTransformer(nn.Module):
         vec = self.time_in(timestep)
         txt = self.txt_in(text_states, timestep, text_mask)
         for index, block in enumerate(self.double_blocks):
-            context = ARDiffusionKVLayerContext(
-                index,
-                cache_valid_len,
-                frames * height * width,
-                cache_txt,
-                update_cache,
-                kv_cache_list[index]["k"],
-                kv_cache_list[index]["v"],
-                kv_cache_state,
-            )
             img, txt = block(
                 img,
                 txt,
                 vec,
                 tables,
                 text_mask,
-                kv_cache_list[index],
+                kv_cache_state if kv_cache_state is not None else kv_cache_list[index],
                 cache_valid_len,
                 update_cache,
                 cache_txt,
                 cache_mask_list[index],
-                context,
+                index,
                 self.attention,
                 self.sp_size,
                 intra_seg_txt_offsets,
@@ -381,5 +362,4 @@ class HyNomasTransformer(nn.Module):
 
     def clear_attention_cache(self):
         for attention in (self.attention, self.camera_attention):
-            if attention.attn_backend.get_name() == "FLEX_ATTENTION":
-                attention.attention.clear()
+            attention.clear()

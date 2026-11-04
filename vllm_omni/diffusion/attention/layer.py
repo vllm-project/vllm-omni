@@ -7,10 +7,9 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import replace
-from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -44,9 +43,6 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
 )
 from vllm_omni.platforms import current_omni_platform
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import AttentionSpec
 
 logger = init_logger(__name__)
 
@@ -102,7 +98,6 @@ class Attention(nn.Module):
         # Keep the platform-selected backend and its capabilities unchanged.
         # Each override must preserve the selected implementation's contract.
         impl_overrides: Mapping[str, type[AttentionImpl]] | None = None,
-        default_backend: str | None = None,
         # Computation semantics are independent of the role used for config.
         # Omitted for legacy callers; new cross-attention callers set it.
         computation: AttentionComputation | str | None = None,
@@ -183,12 +178,7 @@ class Attention(nn.Module):
         self.attention: AttentionImpl | nn.Module
         self.sdpa_fallback: SDPAImpl | None
         if custom_attention is None:
-            selector: Callable[..., tuple[type[AttentionBackend], AttentionSpec | None]]
-            if default_backend is not None:
-                selector = partial(get_attn_backend_for_role, default_backend=default_backend)
-            else:
-                selector = get_attn_backend_for_role
-            attn_backend_cls, spec = selector(
+            attn_backend_cls, spec = get_attn_backend_for_role(
                 role=role,
                 head_size=head_size,
                 attention_config=attention_config,
@@ -243,7 +233,7 @@ class Attention(nn.Module):
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
             self.attn_backend = attn_backend_cls
-            self.attn_impl_cls = attn_backend_cls.get_impl_cls()
+            self.attn_impl_cls = self.attn_backend.get_impl_cls()
             if impl_overrides is not None:
                 override = impl_overrides.get(attn_backend_cls.get_name())
                 if override is not None:
@@ -577,12 +567,6 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
-        if (
-            attn_metadata is not None
-            and attn_metadata.range_mask is not None
-            and (use_paged_attention or self.use_ring and strategy is not self._no_parallel_strategy)
-        ):
-            raise NotImplementedError("Exact range masks require dense attention with no Ring strategy")
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
@@ -607,11 +591,6 @@ class Attention(nn.Module):
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
-
-        if attn_metadata is not None and attn_metadata.kv_context is not None:
-            if use_paged_attention or self.use_ring or strategy.name not in ("none", "ulysses"):
-                raise NotImplementedError("Post-parallel KV assembly supports dense attention and strict Ulysses only")
-            key, value = attn_metadata.kv_context.assemble(key, value)
 
         # MiniMax-H3 Tier2 stores reference K/V in the balanced layout produced
         # by Ulysses. Keeping this hook at the generic post-parallel boundary
@@ -807,9 +786,6 @@ class Attention(nn.Module):
         return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
 
     def _run_local_attention(self, query, key, value, attn_metadata):
-        if attn_metadata is not None and attn_metadata.range_mask is not None:
-            if not getattr(self.attn_backend, "supports_range_mask", False):
-                raise NotImplementedError("Exact attention ranges require a backend supporting range_mask")
         if self._has_custom_attention:
             return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 

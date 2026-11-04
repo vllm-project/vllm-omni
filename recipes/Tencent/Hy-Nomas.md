@@ -110,9 +110,9 @@ vLLM 0.32.0, Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3.
 The NVIDIA driver was 570.133.20.
 
 Install vLLM-Omni with its standard platform dependencies. The native text
-refiner uses the shared `FLASH_ATTN` backend and its available implementation;
-it does not require a separate pinned FlashAttention 2 package. Cached DiT and
-camera attention use the shared `FLEX_ATTENTION` backend for exact range masks.
+refiner reuses Omni's FlashAttention implementation without a separate pinned
+FlashAttention 2 package. Hy-Nomas owns its FlexAttention masks and KV assembly,
+while reusing Omni's Ulysses communication and AR-managed KV storage.
 
 ```bash
 python -m pip install -e .

@@ -13,8 +13,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionRanges
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.models.hy_nomas.attention import RangeAttention
 
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
@@ -183,25 +183,13 @@ class GenAttention(nn.Module):
         self.q_norm_hw = RMSNorm(dim // 2, arch.rms_norm_eps)
         self.k_norm_t = RMSNorm(dim // 2, arch.rms_norm_eps)
         self.k_norm_hw = RMSNorm(dim // 2, arch.rms_norm_eps)
-        self.local_attn = Attention(
-            num_heads=heads,
-            num_kv_heads=kv,
-            head_size=dim,
-            causal=False,
-            softmax_scale=dim**-0.5,
-            role="hy_nomas.decoder.local",
-            skip_sequence_parallel=True,
-            default_backend="FLEX_ATTENTION",
-        )
-        self.full_attn = Attention(
+        self.local_attn = RangeAttention(dim**-0.5)
+        self.full_attn = SDPAImpl(
             num_heads=heads,
             num_kv_heads=heads,
             head_size=dim,
             causal=False,
             softmax_scale=dim**-0.5,
-            role="hy_nomas.decoder.full",
-            skip_sequence_parallel=True,
-            default_backend="TORCH_SDPA",
         )
 
     @staticmethod
@@ -238,13 +226,11 @@ class GenAttention(nn.Module):
         q = self._prepare_qk(q, cos, sin, self.q_norm_t, self.q_norm_hw, v.dtype)
         k = self._prepare_qk(k, cos, sin, self.k_norm_t, self.k_norm_hw, v.dtype)
         if block_mask is not None:
-            out = self.local_attn(
-                q, k, v, AttentionMetadata(range_mask=AttentionRanges(), extra={"block_mask": block_mask})
-            )
+            out = self.local_attn(q, k, v, block_mask=block_mask)
         else:
             repeat = arch.num_heads // arch.num_kv_heads
             k, v = k.repeat_interleave(repeat, dim=2), v.repeat_interleave(repeat, dim=2)
-            out = self.full_attn(q, k, v)
+            out = self.full_attn.forward(q, k, v)
         return self.o_proj(out.reshape(batch, count, arch.num_heads * arch.head_dim))
 
 

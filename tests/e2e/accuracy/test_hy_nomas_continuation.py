@@ -30,8 +30,12 @@ def run_worker(args):
     from vllm_omni.diffusion.distributed.utils import get_local_device
 
     device = get_local_device()
+    height, width = (384, 640) if args.low_resolution else (704, 1280)
+    max_latents = 32 if args.low_resolution else 48
     prompts = PROMPTS if args.frames == 49 else PROMPTS[:1]
     cameras = CAMERAS if args.frames == 49 else [None]
+    if args.low_resolution:
+        prompts, cameras = PROMPTS[:2], ["pan_left"] * 2
     if args.worker == "reference":
         from configs import config as reference_config
         from hydra import compose, initialize_config_dir
@@ -53,8 +57,8 @@ def run_worker(args):
         config.parallelism.shard_text_encoder = False
         config.inference.rollout_type = "chunk_ar"
         config.inference.inference_chunk_size = 16
-        config.inference.interactive_noise_max_seconds = 8
-        config.inference.interactive_noise_hard_max_seconds = 8
+        config.inference.interactive_noise_max_seconds = max_latents / 6
+        config.inference.interactive_noise_hard_max_seconds = max_latents / 6
         pipeline = CPTCausalInferencePipeline(reference_config._flatten_cfg(config), device, config.dit_weight).eval()
         latents = []
         cache_chunks = []
@@ -81,8 +85,8 @@ def run_worker(args):
                 pipeline.inference(
                     prompts=[prompt],
                     num_frames=args.frames,
-                    height=704,
-                    width=1280,
+                    height=height,
+                    width=width,
                     guidance_scale=1.0,
                     num_inference_steps=args.steps,
                     flow_shift=5.0,
@@ -138,7 +142,12 @@ def run_worker(args):
         dtype=torch.bfloat16,
         distributed_executor_backend="mp",
         enforce_eager=True,
-        custom_pipeline_args={"ar_max_latent_frames": 48, "ar_max_segments": 4},
+        custom_pipeline_args={
+            "ar_height": height,
+            "ar_width": width,
+            "ar_max_latent_frames": max_latents,
+            "ar_max_segments": 4,
+        },
     )
     with set_default_torch_dtype(torch.bfloat16):
         pipeline = HyNomasPipeline(od_config=config)
@@ -182,8 +191,8 @@ def run_worker(args):
                 controls=(ARDiffusionControlInput("camera", "hy_nomas.camera.v1", {"camera_trajectory": camera}),),
             )
             params = OmniDiffusionSamplingParams(
-                height=704,
-                width=1280,
+                height=height,
+                width=width,
                 num_frames=args.frames,
                 seed=42,
                 num_inference_steps=args.steps,
@@ -214,9 +223,17 @@ def run_worker(args):
     )
 
 
-@pytest.mark.parametrize("steps", [pytest.param(4, id="four_steps"), pytest.param(8, id="eight_steps")])
-@pytest.mark.parametrize("frames", [pytest.param(49, id="three_turns"), pytest.param(129, id="short_tail")])
-def test_reference_continuation_at_704x1280(tmp_path, steps, frames):
+@pytest.mark.parametrize(
+    "steps,frames,low_resolution",
+    [
+        pytest.param(8, 49, True, id="384x640_two_turns"),
+        pytest.param(4, 49, False, id="704x1280_four_steps_three_turns"),
+        pytest.param(8, 49, False, id="704x1280_eight_steps_three_turns"),
+        pytest.param(4, 129, False, id="704x1280_four_steps_short_tail"),
+        pytest.param(8, 129, False, id="704x1280_eight_steps_short_tail"),
+    ],
+)
+def test_reference_continuation(tmp_path, steps, frames, low_resolution):
     base = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -227,6 +244,8 @@ def test_reference_continuation_at_704x1280(tmp_path, steps, frames):
         "--output",
         str(tmp_path),
     ]
+    if low_resolution:
+        base.append("--low-resolution")
     commands = [
         base + ["--worker", "reference"],
         base + ["--worker", "candidate"],
@@ -244,5 +263,6 @@ if __name__ == "__main__":
     parser.add_argument("--frames", type=int, choices=(49, 129), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--offload", action="store_true")
+    parser.add_argument("--low-resolution", action="store_true")
     with torch.no_grad():
         run_worker(parser.parse_args())

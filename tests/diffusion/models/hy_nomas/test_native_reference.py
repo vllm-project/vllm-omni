@@ -187,9 +187,7 @@ def test_native_rolling_state_matches_independent_reference(lengths, tail_hold):
     expected = reference.PixelUMMDCAELatentDecoder(WindowContext(), **options).create_streaming_decode_session(
         to_cpu=True, retain_history=False, rolling=True
     )
-    actual = PixelUMMDCAELatentDecoder(WindowContext(), **options).create_streaming_decode_session(
-        to_cpu=True, retain_history=False, rolling=True
-    )
+    actual = PixelUMMDCAELatentDecoder(WindowContext(), **options).create_streaming_decode_session()
     generator = torch.Generator().manual_seed(301)
     for index, length in enumerate(lengths):
         latent = torch.randn((1, 32, length, 1, 1), generator=generator)
@@ -202,7 +200,7 @@ def test_native_rolling_state_matches_independent_reference(lengths, tail_hold):
         assert actual.stable_pixel_frames == expected.stable_pixel_frames
         assert actual.withheld_pixel_frames == expected.withheld_pixel_frames
         assert actual.buffer.shape[2] <= 2 * actual.window + actual.stride
-        assert len(actual.push_latent_frames) <= 2 * actual.window and not actual.committed
+        assert len(actual.push_latent_frames) <= 2 * actual.window
     torch.testing.assert_close(actual.finish(), expected.finish(), rtol=0, atol=0)
     assert actual.buffer.numel() == 0 and actual.pending is None
     assert not actual.push_latent_frames
