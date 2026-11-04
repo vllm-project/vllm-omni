@@ -140,7 +140,7 @@ def collect_duplex_audio_continuity(
     invalid: set[str] = set()
     done: set[str] = set()
     completed: set[str] = set()
-    rate = 24_000
+    session_rate = 24_000
     encoding = "pcm16"
     for event, arrival in zip(events, received_at_s, strict=True):
         session = event.get("session")
@@ -149,7 +149,7 @@ def collect_duplex_audio_continuity(
             audio_config = session.get("audio")
             output_config = audio_config.get("output") if isinstance(audio_config, dict) else None
             if isinstance(output_config, dict):
-                rate = output_config.get("sample_rate_hz", rate)
+                session_rate = output_config.get("sample_rate_hz", session_rate)
         response = event.get("response")
         rid = event.get("response_id") or (response.get("id") if isinstance(response, dict) else None)
         if not isinstance(rid, str) or arrival < after_s:
@@ -171,11 +171,10 @@ def collect_duplex_audio_continuity(
         encoded = event.get("delta") or event.get("audio")
         if not encoded:
             continue
-        event_rate = event.get("sample_rate_hz", rate)
+        event_rate = event.get("sample_rate_hz", session_rate)
         if encoding != "pcm16" or not isinstance(event_rate, int) or isinstance(event_rate, bool) or event_rate <= 0:
             invalid.add(rid)
             continue
-        rate = event_rate
         try:
             pcm = base64.b64decode(encoded, validate=True)
         except (ValueError, TypeError):
@@ -187,7 +186,7 @@ def collect_duplex_audio_continuity(
         if pcm:
             times, durations = timelines.setdefault(rid, ([], []))
             times.append(arrival)
-            durations.append(len(pcm) / (2 * rate))
+            durations.append(len(pcm) / (2 * event_rate))
     result = {}
     threshold = audio_continuity_threshold_s()
     for rid, (times, durations) in timelines.items():

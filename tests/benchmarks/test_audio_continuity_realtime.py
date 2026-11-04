@@ -112,6 +112,29 @@ def test_session_sample_rate_is_used_when_packet_rate_is_absent():
     assert rows["a"]["audio_underrun_s"] == pytest.approx(0.2)
 
 
+def test_packet_sample_rate_does_not_override_session_fallback_for_later_response():
+    session = {"type": "session.updated", "session": {"audio": {"output": {"sample_rate_hz": 24000}}}}
+    fallback_first = audio("fallback", 24000, duration=0.1)
+    fallback_second = audio("fallback", 24000, duration=0.1)
+    del fallback_first["sample_rate_hz"]
+    del fallback_second["sample_rate_hz"]
+
+    rows = collect_duplex_audio_continuity(
+        [
+            session,
+            audio("explicit", 16000, duration=0.1),
+            done("explicit"),
+            fallback_first,
+            fallback_second,
+            done("fallback"),
+        ],
+        [0, 1, 1.1, 2, 2.15, 2.3],
+    )
+
+    assert rows["fallback"]["audio_duration_s"] == pytest.approx(0.2)
+    assert rows["fallback"]["audio_underrun_s"] == pytest.approx(0.05)
+
+
 def test_continuity_reaches_session_rows_without_server_timing_metrics():
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
     from vllm_omni.clients.duplex import EventCollector
