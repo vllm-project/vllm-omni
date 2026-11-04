@@ -23,6 +23,16 @@ capabilities are also `UNMIGRATED`, because the runtime GQA decision needs
 actual tensors. Non-divisible Q/KV head ratios report `UNSUPPORTED` with the
 same actionable error as forward.
 
+The existing packed-padding execution path also accepts CUDA producers that
+declare a single `[real, padding]` document. It slices K/V to the published
+`kv_length`, keeps every query row, and rejects causal attention or an
+additional explicit mask. This permits H3 reference inference without a dense
+padding mask; it does not provide isolation between multiple real documents.
+Packed capability resolution remains `UNMIGRATED`, and this change does not
+qualify packed fullgraph compilation. CPU regressions compare real query rows
+against dense masking; the H3 recipes record the separate real-weight CUDA
+validation and numerical limits.
+
 Verified inference paths declare `TRACEABLE` for equal Q/KV heads and
 `CUSTOM_OP` for GQA. The equal-head path passes a concrete boolean to SDPA;
 the compiled CUDA GQA path wraps the runtime `SDPAParams` probe and native/

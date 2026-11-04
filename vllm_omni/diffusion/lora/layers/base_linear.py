@@ -183,7 +183,11 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # output. This avoids materializing both a full-width delta and the
             # result of the following elementwise addition. ``out=`` does not
             # support autograd, so training keeps the functional fallback.
-            if not torch.is_grad_enabled() and y_slice.dtype == buffer.dtype == B.dtype:
+            if (
+                not torch.is_grad_enabled()
+                and getattr(self.base_layer, "diffusion_lora_fuse_addmm", True)
+                and y_slice.dtype == buffer.dtype == B.dtype
+            ):
                 if epilogue_scale is None:
                     torch.addmm(y_slice, buffer, B.t(), out=y_slice)
                 else:

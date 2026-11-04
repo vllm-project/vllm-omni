@@ -166,7 +166,7 @@ class SDPABackend(AttentionBackend):
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
-        return current_omni_platform.is_npu()
+        return current_omni_platform.is_npu() or current_omni_platform.is_cuda()
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
@@ -334,6 +334,13 @@ class SDPAImpl(AttentionImpl):
     ) -> torch.Tensor:
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
+        if attn_metadata is not None and attn_metadata.packed_padding is not None:
+            if self.causal or attn_metadata.attn_mask is not None:
+                raise ValueError("SDPA packed padding requires non-causal attention without an explicit mask")
+            # Producers guarantee one [real, padding] document. Keeping all
+            # query rows preserves the output shape; only real K/V may attend.
+            length = attn_metadata.packed_padding.kv_length
+            key, value = key[:, :length], value[:, :length]
         attention_mask = None
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)

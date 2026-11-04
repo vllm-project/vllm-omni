@@ -24,7 +24,9 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.platforms import current_omni_platform
 
+from .dmad import DmadNoise
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
+from .pika import PikaNoise
 from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -334,6 +336,7 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    renoise_noise: PikaNoise | DmadNoise | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -433,7 +436,9 @@ def minimax_h3_denoise_loop(
                 mv_video_t = v_video.float()[update]
                 mv_audio_t = v_audio.float()[audio_update]
 
-                if video_edit is None:
+                if renoise_noise is not None:
+                    x0_video = video_rows[update] + s_v * mv_video_t
+                elif video_edit is None:
                     x0_video = minimax_h3_rf_v_to_x0(
                         video_rows[update],
                         mv_video_t,
@@ -445,13 +450,19 @@ def minimax_h3_denoise_loop(
                         mv_video_t,
                         t_v,
                     )
-                new_target = video_solver.step(video_rows[update], x0_video, step)
+                new_target = (
+                    video_solver.step(video_rows[update], x0_video, step)
+                    if renoise_noise is None
+                    else renoise_noise.step(x0_video, sigmas_video[step + 1], modality="video")
+                )
                 video_rows = video_rows.clone()
                 video_rows[update] = new_target
                 if cond_anchor is not None:
                     video_rows[~update] = cond_anchor  # per-step imgvid cond reset
 
-                if audio_edit is None:
+                if renoise_noise is not None:
+                    x0_audio = audio_rows[audio_update] + s_a * mv_audio_t
+                elif audio_edit is None:
                     x0_audio = minimax_h3_rf_v_to_x0(
                         audio_rows[audio_update],
                         mv_audio_t,
@@ -463,7 +474,11 @@ def minimax_h3_denoise_loop(
                         mv_audio_t,
                         t_a,
                     )
-                new_audio = audio_solver.step(audio_rows[audio_update], x0_audio, step)
+                new_audio = (
+                    audio_solver.step(audio_rows[audio_update], x0_audio, step)
+                    if renoise_noise is None
+                    else renoise_noise.step(x0_audio, sigmas_audio[step + 1], modality="audio")
+                )
                 audio_rows = audio_rows.clone()
                 audio_rows[audio_update] = (
                     new_audio if positive.locked_audio_rows is None else positive.locked_audio_rows

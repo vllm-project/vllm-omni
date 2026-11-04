@@ -160,11 +160,13 @@ def test_diffusion_base_linear_apply_falls_back_for_mixed_output_dtype(monkeypat
 
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
-def test_epilogue_scaling_preserves_native_bf16_order(output_dtype):
+@pytest.mark.parametrize("fuse_addmm", [True, False])
+def test_epilogue_scaling_preserves_native_bf16_order(output_dtype, fuse_addmm):
     layer = DiffusionBaseLinearLayerWithLoRA.__new__(DiffusionBaseLinearLayerWithLoRA)
     layer.tp_size = 1
     layer.lora_config = _DummyLoRAConfig()
     layer.base_layer = type("Base", (), {})()
+    layer.base_layer.diffusion_lora_fuse_addmm = fuse_addmm
 
     class _Output:
         def apply(self, _layer, x, _bias):
@@ -182,7 +184,7 @@ def test_epilogue_scaling_preserves_native_bf16_order(output_dtype):
     with torch.inference_mode():
         expected = x.to(output_dtype).clone()
         low_rank = x.bfloat16() @ a.T
-        if output_dtype == torch.bfloat16:
+        if output_dtype == torch.bfloat16 and fuse_addmm:
             expected.addmm_(low_rank, b.T, alpha=1.37)
         else:
             expected.add_(((low_rank @ b.T) * 1.37).to(output_dtype))

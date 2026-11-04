@@ -401,6 +401,8 @@ class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
     reduction and scaling in float32.
     """
 
+    reference_numerics: bool = False
+
     def __init__(
         self,
         hidden_size: int,
@@ -408,6 +410,19 @@ class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__(hidden_size, eps=eps, dtype=dtype)
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.reference_numerics:
+            if residual is not None:
+                x = x + residual
+            hidden = x.float()
+            hidden = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + self.variance_epsilon)
+            # Qwen3-VL rounds the normalized activation before multiplying gamma.
+            hidden = self.weight * hidden.to(x.dtype)
+            return hidden if residual is None else (hidden, x)
+        return super().forward(x, residual)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -1133,6 +1148,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         load_model: bool,
         encoder_group: Any | None = None,
         quant_config: QuantizationConfig | None = None,
+        reference_numerics: bool = False,
     ) -> None:
         super().__init__()
         self.device_target = device
@@ -1194,6 +1210,12 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         )
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
+        if reference_numerics:
+            if self._tp_size != 1 or quant_config is not None:
+                raise ValueError("H3 reference numerics requires an unquantized TP=1 text encoder")
+            for module in self.modules():
+                if isinstance(module, MiniMaxH3Qwen3VLRMSNorm):
+                    module.reference_numerics = True
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,

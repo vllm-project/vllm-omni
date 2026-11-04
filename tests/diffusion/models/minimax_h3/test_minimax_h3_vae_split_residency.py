@@ -38,6 +38,44 @@ class _FakeRemote(nn.Module):
         self.model = _FakeRemoteModel()
 
 
+def test_remote_vae_load_preserves_fp32_under_bf16_pipeline_default(monkeypatch):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae as module
+
+    class Checkpoint:
+        @classmethod
+        def from_pretrained(cls, path):
+            model = nn.Linear(1, 1, bias=False)
+            model.register_buffer("filter", torch.tensor([1.0001]))
+            model.load_state_dict({"weight": torch.tensor([[1.0001]], dtype=torch.float32), "filter": model.filter})
+            return model
+
+    monkeypatch.setattr(module, "get_class_from_dynamic_module", lambda *_: Checkpoint)
+    config = {"auto_map": {"AutoModel": "checkpoint.VAE"}}
+    with set_default_torch_dtype(torch.bfloat16):
+        model = module._load_remote_component("unused", config, trust_remote_code=True)
+        assert torch.get_default_dtype() == torch.bfloat16
+    assert model.weight.dtype == model.filter.dtype == torch.float32
+    torch.testing.assert_close(model.weight, torch.tensor([[1.0001]]), atol=0, rtol=0)
+    torch.testing.assert_close(model.filter, torch.tensor([1.0001]), atol=0, rtol=0)
+
+
+def test_reference_decoder_retains_fp32_weights(monkeypatch, mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as module
+
+    monkeypatch.setattr(module, "_load_component_config", lambda *_: {})
+    monkeypatch.setattr(module, "_check_trust_remote_code", lambda *_: None)
+    monkeypatch.setattr(module, "_load_remote_component", lambda *args, **kwargs: _FakeRemote())
+    monkeypatch.setattr(module, "install_temporal_stream_patches", lambda *args, **kwargs: None)
+    optimized = mocker.Mock()
+    monkeypatch.setattr(module, "install_h3_vae_optimizations", optimized)
+    vae = MiniMaxH3VideoVAE("unused", device=torch.device("cpu"), reference_numerics=True)
+    assert vae.decode_dtype == torch.float32
+    assert all(param.dtype == torch.float32 for param in vae.model.decoder.parameters())
+    optimized.assert_not_called()
+
+
 def _vae() -> MiniMaxH3VideoVAE:
     vae = object.__new__(MiniMaxH3VideoVAE)
     nn.Module.__init__(vae)  # bare instance: enable Module attribute assignment

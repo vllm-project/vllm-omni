@@ -34,7 +34,8 @@ def test_sdpa_gqa_custom_op_returns_contiguous_bshd(value_dim, masked):
     torch.testing.assert_close(output, expected)
 
 
-def test_sdpa_npu_packed_padding_matches_dense_mask():
+@pytest.mark.parametrize("forward", ["forward_npu", "forward_cuda"])
+def test_sdpa_packed_padding_matches_dense_mask(forward):
     generator = torch.Generator().manual_seed(7)
     query = torch.randn(1, 9, 2, 8, generator=generator)
     key = torch.randn(1, 11, 2, 8, generator=generator)
@@ -50,7 +51,7 @@ def test_sdpa_npu_packed_padding_matches_dense_mask():
         )
     )
     impl = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.5)
-    actual = impl.forward_npu(query, key, value, metadata)
+    actual = getattr(impl, forward)(query, key, value, metadata)
     expected = torch.nn.functional.scaled_dot_product_attention(
         query.permute(0, 2, 1, 3),
         key.permute(0, 2, 1, 3),
@@ -62,18 +63,28 @@ def test_sdpa_npu_packed_padding_matches_dense_mask():
 
 
 @pytest.mark.cpu
-def test_sdpa_packed_mask_free_gate_is_npu_only(monkeypatch):
-    """H3 skips the padding mask only behind this gate: on for NPU, off elsewhere.
+@pytest.mark.parametrize("npu,cuda", [(True, False), (False, True), (False, False)])
+def test_sdpa_packed_mask_free_gate(monkeypatch, npu, cuda):
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: npu)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    assert SDPABackend.supports_packed_mask_free() is (npu or cuda)
 
-    A revert of SDPABackend.supports_packed_mask_free to the base False would
-    silently restore the Q x K padding mask on NPU while the forward_npu test
-    above stays green, so pin the gate itself.
-    """
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
-    assert SDPABackend.supports_packed_mask_free() is True
 
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
-    assert SDPABackend.supports_packed_mask_free() is False
+@pytest.mark.parametrize("causal,masked", [(True, False), (False, True)])
+def test_sdpa_cuda_packed_padding_rejects_ambiguous_masks(causal, masked):
+    x = torch.randn(1, 4, 2, 8)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones(1, 4, dtype=torch.bool) if masked else None,
+        packed_padding=PackedPaddingMetadata(
+            q_length=3,
+            kv_length=3,
+            cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 3], dtype=torch.int32),
+        ),
+    )
+    impl = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=causal)
+    with pytest.raises(ValueError, match="non-causal attention without an explicit mask"):
+        impl.forward_cuda(x, x, x, metadata)
 
 
 def test_sdpa_expands_kv_when_native_gqa_kernel_is_unavailable(monkeypatch):

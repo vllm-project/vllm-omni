@@ -146,6 +146,11 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     ),
+    "PikaH3Pipeline": (
+        "minimax_h3",
+        "pipeline_pika_h3",
+        "PikaH3Pipeline",
+    ),
     "MiniMaxH3ModularPipeline": (
         "minimax_h3",
         "pipeline_minimax_h3",
@@ -756,6 +761,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
+    "PikaH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",

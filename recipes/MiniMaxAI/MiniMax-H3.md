@@ -2058,6 +2058,8 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
 
 ## Additional resources
 
+- [Pika H3 Flex six-step FL2VA / Ref2VA adapters](Pika-H3-Flex.md)
+- [DMAD four/eight-step T2VA adapters](DMAD-H3.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 - [Diffusion parallelism](../../docs/user_guide/diffusion/parallelism/overview.md)

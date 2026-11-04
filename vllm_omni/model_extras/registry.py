@@ -93,6 +93,7 @@ from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
+from vllm_omni.model_extras.pika_h3 import get_pika_h3_video_generation_defaults
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -270,6 +271,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "output_tensor_range": "zero_to_one",
         # Shared T2I/I2V envelopes select the output modality. LingBot's
         # pipeline owns model-specific validation and normalization.
+    },
+    "PikaH3Pipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+        "video_generation_defaults_builder": get_pika_h3_video_generation_defaults,
     },
     **{
         model_class_name: {

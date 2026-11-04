@@ -14,6 +14,14 @@ For selection precedence and per-role configuration, see the
 dispatcher choose the implementation. It is always available and is the most
 conservative reference when validating another backend.
 
+On CUDA, models can declare one real token sequence followed by padding so
+SDPA can exclude padded K/V without constructing a dense mask. This requires
+non-causal attention and no additional explicit mask. Selecting `TORCH_SDPA`
+alone does not guarantee bitwise agreement with an official model pipeline:
+that also depends on the selected PyTorch kernel and model arithmetic. The
+[Pika H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/Pika-H3-Flex.md#compare-with-official-numerical-results)
+documents its reference configuration.
+
 ```bash
 vllm-omni serve <model> --diffusion-attention-backend TORCH_SDPA
 ```
