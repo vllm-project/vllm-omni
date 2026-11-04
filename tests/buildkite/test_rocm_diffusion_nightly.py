@@ -120,7 +120,17 @@ def test_nightly_runner_fails_closed(
         **overrides,
     }
     result = subprocess.run(
-        ["bash", str(RUNNER), "4", "5", "20m", "nightly-test", "tests/fake.py", "-m", "full_model and diffusion and rocm and MI325 and cards_3"],
+        [
+            "bash",
+            str(RUNNER),
+            "4",
+            "5",
+            "20m",
+            "nightly-test",
+            "tests/fake.py",
+            "-m",
+            "full_model and diffusion and rocm and MI325 and cards_3",
+        ],
         env=env,
         capture_output=True,
         text=True,
