@@ -131,17 +131,18 @@ running. A subsequent request starts with fresh request-owned state.
 
 Use the diffusion serving benchmark to measure serial video jobs through receipt
 of the complete MP4. Set a 50 ms polling interval for this comparison; job cleanup
-and media decoding are outside the reported request latency.
+and media decoding are outside the reported request latency. The custom request
+also uses 124 frames for warmup, matching the original experiment.
 
 ```bash
 cat > requests.jsonl <<'JSONL'
 {"prompt":"A friendly presenter in a quiet studio explains how to grow a small garden, speaking clearly with natural gestures.","size":"480x864","num_frames":124,"fps":24,"seed":8301,"num_inference_steps":3}
 JSONL
-python benchmarks/diffusion/diffusion_benchmark_serving.py \\
-  --base-url http://127.0.0.1:8000 --endpoint /v1/videos \\
-  --dataset custom --dataset-path requests.jsonl --task t2v \\
-  --num-prompts 34 --max-concurrency 1 --warmup-requests 1 \\
-  --warmup-num-inference-steps 3 --video-poll-interval 0.05 \\
+python benchmarks/diffusion/diffusion_benchmark_serving.py \
+  --base-url http://127.0.0.1:8000 --endpoint /v1/videos \
+  --dataset custom --dataset-path requests.jsonl --task t2v \
+  --num-prompts 34 --max-concurrency 1 --warmup-requests 1 \
+  --warmup-num-inference-steps 3 --video-poll-interval 0.05 \
   --output-file block-a.json
 ```
 
