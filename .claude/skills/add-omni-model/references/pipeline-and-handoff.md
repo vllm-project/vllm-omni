@@ -38,6 +38,7 @@ file lists the ones multi-stage omni models normally set.
 | `engine_output_type` | `"latent"` for thinker/talker, `"audio"` for code2wav | What the engine emits downstream |
 | `model_arch` | e.g. `"MiniCPMO45Code2Wav"` | Only when the stage uses a different class |
 | `sampling_constraints` | `{"detokenize": False, "stop_token_ids": [...]}` | Enforced stage sampling keys |
+| `custom_process_input_func` | e.g. MiniCPM-o stage 1's `f"{_PROC}.llm2tts"` | Consumer-side input conversion, invoked by the orchestrator through the receiving stage client |
 | `custom_process_next_stage_input_func` | `f"{_PROC}.<a>2<b>_full_payload"` | Producer hook, `async_chunk` off |
 | `async_chunk_process_next_stage_input_func` | `f"{_PROC}.<a>2<b>_async_chunk"` | Producer hook, `async_chunk` on |
 | `sync_process_input_func` | `f"{_PROC}.<a>2<b>_token_only"` | Orchestrator placeholder, `async_chunk` off |
@@ -49,8 +50,9 @@ file lists the ones multi-stage omni models normally set.
 
 `_select_processor_funcs` (same file) resolves the active pair: with
 `async_chunk` on, `async_chunk_process_next_stage_input_func` replaces
-`custom_process_next_stage_input_func`; with it off, `sync_process_input_func`
-replaces `custom_process_input_func`.
+`custom_process_next_stage_input_func` when supplied; with it off, a supplied
+`sync_process_input_func` replaces `custom_process_input_func`. Otherwise the
+configured consumer-side input function remains active.
 
 ## Processor hook contract
 
@@ -65,6 +67,13 @@ runtime), not in the orchestrator. Callers:
 | full payload | `(transfer_manager, pooling_output, request)` | dict / `OmniPayload`, or `None` |
 | async chunk | `(transfer_manager, multimodal_output, request, is_finished=False)` | `OmniPayloadStruct`, or `None` to send nothing this step |
 | token only | `(source_outputs, prompt=None, requires_multimodal_data=False, streaming_context=None)` | `list[OmniTokensPrompt]` placeholders |
+
+Some edges still use consumer-side conversion. MiniCPM-o stage 1 sets
+`custom_process_input_func` to `llm2tts(source_outputs, prompt=None,
+requires_multimodal_data=False, _streaming_context=None)`, which builds TTS
+inputs from upstream outputs. This remains supported alongside producer hooks;
+prefer Qwen3-style producer hooks for new models. The developer guide's older
+`stage_list` signature does not describe this current consumer hook either.
 
 Rules:
 

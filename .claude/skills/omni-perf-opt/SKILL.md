@@ -131,8 +131,14 @@ only on P0 measurement or instrumentation fixes.
   verify stage costs before applying this placement to a different topology.
   When the talker saturates, add talker replicas before raising thinker batch
   limits.
-- Prefix caching stays off for the full Qwen3-Omni and MiniCPM-o pipelines;
-  the MRv2 first-frame path also requires it off.
+- Prefix caching is stage- and profile-specific. Default `qwen3_omni_moe.yaml`
+  uses MRv2 on CUDA with Thinker prefix caching on; Talker and Code2Wav keep it
+  off. The specialized `qwen3_omni_moe_mrv2.yaml` overlay and non-CUDA platform
+  sections disable Thinker caching. Talker first-frame and fused MTP fast paths
+  require caching off on the Talker, independently of Thinker caching.
+  MiniCPM-o's default duplex deploy keeps caching off; its CUDA turn profile
+  enables it for `llm` (stage 0), while the turn MRv2 overlay disables it again.
+  Inspect the effective YAML before changing it.
 - MRv2 output is not bitwise identical to V1. Re-measure MRv2 numbers after
   any runner change; MiniCPM-o's earlier MRv2 numbers were invalidated. MRv2
   downstream stages support turn mode; duplex needs its own profile and its

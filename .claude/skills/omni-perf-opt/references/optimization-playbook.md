@@ -89,7 +89,7 @@ per-stage `async_chunk: false` opt-out, and connector `extra`:
 | `codec_chunk_frames` | Steady-state chunk size; larger is more efficient, smaller is smoother | Qwen3-Omni, MiniCPM-o |
 | `codec_left_context_frames` | Re-decoded context before each chunk; prevents boundary clicks, costs compute | Qwen3-Omni, MiniCPM-o |
 | `codec_chunk_ramp` | Chunk size schedule, e.g. `[1, 2, 4, 8, 16, 25]` | Qwen3-Omni MRv2 |
-| `talker_first_audio` | Talker emits the first frame itself (CUDA, single-rank talker, one-frame first chunk, prefix caching off); `VLLM_OMNI_TALKER_FIRST_AUDIO=0` disables | Qwen3-Omni MRv2 |
+| `talker_first_audio` | Talker emits the first frame itself (CUDA, single-rank talker, one-frame first chunk, Talker prefix caching off); `VLLM_OMNI_TALKER_FIRST_AUDIO=0` disables | Qwen3-Omni MRv2 |
 | `generation_first_chunk_express`, `generation_first_chunk_express_min_slack_s` | Decode waiting first chunks in their own step while other streams keep enough buffered audio | MiniCPM-o turn MRv2 |
 
 Trade-off: `async_chunk` cuts AUDIO_TTFP by an order of magnitude but adds

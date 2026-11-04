@@ -102,8 +102,14 @@ utilization values sum to at most 1.0.
   usually share.
 - When the talker saturates under concurrency, add talker replicas before raising
   thinker batch limits.
-- Prefix caching is off in the full Qwen3-Omni and MiniCPM-o deploys; keep it off
-  unless the pipeline variant explicitly supports it.
+- Default `qwen3_omni_moe.yaml` uses MRv2 on CUDA with Thinker prefix caching
+  on; Talker and Code2Wav keep it off. The specialized
+  `qwen3_omni_moe_mrv2.yaml` overlay and non-CUDA platform sections disable
+  Thinker caching. Talker first-frame and fused MTP fast paths require caching
+  off on the Talker only. MiniCPM-o's default duplex deploy keeps caching off;
+  its CUDA turn profile enables it for `llm` (stage 0), while the turn MRv2
+  overlay disables it again. Resolve the stage, profile, and platform overrides
+  before changing this setting.
 - Prefer a new YAML with `base_config` over copying a whole file.
 - `tools/configure_stage_memory.py` still parses the legacy `stage_args` layout;
   verify it against the current schema before relying on it.

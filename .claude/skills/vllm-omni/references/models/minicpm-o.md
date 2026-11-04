@@ -5,9 +5,6 @@ Code: `vllm_omni/model_executor/models/minicpmo_4_5/`. Recipe:
 `docs/design/minicpm_o45_mrv2_performance.md`,
 `docs/design/minicpmo_encoder_cuda_graph.md`, `docs/design/fullduplex.md`.
 
-MiniCPM-o 5.0 has no tracked sources, registry entry, or deploy YAML in this
-tree; a `minicpmo_5_0/` directory with only `__pycache__` is a leftover.
-
 ## Stages
 
 | Stage | `model_stage` | Arch | Main files | Output |
@@ -27,14 +24,14 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
 | YAML | Use |
 |------|-----|
 | `minicpmo_4_5.yaml` | Default: **duplex**, all stages on GPU 0 (0.55 / 0.15 / 0.18), `max_sessions: 16`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 3` |
-| `minicpmo_4_5_2gpu.yaml` | Recommended production: thinker on GPU 0, tts + code2wav on GPU 1 |
+| `minicpmo_4_5_2gpu.yaml` | Recommended production: llm (stage 0) on GPU 0, tts + code2wav on GPU 1 |
 | `minicpmo_4_5_3gpu.yaml` | One GPU per stage |
 | `minicpmo_4_5_{3,4}gpu_stage1_replicas.yaml` | Experimental tts replicas (2 or 3) |
-| `minicpmo_4_5_8x4090.yaml` (+ `_stage1_replicas`) | Thinker TP=4, `max_model_len: 4096`, mostly eager |
+| `minicpmo_4_5_8x4090.yaml` (+ `_stage1_replicas`) | llm (stage 0) TP=4, `max_model_len: 4096`, mostly eager |
 | `minicpmo_4_5_duplex_h200.yaml` | Duplex with incremental fbank, fused vision, duplex audio-encoder graphs, stage-2 TF32 and fused CFM |
 | `minicpmo_4_5_duplex_mrv2.yaml` | Opt-in CUDA duplex MRv2 for all stages; NPU/XPU/ROCm/MUSA fall back to v1; measure duplex separately |
-| `minicpmo_4_5_turn.yaml` | `session_mode: turn` for ordinary HTTP chat |
-| `minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`) | Turn mode on MRv2; tts/code2wav `max_num_seqs` 8 (16 on H200) |
+| `minicpmo_4_5_turn.yaml` | `session_mode: turn` for ordinary HTTP chat; enables llm (stage 0) prefix caching on CUDA |
+| `minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`) | Turn mode on MRv2; disables stage 0 prefix caching; tts/code2wav `max_num_seqs` 8 (16 on H200) |
 
 ## Known quirks
 

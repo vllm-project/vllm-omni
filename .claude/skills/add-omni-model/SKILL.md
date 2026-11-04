@@ -24,10 +24,12 @@ Canonical in-tree examples:
 
 Developer guide: `docs/contributing/model/adding_omni_model.md`. Its stage
 processor section still describes the older orchestrator-side
-`custom_process_input_func(stage_list, ...)` contract; current omni models use
-the producer-side hooks described in
-[references/pipeline-and-handoff.md](references/pipeline-and-handoff.md). Its
-e2e test path prefix `vllm_omni/tests/...` is wrong; tests live under `tests/`.
+`custom_process_input_func(stage_list, ...)` signature. Current models use both
+producer-side hooks and consumer-side `custom_process_input_func` (MiniCPM-o's
+`llm2tts`); prefer the Qwen3-style producer hooks for new models. See the current
+signatures in the [pipeline reference](references/pipeline-and-handoff.md).
+The guide's e2e test path prefix `vllm_omni/tests/...` is wrong; tests live under
+`tests/`.
 
 ## Cross-cutting invariants
 
@@ -40,9 +42,14 @@ Check these at the end of every phase.
 - **I2. One stage per process.** The unified class reads
   `vllm_config.model_config.model_stage` and builds only that stage's modules
   and weights. Never instantiate all stages in every process.
-- **I3. Per-request state keyed by request id.** Any cache that survives a
-  `forward()` call (codec buffers, streaming state, graph inputs) is keyed by
-  request id and freed on finish. Shared buffers only fail under concurrency.
+- **I3. Isolate request-specific streaming/recurrent state.** Key codec history
+  and recurrent state by request id; release them on completion or cancellation.
+  Shape-keyed CUDA graphs and static work buffers may persist across requests.
+  Synchronize their reuse, initialize every input region read by replay
+  (including padding), and consume or copy outputs before replay overwrites
+  them. See
+  `vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py`
+  for a shared graph cache.
 - **I4. Delta streaming.** Streaming paths emit only new audio per step;
   every `forward()` return path sets the output keys downstream expects.
 - **I5. Both hand-off modes stay coherent.** For every stage edge, the
@@ -122,6 +129,9 @@ Wire them through `custom_process_next_stage_input_func`,
 `async_chunk_process_next_stage_input_func`, and `sync_process_input_func`.
 `_select_processor_funcs` in `stage_config.py` picks the variant from the
 effective `async_chunk`. Reference: `stage_input_processors/qwen3_omni.py`.
+Existing edges may instead use the receiving stage's
+`custom_process_input_func`, such as MiniCPM-o stage 1's `llm2tts`; preserve
+that consumer-side contract when extending an existing pipeline.
 
 ## Phase 5: Deploy YAML
 
@@ -192,7 +202,8 @@ accuracy and performance comparison with pinned revisions
 Invariants
 - [ ] I1 topology only in pipeline.py; deploy YAML has runtime keys only
 - [ ] I2 each stage process builds and loads only its own modules
-- [ ] I3 cross-step caches keyed by request id and freed on finish
+- [ ] I3 request streaming/recurrent state isolated and freed on finish/cancel
+- [ ] I3 shared graph buffers synchronized, initialized, and outputs safe on reuse
 - [ ] I4 streaming emits deltas; every forward() path sets payload keys
 - [ ] I5 full_payload and async_chunk processors agree for each edge
 

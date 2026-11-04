@@ -21,8 +21,8 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 
 | YAML | Use |
 |------|-----|
-| `qwen3_omni_moe.yaml` | Default. 2×H100: thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). `async_chunk: true`, shared-memory connector with `initial_codec_chunk_frames: 4`, `codec_chunk_frames: 25`, `codec_left_context_frames: 25` |
-| `qwen3_omni_moe_mrv2.yaml` | MRv2 runners on CUDA; `talker_first_audio`, `codec_chunk_ramp`, Code2Wav graph batch sizes, fused snake. Non-CUDA platforms fall back to v1 |
+| `qwen3_omni_moe.yaml` | Default CUDA MRv2 with Thinker prefix caching on. 2×H100: thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). `async_chunk: true`, shared-memory connector with `initial_codec_chunk_frames: 4`, `codec_chunk_frames: 25`, `codec_left_context_frames: 25` |
+| `qwen3_omni_moe_mrv2.yaml` | Specialized CUDA codec profile over the MRv2 default; disables Thinker prefix caching and adds `talker_first_audio`, `codec_chunk_ramp`, Code2Wav graph batch sizes, fused snake. Non-CUDA platforms fall back to v1 |
 | `qwen3_omni_moe_mrv2_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10) plus code-predictor KV and sampling optimizations |
 | `qwen3_omni_moe_thinking.yaml` | Thinker-only pipeline, TP=2, prefix caching on |
 | `qwen3_omni_duplex.yaml` | `session_mode: duplex` |
@@ -30,8 +30,14 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 
 ## Known quirks
 
-- `enable_prefix_caching: false` on all stages of the full pipeline; the MRv2
-  first-frame path also requires it off.
+- Default CUDA deploy enables Thinker prefix caching on either runner; Talker
+  and Code2Wav keep it off. Non-CUDA platform sections and the specialized
+  `qwen3_omni_moe_mrv2.yaml` overlay disable Thinker caching (the H200 overlay
+  inherits that setting). Read the effective profile before tuning.
+- Talker first-frame and fused MTP fast paths require Talker prefix caching
+  off, independently of Thinker caching. Eligibility lives in
+  `vllm_omni/model_executor/models/common/talker_first_audio.py` and
+  `vllm_omni/worker_v2/model_states/mtp_model_state.py`.
 - `moe_backend: triton` on thinker and talker.
 - CUDA forces `custom_ops: ["+rotary_embedding"]` on the thinker; fused MRoPE
   changed audio output.
@@ -68,4 +74,6 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 `vllm_omni/model_executor/models/qwen2_5_omni/`, same thinker/talker/code2wav
 shape, processors in `stage_input_processors/qwen2_5_omni.py`. Default
 `qwen2_5_omni.yaml`: `async_chunk: false`, thinker + code2wav on GPU 0, talker on
-GPU 1, all CUDA AR stages eager, prefix caching off. No recipe yet.
+GPU 1. On CUDA, thinker and code2wav are eager; talker uses CUDA graphs
+(`enforce_eager: false`). Prefix caching is off. Platform sections override the
+graph policy; check the selected backend. No recipe yet.
