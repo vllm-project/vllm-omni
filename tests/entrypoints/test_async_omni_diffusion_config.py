@@ -147,14 +147,15 @@ def test_default_diffusion_factory_rejects_unowned_field(field_name, value):
         StageConfigFactory.create_default_diffusion({field_name: value})
 
 
-def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch):
+def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch, tmp_path):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.config.yaml_util import create_config
     from vllm_omni.engine import stage_init_utils
 
+    model_path = str(tmp_path)
     stage_dict = StageConfigFactory.create_default_diffusion(
         {
-            "model": "unused",
+            "model": model_path,
             "api_key": "frontend-owned",
         }
     )[0]
@@ -163,9 +164,9 @@ def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch)
     metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None, default_sampling_params=None)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
-    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)
+    config = stage_init_utils.build_diffusion_config(model_path, stage_cfg, metadata)
 
-    assert config.model == "unused"
+    assert config.model == model_path
 
 
 def test_default_cache_config_used_when_missing():
@@ -579,6 +580,33 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
     load_model.assert_not_called()
 
 
+def test_serve_cli_forwards_nondefault_dlo_chunk_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-chunk-size-mb",
+            "32",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+    od_config = _terminal_config(stage_cfg)
+
+    assert args.dlo_chunk_size_mb == 32
+    assert explicit_kwargs["dlo_chunk_size_mb"] == 32
+    assert engine_args["dlo_chunk_size_mb"] == 32
+    assert od_config.dlo_chunk_size_mb == 32
+
+
 def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -797,13 +825,13 @@ def test_default_stage_config_includes_quantization_config():
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch):
+def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch, tmp_path):
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
     monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
     kwargs = {"quantization": "fp8"}
 
     if typed:
-        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        stage = StageConfigFactory.create_typed_default_diffusion(str(tmp_path), kwargs).stage_configs[0]
         config = stage.diffusion_config
         config.enrich_config()
     else:

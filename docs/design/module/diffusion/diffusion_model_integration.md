@@ -7,6 +7,7 @@ owners:
   - "@Bounty-hunter"
   - "@wtomin"
   - "@RuixiangMa"
+  - "@timzsu"
 primary_code_paths:
   - vllm_omni/diffusion/models/**
   - vllm_omni/diffusion/model_loader/**

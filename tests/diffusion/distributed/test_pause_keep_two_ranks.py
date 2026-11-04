@@ -41,7 +41,7 @@ def _all_true(results) -> bool:
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_keep_pause_two_ranks_ack_and_rank_failure():
     with ExitStack() as after:

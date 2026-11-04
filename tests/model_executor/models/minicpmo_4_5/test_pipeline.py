@@ -152,6 +152,15 @@ class TestPipelineTopology:
 
 
 class TestDeployTopology:
+    @pytest.mark.parametrize("filename", sorted(path.name for path in _DEPLOY_DIR.glob("minicpmo_4_5*.yaml")))
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_default_thinker_backend_is_scoped_to_cuda(self, filename: str, platform: str) -> None:
+        deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform=platform)
+        stages = {stage.stage_id: stage for stage in deploy.stages}
+        assert stages[0].attention_backend == ("TRITON_ATTN" if platform == "cuda" else None)
+        assert stages[1].attention_backend is None
+        assert stages[2].attention_backend is None
+
     @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())
     def test_deploy_resolves_three_stage_pipeline(self, filename: str, devices: list[str]) -> None:
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
@@ -214,13 +223,16 @@ class TestDeployTopology:
             "minicpmo_4_5_3gpu.yaml",
         ],
     )
-    def test_npu_graph_configuration_is_stage_scoped(self, filename: str) -> None:
+    def test_npu_graph_configuration_is_stage_scoped(self, filename: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Let the production merge select NPU once, independently of the host.
+        # Applying NPU first would let merge_pipeline_deploy overlay CUDA again.
+        monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+        monkeypatch.setattr(current_omni_platform, "device_type", "npu")
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         connector_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
         assert "code2wav_enable_npu_graph" not in connector_extra
         assert "code2wav_max_npu_graphs" not in connector_extra
 
-        deploy = _apply_platform_overrides(deploy, platform="npu")
         stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
         # vLLM 0.30.0 cannot run FULL_DECODE_ONLY on the NPU stage-0 engine,
         # so every variant pins PIECEWISE there. The single-card deploy keeps

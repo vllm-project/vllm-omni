@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -412,6 +413,15 @@ class LancePipeline(BagelPipeline):
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The language model is registered before ``self.bagel``. vLLM therefore
+        # treats the latter's embedding as an alias and skips its checkpoint key.
+        # Route that one key through the first registered name; the other Lance
+        # weights keep their ``bagel.`` prefix and the existing strict load scope.
+        alias = "bagel.language_model.model.embed_tokens.weight"
+        canonical = "language_model.model.embed_tokens.weight"
+        return super().load_weights(((canonical if name == alias else name, weight) for name, weight in weights))
 
     # ------------------------------------------------------------------ #
     # Lance-specific component builders
