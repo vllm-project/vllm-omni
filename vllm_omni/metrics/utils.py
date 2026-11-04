@@ -12,6 +12,10 @@ from prettytable import PrettyTable
 from vllm_omni.metrics import definitions as metric_defs
 
 if TYPE_CHECKING:
+    from typing import SupportsFloat, SupportsIndex, SupportsInt
+
+    from _typeshed import SupportsTrunc
+
     from vllm_omni.metrics.modality import OmniModalityMetrics
     from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
     from vllm_omni.metrics.stats import StageRequestStats
@@ -250,10 +254,10 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(cast(Any, value))
+        converted = int(cast("str | bytes | bytearray | SupportsInt | SupportsIndex | SupportsTrunc", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def coerce_positive_float_scalar(value: object) -> float | None:
@@ -278,10 +282,10 @@ def coerce_positive_float_scalar(value: object) -> float | None:
         except Exception:
             return None
     try:
-        value = float(cast(Any, value))
+        converted = float(cast("str | bytes | bytearray | SupportsFloat | SupportsIndex", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def resolve_int_by_sequential_keys(
@@ -326,7 +330,7 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     if isinstance(mm, Mapping) and mm:
         return mm
     outs = getattr(mm_source, "outputs", None)
-    if outs:
+    if isinstance(outs, Sequence) and outs:
         nested = getattr(outs[0], "multimodal_output", None)
         if isinstance(nested, Mapping) and nested:
             return nested

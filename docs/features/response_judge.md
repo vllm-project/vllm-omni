@@ -200,8 +200,4 @@ went from 43.0 and 44.5 ms to 26.1 and 28.5 ms p50 in two repeats.
   turn. The LAYA example prompt still rejects some of them.
 - A request id carries one judged turn at a time; a request must not send a
   new transcript to the judge before the previous one has been decided.
-- In an auto-response duplex session, a turn that follows a terminal listen
-  (a judge rejection, or the model's own silence) may only get
-  `response.listen`. This is a session issue outside the judge; a fix is
-  tracked separately.
 - The judge adds its own latency and GPU memory to every committed turn.
