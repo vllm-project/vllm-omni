@@ -68,17 +68,7 @@ class NativeOutputWorker:
     @staticmethod
     def _materialize(output: AsyncModelRunnerOutput, plane: Any) -> Any:
         result = output.get_output()
-        inter_stage_outputs = getattr(result, "inter_stage_outputs", None)
-        plane.enqueue_outputs(
-            req_ids=list(result.req_ids),
-            inter_stage_outputs=inter_stage_outputs,
-            sampled_token_ids=getattr(result, "sampled_token_ids", None),
-        )
-        # The native transport owns this full payload. Do not serialize its
-        # pooler alias again on the scheduler/client output path.
-        if inter_stage_outputs is not None and result.pooler_output is inter_stage_outputs and plane._can_send:
-            result.pooler_output = None
-        result.inter_stage_outputs = None
+        plane.publish_output(result)
         return result
 
     def submit(self, output: AsyncModelRunnerOutput, plane: Any) -> NativeAsyncOutput:

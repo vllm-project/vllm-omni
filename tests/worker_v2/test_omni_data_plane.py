@@ -592,10 +592,9 @@ def test_native_worker_fifo_thread_affinity_and_signals():
         calls.append(("signals", threading.get_ident()))
         return "ready"
 
-    plane = SimpleNamespace(
-        enqueue_outputs=lambda **kw: calls.append(("publish", kw["req_ids"], threading.get_ident())),
-        get_omni_connector_output=get_signals,
-    )
+    plane = _bare_plane()
+    plane.enqueue_outputs = lambda **kw: calls.append(("publish", kw["req_ids"], threading.get_ident()))
+    plane.get_omni_connector_output = get_signals
     worker = NativeOutputWorker(2)
     try:
         a = worker.submit(_Output("a", gate=gate, payload={"v": 1}), plane)
@@ -617,7 +616,9 @@ def test_native_worker_fifo_thread_affinity_and_signals():
 def test_native_worker_capacity_error_cache_and_tp_gates():
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-    plane = SimpleNamespace(enqueue_outputs=lambda **kw: None, get_omni_connector_output=lambda: None)
+    plane = _bare_plane()
+    plane.enqueue_outputs = lambda **kw: None
+    plane.get_omni_connector_output = lambda: None
     worker, gate = NativeOutputWorker(1), threading.Event()
     try:
         first = worker.submit(_Output("a", gate=gate), plane)
@@ -789,7 +790,7 @@ def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publi
             worker.close()
 
     plane.drain_outputs()
-    assert gate_result.result(), "Consumer timed out waiting for the publication check"
+    assert gate_result.result(timeout=10), "Consumer timed out waiting for the publication check"
     plane.request_terminal(set(req_ids))
     delivered = {
         request.req_id: (request, payload)

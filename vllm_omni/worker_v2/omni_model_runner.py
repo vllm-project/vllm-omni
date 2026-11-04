@@ -353,17 +353,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         if hasattr(output, "sampled_token_ids_materialized") and getattr(output, "sampled_token_ids", None) is not None:
             if not output.sampled_token_ids_materialized:
                 raise RuntimeError("MRv2 native data plane received non-materialized sampled_token_ids")
-        inter_stage_outputs = getattr(output, "inter_stage_outputs", None)
-        plane.enqueue_outputs(
-            req_ids=list(getattr(output, "req_ids", [])),
-            inter_stage_outputs=inter_stage_outputs,
-            sampled_token_ids=getattr(output, "sampled_token_ids", None),
-        )
-        # Match the background materializer: retain independent pooling output
-        # and inline payloads for stages without a native send path.
-        if inter_stage_outputs is not None and output.pooler_output is inter_stage_outputs and plane._can_send:
-            output.pooler_output = None
-        output.inter_stage_outputs = None
+        plane.publish_output(output)
         output.omni_connector_output = plane.get_omni_connector_output()
         return output
 

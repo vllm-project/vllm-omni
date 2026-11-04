@@ -186,10 +186,11 @@ still block; a supervisor must forcibly terminate an unresponsive process.
 
 ### MRv2 native output ownership
 
-MRv2 publishes materialized inter-stage payloads to `OmniRunnerDataPlane`
-through either `NativeOutputWorker` or the runner's inline finalizer used by
-multi-rank executors. After enqueueing, a stage with a native send path clears
-`pooler_output` when it aliases the same inter-stage payload list. Otherwise,
+Both `NativeOutputWorker` and the runner's inline finalizer used by multi-rank
+executors call `OmniRunnerDataPlane.publish_output()` to publish materialized
+inter-stage payloads. The data plane owns enqueueing and alias cleanup. After
+enqueueing succeeds, it clears `pooler_output` only when a native send path
+exists and that field aliases the same inter-stage payload list. Otherwise,
 the scheduler would serialize those tensors again alongside text output.
 Independent pooling results, client-facing `multimodal_outputs`, and inline
 payloads for stages without a native send path remain available. Terminal
