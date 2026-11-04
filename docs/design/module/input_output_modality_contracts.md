@@ -92,7 +92,7 @@ public rendering of its error fields belong to `error_contracts.md`.
 
 ## Current audio decoding compatibility
 
-Omni retains soundfile-first automatic audio decoding when using vLLM 0.32.
+Omni retains soundfile-first automatic audio decoding when using vLLM 0.33.
 Decoder rounding can affect BF16 model inputs and generated responses.
 Missing soundfile dependencies and unsupported formats fall back to upstream
 decoders; explicit backend selections keep upstream behavior. Encoded-size,

@@ -1362,6 +1362,7 @@ class StagePool:
             raw_outputs.outputs,
             raw_outputs.timestamp,
             iteration_stats,
+            weight_version=raw_outputs.weight_version,
         )
         if self._watermarkers:
             self._discard_completed_llm_watermark_state(raw_outputs.outputs, processor.request_states)
