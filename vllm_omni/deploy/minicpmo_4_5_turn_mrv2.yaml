@@ -29,9 +29,10 @@ connectors:
 stages:
   - stage_id: 0
     model_runner: v2
-    # The Talker only conditions on reply rows, and a prefix hit never covers
-    # those, so the Thinker reuses native KV and caches no output rows (see
-    # supports_mrv2_prefix_cache_outputs in docs/design/feature/prefix_caching.md).
+    # The Talker conditions on reply rows only. A prefix hit stops before the
+    # prompt's last token, and a request resumed after preemption keeps its
+    # earlier reply rows in the row ledger, so the Thinker reuses native KV and
+    # caches no output rows (docs/design/minicpm_o45_mrv2_performance.md).
     # An overlay that sets this key to false turns it off.
     enable_prefix_caching: true
     # llm2tts consumes the completed Thinker payload via the orchestrator.

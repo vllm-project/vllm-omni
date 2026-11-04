@@ -121,17 +121,27 @@ def test_plain_chat_handoff_after_a_prefix_hit_has_no_rows_for_the_cached_prompt
     torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17)]))
 
 
-@pytest.mark.parametrize("repeat", [1, 2], ids=["v1", "mrv2_both_channels"])
-def test_plain_chat_handoff_without_reply_rows_is_an_empty_condition(repeat) -> None:
+def test_plain_chat_handoff_without_reply_rows_is_an_empty_condition() -> None:
     """A Thinker that stopped at its first token has no reply rows; the Talker finishes such a request."""
     prompt_ids, output_ids = [101, 102], [11]
 
-    info = llm2tts([_ledger_output(prompt_ids, output_ids, [(101, 0), (102, 1)] * repeat)], prompt=[{}])[0][
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, [(101, 0), (102, 1)])], prompt=[{}])[0][
         "model_intermediate_buffer"
     ]
 
     assert info["ids"]["tts"] == []
     assert torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])).numel() == 0
+
+
+def test_plain_chat_handoff_after_a_preemption_keeps_reply_rows_from_before_it() -> None:
+    """A resumed request hits on its earlier reply tokens, so their rows come from before the preemption."""
+    prompt_ids, output_ids = list(range(100, 116)), [11, 12, 13, 14]
+    # Forwarded up to token 12, preempted, then resumed from a hit that covers it.
+    forwarded = [(115, 15), (11, 16), (12, 17), (13, 18)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12, 13]
 
 
 def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:

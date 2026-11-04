@@ -119,12 +119,13 @@ Greedy text can differ from decoding without drafts at near-tied tokens.
 `minicpmo_4_5_turn_mrv2.yaml` turns stage-0 prefix caching on. The Thinker does
 not set `supports_mrv2_prefix_cache_outputs`, so it reuses native KV alone: no
 output rows are saved or merged and no host cache is allocated. `llm2tts` picks
-the Talker's rows from the row ledger (`latent_input_ids`, `latent_positions`),
-and the reply's rows are never in a cached prefix, because the prompt's last
-token is always forwarded and `<|tts_bos|>` is the last prompt token. A template
-that places the reply start earlier in the prompt gets the "Thinker rows stop"
-warning and a shorter reply on a hit, so it needs the overlay below. Set
-`enable_prefix_caching: false` on stage 0 to turn it off:
+the Talker's rows from the row ledger (`latent_input_ids`, `latent_positions`).
+The reply starts after `<|tts_bos|>`, the last prompt token, and the prompt's
+last token is always forwarded, so a hit never covers a reply row. A request
+resumed after preemption can hit on its earlier reply tokens, whose rows are
+already in the ledger. A template that opens the reply earlier in the prompt has
+no rows for the cached part of it: on a hit the request logs the "Thinker rows
+stop" warning and produces no audio, so such a template needs this overlay:
 
 ```yaml
 base_config: minicpmo_4_5_turn_mrv2.yaml
