@@ -33,6 +33,7 @@ from vllm.v1.engine.utils import (
     SignalCallback,
 )
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.request import RequestStatus
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -106,6 +107,12 @@ def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
     worker = getattr(worker, "worker", worker)
     release = getattr(getattr(worker, "model_runner", None), "release_omni_shm_resources", None)
     return 0 if release is None else release(request_ids)
+
+
+def _finish_runner_turn(worker: Any, request_id: str) -> None:
+    """Dispatch transport retirement through the executor's worker wrapper."""
+    worker = getattr(worker, "worker", worker)
+    worker.model_runner.finish_omni_turn(request_id)
 
 
 def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
@@ -182,6 +189,21 @@ class StageEngineCoreProc(EngineCoreProc):
                 adapter.release_shm_resources(request_id)
             except Exception as e:
                 logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+
+    def omni_finish_turn(self, request_id: str) -> None:
+        """Acknowledge turn transport retirement while retaining paused KV.
+
+        The orchestrator has stopped downstream consumers. Reject retirement
+        of a still-running producer, and propagate failures to prevent ID reuse.
+        """
+        request = self.scheduler.requests.get(request_id)
+        if request is not None and request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            raise RuntimeError(f"Cannot retire an unfinished turn: {request_id}")
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            adapter.release_shm_resources(request_id, wait=True)
+        elif getattr(self.scheduler, "_native_data_plane", False):
+            self.model_executor.collective_rpc(_finish_runner_turn, args=(request_id,))
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

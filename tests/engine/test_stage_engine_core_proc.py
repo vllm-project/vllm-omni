@@ -48,6 +48,41 @@ def test_release_reaches_native_data_plane_runner(mocker):
     runner.release_omni_shm_resources.assert_called_once_with(["a", "b"])
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_turn_retirement_preserves_resident_scheduler_request(mocker, native):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    request = mocker.Mock(status=RequestStatus.WAITING_FOR_STREAMING_REQ)
+    adapter = None if native else mocker.Mock()
+    engine.scheduler = SimpleNamespace(
+        requests={"resident": request}, chunk_transfer_adapter=adapter, _native_data_plane=native
+    )
+    runner = mocker.Mock()
+    wrapper = SimpleNamespace(worker=SimpleNamespace(model_runner=runner))
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=lambda method, args=(): [run_method(wrapper, method, args, {})]
+    )
+    engine.omni_finish_turn("resident")
+    assert engine.scheduler.requests["resident"] is request
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    if native:
+        runner.finish_omni_turn.assert_called_once_with("resident")
+    else:
+        assert adapter is not None
+        adapter.release_shm_resources.assert_called_once_with("resident", wait=True)
+    request.status = RequestStatus.RUNNING
+    with pytest.raises(RuntimeError, match="unfinished turn"):
+        engine.omni_finish_turn("resident")
+
+
+def test_turn_retirement_propagates_transport_failure(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    adapter = mocker.Mock()
+    adapter.release_shm_resources.side_effect = TimeoutError("save thread stalled")
+    engine.scheduler = SimpleNamespace(requests={}, chunk_transfer_adapter=adapter)
+    with pytest.raises(TimeoutError, match="save thread stalled"):
+        engine.omni_finish_turn("resident")
+
+
 class WrappedUniProcExecutor(UniProcExecutor):
     pass
 

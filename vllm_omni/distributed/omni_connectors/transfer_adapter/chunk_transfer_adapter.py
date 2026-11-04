@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future
 from typing import Any
 
 import torch
@@ -174,7 +175,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        self.connector: Any = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -205,7 +206,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
         # Save-thread only: running count of segments reclaimed after finish.
@@ -213,9 +214,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -478,6 +479,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         duplex_perf_chunk: tuple[int, int] | None = None,
     ) -> dict[str, Any] | None:
         """Per-request admission of a chunk; returns the task to queue, or None."""
+        assert request is not None
         turn_continuation = getattr(request, "resume_from_full_prompt", False) is True
         is_finished = (
             force_request_finished
@@ -764,6 +766,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        if "turn_cleanup_done" in task:
+            task["turn_cleanup_done"].set_result(None)
+            return
         if "cleanup_shm" in task:
             assert isinstance(self.connector, SharedMemoryConnector)
             key_prefix, num_puts = task["cleanup_shm"]
@@ -771,7 +776,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self.connector.cleanup(f"{key_prefix}_{chunk_id}")
             return
         if "release_shm" in task:
-            self._release_shm_prefix(task["release_shm"])
+            completion = task.get("completion")
+            try:
+                self._release_shm_prefix(task["release_shm"])
+            except Exception as exc:
+                if completion is None:
+                    raise
+                completion.set_exception(exc)
+            else:
+                if completion is not None:
+                    # Earlier puts can append abort cleanup behind this release.
+                    # Acknowledge only after those follow-up tasks have drained,
+                    # so no old cleanup can unlink a reinstalled turn's chunks.
+                    self._pending_save_reqs.append({"turn_cleanup_done": completion})
             return
         if "batch" in task:
             self._send_batch(task["batch"])
@@ -845,7 +862,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if live and processor is not None:
                 try:
                     outputs = [
-                        unflatten_payload(t["multimodal_output"])
+                        unflatten_payload(dict(t["multimodal_output"]))
                         if isinstance(t["multimodal_output"], Mapping)
                         else t["multimodal_output"]
                         for t in live
@@ -925,7 +942,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(dict(raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1208,7 +1225,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
-    def release_shm_resources(self, request_id: str) -> None:
+    def release_shm_resources(self, request_id: str, *, wait: bool = False) -> None:
         """Queue reclaim of inter-stage segments this request left unconsumed.
 
         Safe only once every stage has finished with the request: the producer
@@ -1219,14 +1236,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         this (see ``Orchestrator._cleanup_request_ids``).
 
         Like abort cleanup, the unlink runs on the save thread, so the
-        scheduler never performs SHM I/O.
+        scheduler never performs SHM I/O. ``wait`` is used only by explicit
+        turn-retirement RPCs; it acknowledges unlink before same-ID reuse and
+        raises on cleanup failure or timeout.
         """
         if not isinstance(self.connector, SharedMemoryConnector):
             return
         external_req_id = self.request_ids_mapping.get(request_id, request_id)
-        self._pending_save_reqs.append({"release_shm": f"{external_req_id}_{self.connector.stage_id}_"})
+        completion: Future[None] | None = Future() if wait else None
+        self._pending_save_reqs.append(
+            {"release_shm": f"{external_req_id}_{self.connector.stage_id}_", "completion": completion}
+        )
         with self._save_cond:
             self._save_cond.notify()
+        if completion is not None:
+            completion.result(timeout=5.0)
 
     def _release_shm_prefix(self, key_prefix: str) -> None:
         reclaimed = self.connector.cleanup_prefix(key_prefix)
@@ -1792,6 +1816,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
+            assert requests is not None
             request_ids = requests.keys()
 
         connector_owned_ids = {

@@ -39,6 +39,35 @@ async def _settle(pool: StagePool) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_turn_retirement_awaits_only_bound_replica_and_propagates_errors(make_pool, mocker, fail):
+    bound, other = _Replica(), _Replica()
+    pool = make_pool(bound, other)
+    pool.bind_request_to_replica("resident", 0)
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def retire(method, request_id):
+        assert (method, request_id) == ("omni_finish_turn", "resident")
+        started.set()
+        await gate.wait()
+        if fail:
+            raise RuntimeError("retirement failed")
+
+    mocker.patch.object(bound, "call_utility_async", side_effect=retire)
+    task = asyncio.create_task(pool.finish_turn("resident"))
+    await asyncio.wait_for(started.wait(), 2)
+    assert not task.done()
+    assert not other.calls
+    gate.set()
+    if fail:
+        with pytest.raises(RuntimeError, match="retirement failed"):
+            await task
+    else:
+        await task
+    assert pool.get_bound_replica_id("resident") == 0
+
+
+@pytest.mark.asyncio
 async def test_hung_replica_does_not_delay_healthy_replica_batches(monkeypatch, make_pool) -> None:
     hung, healthy = _Replica(hang=True), _Replica()
     pool = make_pool(hung, healthy)

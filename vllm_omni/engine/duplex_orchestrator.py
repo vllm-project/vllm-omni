@@ -39,6 +39,7 @@ from vllm_omni.engine.duplex.contracts import (
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.engine.duplex.plugin import (
+    DuplexInputCapacityError,
     DuplexModelPlugin,
     DuplexPromptTokenizer,
     DuplexTurnContinuation,
@@ -74,6 +75,9 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
     turn_prompt_tokenizer: DuplexPromptTokenizer | None = None
+    turn_entry_finished: bool = False
+    turn_resources_released: bool = False
+    pending_turn_terminal: tuple[int, int, RequestOutput, StageRequestStats | None, float | None] | None = None
     # Session stats (RFC #8325): per stage, the chunks with spans since its last
     # session output, and the chunk of its latest producing step.
     pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
@@ -260,7 +264,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         stage_metrics: StageRequestStats | None,
         submit_ts: float | None,
     ) -> bool:
-        del replica_id, submit_ts
         if not isinstance(req_state, DuplexOrchestratorRequestState) or req_state.fence is None:
             return False
         request_id = output.request_id
@@ -274,6 +277,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if req_state.streaming.enabled and segment.finished and getattr(output, "finished", False):
             output.finished = False
         finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
+        if (
+            self.plugin.supports_turn_kv_continuation
+            and stage_id > 0
+            and stage_id == req_state.final_stage_id
+            and finished
+            and not req_state.turn_entry_finished
+        ):
+            # A downstream token limit can end audio before Thinker stops.
+            # Keep the final packet until its last text has entered the session
+            # mailbox; otherwise response.done reopens a still-running ID.
+            req_state.pending_turn_terminal = (stage_id, replica_id, output, stage_metrics, submit_ts)
+            return True
         transcript = self.plugin.user_transcript(
             stage_id=stage_id,
             output=output,
@@ -294,7 +309,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
         )
-        return runner.on_stage_output(
+        consumed = runner.on_stage_output(
             stage_id,
             output,
             stage_metrics,
@@ -303,6 +318,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
+        if self.plugin.supports_turn_kv_continuation and stage_id == 0 and finished:
+            req_state.turn_entry_finished = True
+            pending = req_state.pending_turn_terminal
+            req_state.pending_turn_terminal = None
+            if pending is not None:
+                sid, replica, terminal, metrics, submitted = pending
+                await self._intercept_stage_output(sid, replica, terminal, req_state, metrics, submitted)
+        return consumed
 
     async def can_append_turn(self, request_id: str, assistant_text: str) -> bool:
         state = self.request_states.get(request_id)
@@ -715,6 +738,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request_state = self.request_states.get(context.request_id)
             if not isinstance(request_state, DuplexOrchestratorRequestState):
                 raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+            if submission.resume_from_full_prompt:
+                if submission.already_submitted and not request_state.turn_resources_released:
+                    raise DuplexInputCapacityError("Previous Thinker turn has not finished retiring its transport")
+                request_state.turn_entry_finished = False
+                request_state.turn_resources_released = False
             pinned_replica_id = self._session_route(context.stage_id, request_state)
             if pinned_replica_id is not None:
                 self.stage_pools[context.stage_id].bind_request_to_replica(context.request_id, pinned_replica_id)
@@ -850,12 +878,21 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             req_state.skip_legacy_stage_forward = False
 
     async def finish_turn(self, request_id: str) -> None:
+        """Retire this turn's transport before allowing the resident ID to reopen."""
         state = self.request_states.get(request_id)
-        if state is None:
+        if not isinstance(state, DuplexOrchestratorRequestState):
             return
+        state.turn_resources_released = False
         for stage_id, pool in enumerate(self.stage_pools[1:], 1):
             await pool.abort_requests([request_id])
             pool.output_processor.remove_request(request_id)
+        # Unlike final request cleanup, this must be acknowledged: a delayed
+        # best-effort prefix release could unlink the next turn's same-ID chunks.
+        for pool in self.stage_pools:
+            await pool.finish_turn(request_id)
+        if self.request_states.get(request_id) is not state:
+            return
+        for stage_id, pool in enumerate(self.stage_pools[1:], 1):
             pool.release_binding(request_id)
             state.stage_submit_ts.pop(stage_id, None)
         state.finished_stage_ids.clear()
@@ -867,6 +904,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         state.streaming.segments.clear()
         state.streaming.bridge_states.clear()
         state.yield_stage_output = None
+        state.turn_resources_released = True
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

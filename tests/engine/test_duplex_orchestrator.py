@@ -535,6 +535,8 @@ async def test_full_prompt_resume_processes_inputs_without_propagating_resumable
     assert prewarm.call_args.args[1].resumable is False
     # Re-enter through the ordinary processor, retaining the core request ID.
     mocker.patch.object(orchestrator.stage_pools[0].output_processor, "remove_request", create=True)
+    mocker.patch.object(orchestrator.stage_pools[1].output_processor, "remove_request", create=True)
+    await orchestrator.finish_turn(first.request_id)
     await orchestrator.submit(replace(submission, already_submitted=True))
     assert clients[0].add_request_calls[-1][0].request_id == first.request_id
     assert builder.call_count == 2
@@ -565,6 +567,68 @@ async def test_finish_turn_keeps_entry_request_and_releases_downstream(ephemeral
     assert not state.upstream_first_audio
     assert not state.pending_first_audio_outputs
     assert not state.streaming.bridge_states
+
+
+@pytest.mark.asyncio
+async def test_resident_turn_holds_early_codec_terminal_until_thinker_stops(ephemeral_submissions, mocker):
+    orchestrator, _, submissions, _ = ephemeral_submissions
+    orchestrator.plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    request_id = submissions[0].context.request_id
+    state = orchestrator.request_states[request_id]
+    state.streaming.enabled = True
+    runner = mocker.Mock()
+    runner.on_stage_output.return_value = False
+    mocker.patch.object(orchestrator.session_manager, "runner_for_request_id", return_value=runner)
+    # Talker can hit its token limit while Thinker is still decoding. Do not
+    # expose response.done (and thus reopen the resident ID) at this boundary.
+    terminal = _audio_request_output(request_id, samples=1, finished=True)
+    assert await orchestrator._intercept_stage_output(1, 0, terminal, state, None, None)
+    runner.on_stage_output.assert_not_called()
+    piece = _audio_request_output(request_id, samples=0, text="old turn", finished=False)
+    await orchestrator._intercept_stage_output(0, 0, piece, state, None, None)
+    assert [call.args[0] for call in runner.on_stage_output.call_args_list] == [0]
+    state.streaming.segment(0).finished = True
+    await orchestrator._intercept_stage_output(
+        0, 0, _audio_request_output(request_id, samples=0, finished=True), state, None, None
+    )
+    assert [call.args[0] for call in runner.on_stage_output.call_args_list] == [0, 0, 1]
+    assert runner.on_stage_output.call_args.args[1] is terminal
+
+
+@pytest.mark.asyncio
+async def test_resident_turn_cannot_reopen_until_transfer_retirement_completes(ephemeral_submissions, mocker):
+    from dataclasses import replace
+
+    from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
+
+    orchestrator, _, submissions, _ = ephemeral_submissions
+    submission = replace(submissions[0], resumable=True, resume_from_full_prompt=True)
+    await orchestrator.submit(submission)
+    request_id = submission.context.request_id
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def retire(rid):
+        assert rid == request_id
+        entered.set()
+        await gate.wait()
+
+    for pool in orchestrator.stage_pools:
+        mocker.patch.object(pool, "finish_turn", side_effect=retire, create=True)
+        mocker.patch.object(pool.output_processor, "remove_request", create=True)
+    finish = asyncio.create_task(orchestrator.finish_turn(request_id))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(DuplexInputCapacityError):
+            await orchestrator.submit(replace(submission, already_submitted=True))
+        gate.set()
+        await finish
+        await orchestrator.submit(replace(submission, already_submitted=True))
+        for pool in orchestrator.stage_pools:
+            pool.finish_turn.assert_awaited_once_with(request_id)
+    finally:
+        gate.set()
+        await finish
 
 
 @pytest.mark.asyncio
