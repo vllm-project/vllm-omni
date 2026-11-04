@@ -254,6 +254,14 @@ def main(args) -> None:
     print("=== transcribe on ===")
     on = transcribe(args, clips, on=True)
 
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        for label, hyp in (("off", off), ("on", on)):
+            with open(os.path.join(args.out_dir, f"{args.model_type}_{label}.tsv"), "w", encoding="utf-8") as f:
+                for idx in sorted(hyp):
+                    f.write(f"{idx}\t{hyp[idx]}\n")
+        print(f"wrote transcripts to {args.out_dir}")
+
     ref = load_tsv(args.ref)
     common = sorted(set(ref) & set(off) & set(on))
     clean: list[str] = []
@@ -330,6 +338,7 @@ def parse_args():
     parser.add_argument("--deploy-config", type=str, required=True)
     parser.add_argument("--audio-dir", type=str, required=True)
     parser.add_argument("--ref", type=str, required=True, help="Reference transcript TSV (idx<TAB>UPPERCASE).")
+    parser.add_argument("--out-dir", type=str, default=None, help="Write {model_type}_{off,on}.tsv transcripts here.")
     parser.add_argument("--prompt", type=str, default="Please transcribe the audio content.")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-seconds", type=float, default=29.0, help="Skip clips longer than this (0 = no filter).")
