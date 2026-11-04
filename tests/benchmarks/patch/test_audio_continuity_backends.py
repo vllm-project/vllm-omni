@@ -151,7 +151,7 @@ def test_unmeasured_rate_is_na_not_100_percent(capsys):
     assert "100.00%" not in printed
 
 
-def test_chat_retry_discards_previous_attempt_audio(monkeypatch):
+def test_chat_partial_stream_failure_has_no_continuity_sample(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(patch.time, "perf_counter", lambda: clock[0])
 
@@ -161,15 +161,14 @@ def test_chat_retry_discards_previous_attempt_audio(monkeypatch):
                 yield chunk
             raise patch.aiohttp.ClientError("connection lost")
 
-    responses = iter(
-        [
-            BrokenResponse(clock, [(1.0, sse_audio(wav_chunk()))]),
-            Response(
-                clock, [(100.0, sse_audio(wav_chunk())), (100.05, sse_audio(wav_chunk())), (101.0, b"data: [DONE]\n\n")]
-            ),
-        ]
-    )
-    session = Session(post=lambda **kwargs: next(responses))
+    post_calls = 0
+
+    def post(**kwargs):
+        nonlocal post_calls
+        post_calls += 1
+        return BrokenResponse(clock, [(1.0, sse_audio(wav_chunk()))])
+
+    session = Session(post=post)
     request = RequestFuncInput(
         model="test",
         model_name="test",
@@ -179,10 +178,11 @@ def test_chat_retry_discards_previous_attempt_audio(monkeypatch):
         api_url="http://unused/v1/chat/completions",
     )
     output = asyncio.run(patch.async_request_openai_chat_omni_completions(request, session))
-    assert output.success, output.error
-    (sample,) = output.audio_continuity_samples
-    assert sample["audio_chunk_count"] == 2
-    assert sample["audio_underrun_s"] == 0
+    assert not output.success
+    assert post_calls == 1
+    assert not output.audio_continuity_samples
+    assert output.audio_underrun_s is None
+    assert output.audio_continuity_ok is None
 
 
 def speech_request():
