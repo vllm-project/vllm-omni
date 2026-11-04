@@ -27,9 +27,10 @@ import torch
 import torch.distributed as dist
 import zmq
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.logging import LoggingConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
-from vllm.logger import init_logger
+from vllm.logger import configure_logging, init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
@@ -94,6 +95,7 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
+    from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
 logger = init_logger(__name__)
@@ -1819,6 +1821,12 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+
+        # Spawned workers do not inherit the API server's logging setup.
+        # Preserve the vLLM environment's logging switch and custom config;
+        # an explicit environment level takes precedence over the stage level.
+        log_level = os.environ.get("VLLM_LOGGING_LEVEL", od_config.log_level).upper()
+        configure_logging(LoggingConfig(log_level=cast("LogLevel", log_level)))
 
         shutdown_triggered = False
 
