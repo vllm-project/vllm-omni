@@ -197,6 +197,73 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
     assert "timeout --signal=TERM --kill-after=2m 45m" in command
 
 
+QWEN_IMAGE_BATCH_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]"
+_QWEN_IMAGE_BATCH_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_MERGE_MARKER = "advanced_model and diffusion and rocm and MI325 and cards_1"
+
+
+def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
+    """READY runs the batch node at core_model. MERGE runs it at advanced_model.
+
+    The single-request MERGE smoke stays. Nightly does not gain this node.
+    Step and command timeouts are copied from that smoke, not measured here.
+    """
+    ready = _find_step("READY · Qwen-Image Batch", AMD_READY_PIPELINE)
+    merge = _find_step("MERGE · Qwen-Image Batch", AMD_MERGE_PIPELINE)
+    smoke = _find_step("MERGE · Qwen-Image Online Smoke", AMD_MERGE_PIPELINE)
+    ready_command = "\n".join(ready["commands"])
+    merge_command = "\n".join(merge["commands"])
+    source = Path("tests/e2e/online_serving/test_qwen_image.py").read_text(encoding="utf-8")
+    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.core_model", 1)[1]
+
+    for step, command, marker, artifact, message in (
+        (
+            ready,
+            ready_command,
+            _QWEN_IMAGE_BATCH_READY_MARKER,
+            "artifacts/rocm-qwen-image-batch-ready/**/*",
+            "Expected exactly one executed Qwen-Image READY batch test",
+        ),
+        (
+            merge,
+            merge_command,
+            _QWEN_IMAGE_BATCH_MERGE_MARKER,
+            "artifacts/rocm-qwen-image-batch-merge/**/*",
+            "Expected exactly one executed Qwen-Image MERGE batch test",
+        ),
+    ):
+        assert step["agent_pool"] == "mi300_1"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["depends_on"] == "amd-build"
+        assert step["grade"] == "Blocking"
+        assert step["timeout_in_minutes"] == 60
+        assert "retry" not in step
+        assert step["artifact_paths"] == [artifact]
+        assert "source_file_dependencies" not in step
+        assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in step["commands"]
+        assert "VLLM_ROCM_USE_AITER=1" not in command
+        assert "AITER_JIT_DIR" not in command
+        assert command.count(QWEN_IMAGE_BATCH_NODE) == 2
+        assert QWEN_IMAGE_SMOKE_NODE not in command
+        assert _marker_expressions(step) == [marker, marker]
+        assert "full_model" not in command
+        assert message in command
+        assert "timeout --signal=TERM --kill-after=2m 45m" in command
+
+    assert "--run-level core_model" in ready_command
+    assert "advanced_model" not in ready_command
+    assert "--run-level advanced_model" in merge_command
+    assert "core_model" not in merge_command
+    assert QWEN_IMAGE_BATCH_NODE not in "\n".join(smoke["commands"])
+    assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_BATCH_NODE) == []
+    assert "SINGLE_CARD_FEATURE_MARKS" in batch_head
+    assert "DEFAULT_SMOKE_MARKS" not in batch_head
+    single_card_line = source.split("SINGLE_CARD_FEATURE_MARKS = ", 1)[1].split("\n", 1)[0]
+    assert '"rocm": "MI325"' in single_card_line
+    parallel_line = source.split("PARALLEL_FEATURE_MARKS = ", 1)[1].split("\n", 1)[0]
+    assert "rocm" not in parallel_line
+
+
 def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
     step = _find_step(QWEN_IMAGE_SMOKE_LABEL, AMD_NIGHTLY_PIPELINE)
 
@@ -560,6 +627,24 @@ def test_cuda_ready_retains_full_model_executor_coverage() -> None:
     test_source = Path(PERSONAPLEX_TEMPORAL_PATH).read_text(encoding="utf-8")
     assert "pytestmark = [pytest.mark.core_model, pytest.mark.cpu]" in test_source
     assert "@pytest.mark.slow" not in test_source
+
+
+def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
+    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
+    assert step["timeout_in_minutes"] == 25
+
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+    assert argv == [
+        "pytest",
+        "-sv",
+        "tests/entrypoints",
+        "tests/engine",
+        "tests/diffusion",
+        "--ignore=tests/diffusion/models",
+        "-m",
+        "core_model and cpu",
+    ]
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
@@ -3365,6 +3450,97 @@ def test_qwen3_tts_ready_pins_selected_customvoice_core_nodes() -> None:
         assert command.count(node) == 1
     assert "diff -u /tmp/qwen3-tts-ready-expected.txt" in command
     assert source.count('"rocm": "MI325"') == 4
+
+
+_CUSTOMVOICE_MERGE_LABEL = "Qwen3-TTS CustomVoice E2E Test · Shard %N/%t"
+_CUSTOMVOICE_QUARANTINE_LABEL = "Qwen3-TTS CustomVoice async_chunk Test (quarantined)"
+_CUSTOMVOICE_MERGE_NODES = (
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_default_cuda_graph_startup[async_chunk]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_002[async_chunk]",
+    "tests/e2e/offline_inference/test_qwen3_tts_customvoice.py::test_text_to_audio_001[no_cuda_graph]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_001[async_chunk]",
+)
+
+
+def test_customvoice_merge_restores_async_chunk_to_the_blocking_shard() -> None:
+    """The async_chunk speech node is the fourth blocking MERGE shard.
+
+    The command leaves five minutes for Buildkite cleanup and fails closed if
+    the selected node does not execute. The speech helper still transcribes at
+    advanced_model.
+    """
+    step = _find_step(_CUSTOMVOICE_MERGE_LABEL, AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+    pipeline = yaml.safe_load(AMD_MERGE_PIPELINE.read_text(encoding="utf-8"))
+    labels = [item.get("label") for item in _walk_steps(pipeline["steps"])]
+    source = _QWEN3_TTS_CUSTOMVOICE.read_text(encoding="utf-8")
+    function = source.split("def test_text_to_audio_001", 1)[1].split("\ndef ", 1)[0]
+    assertions = Path("tests/helpers/assertions.py").read_text(encoding="utf-8")
+    speech = assertions.split("def assert_audio_speech_response", 1)[1].split("\ndef ", 1)[0]
+    body = command.split("TESTS=(", 1)[1].split(")", 1)[0]
+    quoted = tuple(re.findall(r'"(tests/[^"]+)"', body))
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["depends_on"] == "amd-build"
+    assert step["grade"] == "Blocking"
+    assert step["parallelism"] == 4
+    assert step["timeout_in_minutes"] == 80
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-tts-customvoice-merge/**/*"]
+    assert "retry" not in step
+    assert "timeout --signal=TERM --kill-after=2m 75m" in command
+    assert "timeout --signal=TERM --kill-after=2m 80m" not in command
+    assert _marker_expressions(step) == ["advanced_model"]
+    assert command.count('--run-level "advanced_model"') == 1
+    assert "--junitxml=" in command
+    assert "pytest-summary.txt" in command
+    assert "Expected exactly one executed Qwen3-TTS CustomVoice MERGE test" in command
+    assert quoted == _CUSTOMVOICE_MERGE_NODES
+    for node in _CUSTOMVOICE_MERGE_NODES:
+        assert command.count(node) == 1
+        assert AMD_MERGE_PIPELINE.read_text(encoding="utf-8").count(node) == 1
+    assert _CUSTOMVOICE_QUARANTINE_LABEL not in labels
+    assert "test_chunked_prefill_tail" not in command
+    assert "send_audio_speech_request(request_config, request_num=get_max_batch_size())" in function
+    assert "pytest.skip" not in function
+    assert 'run_level in {"advanced_model", "full_model"}' in speech
+    assert "_assert_transcript_matches" in speech
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_customvoice_merge_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_MERGE_PIPELINE,
+        step_label=_CUSTOMVOICE_MERGE_LABEL,
+        command_fragment='pytest -s -v -ra "$$TEST"',
+        expected_message="Expected exactly one executed Qwen3-TTS CustomVoice MERGE test",
+        artifact_env="ROCM_QWEN3_TTS_CUSTOMVOICE_MERGE_ARTIFACT_DIR",
+        job_id_prefix="customvoice-merge-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env={"BUILDKITE_PARALLEL_JOB": "3"},
+    )
 
 
 _WORKER_ONE_CARD_MARKER = "core_model and rocm and MI325 and cards_1"
