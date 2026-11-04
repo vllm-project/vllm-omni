@@ -31,6 +31,7 @@ from vllm_omni.clients.duplex import (  # noqa: E402
     DuplexClient,
     DuplexClientBase,
     DuplexClientError,
+    DuplexConnectionError,
     DuplexSessionClosedError,
     EventCollector,
     acknowledge_collected_playback,
@@ -213,6 +214,39 @@ def _response_done_is_terminal(event: dict[str, object]) -> bool:
     return not isinstance(response, dict) or response.get("status") != "cancelled"
 
 
+def _error_code(event: dict[str, object]) -> object | None:
+    """The error code of an ``error`` event, nested (wire form) or top-level."""
+    code = event.get("code")
+    if code is None:
+        error = event.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+    return code
+
+
+def _post_commit_definitive_refusal(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> bool:
+    """Whether the server definitively refused the forced post-commit create.
+
+    ``response_create_without_input`` and ``text_only_turn_unsupported`` are
+    terminal answers to ``response.create``: the committed turn holds nothing
+    the model can answer. Only the fallback re-ask can trigger them (the demo
+    sends no other create, and a server that already answered commits with a
+    precreated response never refuses), so a post-commit event with one of
+    these codes means the mandatory final answer, if any, was delivered by an
+    earlier response and the recognition judging -- not this timeout -- is
+    what decides whether that answer covers the input.
+    """
+    if committed_index is None:
+        return False
+    return any(
+        event.get("type") == "error" and _error_code(event) in _FORCED_RESPONSE_DEFINITIVE_REFUSAL_CODES
+        for event in events[committed_index + 1 :]
+    )
+
+
 def _post_commit_forced_response_settled(
     events: list[dict[str, object]],
     committed_index: int | None,
@@ -277,24 +311,6 @@ def _post_commit_forced_response_settled(
     # synthetic/anonymous event shapes.
     post_commit_answered = bool(answered & created) or (anonymous_created > 0 and anonymous_answered > 0)
     return post_commit_answered and created <= done and anonymous_done >= anonymous_created
-
-
-def _post_commit_response_done_statuses(
-    events: list[dict[str, object]],
-    committed_index: int | None,
-) -> list[str]:
-    """Terminal statuses of every post-commit ``response.done``, for triage."""
-    if committed_index is None:
-        return []
-    statuses: list[str] = []
-    for event in events[committed_index + 1 :]:
-        if event.get("type") != "response.done":
-            continue
-        response = event.get("response")
-        status = response.get("status") if isinstance(response, dict) else None
-        # The server defaults a missing status to "completed" on the wire.
-        statuses.append(status if isinstance(status, str) and status else "completed")
-    return statuses
 
 
 def _latest_model_decision(
@@ -372,6 +388,31 @@ _FORCED_RESPONSE_CREATE_TIMEOUT_S = 15.0
 #: quiescence over ``response.created``/``response.done``/``response.listen``.
 _FORCED_RESPONSE_SETTLE_QUIET_S = 1.5
 
+#: How long the fallback ``response.create`` keeps retrying through transient
+#: transport failures. A send can land inside a resume/teardown window and
+#: raise ``DuplexConnectionError`` even though the session is still alive; the
+#: re-ask itself is idempotent server-side (a duplicate create while a response
+#: is active is refused with ``response_already_active`` rather than corrupting
+#: the session), so retrying within this window is the difference between a
+#: drained forced answer and a silent 90 s hang.
+_FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S = 15.0
+
+#: Interval between fallback ``response.create`` retries.
+_FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S = 1.0
+
+#: Server refusals that answer a forced ``response.create`` with "there is
+#: nothing left to answer": the commit retained no answerable audio, so the
+#: final answer was already given by an earlier response (or the trailing
+#: input was not answerable at all -- the scene-coverage judging downstream
+#: is what tells those apart). Either way no further waiting can produce the
+#: missing response, so the drain treats these codes as settled.
+_FORCED_RESPONSE_DEFINITIVE_REFUSAL_CODES = frozenset(
+    {
+        "response_create_without_input",
+        "text_only_turn_unsupported",
+    }
+)
+
 #: Response lifecycle signals that can precede a promoted forced create.
 _RESPONSE_SIGNAL_TYPES = frozenset(
     {
@@ -411,8 +452,10 @@ async def _drain_forced_post_commit_response(
     timeout_s: float,
     create_timeout_s: float = _FORCED_RESPONSE_CREATE_TIMEOUT_S,
     settle_quiet_s: float = _FORCED_RESPONSE_SETTLE_QUIET_S,
+    fallback_retry_window_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S,
+    fallback_retry_interval_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S,
 ) -> bool:
-    """Drain the commit-requested response, re-asking once if it never opens.
+    """Drain the commit-requested response, re-asking if it never opens.
 
     The commit carries ``response_create``, so the server answers its retained
     audio directly. The drain settles only when at least one response created
@@ -437,6 +480,26 @@ async def _drain_forced_post_commit_response(
     timeout in that situation points at a lost promotion on the server side,
     not at a missing fallback.
 
+    A re-ask can itself fail client-side: a send landing inside a transport
+    resume window raises ``DuplexConnectionError`` while the session is still
+    alive. Connection-level failures are therefore retried for up to
+    ``fallback_retry_window_s`` (bounded by ``timeout_s``); a closed session
+    or any other client error ends the re-ask immediately, and so does a
+    response that finally opens on its own. The re-ask is idempotent
+    server-side -- a duplicate create while a response is active is refused
+    with ``response_already_active`` -- so a retry that races a promotion is
+    harmless.
+
+    A delivered re-ask can also be *refused*: when the commit retained no
+    answerable audio (the model already answered every scene while the input
+    was still streaming, so the final buffer is trailing silence), the server
+    answers ``response.create`` with ``response_create_without_input`` or
+    ``text_only_turn_unsupported`` instead of a response. Those refusals are
+    definitive -- no amount of waiting produces the missing response -- so
+    the drain settles on them and the caller forgives exactly those two
+    error codes; whether the earlier answers actually covered the input is
+    what the recognition judging decides.
+
     Returns whether the explicit fallback was sent. Raises ``TimeoutError``
     when the drain does not finish, so the caller records a client timeout
     instead of closing on a half-generated answer.
@@ -454,11 +517,48 @@ async def _drain_forced_post_commit_response(
             and _event_count_after(collector.events, "response.done", committed_index) == 0
             and not _response_in_progress(collector.events)
         ):
-            with suppress(DuplexClientError, DuplexSessionClosedError):
-                await client.send({"type": "response.create"})
-                fallback_sent = True
+            retry_deadline_s = time.monotonic() + min(fallback_retry_window_s, timeout_s)
+            attempt = 0
+            while not fallback_sent:
+                if _post_commit_response_created(collector.events, committed_index):
+                    break
+                if (
+                    _event_count_after(collector.events, "error", committed_index)
+                    or _event_count_after(collector.events, "response.done", committed_index)
+                    or _response_in_progress(collector.events)
+                ):
+                    break
+                attempt += 1
+                try:
+                    await client.send({"type": "response.create"})
+                    fallback_sent = True
+                    if attempt > 1:
+                        # Confirms the retry rescued the re-ask; a first-try
+                        # success needs no extra noise.
+                        print(
+                            f"[forced-response] response.create fallback succeeded on attempt {attempt}",
+                            flush=True,
+                        )
+                except (DuplexClientError, DuplexSessionClosedError) as exc:
+                    # Surface which exception delayed the re-ask: the drain
+                    # timeout alone cannot say which side failed.
+                    print(
+                        f"[forced-response] response.create fallback attempt {attempt} failed: {exc!r}",
+                        flush=True,
+                    )
+                    if not isinstance(exc, DuplexConnectionError):
+                        break
+                    remaining_s = retry_deadline_s - time.monotonic()
+                    if remaining_s <= 0:
+                        break
+                    await asyncio.sleep(min(fallback_retry_interval_s, remaining_s))
 
     def _drained() -> bool:
+        if _post_commit_definitive_refusal(collector.events, committed_index):
+            # The server refused to force an answer from the committed turn:
+            # nothing more can arrive for this drain. Whether the input was
+            # in fact already answered is the recognition report's judgement.
+            return True
         if not (
             _post_commit_forced_response_settled(collector.events, committed_index)
             and not _response_in_progress(collector.events)
@@ -944,6 +1044,14 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             response_id=response_id,
         )
         errors = collector.errors()
+        if final_create_response and committed_index is not None:
+            # The forced final create can be answered by a definitive
+            # refusal -- the commit retained nothing answerable, so the final
+            # answer was already given by an earlier response (or the input
+            # was not answerable at all, which the recognition report
+            # judges). Only that pair of codes is forgiven; every other
+            # error still fails the run.
+            errors = [event for event in errors if _error_code(event) not in _FORCED_RESPONSE_DEFINITIVE_REFUSAL_CODES]
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:
@@ -1002,10 +1110,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "response_done_count": _event_count_after(
                     collector.events,
                     "response.done",
-                    committed_index,
-                ),
-                "response_done_statuses": _post_commit_response_done_statuses(
-                    collector.events,
                     committed_index,
                 ),
             },
