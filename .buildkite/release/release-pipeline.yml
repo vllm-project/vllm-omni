@@ -88,6 +88,16 @@ steps:
         env:
           DOCKER_BUILDKIT: "1"
 
+      - label: "Build release image - Intel XPU"
+        key: build-release-image-xpu
+        depends_on: ~
+        agents:
+          queue: intel-gpu-omni
+        commands:
+          - "bash .buildkite/release/scripts/build-release-xpu-image.sh"
+        env:
+          DOCKER_BUILDKIT: "1"
+
   # NIGHTLY=1 only: promote ECR images to DockerHub nightly tags, then prune.
   - label: "Publish nightly multi-arch image to DockerHub"
     depends_on:
@@ -108,11 +118,34 @@ steps:
       DOCKER_BUILDKIT: "1"
       DOCKERHUB_USERNAME: "vllmbot"
 
+  - label: "Publish nightly Intel XPU image to DockerHub"
+    depends_on: build-release-image-xpu
+    if: build.env("NIGHTLY") == "1"
+    key: publish-nightly-xpu-image-dockerhub
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/release/scripts/publish-release-xpu-image.sh nightly"
+      - "DOCKERHUB_REPO=vllm/vllm-omni-xpu bash .buildkite/release/scripts/cleanup-nightly-builds.sh"
+    plugins:
+      - docker-login#v3.0.0:
+          username: vllmbot
+          password-env: DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllmbot"
+
   - block: "Publish release images to DockerHub"
     key: block-publish-release-images
     depends_on:
       - build-release-image-x86
       - build-release-image-arm64
+      - input-release-version
+
+  - block: "Publish release Intel XPU image to DockerHub"
+    key: block-publish-release-xpu-image
+    depends_on:
+      - build-release-image-xpu
       - input-release-version
 
   - label: "Publish release images to DockerHub"
@@ -123,6 +156,21 @@ steps:
       queue: small_cpu_queue_release
     commands:
       - "bash .buildkite/release/scripts/publish-release-images.sh"
+    plugins:
+      - docker-login#v3.0.0:
+          username: vllmbot
+          password-env: DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllmbot"
+
+  - label: "Publish release Intel XPU image to DockerHub"
+    depends_on: block-publish-release-xpu-image
+    key: publish-release-xpu-image-dockerhub
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/release/scripts/publish-release-xpu-image.sh release"
     plugins:
       - docker-login#v3.0.0:
           username: vllmbot

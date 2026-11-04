@@ -7,13 +7,8 @@ set -ex
 
 omni_source_dir=$(git rev-parse --show-toplevel)
 
-: "${VLLM_VERSION:?VLLM_VERSION must be set}"
-# Official upstream XPU image. It is published from vllm's own
-# docker/Dockerfile.xpu, which is exactly what build_vllm_base() clones and
-# builds below, so pulling it is equivalent to building the fallback base.
-upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
-local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
-image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
+commit="${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
+image_name="${VLLM_OMNI_IMAGE:-xpu/vllm-omni-ci:${commit}}"
 container_name="xpu_${BUILDKITE_COMMIT}_$(
     tr -dc A-Za-z0-9 </dev/urandom | head -c 10
     echo
@@ -85,10 +80,20 @@ resolve_vllm_base() {
     fi
 }
 
-resolve_vllm_base
+if [ -n "${VLLM_OMNI_IMAGE:-}" ]; then
+    docker pull "${image_name}"
+else
+    : "${VLLM_VERSION:?VLLM_VERSION must be set}"
+    # Official upstream XPU image. It is published from vllm's own
+    # docker/Dockerfile.xpu, which is exactly what build_vllm_base() clones and
+    # builds below, so pulling it is equivalent to building the fallback base.
+    upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
+    local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
+    resolve_vllm_base
 
-# Try building the docker image
-docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+    # Build the image used by this test run.
+    docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+fi
 
 # Setup cleanup
 remove_docker_container() {
