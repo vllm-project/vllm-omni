@@ -480,6 +480,35 @@ def test_forced_response_keeps_waiting_after_other_server_errors():
     assert sent == [{"type": "response.create"}]
 
 
+def test_forced_response_reports_a_sent_fallback_even_when_the_drain_times_out():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+    marked: list[bool] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(
+                _Client(),
+                collector,
+                committed_index=0,
+                timeout_s=0.05,
+                create_timeout_s=0.05,
+                settle_quiet_s=0.0,
+                on_fallback_sent=lambda: marked.append(True),
+            )
+        )
+
+    # A timed-out drain must not read as "the re-ask was never sent".
+    assert sent == [{"type": "response.create"}]
+    assert marked == [True]
+
+
 def test_refusal_forgiveness_is_scoped_to_the_post_commit_window():
     demo = _load_demo_module()
     pre_commit_refusal = {"type": "error", "error": {"code": "response_create_without_input"}}

@@ -17,6 +17,7 @@ import json
 import math
 import sys
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -451,6 +452,7 @@ async def _drain_forced_post_commit_response(
     settle_quiet_s: float = _FORCED_RESPONSE_SETTLE_QUIET_S,
     fallback_retry_window_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S,
     fallback_retry_interval_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S,
+    on_fallback_sent: Callable[[], None] | None = None,
 ) -> bool:
     """Drain the commit-requested response, re-asking if it never opens.
 
@@ -529,6 +531,11 @@ async def _drain_forced_post_commit_response(
                 try:
                     await client.send({"type": "response.create"})
                     fallback_sent = True
+                    if on_fallback_sent is not None:
+                        # The caller reports the fallback even when this drain
+                        # goes on to time out: a timeout must not read as "the
+                        # re-ask was never sent".
+                        on_fallback_sent()
                     if attempt > 1:
                         # Confirms the retry rescued the re-ask; a first-try
                         # success needs no extra noise.
@@ -948,6 +955,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # answer opt in.
         final_create_response = bool(getattr(args, "final_create_response", False))
         forced_response_fallback_sent = False
+        # A drain timeout must not erase the fact that the re-ask reached the
+        # server: record it as soon as the send succeeds, then fold it back in
+        # after the wait ends.
+        fallback_progress = {"sent": False}
         wait_for_post_commit_decision = False
         commit_sent_at_s = await _commit_input_after_playback_checkpoint(
             client,
@@ -978,6 +989,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         committed_index=committed_index,
                         timeout_s=args.timeout_s,
                         create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
+                        on_fallback_sent=lambda: fallback_progress.__setitem__("sent", True),
                     )
                 else:
                     await wait_for_condition(
@@ -988,6 +1000,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 post_commit_decision = _post_commit_model_decision(collector.events, committed_index)
         except TimeoutError as exc:
             wait_error = str(exc)
+        forced_response_fallback_sent = forced_response_fallback_sent or fallback_progress["sent"]
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
         await client.close(timeout_s=args.timeout_s)
