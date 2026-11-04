@@ -206,6 +206,17 @@ omni = Omni(model="<autoround-mxfp8-model>")
 
 ## Validation and Notes
 
+On Ascend NPU, `VLLM_OMNI_MXFP8_SCALE_ALG` selects the `scale_alg` passed to
+`torch_npu.npu_dynamic_mx_quant` for activations and online weights. It defaults
+to `0`; set it before starting the process:
+
+```bash
+export VLLM_OMNI_MXFP8_SCALE_ALG=1
+```
+
+The installed torch_npu/CANN version must support the selected algorithm and
+the `scale_alg` keyword. Offline checkpoint weights are not requantized.
+
 1. Online mode quantizes BF16 weights at load time using
    `npu_dynamic_mx_quant`. This adds a one-time overhead on the first load
    but requires no checkpoint preparation.

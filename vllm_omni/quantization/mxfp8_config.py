@@ -40,6 +40,7 @@ Extending to a new MX precision with a different calling convention (e.g. dual-s
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -77,6 +78,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+
+def _mx_scale_alg() -> int:
+    return int(os.environ.get("VLLM_OMNI_MXFP8_SCALE_ALG", "0"))
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -437,7 +443,11 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
     def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         import torch_npu
 
-        return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch_npu.float8_e4m3fn)
+        return torch_npu.npu_dynamic_mx_quant(
+            x,
+            dst_type=torch_npu.float8_e4m3fn,
+            scale_alg=_mx_scale_alg(),
+        )
 
     def _quant_matmul(
         self,
@@ -500,7 +510,11 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
             initialize_single_dummy_weight(layer.weight)
 
         # NPU: quantize BF16/FP16 (N, K) → FP8 (N, K) + MX scale (N, S).
-        weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight, dst_type=torch_npu.float8_e4m3fn)
+        weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(
+            layer.weight,
+            dst_type=torch_npu.float8_e4m3fn,
+            scale_alg=_mx_scale_alg(),
+        )
 
         # Normalize to canonical layout shared with offline path.
         weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).transpose(0, 1).contiguous()
