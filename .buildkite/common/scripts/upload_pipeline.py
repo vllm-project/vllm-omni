@@ -599,7 +599,8 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
-    # A step that sets its own retry replaces the hardware preset's retry.
+    # A step-level retry fully replaces the preset retry. It is not merged, so a
+    # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
     return merged

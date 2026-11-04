@@ -3,7 +3,7 @@
 # ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins`` + ``retry``,
 # then strips ``mirror_hardwares`` before Buildkite upload.
 # Every preset keeps a manual Retry button after a green job, and reruns once
-# when the agent is lost or the process is killed by a signal. Pytest failures
+# when the agent is lost or stopped. Pytest failures
 # (exit 1) and OOM (137) are not retried. CPU steps do not use these presets
 # and get no retry from here.
 #
@@ -31,7 +31,7 @@
 # The ``l4_*`` presets run on the EKS ``l4-k8s`` queue (agent-stack-k8s),
 # packed onto g6.12xlarge L4 nodes (``vllm.ci/gpu-pool=l4x4``). GPU / CPU /
 # memory / shm requests scale with card count (1 GPU = 10 CPU / 40Gi / 24Gi shm).
-# Shared hardware retry covers lost agents / killed pods, not pytest or OOM
+# Shared hardware retry covers a lost or stopped agent, not pytest or OOM
 # (exit 1 / 137).
 # The Kubernetes HF secret deliberately uses VLLM_CI_HF_TOKEN. Scheduled
 # build-level HF_TOKEN values can override pod env entries with the same name;
@@ -43,10 +43,12 @@ x-npu-k8s-plugins: &npu_k8s_plugins
         imagePullSecrets:
           - name: swr-secret
 
-# Manual Retry stays available after a green job. Automatic rules rerun a lost
-# agent or a signal-killed process once. Omit exit 1 (pytest failed) and 137
+# Manual Retry stays available after a green job. Automatic rules rerun once
+# when the agent is lost or stopped. Omit exit 1 (pytest failed) and 137
 # (cgroup OOM / SIGKILL of the test process). ci-infra ``K8S_RETRY`` still
 # retries exit 1. L4, H100, B200, and NPU presets all use this.
+# A step that sets its own ``retry`` replaces this block entirely, so an
+# automatic-only step retry drops ``manual.permit_on_passed``.
 x-hardware-retry: &hardware_retry
   manual:
     permit_on_passed: true

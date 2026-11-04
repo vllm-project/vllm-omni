@@ -231,6 +231,7 @@ def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
         },
     )
     assert step["retry"] == {"automatic": [{"exit_status": 255, "limit": 2}]}
+    assert "manual" not in step["retry"]
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
