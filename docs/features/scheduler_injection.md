@@ -65,6 +65,12 @@ already use:
 Construction matches the stock sites: the pipeline passes its resolved
 `local_files_only` (typically `os.path.exists(model)`) and `revision` into
 `cls.from_pretrained(od_config.model, subfolder="scheduler", ...)`.
+For optional stock-specific timestep controls such as Wan's `shift` or
+Boogu's `num_tokens`, the pipeline passes a control only when
+`set_timesteps` declares that named parameter. A generic `**kwargs` does not
+count as support; unsupported optional controls are omitted with a warning.
+Pipeline features that require a schedule input, such as LingBot's refiner
+`sigmas`, require that named parameter and raise a clear error if it is absent.
 
 ## Which pipelines honor the seam
 
@@ -76,17 +82,16 @@ this PR covers, including:
 - `sd3`
 - `ltx2` (dynamic-shifting overwrite is skipped + warned when injection is set)
 - `wan2_2` and `wan2_2_i2v` (per-request `sample_solver` / `flow_shift` rebuild
-  is skipped + warned)
-- `glm_image`, `hidream_image`, `longcat_image*`, `longcat_video_avatar`
+  is skipped + warned; `shift` is passed only when explicitly supported)
+- `glm_image`, `longcat_image*`, `longcat_video_avatar`
 - `hunyuan_video_1_5*`
 - `ernie_image`, `boogu_image`, `krea2`, `lingbot_video`
 
-Variants that construct a scheduler another way (for example DMD2's
-`DMD2EulerScheduler` overwrite, Helios, Cosmos3) skip the overwrite and
-leave the injected object when `od_config.scheduler` is set, or fail at
-pipeline load if the construction site never called
-`build_pipeline_scheduler`. An accepted `scheduler` field is never silently
-ignored.
+Other pipelines fail at load if the selected pipeline did not construct the
+configured scheduler through `build_pipeline_scheduler`. This includes
+custom pipelines unless they use the same factory. The load-time check also
+rejects a pipeline that replaces the constructed instance before loading
+finishes, so the config cannot be silently ignored or overwritten.
 
 Custom pipelines remain supported until the rest of the RL injection surface
 is ready; see [Custom Diffusion Pipeline](custom_pipeline.md).

@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    set_wan_scheduler_timesteps,
     refresh_cache_for_denoise_schedule,
     resolve_wan_boundary_ratio,
     resolve_wan_flow_shift,
@@ -638,10 +639,7 @@ class Wan22I2VPipeline(
             apply_wan_runtime_scheduler(self, sample_solver, flow_shift)
 
         # Timesteps
-        if sample_solver == "unipc":
-            self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
-        else:
-            self.scheduler.set_timesteps(num_steps, device=device)
+        set_wan_scheduler_timesteps(self, num_steps, device, sample_solver, flow_shift)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 

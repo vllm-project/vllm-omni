@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -313,8 +314,13 @@ class QwenImagePipeline(
             qwen_subfolders,
         )
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            ),
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
         # half-written cache (missing-shard ``OSError`` and the default

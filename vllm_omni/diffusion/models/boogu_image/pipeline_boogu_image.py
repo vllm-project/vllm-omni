@@ -58,6 +58,11 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.schedulers import (
+    build_pipeline_scheduler,
+    filter_injected_scheduler_kwargs,
+    is_injected_scheduler,
+)
 from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -272,9 +277,14 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             revision=od_config.revision,
         )
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model,
-            subfolder="scheduler",
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model,
+                subfolder="scheduler",
+                local_files_only=local_files_only,
+                revision=od_config.revision,
+            ),
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
@@ -1113,7 +1123,17 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
         # 4. Timesteps (the ported scheduler consumes ``num_tokens``).
         num_tokens = latents.shape[-2] * latents.shape[-1]
-        self.scheduler.set_timesteps(num_inference_steps, device=device, num_tokens=num_tokens)
+        if is_injected_scheduler(self.od_config):
+            scheduler_kwargs, unsupported = filter_injected_scheduler_kwargs(self.scheduler, {"num_tokens": num_tokens})
+            if unsupported:
+                logger.warning(
+                    "Injected Boogu scheduler %s does not accept optional set_timesteps kwargs %s; omitting them.",
+                    type(self.scheduler).__name__,
+                    unsupported,
+                )
+            self.scheduler.set_timesteps(num_inference_steps, device=device, **scheduler_kwargs)
+        else:
+            self.scheduler.set_timesteps(num_inference_steps, device=device, num_tokens=num_tokens)
         timesteps = self.scheduler.timesteps
         num_timesteps = len(timesteps)
 

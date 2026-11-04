@@ -4,6 +4,7 @@
 from vllm_omni.diffusion.models.schedulers.registry import (
     build_pipeline_scheduler,
     ensure_scheduler_consumed,
+    filter_injected_scheduler_kwargs,
     is_injected_scheduler,
     register_scheduler,
     resolve_scheduler_cls,
@@ -22,6 +23,7 @@ __all__ = [
     "FlowUniPCMultistepScheduler",
     "build_pipeline_scheduler",
     "ensure_scheduler_consumed",
+    "filter_injected_scheduler_kwargs",
     "is_injected_scheduler",
     "register_scheduler",
     "resolve_scheduler_cls",

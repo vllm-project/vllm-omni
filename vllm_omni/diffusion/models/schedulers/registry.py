@@ -53,10 +53,11 @@ import cycles.
 
 import importlib
 import importlib.metadata
+import inspect
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
-from weakref import WeakValueDictionary
+from weakref import ReferenceType, ref
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -65,7 +66,7 @@ SCHEDULER_ENTRY_POINT_GROUP = "vllm_omni.schedulers"
 
 _SCHEDULER_REGISTRY: dict[str, type] = {}
 _entry_points_loaded = False
-_consumed_scheduler_configs: WeakValueDictionary[int, Any] = WeakValueDictionary()
+_consumed_scheduler_configs: dict[int, tuple[ReferenceType[object], object]] = {}
 _RESERVED_FROM_PRETRAINED_KEYS = frozenset({"subfolder", "local_files_only"})
 
 
@@ -116,22 +117,32 @@ def is_injected_scheduler(od_config: "OmniDiffusionConfig") -> bool:
     return getattr(od_config, "scheduler", None) is not None
 
 
-def mark_scheduler_consumed(od_config: "OmniDiffusionConfig") -> None:
-    """Record that this config's ``scheduler`` field was handled by a construction site."""
+def mark_scheduler_consumed(od_config: "OmniDiffusionConfig", scheduler: object) -> None:
+    """Record the exact injected scheduler produced for this config."""
     if is_injected_scheduler(od_config):
-        _consumed_scheduler_configs[id(od_config)] = od_config
+        config_id = id(od_config)
+
+        def discard(config_ref: ReferenceType[object]) -> None:
+            current = _consumed_scheduler_configs.get(config_id)
+            if current is not None and current[0] is config_ref:
+                _consumed_scheduler_configs.pop(config_id, None)
+
+        _consumed_scheduler_configs[config_id] = (ref(od_config, discard), scheduler)
 
 
-def ensure_scheduler_consumed(od_config: "OmniDiffusionConfig", pipeline: Any) -> None:
+def ensure_scheduler_consumed(od_config: "OmniDiffusionConfig", pipeline: object) -> None:
     """Fail if ``od_config.scheduler`` was set but no construction site consumed it."""
     if not is_injected_scheduler(od_config):
         return
-    if id(od_config) in _consumed_scheduler_configs:
+    consumed = _consumed_scheduler_configs.get(id(od_config))
+    pipeline_scheduler = getattr(pipeline, "scheduler", None)
+    if consumed is not None and consumed[0]() is od_config and consumed[1] is pipeline_scheduler:
         return
     pipeline_name = type(pipeline).__name__ if pipeline is not None else "pipeline"
     raise ValueError(
         f"{pipeline_name} does not consume OmniDiffusionConfig.scheduler="
-        f"{od_config.scheduler!r}. Wire the construction site through "
+        f"{od_config.scheduler!r}; the configured class was not constructed "
+        "or its instance was replaced. Wire the construction site through "
         "build_pipeline_scheduler or reject the option explicitly. "
         "See docs/features/scheduler_injection.md."
     )
@@ -140,8 +151,8 @@ def ensure_scheduler_consumed(od_config: "OmniDiffusionConfig", pipeline: Any) -
 def build_pipeline_scheduler(
     od_config: "OmniDiffusionConfig",
     scheduler_cls: str | type | None = None,
-    scheduler_kwargs: dict[str, Any] | None = None,
-    default_builder: Callable[[], Any] | None = None,
+    scheduler_kwargs: Mapping[str, object] | None = None,
+    default_builder: Callable[[], object] | None = None,
     *,
     model: str | None = None,
     local_files_only: bool | None = None,
@@ -159,7 +170,6 @@ def build_pipeline_scheduler(
     (not ``getattr(od_config, "local_files_only")`` — that field does not exist
     on ``OmniDiffusionConfig``).
     """
-    mark_scheduler_consumed(od_config)
     cls = resolve_scheduler_cls(scheduler_cls) or resolve_scheduler_cls(getattr(od_config, "scheduler", None))
     if cls is None:
         if default_builder is None:
@@ -180,9 +190,34 @@ def build_pipeline_scheduler(
         local_files_only = os.path.exists(pretrained_model)
     if revision is not None:
         kwargs.setdefault("revision", revision)
-    return cls.from_pretrained(
+    scheduler = cls.from_pretrained(
         pretrained_model,
         subfolder=subfolder,
         local_files_only=local_files_only,
         **kwargs,
     )
+    mark_scheduler_consumed(od_config, scheduler)
+    return scheduler
+
+
+def filter_injected_scheduler_kwargs(
+    scheduler: object, kwargs: Mapping[str, object]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Partition optional pipeline kwargs by the injected method's named parameters.
+
+    Required ``sigmas`` and ``timesteps`` inputs are validated by the call sites;
+    this helper is for optional stock-scheduler controls such as ``shift`` or
+    ``num_tokens``. It deliberately does not treat ``**kwargs`` as support.
+    """
+    try:
+        parameters = inspect.signature(getattr(scheduler, "set_timesteps")).parameters
+    except (TypeError, ValueError):
+        return {}, tuple(kwargs)
+    supported: dict[str, Any] = {
+        name: value
+        for name, value in kwargs.items()
+        if name in parameters
+        and parameters[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    unsupported = tuple(name for name in kwargs if name not in supported)
+    return supported, unsupported

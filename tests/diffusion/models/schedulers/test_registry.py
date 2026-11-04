@@ -12,9 +12,9 @@ contract.
 import copy
 import importlib.metadata
 import inspect
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import Mock
-from weakref import WeakValueDictionary
 
 import pytest
 
@@ -41,7 +41,7 @@ class RecordingMockScheduler:
     constructed: ClassVar[list[dict[str, Any]]] = []
 
     def __init__(self, **config: Any) -> None:
-        self.config = dict(config)
+        self.config = SimpleNamespace(**config)
         self.timesteps: list[int] = []
         self._begin_index = 0
 
@@ -82,7 +82,7 @@ def _isolate_registry(monkeypatch):
     """Snapshot the module-global registry and skip real entry-point scans."""
     snapshot = dict(registry_mod._SCHEDULER_REGISTRY)
     monkeypatch.setattr(registry_mod, "_entry_points_loaded", True)
-    monkeypatch.setattr(registry_mod, "_consumed_scheduler_configs", WeakValueDictionary())
+    monkeypatch.setattr(registry_mod, "_consumed_scheduler_configs", {})
     RecordingMockScheduler.constructed.clear()
     yield
     registry_mod._SCHEDULER_REGISTRY.clear()
@@ -117,6 +117,7 @@ def assert_scheduler_contract(scheduler: Any) -> None:
     assert callable(getattr(scheduler, "set_timesteps", None)), "set_timesteps() required"
     assert callable(getattr(scheduler, "set_begin_index", None)), "set_begin_index() required"
     assert hasattr(scheduler, "config"), ".config attribute required"
+    assert hasattr(scheduler.config, "num_train_timesteps"), ".config.num_train_timesteps required"
     copy.deepcopy(scheduler)  # must be deepcopy-safe
 
 
@@ -244,8 +245,15 @@ class TestBuildPipelineScheduler:
     def test_ensure_scheduler_consumed_passes_after_factory(self):
         register_scheduler("config_sched", RecordingMockScheduler)
         od_config = _od_config(scheduler="config_sched")
+        scheduler = build_pipeline_scheduler(od_config, local_files_only=False)
+        ensure_scheduler_consumed(od_config, SimpleNamespace(scheduler=scheduler))
+
+    def test_ensure_scheduler_consumed_rejects_replaced_instance(self):
+        register_scheduler("config_sched", RecordingMockScheduler)
+        od_config = _od_config(scheduler="config_sched")
         build_pipeline_scheduler(od_config, local_files_only=False)
-        ensure_scheduler_consumed(od_config, object())
+        with pytest.raises(ValueError, match="instance was replaced"):
+            ensure_scheduler_consumed(od_config, SimpleNamespace(scheduler=RecordingMockScheduler()))
 
     def test_is_injected_scheduler(self):
         assert is_injected_scheduler(_od_config(scheduler="x"))
@@ -259,7 +267,7 @@ class TestBuildPipelineScheduler:
         )
         result = build_pipeline_scheduler(od_config, scheduler_kwargs={"shift": 3.0})
         assert RecordingMockScheduler.constructed[-1]["kwargs"] == {"shift": 3.0, "num_train_timesteps": 1000}
-        assert result.config == {"shift": 3.0, "num_train_timesteps": 1000}
+        assert vars(result.config) == {"shift": 3.0, "num_train_timesteps": 1000}
 
     def test_reserved_scheduler_kwargs_raise(self):
         register_scheduler("config_sched", RecordingMockScheduler)
@@ -294,6 +302,23 @@ class TestSchedulerContract:
         assert scheduler._begin_index == 1
         latents = object()
         assert scheduler.step("noise", 0, latents, return_dict=False) == (latents,)
+
+    def test_optional_kwargs_require_explicit_named_parameters(self):
+        class NamedShiftScheduler:
+            def set_timesteps(self, num_inference_steps, device=None, shift=None):
+                pass
+
+        named, unsupported = registry_mod.filter_injected_scheduler_kwargs(
+            NamedShiftScheduler(), {"shift": 2.0, "num_tokens": 16}
+        )
+        assert named == {"shift": 2.0}
+        assert unsupported == ("num_tokens",)
+
+        generic, unsupported = registry_mod.filter_injected_scheduler_kwargs(
+            RecordingMockScheduler(), {"shift": 2.0}
+        )
+        assert generic == {}
+        assert unsupported == ("shift",)
 
     def test_deepcopy_gives_independent_state(self):
         scheduler = RecordingMockScheduler()
