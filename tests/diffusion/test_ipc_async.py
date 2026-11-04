@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for IPC async D2H stream packing."""
 
+from types import SimpleNamespace
 from unittest.mock import ANY
 
 import pytest
@@ -10,10 +11,12 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.ipc import (
     _pack_diffusion_fields,
+    _pack_diffusion_media,
     _pack_tensor_if_large,
     _pack_value_if_large,
     pack_diffusion_output_shm,
 )
+from vllm_omni.platforms.interface import OmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -110,6 +113,93 @@ class TestPackDiffusionFieldsWithD2hStream:
         _pack_diffusion_fields(out, d2h_stream=d2h)
         # Should pack trajectory_latents and trajectory_log_probs
         assert mock_pack_tensor.call_count == 2
+
+
+def _fake_device_tensor(mocker, host: torch.Tensor):
+    """A sub-threshold tensor that reports a non-CPU device.
+
+    ``.detach().cpu().contiguous()`` returns *host*, so the test can tell
+    whether packing moved the tensor to CPU without accelerator hardware.
+    """
+    fake = mocker.MagicMock(spec=torch.Tensor)
+    fake.device = torch.device("meta")
+    fake.nelement.return_value = host.nelement()
+    fake.element_size.return_value = host.element_size()
+    fake.untyped_storage.return_value.nbytes.return_value = host.untyped_storage().nbytes()
+    fake.detach.return_value.cpu.return_value.contiguous.return_value = host
+    return fake
+
+
+@pytest.fixture
+def set_device_tensor_ipc(monkeypatch):
+    """Make ``current_omni_platform.supports_device_tensor_ipc()`` return *flag*.
+
+    ``ipc.py`` imports ``current_omni_platform`` lazily from
+    ``vllm_omni.platforms``, whose module ``__getattr__`` returns
+    ``_current_omni_platform`` once it is set.
+    """
+
+    def _set(flag: bool) -> None:
+        platform = SimpleNamespace(supports_device_tensor_ipc=lambda: flag)
+        monkeypatch.setattr("vllm_omni.platforms._current_omni_platform", platform)
+
+    return _set
+
+
+class TestSmallDeviceTensorIpcFlag:
+    """``OmniPlatform.supports_device_tensor_ipc()`` gates the CPU move of sub-threshold device tensors."""
+
+    def test_flag_defaults_to_true(self):
+        assert OmniPlatform.supports_device_tensor_ipc() is True
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_small_cpu_tensor_returned_unchanged(self, set_device_tensor_ipc, flag):
+        set_device_tensor_ipc(flag)
+        small_tensor = torch.zeros(10)
+        assert _pack_tensor_if_large(small_tensor) is small_tensor
+
+    def test_small_device_tensor_kept_on_device_when_flag_true(self, mocker, set_device_tensor_ipc):
+        set_device_tensor_ipc(True)
+        fake = _fake_device_tensor(mocker, torch.arange(10, dtype=torch.float32))
+        result = _pack_tensor_if_large(fake)
+        assert result is fake
+        assert result.device.type == "meta"
+        fake.detach.assert_not_called()
+
+    def test_small_device_tensor_moved_to_cpu_when_flag_false(self, mocker, set_device_tensor_ipc):
+        set_device_tensor_ipc(False)
+        host = torch.arange(10, dtype=torch.float32)
+        fake = _fake_device_tensor(mocker, host)
+        result = _pack_tensor_if_large(fake)
+        assert result is host
+        assert result.device.type == "cpu"
+        assert result.is_contiguous()
+
+    def test_legacy_output_and_trajectory_fields_moved_to_cpu_when_flag_false(self, mocker, set_device_tensor_ipc):
+        set_device_tensor_ipc(False)
+        video_host, audio_host = torch.zeros(8), torch.ones(4)
+        latents_host, timesteps_host = torch.zeros(2), torch.ones(2)
+        out = DiffusionOutput(
+            output=(_fake_device_tensor(mocker, video_host), _fake_device_tensor(mocker, audio_host)),
+            trajectory_latents=_fake_device_tensor(mocker, latents_host),
+            trajectory_timesteps=_fake_device_tensor(mocker, timesteps_host),
+        )
+        _pack_diffusion_fields(out)
+        assert out.output[0] is video_host
+        assert out.output[1] is audio_host
+        assert out.trajectory_latents is latents_host
+        assert out.trajectory_timesteps is timesteps_host
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_diffusion_media_tensor_moved_to_cpu(self, mocker, set_device_tensor_ipc, flag):
+        set_device_tensor_ipc(flag)
+        host = torch.zeros(6)
+        media = mocker.MagicMock()
+        media.prepared_for_transport = True
+        media.video.schema_version = 1
+        media.video.tensor = _fake_device_tensor(mocker, host)
+        packed = _pack_diffusion_media(media, d2h_stream=None)
+        assert packed["video"]["tensor"] is host
 
 
 class TestPackDiffusionOutputShmWithD2hStream:
