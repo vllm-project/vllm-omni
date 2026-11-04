@@ -50,7 +50,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_SUPPORTED_CAPABILITIES = {(10, 3)}
+# (10, 3) is the originally validated target; (12, 0) covers RTX PRO 6000
+# Blackwell (SM120), where the same FlashInfer/CUTLASS NVFP4 kernels run.
+_SUPPORTED_CAPABILITIES = {(10, 3), (12, 0)}
 _COMPATIBLE_NVFP4_KERNELS = (
     CutlassNvFp4LinearKernel,
     FbgemmNvFp4LinearKernel,
@@ -80,7 +82,8 @@ def _assert_supported() -> None:
     if not _supports_capability(capability):
         device = current_platform.device_name
         sm = capability.to_int() if capability is not None else "unknown"
-        raise RuntimeError(f"SVDQuant NVFP4 is validated on SM103 only; got {device!r} (SM{sm})")
+        supported = ", ".join(f"SM{a}{b}" for a, b in sorted(_SUPPORTED_CAPABILITIES))
+        raise RuntimeError(f"SVDQuant NVFP4 is supported on {supported}; got {device!r} (SM{sm})")
 
 
 @functools.cache
