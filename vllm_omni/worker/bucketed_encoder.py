@@ -434,12 +434,18 @@ class _BucketedEncoder:
 
 def _install_processor_hook() -> None:
     try:
+        from vllm.multimodal.inputs import MultiModalFieldConfig
+        from vllm.multimodal.processing import BaseMultiModalProcessor
+
         from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
     except Exception:
         return
     if getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False):
         return
 
+    # 1. Add the per-item length field to the mm inputs. ``_apply_hf_processor_main``
+    #    is concrete and models override ``_call_hf_processor`` instead, so this
+    #    patch is not shadowed.
     original = OmniMultiModalProcessor._apply_hf_processor_main
 
     def _apply_hf_processor_main(self, mm_items, hf_kwargs):
@@ -452,18 +458,47 @@ def _install_processor_hook() -> None:
             logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
         return result
 
-    fields_original = OmniMultiModalProcessor._get_mm_fields_config
-
-    def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
-        fields = dict(fields_original(self, hf_inputs, hf_processor_mm_kwargs))
-        if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
-            from vllm.multimodal.inputs import MultiModalFieldConfig
-
-            fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
-        return fields
-
     OmniMultiModalProcessor._apply_hf_processor_main = _apply_hf_processor_main
-    OmniMultiModalProcessor._get_mm_fields_config = _get_mm_fields_config
+
+    # 2. Declare the field config so ``from_hf_inputs`` does not silently drop
+    #    ``encoder_bucket_frames``. ``_get_mm_fields_config`` is abstract and every
+    #    concrete model overrides it, so patching it is shadowed; instead wrap the
+    #    two concrete orchestration methods that call it. The injected wrapper is a
+    #    no-op for non-audio models (their hf inputs carry no bucket key).
+    def _with_bucket_field(get_fields):
+        # ``wrapped`` is assigned to ``self._get_mm_fields_config`` as a plain
+        # function, so it is called WITHOUT binding ``self``; ``get_fields`` is
+        # already a bound method (``self._get_mm_fields_config`` captured above).
+        def wrapped(hf_inputs, hf_processor_mm_kwargs):
+            fields = dict(get_fields(hf_inputs, hf_processor_mm_kwargs))
+            if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
+                fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
+            return fields
+
+        return wrapped
+
+    _orig_apply = BaseMultiModalProcessor._apply_hf_processor
+    _orig_cached = BaseMultiModalProcessor._cached_apply_hf_processor
+
+    def _apply_hf_processor(self, *args, **kwargs):
+        get = self._get_mm_fields_config
+        self._get_mm_fields_config = _with_bucket_field(get)
+        try:
+            return _orig_apply(self, *args, **kwargs)
+        finally:
+            self._get_mm_fields_config = get
+
+    def _cached_apply_hf_processor(self, *args, **kwargs):
+        get = self._get_mm_fields_config
+        self._get_mm_fields_config = _with_bucket_field(get)
+        try:
+            return _orig_cached(self, *args, **kwargs)
+        finally:
+            self._get_mm_fields_config = get
+
+    BaseMultiModalProcessor._apply_hf_processor = _apply_hf_processor
+    BaseMultiModalProcessor._cached_apply_hf_processor = _cached_apply_hf_processor
+
     OmniMultiModalProcessor._bucket_frames_installed = True
     logger.info("Bucketed encoder processor hook installed")
 

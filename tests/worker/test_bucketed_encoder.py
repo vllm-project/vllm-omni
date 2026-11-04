@@ -122,14 +122,18 @@ def bucket_env(monkeypatch):
 def restore_processor_hook():
     """Undo install_bucketed_processor_hook's global class patch afterwards, so
     later tests don't run against a patched OmniMultiModalProcessor."""
+    from vllm.multimodal.processing import BaseMultiModalProcessor
+
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 
     saved_main = OmniMultiModalProcessor._apply_hf_processor_main
-    saved_fields = OmniMultiModalProcessor._get_mm_fields_config
+    saved_apply = BaseMultiModalProcessor._apply_hf_processor
+    saved_cached = BaseMultiModalProcessor._cached_apply_hf_processor
     saved_flag = getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
     yield
     OmniMultiModalProcessor._apply_hf_processor_main = saved_main
-    OmniMultiModalProcessor._get_mm_fields_config = saved_fields
+    BaseMultiModalProcessor._apply_hf_processor = saved_apply
+    BaseMultiModalProcessor._cached_apply_hf_processor = saved_cached
     OmniMultiModalProcessor._bucket_frames_installed = saved_flag
 
 
@@ -632,6 +636,54 @@ def test_processor_hook_adds_encoder_bucket_frames(monkeypatch, restore_processo
 
     assert "encoder_bucket_frames" in result
     assert torch.equal(result["encoder_bucket_frames"], torch.tensor([300], dtype=torch.int64))
+
+
+def test_processor_hook_injects_field_config(monkeypatch, restore_processor_hook):
+    """The field config must be declared even when a model's _get_mm_fields_config
+    does not declare encoder_bucket_frames, otherwise from_hf_inputs silently
+    drops the field and it never reaches the worker's embed_multimodal."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import numpy as np
+    from transformers import BatchFeature
+    from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
+    install_bucketed_processor_hook()
+
+    class Processor(OmniMultiModalProcessor):
+        def _get_mm_fields_config(self, *args):
+            return {}  # model does NOT declare encoder_bucket_frames
+
+        def _get_prompt_updates(self, *args):
+            return []
+
+        def _call_hf_processor(self, *args):
+            return BatchFeature({"audio_features": torch.zeros(2, 128, 3000)})
+
+    processor = object.__new__(Processor)
+    processor.dummy_inputs = SimpleNamespace(get_dummy_text=Mock(return_value="dummy"))
+    processor._postprocess_prompt = lambda x: x
+    processor._get_mm_hashes = Mock(return_value=[])
+    processor._get_mm_prompt_updates = Mock(return_value=[])
+
+    audio = np.zeros(16000 * 3, dtype=np.float32)
+    items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
+    inputs = SimpleNamespace(mm_data_items=items, hf_processor_mm_kwargs={}, prompt="hi")
+    timing_ctx = SimpleNamespace(record=Mock(return_value=nullcontext()))
+
+    result = processor._apply_hf_processor(inputs, timing_ctx)
+
+    flat_fields = set()
+    for items_list in result.kwargs.values():
+        for item in items_list:
+            flat_fields.update(item.keys())
+    assert "encoder_bucket_frames" in flat_fields
 
 
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
