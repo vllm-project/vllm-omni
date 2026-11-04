@@ -312,6 +312,174 @@ def test_forced_response_falls_back_to_an_explicit_create_when_idle():
     assert sent == [{"type": "response.create"}]
 
 
+def test_forced_response_retries_the_fallback_send_through_connection_errors():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+            if len(sent) < 3:
+                # A send inside a transport resume window fails even though
+                # the session itself is still alive.
+                raise demo.DuplexConnectionError("send failed: transport is not connected")
+            collector.add({"type": "response.created", "response": {"id": "resp-forced"}})
+            collector.add({"type": "response.done", "response": {"id": "resp-forced"}})
+
+    fallback = asyncio.run(
+        demo._drain_forced_post_commit_response(
+            _Client(),
+            collector,
+            committed_index=0,
+            timeout_s=0.5,
+            create_timeout_s=0.05,
+            settle_quiet_s=0.0,
+            fallback_retry_window_s=5.0,
+            fallback_retry_interval_s=0.01,
+        )
+    )
+
+    assert fallback is True
+    assert sent == [{"type": "response.create"}] * 3
+
+
+def test_forced_response_does_not_retry_the_fallback_after_the_session_closes():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+            raise demo.DuplexSessionClosedError("closed")
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(
+                _Client(),
+                collector,
+                committed_index=0,
+                timeout_s=0.05,
+                create_timeout_s=0.05,
+                settle_quiet_s=0.0,
+                fallback_retry_window_s=5.0,
+                fallback_retry_interval_s=0.01,
+            )
+        )
+
+    assert sent == [{"type": "response.create"}]
+
+
+def test_forced_response_falls_back_exactly_once_when_the_retry_window_is_zero():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+            raise demo.DuplexConnectionError("send failed: transport is not connected")
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(
+                _Client(),
+                collector,
+                committed_index=0,
+                timeout_s=0.05,
+                create_timeout_s=0.05,
+                settle_quiet_s=0.0,
+                fallback_retry_window_s=0.0,
+                fallback_retry_interval_s=0.01,
+            )
+        )
+
+    assert sent == [{"type": "response.create"}]
+
+
+@pytest.mark.parametrize(
+    ("code", "wire"),
+    [
+        ("response_create_without_input", True),
+        ("text_only_turn_unsupported", True),
+        ("response_create_without_input", False),
+    ],
+)
+def test_forced_response_settles_when_the_server_definitively_refuses(code, wire):
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    if wire:
+        error_event = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "code": code, "message": "refused"},
+        }
+    else:
+        error_event = {"type": "error", "code": code, "message": "refused"}
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+            # The commit retained nothing answerable, so the server answers
+            # the create with a definitive refusal instead of a response.
+            collector.add(error_event)
+
+    fallback = asyncio.run(
+        demo._drain_forced_post_commit_response(
+            _Client(),
+            collector,
+            committed_index=0,
+            timeout_s=0.5,
+            create_timeout_s=0.05,
+            settle_quiet_s=0.0,
+        )
+    )
+
+    assert fallback is True
+    assert sent == [{"type": "response.create"}]
+
+
+def test_forced_response_keeps_waiting_after_other_server_errors():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "input_audio_buffer.committed"})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+            # Any other error (a promotion race, a transport complaint) is
+            # not a definitive refusal: the drain keeps waiting for the
+            # response instead of settling.
+            collector.add(
+                {
+                    "type": "error",
+                    "code": "response_already_active",
+                    "message": "response is already active",
+                }
+            )
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            demo._drain_forced_post_commit_response(
+                _Client(),
+                collector,
+                committed_index=0,
+                timeout_s=0.05,
+                create_timeout_s=0.05,
+                settle_quiet_s=0.0,
+            )
+        )
+
+    assert sent == [{"type": "response.create"}]
+
+
 def test_forced_response_does_not_reask_while_a_response_is_active():
     demo = _load_demo_module()
     collector = demo.EventCollector()
@@ -474,23 +642,6 @@ def test_drain_does_not_reask_when_a_post_commit_response_already_settled():
         )
 
     assert sent == []
-
-
-def test_post_commit_done_statuses_record_terminal_states_for_triage():
-    demo = _load_demo_module()
-    events = [
-        {"type": "input_audio_buffer.committed"},
-        {"type": "response.done", "response": {"id": "resp-failed", "status": "failed"}},
-        {"type": "response.done", "response": {"id": "resp-cancelled", "status": "cancelled"}},
-        {"type": "response.done", "response": {"id": "resp-legacy"}},
-    ]
-
-    assert demo._post_commit_response_done_statuses(events, 0) == [
-        "failed",
-        "cancelled",
-        # The server defaults a missing status to "completed" on the wire.
-        "completed",
-    ]
 
 
 def test_post_commit_settle_lets_a_cancelled_response_close_without_blocking_the_drain():

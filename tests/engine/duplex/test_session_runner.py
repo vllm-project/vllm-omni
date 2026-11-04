@@ -4291,7 +4291,19 @@ async def test_deferred_commit_keeps_vision_units_ahead_of_the_speech_tail(
         await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True))
         if not create_response:
             create_events = await h.run(commands.CreateResponse())
-            assert "error" not in types(create_events), create_events
+            if with_speech:
+                # The speech tail's units were promoted as the response
+                # ended, so the retained audio is gone by the time this
+                # create lands. There is nothing left to answer, and the
+                # refusal is how a native session says so instead of
+                # silently dropping the ask (a silent drop strands the
+                # client until its drain times out).
+                assert types(create_events) == ["error"], create_events
+                assert create_events[0].code == "response_create_without_input"
+            else:
+                # Vision-only retained units are not promoted by the ending
+                # response, so this create still starts the turn.
+                assert "error" not in types(create_events), create_events
         payloads = [s.prompt["model_intermediate_buffer"]["duplex"]["payload"] for s in h.port.submissions]
         assert [p.get("video_frames") for p in payloads[1:]] == (
             [["frame-1"], ["frame-2"], None] if with_speech else [["frame-1"], ["frame-2"]]
