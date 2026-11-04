@@ -73,6 +73,10 @@ stage-0 prefix caching, `async_chunk: true`, synchronous scheduling on stage 0,
 and no speculative decoding. The ordinary V1 and MRv2 profiles keep their
 per-turn request behavior.
 
+Deploy overlays replace the `duplex_session` section as a whole. If an overlay
+sets VAD paths or other session options, include `turn_kv_continuation: true`
+in that section as well; otherwise the default per-turn mode is selected.
+
 The Thinker request and its KV allocation survive a completed turn. Each new
 commit still renders and processes the complete current multimodal history.
 The scheduler compares its block hashes against the resident request: when all

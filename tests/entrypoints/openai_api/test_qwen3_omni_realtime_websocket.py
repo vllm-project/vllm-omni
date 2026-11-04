@@ -19,6 +19,7 @@ import json
 import os
 import wave
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -1090,20 +1091,27 @@ def qwen_duplex_server(request, tmp_path_factory, cached_silero_vad_artifact, ca
     assert run_level in {"advanced_model", "full_model"}, "Duplex playback acceptance requires real weights"
     artifacts = tmp_path_factory.mktemp("qwen_duplex_playback")
     deploy = artifacts / "deploy.yaml"
+    base_path = get_deploy_config_path(getattr(request, "param", "qwen3_omni_duplex.yaml"))
+    base_session = load_deploy_config(base_path).duplex_session
     # An absolute base keeps the production YAML's relative inheritance intact
     # when the test's Silero override lives in a temporary directory.
     deploy.write_text(
         yaml.safe_dump(
             {
-                "base_config": get_deploy_config_path(getattr(request, "param", "qwen3_omni_duplex.yaml")),
+                "base_config": base_path,
                 "duplex_session": {
+                    # Deploy overlays replace this section atomically. Keep
+                    # the selected profile's continuation and session policy.
+                    **asdict(base_session),
                     "server_vad_model_path": cached_silero_vad_artifact,
                     "semantic_vad_model_path": cached_smart_turn_artifact,
                 },
             }
         )
     )
-    assert load_deploy_config(deploy).session_mode == "duplex"
+    resolved = load_deploy_config(deploy)
+    assert resolved.session_mode == "duplex"
+    assert resolved.duplex_session.turn_kv_continuation == base_session.turn_kv_continuation
     model = get_model_prefix() + MODEL
     processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
     with OmniServer(
