@@ -6,8 +6,8 @@
 # vs single-expert eager on H200 t2i). That dual-expert cost also applies to
 # understanding-only batches that share the same FULL graphs.
 #
-# For und-only / chat AR, prefer mammoth_moda2_ar.yaml (eager) or
-# mammoth_moda2_ar_piecewise.yaml — do not use this preset.
+# For und-only / chat AR, prefer mammoth_moda2_ar.yaml (eager) — do not use
+# this preset.
 
 base_config: mammoth_moda2.yaml
 

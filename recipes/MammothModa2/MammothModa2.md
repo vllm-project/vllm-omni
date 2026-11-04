@@ -150,13 +150,14 @@ understanding-only traffic that reuses those FULL graphs.
 
 | Workload | Recommended stage-0 preset |
 | --- | --- |
-| Understanding / AR-only chat | [`mammoth_moda2_ar.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar.yaml) (eager, default) or [`mammoth_moda2_ar_piecewise.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar_piecewise.yaml) |
+| Understanding / AR-only chat | [`mammoth_moda2_ar.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar.yaml) (eager, default) |
 | Text-to-image (default) | [`mammoth_moda2.yaml`](../../vllm_omni/deploy/mammoth_moda2.yaml) (AR eager) |
 | Text-to-image with FULL AR graphs | [`mammoth_moda2_ar_graph_full.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar_graph_full.yaml) (accept dual-expert cost) |
 
-Do not point und-only serving at the FULL preset. Mask-keyed split graphs
-(all-und / all-gen / blend) that would drop the und-only tax under FULL are
-tracked in #9865.
+Do not point und-only serving at the FULL preset. For non-FULL graphs on
+und-only, set `cudagraph_mode: PIECEWISE` on the AR stage yourself. Mask-keyed
+split graphs (all-und / all-gen / blend) that would drop the und-only tax
+under FULL are tracked in #9865.
 
 ### 1x L40S 48GB
 
