@@ -11,7 +11,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.personaplex import personaplex_code2wav, personaplex_mimi
 from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import PersonaPlexCode2Wav
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 class _FakeBatchedMimi(nn.Module):
@@ -71,6 +71,7 @@ class _FakeMimiTransformer(nn.Module):
         return 80
 
 
+@pytest.mark.cpu
 def test_moshi_checkpoint_mapping_drops_replaced_transformer_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -112,6 +113,7 @@ def test_moshi_checkpoint_mapping_drops_replaced_transformer_weights(
     )
 
 
+@pytest.mark.cpu
 def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() -> None:
     codec = personaplex_mimi.PersonaPlexMimiCodec.__new__(personaplex_mimi.PersonaPlexMimiCodec)
     nn.Module.__init__(codec)
@@ -191,6 +193,7 @@ def _actives(mimi: _FakeBatchedMimi) -> list[list[bool]]:
     return [active.tolist() for _, active in mimi.calls]
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("cuda_graphs", [False, True])
 def test_load_weights_builds_one_shared_decoder_with_a_row_per_session(
     monkeypatch: pytest.MonkeyPatch,
@@ -229,6 +232,7 @@ class _LoadCodec(_FakeBatchedMimi):
         self.model = SimpleNamespace(config=SimpleNamespace(sampling_rate=24000))
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("runner_device", "decode_tf32", "expect_tf32"),
     [("cuda", None, True), ("cuda", False, False), ("cpu", None, False)],
@@ -255,6 +259,7 @@ def test_load_weights_tf32_follows_device_and_config(
         torch.set_float32_matmul_precision(old_precision)
 
 
+@pytest.mark.cpu
 def test_delta_codes_skip_history_and_emit_only_new_pcm(mocker) -> None:
     model, mimi = _model()
     decode = mocker.patch.object(model, "_decode_pending", return_value=[])
@@ -272,6 +277,7 @@ def test_delta_codes_skip_history_and_emit_only_new_pcm(mocker) -> None:
     assert _audio(second).tolist() == _pcm(3)
 
 
+@pytest.mark.cpu
 def test_full_payload_is_consumed_once_across_forwards() -> None:
     model, mimi = _model(async_chunk=False)
     runtime_info = [{"codes": {"audio": _codes(2)}}]
@@ -292,6 +298,7 @@ def test_full_payload_is_consumed_once_across_forwards() -> None:
     assert _audio(reused).tolist() == _pcm(1, 2)
 
 
+@pytest.mark.cpu
 def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -307,6 +314,7 @@ def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     assert len(warnings) == 1 and "not divisible by" in warnings[0][0]
 
 
+@pytest.mark.cpu
 def test_rows_leased_recycled_and_scratch_fallback() -> None:
     model, mimi = _model(max_sessions=2)
     initial = model(
@@ -353,6 +361,7 @@ def _step(model, requests: dict[str, int], *, step: int = 0, infos=None):
     )
 
 
+@pytest.mark.cpu
 def test_a_step_decodes_its_request_spans_exactly_like_one_request_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,7 +380,7 @@ def test_a_step_decodes_its_request_spans_exactly_like_one_request_at_a_time(
     assert batched._request_rows == per_request._request_rows
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_a_cuda_step_matches_the_cpu_step() -> None:
     cuda_model, _ = _model(max_sessions=4, device="cuda")

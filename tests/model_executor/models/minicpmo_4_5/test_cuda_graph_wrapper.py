@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
+from tests.helpers.cudnn import ieee_cudnn_fp32
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
@@ -23,7 +24,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     WholeEulerCFMGraphWrapper,
 )
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 
 class _F0Predictor(nn.Module):
@@ -2082,8 +2083,16 @@ class _CurrentFirstCausalDiTBlock(_RealCausalDiTBlock):
         return x
 
 
+@pytest.fixture
+def with_ieee_cudnn_fp32():
+    with ieee_cudnn_fp32():
+        yield
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_query_bucket_keeps_current_first_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_query_bucket_keeps_current_first_cache_layout(
+    monkeypatch: pytest.MonkeyPatch, with_ieee_cudnn_fp32
+) -> None:
     """A narrow padded chunk replayed on a wider capture keeps the cache aligned.
 
     The capture mask has to put the cache block after the full capture width,
@@ -2287,7 +2296,9 @@ def _ragged_mask(lengths: list[int], width: int, offset: int) -> torch.Tensor:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_ragged_rows_match_per_row_exact_solves(
+    monkeypatch: pytest.MonkeyPatch, with_ieee_cudnn_fp32
+) -> None:
     """One graph solves rows of different lengths exactly as each row's own unpadded solve.
 
     Chunk 1 runs through a 16-frame query bucket at width 8: its CNN cache must
@@ -2358,7 +2369,9 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_mixed_histories_match_independent_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_mixed_histories_match_independent_streams(
+    monkeypatch: pytest.MonkeyPatch, with_ieee_cudnn_fp32
+) -> None:
     """Different reference lengths share a graph without exposing padded history."""
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
@@ -2462,7 +2475,9 @@ def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_mixed_prompts_reuse_caches_after_streaming_trim(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_mixed_prompts_reuse_caches_after_streaming_trim(
+    monkeypatch: pytest.MonkeyPatch, with_ieee_cudnn_fp32
+) -> None:
     """Mixed prompt lengths retain exact per-row caches through steady-state trimming."""
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
@@ -2547,7 +2562,9 @@ def test_whole_euler_mixed_prompts_reuse_caches_after_streaming_trim(monkeypatch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_padded_ragged_replay_after_a_wider_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_padded_ragged_replay_after_a_wider_replay(
+    monkeypatch: pytest.MonkeyPatch, with_ieee_cudnn_fp32
+) -> None:
     """A padded ragged replay is exact after a wider replay of the same graph batch.
 
     Every graph of one batch size shares the lengths buffer. The 16-frame
@@ -2664,6 +2681,7 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_vocoder_restores_tf32_policy(fail, monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_watchdog import Code2WavWatchdog
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
     from vllm_omni.platforms import current_omni_platform
 
@@ -2680,7 +2698,11 @@ def test_vocoder_restores_tf32_policy(fail, monkeypatch):
 
     # `_tf32_mode` is resolved in `__init__` now, so the stub model carries the
     # resolved value instead of a config the policy would re-read per forward.
-    model = SimpleNamespace(_tf32_mode="tf32", _forward_impl=forward)
+    model = SimpleNamespace(
+        _tf32_mode="tf32",
+        _watchdog=Code2WavWatchdog(),
+        _forward_impl=forward,
+    )
     if fail:
         with pytest.raises(RuntimeError, match="injected"):
             MiniCPMO45Code2Wav.forward(model)

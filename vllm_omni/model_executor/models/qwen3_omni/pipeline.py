@@ -71,6 +71,12 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
                 "stop_token_ids": [2150],
             },
             requires_full_payload_input=True,
+            # A decode step feeds the code predictor's summed embedding plus the
+            # thinker's text_step into PagedAttention, but only the layer-0
+            # codec id enters the token stream. Replaying the prompt after a
+            # preemption cannot rebuild layers 1..7 or last_talker_hidden, so
+            # fail the request instead of resuming it from frame 0.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=2,

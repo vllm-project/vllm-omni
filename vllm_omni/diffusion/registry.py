@@ -166,6 +166,11 @@ _DIFFUSION_MODELS = {
         "pipeline_stable_audio",
         "StableAudioPipeline",
     ),
+    "StableAudio3Pipeline": (
+        "stable_audio_3",
+        "pipeline_stable_audio_3",
+        "StableAudio3Pipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
@@ -265,6 +270,25 @@ _DIFFUSION_MODELS = {
         "pi05",
         "pipeline_pi05",
         "Pi05Pipeline",
+    ),
+    # SAM3 image checkpoints report ``Sam3Model``; the released combined
+    # image/video checkpoint reports ``Sam3VideoModel``. Both carry the detector.
+    "Sam3Model": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    "Sam3VideoModel": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    # The released Video Depth Anything repositories hold one .pth and no config;
+    # ``resolve_native_diffusion_model_class`` recognizes them by checkpoint name.
+    "VideoDepthAnythingPipeline": (
+        "video_depth_anything",
+        "pipeline_video_depth_anything",
+        "VideoDepthAnythingPipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -411,6 +435,9 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
+    "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
+    "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
     "CausVidWanPipeline": (
         "causvid_wan",
         "pipeline_causvid_wan",
@@ -461,9 +488,15 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # SAM3 is a single forward pass with no denoising steps to cache.
+    "Sam3Model",
+    "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
     "CausVidWanPipeline",
+    "PhysisWanPipeline",
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
@@ -527,9 +560,10 @@ def initialize_model(
                 vae_pp_size,
                 od_config.model_class_name,
             )
-        if vae_pp_size > 1 and is_distributed_vae and vae_mode != "batch" and not od_config.vae_use_tiling:
+        # Only tile mode distributes the tiled path's tiles; spatial_shard_* decodes the full frame.
+        if vae_pp_size > 1 and is_distributed_vae and vae_mode == "tile" and not od_config.vae_use_tiling:
             logger.info(
-                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                "vae_patch_parallel_size=%d in tile mode requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
             )
             od_config.vae_use_tiling = True
@@ -562,15 +596,15 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA is supported; other platforms
-    keep the reference implementation. Failures never abort model loading.
+    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
+    platforms keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
     if level == "off" and encode_level == "off":
         return
-    if not current_omni_platform.is_cuda():
-        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+    if not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
+        logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
@@ -692,6 +726,9 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {
+    "PhysisWanPipeline": "get_wan22_post_process_func",
+    "PhysisH3Pipeline": "get_wan22_post_process_func",
+    "PhysisLTXPipeline": "get_wan22_post_process_func",
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
@@ -723,6 +760,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",

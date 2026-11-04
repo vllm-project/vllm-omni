@@ -19,7 +19,7 @@ identical) and folds everything after it into one Triton kernel that reads
 ``x`` once and writes the result once. The kernel is bit-exact with ATen
 rather than merely close:
 
-* ``tl.math.div_rn`` is IEEE round-to-nearest fp32 division, the operation
+* :func:`div_rn` is IEEE round-to-nearest fp32 division, the operation
   ATen's ``div`` performs in fp32 opmath. Triton's ``/`` lowers to an
   approximate reciprocal-multiply and is not usable here.
 * Every value ATen materializes in ``x.dtype`` is rounded here at the same
@@ -40,6 +40,17 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.platforms import current_omni_platform
+
+# Devices whose Triton backend runs the fused kernels: NVIDIA (CUDA) and Intel (XPU) GPUs.
+KERNEL_DEVICE_TYPES = frozenset({"cuda", "xpu"})
+
+
+def on_kernel_device(x: torch.Tensor) -> bool:
+    """Whether ``x`` lives on a device the fused Triton kernels can run on."""
+    return x.device.type in KERNEL_DEVICE_TYPES
+
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # These kernels are HBM bound; a wide block gives every thread more independent
 # loads to overlap. 2048/4 measured ~6% faster than 1024/4 on the decoder's
@@ -49,6 +60,28 @@ _NUM_WARPS = 4
 _MAX_GRID_Y = 65535
 
 if HAS_TRITON:
+    if current_omni_platform.is_xpu():
+
+        @tl.core.extern
+        def div_rn(x, y, _semantic=None):
+            """IEEE round-to-nearest fp32 ``x / y`` via OpenCL's correctly rounded ``divide_cr``.
+
+            triton-xpu 3.8 lowers ``tl.math.div_rn`` to a plain ``fdiv``, which IGC
+            compiles to its approximate divide (~29% of quotients off by an ulp).
+            3.7 called ``divide_cr`` itself; libdevice ``div_rn`` is exact but a
+            software routine that made the RMSNorm epilogue ~30x slower.
+            """
+            return tl.core.extern_elementwise(
+                "",
+                "",
+                [x, y],
+                {(tl.float32, tl.float32): ("_Z9divide_crff", tl.float32)},
+                is_pure=True,
+                _semantic=_semantic,
+            )
+
+    else:
+        div_rn = tl.math.div_rn
 
     @triton.jit
     def _rms_norm_scale_kernel(
@@ -81,13 +114,13 @@ if HAS_TRITON:
         d = tl.load(DENOM + denom_base, mask=mask, other=1.0)
         g = tl.load(GAMMA + channel).to(tl.float32)
 
-        v = tl.math.div_rn(x, d).to(dtype).to(tl.float32)
+        v = div_rn(x, d).to(dtype).to(tl.float32)
         v = (v * scale).to(dtype).to(tl.float32)
         v = (v * g).to(dtype).to(tl.float32)
         v = (v + 0.0).to(dtype)
         if SILU:
             v32 = v.to(tl.float32)
-            v = tl.math.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
+            v = div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
         tl.store(OUT + base, v, mask=mask)
 
 
@@ -104,7 +137,7 @@ def rms_norm_scale(
     ``x`` must be a contiguous ``(N, C, S)`` tensor, ``denom`` a contiguous fp32
     ``(N, 1, S)`` tensor and ``gamma`` a contiguous ``(C,)`` tensor of ``x``'s dtype.
     """
-    if not HAS_TRITON or not x.is_cuda:
+    if not HAS_TRITON or not on_kernel_device(x):
         return None
     if x.dim() != 3 or x.dtype not in _SUPPORTED_DTYPES:
         return None
@@ -170,7 +203,7 @@ def silu_epilogue_is_exact(device: torch.device, dtype: torch.dtype) -> bool:
     if cached is not None:
         return cached
     result = False
-    if HAS_TRITON and device.type == "cuda":
+    if HAS_TRITON and device.type in KERNEL_DEVICE_TYPES:
         try:
             bits = torch.arange(0, 65536, dtype=torch.int32, device=device).to(torch.int16)
             x = bits.view(dtype).reshape(1, 1, -1)

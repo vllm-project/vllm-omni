@@ -122,9 +122,9 @@ class MiniCPMO45Token2wav:
         """Delegate prompt feature extraction to the wrapped core."""
         return self._core._prepare_prompt(prompt_wav)
 
-    def enable_trt_spk_embedding(self) -> None:
+    def enable_trt_spk_embedding(self, *, cpu_reference: bool = False) -> None:
         """Run the campplus speaker-embedding model on TensorRT."""
-        self._core.enable_trt_spk_embedding()
+        self._core.enable_trt_spk_embedding(cpu_reference=cpu_reference)
 
     def enable_device_spk_embedding(self, *, use_trt: bool = True) -> None:
         """Run CAM++ on device, optionally without TensorRT on CUDA."""

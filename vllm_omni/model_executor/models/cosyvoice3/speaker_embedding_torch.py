@@ -16,6 +16,7 @@ onnxruntime session. Covered by
 """
 
 import os
+import threading
 
 import onnx
 import regex as re
@@ -29,20 +30,149 @@ from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPP
 logger = init_logger(__name__)
 
 
+def _prepare_speaker_embedding_graph_runtime() -> None:
+    """Select graph-capturable ACLNN kernels before CAM++ graph capture.
+
+    Mirrors ``prepare_code2wav_graph_runtime`` (minicpmo_4_5_code2wav) and
+    ``_prepare_moss_codec_graph_runtime``: the NPU platform keeps
+    ``allow_internal_format`` on for quantized LLM kernels, but NPUGraph
+    capture of the conv kernels requires it off, plus ``jit_compile=False``.
+    Configure it right here, only when capture is actually enabled, so
+    this path never relies on another stage having done it.
+    """
+    if os.environ.get("ASCEND_LAUNCH_BLOCKING") == "1":
+        raise RuntimeError(
+            "CAM++ speaker-embedding NPUGraph capture is incompatible with "
+            "ASCEND_LAUNCH_BLOCKING=1; unset it or set it to 0 before startup."
+        )
+    npu = torch.npu
+    npu.config.allow_internal_format = False
+    npu.set_compile_mode(jit_compile=False)
+    logger.info("Configured CAM++ speaker-embedding NPUGraph runtime (allow_internal_format=False, jit_compile=False)")
+
+
 class CampplusTorch:
     """Callable wrapper matching the CampplusTRT contract: ``[T, 80]`` in, ``[1, 192]`` out."""
+
+    # One graph per distinct frame count, capped: Seed-TTS references span
+    # many lengths (179 distinct over 200 wavs), so only the first
+    # ``_MAX_GRAPH_BUCKETS`` frame counts seen get captured and every later
+    # distinct length runs eager — the cap guards against pathological
+    # callers capturing a graph per length.
+    _MAX_GRAPH_BUCKETS = 2
 
     def __init__(self, model: CAMPPlus, device: str | torch.device):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
+        self._graphs: dict[int, tuple] = {}
+        # ``get_campplus_torch`` caches this wrapper process-wide, so several
+        # Token2Wav replicas share one instance. Their private streams all
+        # write the same static inputs, and capture + replay is not atomic
+        # across streams: serialize the copy/replay/clone window.
+        self._graph_lock = threading.Lock()
+        # Frame counts whose capture already failed; retrying them on every
+        # request both burns latency and can leave the stream half-captured.
+        self._graph_failed: set[int] = set()
+        # Replay/eager call counters, logged on capture and at milestones so
+        # a benchmark log shows the realized replay rate per run.
+        self._replay_calls = 0
+        self._eager_calls = 0
+        # Completion event of the previous user: the lock orders host-side
+        # submission only, so replicas on distinct streams need an explicit
+        # device-side dependency before reusing the shared static buffers.
+        self._graph_done = None
 
     @torch.inference_mode()
     def __call__(self, feat: torch.Tensor) -> torch.Tensor:
         """feat: ``[T, 80]`` fbank features. Returns ``[1, 192]`` embedding."""
         if feat.device != self.device:
-            feat = feat.to(self.device, non_blocking=True)
+            # Pageable + non_blocking still degrades to a synchronous copy on
+            # Ascend (host blocks behind queued decode work); stage through
+            # pinned memory for a true async H2D.
+            pinned = torch.empty(feat.shape, dtype=feat.dtype, pin_memory=True)
+            pinned.copy_(feat)
+            feat = pinned.to(self.device, non_blocking=True)
         # Model weights are fp32; guard against any upstream bf16 activation.
-        return self.model(feat.unsqueeze(0).float())
+        batch = feat.unsqueeze(0).float()
+        # CAM++ is ~33ms eager on NPU while its output is input-length
+        # invariant (61..494 frames all ~31ms) — i.e. launch-bound. A captured
+        # graph replays in ~10.7ms with bit-identical output. Eager fallback
+        # off-NPU / on capture failure / bucket overflow. Capture and replay
+        # both run on the caller's current stream (the private CAM++ stream),
+        # so they stay aligned.
+        frames = int(batch.shape[1])
+        with self._graph_lock:
+            entry = self._graphs.get(frames)
+            if entry is None:
+                if (
+                    self.device.type != "npu"
+                    or frames in self._graph_failed
+                    or len(self._graphs) >= self._MAX_GRAPH_BUCKETS
+                ):
+                    # Eager on freshly allocated tensors: no shared static
+                    # buffers are touched, so no event chaining is needed
+                    # (chaining here would re-serialize replicas for nothing).
+                    self._eager_calls += 1
+                    return self.model(batch)
+                # Events only exist on NPU; on other devices the lock alone
+                # is enough (single stream per process).
+                # Capture needs graph-capturable ACLNN kernels; self-configure
+                # here instead of relying on the Code2Wav stage having done it.
+                _prepare_speaker_embedding_graph_runtime()
+                stream = torch.npu.current_stream(self.device) if self.device.type == "npu" else None
+                if stream is not None and self._graph_done is not None:
+                    stream.wait_event(self._graph_done)
+                try:
+                    static_in = batch.clone()
+                    for _ in range(2):
+                        self.model(static_in)
+                    torch.npu.synchronize()
+                    graph = torch.npu.NPUGraph()
+                    with torch.npu.graph(graph):
+                        static_out = self.model(static_in)
+                    torch.npu.synchronize()
+                    entry = (graph, static_in, static_out)
+                    # Captured kernels are recorded, not executed, so
+                    # static_out still holds uninitialized pool memory
+                    # here (the warmup results above went to temporary
+                    # tensors). Replay once so this request gets the same
+                    # real result the replay path produces. The entry is
+                    # published only after the replay+clone succeeded: a
+                    # failed first replay must not leave the bucket
+                    # registered, or later same-length requests would
+                    # replay a broken graph instead of falling back.
+                    graph.replay()
+                    out = static_out.clone()
+                    self._graphs[frames] = entry
+                    self._replay_calls += 1
+                    self._graph_done = stream.record_event() if stream is not None else None
+                    logger.info(
+                        "CAM++ graph captured for %d frames (replays so far: %d, eager calls: %d)",
+                        frames,
+                        self._replay_calls,
+                        self._eager_calls,
+                    )
+                    return out
+                except Exception as exc:  # noqa: BLE001
+                    self._graph_failed.add(frames)
+                    logger.warning(
+                        "CAM++ graph capture failed for %d frames (%s); falling back to eager for this bucket",
+                        frames,
+                        exc,
+                    )
+                    return self.model(batch)
+            stream = torch.npu.current_stream(self.device) if self.device.type == "npu" else None
+            if stream is not None and self._graph_done is not None:
+                stream.wait_event(self._graph_done)
+            graph, static_in, static_out = entry
+            static_in.copy_(batch)
+            graph.replay()
+            out = static_out.clone()
+            self._graph_done = stream.record_event() if stream is not None else None
+            self._replay_calls += 1
+            if self._replay_calls in (1, 10, 100, 1000):
+                logger.info("CAM++ graph replay #%d (eager calls so far: %d)", self._replay_calls, self._eager_calls)
+            return out
 
 
 def _fused_conv2d(old: nn.Module, mod: str, by_mod: dict) -> nn.Module:

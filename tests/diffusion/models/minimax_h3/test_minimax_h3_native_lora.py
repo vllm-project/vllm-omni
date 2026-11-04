@@ -18,7 +18,7 @@ from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 _TINY_HIDDEN = 2
 _TINY_FFN = 2
@@ -148,6 +148,7 @@ def _write_tiny_native(
     )
 
 
+@pytest.mark.cpu
 def test_h3_native_loads_and_packs_qkv_and_fc1(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
@@ -181,6 +182,7 @@ def test_h3_native_loads_and_packs_qkv_and_fc1(tmp_path):
     torch.testing.assert_close(fc1.lora_b[1], torch.full((_TINY_FFN, _TINY_RANK), 1.0))
 
 
+@pytest.mark.cpu
 def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, metadata={"key_format": "minimax-h3-native", "qkv_layout": "runtime"})
@@ -217,6 +219,7 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_rejects_truncated_artifact(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, omit_target="blocks.49.mlp.fc2")
@@ -229,6 +232,7 @@ def test_h3_native_rejects_truncated_artifact(tmp_path):
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
     """A mislabeled schedule must fail closed instead of silently changing steps."""
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
@@ -253,6 +257,7 @@ def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
         )
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("raw_schedule", "message"),
     [
@@ -291,6 +296,7 @@ def test_h3_native_rejects_malformed_schedule_metadata(tmp_path, raw_schedule, m
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_declared_file_fails_closed_on_invalid_metadata(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, metadata={"key_format": "other"})
@@ -303,6 +309,7 @@ def test_h3_native_declared_file_fails_closed_on_invalid_metadata(tmp_path):
         )
 
 
+@pytest.mark.cpu
 def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -340,6 +347,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
         pipeline._sigma_schedule_for_request(sampling, "t2va")
 
 
+@pytest.mark.cpu
 def test_pipeline_native_step_count_follows_adapter_schedule():
     """The accepted step count is the adapter's interval count, never a literal."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -367,6 +375,7 @@ def test_pipeline_native_step_count_follows_adapter_schedule():
         )
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("step_execution", [False, True])
 def test_pipeline_native_omitted_step_count_follows_execution_mode(step_execution):
     """Only request mode can resolve an omitted count from the adapter schedule.
@@ -403,6 +412,7 @@ def test_pipeline_native_omitted_step_count_follows_execution_mode(step_executio
         )
 
 
+@pytest.mark.cpu
 def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
@@ -439,6 +449,7 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
     assert request.lora_int_id not in pipeline._lora_sigma_schedules
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "offload_mode",
     [
@@ -460,6 +471,7 @@ def test_h3_native_rejects_offload_modes(tmp_path, offload_mode):
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
     """DLO keeps LoRA A/B buffers resident, so native must not fail closed."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -499,6 +511,7 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
     assert pipeline._lora_sigma_schedules[request.lora_int_id] is schedule
 
 
+@pytest.mark.cpu
 def test_h3_native_qkv_reorder_matches_base_loader_contract():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
 
@@ -521,6 +534,7 @@ def test_h3_native_qkv_reorder_matches_base_loader_contract():
     assert v.reshape(num_query_groups, head_dim)[0, 0] == grouped[0, 2 * head_dim]
 
 
+@pytest.mark.cpu
 def test_native_target_pattern_matches_component_qualified_names():
     """The manager matches "<component>.<module>", so the pattern needs the prefix."""
     import regex as re
@@ -536,6 +550,7 @@ def test_native_target_pattern_matches_component_qualified_names():
     assert re.search(pattern, "transformer.token_refiner.blocks.0.adaln_proj.linear") is None
 
 
+@pytest.mark.cpu
 def test_replace_layers_binds_every_native_target(monkeypatch):
     """Regression for bound=0/259: layer replacement must reach all 259 modules."""
     from vllm.lora.layers import BaseLayerWithLoRA
@@ -596,6 +611,7 @@ def test_replace_layers_binds_every_native_target(monkeypatch):
     assert set(manager._lora_modules) == {f"transformer.{target}" for target in lora_module._NATIVE_EXPECTED_TARGETS}
 
 
+@pytest.mark.cpu
 def test_legacy_manager_uses_native_loader(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
@@ -629,6 +645,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
     assert len(lora_model.loras) == 259
 
 
+@pytest.mark.cpu
 def test_pipeline_schedule_inactive_when_scale_zero():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -649,6 +666,7 @@ def test_pipeline_schedule_inactive_when_scale_zero():
     assert not pipeline._has_active_native_lora(sampling)
 
 
+@pytest.mark.cpu
 def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
@@ -691,11 +709,13 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
     assert pipeline._sigma_schedule_for_request(sampling, "t2va") is None
 
 
+@pytest.mark.cpu
 def test_native_packed_qkv_slices_are_tp2_divisible():
     assert lora_module._NATIVE_QKV_SLICE % 2 == 0
     assert lora_module._NATIVE_FFN_HIDDEN_SIZE % 2 == 0
 
 
+@pytest.mark.cpu
 def test_lora_manager_activates_native_packed_qkv(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
@@ -749,6 +769,7 @@ def test_lora_manager_activates_native_packed_qkv(tmp_path):
     torch.testing.assert_close(lora_b_list[2], packed.lora_b[2] * 0.5)
 
 
+@pytest.mark.cpu
 def test_lora_manager_tp2_splits_native_packed_qkv_per_rank():
     """Each Q/K/V slice must be divisible by TP2 so rank-local layers can shard rows."""
 
@@ -805,6 +826,7 @@ def _iter_native_slice_pairs(lora_model):
             yield module_name, a, b
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
     """The artifact is trained on Ascend, but loading it is not Ascend-only.
@@ -836,7 +858,7 @@ def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
     assert {name: tensor.dtype for name, tensor in tensors.items() if tensor.dtype != dtype} == {}
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
     """The packed adapter produces the same delta weight on CUDA as on CPU.
