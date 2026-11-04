@@ -5,7 +5,6 @@
 import json
 import warnings
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -209,13 +208,12 @@ def test_generic_diffusion_preserves_complete_deploy(tmp_path, generic_flux_mode
     assert stage.diffusion_config.extras == {
         "keep": "yaml",
         "default_llama_model_id": "custom/llama",
-        "auxiliary_text_encoder": None,
     }
 
 
 @pytest.mark.parametrize("cli_dtype", [None, torch.float32])
 def test_generic_diffusion_cli_overrides_platform_deploy(tmp_path, generic_flux_model, monkeypatch, cli_dtype):
-    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", SimpleNamespace(device_name="cuda"))
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", "cuda")
     deploy = tmp_path / "deploy.yaml"
     deploy.write_text(
         "dtype: float32\n"
@@ -259,6 +257,37 @@ def test_generic_diffusion_cli_overrides_platform_deploy(tmp_path, generic_flux_
     assert stage.model_config.default_sampling_params == {"guidance_scale": 7.5, "height": 128, "width": 256}
     assert stage.diffusion_config.extras["keep"] == "platform"
     assert stage.diffusion_config.extras["added"] == "cli"
+
+
+@pytest.mark.parametrize("cli_tp", [None, 1])
+def test_generic_diffusion_platform_parallelism_overrides_deploy(tmp_path, generic_flux_model, monkeypatch, cli_tp):
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", "cuda")
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text(
+        "stages:\n"
+        "  - stage_id: 0\n"
+        "    tensor_parallel_size: 2\n"
+        "platforms:\n"
+        "  cuda:\n"
+        "    stages:\n"
+        "      - stage_id: 0\n"
+        "        tensor_parallel_size: 4\n",
+        encoding="utf-8",
+    )
+    resolution = resolve_omni_config(
+        generic_flux_model,
+        trust_remote_code=None,
+        deploy_config_path=str(deploy),
+        cli_overrides={} if cli_tp is None else {"tensor_parallel_size": cli_tp},
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    stage = resolution.stage_configs[0]
+    expected_tp = 4 if cli_tp is None else cli_tp
+    assert stage.parallel_config.tensor_parallel_size == expected_tp
+    assert stage.parallel_config.world_size == expected_tp
+    assert stage.runtime_config.num_gpus == expected_tp
+    assert stage.runtime_config.devices == ",".join(str(i) for i in range(expected_tp))
 
 
 @pytest.mark.parametrize("data_parallel_size", [None, 2, 3])
@@ -306,26 +335,19 @@ def test_generic_diffusion_deploy_model_class_sets_output_metadata(tmp_path, gen
 
 
 @pytest.mark.parametrize("with_deploy", [False, True], ids=["kwargs-only", "deploy-and-kwargs"])
-def test_generic_diffusion_top_level_auxiliary_encoder_overrides_extras(tmp_path, generic_flux_model, with_deploy):
+@pytest.mark.parametrize("removed_field", ["auxiliary_text_encoder", "default_llama_model_id"])
+def test_generic_diffusion_rejects_removed_model_aliases(tmp_path, generic_flux_model, with_deploy, removed_field):
     deploy = tmp_path / "deploy.yaml"
-    deploy.write_text("stages:\n  - stage_id: 0\n")
-    original_extras = {"auxiliary_text_encoder": "cli/old", "keep": "cli"}
-    overrides = {
-        "auxiliary_text_encoder": "cli/new",
-        "extras": original_extras,
-    }
-    resolution = resolve_omni_config(
-        generic_flux_model,
-        trust_remote_code=None,
-        deploy_config_path=str(deploy) if with_deploy else None,
-        cli_overrides=overrides,
-        stage_overrides=None,
-        strategy_config_path=None,
-    )
-    extras = resolution.stage_configs[0].diffusion_config.extras
-    assert extras["auxiliary_text_encoder"] == "cli/new"
-    assert extras["keep"] == "cli"
-    assert original_extras["auxiliary_text_encoder"] == "cli/old"
+    deploy.write_text("stages:\n  - stage_id: 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=removed_field):
+        resolve_omni_config(
+            generic_flux_model,
+            trust_remote_code=None,
+            deploy_config_path=str(deploy) if with_deploy else None,
+            cli_overrides={removed_field: "custom/encoder"},
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
 
 
 @pytest.mark.parametrize("with_deploy", [False, True], ids=["kwargs-only", "deploy-and-kwargs"])

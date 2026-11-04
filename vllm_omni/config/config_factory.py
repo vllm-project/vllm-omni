@@ -379,6 +379,19 @@ class StageConfigFactory:
             raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
         return load_deploy_config(deploy_path)
 
+    @staticmethod
+    def _resolve_lance_checkpoint_output(pipeline_cfg: PipelineConfig, model: str) -> PipelineConfig:
+        """Label the Lance video checkpoint as video without changing image Lance."""
+        if pipeline_cfg.model_type != "lance" or _name_match_candidate(model) != "Lance_3B_Video":
+            return pipeline_cfg
+        return replace(
+            pipeline_cfg,
+            stages=tuple(
+                replace(stage, final_output_type="video") if stage.final_output else stage
+                for stage in pipeline_cfg.stages
+            ),
+        )
+
     @classmethod
     def create_from_model(
         cls,
@@ -401,6 +414,7 @@ class StageConfigFactory:
         )
         if pipeline_cfg is None:
             return None
+        pipeline_cfg = cls._resolve_lance_checkpoint_output(pipeline_cfg, model)
 
         # Keep the typed representation's topology in lockstep with the
         # compatibility launch representation. The aligner is a real extra
@@ -456,6 +470,7 @@ class StageConfigFactory:
         )
         if pipeline_cfg is None:
             return None, None
+        pipeline_cfg = cls._resolve_lance_checkpoint_output(pipeline_cfg, model)
 
         legacy_cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
         return cls._create_legacy_from_registry(
@@ -656,13 +671,6 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
-        # Preserve the default builder's explicit top-level override of model
-        # extras before the strict same-source alias validator runs.
-        if kwargs.get("auxiliary_text_encoder") is not None:
-            kwargs = dict(kwargs)
-            extras = dict(kwargs.get("extras") or {})
-            extras.pop("auxiliary_text_encoder", None)
-            kwargs["extras"] = extras
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
@@ -687,18 +695,6 @@ class StageConfigFactory:
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(
             {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
         )
-
-        extras = dict(engine_args.get("extras") or {})
-        for key, default in (
-            ("auxiliary_text_encoder", None),
-            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-        ):
-            value = kwargs.get(key)
-            if value is not None:
-                extras[key] = value
-            else:
-                extras.setdefault(key, default)
-        engine_args["extras"] = extras
 
         model_class_name = engine_args.get("model_class_name")
         final_output_type = get_diffusion_output_type(model_class_name)
@@ -782,6 +778,9 @@ class StageConfigFactory:
             or kwargs.get("devices")
             or ",".join(str(i) for i in range(parallel_config.world_size))
         )
+        for name in ("num_replicas", "env"):
+            if kwargs.get(name) is not None:
+                stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
         deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])
@@ -815,20 +814,10 @@ class StageConfigFactory:
         # terminal defaults (dtype, cache, and parallel degrees) are not CLI
         # overrides and must not replace deploy or platform values.
         inputs = dict(kwargs)
-        if inputs.get("auxiliary_text_encoder") is not None:
-            extras = dict(inputs.get("extras") or {})
-            extras.pop("auxiliary_text_encoder", None)
-            inputs["extras"] = extras
         explicit = normalize_and_validate_diffusion_engine_ingress_kwargs(inputs, stage_id=0)
         quantization = explicit.pop("quantization", None)
         if quantization is not None:
             explicit["quantization_config"] = quantization
-        default_llama_model_id = explicit.pop("default_llama_model_id", None)
-        if default_llama_model_id is not None:
-            explicit["extras"] = {
-                **dict(explicit.get("extras") or {}),
-                "default_llama_model_id": default_llama_model_id,
-            }
 
         sampling = explicit.pop("default_sampling_params", None)
         if isinstance(sampling, str):
@@ -897,8 +886,6 @@ class StageConfigFactory:
             stage.runtime_config.num_gpus = parallel.world_size
         if stage.runtime_config.devices is None:
             stage.runtime_config.devices = ",".join(str(i) for i in range(stage.parallel_config.world_size))
-        stage.diffusion_config.extras.setdefault("auxiliary_text_encoder", None)
-        stage.diffusion_config.extras.setdefault("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct")
         resolved_model_class = stage.diffusion_config.model_class_name
         output_type = get_diffusion_output_type(resolved_model_class)
         if resolved_model_class != model_class_name or output_type != stage.final_output_type:

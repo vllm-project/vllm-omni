@@ -254,10 +254,13 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     calls = []
+    boundaries = []
 
     def execute(output):
         request_id = output.scheduled_request_ids[0]
         calls.append(request_id)
+        if request_id == "paced":
+            boundaries.append(output.interaction_boundaries[request_id])
         chunk = calls.count(request_id)
         return RunnerOutput(
             request_id=request_id,
@@ -286,11 +289,19 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
         await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.1))
         await asyncio.sleep(0.02)
         assert calls == ["paced"]
+        stamp = await engine.async_collective_rpc("track_streaming_interaction", args=("paced", "release"))
         await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.3))
+        await asyncio.sleep(0.02)
+        assert calls == ["paced"]
+        assert stamp < engine._streaming_playback["paced"].next_ready_at
         await engine.async_collective_rpc("submit_interaction", args=("paced", {"event_id": "release", "event": {}}))
         second = await asyncio.wait_for(queue.get(), 2)
         assert second.chunk_index == 1
         assert calls == ["paced", "paced"]
+        assert boundaries[0].window_end_at is None
+        assert boundaries[1].window_opened_at == boundaries[0].boundary_at
+        assert boundaries[1].window_end_at == pytest.approx(boundaries[0].boundary_at + 1.0)
+        assert boundaries[1].boundary_at >= boundaries[1].window_end_at
         assert engine._playback_blocked()
         # Delayed/reordered progress cannot move the playhead backwards.
         await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.2))
@@ -379,8 +390,10 @@ async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(expli
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("over_limit", [False, True])
-async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit):
+@pytest.mark.parametrize("interaction_wait", [False, True])
+async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit, interaction_wait):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.utils import StepWait
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     calls = []
@@ -394,6 +407,7 @@ async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit)
             step_index=1,
             finished=finished,
             result=DiffusionOutput(output=b"four", finished=finished),
+            wait_for_interaction=StepWait() if interaction_wait and not finished else None,
             streaming_media_duration=0.01,
             streaming_next_media_duration=0.01,
         )
@@ -438,6 +452,22 @@ async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit)
         assert calls == ["paced", "next"]
     finally:
         _stop_engine(engine)
+
+
+def test_pending_streaming_controls_are_bounded_and_keep_original_ingress_time():
+    from vllm_omni.diffusion.diffusion_engine import _StreamingPlayback
+    from vllm_omni.diffusion.interaction.types import MAX_PENDING_INTERACTION_EVENTS
+
+    engine = _make_engine_with_loop(None, start_loop=False)
+    engine._streaming_playback = {"paced": _StreamingPlayback(1.0)}
+    first = engine.track_streaming_interaction("paced", "first")
+    assert engine.track_streaming_interaction("paced", "first") == first
+    for index in range(MAX_PENDING_INTERACTION_EVENTS - 1):
+        engine.track_streaming_interaction("paced", str(index))
+    with pytest.raises(ValueError, match="Too many pending interactions"):
+        engine.track_streaming_interaction("paced", "overflow")
+    engine.track_streaming_interaction("paced", "first", pending=False)
+    assert engine.track_streaming_interaction("paced", "accepted-after-release") is not None
 
 
 def test_internal_pacing_deadline_does_not_start_client_idle_timeout():
@@ -1155,3 +1185,49 @@ async def test_requests_without_pause_never_trigger_the_barrier():
 
     assert (first.error, second.error) == ("result_for_r1", "result_for_r2")
     assert _methods(engine) == ["execute_model", "ping", "execute_model"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain_consumer", [False, True])
+async def test_busy_loop_releases_delivered_output_without_mutating_consumers(retain_consumer: bool) -> None:
+    import weakref
+
+    class Payload:
+        pass
+
+    first_ref: weakref.ReferenceType[Payload] | None = None
+
+    def execute(scheduled):
+        nonlocal first_ref
+        request_id = scheduled.scheduled_request_ids[0]
+        if request_id == "second":
+            assert first_ref is not None
+            assert (first_ref() is not None) == retain_consumer
+        payload = Payload()
+        if request_id == "first":
+            first_ref = weakref.ref(payload)
+        return RunnerOutput(
+            request_id=request_id, step_index=None, finished=True, result=DiffusionOutput(output=payload)
+        )
+
+    engine = _make_engine_with_loop(asyncio.get_running_loop(), start_loop=False)
+    engine.execute_fn = execute
+    engine._loop_started = True
+    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
+    engine.worker_thread.start()
+    try:
+        engine.add_request(_make_request("first"))
+        first = await asyncio.wait_for(_consume_final_output(engine.get_output_stream("first")), 5)
+        assert first_ref is not None
+        assert first.output is first_ref()
+        if not retain_consumer:
+            del first
+        engine.add_request(_make_request("second"))
+        second = await asyncio.wait_for(_consume_final_output(engine.get_output_stream("second")), 5)
+        assert second.error is None
+        if retain_consumer:
+            assert first.output is first_ref(), "delivery must not clear consumer-owned storage"
+            del first
+        assert first_ref() is None
+    finally:
+        _stop_engine(engine)

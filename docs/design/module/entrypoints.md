@@ -96,6 +96,11 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+The serving composition removes inherited `/tokenize`, `/detokenize`, and
+optional `/tokenizer_info` routes when no tokenization handler is configured
+(including pure diffusion mode). These endpoints return HTTP 404 and are absent
+from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
+
 When `--api-server-count` is greater than one, the serve composition root
 starts the frontend process manager while a parent-owned `StageRuntime`
 launches the shared local stage engines. Each frontend receives only its own

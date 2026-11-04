@@ -65,7 +65,7 @@ def test_online_ignore_patterns_skip_layer_quantization() -> None:
     assert isinstance(config, OnlineQuantizationConfig)
     layer = LinearBase(16, 16, quant_config=config, prefix="transformer.final_layer.proj", disable_tp=True)
     assert isinstance(layer.quant_method, UnquantizedLinearMethod)
-    assert config.resolve_quant_method_cls(layer, "transformer.blocks.0.attn.to_q") is not None
+    assert config.resolve_quant_method_cls(type(layer), "transformer.blocks.0.attn.to_q") is not None
 
 
 def test_online_targets() -> None:

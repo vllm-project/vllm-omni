@@ -20,6 +20,8 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, s
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     DEFAULT_INSTRUCTIONS,
+    MIX_MODES,
+    MIX_QUESTION,
     GenerateSampleResult,
     generate_sample,
 )
@@ -88,7 +90,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     generate.add_argument("--response-root", required=True)
     generate.add_argument("--fps", type=float, default=1.0)
-    generate.add_argument("--mix", choices=("question",), default="question")
+    generate.add_argument(
+        "--mix",
+        choices=MIX_MODES,
+        default=MIX_QUESTION,
+        help="Session audio: 'question' streams only the instruction; 'soundtrack' overlays it on the clip's audio.",
+    )
     generate.add_argument(
         "--pace",
         choices=("realtime", "as-fast-as-possible"),
