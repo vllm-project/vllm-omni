@@ -11,6 +11,12 @@ stages:
     enable_prefix_caching: true
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Keep the turn engine's upstream kernel and compilation defaults.
+        kernel_config: {}
+        compilation_config: {}
   rocm:
     stages:
       - stage_id: 0
