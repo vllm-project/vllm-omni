@@ -132,3 +132,21 @@ def test_failed_limit_validation_is_not_cached(pipeline):
             pipeline.encode_prompt("A", max_sequence_length=-1)
     assert pipeline._get_qwen_prompt_embeds.call_count == 2
     assert not pipeline._prompt_embedding_cache
+
+
+@torch.no_grad()
+def test_public_flag_does_not_gate_single_prompt_cache(pipeline):
+    pipeline.od_config.enable_prompt_embed_cache = False
+    pipeline.encode_prompt("A")
+    pipeline.encode_prompt("A")
+    assert pipeline._get_qwen_prompt_embeds.call_count == 1
+    assert pipeline._prompt_embedding_cache
+
+
+@torch.no_grad()
+def test_edit_and_batch_bypass_drop_text_entries(pipeline):
+    pipeline.encode_prompt("A")
+    pipeline.encode_prompt("A", images_per_prompt=[[object()]])
+    pipeline.encode_prompt(["A", "B"])
+    pipeline.encode_prompt("A")
+    assert pipeline._get_qwen_prompt_embeds.call_count == 4

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -117,6 +118,13 @@ def test_sample_tokens_dict_output():
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
 
 
+def test_host_copy_still_makes_other_outputs_contiguous_host_tensors():
+    for tensor in (torch.randn(4, 2).t(), torch.randn(3, requires_grad=True)):
+        host = gen_runner_module._HostCopyBatch(pin_memory=False).copy(tensor)
+        assert host.device.type == "cpu" and host.is_contiguous() and not host.requires_grad
+        assert torch.equal(host, tensor.detach())
+
+
 class _StubSchedulerOutput:
     def __init__(self, total_num_scheduled_tokens):
         self.total_num_scheduled_tokens = total_num_scheduled_tokens
@@ -126,6 +134,10 @@ class _StubSchedulerOutput:
         self.scheduled_encoder_inputs = {}
         self.scheduled_spec_decode_tokens = {}
         self.num_common_prefix_blocks = 0
+        self.scheduled_new_reqs = []
+        self.scheduled_cached_reqs = SimpleNamespace(req_ids=[])
+        self.free_encoder_mm_hashes = []
+        self.new_block_ids_to_zero = None
 
 
 def _make_guard_runner():
@@ -146,6 +158,7 @@ def _make_guard_runner():
     runner.parallel_config = SimpleNamespace(
         distributed_executor_backend=None,
         data_parallel_size=1,
+        pipeline_parallel_size=1,
     )
     runner._dummy_run_calls = []
     runner._dummy_run = lambda n: runner._dummy_run_calls.append(n)
@@ -153,6 +166,92 @@ def _make_guard_runner():
     runner.synchronize_input_prep = contextlib.nullcontext
     runner.attach_omni_connector_output = lambda result: result
     return runner
+
+
+def _make_idle_poll(monkeypatch):
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = _make_guard_runner()
+    runner.model_config.async_chunk = True
+    runner._prev_step_idle = True
+    runner.input_batch = _DummyInputBatch(0)
+    runner._update_states = Mock(return_value=None)
+    runner.synchronize_input_prep = Mock(side_effect=contextlib.nullcontext)
+    runner.model = SimpleNamespace(run_idle_prefetch=Mock(), on_requests_added=Mock(), on_requests_finished=Mock())
+    scheduler_output = _StubSchedulerOutput(0)
+    scheduler_output.num_scheduled_tokens = {}
+    return runner, scheduler_output
+
+
+def test_unchanged_idle_poll_preserves_connector_and_prefetch_work(monkeypatch):
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    runner._omni_connector = object()
+    runner.register_chunk_recv = Mock()
+    runner.recv_full_payload_inputs = Mock()
+    runner._pending_full_payload_send = {}
+    scheduled.pending_input_registrations = ["new-input"]
+    scheduled.pending_request_prewarms = ["new-input"]
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    runner._update_states.assert_not_called()
+    runner.synchronize_input_prep.assert_not_called()
+    runner.register_chunk_recv.assert_called_once_with("new-input")
+    runner.recv_full_payload_inputs.assert_called_once_with(scheduled)
+    runner.model.on_requests_added.assert_called_once_with(["new-input"])
+    runner.model.run_idle_prefetch.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "first_idle",
+        "batch",
+        "new",
+        "cached",
+        "finished",
+        "encoder_free",
+        "zero_blocks",
+        "block_copies",
+        "encoder_input",
+        "spec",
+        "dp",
+        "pp",
+    ],
+)
+def test_idle_input_updates_are_not_skipped_on_state_changes(monkeypatch, change):
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    if change == "first_idle":
+        runner._prev_step_idle = False
+    elif change == "batch":
+        runner.input_batch = _DummyInputBatch(1)
+    elif change == "new":
+        scheduled.scheduled_new_reqs = [object()]
+    elif change == "cached":
+        scheduled.scheduled_cached_reqs.req_ids = ["req-1"]
+    elif change == "finished":
+        scheduled.finished_req_ids = {"req-1"}
+    elif change == "encoder_free":
+        scheduled.free_encoder_mm_hashes = ["image"]
+    elif change == "zero_blocks":
+        scheduled.new_block_ids_to_zero = [0]
+    elif change == "block_copies":
+        scheduled.kv_cache_block_copies = [(0, 1)]
+    elif change == "encoder_input":
+        scheduled.scheduled_encoder_inputs = {"req-1": [0]}
+    elif change == "spec":
+        scheduled.scheduled_spec_decode_tokens = {"req-1": [1]}
+    elif change == "dp":
+        runner.parallel_config.data_parallel_size = 2
+    elif change == "pp":
+        runner.parallel_config.pipeline_parallel_size = 2
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    runner._update_states.assert_called_once_with(scheduled)
+    runner.synchronize_input_prep.assert_called_once_with()
+    if change == "finished":
+        runner.model.on_requests_finished.assert_called_once_with({"req-1"})
+    if change == "first_idle":
+        runner.model.run_idle_prefetch.assert_not_called()
 
 
 @pytest.mark.parametrize("total", [-1, -512, 0])
@@ -195,11 +294,13 @@ def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: True)
     runner = _make_guard_runner()
     sentinel = object()
-    calls = []
-    runner.kv_connector_no_forward = lambda scheduler_output, vllm_config: (
-        calls.append(scheduler_output),
-        sentinel,
-    )[1]
+    calls: list[object] = []
+
+    def _no_forward(scheduler_output, vllm_config):
+        calls.append(scheduler_output)
+        return sentinel
+
+    runner.kv_connector_no_forward = _no_forward
     runner.vllm_config = object()
 
     output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))
@@ -287,7 +388,6 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
         requires_request_ids=False,
         requires_exact_input_shape=exact_shape,
     )
-    runner.cascade_attn_enabled = False
     runner.num_prompt_logprobs = None
     runner.vllm_config = None
     runner.parallel_config = SimpleNamespace(
@@ -310,7 +410,15 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
         ),
     )
     monkeypatch.setattr(GPUGenerationModelRunner, "_get_slot_mappings", lambda self, **kw: (None, None))
-    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", lambda self, **kw: (None, None))
+    # Use the installed upstream contract: a permissive **kwargs stub would
+    # hide removed runner arguments such as cascade_attn_prefix_lens.
+    metadata_signature = inspect.signature(GPUGenerationModelRunner._build_attention_metadata)
+
+    def _build_attention_metadata(self, **kwargs):
+        metadata_signature.bind(self, **kwargs)
+        return None, None
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", _build_attention_metadata)
     monkeypatch.setattr(
         GPUGenerationModelRunner,
         "_maybe_attach_attention_metadata_extensions",

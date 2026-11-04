@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pybase64 as base64
+from vllm.multimodal.image import open_image
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -76,8 +77,6 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
         return {}
     from io import BytesIO
 
-    from PIL import Image
-
     images: list[object] = []
     for frame in frames:
         if not isinstance(frame, str) or not frame:
@@ -87,7 +86,7 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
         except (binascii.Error, ValueError):
             continue
         try:
-            images.append(np.asarray(Image.open(BytesIO(raw)).convert("RGB")))
+            images.append(np.asarray(open_image(BytesIO(raw)).convert("RGB")))
         except Exception:
             continue
     if not images:
@@ -406,6 +405,21 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         text = getattr(completion, "text", None) if completion is not None else None
         cumulative = getattr(completion, "cumulative_text", None) if completion is not None else None
         text_blob = " ".join(part for part in (text, cumulative) if isinstance(part, str))
+        # A finished Stage1 chunk can carry stop id 151669 and still be spoken.
+        # include_stop_str_in_output leaves <|silent|> on that text.
+        # is_effectively_silent is only the exact marker, so a sentence with
+        # the marker still appended is spoken. Classifying it as listen aborts
+        # the utterance sentence TTS already handed to Talker.
+        spoken = next(
+            (
+                part
+                for part in (cumulative, text)
+                if isinstance(part, str) and part.strip() and not is_effectively_silent(part)
+            ),
+            None,
+        )
+        if spoken is not None:
+            return None
         # Empty finished Stage1 is silent: stop_token 151669 is often omitted from
         # token_ids/text unless include_stop_str_in_output is set.
         is_silent = (

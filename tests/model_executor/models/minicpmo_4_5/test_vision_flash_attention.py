@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression coverage for MiniCPM-o 4.5 SigLIP FlashAttention."""
 
 from __future__ import annotations
@@ -253,7 +253,7 @@ def _make_cuda_attention_pair() -> tuple[SiglipAttention, SiglipFlashAttention2]
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_encoder_metadata_reuse_matches_per_layer_recomputation() -> None:
     _require_flash_attention()
     encoder = SiglipEncoder(_encoder_config()).eval().to(device="cuda", dtype=_DTYPE)
@@ -285,7 +285,7 @@ def test_encoder_metadata_reuse_matches_per_layer_recomputation() -> None:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_flash_attention_unpadded_matches_eager_reference() -> None:
     _require_flash_attention()
     eager_attention, flash_attention = _make_cuda_attention_pair()
@@ -306,7 +306,7 @@ def test_flash_attention_unpadded_matches_eager_reference() -> None:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize(
     "valid_lengths",
     [
