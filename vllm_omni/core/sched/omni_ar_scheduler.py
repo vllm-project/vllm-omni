@@ -776,7 +776,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 min_frames = 0
         if changed:
             scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-            logger.error(
+            logger.warning(
                 "[kstep] booked spans were non-uniform; rewrote the step to a "
                 "uniform %d-frame batch (%d rows, total=%d, per_req=%s) instead of "
                 "feeding the multi-frame loop spans it declines",

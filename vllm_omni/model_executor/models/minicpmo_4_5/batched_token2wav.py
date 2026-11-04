@@ -659,10 +659,14 @@ class BatchedToken2Wav(nn.Module):
             return
         try:
             torch.accelerator.synchronize(device)
-        except (RuntimeError, NotImplementedError):
-            # A reported-but-unimplemented sync is a debug-knob degradation,
-            # not a solve failure: keep the enqueue timing.
-            pass
+        except NotImplementedError:
+            # Only an unimplemented sync degrades to enqueue timing. A real
+            # device error -- an async kernel fault surfacing at this sync --
+            # must propagate so it is attributed to the solve that caused it.
+            logger.warning_once(
+                "accelerator sync is not implemented for %s; solve timing keeps enqueue time",
+                device.type,
+            )
 
     def _hift_inference(
         self,
