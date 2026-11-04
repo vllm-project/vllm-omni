@@ -136,12 +136,14 @@ def test_plain_chat_handoff_without_reply_rows_is_an_empty_condition() -> None:
 def test_plain_chat_handoff_after_a_preemption_keeps_reply_rows_from_before_it() -> None:
     """A resumed request hits on its earlier reply tokens, so their rows come from before the preemption."""
     prompt_ids, output_ids = list(range(100, 116)), [11, 12, 13, 14]
-    # Forwarded up to token 12, preempted, then resumed from a hit that covers it.
-    forwarded = [(115, 15), (11, 16), (12, 17), (13, 18)]
+    # Forwarded up to token 13, preempted, then resumed from a hit that ends after token 11.
+    forwarded = [(115, 15), (11, 16), (12, 17), (13, 18), (12, 17), (13, 18)]
 
     info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
 
     assert info["ids"]["tts"] == [11, 12, 13]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17), _row(13, 18)]))
 
 
 def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:

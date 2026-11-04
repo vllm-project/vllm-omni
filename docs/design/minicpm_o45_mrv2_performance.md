@@ -121,9 +121,9 @@ not set `supports_mrv2_prefix_cache_outputs`, so it reuses native KV alone: no
 output rows are saved or merged and no host cache is allocated. `llm2tts` picks
 the Talker's rows from the row ledger (`latent_input_ids`, `latent_positions`).
 The reply starts after `<|tts_bos|>`, the last prompt token, and the prompt's
-last token is always forwarded, so a hit never covers a reply row. A request
-resumed after preemption can hit on its earlier reply tokens, whose rows are
-already in the ledger. A template that opens the reply earlier in the prompt has
+last token is always forwarded, so a new request's hit never covers a reply row.
+A request resumed after preemption can hit on its earlier reply tokens, whose
+rows are already in the ledger. A template that opens the reply earlier in the prompt has
 no rows for the cached part of it: on a hit the request logs the "Thinker rows
 stop" warning and produces no audio, so such a template needs this overlay:
 

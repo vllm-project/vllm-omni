@@ -914,7 +914,7 @@ def _turn_hidden_rows(
         # Only the last sampled token is expected to have no row.
         logger.warning(
             "MiniCPM-o turn handoff: req=%s Thinker rows stop at token %d of %d (position %d); "
-            "the Talker gets the shorter reply",
+            "the Talker conditions only on the rows before it",
             request_id,
             len(rows),
             end - start,
