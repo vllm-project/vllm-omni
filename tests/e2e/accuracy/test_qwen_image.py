@@ -33,12 +33,17 @@ NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
 # H100 #17798, eager TORCH_SDPA vs Diffusers native: SSIM 0.989517 / PSNR 34.677647.
-# A3 #9532 and #9545: SSIM 0.955357 / PSNR 27.170992. Bounds sit just under those scores.
+# A3 #9532 and #9545: SSIM 0.955357 / PSNR 27.170992.
+# MI325 #14411, eager TORCH_SDPA vs Diffusers native: SSIM 0.962854 /
+# PSNR 28.407295. Keep each accelerator's gate separate rather than weakening
+# the CUDA contract; bounds sit below the exact eager measurements.
 # B200 has no eager measurement yet and uses the H100 bounds.
 _CUDA_SSIM_THRESHOLD = 0.98
 _CUDA_PSNR_THRESHOLD = 34.6
 _NPU_SSIM_THRESHOLD = 0.95
 _NPU_PSNR_THRESHOLD = 27.0
+_ROCM_SSIM_THRESHOLD = 0.95
+_ROCM_PSNR_THRESHOLD = 27.0
 
 PROMPT_PIXELWISE = (
     "A 20-year-old East Asian girl with delicate, charming features and large, bright brown eyes—expressive and "
@@ -53,8 +58,8 @@ NEGATIVE_PROMPT_PIXELWISE = (
     "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。"
     "构图混乱。文字模糊，扭曲。"
 )
-# CUDA keeps the 1664x928 case. A3 #9532 OOM there (61.3 GiB, weights 52.48 GiB),
-# so NPU uses 768x432. Prompt and step count stay the same.
+# CUDA and ROCm keep the 1664x928 case. A3 #9532 OOM there (61.3 GiB,
+# weights 52.48 GiB), so NPU uses 768x432. Prompt and step count stay the same.
 _CUDA_WIDTH_PIXELWISE = 1664
 _CUDA_HEIGHT_PIXELWISE = 928
 _NPU_WIDTH_PIXELWISE = 768
@@ -64,11 +69,14 @@ TRUE_CFG_SCALE_PIXELWISE = 4.0
 SEED_PIXELWISE = 42
 # H100 #17798 at 1664x928: mean abs 4.108345e-03, p99 3.529412e-02.
 # A3 #9545 at 768x432: mean abs 1.399533e-02, p99 1.882353e-01.
-# Bounds sit just above those errors.
+# MI325 #14411 at 1664x928: mean abs 1.401817e-02, p99 1.490196e-01.
+# Bounds sit above those errors with margin for run-to-run variation.
 _CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1e-2
 _CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 5e-2
 _NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-2
 _NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 2.5e-1
+_ROCM_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-2
+_ROCM_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-1
 
 
 def _pixelwise_size() -> tuple[int, int]:
@@ -78,12 +86,16 @@ def _pixelwise_size() -> tuple[int, int]:
 
 
 def _similarity_thresholds() -> tuple[float, float]:
+    if current_omni_platform.is_rocm():
+        return _ROCM_SSIM_THRESHOLD, _ROCM_PSNR_THRESHOLD
     if current_omni_platform.is_npu():
         return _NPU_SSIM_THRESHOLD, _NPU_PSNR_THRESHOLD
     return _CUDA_SSIM_THRESHOLD, _CUDA_PSNR_THRESHOLD
 
 
 def _pixel_thresholds() -> tuple[float, float]:
+    if current_omni_platform.is_rocm():
+        return _ROCM_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE, _ROCM_P99_ABS_DIFF_THRESHOLD_PIXELWISE
     if current_omni_platform.is_npu():
         return _NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE, _NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE
     return _CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE, _CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE
@@ -97,10 +109,10 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
-# Same Omni / Diffusers pair on CUDA (H100, B200) and NPU A3.
+# Same Omni / Diffusers pair on CUDA (H100, B200), NPU A3, and ROCm MI325.
 # FLASH_ATTN_3_HUB is Hopper-only and fails on B200/A100 (#8087). Auto-select
 # can still land on that kernel. TORCH_SDPA matches Diffusers ``native`` and
-# has a binding on both sides.
+# has a binding on all three accelerator families.
 _OMNI_CI_ATTN_BACKEND = "TORCH_SDPA"
 _DIFFUSERS_CI_ATTN_BACKEND = "native"
 _OMNI_CI_ATTN_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_CI_ATTN_BACKEND}
@@ -247,7 +259,7 @@ def _run_diffusers_qwen_image_pixelwise(*, model: str, output_path: Path) -> Ima
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -268,7 +280,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)

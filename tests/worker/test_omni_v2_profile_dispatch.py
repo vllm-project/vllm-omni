@@ -18,6 +18,8 @@ def test_dispatch_eager_and_manager_paths(monkeypatch, dp_size):
     # dp_size/dp_rank are read-only upstream properties resolved from
     # parallel_config, so the stub only needs the config namespace.
     runner.parallel_config = SimpleNamespace(data_parallel_size=dp_size, data_parallel_rank=1)
+    # Non-spec default: one newly sampled token and no draft steps.
+    runner.decode_query_len = 1
 
     import vllm.v1.worker.gpu.dp_utils as dp_utils
 

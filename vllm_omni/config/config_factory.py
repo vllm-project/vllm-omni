@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -377,6 +377,19 @@ class StageConfigFactory:
             raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
         return load_deploy_config(deploy_path)
 
+    @staticmethod
+    def _resolve_lance_checkpoint_output(pipeline_cfg: PipelineConfig, model: str) -> PipelineConfig:
+        """Label the Lance video checkpoint as video without changing image Lance."""
+        if pipeline_cfg.model_type != "lance" or _name_match_candidate(model) != "Lance_3B_Video":
+            return pipeline_cfg
+        return replace(
+            pipeline_cfg,
+            stages=tuple(
+                replace(stage, final_output_type="video") if stage.final_output else stage
+                for stage in pipeline_cfg.stages
+            ),
+        )
+
     @classmethod
     def create_from_model(
         cls,
@@ -399,6 +412,7 @@ class StageConfigFactory:
         )
         if pipeline_cfg is None:
             return None
+        pipeline_cfg = cls._resolve_lance_checkpoint_output(pipeline_cfg, model)
 
         # Keep the typed representation's topology in lockstep with the
         # compatibility launch representation. The aligner is a real extra
@@ -454,6 +468,7 @@ class StageConfigFactory:
         )
         if pipeline_cfg is None:
             return None, None
+        pipeline_cfg = cls._resolve_lance_checkpoint_output(pipeline_cfg, model)
 
         legacy_cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
         return cls._create_legacy_from_registry(

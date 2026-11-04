@@ -154,6 +154,27 @@ def _stop_id_tuple(eos_token_id: int, min_tokens_stop_ids: tuple[int, ...]) -> t
     return tuple(dict.fromkeys((int(eos_token_id), *min_tokens_stop_ids)))
 
 
+# The censoring step runs once per codec frame and the K-step loop calls it
+# once per frame per decode step, so rebuilding the index tensor from the
+# Python tuple with torch.tensor(...) -- a blocking H2D copy -- is the
+# dominant single host cost of this path under py-spy sampling. stop_ids is
+# an immutable tuple of ints and the tensor is only ever consumed as an index
+# (index_select/index_copy read it, never write it), so one tensor per
+# (stop set, device) can be shared across frames and requests; the persistent
+# storage also gives graph capture a stable address.
+_STOP_INDEX_CACHE: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
+
+
+def _stop_index_tensor(stop_ids: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """One device index tensor per (stop set, device), built on first use."""
+    key = (stop_ids, str(device))
+    cached = _STOP_INDEX_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(stop_ids, dtype=torch.long, device=device)
+        _STOP_INDEX_CACHE[key] = cached
+    return cached
+
+
 def _censor_stop_logits(
     logits: torch.Tensor,
     state: TalkerCodecDeviceState,
@@ -172,7 +193,7 @@ def _censor_stop_logits(
     overrides the floor for the duplex turn-end drain window, which the
     ``step < min_tokens`` criterion cannot express.
     """
-    stop_index = torch.tensor(stop_ids, dtype=torch.long, device=logits.device)
+    stop_index = _stop_index_tensor(stop_ids, logits.device)
     stop_logits = logits.index_select(-1, stop_index)
     if eos_window_masked:
         censored = torch.full_like(stop_logits, float("-inf"))

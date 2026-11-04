@@ -41,6 +41,7 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
@@ -601,6 +602,16 @@ class Wan22S2VPipeline(
     # Format-specific initialization
     # ------------------------------------------------------------------
 
+    def _create_transformer(self, config: dict) -> nn.Module:
+        """Create the S2V transformer. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        # Same rule as the T2V/I2V pipeline: auto-detected startup metadata is not a
+        # user policy, so let the checkpoint's own config.json decide.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        quant_config = resolve_wan_transformer_quant_config(config, quant_config, "transformer")
+        return create_s2v_transformer_from_config(config, quant_config=quant_config)
+
     def _init_diffusers_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from a diffusers-format model with subfolders."""
         # -- Weight sources for transformer (loaded via load_weights) --
@@ -635,7 +646,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, "transformer", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
 
     def _init_original_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from the original Wan2.2 checkpoint layout.
@@ -692,7 +703,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, ".", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
 
     # ------------------------------------------------------------------
     # Properties

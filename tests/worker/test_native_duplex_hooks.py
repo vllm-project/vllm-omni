@@ -397,6 +397,7 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -424,6 +425,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -2803,6 +2805,10 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
     assert sampled is not None
+    # Keep the complete token that reaches the soft character target.
+    assert sampled.sampled_token_ids.tolist() == [[candidate]]
+    sampling_metadata.output_token_ids[0].append(candidate)
+    sampled = model.sample(logits, sampling_metadata)
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
 
