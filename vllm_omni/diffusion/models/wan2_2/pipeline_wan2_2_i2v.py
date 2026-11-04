@@ -46,13 +46,13 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
-    set_wan_scheduler_timesteps,
     refresh_cache_for_denoise_schedule,
     resolve_wan_boundary_ratio,
     resolve_wan_flow_shift,
     resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
     retrieve_latents,
+    set_wan_scheduler_timesteps,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor

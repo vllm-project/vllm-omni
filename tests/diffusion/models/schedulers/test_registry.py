@@ -314,9 +314,7 @@ class TestSchedulerContract:
         assert named == {"shift": 2.0}
         assert unsupported == ("num_tokens",)
 
-        generic, unsupported = registry_mod.filter_injected_scheduler_kwargs(
-            RecordingMockScheduler(), {"shift": 2.0}
-        )
+        generic, unsupported = registry_mod.filter_injected_scheduler_kwargs(RecordingMockScheduler(), {"shift": 2.0})
         assert generic == {}
         assert unsupported == ("shift",)
 
