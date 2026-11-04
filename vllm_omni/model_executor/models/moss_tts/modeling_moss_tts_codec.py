@@ -784,7 +784,7 @@ class MossTTSCodecDecoder(nn.Module):
                 },
             )
 
-        if self._async_chunk and runtime_additional_information is None:
+        if self._async_chunk and all(not info or info.get("_is_dummy") for info in info_list):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
