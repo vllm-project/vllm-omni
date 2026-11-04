@@ -7,7 +7,6 @@ import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from inspect import signature
 from itertools import groupby
 from pathlib import Path
 from typing import Any, ClassVar
@@ -42,18 +41,22 @@ from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, act
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     commit_cache,
-    initialize_reference_parallelism,
     load_component_weights,
     load_transformer_weights,
     reference_cache_views,
+    validate_sequence_parallelism,
 )
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasInteractionSession, validate_camera_payload
+from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
+from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import (
     action_conditioning,
     normalize_request,
     plan_chunks,
     prepare_camera,
 )
+from vllm_omni.diffusion.models.hy_nomas.scheduler import EulerSolver
+from vllm_omni.diffusion.models.hy_nomas.text_encoder import TextEncoder
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
@@ -82,30 +85,22 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 logger = init_logger(__name__)
 
 
-def build_reference_config(model_root: Path, text_encoder: str, sp_size: int = 1) -> DictConfig:
-    from configs import config as reference_config
-    from omegaconf import OmegaConf
-
-    directory = Path(reference_config.__file__).parent
-    base = OmegaConf.load(directory / "config.yaml")
-    inference = OmegaConf.load(directory / "experiment" / "inference.yaml")
-    # Compose component settings without reading CLI arguments or changing Hydra's global state.
-    del base["defaults"]
-    del inference["defaults"]
-    config = OmegaConf.merge(base, inference)
-    config.dit_weight = str(model_root / "transformer")
-    config.model.vae.checkpoint = str(model_root / "decoder")
-    config.model.vae.parallel_mode = "none"
-    config.model.text_encoder.model_name = text_encoder
-    config.model.dit.seg_ar_attention_backend = "flex"
-    config.parallelism.sp_size = sp_size
-    config.parallelism.shard_text_encoder = False
-    config.inference.save_latents = False
-    config.inference.save_prompt_txt = False
-    config.inference.video_size = [704, 1280]
-    config = reference_config._flatten_cfg(config)
-    OmegaConf.set_struct(config, True)
-    return config
+def build_model_config(sp_size: int = 1) -> DictConfig:
+    return DictConfig(
+        {
+            "text_len": 1280,
+            "parallelism": {"sp_size": sp_size},
+            "normalize_displacement_per_video": True,
+            "inference": {
+                "cache_noise_sigma": 0.206897,
+                "normalize_relative_to_first_frame": True,
+                "normalize_framewise": True,
+                "normalize_displacement": True,
+                "trajectory_translation_scale": 1.0,
+                "trajectory_rotation_scale": 2.5,
+            },
+        }
+    )
 
 
 def read_component_config(root: Path, component: str, filename: str, class_name: str) -> dict[str, Any]:
@@ -117,9 +112,6 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
 
 
 def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
-    from hymm.models.vae.pixelumm_decoder.autoencoder import PixelUMMDCAELatentDecoder
-    from hymm.models.vae.pixelumm_decoder.model import DCAEVPixelUMMDecoder, GenExpertArch
-
     arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
     local_pixels = config["local_attention_tile_pixels"]
     if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
@@ -149,7 +141,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
     from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
 
-    # Reference components initialize global distributed state; reject in-process use before importing them.
+    # Keep the qualified executor profile and scope decoder SDPA changes to a worker.
     implicit_uni = config.distributed_executor_backend is None and (config.num_gpus or 1) == 1
     if implicit_uni or issubclass(DiffusionExecutor.get_class(config), UniProcDiffusionExecutor):
         raise ValueError("Hy-Nomas requires process isolation; set distributed_executor_backend='mp' or 'ray'.")
@@ -159,7 +151,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if 16 % parallel.ulysses_degree:
         raise ValueError("Hy-Nomas ulysses_degree must divide its 16 attention heads.")
     if parallel.ulysses_mode != "strict" or parallel.ulysses_a2a_permute:
-        raise ValueError("Hy-Nomas requires strict Ulysses SP with the reference all-to-all implementation.")
+        raise ValueError("Hy-Nomas requires strict Ulysses SP.")
     if parallel.vae_patch_parallel_size != 1 or parallel.text_encoder_tp_size != 1 or parallel.enable_expert_parallel:
         raise ValueError("Hy-Nomas does not support VAE, text encoder or expert parallelism.")
     if config.dtype != torch.bfloat16:
@@ -227,12 +219,6 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
-        from hymm.models.vae.pixelumm_decoder.streaming import WindowStreamingDecodeSession
-
-        if "rolling" not in signature(WindowStreamingDecodeSession).parameters:
-            raise RuntimeError(
-                "Hy-Nomas requires the pinned rolling PixelUMM revision; see recipes/Tencent/Hy-Nomas.md."
-            )
         self.initialize_ar(od_config.custom_pipeline_args or {})
         self.sp_size = od_config.parallel_config.ulysses_degree
         self.target_dtype = torch.bfloat16
@@ -279,8 +265,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         ):
             raise ValueError("Hy-Nomas requires the checkpoint's standard deterministic Euler schedule.")
         text_encoder = text_encoder_override or str(root / "text_encoder")
-        initialize_reference_parallelism(self.sp_size, self.device)
-        self.args = build_reference_config(root, text_encoder, self.sp_size)
+        validate_sequence_parallelism(self.sp_size)
+        self.args = build_model_config(self.sp_size)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -291,27 +277,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             )
             for component, prefix in (("transformer", "transformer."), ("decoder", "vae."))
         ]
-        from configs.constants import PROMPT_TEMPLATE
-        from hymm.models.text_encoder import TextEncoder
-
         self.transformer = build_transformer(self.args, self.device, transformer_config)
-        text_config = self.args.text_encoder
         self.text_encoder = (
             TextEncoder(
-                text_encoder_type=self.args.text_encoder_type,
                 text_encoder_path=text_encoder,
-                tokenizer_type=text_config.tokenizer,
                 tokenizer_path=text_encoder_override or str(root / "tokenizer"),
-                max_length=text_config.text_len if not text_config.use_ll_cap_dataset else text_config.text_len_ll_cap,
-                text_encoder_precision=text_config.text_encoder_precision,
-                prompt_template=PROMPT_TEMPLATE[text_config.prompt_template] if text_config.prompt_template else None,
-                prompt_template_video=PROMPT_TEMPLATE[text_config.prompt_template_video]
-                if text_config.prompt_template_video
-                else None,
-                hidden_state_skip_layer=2,
-                apply_final_norm=False,
-                reproduce=False,
-                logger=logger,
                 device=self.device,
             )
             .eval()
@@ -423,8 +393,6 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         }
 
     def _new_scheduler(self, steps: int):
-        from hymm.pipeline.solvers.euler import EulerSolver
-
         scheduler = EulerSolver(shift=5.0, reverse=True, solver="euler")
         scheduler.set_timesteps(steps, device=self.device)
         return scheduler
@@ -1058,6 +1026,4 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         finally:
             if self._ar_state is None:
                 self._offline_session = None
-                from hymm.models.dit.modules.attention.range_attention import clear_range_cache
-
-                clear_range_cache()
+                self.transformer.clear_attention_cache()

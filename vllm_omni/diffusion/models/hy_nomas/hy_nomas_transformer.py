@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from collections import Counter
 from collections.abc import Iterable
 
 import regex as re
 import torch
-import torch.distributed as dist
 from omegaconf import DictConfig
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.models.hy_nomas.dit import HyNomasTransformer
+from vllm_omni.diffusion.models.hy_nomas.layers import get_flash_attention2
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
 _DIT_NAMES = WeightsMapper(
@@ -28,52 +27,11 @@ _DIT_NAMES = WeightsMapper(
 
 
 def build_transformer(config: DictConfig, device: torch.device, model_config: dict) -> nn.Module:
-    from hymm.models.dit.nomas_cpt import CPTHYNomasDiffusionTransformer
-
-    transformer = CPTHYNomasDiffusionTransformer(
-        in_channels=model_config["in_channels"],
-        out_channels=model_config["out_channels"],
-        mm_double_blocks_depth=model_config["num_layers"],
-        mm_single_blocks_depth=0,
-        rope_dim_list=model_config["rope_axes_dim"],
-        rope_theta=model_config["rope_theta"],
-        hidden_size=model_config["num_attention_heads"] * model_config["attention_head_dim"],
-        heads_num=model_config["num_attention_heads"],
-        mlp_width_ratio=model_config["mlp_ratio"],
-        patch_size=[1, 1, 1],
-        text_states_dim=model_config["text_embed_dim"],
-        attn_mode=config.dit.attn_mode,
-        seg_ar_attention_backend="flex",
-        is_reshape_temporal_channels=False,
-        unpad_zero_tokens=True,
-        text_seg_pos_emb_num=0,
-        camera_injection_mode="extrinsics_attn",
-        action_config={
-            "keyboard_dim_in": 64,
-            "hidden_size": model_config["camera_embed_dim"],
-            "img_hidden_size": model_config["num_attention_heads"] * model_config["attention_head_dim"],
-            "keyboard_hidden_dim": model_config["camera_attention_dim"],
-            "heads_num": model_config["camera_num_attention_heads"],
-            "patch_size": [1, 1, 1],
-            "qk_norm": True,
-            "qk_norm_type": "rms",
-            "qkv_bias": False,
-            "rope_dim_list": model_config["camera_rope_axes_dim"],
-            "rope_theta": model_config["rope_theta"],
-            "per_segment_camera_attn": config.camera.per_segment_camera_attn,
-            "per_chunk_camera_attn": config.camera.per_chunk_camera_attn,
-            "camera_chunk_size": config.camera.camera_chunk_size,
-            "seg_ar_attention_backend": "flex",
-        },
-        device=device,
-        dtype=torch.bfloat16,
+    if device.type == "cuda":
+        get_flash_attention2()
+    transformer = HyNomasTransformer(
+        model_config, sp_size=config.parallelism.sp_size, device=device, dtype=torch.bfloat16
     )
-    transformer.nomas_sparse_config = {"enabled": False}
-    transformer.sparse_optim = {"enabled": False}
-    transformer.sparse_optim_counts = Counter()
-    for block in transformer.double_blocks:
-        block.compile_cache_prepost = False
-    # The reference output head does not consume the factory's device/dtype kwargs.
     return transformer.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
@@ -123,37 +81,8 @@ def commit_cache(cache: ARDiffusionSegmentedKVState, views: list[dict[str, torch
         cache.stage(layer)
 
 
-def initialize_reference_parallelism(sp_size: int, device: torch.device) -> DeviceMesh | None:
-    from hymm.distributed.parallel_states import (
-        ParallelDims,
-        initialize_sequence_parallel_state_v2,
-        nccl_info,
-        set_sequence_parallel_state,
-        set_tensor_parallel_state,
-    )
-
-    dims = ParallelDims(dp_replicate=1, dp_shard=1, sp=sp_size, tp=1, pp=1, world_size=sp_size)
-    mesh = None
+def validate_sequence_parallelism(sp_size: int) -> None:
     if sp_size > 1:
         group = get_sp_group()
         if group.ulysses_world_size != sp_size or group.world_size != sp_size:
             raise ValueError("Hy-Nomas requires the initialized SP group to match ulysses_degree.")
-        # Reuse the worker's group; vLLM-Omni owns its creation and destruction.
-        mesh = DeviceMesh.from_group(group.ulysses_group, device.type, mesh_dim_names=("sp",))
-        dims.sp_mesh = mesh
-        dims.sp_group = group.ulysses_group
-    else:
-        dims.sp_group = None
-    dims.device_mesh = mesh
-    # The upstream single-device path leaves stale SP state when a model is reloaded.
-    set_sequence_parallel_state(False)
-    set_tensor_parallel_state(False)
-    nccl_info.sp_group = None
-    nccl_info.tp_group = None
-    nccl_info.use_dynamic_ring_attention = False
-    nccl_info.sp_stream = None
-    nccl_info.sp_rank_list = None
-    initialize_sequence_parallel_state_v2(dims, mesh)
-    # Use the initialized worker rank instead of the torchrun RANK environment variable.
-    nccl_info.global_rank = dist.get_rank() if dist.is_initialized() else 0
-    return mesh

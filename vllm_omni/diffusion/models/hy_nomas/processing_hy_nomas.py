@@ -13,6 +13,21 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS, get_hy_nomas_video_generation_defaults
 
 
+def _parse_timestamp(value: int | float | str | None) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    parts = value.strip().split(":")
+    if not 1 <= len(parts) <= 3:
+        raise OmniClientError("Hy-Nomas timestamps must use seconds, MM:SS or HH:MM:SS.")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(parts[0])
+
+
 @dataclass(frozen=True)
 class HyNomasRequest:
     prompts: list[str]
@@ -193,8 +208,6 @@ def action_conditioning(
     mask = inputs.get("attention_mask")
     offsets.append(min(int(mask[0].sum()) if mask is not None else text_length, text_length))
 
-    from hymm.inference import _parse_timestamp
-
     action_list = list(actions.values()) if isinstance(actions, dict) else actions
     spans = []
     for index, action in enumerate(action_list):
@@ -238,7 +251,7 @@ def prepare_camera(
         return None
     if transformer.camera_injection_mode != "extrinsics_attn":
         raise ValueError("Hy-Nomas camera control requires extrinsics_attn.")
-    from hymm.pipeline.bidirectional import prepare_camera_inputs
+    from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
 
     inference = config.inference
     camera = prepare_camera_inputs(

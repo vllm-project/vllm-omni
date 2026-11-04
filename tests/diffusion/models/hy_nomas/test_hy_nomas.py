@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from datetime import timedelta
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -30,7 +30,7 @@ from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import build_trans
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import (
     HyNomasPipeline,
     build_decoder,
-    build_reference_config,
+    build_model_config,
     validate_config,
 )
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import action_conditioning, normalize_request
@@ -105,22 +105,12 @@ def checkpoint(tmp_path):
     return tmp_path
 
 
-def test_old_reference_decoder_fails_before_component_loading(checkpoint, monkeypatch, mocker):
-    class LegacySession:
-        def __init__(self, model, *, to_cpu=True, retain_history=True):
-            pass
+def test_native_decoder_has_rolling_session():
+    from inspect import signature
 
-    reference = ModuleType("hymm.models.vae.pixelumm_decoder.streaming")
-    monkeypatch.setattr(reference, "WindowStreamingDecodeSession", LegacySession, raising=False)
-    monkeypatch.setitem(sys.modules, reference.__name__, reference)
-    monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda"))
-    download = mocker.patch.object(pipeline_hy_nomas, "download_weights_from_hf_specific")
-    config = OmniDiffusionConfig(
-        model=str(checkpoint), dtype=torch.bfloat16, distributed_executor_backend="mp", enforce_eager=True
-    )
-    with pytest.raises(RuntimeError, match="pinned rolling PixelUMM revision"):
-        pipeline_hy_nomas.HyNomasPipeline(od_config=config)
-    download.assert_not_called()
+    from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
+
+    assert "rolling" in signature(PixelUMMDCAELatentDecoder.create_streaming_decode_session).parameters
 
 
 def test_discovery_from_modular_index(checkpoint, monkeypatch):
@@ -178,13 +168,6 @@ def test_public_defaults(architecture):
 
 @pytest.mark.parametrize("text_encoder_override", [None, "local-text-encoder"])
 def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encoder_override):
-    class RollingSession:
-        def __init__(self, model, *, to_cpu=True, retain_history=True, rolling=False):
-            pass
-
-    streaming = ModuleType("hymm.models.vae.pixelumm_decoder.streaming")
-    monkeypatch.setattr(streaming, "WindowStreamingDecodeSession", RollingSession, raising=False)
-    monkeypatch.setitem(sys.modules, streaming.__name__, streaming)
     download = Mock(return_value=str(checkpoint))
     transformer = nn.Linear(2, 2, bias=False)
     transformer.patch_size = (1, 1, 1)
@@ -195,21 +178,16 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
     text_encoder = nn.Linear(2, 2)
     vae = nn.Linear(2, 2)
     vae.spatial_compression_ratio = 32
-    loader = ModuleType("hymm.models.text_encoder")
     load_text = Mock(return_value=text_encoder)
-    monkeypatch.setattr(loader, "TextEncoder", load_text, raising=False)
-    constants = ModuleType("configs.constants")
-    monkeypatch.setattr(constants, "PROMPT_TEMPLATE", {}, raising=False)
-    monkeypatch.setitem(sys.modules, loader.__name__, loader)
-    monkeypatch.setitem(sys.modules, constants.__name__, constants)
+    monkeypatch.setattr(pipeline_hy_nomas, "TextEncoder", load_text)
     monkeypatch.setattr(pipeline_hy_nomas, "build_transformer", Mock(return_value=transformer))
     monkeypatch.setattr(pipeline_hy_nomas, "build_decoder", Mock(return_value=vae))
     monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda:0"))
-    monkeypatch.setattr(pipeline_hy_nomas, "initialize_reference_parallelism", Mock(return_value=None))
+    monkeypatch.setattr(pipeline_hy_nomas, "validate_sequence_parallelism", Mock(return_value=None))
     monkeypatch.setattr(pipeline_hy_nomas, "download_weights_from_hf_specific", download)
     monkeypatch.setattr(
         pipeline_hy_nomas,
-        "build_reference_config",
+        "build_model_config",
         Mock(
             return_value=DictConfig(
                 {
@@ -376,9 +354,6 @@ def test_negative_prompt_requires_string(negative_prompt):
 def pipeline(monkeypatch):
     from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
 
-    module = ModuleType("hymm.models.dit.modules.attention.range_attention")
-    monkeypatch.setattr(module, "clear_range_cache", Mock(), raising=False)
-    monkeypatch.setitem(sys.modules, module.__name__, module)
     pipeline = PipelineWithCPUComponents()
     pipeline.initialize_ar({})
     return pipeline
@@ -585,13 +560,10 @@ class CustomUniExecutor(UniProcDiffusionExecutor):
         "vllm_omni.diffusion.executor.uniproc_executor.UniProcDiffusionExecutor",
     ],
 )
-def test_model_rejects_in_process_execution_before_initializing_components(monkeypatch, backend):
-    device = Mock(side_effect=AssertionError("Component initialization must not start"))
-    monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", device)
+def test_native_model_preserves_isolated_executor_profile(backend):
     config = OmniDiffusionConfig(dtype=torch.bfloat16, distributed_executor_backend=backend)
     with pytest.raises(ValueError, match="requires process isolation"):
-        HyNomasPipeline(od_config=config)
-    device.assert_not_called()
+        validate_config(config)
 
 
 @pytest.mark.parametrize("backend", ["mp", "ray"])
@@ -753,10 +725,8 @@ def test_action_masks_match_reference_helpers(structured):
     assert action_conditioning(prompt, model.text_encoder, 1280, 12) == expected
 
 
-@pytest.mark.local_model
-def test_reference_transformer_factory_places_every_parameter(checkpoint):
-    pytest.importorskip("hymm.models.dit.modules")
-    config = build_reference_config(checkpoint, str(checkpoint / "text_encoder"))
+def test_native_transformer_factory_places_every_parameter(checkpoint):
+    config = build_model_config()
     transformer = build_transformer(config, torch.device("meta"), TRANSFORMER_CONFIG)
     parameters = dict(transformer.named_parameters())
     assert len(parameters) == 2268
@@ -764,9 +734,7 @@ def test_reference_transformer_factory_places_every_parameter(checkpoint):
     assert all(parameter.dtype == torch.bfloat16 for parameter in parameters.values())
 
 
-@pytest.mark.local_model
 def test_decoder_factory_places_every_parameter():
-    pytest.importorskip("hymm.models.vae.pixelumm_decoder.autoencoder")
     decoder = build_decoder(DECODER_CONFIG, torch.device("meta"))
     parameters = dict(decoder.named_parameters())
     assert len(parameters) == 476
@@ -777,8 +745,6 @@ def test_decoder_factory_places_every_parameter():
 
 
 def _check_reference_parallelism(rank, rendezvous):
-    from hymm.distributed.parallel_states import get_sequence_parallel_state, nccl_info
-
     from vllm_omni.diffusion.models.hy_nomas import hy_nomas_transformer
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
@@ -787,32 +753,21 @@ def _check_reference_parallelism(rank, rendezvous):
             patch.setenv("RANK", "0")
             group = Mock(ulysses_group=dist.group.WORLD, ulysses_world_size=2, world_size=2)
             patch.setattr(hy_nomas_transformer, "get_sp_group", lambda: group)
-            mesh = hy_nomas_transformer.initialize_reference_parallelism(2, torch.device("cpu"))
-            assert mesh.get_group("sp") is dist.group.WORLD
-            assert nccl_info.sp_group is dist.group.WORLD
-            assert nccl_info.sp_size == 2
-            assert nccl_info.rank_within_spgroup == nccl_info.global_rank == rank
-            assert nccl_info.parallel_dims.sp_group is dist.group.WORLD
-            assert get_sequence_parallel_state()
+            hy_nomas_transformer.validate_sequence_parallelism(2)
             value = torch.tensor(rank + 1)
-            dist.all_reduce(value, group=nccl_info.sp_group)
+            dist.all_reduce(value, group=group.ulysses_group)
             assert value.item() == 3
 
-            assert hy_nomas_transformer.initialize_reference_parallelism(1, torch.device("cpu")) is None
-            assert not get_sequence_parallel_state()
-            assert nccl_info.sp_size == 1
-            assert nccl_info.sp_group is None
-            assert nccl_info.device_mesh is None
+            assert hy_nomas_transformer.validate_sequence_parallelism(1) is None
+            assert group.ulysses_group is dist.group.WORLD
             assert dist.is_initialized()
 
             group.ulysses_world_size = 4
             with pytest.raises(ValueError, match="match ulysses_degree"):
-                hy_nomas_transformer.initialize_reference_parallelism(2, torch.device("cpu"))
+                hy_nomas_transformer.validate_sequence_parallelism(2)
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.local_model
-def test_reference_reuses_process_group_and_resets_single_device(tmp_path):
-    pytest.importorskip("hymm.distributed.parallel_states", reason="Install the pinned Hy-Nomas reference checkout")
+def test_native_validation_preserves_worker_process_group(tmp_path):
     mp.spawn(_check_reference_parallelism, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)

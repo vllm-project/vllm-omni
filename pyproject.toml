@@ -40,6 +40,10 @@ tracing = [
     "opentelemetry-instrumentation-fastapi>=0.49b0",
 ]
 
+hy-nomas = [
+    "flash-attn==2.8.3",
+]
+
 ming-tn = [
     "pynini",
     "inflect",
@@ -211,6 +215,8 @@ include = ["vllm_omni*"]
     "deploy/*.yaml",
     "diffusion/distributed/csrc/*.cu",
     "diffusion/distributed/csrc/*.hpp",
+    "diffusion/models/hy_nomas/camera_trajectories.json",
+    "diffusion/models/hy_nomas/SOURCES.md",
     "model_executor/models/covo_audio/speaker_prompt/*.npy",
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",

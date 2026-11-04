@@ -7,16 +7,20 @@
 - Task: text-to-video with segment prompts and optional camera control
 - Modes: offline generation, `/v1/videos`, realtime streaming, and multi-turn continuation
 - Hardware: one or two NVIDIA H200 GPUs, 141 GB per device
-- Runtime: `HyNomasPipeline`, BF16, with the pinned Hy-Nomas reference package
+- Runtime: native `HyNomasPipeline`, BF16
 - Maintainer: vLLM-Omni community
 
 Use this recipe for text-controlled video generation and interactive continuation.
 The pipeline manages generation and loads the DiT and PixelUMM shards through
 vLLM-Omni's component weight loader. It uses the checkpoint's bundled text encoder
-and tokenizer. Model computation, text preprocessing, and the Euler scheduler
-retain the pinned Hy-Nomas reference implementation.
+and tokenizer. DiT, text preprocessing, camera conditioning, Euler sampling and
+PixelUMM (including rolling state) are implemented inside vLLM-Omni.
 `HyNomasModularPipeline` in the checkpoint index selects this vLLM-Omni pipeline.
 The author's Diffusers fork is not needed for this integration.
+
+The native port's GPU qualification is pending. Measurements below retain their
+original adapter implementation revisions and must not be read as native-port
+accuracy or performance results.
 
 ## Model architecture
 
@@ -105,27 +109,20 @@ Validation used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
 vLLM 0.32.0, Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3.
 The NVIDIA driver was 570.133.20.
 
-Install vLLM-Omni first, then install the pinned reference checkout without
-replacing the environment's existing dependency versions:
+Install vLLM-Omni and the Hy-Nomas text-refiner kernel dependency for the
+environment's PyTorch/CUDA versions:
 
 ```bash
-git clone https://github.com/wtz2333/Hy-Nomas.git
-git -C Hy-Nomas checkout --detach 16a4c228fd6f4770ed4a111b360031f7686c4a19
-python -m pip install --no-deps -e ./Hy-Nomas
-python -m pip install hydra-core==1.3.2 omegaconf==2.3.0 loguru einops
+python -m pip install --no-build-isolation 'flash-attn==2.8.3'
 ```
 
-Keep the editable checkout: the integration reads its configuration files.
-This fork adds opt-in rolling PixelUMM decoding to reference revision
-`911cea6458a89c2663513ff7099561ec190dd491`. The default reference decoder is
-unchanged. AR sessions use stable-prefix rolling decoding without retained
-output history, replace-tail preview, or rollback.
-Install FlashAttention 2 for the environment's PyTorch/CUDA versions using the
-[reference installation instructions](https://github.com/Tencent-Hunyuan/Hy-Nomas/tree/911cea6458a89c2663513ff7099561ec190dd491).
-Verify imports before loading weights:
+Generation does not import `hymm` or the reference repository's `configs`.
+The pinned upstream source is needed only for independent comparison tests.
+AR sessions use native stable-prefix rolling decoding without retained output
+history. Verify the runtime modules before loading weights:
 
 ```bash
-python -c 'from hymm.pipeline.causal_ar import CPTCausalInferencePipeline'
+python -c 'from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline'
 ```
 
 Download the component checkpoint:
@@ -139,7 +136,7 @@ hf download tencent/Hy-Nomas-Diffusers \
 Keep `modular_model_index.json` and the `transformer/`, `decoder/`, `text_encoder/`,
 `tokenizer/`, and `scheduler/` directories. The pipeline uses each weight index to
 load its shards and checks required parameters, duplicate names, and tensor shapes.
-The published DiT attention names are mapped to the reference component's names.
+The published DiT attention names are mapped to the native component's names.
 The Hub ID also works directly; standard modular-checkpoint discovery selects the
 pipeline without a generated index or model-name special case.
 
@@ -169,9 +166,10 @@ Add `--ulysses-degree 2` for two GPUs. The default single-segment boundary is
 go in `--extra-body`; the latter contains one boolean per segment.
 
 The deployment selects the `mp` executor and eager execution. Python callers
-must set `distributed_executor_backend="mp"` and `enforce_eager=True`.
-The reference package needs process isolation. The first real request includes
-reference-kernel compilation; generic startup warmup is disabled because its
+must use `distributed_executor_backend="mp"` and `enforce_eager=True` for the
+documented profiles. Decoder SDPA policy is scoped inside the worker. The first
+real request includes FlexAttention kernel
+compilation; generic startup warmup is disabled because its
 sampling parameters are outside this checkpoint's contract.
 
 ## Online generation
@@ -337,14 +335,15 @@ MP4 incrementally instead of retaining all decoded frames in host memory.
 
 ### Scope relative to the RFC
 
-This first PR implements model integration and qualifies offline/full/recent
-accuracy plus normal realtime output. Relative to
+This first PR's acceptance scope covers model integration, offline/full/recent
+accuracy and normal realtime output. Historical qualification below applies to
+the recorded adapter revisions; native GPU requalification is pending. Relative to
 [RFC #14, §5](https://github.com/wtz2333/vllm-omni/issues/14):
 
 | RFC item | Included here | Deferred / not claimed here |
 | --- | --- | --- |
 | A1 | Absolute progress, resident budgets, incremental-v1 noise, legacy full behavior and model-state guards | Complete production resource/lifecycle qualification |
-| A2 | Pinned companion reference rolling decoder at `16a4c228` | Reference-side source is not duplicated in this Omni diff |
+| A2 | Native rolling PixelUMM decoder, preserving the `16a4c228` source contract | Native GPU precision and performance requalification pending |
 | A3 | Session-bound rolling decode, positions, empty stable metadata, normal final flush | Full cancellation/transport qualification |
 | A4 | Full/recent transactional retention; offline AR and normal realtime/typed output; 18/36 precision and 120+ second delivery | Remaining A4 service matrix, 72 precision, complete high-water accounting and broad W6/full-vs-recent quality |
 | B1–B9 | Basic SP/module offload remains supported; no new B-series optimization claimed | Media/kernel/attention/staging optimization, chunk residency/prefetch, decode parallelism, encoder sharding, regional compile/graphs and sparsity |
@@ -364,7 +363,7 @@ Implementation `209771901` passed 234 related CPU checks and four isolated
 resident/offload continuation/tail-reference cases; the pinned PixelUMM revision
 passed 34 CPU checks. All applicable local hooks passed.
 
-The latest precision campaign used one H200, SP1, resident BF16, FlexAttention,
+The adapter precision campaign used one H200, SP1, resident BF16, FlexAttention,
 704×1280, 24 fps, seed 42, CFG=1, and flow shift=5:
 
 | Comparison | Workload | Result |

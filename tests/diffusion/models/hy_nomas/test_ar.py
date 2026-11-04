@@ -89,6 +89,7 @@ class PipelineWithCPUComponents(HyNomasPipeline):
             config=SimpleNamespace(out_channels=2),
             camera_injection_mode="extrinsics_attn",
             forward_with_cache=self.transformer_forward,
+            clear_attention_cache=lambda: None,
         )
         self.vae = SimpleNamespace(
             temporal_window_latents=8,
