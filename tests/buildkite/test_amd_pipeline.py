@@ -1322,16 +1322,21 @@ def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     assert AITER_MHA_CACHE_PUBLISH not in pytest_commands[1]
 
 
-def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
-    step = _find_step("Diffusion Stable Audio Layerwise Offload Test (quarantined)")
-
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    _assert_build_scoped_aiter_mha_cache(step, STABLE_AUDIO_LAYERWISE_NODE, publishes=False)
+def test_stable_audio_layerwise_merge_owner_is_removed() -> None:
+    pipeline = yaml.safe_load(AMD_MERGE_PIPELINE.read_text(encoding="utf-8"))
+    labels = [step.get("label") for step in _walk_steps(pipeline["steps"])]
+    assert "Diffusion Stable Audio Layerwise Offload Test (quarantined)" not in labels
 
     blocking = _find_step("Diffusion Model CPU offloading Test")
+    commands = "\n".join(blocking["commands"])
+    deselect = f"--deselect='{STABLE_AUDIO_LAYERWISE_NODE}'"
+
+    assert blocking["grade"] == "Blocking"
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in blocking["commands"]
     assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
+    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
+    assert "tests/diffusion/offloader/test_diffusion_layerwise_offload.py" in commands
+    assert deselect in commands
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
@@ -1892,23 +1897,28 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
 def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
     command = "\n".join(step["commands"])
-    node = (
-        "tests/diffusion/offloader/test_diffusion_layerwise_offload.py"
-        "::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]"
-    )
+    nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
 
+    assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
     assert step["grade"] == "NonBlocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
-    assert step["source_file_dependencies"] == "diffusion_offloader"
+    assert step["source_file_dependencies"] == [
+        "diffusion_offloader",
+        "diffusion_stable_audio_function",
+    ]
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-layerwise-offload/**/*"]
     assert "full_model and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level full_model" in command
     assert "timeout --signal=TERM --kill-after=2m 45m" in command
-    assert node in command
+    assert STABLE_AUDIO_LAYERWISE_NODE in command
     assert "test_diffusion_cpu_offload.py" not in command
     assert "riverclouds/qwen_image_random" not in command
+    assert "if pytest --collect-only -q" in command
+    assert "else\n  exit $$?" in command
+    assert "PIPESTATUS[0]" in command
     assert "Expected exactly one Stable Audio layerwise-offload node" in command
     assert "Expected exactly one executed Stable Audio layerwise-offload test" in command
     assert "skipped != 0" in command
@@ -1919,7 +1929,7 @@ def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None
     )
     cpu_offload = "\n".join(_find_step("Stable Audio CPU Offload", AMD_NIGHTLY_PIPELINE)["commands"])
     assert "test_diffusion_layerwise_offload.py" not in cpu_offload
-    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_WEEKLY_PIPELINE):
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_WEEKLY_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert 'label: "Stable Audio Layerwise Offload"' not in text
 

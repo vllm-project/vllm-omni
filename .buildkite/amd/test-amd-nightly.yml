@@ -624,7 +624,8 @@ steps:
 
   # CUDA nightly "Diffusion · Offloader Test" selects this full_model node.
   # The ROCm mark is cards_1. The existing 512 MB savings check stays in the
-  # test. This job does not change Stable Audio CPU offload or MERGE.
+  # test. The former quarantined MERGE leaf is removed, making this the sole
+  # Stable Audio layerwise-offload owner on ROCm.
   - group: ":full_moon: Layerwise Offload MI300 Nightly"
     steps:
       - label: "Stable Audio Layerwise Offload"
@@ -633,7 +634,9 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 60
-        source_file_dependencies: diffusion_offloader
+        source_file_dependencies:
+          - diffusion_offloader
+          - diffusion_stable_audio_function
         artifact_paths:
           - artifacts/rocm-stable-audio-layerwise-offload/**/*
         commands:
@@ -642,17 +645,20 @@ steps:
           - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
           - |
             node='tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
-            pytest --collect-only -q \
+            if pytest --collect-only -q \
               tests/diffusion/offloader/test_diffusion_layerwise_offload.py \
               -m 'full_model and diffusion and rocm and MI325 and cards_1' \
               --run-level full_model \
-              > "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt"
-            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
-              "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 1 ]]; then
-              echo "Expected exactly one Stable Audio layerwise-offload node, found $$count." >&2
-              cat "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
+              > "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt"; then
+              count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+                "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt")
+              if [[ "$$count" != 1 ]]; then
+                echo "Expected exactly one Stable Audio layerwise-offload node, found $$count." >&2
+                cat "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            else
+              exit $$?
             fi
           - |
             if (
