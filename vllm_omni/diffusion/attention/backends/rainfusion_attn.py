@@ -344,17 +344,25 @@ class RainFusionAttentionImpl(AttentionImpl):
             or query.ndim != 4
             or query.shape[0] != 1
             or self.qkv_layout != _INPUT_LAYOUT
-            or self.rainfusion.precision != "bf16"
-            or metadata.attn_mask is not None
+            or self.rainfusion.precision not in ("bf16", "mix")
             or metadata.extra.get("kv_cache_dtype", "bf16") not in ("float", "bf16")
             or not metadata.extra.get("npu_attn_varlen", False)
         ):
+            return False
+        # The rectangular path slices Q and KV to their valid lengths itself, so a
+        # padding-only boolean mask carries no constraint it does not already honour.
+        # Any richer mask does, and the sparse runtime cannot represent it.
+        mask = metadata.attn_mask
+        if mask is not None and not (mask.ndim == 2 and mask.dtype == torch.bool):
             return False
         try:
             from mindiesd.utils.get_platform import is_a5_device
         except ImportError:
             return False
-        return not is_a5_device()
+        if not is_a5_device():
+            return True
+        # A5 has no bf16 rf_v2 kernel, so only the EagleQBSA ('mix') form is available.
+        return self.rainfusion.precision == "mix"
 
     def _forward_hybrid_npu(self, query, key, value, metadata, sparse_plan, reference_rows, *, q_spans):
         from vllm_omni.diffusion.attention.ops.rainfusion_hybrid import get_hybrid_plan, hybrid_attention
@@ -388,14 +396,16 @@ class RainFusionAttentionImpl(AttentionImpl):
             )
             return self.dense_fallback.forward_npu(q, k, v, dense_metadata)
 
+        precision = self.rainfusion.precision
+        kernel_dtype = "bf16" if precision == "mix" else "fp16"
         logger.info_once(
             "RAINFUSION_ATTN hybrid active: dense_q_rows=%d, sparse_q_rows=%d, kv_rows=%d, kernel=%s, dtype=%s; "
             "dense guards use Flash, geometry indices cached across layers.",
             plan.dense_query_rows,
             plan.sparse_query_rows,
             plan.key_rows,
-            "bsa",
-            "fp16",
+            "eagle_qbsa" if precision == "mix" else "bsa",
+            kernel_dtype,
         )
         if reference_rows:
             logger.info_once(
@@ -412,9 +422,10 @@ class RainFusionAttentionImpl(AttentionImpl):
             dense_forward,
             sparsity=self.rainfusion.sparsity,
             scale=self.softmax_scale,
-            inner_precise=_INNER_PRECISE,
-            kernel_dtype="fp16",
+            inner_precise=4 if precision == "mix" else _INNER_PRECISE,
+            kernel_dtype=kernel_dtype,
             input_scale=float(metadata.extra.get("laser_input_scale", 256.0)),
+            precision=precision,
         )
         if used_q == query.shape[1]:
             return out
