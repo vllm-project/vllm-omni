@@ -343,7 +343,13 @@ from it yields a `PrefixCacheDelivery`:
 - start below it (a resume that recomputes delivered rows): `trim` leading
   rows of this step's slice are dropped from the merged output.
 
-Only steps with a hit, replay or trim keep their step id
+Only TP rank 0 retains step ids for output rewrites: the executor consumes
+async outputs from that rank on the last PP stage. Other TP ranks discard
+the read-side step context in `sample_tokens`, including on a prefix hit.
+Discarding releases the step holder; cache writes retain their own staging
+holders until they complete, so the slot cannot be reused too early.
+
+On the output rank, only steps with a hit, replay or trim keep their step id
 (`step_rewrite_req_ids`). The rewrite rides the async output's existing
 `finalize_output` hook: once the host payloads are built, and before they are
 published to the next stage, it materializes the step with

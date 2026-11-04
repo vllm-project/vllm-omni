@@ -165,6 +165,8 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         replay or trim) is discarded at once, so misses keep the plain
         output path.
         """
+        from vllm.distributed.parallel_state import get_tp_group
+
         cache, view = self.omni_prefix_cache, self._prefix_cache_group_view
         if cache is None or view is None:
             return None
@@ -181,7 +183,13 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         if step_id is None:
             return None
         rewrite_ids = cache.step_rewrite_req_ids(step_id)
-        emits_payloads = getattr(self.vllm_config.model_config, "engine_output_type", "text") != "text"
+        # The executor consumes async output only on TP rank 0. Other ranks
+        # must drop their read-side context here; discard leaves cache writes
+        # and their staging holders intact until the writes complete.
+        emits_payloads = (
+            get_tp_group().is_first_rank
+            and getattr(self.vllm_config.model_config, "engine_output_type", "text") != "text"
+        )
         if not rewrite_ids or not emits_payloads or self._model_mm_outputs_written_in_sample():
             cache.discard_step(step_id)
             return None

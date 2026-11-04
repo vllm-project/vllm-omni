@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model Runner V2 binding of the omni prefix cache."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -123,7 +124,10 @@ def test_init_refuses_unmirrored_layouts(monkeypatch, block_sizes, dcp_size, mat
         ({"b"}, "latent", True, False),
     ],
 )
-def test_save_keeps_step_only_for_rewrites(rewrite_ids, output_type, written_in_sample, kept):
+def test_save_keeps_step_only_for_rewrites(monkeypatch, rewrite_ids, output_type, written_in_sample, kept):
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True))
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.omni_prefix_cache = cache = _FakePrefixCache(rewrite_ids)
     runner._prefix_cache_group_view = view = MagicMock()
@@ -219,3 +223,68 @@ def test_rewrite_consumes_step_once_even_when_materialize_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="already consumed"):
         rewrite.discard()
     assert cache.consumed == [("materialize", 3)]
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_tp_output_consumption_recycles_staging_slots(monkeypatch, caplog, tp_rank):
+    """Only the replying worker consumes async outputs; both ranks save steps."""
+    from vllm.distributed import parallel_state
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+
+    from tests.core.test_prefix_cache_mrv2 import input_batch, sched_output
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+    from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(is_first_rank=tp_rank == 0))
+    cfg = PrefixCacheConfig(num_blocks=8, block_size=4, staging_depth=2, staging_claim_timeout_s=0)
+    cache = OmniPrefixCacheManager(cfg, eager=True)
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.omni_prefix_cache = cache
+    runner.is_pooling_model = False
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter(track_requests=True)
+    runner._prefix_cache_group_view = MRv2FullAttentionGroupView(runner._prefix_cache_adapter, 4)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="latent"))
+    outputs = []
+    errors = []
+
+    def sample_tokens(req_id, computed):
+        runner._prefix_cache_step_begin(
+            sched_output(new=[(req_id, computed, [0, 1])], scheduled={req_id: 8 - computed})
+        )
+        batch = input_batch([(req_id, computed, 8 - computed)])
+        batch.num_tokens = batch.num_tokens_after_padding = 8 - computed
+        hidden = torch.arange(computed, 8, dtype=torch.float32).reshape(-1, 1)
+        rewrite = runner._prefix_cache_save_mrv2(batch, hidden, {})
+        output = SimpleNamespace(inter_stage_outputs=[{"hidden": hidden}], pooler_output=None, multimodal_outputs=None)
+        finalize = runner._prefix_cache_output_finalizer(rewrite, lambda x: x, mergeable=True)
+        return SimpleNamespace(get_output=lambda: finalize(output))
+
+    def handle_output(output):
+        if isinstance(output, Exception):
+            errors.append(output)
+        else:
+            outputs.append(output.get_output())
+
+    worker = WorkerProc.__new__(WorkerProc)
+    worker.rank = tp_rank
+    worker.worker = SimpleNamespace(sample_tokens=sample_tokens)
+    worker.handle_output = handle_output
+    try:
+        # Seed full rows, then repeatedly reuse the first block. Drive the real
+        # executor reply gate, rather than consuming every returned rewrite.
+        for index in range(8):
+            req_id = f"request-{index}"
+            WorkerProc._execute_worker_rpc(worker, ("sample_tokens", (req_id, 0 if index == 0 else 4), {}, 0))
+            runner._prefix_cache_step_begin(sched_output(finished=[req_id]))
+        assert not errors
+        # Non-replying workers log RPC exceptions instead of returning them.
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+        assert not cache._step_ctxs
+        assert cache._controller.in_flight_tasks() == 0
+        assert not any(cache._controller._staging_pool._busy)
+        assert len(outputs) == (8 if tp_rank == 0 else 0)
+        for output in outputs:
+            assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.arange(8).reshape(-1, 1))
+    finally:
+        cache.shutdown()
