@@ -1,9 +1,0 @@
-# Opt-in resident Thinker KV for committed Qwen3-Omni duplex turns.
-# V1 synchronous scheduling fences each turn before reusing its allocation.
-base_config: qwen3_omni_duplex.yaml
-duplex_session:
-  turn_kv_continuation: true
-stages:
-  - stage_id: 0
-    async_scheduling: false
-    enable_prefix_caching: true

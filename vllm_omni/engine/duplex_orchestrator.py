@@ -96,16 +96,27 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         super().__init__(*args, **kwargs)
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
-        if duplex_session_config.turn_kv_continuation:
+        if plugin.supports_turn_kv_continuation:
             config = self.stage_pools[0].stage_vllm_config
-            if not plugin.supports_turn_kv_continuation:
-                raise ValueError("This model does not support turn KV continuation")
-            if config.model_config.use_v2_model_runner or config.scheduler_config.async_scheduling:
-                raise ValueError("Turn KV continuation requires stage 0 model runner V1 and async_scheduling: false")
-            if not config.cache_config.enable_prefix_caching:
-                raise ValueError("Turn KV continuation requires stage 0 prefix caching for Talker hidden-state replay")
-            if not self.async_chunk or config.speculative_config is not None:
-                raise ValueError("Turn KV continuation requires async_chunk and does not support speculative decoding")
+            unsupported = [
+                reason
+                for active, reason in (
+                    (config.model_config.use_v2_model_runner, "model runner V2"),
+                    (config.scheduler_config.async_scheduling, "async scheduling"),
+                    (not config.cache_config.enable_prefix_caching, "prefix caching disabled"),
+                    (not self.async_chunk, "async_chunk disabled"),
+                    (config.speculative_config is not None, "speculative decoding"),
+                )
+                if active
+            ]
+            if unsupported:
+                # Resolve the model's capability once for this deployment.
+                # Session admission and frontend discovery use the same value.
+                plugin.supports_turn_kv_continuation = False
+                logger.warning(
+                    "Thinker KV continuation unavailable (%s); using per-turn requests",
+                    ", ".join(unsupported),
+                )
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":
@@ -359,7 +370,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
         close_session = not duplex_is_auxiliary_request(req_id) and (
-            self.duplex_session_config.turn_kv_continuation
+            self.plugin.supports_turn_kv_continuation
             or self.plugin.capabilities(
                 max_sessions=self.duplex_session_config.max_sessions
             ).supports_core_resumable_request

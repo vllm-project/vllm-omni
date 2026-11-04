@@ -686,20 +686,16 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 `model_turn_id`), the public session config and the server-owned runtime
 config for the worker-side model hooks.
 
-Qwen3-Omni instead submits a fresh non-resumable Thinker request per committed
-turn, rendering the current history through its normal multimodal processor.
-Its CUDA duplex profiles enable [prefix caching](feature/prefix_caching.md#qwen3-omni-duplex-reuse)
-to reuse matching Thinker KV and stage-output rows across those requests.
-This cache is owned by the engine, not the session; cancel/epoch fencing,
-history calibration and per-turn Talker/Code2Wav lifetimes are unchanged.
-
-An explicit `duplex_session.turn_kv_continuation` deployment selects a different
-entry-stage lifetime for Qwen: `supports_turn_kv_continuation` keeps Stage0
-resident while leaving commit, playback and VAD policy turn-based. Full prompt
+Qwen3-Omni defaults to resident Thinker requests in the existing V1 duplex
+profile, using the upstream resumable streaming-input request path. The
+`supports_turn_kv_continuation` capability is resolved from engine settings;
+unsupported configurations log a reason and use per-turn requests with ordinary
+prefix caching where available. No separate deployment or session switch is
+required. Commit, playback and VAD policy remain turn-based. Full prompt
 snapshots go through normal multimodal preprocessing before scheduler-side
 prefix validation. `DuplexStagePort.finish_turn` releases only downstream turn
 state. Cancel, close and expiry still clean up every owned stage, including the
-resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#opt-in-resident-thinker-kv-continuation)
+resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#resident-thinker-kv-continuation)
 for runner restrictions and fallback behavior.
 
 ## Model plugin

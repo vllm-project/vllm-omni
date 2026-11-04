@@ -43,39 +43,28 @@ playback acknowledgement or interruption handling.
 
 ### Qwen3-Omni cross-turn Thinker KV reuse
 
-On CUDA, `qwen3_omni_duplex.yaml` and `qwen3_omni_duplex_mrv2.yaml`
-enable Thinker prefix caching. Each committed turn still submits a fresh,
-non-resumable request with the current conversation history. Matching complete
-prefix blocks reuse Thinker KV; the stage-output cache supplies the matching
-hidden-state rows needed by Talker. Talker and Code2Wav remain per-turn and
-do not enable prefix caching.
+The existing CUDA `qwen3_omni_duplex.yaml` profile defaults to resident
+Thinker KV continuation. No additional YAML or session switch is needed.
+As in upstream streaming input, the request path sets `resumable=True`;
+ordinary non-streaming requests keep upstream's `resumable=False` default.
+Talker and Code2Wav remain per-turn and do not enable prefix caching.
 
-This reduces repeated history prefill when matching blocks remain cached. It
-does not retain a session-owned Thinker request or change the commit, playback
-acknowledgement, or cancellation protocol. After interruption, history
-calibration, item edits, tool-result insertion, or history pruning, reuse is
-limited to the prefix matching the newly rendered prompt and multimodal inputs.
-The remaining suffix is computed normally; cache eviction also falls back to
-normal prefill. In particular, reuse does not append an unheard assistant
-suffix to the conversation.
+### Resident Thinker KV continuation
 
-Prefix caching does not eliminate input processing or Talker/Code2Wav work,
-so commit-to-first-audio latency gains depend on the workload. Budget host RAM
-for the [stage-output cache](../design/feature/prefix_caching.md).
-Non-CUDA platform overrides keep this cache disabled. To disable it on CUDA,
-set `enable_prefix_caching: false` on stage 0 in a deployment overlay.
+Continuation is selected from the resolved engine configuration: stage 0 must
+use Model Runner V1, synchronous scheduling, prefix caching, async-chunk
+transport and no speculative decoding. The existing V1 profile sets these
+existing engine options. Unsupported combinations, including MRv2, retain
+fresh per-turn Thinker requests; startup logs the reason and the session reports
+`supports_turn_kv_continuation: false`. Where enabled, ordinary APC still reuses
+matching blocks in that fallback path. Disabling stage-0 prefix caching also
+disables resident continuation because Talker needs cached hidden-state rows.
+Non-CUDA profile overrides keep prefix caching disabled.
 
-### Opt-in resident Thinker KV continuation
-
-`qwen3_omni_duplex_kv.yaml` enables experimental same-request continuation with
-`duplex_session.turn_kv_continuation: true`. It requires CUDA Model Runner V1,
-stage-0 prefix caching, `async_chunk: true`, synchronous scheduling on stage 0,
-and no speculative decoding. The ordinary V1 and MRv2 profiles keep their
-per-turn request behavior.
-
-Deploy overlays replace the `duplex_session` section as a whole. If an overlay
-sets VAD paths or other session options, include `turn_kv_continuation: true`
-in that section as well; otherwise the default per-turn mode is selected.
+Prefix caching does not eliminate multimodal preprocessing or Talker/Code2Wav
+work. Budget host RAM for the
+[stage-output cache](../design/feature/prefix_caching.md) as well as GPU memory
+for resident KV.
 
 The Thinker request and its KV allocation survive a completed turn. Each new
 commit still renders and processes the complete current multimodal history.
