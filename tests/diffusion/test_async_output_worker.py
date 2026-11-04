@@ -31,12 +31,18 @@ from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class _WorkerWithDevice:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+
+
 def _make_worker_proc(step_execution=False):
     """Create a minimal WorkerProc-like object with async output state."""
     proc = object.__new__(WorkerProc)
     proc.od_config = MagicMock()
     proc.od_config.step_execution = step_execution
     proc.gpu_id = 0
+    proc.worker = _WorkerWithDevice(torch.device("cpu", 0))
     proc.result_mq = MagicMock()
     proc._running = True
     proc._async_output_queue = queue.Queue() if not step_execution else None
@@ -376,6 +382,31 @@ class TestAsyncOutputLoopLogic:
         assert output.trajectory_latents is original_latents
         with pytest.raises(FileNotFoundError):
             shared_memory.SharedMemory(name=str(created_handles[0]["name"]))
+
+
+class TestAsyncOutputLoopStreamDevice:
+    """The D2H stream must live on the device the worker selected."""
+
+    @staticmethod
+    def _run_loop(mocker, proc: WorkerProc) -> MagicMock:
+        mock_torch = mocker.MagicMock()
+        mock_torch.device = torch.device
+        mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+
+        proc._async_output_queue.put(None)
+        proc._async_output_loop()
+        return mock_torch.Stream
+
+    def test_uses_worker_device_when_it_differs_from_gpu_id(self, mocker):
+        # e.g. a platform whose worker selects device index 0 in every process.
+        proc = _make_worker_proc(step_execution=False)
+        proc.gpu_id = 1
+        proc.worker = _WorkerWithDevice(torch.device("cpu", 0))
+
+        stream_cls = self._run_loop(mocker, proc)
+
+        stream_cls.assert_called_once_with(device=torch.device("cpu", 0))
 
 
 class TestDrainAsyncOutputs:
