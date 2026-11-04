@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import pybase64 as base64
 from vllm.logger import init_logger
@@ -79,6 +80,8 @@ _FINAL_ACK_TIMEOUT_S = 20.0
 # Same bound for the closing write path: the send itself has no deadline, so
 # this one has to cover the send too (see ``_close_duplex_session``).
 _FINAL_CLOSE_TIMEOUT_S = 20.0
+# Optional session.stats fetch: the deadline covers the send as well as the reply.
+_SESSION_STATS_TIMEOUT_S = 5.0
 # How long a cancelled close may take to unwind before the transport goes down.
 _FORCE_CLOSE_GRACE_S = 5.0
 # Events that can still open or extend a response after the commit. Playback
@@ -259,6 +262,25 @@ def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventColle
 
 def _with_sample_identity(payload: dict[str, object], sample: DuplexSample) -> dict[str, object]:
     return {"sample_id": sample.id, "split": sample.split, **payload}
+
+
+def _event_related_ids(event: dict[str, object]) -> tuple[str, ...]:
+    ids: list[str] = []
+    for key in ("related_event_id", "event_id"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            ids.append(value)
+    error = event.get("error")
+    if isinstance(error, dict):
+        for key in ("event_id", "related_event_id"):
+            value = error.get(key)
+            if isinstance(value, str) and value:
+                ids.append(value)
+    return tuple(ids)
+
+
+def _correlates_to_request(event: dict[str, object], request_event_id: str | None) -> bool:
+    return bool(request_event_id) and request_event_id in _event_related_ids(event)
 
 
 def _session_capabilities(client: RealtimeDuplexClient) -> dict[str, object]:
@@ -685,6 +707,9 @@ async def generate_sample(
     close_timeout = None
     ack_timeout = None
     server_errors: list[str] = []
+    session_stats_errors: list[str] = []
+    session_stats: dict[str, object] | None = None
+    stats_event_id: str | None = None
     input_committed = False
     stream_start: float | None = None
     async with client:
@@ -812,6 +837,17 @@ async def generate_sample(
             # diagnosis, not folded into ``error`` and not a retry reason.
             ack_timeout = str(exc) or "playback ack timed out"
             logger.warning("DuplexEval: playback ack not delivered for sample %s: %s", sample.id, exc)
+        if _session_capabilities(client).get("supports_session_stats") is True:
+            stats_event_id = f"evt_{uuid4().hex}"
+            try:
+                fetched = await client.get_session_stats(
+                    timeout_s=_SESSION_STATS_TIMEOUT_S,
+                    event_id=stats_event_id,
+                )
+            except (TimeoutError, ConnectionError) as exc:
+                logger.warning("Omni-DuplexEval session stats unavailable: %s", exc)
+                fetched = None
+            session_stats = fetched or None
         try:
             await _close_duplex_session(client, timeout_s=_FINAL_CLOSE_TIMEOUT_S)
         except TimeoutError as exc:
@@ -847,6 +883,7 @@ async def generate_sample(
         "close_timeout": close_timeout,
         "ack_timeout": ack_timeout,
         "server_errors": server_errors,
+        "session_stats_errors": session_stats_errors,
         "ref_audio_sha256": prepared.ref_audio_sha256,
     }
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
@@ -855,6 +892,7 @@ async def generate_sample(
         collector,
         stream_start=stream_start if stream_start is not None else 0.0,
         session_id=sample.id,
+        session_stats=session_stats,
     )
     errors = []
     # Server-side failures are recorded apart from the timeouts below, which are
@@ -862,6 +900,9 @@ async def generate_sample(
     for event in client.events.errors():
         error = event.get("error")
         code = error.get("code") if isinstance(error, dict) else event.get("code")
+        if _correlates_to_request(event, stats_event_id):
+            session_stats_errors.append(str(event))
+            continue
         # As in OmniInteract, an ACK racing a later commit is harmless. All
         # other server errors still make the serving sample unsuccessful.
         if code not in {"playback_ack_too_late", "playback_item_not_found"}:
