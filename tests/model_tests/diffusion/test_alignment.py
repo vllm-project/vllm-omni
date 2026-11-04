@@ -41,6 +41,9 @@ EXCLUDED_MODELS = [
     # Requires upstream AR hidden states and token boundaries; covered by
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
+    # Action expert that needs the reasoning stage's KV prefix; covered by
+    # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
+    "Alpamayo2SuperPipeline",
     "WanPipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",

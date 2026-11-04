@@ -20,6 +20,7 @@ from vllm_omni.diffusion.models.alpamayo2_super.pipeline_alpamayo2_super import 
     Alpamayo2SuperPipeline,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -55,8 +56,26 @@ def test_velocity_solver_matches_direct_least_squares():
     for row in range(n - 2):
         d3[row, row : row + 4] = torch.tensor([-1.0, 3.0, -3.0, 1.0], dtype=torch.float64)
     lhs = a.T @ a + lam / dt**6 * d3.T @ d3 + ridge * torch.eye(n + 1, dtype=torch.float64)
-    expected = torch.linalg.solve(lhs, a.T @ (2 / dt * dxy).flatten())
+    expected = safe_linalg_solve(lhs, a.T @ (2 / dt * dxy).flatten())
     actual = _velocity_from_history(dxy, theta, dt=dt, v_lambda=lam, v_ridge=ridge)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_velocity_solver_falls_back_without_cpu_lapack(monkeypatch):
+    generator = torch.Generator().manual_seed(1)
+    theta = torch.cumsum(0.05 * torch.randn(9, generator=generator, dtype=torch.float64), dim=0)
+    dxy = torch.randn(8, 2, generator=generator, dtype=torch.float64)
+    expected = _velocity_from_history(dxy, theta, dt=0.1, v_lambda=1e-6, v_ridge=1e-4)
+
+    def missing_lapack(*_args, **_kwargs):
+        raise RuntimeError(
+            "Calling torch.linalg.cholesky on a CPU tensor requires compiling PyTorch with LAPACK. "
+            "Please use PyTorch built with LAPACK support."
+        )
+
+    monkeypatch.setattr(torch.linalg, "cholesky", missing_lapack)
+    monkeypatch.setattr(torch.linalg, "solve", missing_lapack)
+    actual = _velocity_from_history(dxy, theta, dt=0.1, v_lambda=1e-6, v_ridge=1e-4)
     torch.testing.assert_close(actual, expected)
 
 

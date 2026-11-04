@@ -19,6 +19,8 @@ import torch
 from torch import nn
 from transformers import AutoConfig, AutoModel
 
+from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
+
 
 def _round_2pi(x: torch.Tensor) -> torch.Tensor:
     """Normalize angles to [-pi, pi]."""
@@ -99,8 +101,14 @@ def _velocity_from_history(
     rhs = torch.einsum("...ij,...i->...j", a, b)
     dtd = v_lambda / dt**6 * _third_order_dtd(n + 1, tuple(lead), device=device, dtype=dtype)
     ridge = v_ridge * torch.eye(n + 1, dtype=dtype, device=device).expand(*lead, n + 1, n + 1)
-    chol = torch.linalg.cholesky(ata + dtd + ridge)
-    return torch.cholesky_solve(rhs.unsqueeze(-1), chol).squeeze(-1)
+    lhs = ata + dtd + ridge
+    try:
+        return torch.cholesky_solve(rhs.unsqueeze(-1), torch.linalg.cholesky(lhs)).squeeze(-1)
+    except RuntimeError as exc:
+        # Some CPU PyTorch builds (ROCm wheels) lack LAPACK; solve the same system without it.
+        if lhs.device.type != "cpu" or "requires compiling PyTorch with LAPACK" not in str(exc):
+            raise
+        return safe_linalg_solve(lhs, rhs.unsqueeze(-1)).squeeze(-1)
 
 
 class UnicycleAccelCurvatureActionSpace(nn.Module):
