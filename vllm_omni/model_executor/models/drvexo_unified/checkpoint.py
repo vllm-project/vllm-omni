@@ -36,23 +36,34 @@ class UnifiedBF16Checkpoint:
 
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve(strict=True)
-        config = json.loads((self.root / "config.json").read_text())
+        config = self._read_object("config.json")
         if config.get("model_type") != "drvexo_speech_qwen35_4b":
             raise ValueError("Expected a DRVEXO Qwen3.5 4B unified checkpoint")
         cognition = config.get("drvexo_cognition", {})
-        if cognition.get("language_LoRA_merged") is not True or cognition.get("embedded_v12_branch_tensors") != 0:
+        if (
+            not isinstance(cognition, dict)
+            or cognition.get("language_LoRA_merged") is not True
+            or cognition.get("embedded_v12_branch_tensors") != 0
+        ):
             raise ValueError("Expected physically merged cognition weights without an adapter branch")
         if config.get("quantization_config"):
             raise ValueError("This reader accepts BF16/FP32 source weights, not quantized checkpoints")
-        index = json.loads((self.root / "model.safetensors.index.json").read_text())
-        manifest = json.loads((self.root / "components.json").read_text())
-        if index.get("metadata", {}).get("format") != _FORMAT or manifest.get("format") != _FORMAT:
+        index = self._read_object("model.safetensors.index.json")
+        manifest = self._read_object("components.json")
+        metadata = index.get("metadata")
+        if not isinstance(metadata, dict) or metadata.get("format") != _FORMAT or manifest.get("format") != _FORMAT:
             raise ValueError("Invalid DRVEXO unified checkpoint format")
-        self.components = manifest["components"]
-        if set(self.components) != _COMPONENTS:
+        self.components = manifest.get("components")
+        if not isinstance(self.components, dict) or set(self.components) != _COMPONENTS:
             raise ValueError("A complete eight-component model is required")
-        self.weight_map: dict[str, str] = index["weight_map"]
-        prefixes = {name: row["prefix"] for name, row in self.components.items()}
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("Expected a nonempty checkpoint weight_map")
+        self.weight_map: dict[str, str] = weight_map
+        for name, row in self.components.items():
+            if not isinstance(row, dict) or type(row.get("tensor_count")) is not int or row["tensor_count"] <= 0:
+                raise ValueError(f"Invalid component tensor count: {name}")
+        prefixes = {name: row.get("prefix") for name, row in self.components.items()}
         if any(not isinstance(value, str) or not value for value in prefixes.values()):
             raise ValueError("Invalid component prefix")
         counts: Counter[str] = Counter()
@@ -83,6 +94,12 @@ class UnifiedBF16Checkpoint:
                     self.dtypes[dtype] += 1
         if observed != set(self.weight_map):
             raise ValueError("The checkpoint index references missing tensors")
+
+    def _read_object(self, filename: str) -> dict:
+        value = json.loads((self.root / filename).read_text())
+        if not isinstance(value, dict):
+            raise ValueError(f"Expected a JSON object: {filename}")
+        return value
 
     def _shard_path(self, filename: str) -> Path:
         if not isinstance(filename, str) or Path(filename).name != filename or not filename.endswith(".safetensors"):

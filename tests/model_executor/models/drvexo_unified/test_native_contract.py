@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.drvexo_speech_8b.talker import (
     DRVEXOSpeech8BTalker,
     Qwen3TTSTalkerForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.drvexo_unified import decision as decision_module
 from vllm_omni.model_executor.models.drvexo_unified.decision import UnifiedClassifier, UnifiedPrefill
 from vllm_omni.model_executor.models.drvexo_unified.processing import UnifiedProcessingInfo
 from vllm_omni.model_executor.models.drvexo_unified.temporal_projector import TemporalInputProjector, project_utterances
@@ -175,6 +176,52 @@ def test_head_captures_final_normalized_token_across_long_prefill_once():
     assert again["drvexo_general_scores"][0].numel() == 0
     info["drvexo_general_decision"]["task"] = "noul"
     assert prefill.process(last, [info], [(0, 384)], [4096])["drvexo_general_status"][0].item() == -1
+
+
+def test_nonfinite_head_failure_is_logged_and_next_request_can_score(mocker):
+    scorer = mocker.Mock()
+    scorer.score.side_effect = [ValueError("Nonfinite native candidate score"), torch.tensor([7.0])]
+    warning = mocker.patch.object(decision_module.logger, "warning")
+    prefill = UnifiedPrefill(scorer)
+    broken = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
+    failed = prefill.process(torch.zeros(1, 2560), [broken], [(0, 1)], [0])
+    assert failed["drvexo_general_status"][0].item() == -1
+    assert failed["drvexo_general_scores"][0].numel() == 0
+    assert "Nonfinite native candidate score" in str(warning.call_args)
+    healthy = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
+    recovered = prefill.process(torch.zeros(1, 2560), [healthy], [(0, 1)], [0])
+    assert recovered["drvexo_general_status"][0].item() == 1
+    assert recovered["drvexo_general_scores"][0].item() == 7
+
+
+@pytest.mark.parametrize("components", [{}, {"general_decision_head": {}}, {"general_decision_head": {"metadata": {}}}])
+def test_head_missing_metadata_is_a_package_validation_error(components):
+    with pytest.raises(ValueError, match="2560-dimensional"):
+        UnifiedClassifier(SimpleNamespace(components=components))
+
+
+@pytest.mark.parametrize(
+    "section,setting,value",
+    [
+        ("model_config", "enforce_eager", False),
+        ("cache_config", "enable_prefix_caching", True),
+        ("scheduler_config", "max_num_seqs", 2),
+        ("scheduler_config", "enable_chunked_prefill", False),
+        ("scheduler_config", "max_num_batched_tokens", 1024),
+        ("model_config", "max_model_len", 2048),
+        ("model_config", "dtype", torch.float32),
+    ],
+)
+def test_scheduler_startup_error_names_the_incompatible_setting(section, setting, value):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True, max_model_len=4480, dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        scheduler_config=SimpleNamespace(max_num_seqs=1, enable_chunked_prefill=True, max_num_batched_tokens=2048),
+    )
+    UnifiedClassifier.validate_scheduler(config)
+    setattr(getattr(config, section), setting, value)
+    with pytest.raises(ValueError, match=setting):
+        UnifiedClassifier.validate_scheduler(config)
 
 
 def test_missing_scheduler_progress_fails_explicitly():

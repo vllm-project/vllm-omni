@@ -8,6 +8,7 @@ backbone and its unchanged stage6 head. No language-generated score is used.
 """
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.drvexo_speech_8b.general_decision_head import GeneralDecisionHead
 
@@ -15,12 +16,18 @@ from .checkpoint import UnifiedBF16Checkpoint
 
 TASKS = ("choice", "noul", "score")
 MAX_PROMPT_TOKENS = 4480
+logger = init_logger(__name__)
 
 
 class UnifiedClassifier:
     def __init__(self, checkpoint: UnifiedBF16Checkpoint):
-        metadata = checkpoint.components["general_decision_head"]["metadata"]
-        if metadata["hidden_size"] != 2560 or metadata["projection_size"] != 0:
+        row = checkpoint.components.get("general_decision_head")
+        metadata = row.get("metadata") if isinstance(row, dict) else None
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("hidden_size") != 2560
+            or metadata.get("projection_size") != 0
+        ):
             raise ValueError("Expected the trained native 2560-dimensional unprojected heads")
         with torch.device("cpu"):
             self.head = GeneralDecisionHead(hidden_size=2560, projection_size=0).float()
@@ -32,18 +39,21 @@ class UnifiedClassifier:
 
     @staticmethod
     def validate_scheduler(config):
-        if (
-            not config.model_config.enforce_eager
-            or config.cache_config.enable_prefix_caching
-            or config.scheduler_config.max_num_seqs != 1
-            or not config.scheduler_config.enable_chunked_prefill
-            or config.scheduler_config.max_num_batched_tokens != 2048
-            or config.model_config.max_model_len < MAX_PROMPT_TOKENS
-            or config.model_config.dtype != torch.bfloat16
-        ):
-            raise ValueError(
-                "4B decisions require eager BF16, one sequence, chunked2048 prefill, no prefix cache and 4480 tokens"
-            )
+        # Decision scoring is always bound in this complete package. Keep the
+        # validated deployment contract for plain chat too, but identify every
+        # incompatible setting instead of reporting an undifferentiated error.
+        checks = (
+            (config.model_config.enforce_eager, "enforce_eager=True"),
+            (not config.cache_config.enable_prefix_caching, "enable_prefix_caching=False"),
+            (config.scheduler_config.max_num_seqs == 1, "max_num_seqs=1"),
+            (config.scheduler_config.enable_chunked_prefill, "enable_chunked_prefill=True"),
+            (config.scheduler_config.max_num_batched_tokens == 2048, "max_num_batched_tokens=2048"),
+            (config.model_config.max_model_len >= MAX_PROMPT_TOKENS, f"max_model_len>={MAX_PROMPT_TOKENS}"),
+            (config.model_config.dtype == torch.bfloat16, "dtype=bfloat16"),
+        )
+        failures = [setting for valid, setting in checks if not valid]
+        if failures:
+            raise ValueError("4B complete-package decision support requires " + ", ".join(failures))
 
     @torch.inference_mode()
     def score(self, hidden: torch.Tensor, task: str) -> torch.Tensor:
@@ -94,7 +104,8 @@ class UnifiedPrefill:
                         score = self.classifier.score(hidden[start + length - 1 - offset], task)
                         prior["done"] = True
                         status = 1
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError) as exc:
+                    logger.warning("Rejecting invalid DRVEXO decision prefill: %s", exc)
                     status = -1
             scores.append(score)
             statuses.append(torch.tensor([status], dtype=torch.int64))

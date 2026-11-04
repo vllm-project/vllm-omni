@@ -25,6 +25,12 @@ paths, full header/index coverage and retained BF16/FP32 precision. It exposes
 component-relative names and a language-plus-vision iterator. It does not copy,
 convert, merge, quantize or rewrite the source package.
 
+Malformed JSON objects, missing component rows/counts/prefixes and missing
+decision-head metadata fail with `ValueError`, rather than leaking key lookup
+errors. Header validation is deliberately repeated at independent loading
+boundaries; this contribution does not introduce a cross-load metadata cache
+or claim a startup I/O improvement.
+
 The file-format unit tests import only this engine-independent reader. They
 can run with `pytest --noconftest`; this is not a substitute for package import,
 native model construction or a live serving test.
@@ -60,11 +66,21 @@ scheduler offsets across chunks, eager BF16 execution, one sequence, no prefix
 cache and a chunk budget of 2048. The 4B endpoint retains the training protocol's
 4096/384 prefix/candidate budgets; 8B retains 1536/384. A successful candidate
 request is not acceptance of the head paired with the newly merged backbone.
+This complete deployment always binds the head, including for chat-only
+requests; startup errors name each incompatible scheduler/model setting.
+Invalid prefill/scoring results retain their explicit failed status and log
+the reason, including nonfinite numerical failures, without logging user text.
 
 Shared chat sampling preserves JSON Schema on the comprehension stage. Forced
-and required tool calls use the configured parser's native extraction when it
-does not support the plain JSON tool format, for full and streaming responses.
+and required DRVEXO tool calls use the configured parser's native extraction
+when it explicitly does not support the plain JSON tool format, for full and
+streaming responses. Other model families retain their existing named/required
+JSON path; a parser without a capability flag uses that existing path as well.
 Speech stage sampling remains independent of text formatting constraints.
+The same comprehension-only constraint rule is covered for Qwen3-Omni; its
+downstream Talker/Codec defaults stay unchanged. The DRVEXO speech adapter is
+covered for both 4B and 8B caller-text/reference-audio requests and takes its
+sampling slice from the declared Talker entry-stage ID.
 
 ## Acceptance
 

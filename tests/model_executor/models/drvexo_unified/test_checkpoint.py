@@ -90,6 +90,11 @@ def test_all_components_and_original_values(reader_type, checkpoint):
         "quantized",
         "old_8b",
         "missing_component",
+        "missing_components_map",
+        "missing_count",
+        "missing_prefix",
+        "missing_weight_map",
+        "invalid_component_row",
         "wrong_count",
         "escaping_shard",
         "missing_tensor",
@@ -112,6 +117,14 @@ def test_incomplete_or_wrong_packages_rejected(reader_type, checkpoint, variant)
     components = json.loads(path.read_text())
     if variant == "missing_component":
         del components["components"]["vision_model"]
+    elif variant == "missing_components_map":
+        del components["components"]
+    elif variant == "missing_count":
+        del components["components"]["vision_model"]["tensor_count"]
+    elif variant == "missing_prefix":
+        del components["components"]["vision_model"]["prefix"]
+    elif variant == "invalid_component_row":
+        components["components"]["vision_model"] = None
     elif variant == "wrong_count":
         components["components"]["language_model"]["tensor_count"] = 2
     elif variant == "duplicate_owner":
@@ -125,6 +138,8 @@ def test_incomplete_or_wrong_packages_rejected(reader_type, checkpoint, variant)
         index["weight_map"]["language_model.missing"] = index["weight_map"].pop("language_model.weight")
     elif variant == "extra_tensor":
         save_file({**values, "language_model.extra": torch.zeros(1)}, root / "model.safetensors")
+    elif variant == "missing_weight_map":
+        del index["weight_map"]
     path.write_text(json.dumps(index))
     with pytest.raises(ValueError):
         reader_type(root)

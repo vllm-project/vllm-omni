@@ -250,9 +250,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         # parser_cls may be None (no tool parser configured); guard accordingly
         tp_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
         native_forced = (
-            tp_cls is not None
-            and not tp_cls.supports_required_and_named
+            getattr(hf_config, "model_type", None) in DRVEXO_MODEL_TYPES
+            and tp_cls is not None
+            and not getattr(tp_cls, "supports_required_and_named", True)
             and (
                 isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam) or request.tool_choice == "required"
             )
@@ -1099,6 +1101,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if renderer is None:
             renderer = self.renderer
 
+        # Fail validation explicitly even with python -O. This happens before
+        # rendering or dispatch, so an inconsistent server parser cannot turn
+        # a tools request into an assertion failure/engine request.
+        should_parse_tools = (
+            tool_parser is not None and hasattr(request, "tool_choice") and request.tool_choice != "none"
+        )
+        if should_parse_tools and self.parser_cls is None:
+            raise ValueError("Tool parsing was requested but no chat parser is configured")
+
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
         default_template_kwargs = merge_kwargs(
@@ -1156,7 +1167,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 msg = "Tool usage is only supported for Chat Completions API"
                 raise NotImplementedError(msg)
 
-            assert self.parser_cls is not None
+            if self.parser_cls is None:
+                raise ValueError("Tool parsing was requested but no chat parser is configured")
             request = self.parser_cls(tokenizer, request.tools).adjust_request(request=request)
 
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
@@ -2014,7 +2026,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             assert previous_texts is not None
                             previous_text = previous_texts[i]
                             current_text = previous_text + delta_text
-                            fn_name_returned = function_name_returned[i]
                             output_token_ids = as_list(output.token_ids)
 
                             if (
@@ -2050,8 +2061,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 delta_message, function_name_returned[i] = extract_required_tool_call_streaming(
                                     previous_text=previous_text,
                                     current_text=content,
-                                    delta_text=delta_text,
-                                    function_name_returned=fn_name_returned,
                                     tool_call_idx=history_tool_call_cnt,
                                     tool_call_id_type=self.tool_call_id_type,
                                 )

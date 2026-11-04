@@ -17,8 +17,8 @@ class DRVEXOTTSAdapter(Qwen3TTSAdapter):
 
     def apply_sampling_overrides(self, sampling_params_list, request, prompt=None, request_id=None):
         # Qwen3-TTS owns the Talker budget. Keep Thinker's params independent.
-        return sampling_params_list[:1] + super().apply_sampling_overrides(
-            sampling_params_list[1:], request, prompt, request_id
+        return sampling_params_list[: self.entry_stage_id] + super().apply_sampling_overrides(
+            sampling_params_list[self.entry_stage_id :], request, prompt, request_id
         )
 
     def _build_tts_params(self, request):

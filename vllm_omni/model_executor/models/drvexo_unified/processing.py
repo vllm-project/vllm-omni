@@ -31,6 +31,8 @@ class ImageAudioProcessor:
     def __call__(self, text=None, audios=None, audio=None, **kwargs):
         result = self.vision(text=text, **kwargs)
         # vLLM owns placeholder expansion, including cached-image requests.
+        # This collapses the single image's patch run. The advertised limit of
+        # one image is required: adjacent distinct images cannot share a run.
         if "input_ids" in result:
             image_id = self.vision.image_token_id
             ids = result["input_ids"]

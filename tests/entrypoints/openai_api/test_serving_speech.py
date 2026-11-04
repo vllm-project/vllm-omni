@@ -6171,6 +6171,38 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._adapter._build_tts_params.assert_called_once()
         qwen3_tts_server._adapter._estimate_prompt_len_async.assert_awaited_once()
 
+    @pytest.mark.parametrize("arch", ["DRVEXOSpeech8BTalker", "DRVEXOUnifiedTalker"])
+    def test_drvexo_standard_speech_dispatch_skips_thinker(self, qwen3_tts_server, arch, mocker):
+        from vllm.sampling_params import SamplingParams
+
+        from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type, resolve_adapter
+        from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities
+
+        server = qwen3_tts_server
+        server._tts_model_type = detect_tts_model_type("qwen3_tts", arch)
+        server._adapter = resolve_adapter(server._tts_model_type)(
+            SpeechServingContext(server=server, engine_client=server.engine_client)
+        )
+        server._adapter.capabilities = TTSCapabilities(
+            supported_speakers=frozenset({"vivian"}), default_speaker="vivian"
+        )
+        server._adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=3)
+        server.engine_client.default_sampling_params_list = [
+            SamplingParams(max_tokens=100),
+            SamplingParams(max_tokens=400, seed=17),
+            SamplingParams(max_tokens=500),
+        ]
+        request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=80, seed=42)
+        _, _, params = asyncio.run(server._prepare_speech_generation(request))
+        call = server.engine_client.generate.call_args.kwargs
+        assert call["entry_stage_id"] == 1
+        assert call["prompt"]["additional_information"]["drvexo_fixed_reply"] is True
+        assert [p.max_tokens for p in call["sampling_params_list"]] == [100, 80, 500]
+        assert call["sampling_params_list"][1].seed == 42
+        assert call["sampling_params_list"][1].extra_args["tts_local_seed"] == 42
+        assert call["sampling_params_list"][0].extra_args is None
+        assert params["text"] == ["Hello"]
+
     def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
         self, qwen3_tts_server, mocker: MockerFixture
     ):
