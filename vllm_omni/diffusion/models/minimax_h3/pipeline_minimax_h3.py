@@ -3033,10 +3033,9 @@ class MiniMaxH3Pipeline(
         or ``None`` when ``keep_steps`` is absent or equals the step count
         (degenerate: the historical full-video path).
 
-        ``num_steps`` here is the request's step count; a pinned sigma
-        schedule can still shorten the effective schedule, which the
-        authoritative check in ``_prepare_encoder_conditioning_inputs``
-        re-validates against the resolved count.
+        ``num_steps`` must come from ``_resolve_sigma_positions``; both call
+        sites resolve it that way, so a pinned sigma schedule or a fused
+        checkpoint cannot make the early and authoritative checks disagree.
         """
         keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
         if keep_steps is None:
@@ -3118,10 +3117,12 @@ class MiniMaxH3Pipeline(
                 )
                 # CodeVideoModel keep_steps: validate and normalize before any
                 # encoder work, then encode the image-only presentation only
-                # when the mid-loop switch will actually happen.
+                # when the mid-loop switch will actually happen. Resolve the
+                # step count with the same resolver the authoritative check
+                # uses, so pinned schedules cannot make the two disagree.
                 keep_steps = self._normalize_keep_steps(
                     sampling,
-                    num_steps=int(sampling.num_inference_steps or 50),
+                    num_steps=self._resolve_sigma_positions(task, sampling)[1],
                     task=task,
                     condition_labels=prepared.condition_labels,
                     timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),

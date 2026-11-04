@@ -216,6 +216,11 @@ def test_keep_steps_builds_matching_base_layout(pipeline):
     assert int(base.audio_pos.shape[0]) == int(branch.audio_pos.shape[0])
     assert base.seq_len < branch.seq_len
     assert tuple(inputs["base_cond_rows"].shape) == (BASE_IMAGE_ROWS, 96)
+    # The base layout's non-update image rows are exactly the image condition
+    # rows: audio references and guides are rejected, so the anchor prefix
+    # covers precisely the image conditions.
+    assert int((~base.update_mask).sum()) == BASE_IMAGE_ROWS
+    assert int((~branch.update_mask).sum()) == BASE_IMAGE_ROWS + 12
 
 
 def test_base_cond_rows_equal_image_only_anchor(pipeline):
@@ -471,6 +476,8 @@ def test_keep_steps_equal_to_step_count_degrades_to_full_video():
         ),
         ({"base_hidden_states": None, "base_token_tags": None}, {"keep_steps": 2}, "image-only"),
         (dict(), {"keep_steps": "2"}, "must be an integer"),
+        # bool is an int subclass; type() rejects it on purpose.
+        (dict(), {"keep_steps": True}, "must be an integer"),
         (dict(), {"keep_steps": 0}, "must be an integer"),
         (dict(), {"keep_steps": 5}, "must be an integer"),
         (dict(), {"keep_steps": -1}, "must be an integer"),
@@ -649,6 +656,69 @@ def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.Mo
     with pytest.raises(OmniClientError, match="must be an integer"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=9))
     assert encode_prompt.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Reference-order normalization through the real request path
+# ---------------------------------------------------------------------------
+
+
+def test_request_path_normalizes_video_first_references(monkeypatch: pytest.MonkeyPatch):
+    """Video uploaded before the image still packs image labels first.
+
+    This is the invariant the switch relies on: the image rows must be the
+    prefix of the full layout's condition rows. The loader layer is stubbed;
+    everything else (reference assembly, label ordering) is the real code.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    monkeypatch.setattr(
+        encoder_processing, "load_minimax_h3_images", lambda values: [Image.new("RGB", (64, 64))]
+    )
+    monkeypatch.setattr(
+        encoder_processing,
+        "prepare_reference_videos",
+        lambda videos, **kwargs: [
+            {
+                "original_path": "v.mp4",
+                "prepared_path": "v.mp4",
+                "input_has_audio": False,
+                "duration_seconds": 5.0,
+                "audio_duration_seconds": None,
+                "start_time_seconds": 0.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        encoder_processing, "load_video_frames", lambda path: np.zeros((4, 8, 8, 3), dtype=np.uint8)
+    )
+    monkeypatch.setattr(
+        encoder_processing,
+        "sample_reference_video_frames",
+        lambda path, decoded_frames: {
+            "block_timestamps": [0.0, 1.0],
+            "frames": [np.zeros((8, 8, 3), dtype=np.uint8)] * 2,
+        },
+    )
+    prepared = encoder_processing.prepare_encoder_inputs(
+        {"prompt": "p", "multi_modal_data": {"video": [b"v"], "image": [b"i"]}},
+        OmniDiffusionSamplingParams(
+            quality="lossless",
+            fps=24,
+            num_inference_steps=4,
+            height=64,
+            width=64,
+            num_frames=NUM_FRAMES,
+            extra_args={"task": "ref2va"},
+        ),
+        task="ref2va",
+    )
+    assert prepared.condition_labels == [("image", 1), ("video", 1)]
+    assert len(prepared.images) == 1
+    assert len(prepared.qwen_videos) == 1
 
 
 # ---------------------------------------------------------------------------
