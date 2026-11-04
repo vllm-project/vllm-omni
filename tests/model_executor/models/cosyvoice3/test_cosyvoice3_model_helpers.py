@@ -1162,12 +1162,13 @@ def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monke
     assert model._code2wav_trt_done
 
 
-@pytest.mark.parametrize("compile_dit", [False, True])
+@pytest.mark.parametrize("compile_dit", [None, False, True], ids=["missing", "disabled", "enabled"])
 def test_dit_compile_selection_controls_only_the_flow_trt_swap(monkeypatch, compile_dit):
     from vllm_omni.model_executor.models.cosyvoice3 import flow_estimator_trt
 
     model = _make_code2wav_model()
-    model.config.cosyvoice3_compile_dit = compile_dit
+    if compile_dit is not None:
+        model.config.cosyvoice3_compile_dit = compile_dit
     model._code2wav_trt_done = False
     decoder = nn.Module()
     estimator = nn.Linear(2, 2)

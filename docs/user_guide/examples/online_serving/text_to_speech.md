@@ -231,9 +231,11 @@ Compilation occurs on first use, so warm up representative request batches and m
 
 ### Optional DSpark speculative decoding
 
-CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav. Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
+CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav.
 
 The public checkpoint used for validation is [yuekai/cosyvoice3_llm_dspark](https://huggingface.co/yuekai/cosyvoice3_llm_dspark) at revision `0b1b28dbb751bac3b74eea5dcc11e0570c91563b`. Download that revision as `/path/to/dspark-checkpoint`, then use the conversion below; the raw unified-vocabulary checkpoint is not the serving-ready speech-vocabulary directory.
+
+Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
 
 ```bash
 python -m vllm_omni.entrypoints.convert_cosyvoice3_dspark \
