@@ -22,7 +22,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypatch):
     # Greedy sampling alone does not make different prefill shapes numerically
