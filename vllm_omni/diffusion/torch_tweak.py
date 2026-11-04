@@ -13,7 +13,7 @@ and ``enforce_eager`` turns both off. Enable it with
 
 ``mode`` and ``backends`` are passed to ``torch_tweak.torch.ServingConfig``.
 ``modules`` lists the pipeline attributes to serve, the DiT modules by default.
-A shape that was not recorded runs the module eagerly.
+A shape that was not recorded runs the module compiled with dynamic shapes.
 """
 
 import torch
