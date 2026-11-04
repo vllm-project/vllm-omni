@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -362,14 +363,24 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
-    monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+    # vllm_omni loggers are reparented onto the vllm logger, which does not
+    # propagate to root, so the fixture's root handler never sees this warning.
+    # Pin this logger itself: an earlier test on the same xdist worker can leave
+    # an ancestor above WARNING, and then logger.warning() emits nothing.
+    target_logger = model_runner_module.logger
+    target_logger.addHandler(caplog.handler)
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.WARNING)
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
     req.sampling_params.num_inference_steps = None
-
-    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    try:
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(previous_level)
 
     assert cache_backend.refresh_calls == []
     assert "requires num_inference_steps to be passed explicitly" in caplog.text
@@ -480,16 +491,13 @@ def test_update_states_carries_prepared_layout() -> None:
     request = _make_request()
     prepared_layout = object()
     request.prepared_layout = prepared_layout
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[
-            SimpleNamespace(
-                request_id=request.request_id,
-                req=request,
-                diffusion_kv_metadata=None,
-            )
-        ],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
 
     states, new_request_ids = DiffusionModelRunner._update_states(runner, scheduler_output)
@@ -1215,14 +1223,18 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+@pytest.mark.parametrize("early_lora", [False, True])
+def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, early_lora):
+    events = []
+
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
 
         def load_model(self, **kwargs):
             del kwargs
-            return SimpleNamespace(transformer=torch.nn.Identity())
+            events.append("weights_finalized")
+            return SimpleNamespace(transformer=torch.nn.Identity(), requires_early_lora_init=early_lora)
 
     class _DummyMemoryProfiler:
         consumed_memory = 0
@@ -1263,17 +1275,19 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
-    monkeypatch.setattr(
-        model_runner_module,
-        "enable_offload_backend",
-        lambda od_config, pipeline, device: (pipeline, None),
-    )
+
+    def offload(od_config, pipeline, device):
+        events.append("offload")
+        return pipeline, None
+
+    monkeypatch.setattr(model_runner_module, "enable_offload_backend", offload)
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )
 
-    DiffusionModelRunner.load_model(runner)
+    DiffusionModelRunner.load_model(runner, initialize_lora=lambda: events.append("lora"))
 
+    assert events == ["weights_finalized", *(["lora"] if early_lora else []), "offload"]
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False

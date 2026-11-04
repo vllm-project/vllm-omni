@@ -432,7 +432,9 @@ Maintain separate CI gates:
    reference alignment, calibration, and CI wiring.
 3. Performance: fixed best deployment plus memory-constrained/DLO row, raw JSON,
    explicit warmup, enough samples for each claimed statistic, and owned
-   regression thresholds.
+   regression thresholds. Reuse
+   [diffusion-perf-test](../diffusion-perf-test/SKILL.md) for workload/deployment
+   row selection, the `run_benchmark.py` schema, and Perf CI wiring.
 4. Reliability: long mixed-RPS soak, abort/disconnect/fault cleanup, memory and
    temporary-resource trend.
 

@@ -163,7 +163,9 @@ Throughput is seconds of audio generated per wall-clock second.
 
 #### Known limitations
 
-- One tensor and pipeline rank only.
+- Pipeline parallel is not supported. The CUDA deploy uses one tensor rank.
+  The Ascend profile shards the backbone across two cards and the routed
+  experts with them (see NPU below).
 - Prefix caching is off: prompt rows carry ten codes per audio row that
   token-id hashing does not see.
 - Some takes stop speaking after the first word or event and emit silence
@@ -171,3 +173,79 @@ Throughput is seconds of audio generated per wall-clock second.
   that start with a filler word or a tag, and with pause-heavy references.
 - `previous_takes` (editing as continuation) and long-text chunking are not
   exposed by the speech API yet.
+
+### 1x A100 80GB (INT4)
+
+#### Environment
+
+- OS: Linux
+- Python: 3.12
+- vLLM version: 0.32.0
+- vLLM-Omni version or commit: `612017210` + INT4 support
+
+#### Command
+
+```bash
+vllm serve fishaudio/drama-3-int4 --omni --port 8091
+```
+
+#### Measured performance (1x A100, both stages on one GPU)
+
+Default `vllm_omni/deploy/fish_omni.yaml` (vLLM 0.32.0, vLLM-Omni `612017210` + INT4 support), INT4 checkpoint with Marlin experts, stage 0 memory utilization 0.65 on a shared GPU and `max_num_seqs: 128` on both stages. Seed-TTS-Eval en (1088 lines, each cloning its own reference, sent pre-encoded as `ref_audio_codes`), streaming `/v1/audio/speech` (raw PCM).
+
+| Concurrency | Audio s/s | TTFA p50 | TTFA p95 | RTF (mean) | Streams that stall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 54.1 | 270 ms | 365 ms | 0.589 | 0.046% |
+| 64 | 83.2 | 393 ms | 1076 ms | 0.754 | 11.9% |
+| 128 | 101.1 | 569 ms | 1958 ms | 1.180 | 97.7% |
+
+#### FP8 comparison (1x A100, both stages on one GPU)
+
+The same Seed-TTS-Eval en benchmark on vLLM-Omni `612017210` + INT4 support (vLLM 0.32.0), with `max_num_seqs: 128` on both stages, stage 0 memory utilization 0.65 and Marlin. Each checkpoint uses two fresh-server runs with 8 warmup requests excluded and 1088 timed requests per run; the table reports medians across runs. GPU 1 is shared with an existing process using approximately 7.7 GiB.
+
+| Checkpoint | Concurrency | Audio s/s | TTFA p50 | TTFA p95 | RTF (mean) | Streams that stall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original FP8 | 32 | 43.9 | 317 ms | 416 ms | 0.721 | 7.26% |
+| INT4 | 32 | 53.1 | 277 ms | 374 ms | 0.596 | 0.046% |
+
+INT4 delivers 21.0% more audio s/s and a 17.4% lower mean RTF in this comparison. Across the two runs, throughput ranges were 43.29–44.44 audio s/s (FP8) and 52.93–53.17 audio s/s (INT4). All 4352 timed HTTP requests completed; 3 FP8 outputs and no INT4 outputs had RMS at or below 1e-4. Throughput includes these low-RMS outputs. Model-loading GPU allocations were 37.95 GiB (FP8) and 21.33 GiB (INT4).
+
+#### Seed-TTS-Eval accuracy
+
+Evaluated on vLLM-Omni `612017210` + INT4 support, using the first C32 run above (`max_num_seqs: 128` on both stages). Seed-TTS-Eval en, 1088 outputs per checkpoint, including low-RMS outputs. WER: Whisper large-v3 FP32. SIM: mean-pooled `microsoft/wavlm-base-plus` embedding cosine (proxy, not the official WavLM-SV score). UTMOS: `balacoon/utmos`.
+
+| Checkpoint | WER (en) ↓ | SIM (WavLM proxy) ↑ | UTMOS ↑ |
+| --- | ---: | ---: | ---: |
+| Original FP8 | 2.60% | 0.8626 | 3.3571 |
+| INT4 | 2.47% | 0.8671 | 3.3572 |
+
+## NPU
+
+### 2x Ascend 910B 64GB
+
+Stage 0 (backbone + codebook tower) uses Model Runner V2 on both cards:
+tensor parallel 2 and expert parallel, replaying piecewise ACL graphs
+(`enforce_eager: false`, `cudagraph_mode: PIECEWISE`). The NPU AR runner builds
+Ascend input state (`AscendInputBatch` with `attn_state` and `seq_lens_np`)
+and the model state builds Ascend attention metadata. Gated-delta-net stays on
+the Ascend implementation. The codebook tower uses the eager norm and sampling
+path. Stage 1 (DAC) shares the second card and stays eager, without ACL graphs
+or MPS.
+Sampling noise is broadcast from tensor-parallel rank 0 so both ranks draw
+the same frame.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 vllm serve fishaudio/drama-3 --omni --port 8091
+```
+
+`vllm_omni/deploy/fish_omni.yaml` applies this `npu` profile automatically
+(`tensor_parallel_size: 2`, `enable_expert_parallel: true`, `max_num_seqs: 64`,
+stage 0 `enforce_eager: false`).
+Stage 0 reserves 0.72 of each card and stage 1 reserves 0.10 of the second
+card. The speech request is the same as the GPU section.
+
+vLLM-Ascend on 910B still expands this checkpoint's block-FP8 experts to
+bfloat16 (64.4 GiB for all 256 routed experts). One card cannot hold that
+expansion. Expert parallel places 128 experts on each card, about 32 GiB,
+plus the sharded backbone. The codec then fits in the headroom on the second
+card. This profile has not been scored for WER or RTF.

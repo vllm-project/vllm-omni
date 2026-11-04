@@ -16,6 +16,7 @@ import torch
 
 from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -348,7 +349,7 @@ def test_4d_identity(world_size: int, use_sync: bool):
         head_size=32,
         use_sync=use_sync,
         device_kind="cpu",
-        master_port=29610,
+        master_port=get_open_port(),
     )
 
 
@@ -368,7 +369,7 @@ def test_5d_identity(world_size: int, use_sync: bool):
         head_size=32,
         use_sync=use_sync,
         device_kind="cpu",
-        master_port=29611,
+        master_port=get_open_port(),
     )
 
 
@@ -384,7 +385,7 @@ def test_ring_p2p(world_size: int):
         num_heads=8,
         head_size=128,
         device_kind="cpu",
-        master_port=29612,
+        master_port=get_open_port(),
     )
 
 
