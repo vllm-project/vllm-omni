@@ -3816,6 +3816,16 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
 
+        # The stage pool fans out n > 1 on any LLM stage, but only the entry stage's samples have a consumer.
+        for later_stage_id in range(stage_id + 1, min(final_stage_id, len(sampling_params_list) - 1) + 1):
+            later_n = getattr(sampling_params_list[later_stage_id], "n", 1) or 1
+            if later_n > 1:
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    f"n > 1 is supported only on the entry stage {stage_id}; stage {later_stage_id} has n={later_n}",
+                )
+                return
         entry_params = sampling_params_list[stage_id]
         if (getattr(entry_params, "n", 1) or 1) > 1:
             reason = None

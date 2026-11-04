@@ -4057,3 +4057,57 @@ async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
     else:
         dispatch.assert_not_awaited()
         fail.assert_awaited_once_with("req", 0, "n > 1 is not supported with output watermarking on stage 0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage_n", "watermark_final", "rejected_stage"),
+    [
+        ([1, 2, 1], False, 1),
+        ([1, 1, 2], True, 2),
+        ([1, 1, 1], True, None),
+    ],
+    ids=["middle-stage-n2", "watermarked-final-stage-n2", "n1-everywhere"],
+)
+async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_submission(
+    mocker, stage_n: list[int], watermark_final: bool, rejected_stage: int | None
+) -> None:
+    pools = [StagePool(0, FakeStageClient()), StagePool(1, FakeStageClient())]
+    pools.append(_audio_stage_pool(_audio_stage_client("llm")) if watermark_final else StagePool(2, FakeStageClient()))
+    assert pools[2].will_watermark(SamplingParams(n=2)) is watermark_final
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    fail = mocker.patch.object(orchestrator, "_fail_request_client_error", new_callable=mocker.AsyncMock)
+    submits = [
+        mocker.patch.object(pool, "submit_initial", new_callable=mocker.AsyncMock, return_value=0) for pool in pools
+    ]
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=SimpleNamespace(sampling_params=SamplingParams()),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[SamplingParams(n=n) for n in stage_n],
+            final_stage_id=2,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+
+    if rejected_stage is None:
+        fail.assert_not_awaited()
+        submits[0].assert_awaited_once()
+    else:
+        fail.assert_awaited_once_with(
+            "req", 0, f"n > 1 is supported only on the entry stage 0; stage {rejected_stage} has n=2"
+        )
+        for submit in submits:
+            submit.assert_not_awaited()
+        assert "req" not in orchestrator.request_states
