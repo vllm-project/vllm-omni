@@ -358,9 +358,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if shared_group is not None:
             if shared_group.role != "consumer":
                 raise ValueError("diffusion weight sharing requires role='consumer'")
-            from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
+            from vllm_omni.distributed.weight_sharing import TorchIpcBackend
 
-            weight_sharing_backend = TorchCudaIpcBackend()
+            weight_sharing_backend = TorchIpcBackend()
             # Own uncertain imports even when the loader never returns a pipeline.
             self._weight_share_backend = weight_sharing_backend
             self._weight_share_session_id = shared_group.session_id

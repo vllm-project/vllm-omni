@@ -4,6 +4,7 @@ import gc
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from types import ModuleType
 from typing import Any, Literal, TypeAlias
 
 import numpy as np
@@ -2230,27 +2231,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         )
         return loaded_params
 
-    def shared_backbone_bindings(self) -> dict[str, torch.Tensor]:
-        """Return the final runtime backbone tensors eligible for IPC sharing.
+    @staticmethod
+    def get_weight_sharing_adapter() -> ModuleType:
+        """Return the model-specific shared-weight operations used by the runner."""
+        from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
 
-        The DiT consumer reconstructs the same canonical name space, so the
-        bindings here are keyed by backbone-relative parameter paths relative
-        to ``self.model``.
-        """
-        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import collect_shared_bindings
-
-        return collect_shared_bindings(self.model)
-
-    def publish_shared_backbone(self, backend: Any, group: Any, device_index: int) -> Any:
-        """Publish this AR model's finalized backbone weights via CUDA IPC.
-
-        ``group`` is a ``SharedWeightGroupConfig`` prepared by the startup
-        layer; the returned ``ExportSession`` must stay alive until the paired
-        DiT consumer releases its import.
-        """
-        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import publish_backbone
-
-        return publish_backbone(backend, self, group=group, device_index=device_index)
+        return hunyuan_image3
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model

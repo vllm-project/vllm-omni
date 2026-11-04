@@ -20,18 +20,20 @@ parameter path (relative to ``.model``), which is identical on both stages.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..backend import ExportSession, ImportedWeights
-from ..contracts import CompatibilityError, TensorSpec, WeightSpec
+from ..contracts import CompatibilityError
 from ..session import (
     SharedWeightGroupConfig,
     build_session_context,
 )
+from . import build_weight_spec
+
+if TYPE_CHECKING:
+    import torch
 
 BACKBONE_ATTR = "model"
-LAYOUT_ID = "hunyuan_image3_backbone_v1"
 
 # Backbone-relative runtime parameter suffixes that belong to the shared
 # backbone.  The AR and DiT stages must agree on this exact set; anything else
@@ -94,57 +96,17 @@ def shared_backbone_names(backbone: Any) -> list[str]:
     return sorted(name for name, _ in backbone.named_parameters() if is_shared_param(name))
 
 
-def collect_shared_bindings(backbone: Any) -> dict[str, Any]:
-    """Return ``{canonical_name: tensor}`` for the provider's final weights.
+def collect_shared_bindings(backbone: Any) -> dict[str, torch.Tensor]:
+    """Collect shared tensors once, in canonical name order (including on meta).
 
     Values are plain ``torch.Tensor`` views (``detach()``) sharing the original
     storage: the codec rejects tensor subclasses such as vLLM's
     ``ModelWeightParameter``, and a view avoids copying or mutating the model.
     """
-    params = dict(backbone.named_parameters())
-    missing = [name for name in shared_backbone_names(backbone) if name not in params]
-    if missing:
-        raise CompatibilityError(f"shared backbone parameters are missing: {missing}")
-    return {name: params[name].detach() for name in shared_backbone_names(backbone)}
-
-
-def build_weight_spec(
-    model_id: str,
-    checkpoint_revision: str,
-    backbone: Any,
-    *,
-    layout: str = LAYOUT_ID,
-) -> WeightSpec:
-    """Build the provider/consumer ``WeightSpec`` from backbone tensor metadata.
-
-    Works on both CUDA (provider) and meta (consumer) backbones because it reads
-    only dtype/shape/stride. ``layout`` must encode the resolved backend and
-    sharding contract (the startup layer populates ``SharedWeightGroupConfig.layout``);
-    the backend rejects any provider/consumer mismatch.
-    """
-    if not layout:
-        raise CompatibilityError("weight sharing requires a nonempty layout contract")
-    params = dict(backbone.named_parameters())
-    tensors: list[TensorSpec] = []
-    for name in shared_backbone_names(backbone):
-        param = params[name]
-        tensors.append(
-            TensorSpec(
-                name=name,
-                dtype=str(param.dtype).removeprefix("torch."),
-                shape=tuple(param.shape),
-                stride=tuple(int(s) for s in param.stride()),
-                alias_of=None,
-            )
-        )
-    if not tensors:
-        raise CompatibilityError("no shared backbone parameters were found")
-    return WeightSpec(
-        model_id=model_id,
-        checkpoint_revision=checkpoint_revision,
-        layout=layout,
-        tensors=tuple(tensors),
-    )
+    return {
+        name: param.detach()
+        for name, param in sorted((name, param) for name, param in backbone.named_parameters() if is_shared_param(name))
+    }
 
 
 def attach_imported_weights(backbone: Any, imported: ImportedWeights) -> None:
@@ -233,13 +195,6 @@ def is_shared_checkpoint_name(name: str) -> bool:
     return False
 
 
-def filter_shared_checkpoint_weights(weights: Iterable[tuple[str, Any]]) -> Iterator[tuple[str, Any]]:
-    """Yield only checkpoint weights that do not target the shared backbone."""
-    for name, tensor in weights:
-        if not is_shared_checkpoint_name(name):
-            yield name, tensor
-
-
 def validate_supported_layout(config: Any) -> None:
     """Reject v1-unsupported HunyuanImage3 configuration shapes.
 
@@ -265,17 +220,9 @@ def publish_backbone(
     """Provider entry: export the AR model's finalized backbone weights."""
     backbone = getattr(model, BACKBONE_ATTR)
     bindings = collect_shared_bindings(backbone)
-    spec = build_weight_spec(group.model_id, group.checkpoint_revision, backbone, layout=group.layout)
+    spec = build_weight_spec(group.model_id, group.checkpoint_revision, bindings, layout=group.layout)
     context = build_session_context(group, device_index)
     return backend.prepare_export(bindings, spec, context)
-
-
-def claim_backbone_export(
-    backend: Any,
-    export: ExportSession,
-) -> bytes:
-    """Provider entry: claim one single-use consumer-bound bundle."""
-    return backend.claim_export(export)
 
 
 def open_backbone_import(
@@ -288,7 +235,8 @@ def open_backbone_import(
 ) -> ImportedWeights:
     """Consumer entry: import and bind the shared backbone into a meta model."""
     backbone = getattr(model, BACKBONE_ATTR)
-    expected = build_weight_spec(group.model_id, group.checkpoint_revision, backbone, layout=group.layout)
+    bindings = collect_shared_bindings(backbone)
+    expected = build_weight_spec(group.model_id, group.checkpoint_revision, bindings, layout=group.layout)
     context = build_session_context(group, device_index)
     imported = backend.open_import(payload, expected, context)
     try:
@@ -302,18 +250,9 @@ def open_backbone_import(
 
 
 __all__ = [
-    "BACKBONE_ATTR",
-    "LAYOUT_ID",
-    "attach_imported_weights",
-    "build_weight_spec",
-    "claim_backbone_export",
-    "collect_shared_bindings",
-    "filter_shared_checkpoint_weights",
     "is_shared_checkpoint_name",
-    "is_shared_param",
     "open_backbone_import",
     "publish_backbone",
-    "shared_backbone_names",
     "shared_param_full_names",
     "validate_supported_layout",
 ]

@@ -1373,11 +1373,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         stage-private weights from disk.  It intentionally bypasses the
         ordinary (whole-backbone) load path to avoid a second backbone peak.
         """
-        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import (
-            is_shared_checkpoint_name,
-            shared_param_full_names,
-        )
-
         if getattr(shared_group, "role", None) != "consumer":
             raise ValueError("diffusion weight sharing requires role='consumer'")
         if self.quant_config is not None:
@@ -1394,22 +1389,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 backbone_meta=True,
             )
 
-        attach = getattr(model, "attach_shared_backbone", None)
-        if attach is None:
-            raise ValueError(f"consumer model {type(model).__name__} has no attach_shared_backbone hook")
+        get_adapter = getattr(model, "get_weight_sharing_adapter", None)
+        if not callable(get_adapter):
+            raise ValueError(f"consumer model {type(model).__name__} has no get_weight_sharing_adapter hook")
+        adapter = get_adapter()
 
-        index = getattr(target_device, "index", None)
-        if index is None:
-            from vllm_omni.platforms import current_omni_platform
+        from vllm_omni.platforms import current_omni_platform
 
-            device_index = current_omni_platform.current_device()
-        else:
-            device_index = int(index)
+        device_index = current_omni_platform.current_device()
         payload = getattr(shared_group, "payload", None)
         if payload is None:
             raise ValueError("consumer weight sharing requires the provider's claimed payload")
         # Reject unsupported finalization before creating any IPC mappings.
-        shared = shared_param_full_names(model)
+        shared = adapter.shared_param_full_names(model)
         shared_module_names = frozenset(name.rsplit(".", 1)[0] for name in shared)
         shared_set = set(shared)
         for full_name, _param in model.named_parameters():
@@ -1437,7 +1429,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model._weight_share_backend = backend
         model._weight_share_import = None
         try:
-            imported = attach(backend, payload, shared_group, device_index)
+            imported = adapter.open_backbone_import(
+                backend, model, payload=payload, group=shared_group, device_index=device_index
+            )
             model._weight_share_import = imported
 
             params_by_name = dict(model.named_parameters())
@@ -1450,7 +1444,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             self.load_weights(
                 model,
                 planned_weights=shared,
-                weight_name_filter=is_shared_checkpoint_name,
+                weight_name_filter=adapter.is_shared_checkpoint_name,
                 disallow_weights=shared,
             )
             self._process_weights_after_loading(model, target_device, preprocessed_module_names=shared_module_names)

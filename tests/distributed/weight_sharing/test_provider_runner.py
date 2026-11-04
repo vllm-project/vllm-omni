@@ -23,13 +23,20 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
     )
 
     codec = FakeCodec(contracts)
-    backend = weight_sharing.TorchCudaIpcBackend(codec=codec)
+    backend = weight_sharing.TorchIpcBackend(codec=codec)
     factory = Mock(return_value=backend)
     monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing", weight_sharing)
-    monkeypatch.setattr(weight_sharing, "TorchCudaIpcBackend", factory)
+    monkeypatch.setattr(weight_sharing, "TorchIpcBackend", factory)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms",
+        SimpleNamespace(current_omni_platform=SimpleNamespace(current_device=lambda: 3)),
+    )
     context = make_context(contracts)
 
-    def publish(backend, group, device_index):
+    def publish(backend, model, *, group, device_index):
+        assert model is runner.model
+        assert device_index == 3  # Current device, not runner.device.index or TP rank.
         bindings, spec = make_weights(contracts, two_storages=True)
         return backend.prepare_export(bindings, spec, context)
 
@@ -38,7 +45,8 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
         weight_sharing=SimpleNamespace(role="provider", session_id=context.identity.session_id, group_id="group")
     )
     runner.device = SimpleNamespace(index=0)
-    runner.model = SimpleNamespace(publish_shared_backbone=Mock(side_effect=publish))
+    runner.adapter = SimpleNamespace(publish_backbone=Mock(side_effect=publish))
+    runner.model = SimpleNamespace(get_weight_sharing_adapter=Mock(return_value=runner.adapter))
     runner.publish = runner._publish_shared_backbone_if_configured
     return runner, backend, codec, factory
 
@@ -47,7 +55,7 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
 def test_failed_publish_retains_owner_and_rejects_retry(provider_runner, contracts, failure):
     runner, backend, codec, factory = provider_runner
     if failure == "before_prepare":
-        runner.model.publish_shared_backbone.side_effect = RuntimeError("adapter failed")
+        runner.adapter.publish_backbone.side_effect = RuntimeError("adapter failed")
         error = RuntimeError
     else:
         codec.failures["export"] = (2, RuntimeError("reducer failed"))
@@ -72,7 +80,7 @@ def test_failed_publish_retains_owner_and_rejects_retry(provider_runner, contrac
     with pytest.raises(RuntimeError, match="previous weight-sharing publish attempt"):
         runner.publish()
     factory.assert_called_once_with()
-    runner.model.publish_shared_backbone.assert_called_once()
+    runner.adapter.publish_backbone.assert_called_once()
     assert codec.calls == calls
     assert not codec.cancellations
 
@@ -90,7 +98,16 @@ def test_successful_publish_retains_owner_before_export_and_is_idempotent(provid
     assert backend.session_status(session).state == contracts.SessionState.EXPORTED
     runner.publish()
     factory.assert_called_once_with()
-    runner.model.publish_shared_backbone.assert_called_once()
+    runner.adapter.publish_backbone.assert_called_once()
     assert runner._weight_share_session is session
     assert len(codec.exports) == 2
     assert backend.release_export(session).status == "CLOSED"
+
+
+def test_missing_adapter_is_rejected_before_export(provider_runner):
+    runner, backend, codec, factory = provider_runner
+    del runner.model.get_weight_sharing_adapter
+    with pytest.raises(ValueError, match="get_weight_sharing_adapter"):
+        runner.publish()
+    factory.assert_not_called()
+    assert not codec.exports

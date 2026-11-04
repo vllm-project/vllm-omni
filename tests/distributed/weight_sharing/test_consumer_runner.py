@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Consumer load ownership: production runner/loader methods with CPU IPC tokens."""
 
-import importlib
 import sys
 import time
 from contextlib import nullcontext
@@ -23,8 +22,8 @@ class LoadError(RuntimeError):
 @pytest.fixture
 def consumer_load(weight_sharing, contracts, monkeypatch):
     codec = FakeCodec(contracts)
-    provider = weight_sharing.TorchCudaIpcBackend(codec=codec)
-    backend = weight_sharing.TorchCudaIpcBackend(codec=codec)
+    provider = weight_sharing.TorchIpcBackend(codec=codec)
+    backend = weight_sharing.TorchIpcBackend(codec=codec)
     context = make_context(contracts)
     bindings, spec = make_weights(contracts, two_storages=True)
     exported = provider.prepare_export(bindings, spec, context)
@@ -32,24 +31,32 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
     group = SimpleNamespace(role="consumer", session_id="session", payload=payload)
     factory = Mock(return_value=backend)
     monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing", weight_sharing)
-    monkeypatch.setattr(weight_sharing, "TorchCudaIpcBackend", factory)
-    adapter = importlib.import_module(f"{weight_sharing.__name__}.adapters.hunyuan_image3")
-    monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3", adapter)
+    monkeypatch.setattr(weight_sharing, "TorchIpcBackend", factory)
+    platform = Mock(current_device=Mock(return_value=3))
+    monkeypatch.setitem(sys.modules, "vllm_omni.platforms", SimpleNamespace(current_omni_platform=platform))
     # Model binding is outside this test; imported views still have real backend lifetimes.
-    monkeypatch.setattr(adapter, "shared_param_full_names", lambda model: [])
+    adapter = SimpleNamespace(
+        shared_param_full_names=Mock(return_value=[]), is_shared_checkpoint_name=Mock(return_value=False)
+    )
     model = SimpleNamespace(
-        named_parameters=lambda: [], named_buffers=lambda: [], named_modules=lambda: [], eval=lambda: model
+        named_parameters=lambda: [],
+        named_buffers=lambda: [],
+        named_modules=lambda: [],
+        eval=lambda: model,
+        get_weight_sharing_adapter=Mock(return_value=adapter),
     )
 
-    def attach(received_backend, received_payload, received_group, device_index):
+    def attach(received_backend, received_model, *, payload, group, device_index):
+        assert received_model is model
+        assert device_index == 3  # Current device, not the loader's target-device index.
         assert received_backend is runner._weight_share_backend is backend
-        assert received_group is group
+        assert group is loader.od_config.weight_sharing
         assert runner._weight_share_session_id == "session"
-        imported = backend.open_import(received_payload, spec, context)
+        imported = backend.open_import(payload, spec, context)
         model.views = list(imported.values())  # Model-owned aliases make close_import return HELD.
         return imported
 
-    model.attach_shared_backbone = Mock(side_effect=attach)
+    adapter.open_backbone_import = Mock(side_effect=attach)
     loader_cls = load_class_methods(
         "vllm_omni/diffusion/model_loader/diffusers_loader.py",
         "DiffusersPipelineLoader",
@@ -71,7 +78,7 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
         "resolve_prompt_embed_cache_config": lambda **_: (False, 0),
         "resolve_offload": lambda _: None,
         "offload_enabled": lambda _: False,
-        "current_omni_platform": Mock(),
+        "current_omni_platform": platform,
         "LoadConfig": Mock(),
         "DiffusersPipelineLoader": Mock(return_value=loader),
         "time": time,
@@ -88,14 +95,16 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
     runner.od_config = loader.od_config
     runner.vllm_config = SimpleNamespace()
     runner.device = "cuda:0"
-    return SimpleNamespace(runner=runner, loader=loader, model=model, backend=backend, codec=codec, factory=factory)
+    return SimpleNamespace(
+        runner=runner, loader=loader, model=model, adapter=adapter, backend=backend, codec=codec, factory=factory
+    )
 
 
 @pytest.mark.parametrize("failure", ["preflight", "partial_import", "private_weights", "postprocess"])
 def test_load_failure_retains_backend_and_blocks_retry(consumer_load, contracts, failure):
     r = consumer_load
     if failure == "preflight":
-        r.model.attach_shared_backbone.side_effect = LoadError("preflight failed")
+        r.adapter.open_backbone_import.side_effect = LoadError("preflight failed")
     elif failure == "partial_import":
         r.codec.failures["import"] = (2, RuntimeError("import failed"))
     elif failure == "private_weights":
@@ -125,7 +134,7 @@ def test_load_failure_retains_backend_and_blocks_retry(consumer_load, contracts,
         r.runner.load_model()
     assert r.codec.calls == calls
     r.factory.assert_called_once_with()
-    r.model.attach_shared_backbone.assert_called_once()
+    r.adapter.open_backbone_import.assert_called_once()
 
 
 def test_pipeline_return_keeps_same_backend_on_runner(consumer_load):
@@ -137,6 +146,9 @@ def test_pipeline_return_keeps_same_backend_on_runner(consumer_load):
     assert r.runner.pipeline is r.model
     assert r.model._weight_share_backend is r.runner._weight_share_backend is r.backend
     assert r.model._weight_share_import.session_id == r.runner._weight_share_session_id
+    r.model.get_weight_sharing_adapter.assert_called_once_with()
+    r.adapter.shared_param_full_names.assert_called_once_with(r.model)
+    assert r.loader.load_weights.call_args.kwargs["weight_name_filter"] is r.adapter.is_shared_checkpoint_name
     r.factory.assert_called_once_with()
 
 
@@ -167,10 +179,19 @@ def test_unsupported_postload_is_rejected_before_import(consumer_load, monkeypat
         method.supports_pre_processed_weights = declared
     r.model.named_parameters = lambda: [("shared.weight", object())]
     r.model.named_modules = lambda: [("shared", SimpleNamespace(quant_method=method))]
-    adapter = sys.modules["vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3"]
-    monkeypatch.setattr(adapter, "shared_param_full_names", lambda _: ["shared.weight"])
+    r.adapter.shared_param_full_names.return_value = ["shared.weight"]
     monkeypatch.setitem(r.loader._load_model_with_shared_backbone.__globals__, "QuantizeMethodBase", SimpleNamespace)
     with pytest.raises(ValueError, match="does not support preprocessed shared weights"):
         r.runner.load_model()
-    r.model.attach_shared_backbone.assert_not_called()
+    r.adapter.open_backbone_import.assert_not_called()
+    assert not r.codec.imports
+
+
+def test_missing_adapter_is_rejected_before_import(consumer_load):
+    r = consumer_load
+    del r.model.get_weight_sharing_adapter
+    with pytest.raises(ValueError, match="get_weight_sharing_adapter"):
+        r.runner.load_model()
+    r.adapter.open_backbone_import.assert_not_called()
+    r.loader.load_weights.assert_not_called()
     assert not r.codec.imports

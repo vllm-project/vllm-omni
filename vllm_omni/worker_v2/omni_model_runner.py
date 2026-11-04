@@ -444,28 +444,25 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 "A previous weight-sharing publish attempt did not complete; "
                 "tear down the sharing group before retrying."
             )
-        publish = getattr(self.model, "publish_shared_backbone", None)
-        if publish is None:
+        get_adapter = getattr(self.model, "get_weight_sharing_adapter", None)
+        if not callable(get_adapter):
             raise ValueError(
                 f"weight sharing requested for a provider rank, but {type(self.model).__name__} "
-                "has no publish_shared_backbone hook"
+                "has no get_weight_sharing_adapter hook"
             )
-        from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
+        adapter = get_adapter()
+        from vllm_omni.distributed.weight_sharing import TorchIpcBackend
+        from vllm_omni.platforms import current_omni_platform
 
-        device = getattr(self, "device", None)
-        index = getattr(device, "index", None)
-        if index is None:
-            from vllm_omni.platforms import current_omni_platform
-
-            device_index = current_omni_platform.current_device()
-        else:
-            device_index = int(index)
-        backend = TorchCudaIpcBackend()
+        device_index = current_omni_platform.current_device()
+        backend = TorchIpcBackend()
         # Retain partial exports and their diagnostics if publish raises. The
         # session ID remains queryable once the backend registers the session.
         self._weight_share_backend = backend
         self._weight_share_session_id = group.session_id
-        self._weight_share_session = publish(backend, group, device_index)
+        self._weight_share_session = adapter.publish_backbone(
+            backend, self.model, group=group, device_index=device_index
+        )
         logger.info("Published shared backbone weights for sharing group %s", getattr(group, "group_id", None))
 
     def _adopt_model_logits_vocab(self, model: Any) -> None:

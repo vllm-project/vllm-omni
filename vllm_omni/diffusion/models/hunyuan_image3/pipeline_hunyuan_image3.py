@@ -4,6 +4,7 @@
 import copy
 import logging
 from collections.abc import Iterable
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -520,17 +521,12 @@ class HunyuanImage3Pipeline(
             weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
 
-    def attach_shared_backbone(self, backend: Any, payload: bytes, group: Any, device_index: int) -> Any:
-        """Import and bind the AR stage's finalized backbone into this DiT model."""
-        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import open_backbone_import
+    @staticmethod
+    def get_weight_sharing_adapter() -> ModuleType:
+        """Return the model-specific shared-weight operations used by the loader."""
+        from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
 
-        return open_backbone_import(backend, self, payload=payload, group=group, device_index=device_index)
-
-    def shared_backbone_param_names(self) -> list[str]:
-        """Full parameter paths of the shared backbone, for external-load bookkeeping."""
-        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import shared_param_full_names
-
-        return shared_param_full_names(self)
+        return hunyuan_image3
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed

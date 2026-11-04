@@ -115,9 +115,9 @@ def _provider(control):
     ws, session, adapter, device_uuid = _adapter_runtime()
     model = _Model("cuda")
     group = _make_group(session, role="provider", device_uuid=device_uuid)
-    backend = ws.TorchCudaIpcBackend()
+    backend = ws.TorchIpcBackend()
     export = adapter.publish_backbone(backend, model, group=group, device_index=0)
-    payload = adapter.claim_backbone_export(backend, export)
+    payload = backend.claim_export(export)
     control.send(payload)
     backend.confirm_import(receive(control))
     control.send("attached")
@@ -132,7 +132,7 @@ def _consumer(control):
     model = _Model("meta")
     reference = _make_backbone("cpu")
     group = _make_group(session, role="consumer", device_uuid=device_uuid)
-    backend = ws.TorchCudaIpcBackend()
+    backend = ws.TorchIpcBackend()
     imported = adapter.open_backbone_import(backend, model, payload=payload, group=group, device_index=0)
 
     for name, expected in reference.named_parameters():

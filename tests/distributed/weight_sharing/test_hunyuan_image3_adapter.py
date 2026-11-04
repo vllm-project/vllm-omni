@@ -10,6 +10,8 @@ package is never initialized.
 """
 
 import importlib
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -114,6 +116,12 @@ def session_module():
 
 
 @pytest.fixture(scope="module")
+def spec_builder():
+    ws = load_weight_sharing()
+    return importlib.import_module(f"{ws.__name__}.adapters").build_weight_spec
+
+
+@pytest.fixture(scope="module")
 def backbone() -> _Backbone:
     return _Backbone()
 
@@ -137,7 +145,7 @@ def test_shared_backbone_names_matches_module(adapter, backbone):
 
 def test_collect_shared_bindings(adapter, backbone):
     bindings = adapter.collect_shared_bindings(backbone)
-    assert set(bindings) == _expected_shared_names()
+    assert list(bindings) == sorted(_expected_shared_names())
     assert all(isinstance(value, torch.Tensor) for value in bindings.values())
     # The router must be float32 per the fusion contract.
     assert bindings["layers.0.mlp.gate.weight"].dtype == torch.float32
@@ -160,18 +168,61 @@ def test_collect_shared_bindings_detaches_parameter_subclasses(adapter):
     assert all(type(value) is torch.Tensor for value in bindings.values()), [type(value) for value in bindings.values()]
 
 
-def test_build_weight_spec(adapter, backbone):
-    spec = adapter.build_weight_spec("model-id", "revision", backbone)
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_build_weight_spec(spec_builder, device):
+    # Arbitrary model names and non-contiguous views exercise the common builder.
+    bindings = {"z.weight": torch.empty(2, 3, device=device).t(), "a.weight": torch.empty(4, device=device)}
+    spec = spec_builder("model-id", "revision", bindings, layout="test-layout")
     assert spec.model_id == "model-id"
     assert spec.checkpoint_revision == "revision"
-    assert spec.layout == adapter.LAYOUT_ID
-    assert {tensor.name for tensor in spec.tensors} == _expected_shared_names()
-    params = dict(backbone.named_parameters())
+    assert spec.layout == "test-layout"
+    assert [tensor.name for tensor in spec.tensors] == sorted(bindings)
+    assert spec == spec_builder("model-id", "revision", dict(reversed(bindings.items())), layout="test-layout")
     for tensor in spec.tensors:
-        param = params[tensor.name]
+        param = bindings[tensor.name]
         assert tensor.shape == tuple(param.shape)
         assert tensor.stride == tuple(param.stride())
         assert tensor.dtype == str(param.dtype).removeprefix("torch.")
+
+
+def test_build_weight_spec_rejects_empty_bindings(spec_builder, contracts):
+    with pytest.raises(contracts.CompatibilityError, match="no shared weight bindings"):
+        spec_builder("model-id", "revision", {}, layout="test-layout")
+
+
+def test_build_weight_spec_requires_layout(spec_builder, contracts):
+    bindings = {"weight": torch.empty(1)}
+    with pytest.raises(contracts.CompatibilityError, match="nonempty layout"):
+        spec_builder("model-id", "revision", bindings, layout="")
+    with pytest.raises(TypeError, match="layout"):
+        spec_builder("model-id", "revision", bindings)
+
+
+def test_publish_collects_bindings_once(adapter, backbone, session_module, monkeypatch):
+    group = session_module.SharedWeightGroupConfig(
+        group_id="group",
+        generation=0,
+        session_id="session",
+        provider_id="ar",
+        consumer_id="dit",
+        role="provider",
+        rank=0,
+        tp_size=1,
+        device_uuid="GPU-test",
+        model_id="model",
+        checkpoint_revision="revision",
+    )
+    enumerate_params = Mock(wraps=backbone.named_parameters)
+    monkeypatch.setattr(backbone, "named_parameters", enumerate_params)
+    backend = Mock()
+    adapter.publish_backbone(backend, SimpleNamespace(model=backbone), group=group, device_index=0)
+    enumerate_params.assert_called_once_with()
+    backend.prepare_export.assert_called_once()
+    bindings, spec, _ = backend.prepare_export.call_args.args
+    assert list(bindings) == [tensor.name for tensor in spec.tensors] == sorted(_expected_shared_names())
+    assert spec.layout == group.layout
+    for name, tensor in bindings.items():
+        assert tensor.data_ptr() == backbone.get_parameter(name).data_ptr()
 
 
 def test_is_shared_checkpoint_name(adapter):
