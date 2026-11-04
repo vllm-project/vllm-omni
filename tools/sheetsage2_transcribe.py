@@ -18,10 +18,8 @@ DEFAULT_MODEL = "m-a-p/SheetSage2"
 DEFAULT_REVISION = "cafc0df1021e14f49e928c4b345f5959d414ef64"
 
 
-def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("audio", type=Path, help="Local music recording (decoded by FFmpeg)")
-    parser.add_argument("--output-dir", required=True, type=Path, help="New or empty output directory")
+def add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    """Loading options shared with tools/sheetsage2_serve.py."""
     parser.add_argument("--model", default=DEFAULT_MODEL, help="SheetSage2 Hub ID or local snapshot")
     parser.add_argument("--revision", help="Model/code revision; the default Hub model uses a pinned commit")
     parser.add_argument("--base-model-path", type=Path, help="Local MERT-v2 parent for offline loading")
@@ -33,6 +31,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype", choices=("bf16", "fp32"), default="bf16", help="Inference autocast; weights load in FP32"
     )
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("audio", type=Path, help="Local music recording (decoded by FFmpeg)")
+    parser.add_argument("--output-dir", required=True, type=Path, help="New or empty output directory")
+    add_model_arguments(parser)
     parser.add_argument("--melody-only", action="store_true", help="Retain vocal/instrumental melodies and omit chords")
     parser.add_argument(
         "--max-seconds", type=float, help="Transcribe only this many seconds; otherwise process the song"
@@ -87,9 +92,8 @@ def build_yue2_request(abc: str, lyrics: str, args: argparse.Namespace) -> dict[
     return request
 
 
-def transcribe(args: argparse.Namespace) -> Path:
-    # Validate before loading dependencies/weights or touching an existing output.
-    lyrics = validate_args(args)
+def load_model(args: argparse.Namespace) -> tuple[object, str, str | None]:
+    """Load SheetSage2 from the shared loading options; returns (model, device, revision)."""
     import torch
     from transformers import AutoModel
 
@@ -125,14 +129,11 @@ def transcribe(args: argparse.Namespace) -> Path:
     model = AutoModel.from_pretrained(args.model, **load_options).eval().to(device)
     if model.config.model_type != "sheetsage2":
         raise ValueError("--model must identify a SheetSage2 checkpoint")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    result = model.transcribe(
-        str(args.audio),
-        output_dir=str(args.output_dir),
-        melody_only=args.melody_only,
-        dtype=args.dtype,
-        max_seconds=args.max_seconds,
-    )
+    return model, device, revision
+
+
+def checked_score(result: dict) -> str:
+    """The ABC score of an upstream transcribe() result, once both exports succeeded."""
     abc = result.get("abc")
     if result.get("abc_error") or not isinstance(abc, str) or not abc.strip():
         raise RuntimeError(
@@ -141,6 +142,24 @@ def transcribe(args: argparse.Namespace) -> Path:
     midi = result.get("midi")
     if not isinstance(midi, bytes) or not midi.startswith(b"MThd"):
         raise RuntimeError("MIDI export failed; no YuE2 request was written")
+    return abc
+
+
+def transcribe(args: argparse.Namespace) -> Path:
+    # Validate before loading dependencies/weights or touching an existing output.
+    lyrics = validate_args(args)
+    import torch
+
+    model, device, revision = load_model(args)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    result = model.transcribe(
+        str(args.audio),
+        output_dir=str(args.output_dir),
+        melody_only=args.melody_only,
+        dtype=args.dtype,
+        max_seconds=args.max_seconds,
+    )
+    abc = checked_score(result)
     if lyrics is not None:
         request = build_yue2_request(abc, lyrics, args)
         (args.output_dir / "yue2_request.json").write_text(

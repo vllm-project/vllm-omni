@@ -90,6 +90,8 @@ def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
         output_type=None,
         num_generation_tokens=None,
         finished=True,
+        # Upstream EngineCoreOutput.error is read before any other field.
+        error=None,
     )
 
 
