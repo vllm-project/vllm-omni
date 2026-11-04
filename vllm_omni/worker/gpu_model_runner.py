@@ -1015,10 +1015,16 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if not self._moe_routing_specialize_enabled():
             return MoERoutingKey.BLEND
         model = getattr(self, "model", None)
-        gen_start = getattr(model, "gen_vocab_start_index", None)
-        if gen_start is None:
-            language_model = getattr(model, "language_model", None)
-            gen_start = getattr(language_model, "gen_vocab_start_index", None)
+        gen_start = None
+        cursor = model
+        # Mammoth pipeline wraps AR as ``model.ar.language_model``.
+        for _ in range(4):
+            if cursor is None:
+                break
+            gen_start = getattr(cursor, "gen_vocab_start_index", None)
+            if gen_start is not None:
+                break
+            cursor = getattr(cursor, "language_model", None) or getattr(cursor, "ar", None)
         if gen_start is None or num_tokens is None:
             return MoERoutingKey.BLEND
         input_ids = self.input_ids.gpu[:num_tokens]
