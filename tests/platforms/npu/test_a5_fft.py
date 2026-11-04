@@ -53,11 +53,15 @@ def _save_torch_ops():
         torch.hann_window,
         torch.functional.stft,
         torch.functional.istft,
+        torch.Tensor.stft,
+        torch.Tensor.istft,
     )
 
 
 def _restore_torch_ops(saved) -> None:
-    torch.stft, torch.istft, torch.hann_window, torch.functional.stft, torch.functional.istft = saved
+    torch.stft, torch.istft, torch.hann_window, torch.functional.stft, torch.functional.istft = saved[:5]
+    setattr(torch.Tensor, "stft", saved[5])
+    setattr(torch.Tensor, "istft", saved[6])
 
 
 @pytest.mark.parametrize("window_length", [0, 1, 2, 5, 16, 400, 1024])
@@ -75,6 +79,12 @@ def test_hann_window_uses_numpy_for_non_cpu_device() -> None:
     assert window.device.type == "meta"
     assert window.shape == (16,)
     assert window.dtype == torch.float32
+
+
+def test_hann_window_accepts_pin_memory() -> None:
+    module = _load_module()
+    window = module.hann_window(4, pin_memory=False)
+    assert window.shape == (4,)
 
 
 @pytest.mark.parametrize("n_fft,hop_length,win_length", _SHAPES)
@@ -143,6 +153,56 @@ def test_stft_fft_matches_torch_normalized_real_and_full_spectrum() -> None:
     )
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("center", [True, False])
+def test_stft_fft_matches_torch_1d(center: bool) -> None:
+    module = _load_module()
+    torch.manual_seed(4)
+    audio = torch.randn(1000)
+    window = torch.hann_window(400)
+    expected = torch.stft(
+        audio,
+        400,
+        160,
+        400,
+        window=window,
+        center=center,
+        return_complex=True,
+    )
+    actual = module._stft_fft(audio, 400, 160, 400, window, center, "reflect", False, None, True)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_stft_fft_rejects_short_input() -> None:
+    module = _load_module()
+    window = torch.hann_window(16)
+    with pytest.raises(module._FallbackError):
+        module._stft_fft(torch.randn(8), 16, 4, 16, window, False, "reflect", False, None, True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_stft_fft_accepts_low_precision_input(dtype: torch.dtype) -> None:
+    module = _load_module()
+    torch.manual_seed(5)
+    audio = torch.randn(2, 64, dtype=dtype)
+    window = torch.hann_window(16, dtype=dtype)
+    expected = module._stft_fft(
+        audio.float(),
+        16,
+        4,
+        16,
+        window.float(),
+        True,
+        "reflect",
+        False,
+        None,
+        True,
+    )
+    actual = module._stft_fft(audio, 16, 4, 16, window, True, "reflect", False, None, True)
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("n_fft,hop_length,win_length", _SHAPES)
@@ -217,6 +277,18 @@ def test_istft_fft_matches_torch_normalized_and_full_spectrum() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_istft_fft_matches_torch_length_beyond_reconstruction() -> None:
+    module = _load_module()
+    torch.manual_seed(6)
+    audio = torch.randn(1, 64)
+    window = torch.hann_window(16)
+    spec = torch.stft(audio, 16, 4, 16, window=window, return_complex=True)
+    expected = torch.istft(spec, 16, 4, 16, window=window, length=100)
+    actual = module._istft_fft(spec, 16, 4, 16, window, True, False, None, 100, False)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_install_patches_torch_ops() -> None:
     module = _load_module()
     saved = _save_torch_ops()
@@ -227,6 +299,8 @@ def test_install_patches_torch_ops() -> None:
         assert torch.hann_window is module.hann_window
         assert torch.functional.stft is module.stft
         assert torch.functional.istft is module.istft
+        assert torch.Tensor.stft is module.stft
+        assert torch.Tensor.istft is module.istft
     finally:
         _restore_torch_ops(saved)
 
