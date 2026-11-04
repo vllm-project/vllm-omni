@@ -150,3 +150,18 @@ def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
     result = attention(torch.empty(2, sequence, 4096, device="cuda", dtype=torch.bfloat16), freqs)
     assert observed == [True]
     torch.testing.assert_close(result, projection[:, :, 2].flatten(2), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_rope_qualifies_musa_with_unfused_products():
+    """MUSA's complex multiply does not fuse its products, so its reference
+    rotation is a plain multiply/add; the fused kernel keeps that order (no FMA)
+    to stay bit-exact."""
+    assert pointwise.rope_fma_products(torch.device("musa")) is False
+    assert pointwise.rope_fma_products(torch.device("cpu")) is None
+
+
+@pytest.mark.cpu
+def test_rope_is_a_registered_custom_op():
+    """A compiled region can only call the kernel through a real custom op."""
+    assert torch.ops.vllm_omni.interleaved_rope.default is not None
