@@ -31,3 +31,16 @@ def test_image_cache_is_published_atomically(mocker, tmp_path):
     publish.assert_called_once()
     assert base64.b64decode(result["base64"]) == cache_path.read_bytes()
     assert list(tmp_path.iterdir()) == [cache_path]
+
+
+def test_failed_image_cache_publication_preserves_old_file(mocker, tmp_path):
+    original = media.generate_synthetic_image(64, 32, cache_dir=tmp_path, seed=42)
+    cache_path = Path(original["file_path"])
+    old_bytes = cache_path.read_bytes()
+    mocker.patch.object(media.os, "replace", side_effect=OSError("publication failed"))
+
+    with pytest.raises(OSError, match="publication failed"):
+        media.generate_synthetic_image(64, 32, force_regenerate=True, cache_dir=tmp_path, seed=43)
+
+    assert cache_path.read_bytes() == old_bytes
+    assert list(tmp_path.iterdir()) == [cache_path]
