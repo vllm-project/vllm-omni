@@ -370,6 +370,13 @@ class OmniPlatform(Platform):
         return True
 
     @classmethod
+    def supports_signal_window_ops(cls) -> bool:
+        """Whether the device implements the window/sinc kernels (torch.kaiser_window,
+        torch.sinc) used to build audio resampling filters. Platforms that return
+        False build those modules/filters on CPU and move them to the device."""
+        return True
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
