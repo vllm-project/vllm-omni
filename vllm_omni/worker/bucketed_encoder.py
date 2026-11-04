@@ -45,6 +45,7 @@ __all__ = [
 _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
 _ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
 _ENV_TIME_AXIS = "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"
+_ENV_CONTEXT_MARGIN = "VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN"
 _FRAMES_PER_SECOND = 100  # 10 ms mel hop; seconds ladder -> frames
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
@@ -131,6 +132,51 @@ def _rungs_from_env() -> tuple[int, ...] | None:
     return tuple(max(1, int(round(s * _FRAMES_PER_SECOND))) for s in seconds)
 
 
+def _context_margin_from_env() -> int | None:
+    """Return the deployment-wide conv context margin, or None if unset.
+
+    Kept parallel to ``VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS``: a deployment knob so
+    a model does not have to declare ``bucketing_context_margin`` on its encoder.
+    """
+    raw = os.environ.get(_ENV_CONTEXT_MARGIN, "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", _ENV_CONTEXT_MARGIN, raw)
+        return None
+
+
+# Verified models: the pipeline ``model_type`` -> the per-encoder knobs that have
+# been validated end-to-end. A model NOT listed here cannot use bucketing —
+# install_bucketed_encoders logs a warning and returns [] (the original forward
+# is served unchanged). ``model_type`` is the same identifier an author writes
+# in the PipelineConfig when registering a model, so the reference table and the
+# whitelist share one name.
+_VERIFIED_MODELS: dict[str, dict[str, int]] = {
+    "step_audio_2": {"context_margin": 2, "time_axis": 2},
+    "covo_audio": {"context_margin": 0, "time_axis": 2},
+}
+
+
+def _verified_knobs(vllm_config) -> dict[str, int] | None:
+    """Return the verified bucketing knobs, or None if the model is unverified."""
+    return _VERIFIED_MODELS.get(vllm_config.model_config.hf_config.model_type)
+
+
+def _context_margin_for(module: nn.Module, verified_margin: int = 0) -> int:
+    """Env var wins, then the encoder's class attribute, then the verified
+    whitelist value, then 0."""
+    from_env = _context_margin_from_env()
+    if from_env is not None:
+        return from_env
+    declared = getattr(module, "bucketing_context_margin", None)
+    if declared is not None:
+        return int(declared)
+    return verified_margin
+
+
 def _as_tensor(output):
     if torch.is_tensor(output):
         return output
@@ -191,10 +237,14 @@ class _BucketedEncoder:
         self._disabled = False
         self._truncation_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
+        # Verified time axis from the whitelist, used when neither the env var
+        # nor a class attribute nor a fixed-window shim pins the layout.
+        self._default_time_axis: int | None = None
         # Extra feature frames the encoder's front conv reads beyond the
         # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
         # Bucketing and copying add this margin; the attention mask length is
-        # unchanged (it still uses the reported valid length).
+        # unchanged (it still uses the reported valid length). Set per encoder
+        # by the installer (env var -> class attribute -> whitelist -> 0).
         self._context_margin = 0
 
     def publish(self, lengths: tuple[int, ...] | None) -> None:
@@ -229,6 +279,8 @@ class _BucketedEncoder:
         # defeat the length-scale heuristic below).
         if self._shim is not None:
             return 2
+        if self._default_time_axis is not None:
+            return self._default_time_axis
         time_on_1, time_on_2 = features.size(1), features.size(2)
         longest = max(lengths)
         if longest > time_on_1 and time_on_2 >= longest:
@@ -559,6 +611,18 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     if model is None or getattr(model, "_bucketed_installed", False):
         return []
 
+    verified = _verified_knobs(vllm_config)
+    if verified is None:
+        logger.warning(
+            "Bucketed encoder is not verified for model_type %r; disabling the "
+            "feature and serving the untouched forward. Verified model_type values: "
+            "%s. Remove %s to silence this warning.",
+            vllm_config.model_config.hf_config.model_type,
+            sorted(_VERIFIED_MODELS),
+            _ENV_SECONDS,
+        )
+        return []
+
     ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
     pattern_src = os.environ.get(_ENV_MODULES, "").strip() or _MODULE_PATTERN
     pattern = re.compile(pattern_src)
@@ -570,7 +634,8 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
-        encoder._context_margin = int(getattr(module, "bucketing_context_margin", 0) or 0)
+        encoder._context_margin = _context_margin_for(module, verified["context_margin"])
+        encoder._default_time_axis = verified["time_axis"]
         for klass in type(module).__mro__:
             shim = _FORWARD_SHIMS.get(klass.__name__)
             if shim is not None:

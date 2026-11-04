@@ -28,6 +28,7 @@ Bucketing env vars (set to turn the feature on)
   (rung mel frames = seconds x 100).
 * ``VLLM_OMNI_AUDIO_BUCKET_MODULES=encoder`` — which encoder modules to bucket.
 * ``VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS=2`` — the time axis of the feature tensor.
+* ``VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN=2`` — extra conv-context frames (StepAudio2 = 2).
 
 Usage (lossy case, unmasked Whisper):
     COVO_AUDIO_CHAT_CKPT=/path/to/Covo-Audio-Chat \
@@ -39,6 +40,7 @@ Usage (lossless case, mask-aware):
     STEP_AUDIO2_CKPT=/path/to/Step-Audio-2-mini \
     VLLM_OMNI_AUDIO_BUCKET_SECONDS=2,4,8,16,30 \
     VLLM_OMNI_AUDIO_BUCKET_MODULES=encoder VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS=2 \
+    VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN=2 \
     python benchmarks/encoder_bucketing_onoff_cosine.py --model-type stepaudio2
 """
 
@@ -58,6 +60,7 @@ from torch import nn
 os.environ.setdefault("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
 os.environ.setdefault("VLLM_OMNI_AUDIO_BUCKET_MODULES", "encoder")
 os.environ.setdefault("VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS", "2")
+os.environ.setdefault("VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN", "0")
 
 RUNGS = (200, 400, 800, 1600, 3000)
 N_ITERS = 20
@@ -77,7 +80,7 @@ _REALISTIC_BATCHES = {
     "stepaudio2": [
         (
             "realistic (LibriSpeech dist)",
-            [400, 500, 650, 750, 800, 900, 1000, 1100, 1300, 1500, 1700, 2000, 2300, 2600, 2900, 3000],
+            [400, 500, 650, 750, 800, 900, 1000, 1100, 1300, 1500, 1700, 2000, 2300, 2600, 2900, 2980],
         ),
     ],
 }
@@ -143,10 +146,13 @@ class Model(nn.Module):
         return self.encoder(kwargs["audio_features"]).last_hidden_state
 
 
-def make_batch(lengths, mel=128):
-    feats = torch.randn(len(lengths), mel, max(lengths), dtype=torch.bfloat16, device="cuda")
+def make_batch(lengths, mel=128, margin=0):
+    # Pad to the longest FULL input (positional length + conv context margin),
+    # mirroring pad_sequence in the real processor. Rows carry real content in
+    # [0, length + margin) and silence (zeros) after.
+    feats = torch.randn(len(lengths), mel, max(lengths) + margin, dtype=torch.bfloat16, device="cuda")
     for row, length in enumerate(lengths):
-        feats[row, :, length:] = 0
+        feats[row, :, length + margin :] = 0
     return feats
 
 
@@ -158,9 +164,9 @@ def _features(output):
     return getattr(output, "last_hidden_state", None)
 
 
-def _measure_speedup(encoder, model, has_length, lengths):
+def _measure_speedup(encoder, model, has_length, lengths, margin=0):
     """Return ``(off_ms, on_ms)`` for one batch of the given mel-frame lengths."""
-    feats = make_batch(lengths)
+    feats = make_batch(lengths, margin=margin)
     lens = torch.tensor(lengths, dtype=torch.long)
 
     def call_off():
@@ -196,12 +202,18 @@ def main():
     parser.add_argument("--model-type", choices=("covo", "stepaudio2"), required=True)
     args = parser.parse_args()
 
+    # StepAudio2's front conv reads two mel frames beyond the reported length;
+    # set the deployment-wide margin so the bucketed wrapper copies them.
+    if args.model_type == "stepaudio2":
+        os.environ["VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN"] = "2"
+    margin = int(os.environ.get("VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN", "0"))
+
     checkpoint = os.environ["COVO_AUDIO_CHAT_CKPT" if args.model_type == "covo" else "STEP_AUDIO2_CKPT"]
     lengths = _LENGTHS[args.model_type]
 
     torch.manual_seed(0)
     encoder, has_length = load_encoder(args.model_type, checkpoint)
-    feats = make_batch(lengths)
+    feats = make_batch(lengths, margin=margin)
     lens = torch.tensor(lengths, dtype=torch.long)
 
     with torch.inference_mode():
@@ -211,7 +223,13 @@ def main():
             off = _features(encoder(feats))
 
         model = Model(encoder, has_length)
+        from vllm_omni.worker import bucketed_encoder
         from vllm_omni.worker.bucketed_encoder import install_bucketed_encoders
+
+        # This benchmark wraps the raw encoder in a synthetic ``Model``, not a
+        # real stage model, so bypass the verified-model whitelist and drive the
+        # wrapper with the resolved knobs directly.
+        bucketed_encoder._verified_knobs = lambda vllm_config: {"context_margin": margin, "time_axis": 2}
 
         assert install_bucketed_encoders(model) == ["encoder"]
         if has_length:
@@ -237,7 +255,7 @@ def main():
 
     batches = [("best case", lengths)] + _REALISTIC_BATCHES.get(args.model_type, [])
     for name, batch_lengths in batches:
-        off_ms, on_ms = _measure_speedup(encoder, model, has_length, batch_lengths)
+        off_ms, on_ms = _measure_speedup(encoder, model, has_length, batch_lengths, margin)
         print(f"\n{name}: off {off_ms:.2f} ms   on {on_ms:.2f} ms   speedup {off_ms / on_ms:.2f}x")
 
 

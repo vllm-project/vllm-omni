@@ -114,6 +114,17 @@ def expected_bucketed(feats: torch.Tensor, lengths=LENGTHS) -> torch.Tensor:
 def bucket_env(monkeypatch):
     # Real env names from the code (not the drifted names in the commit message).
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "0.4,1,2")
+    # These tests exercise the wrapper logic on toy models, which are not in the
+    # production verified-model whitelist; make the gate permissive so the tests
+    # drive the wrapper directly. Individual tests pin margin/time axis via env
+    # vars or class attributes, which override these defaults.
+    from vllm_omni.worker import bucketed_encoder
+
+    monkeypatch.setattr(
+        bucketed_encoder,
+        "_verified_knobs",
+        lambda vllm_config: {"context_margin": 0, "time_axis": 1},
+    )
     if not torch.cuda.is_available():
         pytest.skip("bucketed encoder requires CUDA")
 
@@ -381,6 +392,48 @@ def test_context_margin_preserves_conv_tail(bucket_env):
     assert out.shape[0] == len(lengths)
     for row, length in enumerate(lengths):
         # The eager reference feeds the full real window (length + context margin).
+        solo, solo_len = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
+        torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
+def test_context_margin_env_override(bucket_env, monkeypatch):
+    """VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN overrides a class-attribute margin,
+    so a model does not have to declare ``bucketing_context_margin`` at all."""
+    from torch.nn import functional as F
+
+    class ConvContextEncoder(nn.Module):
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            pad = F.pad(x, (0, 0, 1, 1))
+            out = pad[:, : x.size(1)] + pad[:, 1 : x.size(1) + 1] + pad[:, 2 : x.size(1) + 2]
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ConvContextEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN", "2")
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+    assert wrapper._context_margin == 2
+
+    lengths = [40, 120, 150, 75]
+    feats = torch.randn(len(lengths), T, D, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, length + 2 :] += 3.0
+    lens = torch.tensor(lengths, dtype=torch.long)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
+        out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    for row, length in enumerate(lengths):
         solo, solo_len = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
         torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
         assert out_lens[row].item() == solo_len.item()
@@ -804,3 +857,125 @@ def test_encoder_bucket_frames_keep_on_cpu(bucket_env):
                 )
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+def test_bucketing_stays_off_without_seconds_env(monkeypatch):
+    """VLLM_OMNI_AUDIO_BUCKET_SECONDS is the master switch. With it unset the
+    installer wraps nothing and never reads the other knobs, so setting
+    TIME_AXIS / CONTEXT_MARGIN alone cannot change the original forward."""
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS", "2")
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN", "2")
+
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model) == []
+    assert not getattr(model, "_bucketed_installed", False)
+    assert type(model.encoder.forward).__name__ != "_BucketedEncoder"
+
+    # The untouched forward still behaves as the original (records its call).
+    feats = make_features()
+    with torch.inference_mode():
+        out = model.embed_multimodal(
+            audio_features=feats, encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64)
+        )
+    assert out.shape == feats.shape
+
+
+def test_seconds_only_enables_with_default_knobs(bucket_env, monkeypatch):
+    """With only VLLM_OMNI_AUDIO_BUCKET_SECONDS set (no TIME_AXIS / CONTEXT_MARGIN),
+    the feature turns on with the defaults: context margin 0, time axis auto.
+    ``bucket_env`` bypasses the verified-model whitelist so this test isolates the
+    SECONDS master switch."""
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN", raising=False)
+
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+    assert wrapper._context_margin == 0  # default when CONTEXT_MARGIN is unset
+
+
+def test_missing_context_margin_silently_truncates_conv_tail(bucket_env, monkeypatch):
+    """Regression: setting SECONDS but NOT CONTEXT_MARGIN leaves the margin at 0,
+    so a conv front that reads frames beyond the reported length gets its tail
+    zeroed — the bucketed output silently differs from the full-window eager
+    reference (lossy), rather than crashing or warning. This guards against the
+    assumption that "SECONDS alone is enough" for a conv-context encoder."""
+    from torch.nn import functional as F
+
+    monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN", raising=False)
+
+    class ConvContextEncoder(nn.Module):
+        def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_len = x_len.to(x.device)
+            pad = F.pad(x, (0, 0, 1, 1))  # zero-pad the time axis by 1 each side
+            out = pad[:, : x.size(1)] + pad[:, 1 : x.size(1) + 1] + pad[:, 2 : x.size(1) + 2]
+            return out, (x_len + 1) // 2
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = ConvContextEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+    assert wrapper._context_margin == 0  # CONTEXT_MARGIN unset -> default 0
+
+    lengths = [40, 120, 150, 75]
+    feats = torch.randn(len(lengths), T, D, device="cuda")
+    for row, length in enumerate(lengths):
+        feats[row, length + 2 :] += 3.0  # real content in [0, length+2); garbage after
+    lens = torch.tensor(lengths, dtype=torch.long)
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
+        out, _ = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    # The full-window reference reads length+2 frames; with margin 0 the wrapper
+    # copies only `length` frames, so the last valid output (which reads the two
+    # context frames) is computed over zeros and diverges.
+    for row, length in enumerate(lengths):
+        solo, _ = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
+        assert not torch.allclose(out[row, :length], solo[0, :length], rtol=0, atol=1e-6), (
+            f"row {row}: margin=0 must diverge from the full-window reference (silent truncation)"
+        )
+
+
+def _mock_vllm_config(model_type: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)))
+
+
+def test_unverified_model_is_gated_off(monkeypatch):
+    """A model not in the verified whitelist must be gated off (no wrapping, no
+    effect) even when VLLM_OMNI_AUDIO_BUCKET_SECONDS is set. This is the safety
+    guard: an un-adapted encoder must never silently bucket."""
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "0.4,1,2")
+
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=_mock_vllm_config("unverified_model")) == []
+    assert not getattr(model, "_bucketed_installed", False)
+    assert type(model.encoder.forward).__name__ != "_BucketedEncoder"
+
+
+def test_whitelisted_model_gets_verified_knobs(monkeypatch):
+    """A whitelisted model is wrapped with the verified per-model knobs."""
+    from vllm_omni.worker import bucketed_encoder
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "0.4,1,2")
+    monkeypatch.setitem(
+        bucketed_encoder._VERIFIED_MODELS,
+        "test_model",
+        {"context_margin": 2, "time_axis": 2},
+    )
+
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=_mock_vllm_config("test_model")) == ["encoder"]
+    wrapper = model.encoder.forward
+    assert wrapper._context_margin == 2
+    assert wrapper._default_time_axis == 2

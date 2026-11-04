@@ -229,14 +229,10 @@ class AudioEncoder(nn.Module):
     Optimized for 25s audio chunks at 25Hz
     """
 
-    # padding_mels reports ``s.size(1) - 2`` as the valid length but keeps the
-    # two trailing mel frames in the tensor; conv1/conv2 read those frames, so
-    # the length-bucketed wrapper must copy them (not zero them) to stay exact.
-    bucketing_context_margin = 2
-    # Input is channels-first (B, mel, T): time lives on dim 2. Declared so the
-    # wrapper does not have to guess from the length scale (which fails for an
-    # all-short batch, whose longest item is <= the 128 mel bins).
-    bucketing_time_axis = 2
+    # Length bucketing is driven by deployment env vars, not per-model code:
+    #   VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS=2       — channels-first (B, mel, T)
+    #   VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN=2  — conv1/conv2 read 2 extra frames
+    #                                              beyond padding_mels' T-2 length
 
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
         super().__init__()
