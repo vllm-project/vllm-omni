@@ -522,7 +522,7 @@ def generate_synthetic_image(
     """
     Random colored squares on white background. Caches JPEG by ``width`` /
     ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
-    if given, else the default temp subdirectory.
+    if given, else the default temp subdirectory. Cache files are published atomically.
     """
     if seed is not None:
         random.seed(seed)
