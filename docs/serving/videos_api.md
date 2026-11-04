@@ -486,11 +486,16 @@ curl -s http://localhost:8091/v1/videos \
 ### MiniMax H3 Early-Only Video Conditioning (`keep_steps`)
 
 MiniMax H3 Ref2VA requests can drop the video reference after the leading
-denoise steps and finish from the image + text presentation. The reference
-video's rows dominate the packed sequence, but its structural influence —
-layout and motion timing — is absorbed early in the schedule, so later steps
-only need the remaining conditions to finish appearance and detail. Requests
-opt in per call with `keep_steps` in `extra_params`:
+denoise steps and finish from the image + text presentation. This follows the
+[CodeVideoModel](https://github.com/code-video-model/CodeVideoModel)
+[tech report](https://code-video-model.github.io/tech_report.pdf), whose
+text → proxy video → high-fidelity video pipeline introduced the mechanism and
+the `keep_steps` parameter; this port applies it to H3's packed layouts inside
+vLLM-Omni. The reference video's rows dominate the packed sequence, but its
+structural influence — layout and motion timing — is absorbed early in the
+schedule, so later steps only need the remaining conditions to finish
+appearance and detail. Requests opt in per call with `keep_steps` in
+`extra_params`:
 
 ```bash
 curl -s http://localhost:8091/v1/videos/sync \
