@@ -1249,6 +1249,26 @@ async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, w
 
 
 @pytest.mark.asyncio
+async def test_turn_delta_transport_keeps_full_frontend_context():
+    from vllm.sampling_params import SamplingParams
+
+    orchestrator, clients, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    params = SamplingParams(max_tokens=8)
+    state = DuplexOrchestratorRequestState(request_id="r", sampling_params_list=[params])
+    request = build_engine_core_request_from_tokens("r", {"prompt_token_ids": [10, 11, 12, 13]}, params, resumable=True)
+    request.append_prefix_length = 2
+    request.resume_from_full_prompt = True
+    pool = orchestrator.stage_pools[0]
+    await pool.submit_update("r", state, request)
+    wire = clients[0].add_request_calls[0][0]
+    assert wire.prompt_token_ids == [12, 13]
+    assert wire.append_prefix_length == 2
+    assert not wire.resume_from_full_prompt
+    assert pool.output_processor.add_request_calls[0][1]["request"].prompt_token_ids == [10, 11, 12, 13]
+    assert request.prompt_token_ids == [10, 11, 12, 13]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bypass", ["kwargs", "lowercase", "special_tokens", "ordinary", "downstream"])
 async def test_incremental_tokenization_preserves_other_input_paths(monkeypatch, bypass):
     from vllm.renderers.params import TokenizeParams

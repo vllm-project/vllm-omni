@@ -1090,6 +1090,7 @@ class OrchestratorBase:
                     reported_session_errors.add(request_id)
             if isinstance(getattr(eco, "stage_work", None), list):
                 self._collect_duplex_stage_work(stage_id, eco, req_state)
+            self._observe_stage_tokens(stage_id, eco, req_state)
 
         iteration_stats = IterationStats() if self._stat_logger is not None and raw_outputs.outputs else None
         processed = await pool.process_llm_raw_outputs(
@@ -2048,6 +2049,9 @@ class OrchestratorBase:
             return True
         req_state.finished_final_output_stage_ids.add(stage_id)
         return True
+
+    def _observe_stage_tokens(self, stage_id: int, eco: Any, req_state: OrchestratorRequestState) -> None:
+        """Observe accepted raw tokens before output-processor transformations."""
 
     def _collect_duplex_stage_work(
         self,

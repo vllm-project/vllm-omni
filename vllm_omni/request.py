@@ -46,6 +46,7 @@ class OmniRequest(Request):
         model_intermediate_buffer: dict | None = None,
         payload_sender_info: PayloadSenderInfo | None = None,
         resume_from_full_prompt: bool = False,
+        append_prefix_length: int | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -68,6 +69,7 @@ class OmniRequest(Request):
         # Sender's connector address, or the payload itself for run requests.
         self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
         self.resume_from_full_prompt = resume_from_full_prompt
+        self.append_prefix_length = append_prefix_length
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -118,6 +120,7 @@ class OmniRequest(Request):
             payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
+            append_prefix_length=getattr(request, "append_prefix_length", None),
             session_id=request.session_id,
             kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
@@ -144,6 +147,7 @@ class OmniStreamingUpdate:
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict | None = None
     resume_from_full_prompt: bool = False
+    append_prefix_length: int | None = None
     block_hashes: "tuple[BlockHash, ...]" = ()
     cache_salt: str | None = None
 
@@ -160,6 +164,7 @@ class OmniStreamingUpdate:
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
+            append_prefix_length=getattr(request, "append_prefix_length", None),
             block_hashes=tuple(request.block_hashes) if getattr(request, "resume_from_full_prompt", False) else (),
             cache_salt=request.cache_salt,
         )

@@ -152,3 +152,39 @@ def test_cancel_async_continuation_while_old_output_drains():
     assert not scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
     assert not scheduler.waiting and not scheduler.kv_holding_waiting and not scheduler.running
     assert scheduler.num_waiting_for_streaming_input == 0
+
+
+def test_direct_turn_delta_reuses_resident_blocks_without_snapshot_hashes():
+    scheduler = _scheduler()
+    request = _request(list(range(33)))
+    lookahead = _stop_with_in_flight_decode(scheduler, request)
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)[0][:2]
+    update = _request([999, 100, 101])
+    update.append_prefix_length = 34
+    # These are hashes of the suffix alone and cannot match the resident prefix.
+    update.block_hashes.clear()
+    scheduler.add_request(update)
+    assert request.prompt_token_ids == list(range(33)) + [33, 999, 100, 101]
+    assert request.num_computed_tokens == 32
+    assert scheduler.num_waiting_for_streaming_input == 0
+    assert not scheduler.update_from_output(lookahead, _output(request, 777))
+    resumed = scheduler.schedule()
+    assert request.request_id in resumed.finished_req_ids
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id)[0][:2] == blocks
+    scheduler.update_from_output(resumed, _output(request, 888))
+    assert list(request.output_token_ids) == [888]
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_stale_turn_delta_fails_only_its_request(missing):
+    scheduler = _scheduler()
+    if not missing:
+        resident = _request(list(range(33)))
+        _stop_with_in_flight_decode(scheduler, resident)
+    update = _request([999, 100])
+    update.append_prefix_length = 123
+    scheduler.add_request(update)
+    assert "resident" not in scheduler.requests
+    assert "resident" in scheduler._streaming_context_overflow
+    scheduler.add_request(_request([10, 11], request_id="other"))
+    assert scheduler.schedule().num_scheduled_tokens["other"] == 2

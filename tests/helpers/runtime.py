@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TextIO
 
 import numpy as np
 import psutil
@@ -192,6 +192,7 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
+        log_file: TextIO | None = None,
     ) -> None:
         cleanup_test_environment()
         self.startup_timeout = startup_timeout
@@ -199,6 +200,7 @@ class OmniServer:
         self.serve_args = list(serve_args)
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
+        self.log_file = log_file
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
@@ -277,6 +279,8 @@ class OmniServer:
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT if self.log_file is not None else None,
         )
 
         max_wait = self.startup_timeout

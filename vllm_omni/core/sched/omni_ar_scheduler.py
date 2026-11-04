@@ -221,6 +221,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
+        if getattr(request, "append_prefix_length", None) is not None and request.request_id not in self.requests:
+            # A delta cannot bootstrap a missing resident. Fail this request,
+            # never execute a suffix as an independent conversation.
+            super().add_request(request)
+            self._reject_turn_delta(request, "Resident turn prefix is missing; restart the session")
+            return
         super().add_request(request)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
@@ -1626,6 +1632,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
+        if getattr(update, "append_prefix_length", None) is not None:
+            self._resume_from_turn_delta(session, update)
+            return
         if getattr(update, "resume_from_full_prompt", False):
             self._resume_from_full_prompt(session, update)
             return
@@ -1813,7 +1822,47 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
 
-    def _resume_from_full_prompt(self, session: Request, update: StreamingUpdate) -> None:
+    def _reject_turn_delta(self, session: Request, reason: str) -> None:
+        self._streaming_context_overflow[session.request_id] = (session.client_index, reason)
+        self._overflowed_streaming_requests.add(session.request_id)
+        # A queued append may be applied inside stop handling; that caller
+        # already owns the terminal free, as with a context-length overflow.
+        if not session.is_finished():
+            self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
+
+    def _resume_from_turn_delta(self, session: Request, update: StreamingUpdate) -> None:
+        """Append to the actual resident sequence without comparing history hashes."""
+        confirmed = self._get_confirmed_num_computed_tokens(session)
+        if update.append_prefix_length != confirmed or update.cache_salt != session.cache_salt:
+            self._reject_turn_delta(session, "Resident turn prefix changed; restart the session")
+            return
+        features = list(session.mm_features or ())
+        features.extend(
+            replace(feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset + confirmed))
+            for feature in update.mm_features or ()
+        )
+        retained = confirmed // self.cache_config.block_size * self.cache_config.block_size
+        # Replay the partial block for the stage-output cache. Full blocks and
+        # their hashes stay owned by this resident request; only new blocks are
+        # hashed by upstream when it extends the sequence.
+        snapshot = replace(
+            update,
+            prompt_token_ids=list(session._all_token_ids[:confirmed]) + list(update.prompt_token_ids or ()),
+            mm_features=features,
+            block_hashes=tuple(session.block_hashes[: retained // self.hash_block_size]),
+        )
+        self._resume_from_full_prompt(session, snapshot, retained_prefix=retained)
+        logger.debug(
+            "Resident turn delta request=%s prefix=%d appended=%d retained=%d",
+            session.request_id,
+            confirmed,
+            len(update.prompt_token_ids or ()),
+            retained,
+        )
+
+    def _resume_from_full_prompt(
+        self, session: Request, update: StreamingUpdate, *, retained_prefix: int | None = None
+    ) -> None:
         """Continue a committed turn on resident KV, or rebuild a changed history.
 
         Full block hashes include multimodal identities and cache salt. Only
@@ -1825,10 +1874,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return
         block_size = self.cache_config.block_size
         confirmed = session.num_computed_tokens - int(getattr(session, "num_output_placeholders", 0))
-        retained = confirmed // block_size * block_size
+        retained = confirmed // block_size * block_size if retained_prefix is None else retained_prefix
         hash_count = retained // self.hash_block_size
         hashes = getattr(update, "block_hashes", ())
-        can_continue = (
+        can_continue = retained_prefix is not None or (
             retained > 0
             and len(update.prompt_token_ids) > retained
             and len(session.block_hashes) >= hash_count

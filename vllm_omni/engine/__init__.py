@@ -88,6 +88,20 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: PayloadSenderInfo | None = None
     resume_from_full_prompt: bool = False
+    # For turn deltas, frontend token IDs include the resident prefix for
+    # output processing/prewarm; transport sends only the suffix below.
+    # mm_features describe only that suffix and keep suffix-relative offsets.
+    append_prefix_length: int | None = None
+
+    def for_engine_submission(self) -> "OmniEngineCoreRequest":
+        if self.append_prefix_length is None:
+            return self
+        if self.prompt_token_ids is None or not 0 <= self.append_prefix_length < len(self.prompt_token_ids):
+            raise ValueError("Turn append requires a valid resident prefix and non-empty token suffix")
+        request = self.from_request(self)
+        request.prompt_token_ids = self.prompt_token_ids[self.append_prefix_length :]
+        request.resume_from_full_prompt = False
+        return request
 
     @classmethod
     def from_request(
@@ -128,6 +142,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             trace_headers=request.trace_headers,
             resumable=request.resumable,
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
+            append_prefix_length=getattr(request, "append_prefix_length", None),
             external_req_id=request.external_req_id,
             session_id=request.session_id,
             kv_hints=request.kv_hints,

@@ -1114,11 +1114,15 @@ def qwen_duplex_server(request, tmp_path_factory, cached_silero_vad_artifact, ca
     assert resolved.duplex_session.max_sessions == base_session.max_sessions
     model = get_model_prefix() + MODEL
     processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
-    with OmniServer(
-        model,
-        ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600", "--log-stats"],
-        env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts)},
-    ) as server:
+    with (
+        (artifacts / "server.log").open("w") as log_file,
+        OmniServer(
+            model,
+            ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600", "--log-stats"],
+            env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts), "VLLM_LOGGING_LEVEL": "DEBUG"},
+            log_file=log_file,
+        ) as server,
+    ):
         yield _DuplexTestRuntime(server=server, processor=processor, artifacts=artifacts)
 
 
@@ -1651,6 +1655,9 @@ class TestQwen3OmniDuplexPlayback:
         ]
         assert len(requests) == 6
         assert len(set(requests)) == 1, "All six turns must use the same resident Thinker request"
+        assert "Resident turn delta" in (qwen_duplex_server.artifacts / "server.log").read_text(), (
+            "The multi-turn test must exercise direct append, not only full-snapshot fallback"
+        )
 
     @pytest.mark.advanced_model
     @pytest.mark.parametrize(

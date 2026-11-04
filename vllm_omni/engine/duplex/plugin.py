@@ -19,7 +19,7 @@ from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import pybase64 as base64
 
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine import OmniEngineCoreRequest
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
@@ -43,6 +44,17 @@ class DuplexPromptTokenizer(Protocol):
     """Request-owned incremental tokenizer; full media processing stays upstream."""
 
     def tokenize(self, text: str) -> list[int]: ...
+
+
+@runtime_checkable
+class DuplexTurnContinuation(DuplexPromptTokenizer, Protocol):
+    """Model-owned preparation of deltas against an accepted resident turn."""
+
+    def record_output(self, token_ids: list[int], finished: bool) -> None: ...
+
+    def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]: ...
+
+    def complete_turn(self, prompt: dict, request: OmniEngineCoreRequest, prefix: list[int] | None) -> None: ...
 
 
 class DuplexRuntimeConfigError(ValueError):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
@@ -224,7 +225,7 @@ def test_full_prompt_continuation_rebuilds_when_history_shrinks():
     sched._free_request_blocks.assert_called_once_with(session)
 
 
-@pytest.mark.parametrize("change", ["append", "tokens", "audio", "salt", "shrink"])
+@pytest.mark.parametrize("change", ["append", "delta", "tokens", "audio", "salt", "shrink"])
 def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, mocker):
     from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
     from vllm.utils.hashing import get_hash_fn_by_name
@@ -278,7 +279,12 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     )
     fresh.resume_from_full_prompt = True
     update = StreamingUpdate.from_request(fresh)
-    original_offsets = [f.mm_position.offset for f in features]
+    if change == "delta":
+        update.append_prefix_length = 35
+        update.prompt_token_ids = tokens[35:]
+        update.mm_features = [replace(features[-1], mm_position=replace(features[-1].mm_position, offset=5))]
+        update.block_hashes = ()
+    original_offsets = [f.mm_position.offset for f in update.mm_features]
     upstream_update = VLLMScheduler._update_request_as_session
 
     def checked_upstream(scheduler, resident, delta):
@@ -301,7 +307,7 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     sched.log_stats = True
     sched._update_request_as_session(session, update)
 
-    retained = 32 if change == "append" else 0
+    retained = 32 if change in {"append", "delta"} else 0
     upstream.assert_called_once()
     delta = upstream.call_args.args[2]
     assert delta.prompt_token_ids == tokens[retained:]

@@ -27,7 +27,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, PayloadSenderInfo
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest, PayloadSenderInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -1394,7 +1394,10 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request)
+                wire_request = (
+                    request.for_engine_submission() if isinstance(request, OmniEngineCoreRequest) else request
+                )
+                await self._llm_client(replica_id).add_request_async(wire_request)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):

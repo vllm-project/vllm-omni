@@ -38,7 +38,12 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexPromptTokenizer, validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import (
+    DuplexModelPlugin,
+    DuplexPromptTokenizer,
+    DuplexTurnContinuation,
+    validate_duplex_replica_policy,
+)
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -299,6 +304,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
+
+    def _observe_stage_tokens(self, stage_id: int, eco: Any, req_state: OrchestratorRequestState) -> None:
+        if stage_id == 0 and isinstance(req_state, DuplexOrchestratorRequestState):
+            continuation = req_state.turn_prompt_tokenizer
+            if isinstance(continuation, DuplexTurnContinuation):
+                continuation.record_output(list(eco.new_token_ids), bool(eco.is_segment_finished))
 
     def _collect_duplex_stage_work(
         self,
@@ -596,6 +607,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         request_id = kwargs.get("request_id")
         state = self.request_states.get(request_id) if isinstance(request_id, str) else None
         prompt = kwargs.get("prompt")
+        complete_turn = None
+        prefix = None
         if (
             stage_id == 0
             and self.plugin.supports_turn_kv_continuation
@@ -618,18 +631,29 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     state.turn_prompt_tokenizer = self.plugin.create_turn_prompt_tokenizer(tokenizer)
             if state.turn_prompt_tokenizer is not None:
                 prompt_tokenizer = state.turn_prompt_tokenizer
+                prepare_turn = None
+                if isinstance(prompt_tokenizer, DuplexTurnContinuation):
+                    prepare_turn = prompt_tokenizer.prepare_turn
+                    complete_turn = prompt_tokenizer.complete_turn
 
-                def tokenize() -> list[int]:
-                    text = prompt["prompt"]
-                    if defaults is not None:
-                        # Preserve upstream's character-length validation and
-                        # pre-truncation before replacing text with token IDs.
-                        text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
-                    return prompt_tokenizer.tokenize(text)
+                def tokenize() -> tuple[dict, list[int] | None]:
+                    # Tokenizer instances can be shared by stage processors.
+                    # Use the same worker-thread lock as upstream preprocessing.
+                    with self._prompt_processing_lock:
+                        prepared, prefix = prepare_turn(prompt) if prepare_turn is not None else (dict(prompt), None)
+                        prepared = dict(prepared)
+                        text = prepared["prompt"]
+                        if defaults is not None:
+                            # Preserve upstream's character-length validation
+                            # and pre-truncation before replacing text with IDs.
+                            text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
+                        prepared.pop("prompt")
+                        prepared["prompt_token_ids"] = prompt_tokenizer.tokenize(text)
+                        return prepared, prefix
 
                 task = asyncio.create_task(asyncio.to_thread(tokenize))
                 try:
-                    tokens = await asyncio.shield(task)
+                    prepared, prefix = await asyncio.shield(task)
                 except asyncio.CancelledError:
                     # Finish updating this request-owned cache before another
                     # append can acquire the stage's input submission guard.
@@ -643,13 +667,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     if not task.cancelled():
                         task.exception()
                     raise
-                prepared = dict(prompt)
-                prepared.pop("prompt")
-                prepared["prompt_token_ids"] = tokens
-                # Still visit every media item through the upstream processor:
-                # bypassing it desynchronizes sender/receiver cache touches.
                 kwargs["prompt"] = prepared
-        return await super()._process_stage_inputs(stage_id, **kwargs)
+        request = await super()._process_stage_inputs(stage_id, **kwargs)
+        if complete_turn is not None:
+            assert isinstance(prompt, dict)
+            request = OmniEngineCoreRequest.from_request(request)
+            complete_turn(prompt, request, prefix)
+        return request
 
     async def _build_next_stage_request(self, req_id, next_stage_id, next_input, params, **kwargs):
         state = self.request_states.get(req_id)
