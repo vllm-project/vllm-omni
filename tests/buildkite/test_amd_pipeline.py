@@ -1572,6 +1572,7 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         "tests/helpers/client.py",
         "tests/helpers/fixtures/runtime.py",
         "tests/helpers/runtime.py",
+        "tests/helpers/stage_config.py",
     ):
         assert dependency in qwen_deps
     qwen_weekly = "\n".join(_find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)["commands"])
