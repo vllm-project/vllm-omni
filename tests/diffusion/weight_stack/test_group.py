@@ -378,6 +378,21 @@ def test_raise_if_any_failed_returns_when_every_rank_succeeded():
     raise_if_any_failed([RoundMessage.of("point2_ready", 0, None, None)], None)
 
 
+def test_raise_if_any_failed_reports_a_peer_without_an_error_summary():
+    gathered = [
+        RoundMessage.of("point2_ready", 0, None, None),
+        RoundMessage(point="point2_ready", rank=1, ok=False, error=None, payload=None),
+    ]
+    with pytest.raises(PeerFailureError) as exc_info:
+        raise_if_any_failed(gathered, None)
+    assert "rank 1: no error summary" in str(exc_info.value)
+    assert exc_info.value.phase == "point2_ready"
+
+
+def test_raise_if_any_failed_returns_without_any_message():
+    raise_if_any_failed([], None)
+
+
 # ---------------------------------------------------------------------------
 # Point 0: topology assembly
 # ---------------------------------------------------------------------------
@@ -570,6 +585,68 @@ def test_assemble_topology_defaults_missing_stage_id_to_zero():
     payload = Point0Payload(record=object(), coordinates=_coordinates(), deployment=("a" * 32, False))
     ctx = SimpleNamespace(world_size=1, od_config=SimpleNamespace(stage_id=None))
     assert assemble_topology([payload], ctx).stage_id == 0
+
+
+def test_assemble_topology_rejects_a_non_integer_stage_id():
+    payload = Point0Payload(record=object(), coordinates=_coordinates(), deployment=("a" * 32, False))
+    for stage_id in ("0", True, 1.0):
+        ctx = SimpleNamespace(world_size=1, od_config=SimpleNamespace(stage_id=stage_id))
+        with pytest.raises(GroupConfirmationError, match="stage_id must be an int") as exc_info:
+            assemble_topology([payload], ctx)
+        assert exc_info.value.phase == "point0_topology"
+
+
+def test_assemble_topology_rejects_a_payload_without_a_coordinate_record():
+    """The payload crosses ``all_gather_object``; a malformed one must not leak an ``AttributeError``."""
+    for coordinates in ({}, None):
+        payload = Point0Payload(record=object(), coordinates=coordinates, deployment=("a" * 32, False))
+        with pytest.raises(GroupConfirmationError, match="invalid coordinate record") as exc_info:
+            assemble_topology([payload], _ctx(world_size=1))
+        assert exc_info.value.phase == "point0_topology"
+
+
+@pytest.mark.parametrize(("field_name", "value"), [("size", 2.0), ("size", True), ("rank", 1.0), ("rank", False)])
+def test_assemble_topology_rejects_non_integer_coordinate_fields(field_name, value):
+    from dataclasses import replace
+
+    bad_tp = replace(ParallelCoordinate(size=2, rank=1), **{field_name: value})
+    payloads = [
+        Point0Payload(record=object(), coordinates=_coordinates(0, 2), deployment=("a" * 32, False)),
+        Point0Payload(
+            record=object(), coordinates=replace(_coordinates(1, 2), tp=bad_tp), deployment=("a" * 32, False)
+        ),
+    ]
+    with pytest.raises(GroupConfirmationError, match=f"non-integer 'tp' {field_name}") as exc_info:
+        assemble_topology(payloads, _ctx(world_size=2))
+    assert exc_info.value.phase == "point0_topology"
+
+
+def test_assemble_topology_checks_the_product_when_the_hsdp_dimension_is_a_singleton():
+    """An FS group of size 1 overlaps nothing, so the orthogonal product must still cover the replica."""
+    from dataclasses import replace
+
+    payloads = [
+        Point0Payload(
+            record=object(), coordinates=replace(_coordinates(0, 1), fs=WORLD_ONE), deployment=("a" * 32, False)
+        )
+        for _ in range(2)
+    ]
+    with pytest.raises(GroupConfirmationError, match="does not equal the replica world size") as exc_info:
+        assemble_topology(payloads, _ctx(world_size=2))
+    assert exc_info.value.phase == "point0_topology"
+
+
+def test_assemble_topology_accepts_a_singleton_hsdp_dimension_when_the_product_matches():
+    from dataclasses import replace
+
+    payloads = [
+        Point0Payload(
+            record=object(), coordinates=replace(_coordinates(rank, 2), fs=WORLD_ONE), deployment=("a" * 32, False)
+        )
+        for rank in range(2)
+    ]
+    topology = assemble_topology(payloads, _ctx(world_size=2))
+    assert [coordinates.fs for coordinates in topology.coordinates] == [WORLD_ONE, WORLD_ONE]
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +842,19 @@ def test_check_unmatched_policy_keys_message_is_identical_on_every_rank():
             check_unmatched_policy_keys(gathered)
         messages.append(str(exc_info.value))
     assert messages[0] == messages[1]
+
+
+def test_check_unmatched_policy_keys_returns_without_payloads():
+    check_unmatched_policy_keys([])
+
+
+def test_check_unmatched_policy_keys_reports_when_no_rank_declares_a_component():
+    gathered = [
+        _point1(_fingerprints(0), unmatched_policy_keys=frozenset({"ghost"})),
+        _point1(_fingerprints(1), unmatched_policy_keys=frozenset({"ghost"})),
+    ]
+    with pytest.raises(PlanningError, match="declared on this replica: <none>"):
+        check_unmatched_policy_keys(gathered)
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +1067,56 @@ def test_create_allgather_groups_partial_failure_keeps_created_groups_registered
     assert group_table_keys() == frozenset({((0, 1), "gloo")})
 
 
+def test_create_allgather_groups_rejects_a_payload_count_mismatch(monkeypatch):
+    created: list[tuple[tuple[int, ...], str]] = []
+    _patch_fake_dist(monkeypatch, new_group=_recording_new_group(created))
+    fingerprints = [
+        _fingerprints(0, content_identities={"dit": "id"}, collective={"dit": "sig"}),
+        _fingerprints(1, content_identities={"dit": "id"}, collective={"dit": "sig"}),
+    ]
+    with pytest.raises(GroupConfirmationError, match="expected one point-1 payload per rank") as exc_info:
+        create_allgather_groups(fingerprints, [_point1(fingerprints[0])], backend="gloo")
+    assert exc_info.value.phase == "point1_fingerprints"
+    assert created == []
+
+
+def test_create_allgather_groups_requires_an_initialized_process_group(monkeypatch):
+    created: list[tuple[tuple[int, ...], str]] = []
+    _patch_fake_dist(monkeypatch, initialized=False, new_group=_recording_new_group(created))
+    fingerprints = [
+        _fingerprints(0, content_identities={"dit": "id"}, collective={"dit": "sig"}),
+        _fingerprints(1, content_identities={"dit": "id"}, collective={"dit": "sig"}),
+    ]
+    with pytest.raises(GroupConfirmationError, match="require an initialized torch.distributed") as exc_info:
+        create_allgather_groups(fingerprints, [_point1(item) for item in fingerprints], backend="gloo")
+    assert exc_info.value.phase == "point1_fingerprints"
+    assert created == []
+    assert group_table_keys() == frozenset()
+
+
+def test_create_allgather_groups_creates_one_group_per_component_with_identical_members(monkeypatch):
+    """Groups are formed per component, so two components with the same members get one group each.
+
+    The process-level table keeps a single entry per ``(members, backend)`` key, so the earlier
+    group moves to the retired list; both are released exactly once by ``destroy_allgather_groups``.
+    """
+    created: list[tuple[tuple[int, ...], str]] = []
+    destroyed: list[object] = []
+    _patch_fake_dist(monkeypatch, rank=0, new_group=_recording_new_group(created))
+    fingerprints = [
+        _fingerprints(rank, content_identities={"dit": "id", "vae": "id"}, collective={"dit": "sig", "vae": "sig"})
+        for rank in range(2)
+    ]
+
+    groups = create_allgather_groups(fingerprints, [_point1(item) for item in fingerprints], backend="gloo")
+
+    assert created == [((0, 1), "gloo"), ((0, 1), "gloo")]
+    assert groups["dit"][0].group is not groups["vae"][0].group
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", lambda group=None: destroyed.append(group))
+    destroy_allgather_groups()
+    assert {id(group) for group in destroyed} == {id(groups["dit"][0].group), id(groups["vae"][0].group)}
+
+
 def test_destroy_allgather_groups_is_idempotent_and_only_destroys_own_groups(monkeypatch):
     created: list[tuple[tuple[int, ...], str]] = []
     destroyed: list[object] = []
@@ -1007,6 +1147,30 @@ def test_destroy_allgather_groups_clears_records_without_distributed(monkeypatch
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     destroy_allgather_groups()
+    assert group_table_keys() == frozenset()
+
+
+def test_destroy_allgather_groups_keeps_going_after_a_failed_destroy(monkeypatch):
+    created: list[tuple[tuple[int, ...], str]] = []
+    calls: list[object] = []
+    _patch_fake_dist(monkeypatch, rank=0, new_group=_recording_new_group(created))
+    fingerprints = [
+        _fingerprints(rank, content_identities={"dit": "id", "vae": "id"}, collective={"dit": "sig", "vae": "sig"})
+        for rank in range(2)
+    ]
+    groups = create_allgather_groups(fingerprints, [_point1(item) for item in fingerprints], backend="gloo")
+    first = groups["dit"][0].group
+
+    def failing_destroy(group=None):
+        calls.append(group)
+        if group is first:
+            raise RuntimeError("destroy failed")
+
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", failing_destroy)
+    destroy_allgather_groups()
+
+    # One failing group neither stops the destruction of the others nor keeps the table populated.
+    assert len(calls) == 2
     assert group_table_keys() == frozenset()
 
 
@@ -1061,3 +1225,11 @@ def test_from_config_uses_world_group_for_multi_rank(monkeypatch):
     assert channel.world_size == 2
     assert channel.rank == 1
     assert channel.cpu_group is cpu_group
+
+
+def test_from_config_rejects_a_rank_outside_the_replica(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    with pytest.raises(ValueError, match="outside the replica"):
+        GroupConfirmation.from_config(SimpleNamespace(dist_timeout=None), rank=1)

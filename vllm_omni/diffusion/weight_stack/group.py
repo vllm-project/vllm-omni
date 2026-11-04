@@ -690,6 +690,11 @@ def _adopt_deployment_id(gathered: Sequence[Point0Payload]) -> tuple[str, bool]:
 
 def _validate_coordinates(coordinates: Sequence[RankCoordinates], world_size: int) -> None:
     for rank, rank_coordinates in enumerate(coordinates):
+        if not isinstance(rank_coordinates, RankCoordinates):
+            raise GroupConfirmationError(
+                f"rank {rank} reported an invalid coordinate record: {rank_coordinates!r}",
+                phase="point0_topology",
+            )
         for field_name in _REQUIRED_COORDINATES:
             _validate_coordinate(getattr(rank_coordinates, field_name), field_name, rank, world_size)
         for field_name in _OPTIONAL_COORDINATES:
@@ -729,13 +734,15 @@ def _validate_coordinates(coordinates: Sequence[RankCoordinates], world_size: in
                 phase="point0_topology",
             )
 
-    # Without HSDP the orthogonal dimensions are a decomposition of the replica,
-    # so their sizes multiply to the world size.  ``ulysses``/``ring`` are
-    # already contained in ``sp`` and must not be multiplied again.  With HSDP
-    # the FS dimension overlaps the orthogonal ones (pure HSDP uses singleton
-    # tp/sp/pp/cfg/dp groups over the whole world), so the product check does not
-    # apply; the per-dimension uniform-covering checks above still do.
-    if coordinates[0].fs is None:
+    # The orthogonal dimensions are a decomposition of the replica, so their
+    # sizes multiply to the world size.  ``ulysses``/``ring`` are already
+    # contained in ``sp`` and must not be multiplied again.  A multi-rank FS
+    # dimension overlaps the orthogonal ones (pure HSDP uses singleton
+    # tp/sp/pp/cfg/dp groups over the whole world), so the product check does
+    # not apply there; the per-dimension uniform-covering checks above still do.
+    # An FS dimension of size 1 overlaps nothing, so the product still applies.
+    fs_coordinate = coordinates[0].fs
+    if fs_coordinate is None or fs_coordinate.size == 1:
         product = 1
         for field_name in _ORTHOGONAL_COORDINATES:
             product *= getattr(coordinates[0], field_name).size
@@ -756,6 +763,16 @@ def _validate_coordinate(
     if not isinstance(coordinate, ParallelCoordinate):
         raise GroupConfirmationError(
             f"rank {rank} reported an invalid {field_name!r} coordinate: {coordinate!r}",
+            phase="point0_topology",
+        )
+    if isinstance(coordinate.size, bool) or not isinstance(coordinate.size, int):
+        raise GroupConfirmationError(
+            f"rank {rank} reported a non-integer {field_name!r} size: {coordinate.size!r}",
+            phase="point0_topology",
+        )
+    if isinstance(coordinate.rank, bool) or not isinstance(coordinate.rank, int):
+        raise GroupConfirmationError(
+            f"rank {rank} reported a non-integer {field_name!r} rank: {coordinate.rank!r}",
             phase="point0_topology",
         )
     if coordinate.size < 1:
