@@ -27,7 +27,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
-from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import HISTORY_KEY, QwenIncrementalPrompt
+from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import DELTA_KEY, QwenIncrementalPrompt
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -872,6 +872,27 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 params[0].max_tokens = runtime_config["max_tokens"]
         return params
 
+    def can_prepare_turn_delta(
+        self, *, state, payload, history_length: int, runtime_config, previous_runtime_config, extra_body
+    ) -> bool:
+        if any(
+            runtime_config.get(key) != previous_runtime_config.get(key) for key in ("instructions", "initial_user_text")
+        ):
+            return False
+        # Window eviction changes resident context and still requires a snapshot.
+        if any(runtime_config.get(key) for key in ("qwen_tools", "qwen_tool_turns", "qwen_tool_turns_inflight")):
+            return False
+        if extra_body.get("realtime_tools"):
+            return False
+        return history_length <= 16 and (
+            not payload.get("audio")
+            or (
+                len(state.audio_history) < 4
+                and sum(len(value.get("audio", "")) for _, value in state.audio_history) + len(payload.get("audio", ""))
+                <= 8 * 1024 * 1024
+            )
+        )
+
     def prepare_prompt_config(self, config, *, state, payload):
         history = config.get("conversation", [])
         bind_from = 0
@@ -1103,7 +1124,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if not has_audio and payload.get("type") != "conversation":
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
         messages = []
-        if runtime_config.get("instructions"):
+        is_delta = bool(session_config.get("_duplex_turn_delta"))
+        if runtime_config.get("instructions") and not is_delta:
             messages.append({"role": "system", "content": runtime_config["instructions"]})
         history = session_config.get("qwen_messages")
         if history is None and has_audio:
@@ -1161,6 +1183,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if tools:
             template_kwargs["tools"] = tools
         prompt = self.processor.apply_chat_template(messages, **template_kwargs)
+        if is_delta:
+            # Render only the new user unit; the resident already owns the
+            # system prompt and previous assistant tokens.
+            user_start = prompt.index("<|im_start|>user\n")
+            prompt = "<|im_end|>\n" + prompt[user_start:]
         mm = {"audio": audios} if audios else {}
         if images:
             mm["image"] = images
@@ -1195,7 +1222,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             except (OSError, ValueError):
                 logger.exception("Failed to capture Qwen visual input request=%s", request_id)
         prompt_payload: dict[str, object] = {"prompt": prompt, "multi_modal_data": mm}
-        prompt_payload[HISTORY_KEY] = history
+        if is_delta:
+            prompt_payload[DELTA_KEY] = True
         if remaining_tool_turns is not None:
             # Private write-back for the session after a successful submit.
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns

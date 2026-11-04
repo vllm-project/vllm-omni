@@ -694,8 +694,10 @@ before worker delivery state is reset; other sessions remain schedulable. The
 unsupported configurations log a reason and use per-turn requests with ordinary
 prefix caching where available. No separate deployment or session switch is
 required. Commit, playback and VAD policy remain turn-based. A request-owned
-Qwen input ledger records accepted output tokens. Unchanged history with a
-completed assistant boundary sends only newly processed tokens and media to
+Qwen input ledger records accepted output tokens. A session-owned append cursor
+is invalidated by edits to previously submitted history. After checking the
+last heard reply against completed output, the normal path renders only new
+user messages and sends their processed tokens and media to
 EngineCore; resident feature data is reused there, never replayed from frontend
 cache handles. The engine validates the expected prefix length and salt without
 comparing history hashes. APC and hidden-state prefix replay remain enabled.

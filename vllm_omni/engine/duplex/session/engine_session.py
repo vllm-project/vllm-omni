@@ -133,6 +133,8 @@ class PlaybackLedger:
 class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
     revision: int = 0
+    append_cursor: int = 0
+    append_invalidated: bool = True
     #: User items added by ``conversation.item.create`` that no response has
     #: answered yet. A turn can start from these alone, the way the Realtime
     #: protocol allows, without any audio having been committed.
@@ -479,6 +481,38 @@ class DuplexEngineSession:
         placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
         return tuple(dict(message) for message in self._conversation.messages if id(message) not in placeholders)
 
+    def checkpoint_append_history(self, cursor: int) -> None:
+        self._conversation.append_cursor = cursor
+        self._conversation.append_invalidated = False
+
+    @property
+    def history_storage_length(self) -> int:
+        # response.created may already have reserved the reply's empty slot.
+        # It belongs to the output of this append, not to its submitted prefix.
+        messages = self._conversation.messages
+        end = len(messages)
+        while end and not messages[end - 1]:
+            end -= 1
+        return end
+
+    def append_history_tail(self) -> tuple[str, tuple[dict[str, object], ...]] | None:
+        """Return only the completed reply and new user items after the checkpoint."""
+        history = self._conversation
+        if history.append_invalidated or not history.append_cursor:
+            return None
+        tail = [item for item in history.messages[history.append_cursor :] if item]
+        if len(tail) < 2 or tail[0].get("role") != "assistant":
+            return None
+        text = tail[0].get("content")
+        if not isinstance(text, str) or any(item.get("role") != "user" for item in tail[1:]):
+            return None
+        return text, tuple(dict(item) for item in tail[1:])
+
+    def _invalidate_appended_history(self, message: dict[str, object]) -> None:
+        history = self._conversation
+        if any(item is message for item in history.messages[: history.append_cursor]):
+            history.append_invalidated = True
+
     def history_snapshot(self) -> tuple[tuple[dict[str, object], ...], tuple[str | None, ...]]:
         """Snapshot committed messages and their aligned, optional item identities."""
         placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
@@ -560,6 +594,7 @@ class DuplexEngineSession:
         self._conversation.revision += 1
         existing = self._conversation.item_ids.get(item_id)
         if existing is not None:
+            self._invalidate_appended_history(existing)
             if existing is not message:
                 existing.clear()
                 existing.update(message)
@@ -567,6 +602,7 @@ class DuplexEngineSession:
 
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
         if placeholder is not None:
+            self._invalidate_appended_history(placeholder)
             for index, candidate in enumerate(self._conversation.messages):
                 if candidate is placeholder:
                     self._conversation.messages[index] = message
@@ -582,6 +618,7 @@ class DuplexEngineSession:
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
         if placeholder is None:
             return False
+        self._invalidate_appended_history(placeholder)
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not placeholder
         ]
@@ -870,6 +907,7 @@ class DuplexEngineSession:
         if "transcript" in message or "transcript" in audio_part:
             return False
         audio_part["transcript"] = transcript
+        self._invalidate_appended_history(message)
         message["transcript"] = transcript
         self._conversation.revision += 1
         return True
@@ -1640,6 +1678,7 @@ class DuplexEngineSession:
         if message is None:
             return pending is not None or removed_placeholder or audio_only
         self._conversation.revision += 1
+        self._conversation.append_invalidated = True
         # Distinct response items can have identical (including empty) content.
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not message
@@ -1762,6 +1801,7 @@ class DuplexEngineSession:
             playback=playback,
         )
         if changed:
+            self._invalidate_appended_history(message)
             self._conversation.revision += 1
         # Explicit truncation clears content, not the turn. The command also
         # sends a playback ACK, which must still find this item even at zero.

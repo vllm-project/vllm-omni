@@ -185,6 +185,8 @@ class ModelChannel:
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
+        self._append_runtime_config: dict[str, object] = {}
+        self._append_request_id: str | None = None
 
     def is_input_transcription(self, request_id: str) -> bool:
         return request_id in self._input_transcriptions
@@ -424,12 +426,39 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
-            conversation, conversation_item_ids = session.history_snapshot()
+            history_cursor = session.history_storage_length
+            history_revision = session.history_revision
+            tail = session.append_history_tail() if turn_continuation and already_submitted else None
+            use_delta = False
+            if (
+                tail is not None
+                and self._append_request_id == request_id
+                and self._ctx.plugin.can_prepare_turn_delta(
+                    state=self._ctx.model_state,
+                    payload=prompt_payload,
+                    history_length=history_cursor,
+                    runtime_config=request_context.runtime_config,
+                    previous_runtime_config=self._append_runtime_config,
+                    extra_body=session.response_config.extra_body,
+                )
+            ):
+                use_delta = await self._ctx.stage_port.can_append_turn(request_id, tail[0])
+                # The eligibility check yields; never use a stale history view.
+                use_delta = use_delta and session.history_revision == history_revision
+            conversation_item_ids: tuple[str | None, ...]
+            if use_delta:
+                assert tail is not None
+                conversation, conversation_item_ids = tail[1], ()
+            else:
+                conversation, conversation_item_ids = session.history_snapshot()
+                history_cursor = session.history_storage_length
+                history_revision = session.history_revision
             prompt_session = {
                 **request_context.session_config,
                 "conversation": list(conversation),
                 "conversation_item_ids": conversation_item_ids,
                 "modalities": list(session.response_config.modalities),
+                "_duplex_turn_delta": use_delta,
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
@@ -449,6 +478,8 @@ class ModelChannel:
                 sampling_params=request_context.stage_sampling_params,
             )
             # Preparation may yield while cancellation or session teardown runs.
+            if use_delta and session.history_revision != history_revision:
+                raise DuplexInputCapacityError("Conversation changed during turn preparation; retry the response")
             # Never submit the worker's stale result to the model.
             if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
                 raise DuplexFenceMismatchError(session.fence, fence)
@@ -510,6 +541,10 @@ class ModelChannel:
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
+                if turn_continuation and session.history_revision == history_revision:
+                    session.checkpoint_append_history(history_cursor)
+                    self._append_request_id = request_id
+                    self._append_runtime_config = dict(request_context.runtime_config)
             except BaseException:
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)

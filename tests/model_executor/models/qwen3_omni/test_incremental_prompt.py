@@ -89,31 +89,21 @@ def test_no_chat_boundary_clears_previous_prefix(tokenizer):
     assert encode.call_args_list[0].args[0] == prompt
 
 
-@pytest.mark.parametrize("change", [None, "unlisted_start", "audio", "assistant", "system", "prune", "unfinished"])
+@pytest.mark.parametrize("change", [None, "unlisted_start", "assistant", "unfinished"])
 def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
     from vllm.sampling_params import SamplingParams
 
     from vllm_omni.engine import OmniEngineCoreRequest
-    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import HISTORY_KEY
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import DELTA_KEY
 
-    if change == "unlisted_start":
+    class UnlistedStartTokenizer:
+        all_special_tokens = [token for token in tokenizer.all_special_tokens if token != "<|im_start|>"]
 
-        class UnlistedStartTokenizer:
-            # vLLM's real Qwen CachedTokenizer encodes im_start atomically but
-            # does not list it among all_special_tokens.
-            all_special_tokens = [token for token in tokenizer.all_special_tokens if token != "<|im_start|>"]
+        def __getattr__(self, name):
+            return getattr(tokenizer, name)
 
-            def __getattr__(self, name):
-                return getattr(tokenizer, name)
-
-        cache = QwenIncrementalPrompt(UnlistedStartTokenizer())
-    else:
-        cache = QwenIncrementalPrompt(tokenizer)
-    first: dict = {
-        "prompt": "<|im_start|>user\naudio<|im_end|>\n<|im_start|>assistant\n",
-        "multi_modal_data": {"audio": ["old audio"]},
-        HISTORY_KEY: [{"role": "user", "audio_payload": "old audio"}],
-    }
+    cache = QwenIncrementalPrompt(UnlistedStartTokenizer() if change == "unlisted_start" else tokenizer)
+    first = {"prompt": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"}
     request = OmniEngineCoreRequest(
         request_id="r",
         prompt_token_ids=[11, 12, 13],
@@ -131,33 +121,23 @@ def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
     cache.record_output(generated, False)
     cache.record_output([tokenizer.convert_tokens_to_ids("<|im_end|>")], change != "unfinished")
     answer = tokenizer.decode(generated, skip_special_tokens=False)
-    second: dict = {
-        "prompt": first["prompt"] + answer + "<|im_end|>\n<|im_start|>user\nimage<|im_end|>\n<|im_start|>assistant\n",
-        "multi_modal_data": {"audio": ["old audio", "new audio"], "image": ["new image"]},
-        "multi_modal_uuids": {"audio": ["rep0:old", "rep0:new"], "image": ["rep0:image"]},
-        HISTORY_KEY: first[HISTORY_KEY]
-        + [{"role": "assistant", "content": answer}, {"role": "user", "content": "image"}],
-    }
-    if change == "audio":
-        second[HISTORY_KEY][0] = {"role": "user", "audio_payload": "edited audio"}
-    elif change == "assistant":
-        second["prompt"] = second["prompt"].replace(answer, "changed answer")
-    elif change == "system":
-        second["prompt"] = "system change" + second["prompt"]
-    elif change == "prune":
-        second[HISTORY_KEY] = second[HISTORY_KEY][1:]
-    prepared, prefix = cache.prepare_turn(second)
-    if change not in {None, "unlisted_start"}:
-        assert prefix is None
-        assert prepared is second
+    assert cache.can_append_turn("changed" if change == "assistant" else answer) == (
+        change not in {"assistant", "unfinished"}
+    )
+    if change in {"assistant", "unfinished"}:
+        assert cache.prepare_turn(first) == (first, None)
         return
+    delta = {
+        DELTA_KEY: True,
+        "prompt": "<|im_end|>\n<|im_start|>user\nnew",
+        "multi_modal_data": {"audio": ["new audio"]},
+        "multi_modal_uuids": {"audio": ["rep0:new"]},
+    }
+    prepared, prefix = cache.prepare_turn(delta)
+    assert prepared is delta
     assert prefix == [11, 12, 13] + generated
-    assert prepared["multi_modal_data"] == {"audio": ["new audio"], "image": ["new image"]}
-    assert prepared["multi_modal_uuids"] == {"audio": ["rep0:new"], "image": ["rep0:image"]}
-    assert second["multi_modal_uuids"]["audio"] == ["rep0:old", "rep0:new"]
-    assert prepared["prompt"].startswith("<|im_end|>\n<|im_start|>user")
     request.prompt_token_ids = [21, 22]
-    cache.complete_turn(second, request, prefix)
+    cache.complete_turn(delta, request, prefix)
     assert request.prompt_token_ids == prefix + [21, 22]
     assert request.for_engine_submission().prompt_token_ids == [21, 22]
-    assert request.prompt_token_ids == prefix + [21, 22]  # frontend snapshot is immutable to transport
+    assert request.prompt_token_ids == prefix + [21, 22]

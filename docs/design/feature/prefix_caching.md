@@ -55,8 +55,11 @@ matching prefixes in that path. Non-CUDA profile overrides disable caching.
 Talker and Code2Wav remain per-turn, with caching disabled.
 
 The normal resident path appends new tokens and media to the actual generated
-sequence. An input ledger checks unchanged history and the completed assistant
-boundary before preparing a delta. EngineCore validates the resident prefix
+sequence. A session cursor selects only new user messages; edits to submitted
+history invalidate it. The token ledger checks the latest heard reply against
+completed output before rendering a delta, without rebuilding old history or
+decoding old media. Window eviction and tool turns use a full snapshot.
+EngineCore validates the resident prefix
 length and salt, without comparing history block hashes. Old materialized media
 remain in the resident request; only new media touch the sender/receiver caches.
 APC stays enabled and upstream maintains hashes for newly completed blocks.

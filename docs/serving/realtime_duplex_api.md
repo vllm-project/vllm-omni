@@ -77,16 +77,18 @@ work. Budget host RAM for the
 for resident KV.
 
 The Thinker request and its KV allocation survive a completed turn. Each new
-commit still renders the current history to check that earlier conversation
-content is unchanged. A request-owned input ledger records the actual accepted
-Thinker output token IDs. After a completed `<|im_end|>` turn, if the history and
-rendered assistant text agree with that ledger, only the new text and media
-are processed. The wire request contains only the new tokens and multimodal
+commit uses the session's append cursor to select only the new user messages.
+Mutations of already submitted history invalidate that cursor. The stage port
+checks the latest heard assistant text against the actual completed output
+before the plugin constructs a suffix-only prompt. Normal turns do not build a
+full history snapshot, render old messages, or decode old media.
+
+The request-owned input ledger retains actual accepted token IDs, not old
+message snapshots. The wire request contains only new tokens and multimodal
 features, plus the expected resident prefix length. The sampled terminator is
 re-injected exactly once because upstream discards the final uncomputed sample.
-Old media features remain owned by EngineCore; both multimodal caches visit
-only the new media. Frontend output processing and downstream prewarm retain
-the complete token context, including the actual previously generated IDs.
+Frontend output processing and downstream prewarm retain the complete token
+context. Old materialized media remain in EngineCore.
 
 The direct-append path validates the resident prefix length and cache salt,
 then extends the existing request without comparing full-history block hashes.
@@ -95,7 +97,8 @@ and Omni replays complete cached hidden-state blocks for Talker. The partial
 block tail is recomputed. A missing or stale resident fails only that request.
 
 Changed/pruned history, playback-truncated text, or an unsupported completion
-boundary falls back to full-snapshot processing. Its tokenizer can reuse a
+boundary falls back to full-snapshot processing. Tool turns, changed prompt
+settings and the existing message/audio window limits also use that fallback. Its tokenizer can reuse a
 matching special-token prefix. For this fallback, the scheduler compares block
 hashes against the resident request: when all
 completed blocks match and the new prompt extends them, it retains those KV

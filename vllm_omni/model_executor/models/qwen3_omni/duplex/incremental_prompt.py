@@ -10,7 +10,7 @@ from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.engine import OmniEngineCoreRequest
 
-HISTORY_KEY = "_qwen_append_history"
+DELTA_KEY = "_qwen_turn_delta"
 
 
 class QwenIncrementalPrompt:
@@ -22,89 +22,42 @@ class QwenIncrementalPrompt:
         self.tokenizer = tokenizer
         self._prefix = ""
         self._prefix_ids: list[int] = []
-        self._history: list | None = None
-        self._prompt_text = ""
         self._prompt_ids: list[int] = []
         self._output_ids: list[int] = []
         self._finished = False
-        self._media_counts: dict[str, int] = {}
         self._append_safe = False
 
     def record_output(self, token_ids: list[int], finished: bool) -> None:
         self._output_ids.extend(token_ids)
         self._finished = self._finished or finished
 
-    def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]:
-        """Authorize an append from immutable history and actual sampled IDs.
-
-        Only the new media visit the sender cache. The matching receiver thus
-        sees precisely the same accesses; old materialized features stay owned
-        by the resident EngineCore request.
-        """
-        history = prompt.get(HISTORY_KEY)
+    def can_append_turn(self, assistant_text: str) -> bool:
         end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        if (
-            not self._append_safe
-            or "<|im_end|>" not in self.tokenizer.all_special_tokens
-            or self._history is None
-            or not isinstance(history, list)
-            or history[: len(self._history)] != self._history
-            or not self._finished
-            or not self._output_ids
-            or self._output_ids[-1] != end_id
-            or self.tokenizer.encode("<|im_end|>", add_special_tokens=False) != [end_id]
-        ):
-            return prompt, None
-        # Playback truncation, edited assistant text, tools inserted into old
-        # context, or a changed system prompt must rebuild, not silently append.
-        answer = self.tokenizer.decode(self._output_ids[:-1], skip_special_tokens=False)
-        closed = self._prompt_text + answer + "<|im_end|>\n"
-        text = prompt["prompt"]
-        if not text.startswith(closed):
-            return prompt, None
-        media = prompt.get("multi_modal_data") or {}
-        if any(not isinstance(items, list) for items in media.values()):
-            return prompt, None
-        if any(len(media.get(kind, [])) < count for kind, count in self._media_counts.items()):
-            return prompt, None
-        uuids = prompt.get("multi_modal_uuids")
-        if uuids is not None and (
-            not isinstance(uuids, dict)
-            or any(
-                kind not in media or not isinstance(ids, list) or len(ids) != len(media[kind])
-                for kind, ids in uuids.items()
-            )
-        ):
-            return prompt, None
-        prepared = dict(prompt)
-        # Upstream drops the final uncomputed sample. Re-inject that terminator
-        # exactly once, followed by the new conversation content.
-        prepared["prompt"] = "<|im_end|>\n" + text[len(closed) :]
-        prepared["multi_modal_data"] = {
-            kind: items[self._media_counts.get(kind, 0) :]
-            for kind, items in media.items()
-            if len(items) > self._media_counts.get(kind, 0)
-        }
-        if uuids is not None:
-            # Replica scoping ran before this hook. Keep UUIDs aligned with the
-            # sliced media, otherwise the new item could reuse an old cache key.
-            prepared["multi_modal_uuids"] = {
-                kind: ids[self._media_counts.get(kind, 0) :]
-                for kind, ids in uuids.items()
-                if kind in prepared["multi_modal_data"]
-            }
-        return prepared, self._prompt_ids + self._output_ids[:-1]
+        return bool(
+            self._append_safe
+            and self._finished
+            and self._output_ids
+            and self._output_ids[-1] == end_id
+            and "<|im_end|>" in self.tokenizer.all_special_tokens
+            and self.tokenizer.encode("<|im_end|>", add_special_tokens=False) == [end_id]
+            and self.tokenizer.decode(self._output_ids[:-1], skip_special_tokens=False) == assistant_text
+        )
+
+    def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]:
+        """Use the session-authorized delta, or process a replacement snapshot."""
+        if prompt.get(DELTA_KEY):
+            if not self._finished or not self._output_ids or not self._append_safe:
+                raise ValueError("Turn delta has no completed resident token ledger")
+            return prompt, self._prompt_ids + self._output_ids[:-1]
+        return prompt, None
 
     def complete_turn(self, prompt: dict, request: OmniEngineCoreRequest, prefix: list[int] | None) -> None:
         if prefix is not None:
             request.append_prefix_length = len(prefix)
             request.prompt_token_ids = prefix + (request.prompt_token_ids or [])
-        self._history = prompt.get(HISTORY_KEY)
-        self._prompt_text = prompt["prompt"]
         self._prompt_ids = list(request.prompt_token_ids or ())
         self._output_ids = []
         self._finished = False
-        self._media_counts = {kind: len(items) for kind, items in (prompt.get("multi_modal_data") or {}).items()}
 
     def _encode_full(self, text: str) -> list[int]:
         ids = self.tokenizer.encode(text, add_special_tokens=True)
