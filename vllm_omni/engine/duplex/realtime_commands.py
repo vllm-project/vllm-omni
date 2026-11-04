@@ -35,6 +35,7 @@ from vllm_omni.engine.duplex.commands import (
     BargeIn,
     CancelInput,
     CancelResponse,
+    CancelToolCall,
     ClearInput,
     ClearOutputAudio,
     CloseSession,
@@ -292,6 +293,21 @@ def translate_realtime_command(
 
     if event_type == "input.cancel":
         return CancelInput(event_id=event_id)
+
+    if event_type == "tool_call.cancel":
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise DuplexCommandError(
+                "tool_call.cancel requires call_id", code="invalid_tool_call_cancel", event_id=event_id
+            )
+        reason = payload.get("reason", "cancelled")
+        if reason not in ("cancelled", "failed"):
+            raise DuplexCommandError(
+                "tool_call.cancel reason must be cancelled or failed",
+                code="invalid_tool_call_cancel",
+                event_id=event_id,
+            )
+        return CancelToolCall(event_id=event_id, call_id=call_id, reason=str(reason))
 
     if event_type == "barge_in":
         return BargeIn(event_id=event_id)

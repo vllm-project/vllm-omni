@@ -151,4 +151,5 @@ async def test_missing_context_refusals_preserve_the_original_deadline(monkeypat
         await h.settle()
         assert call.state is ToolCallState.TIMED_OUT
         assert error_codes(await answer(h, call_id)) == ["invalid_function_call_output"]
-        assert generation(h) == 0
+        # One notice for each call that timed out; no refused result was queued.
+        assert generation(h) == 2

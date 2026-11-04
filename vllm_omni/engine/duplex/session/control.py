@@ -23,8 +23,10 @@ from copy import deepcopy
 
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex.commands import CancelToolCall
 from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_history_message
-from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.contracts import ToolCallAbandonReason
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_session_tools
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto_responds
@@ -319,6 +321,11 @@ class SessionControl:
             # Still before the live session adopts the candidate. A stamped
             # error means nothing was applied, including a staged detector.
             self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            return
+        try:
+            validate_session_tools(session.capabilities, candidate_config.extra_body)
+        except DuplexRuntimeConfigError as exc:
+            self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
             return
         # Also when the update only turns auto_response on under a live semantic_vad.
         unsupported = self._semantic_vad_unsupported(
@@ -650,6 +657,23 @@ class SessionControl:
                 ),
                 name="duplex-continue",
             )
+
+    def on_tool_call_cancel(self, command: CancelToolCall) -> None:
+        """End one pending call for the client. Any tool output stays with the client."""
+        reason = (
+            ToolCallAbandonReason.CLIENT_FAILED
+            if command.reason == "failed"
+            else ToolCallAbandonReason.CLIENT_CANCELLED
+        )
+        rejection = self._ctx.tool_calls.cancel(command.call_id, reason=reason, epoch=self._ctx.session.epoch)
+        if rejection is None:
+            return
+        message = (
+            f"tool_call.cancel requires a function call this session exposed, got {command.call_id}"
+            if rejection is ToolCallRejection.UNKNOWN
+            else f"function call {command.call_id} has already settled"
+        )
+        self._out.emit_error("invalid_tool_call_cancel", message, event_id=command.event_id)
 
     def _reject_function_call_output(self, reason: ToolCallRejection, call_id: object, *, event_id: object) -> None:
         """Report a refused result with the wire shape the public contract kept.

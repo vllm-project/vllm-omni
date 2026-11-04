@@ -10,6 +10,7 @@ implements for the session manager/runner.
 from __future__ import annotations
 
 import base64
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -257,6 +258,8 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 
 
 __all__ = [
+    "ToolCallAbandonReason",
+    "abandoned_tool_call_notice",
     "DuplexFence",
     "DuplexAppendPlan",
     "DuplexOutputAction",
@@ -275,3 +278,26 @@ __all__ = [
     "duplex_same_turn_request_ids",
     "duplex_session_id_from_request_id",
 ]
+
+
+class ToolCallAbandonReason(str, Enum):
+    """Why a call ended without a usable result, or was refused as a repeat."""
+
+    TIMEOUT = "timeout"
+    EPOCH_CANCELLED = "epoch_cancelled"
+    CLIENT_CANCELLED = "client_cancelled"
+    CLIENT_FAILED = "client_failed"
+    #: Not a settlement: a repeat of an abandoned call, never exposed or recorded.
+    SUPPRESSED = "suppressed"
+
+
+def abandoned_tool_call_notice(reason: ToolCallAbandonReason) -> str:
+    """The fixed status a plugin shows the model. It never carries client text."""
+    return json.dumps(
+        {
+            "status": "abandoned",
+            "reason": reason.value,
+            "instruction": "This tool call did not complete. Do not call it again unless the user asks.",
+        },
+        separators=(",", ":"),
+    )

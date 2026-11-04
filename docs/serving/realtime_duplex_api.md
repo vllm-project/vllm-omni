@@ -791,7 +791,7 @@ two events the call is *pending*, and it settles exactly once:
 | --- | --- |
 | `accepted` | the result was admitted and the item was created |
 | `timed_out` | the deadline passed (only when `tool_result_timeout_s` is set) |
-| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`) |
+| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`), or the client sent `tool_call.cancel` |
 
 Admission is authoritative per session, and it is about the *call*, not about
 conversation history: only a call this session exposed can be answered, and only
@@ -834,19 +834,89 @@ the call as timed out at most once, and that settlement emits one `error`
 with `code: "tool_result_timeout"` naming the expired `call_id`. When
 admission settles it, the correlated `invalid_function_call_output` is also
 present. The notices have no promised order. No business result is fabricated,
-and input keeps flowing. If the model emits another call in the same session,
-including the same turn, that call can be answered normally. Closing the
+and input keeps flowing. If the model emits a different call in the same
+session, including the same turn, that call can be answered normally; an
+identical call is refused as described under "Repeated calls". Closing the
 session disarms every pending deadline.
 
-This deadline settles the session ledger and rejects late results; it does not
-by itself make the model abandon a call or guarantee that it emits another one.
-Model recovery requires an adapter implementation of
-`runtime_config_for_tool_call_timeout`. The native Nemotron adapter currently
-inherits the no-op hook, so enabling its deadline does not guarantee native
-timeout recovery. The session admission and settlement support here is also
-separate from Qwen tool-result delivery in
-[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); this runtime change
-alone does not establish Qwen tool-call end-to-end support.
+This deadline settles the session ledger and rejects late results. It does not
+by itself make the model abandon a call or guarantee that it emits another one;
+the notice and repeat guard below address that, and how a model responds to a
+notice depends on the model.
+
+**Ending a call from the client.** Send `tool_call.cancel` to end one pending
+call. `reason` is `cancelled` (the default) or `failed`. Report a failed tool
+this way rather than sending its error as `function_call_output`: the session
+cannot tell an error string from a result, and would pass it to the model. A
+`call_id` that is unknown or already settled gets `invalid_tool_call_cancel`.
+
+**Knowing a call ended.** Every call that ends without a result produces
+`duplex.tool_call.settled`, whose `event` body carries `call_id`, `state`
+(`timed_out` or `cancelled`), `reason` (`timeout`, `epoch_cancelled`,
+`client_cancelled` or `client_failed`) and `epoch`. Stop the tool and discard its
+result when this arrives.
+
+**Repeated calls.** A timed-out or cancelled call blocks later calls with the same
+name and arguments, compared as JSON so key order does not matter. A blocked call
+is not published or recorded; the client gets `duplex.tool_call.suppressed`, whose
+`event` body carries `name`, `arguments`, `blocked_by_call_id` and `epoch`. A
+retry with different arguments is not blocked.
+
+`extra_body.tool_retry_policy` sets when a block lifts. It is fixed at session
+open.
+
+| Value | Meaning |
+| --- | --- |
+| `user_turn` (default) | The next user turn lifts the block, on models with `capabilities.clears_tool_block_on_user_commit`. On other models it lasts for the session, because they have no reliable user-turn boundary. |
+| `never` | The block lasts for the session. |
+
+**Notices.** The session also shows the model a fixed status saying the call did
+not complete, through the plugin hook `runtime_config_for_abandoned_tool_call`.
+It never contains client text.
+
+| Model | How the model sees it |
+| --- | --- |
+| Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
+| Nemotron VoiceChat | On the function channel of the open request, except after an epoch cancellation. |
+| JoyAI-VL-Interaction | As a delegated result on the next observation, except after an epoch cancellation or a suppressed repeat. |
+
+**Interruptions.** `extra_body.tool_interrupt_policy` sets what an epoch advance
+does to pending calls. It is fixed at session open. With `cancel` (the default),
+they settle as `cancelled`. With `keep`, they stay pending and can still be
+answered, so only the deadline, `tool_call.cancel` or close ends them. A result
+already accepted follows the model's existing retirement rules either way.
+
+**Discovering what a model supports.** `capabilities` reports these fields:
+
+| Field | Values |
+| --- | --- |
+| `tool_call_mode` | `none`, `declared` (client-defined tools) or `delegate_only` (only the model's `delegate` function) |
+| `tool_result_continuation` | What turns an accepted result into output: `client_response_create`, `automatic`, `next_observation`, or `none` |
+| `max_tools` | Most tools one session may declare, or `null` for no model limit |
+| `clears_tool_block_on_user_commit` | Whether `tool_retry_policy: user_turn` can lift a block |
+
+Non-empty `tools` on a `none` model is refused with `tools_unsupported`.
+`tool_choice` other than `auto` is refused with `unsupported_tool_choice`, because
+no duplex model honours it.
+
+**Client library.** `DuplexClientBase.send_tool_result` and `cancel_tool_call`
+send these events. `vllm_omni.clients.tool_calls.DuplexToolRunner` runs each tool
+in its own task, so audio keeps streaming; reports failures with
+`tool_call.cancel`; stops a tool when its call settles; and sends `response.create`
+only when the model needs it. Pass `tool_session_defaults()` as `extra_body` when
+opening the session to keep pending tools across an interruption.
+
+```python
+from vllm_omni.clients.duplex import DuplexClient, SessionConfig
+from vllm_omni.clients.tool_calls import DuplexToolRunner, tool_session_defaults
+
+async def get_weather(arguments: dict[str, object]) -> str:
+    return "25C"
+
+config = SessionConfig(extra_body=tool_session_defaults())
+async with DuplexClient("ws://127.0.0.1:8099/v1/realtime", model="Qwen/Qwen3-Omni-30B-A3B-Instruct", config=config) as client:
+    await DuplexToolRunner(client, {"get_weather": get_weather}).run()
+```
 
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
@@ -1175,6 +1245,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input.commit` | 3 | Alias of `input_audio_buffer.commit` accepted by the runner. |
 | `input_audio_buffer.clear` | 1 | Drop un-committed input audio. |
 | `input.cancel` | 3 | Cancel pending input; advances `epoch`. |
+| `tool_call.cancel` | 3 | End one pending function call (`call_id`, `reason`: `cancelled` or `failed`). |
 | `input.text.append` | 3 | Append text input; model-native sessions reject it with `native_text_append_unsupported`. |
 | `conversation.item.create` | 1 | Add a completed user item (text, audio, or `function_call_output`) to history. |
 | `conversation.item.retrieve` | 1 | Fetch a stored item by id. |
@@ -1229,6 +1300,8 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.function_call_arguments.delta` | 1 | Tool-call arguments delta (Nemotron VoiceChat). |
 | `response.function_call_arguments.done` | 1 | Tool-call arguments complete. |
 | `duplex.function_call.done` | 3 | Raw fallback when a model tool call is malformed. |
+| `duplex.tool_call.settled` | 3 | A function call ended without a result; details under `event`. |
+| `duplex.tool_call.suppressed` | 3 | The session refused to publish a repeat of an abandoned call; details under `event`. |
 | `output_audio_buffer.cleared` | 1 | Reply to `output_audio_buffer.clear`. |
 | `playback.acknowledged` | 3 | Reply to `playback.ack`; returns the playback ledger and `history_committed`. |
 | `overlap.decision` | 3 | How an append that overlapped an active response was handled (`drop` \| `listen` \| `barge_in`); details under `metadata`. |
