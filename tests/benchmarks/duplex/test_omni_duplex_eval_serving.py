@@ -761,10 +761,13 @@ async def test_padding_listens_do_not_reset_the_drain_quiet_window(tmp_path, pre
 
     monkeypatch.setattr(runner, "wait_for", bounded_wait)
 
+    sent_listens: list[dict] = []
+
     async def listen_every(socket, interval):
         while True:
             await asyncio.sleep(interval)
             listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+            sent_listens.append(listen)
             await socket.send(json.dumps(listen))
 
     async def handler(socket):
@@ -798,10 +801,52 @@ async def test_padding_listens_do_not_reset_the_drain_quiet_window(tmp_path, pre
         output = await patch.async_request_openai_realtime_duplex(request, session=None)
     assert output.success is True
     assert output.duplex_eval_result.metadata["drain_timeout"] is None
+    # The exclusion is only exercised if padding listens actually landed after
+    # the commit; a fake whose listen task never ran would pass vacuously.
+    assert sent_listens
     summary = adapter.finalize_duplex_eval([sample], [output])
     assert summary["published"] == 1
     response = json.loads(output.duplex_eval_result.output.read_text())
     assert response["sentences"][0]["sentence"] == "Earlier."
+
+
+@pytest.mark.asyncio
+async def test_drain_settles_when_the_committed_clip_gets_only_a_listen(tmp_path, prepared, monkeypatch):
+    """A model that answers the committed clip by listening still settles.
+
+    The only post-commit event is the server's model-listen acknowledgement, so
+    the quiet window never sees activity; the residual decision must come from
+    that listen and settle the drain instead of holding it to ``drain_timeout``.
+    """
+    sample = _samples(tmp_path)[0]
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.15)
+    original_wait = runner.wait_for
+
+    async def bounded_wait(predicate, **kwargs):
+        await original_wait(predicate, timeout_s=0.8, label=kwargs["label"])
+
+    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+
+    async def handler(socket):
+        async for raw in socket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                # No response is created for the clip: the model listens.
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await socket.send(json.dumps(listen))
+            elif event["type"] == "session.close":
+                await socket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success is True
+    assert output.duplex_eval_result.metadata["drain_timeout"] is None
 
 
 @pytest.mark.asyncio

@@ -106,12 +106,14 @@ _COMPLETION_ACTIVITY = frozenset(
         "response.text.delta",
     }
 )
-# In 'none' mode the client sends nothing but silence padding after the
-# commit, so a `response.listen` from then on is the server acknowledging
-# that padding rather than the reply moving forward. Counting it lets every
-# padded step reset the quiet window and leaves each drain to end at its
-# timeout (measured against the real MiniCPM-o server: one listen per
-# padded unit).
+# After the commit the client sends nothing but silence padding (the padded
+# path is only taken when the server does not drive turns), so a
+# `response.listen` from then on is the server acknowledging that padding
+# rather than the reply moving forward. Counting it lets every padded step
+# reset the quiet window and leaves each drain to end at its timeout
+# (measured against the real MiniCPM-o server: one listen per padded unit).
+# No runtime mode check is needed here: `responses_finished` is only reachable
+# through the padding path, which is selected when `server_turns` is false.
 _DRAIN_ACTIVITY = _COMPLETION_ACTIVITY - {"response.listen"}
 
 
@@ -597,10 +599,11 @@ async def _pad_silence_until_stopped(client, period_ms: int, stop: asyncio.Event
 
     The step loop is driven by the frames the client appends, which stop at EOF.
     The append goes through the client's own ``append_silence`` — the same event
-    shape streaming sends — so non-speech units are expected to produce no
-    ``response.listen``/delta events and not to reset the completion activity
-    window. If drains start ending at ``_drain_timeout_s`` after this padding,
-    check what a padded unit produces server-side first.
+    shape streaming sends. The server acknowledges every padded unit with a
+    ``response.listen``; the drain deliberately counts only ``_DRAIN_ACTIVITY``
+    so those acknowledgements do not reset the quiet window (see
+    ``_DRAIN_ACTIVITY``). If drains start ending at ``_drain_timeout_s`` after
+    this padding, check what a padded unit produces server-side first.
     """
     period_ms = max(20, int(period_ms or 0))
     while not stop.is_set():
