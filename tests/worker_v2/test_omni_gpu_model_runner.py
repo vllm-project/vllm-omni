@@ -341,6 +341,26 @@ def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, 
     assert mr.init_model_state is upstream_factory
 
 
+def test_load_model_factory_swap_is_restored_when_loading_fails(monkeypatch):
+    """On older vLLM a failing load still restores the module factory."""
+    import vllm.v1.worker.gpu.model_runner as mr
+
+    import vllm_omni.worker_v2.omni_model_runner as omni_mr
+
+    upstream_factory = mr.init_model_state
+
+    def failing_load_model(self, *args, **kwargs):
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(omni_mr, "_UPSTREAM_HAS_MODEL_STATE_HOOK", False)
+    monkeypatch.setattr(GPUModelRunner, "load_model", failing_load_model)
+    runner = _make_runner()
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        runner.load_model()
+    assert mr.init_model_state is upstream_factory
+
+
 @pytest.mark.parametrize(
     "flag,expect_omni",
     [(None, False), ("has_preprocess", True), ("has_postprocess", True), ("have_multimodal_outputs", True)],
