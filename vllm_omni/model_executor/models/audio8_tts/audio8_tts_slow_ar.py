@@ -141,6 +141,30 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
 
     prefer_model_sampler = True
 
+    def _init_fast_ar(self, vllm_config: VllmConfig) -> None:
+        """Build the Fast AR under its own compilation context.
+
+        Shared by both backbones (0.6b Qwen2, 0.1b Falcon-H1). Requires
+        ``self.fast_ar_config`` and ``self.text_config`` to be set. The Fast AR
+        shares the parent's VllmConfig but must not share the compilation
+        context: this is ``copy.copy`` and not ``dataclasses.replace`` because
+        pydantic validators re-run and reject an already-rebound compilation
+        backend (see the Fish Speech note).
+        """
+        from vllm.config.vllm import set_current_vllm_config
+
+        fast_ar_compilation = copy.copy(vllm_config.compilation_config)
+        fast_ar_compilation.static_forward_context = {}
+        self._fast_ar_vllm_config = copy.copy(vllm_config)
+        self._fast_ar_vllm_config.compilation_config = fast_ar_compilation
+        with set_current_vllm_config(self._fast_ar_vllm_config):
+            self.fast_ar = Audio8TTSFastAR(
+                vllm_config=self._fast_ar_vllm_config,
+                config=self.fast_ar_config,
+                slow_ar_config=self.text_config,
+                prefix="fast_ar",
+            )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -191,23 +215,9 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             self.text_config.hidden_size,
         )
 
-        # Fast AR shares the parent's VllmConfig but must not share the
-        # compilation context: see the Fish Speech note on why this is
-        # copy.copy and not dataclasses.replace (pydantic validators re-run and
-        # reject an already-rebound compilation backend).
-        fast_ar_compilation = copy.copy(vllm_config.compilation_config)
-        fast_ar_compilation.static_forward_context = {}
-        self._fast_ar_vllm_config = copy.copy(vllm_config)
-        self._fast_ar_vllm_config.compilation_config = fast_ar_compilation
-        from vllm.config.vllm import set_current_vllm_config
-
-        with set_current_vllm_config(self._fast_ar_vllm_config):
-            self.fast_ar = Audio8TTSFastAR(
-                vllm_config=self._fast_ar_vllm_config,
-                config=self.fast_ar_config,
-                slow_ar_config=self.text_config,
-                prefix="fast_ar",
-            )
+        # Fast AR shares the parent's VllmConfig but under its own compilation
+        # context; see _init_fast_ar for why.
+        self._init_fast_ar(vllm_config)
 
         # Constant logits mask: semantic codes plus <|im_end|>. Safe as a
         # non-persistent buffer under vLLM (module built on the target device),
