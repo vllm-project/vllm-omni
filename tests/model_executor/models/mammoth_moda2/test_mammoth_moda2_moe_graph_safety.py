@@ -120,12 +120,25 @@ def test_ar_wrappers_keep_raw_input_tokens() -> None:
     assert m.MammothModa2Qwen3ForCausalLM.get_input_embeddings is m.MammothModa2Qwen2ForCausalLM.get_input_embeddings
 
 
-def test_empty_intermediate_tensors_seed_gen_token_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("is_first_rank", "is_last_rank"),
+    [
+        (True, True),
+        (True, False),  # non-last PP rank: factory still seeds gen_token_mask
+    ],
+)
+def test_empty_intermediate_tensors_seed_gen_token_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    is_first_rank: bool,
+    is_last_rank: bool,
+) -> None:
     """PP empty tensors must come from the factory the LM constructor installs.
 
-    Embeddings, logits, and decoder layers are stubbed so ``__init__`` can run
-    without a distributed runtime. The factory attribute is left as the closure
-    ``__init__`` assigns; replacing it would test the helper instead of that wiring.
+    Stub only what ``__init__`` needs without a distributed runtime:
+    ``VocabParallelEmbedding``, ``ParallelLMHead``, ``LogitsProcessor``,
+    ``RMSNorm``, ``make_layers``, and ``get_pp_group``. Leave
+    ``make_empty_intermediate_tensors`` as the closure ``__init__`` assigns.
+    Non-last ranks use real ``PPMissingLayer`` for head/norm.
     """
     from types import SimpleNamespace
 
@@ -153,14 +166,27 @@ def test_empty_intermediate_tensors_seed_gen_token_mask(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         m,
         "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        lambda: SimpleNamespace(is_first_rank=is_first_rank, is_last_rank=is_last_rank),
     )
 
-    lm = m.MammothModa2Qwen2ForCausalLM(vllm_config=vllm_config)
-    factory = lm.make_empty_intermediate_tensors
-    assert "make_empty_intermediate_tensors_with_gen_mask" in factory.__code__.co_names
+    real_helper = m.make_empty_intermediate_tensors_with_gen_mask
+    spy_calls: list[tuple[int, int]] = []
 
-    tensors = factory(batch_size, torch.float32, torch.device("cpu"))
+    def _spy(
+        batch_size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        spy_calls.append((batch_size, hidden_size))
+        return real_helper(batch_size, hidden_size, dtype, device)
+
+    monkeypatch.setattr(m, "make_empty_intermediate_tensors_with_gen_mask", _spy)
+
+    lm = m.MammothModa2Qwen2ForCausalLM(vllm_config=vllm_config)
+    tensors = lm.make_empty_intermediate_tensors(batch_size, torch.float32, torch.device("cpu"))
+
+    assert spy_calls == [(batch_size, hidden)]
     assert "gen_token_mask" in tensors.tensors
     assert tensors.tensors["gen_token_mask"].dtype == torch.bool
     assert tuple(tensors.tensors["gen_token_mask"].shape) == (batch_size,)
