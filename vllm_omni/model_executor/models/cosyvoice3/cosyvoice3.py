@@ -435,6 +435,9 @@ class _SpeechTokenBatcher:
 _REFERENCE_CONDITIONERS: dict[str, "CosyVoice3MultiModalProcessor"] = {}
 _REFERENCE_CACHE_DEBUG = {"hits": 0, "misses": 0, "coalesced": 0}
 _REFERENCE_CONDITIONERS_LOCK = Lock()
+# Own lock for the first S3 load, so same-reference callers still reach the bounded wait in _audio_conditioning.
+# Owners of other references still queue here without a timeout.
+_S3_MODEL_LOCK = Lock()
 
 
 def prefetch_reference_conditioning(model_dir: str, config, audio) -> None:
@@ -606,7 +609,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
     def _ensure_s3_model(cls):
         if cls._s3_model is not None:
             return cls._s3_model
-        with _REFERENCE_CONDITIONERS_LOCK:
+        with _S3_MODEL_LOCK:
             if cls._s3_model is None:
                 cls._s3_model = cls._load_s3_model()
         return cls._s3_model

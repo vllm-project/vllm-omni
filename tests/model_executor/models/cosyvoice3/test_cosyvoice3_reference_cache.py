@@ -232,6 +232,53 @@ def test_reference_cache_waiter_fails_after_bounded_wait_on_stuck_worker(process
     assert len(calls) == 1
 
 
+def test_reference_prefetch_waiter_is_bounded_while_s3_model_loads(processor, monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3 as module
+
+    obj, _, calls = processor
+    processor_cls = module.CosyVoice3MultiModalProcessor
+    original_speech = obj._extract_speech_token_via_s3
+    load_started = threading.Event()
+    release_load = threading.Event()
+    other_reached_load = threading.Event()
+
+    def load():
+        # A first load that hangs, like a stalled checkpoint download.
+        load_started.set()
+        assert release_load.wait(timeout=5)
+        return object()
+
+    def speech(audio, device):
+        if len(audio[0]) == 9:
+            other_reached_load.set()
+        processor_cls._ensure_s3_model()
+        return original_speech(audio, device)
+
+    model_dir = obj.info.ctx.model_config.model
+    config = obj.info.ctx.get_hf_config()
+    audio = (np.arange(8, dtype=np.float32), 16000)
+    other_audio = (np.arange(9, dtype=np.float32), 16000)
+    monkeypatch.setattr(processor_cls, "_s3_model", None)
+    monkeypatch.setattr(processor_cls, "_load_s3_model", load)
+    monkeypatch.setattr(obj, "_extract_speech_token_via_s3", speech)
+    monkeypatch.setitem(module._REFERENCE_CONDITIONERS, model_dir, obj)
+    monkeypatch.setattr(module, "_REFERENCE_CONDITIONING_WAIT_S", 0.01)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        owner = executor.submit(module.prefetch_reference_conditioning, model_dir, config, audio)
+        try:
+            assert load_started.wait(timeout=5)
+            waiter = executor.submit(module.prefetch_reference_conditioning, model_dir, config, audio)
+            other = executor.submit(module.prefetch_reference_conditioning, model_dir, config, other_audio)
+            assert isinstance(waiter.exception(timeout=5), TimeoutError)
+            # A different reference is not held back by the load: it becomes its own owner.
+            assert other_reached_load.wait(timeout=5)
+        finally:
+            release_load.set()
+        owner.result(timeout=5)
+        other.result(timeout=5)
+    assert len(calls) == 2
+
+
 def test_reference_cache_keeps_distinct_keys_parallel(processor, monkeypatch):
     obj, _, calls = processor
     original_speech = obj._extract_speech_token_via_s3
