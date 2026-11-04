@@ -30,3 +30,24 @@ def unpack_handoff_tensor(value: object) -> object:
     if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.float32 or tensor.device.type != "cpu":
         raise ValueError("MiniCPM-o packed handoff must contain a CPU float32 tensor")
     return tensor
+
+
+def ends_with_own_row(payload: object, position: int, token_id: int) -> bool:
+    """Whether a forward's rows end at ``token_id``'s own row at ``position``.
+
+    The rows must be one per consecutive input position, so a row predicting
+    the token, a duplicated row or a rejected draft's row does not qualify.
+    """
+    if not isinstance(payload, dict):
+        return False
+    ids, positions, latent = (payload.get(k) for k in ("latent_input_ids", "latent_positions", "latent"))
+    if not all(isinstance(v, torch.Tensor) for v in (ids, positions, latent)):
+        return False
+    ids, positions = ids.reshape(-1).tolist(), positions.reshape(-1).tolist()
+    n = len(ids)
+    return (
+        n > 0
+        and len(positions) == latent.shape[0] == n
+        and positions == list(range(position - n + 1, position + 1))
+        and int(ids[-1]) == token_id
+    )
