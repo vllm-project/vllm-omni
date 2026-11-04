@@ -146,6 +146,33 @@ def test_ldd_uses_runtime_library_paths_and_rejects_missing_dependencies(
     assert not cache.ldd_resolves(module, runner=missing_runner, library_paths=[])
 
 
+def test_dynamic_library_paths_include_therock_openblas_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    torch_lib = site_packages / "torch/lib"
+    therock_lib = site_packages / "_rocm_sdk_libraries/lib/rocm_sysdeps/lib"
+    therock_runtime_lib = site_packages / "_rocm_sdk_runtime/lib/rocm_sysdeps/lib"
+    torch_lib.mkdir(parents=True)
+    therock_lib.mkdir(parents=True)
+    therock_runtime_lib.mkdir(parents=True)
+    (therock_lib / "librocm-openblas.so.0").touch()
+    (therock_lib / "librocm-openblas.so.0.3").touch()
+    (therock_runtime_lib / "librocm-openblas.so.0").touch()
+
+    class TorchDistribution:
+        def locate_file(self, path: str) -> Path:
+            return site_packages / path
+
+    def distribution(name: str) -> TorchDistribution:
+        assert name == "torch"
+        return TorchDistribution()
+
+    monkeypatch.setattr(cache.importlib.metadata, "distribution", distribution)
+
+    assert cache.dynamic_library_paths()[:3] == [torch_lib, therock_lib, therock_runtime_lib]
+
+
 def test_image_dependency_identity_tracks_the_rocm_image_inputs(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     for relative in cache._IMAGE_DEPENDENCY_PATHS:
