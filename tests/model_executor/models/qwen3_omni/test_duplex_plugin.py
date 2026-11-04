@@ -91,6 +91,8 @@ def test_capabilities_advertise_image_items_not_append_frames():
     """Clients choose how to send frames from these fields; they must match the buffer's refusal."""
     caps = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA").capabilities(max_sessions=1)
     assert caps.supports_image_input
+    assert caps.supports_turn_kv_continuation
+    assert not caps.supports_core_resumable_request
     assert not caps.accepts_input_modality("video")
     assert caps.validate_append_modalities(has_audio=True, has_video=True) == (
         "This duplex model does not accept video_frames"
@@ -104,10 +106,12 @@ async def open_qwen(
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
-    turn_kv_continuation=False,
+    turn_kv_continuation=True,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
+    # Exercise both the supported deployment and the per-turn fallback.
+    plugin.supports_turn_kv_continuation = turn_kv_continuation
     if calibrate is not None:
         plugin.history_calibrator = lambda config: HistoryCalibrationPolicy(calibrate, requires_audio=requires_audio)
         plugin.data_plane.retain_history_audio = requires_audio
@@ -128,7 +132,6 @@ async def open_qwen(
         output_sink=output,
         result_sink=results,
         runtime_config=DuplexSessionRuntimeConfig(
-            turn_kv_continuation=turn_kv_continuation,
             history_calibration_timeout_ms=calibration_timeout_ms,
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
@@ -594,6 +597,25 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests(tu
 
 
 @pytest.mark.asyncio
+async def test_default_continuation_releases_idle_thinker_on_close():
+    h = await open_qwen()
+    try:
+        assert h.session.capabilities.supports_turn_kv_continuation
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        assert h.port.submissions[-1].resumable
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        assert (0, request_id) in h.session.request_resources
+        await h.run(CloseSession())
+        assert any(request_id in ids and abort for ids, abort in h.port.cleanups)
+        assert not h.session.request_resources
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("played_ms", [0, 500, 1000])
 async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
     h = await open_qwen()
@@ -628,7 +650,9 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
         await h.run(CreateResponse())
         assert len(h.port.submissions) == 2, [event.to_realtime() for event in h.events]
         latest = h.port.submissions[-1]
-        assert latest.context.request_id != old.request_id
+        # Fully played output preserves the resident request; truncating
+        # unplayed output invalidates its history and starts a new epoch.
+        assert (latest.context.request_id == old.request_id) is (played_ms == 1000)
         assert latest.prompt["prompt"] == repr(
             [
                 {"role": "user", "content": [{"type": "audio"}]},
@@ -1700,10 +1724,9 @@ async def test_the_bound_request_id_is_the_one_the_stage_received():
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))
         submitted = h.port.submissions[-1].context.request_id
-        # Qwen has no resumable core request, so every turn gets its own stage
-        # id. The runner names that id before the append runs and the model
-        # channel names it again when it submits; they have to agree.
-        assert submitted.endswith(".r.stage0-turn0"), submitted
+        # The runner prebinds the resident Thinker ID before append; the
+        # model channel must submit with the same ID.
+        assert submitted.endswith(".r.stage0"), submitted
         assert h.session.active_request_id == submitted
     finally:
         await h.manager.shutdown()

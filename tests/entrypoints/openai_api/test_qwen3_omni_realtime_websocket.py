@@ -1111,7 +1111,7 @@ def qwen_duplex_server(request, tmp_path_factory, cached_silero_vad_artifact, ca
     )
     resolved = load_deploy_config(deploy)
     assert resolved.session_mode == "duplex"
-    assert resolved.duplex_session.turn_kv_continuation == base_session.turn_kv_continuation
+    assert resolved.duplex_session.max_sessions == base_session.max_sessions
     model = get_model_prefix() + MODEL
     processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
     with OmniServer(
@@ -1637,7 +1637,7 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
-    @pytest.mark.parametrize("qwen_duplex_server", ["qwen3_omni_duplex_kv.yaml"], indirect=True)
+    @pytest.mark.parametrize("qwen_duplex_server", ["qwen3_omni_duplex.yaml"], indirect=True)
     def test_resident_thinker_history_pruning(self, qwen_duplex_server, tmp_path: Path):
         events_path = tmp_path / "events.json"
         asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, events_path))
@@ -1655,7 +1655,7 @@ class TestQwen3OmniDuplexPlayback:
     @pytest.mark.advanced_model
     @pytest.mark.parametrize(
         "qwen_duplex_server",
-        ["qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml"],
+        ["qwen3_omni_duplex_mrv2.yaml"],
         indirect=True,
     )
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):

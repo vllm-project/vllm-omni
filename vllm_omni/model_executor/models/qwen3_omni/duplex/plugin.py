@@ -383,6 +383,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             supports_reencode_context=True,
             supports_turn_commit_only=True,
             supports_core_resumable_request=False,
+            supports_turn_kv_continuation=self.supports_turn_kv_continuation,
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
             supports_multi_session=max_sessions > 1,

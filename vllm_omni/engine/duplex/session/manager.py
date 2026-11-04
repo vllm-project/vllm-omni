@@ -626,10 +626,6 @@ class DuplexSessionManager:
             capabilities = apply_session_stats_capability(
                 self.plugin.capabilities(max_sessions=max_sessions), collect_stats
             )
-            if self.runtime_config.turn_kv_continuation:
-                if not self.plugin.supports_turn_kv_continuation:
-                    raise DuplexRuntimeConfigError("This model does not support turn KV continuation")
-                capabilities.supports_turn_kv_continuation = True
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,

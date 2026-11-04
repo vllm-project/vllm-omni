@@ -59,8 +59,16 @@ def _encode_audio(audio: object, sample_rate_hz: int, response_format: str, spee
     return f"wav-{samples}" if samples > 0 else None
 
 
-def _stage_configs(count: int) -> list[object]:
-    return [SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096)) for _ in range(count)]
+def _stage_configs(count: int) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=4096, use_v2_model_runner=False),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            speculative_config=None,
+        )
+        for _ in range(count)
+    ]
 
 
 def _build(
@@ -72,6 +80,8 @@ def _build(
     plugin=None,
     frontend_count: int = 1,
     frontend_index: int = 0,
+    async_chunk: bool = False,
+    stage_configs: list[SimpleNamespace] | None = None,
 ) -> tuple[DuplexOrchestrator, list[FakeStageClient], asyncio.Queue, asyncio.Queue]:
     clients = [FakeStageClient(stage_type="llm", final_output=index == stages - 1) for index in range(stages)]
     pools = _build_stage_pools(
@@ -80,7 +90,7 @@ def _build(
             for index, client in enumerate(clients)
         ],
         output_processors=[FakeOutputProcessor() for _ in clients],
-        stage_vllm_configs=_stage_configs(stages),
+        stage_vllm_configs=stage_configs or _stage_configs(stages),
     )
     rpc_q: asyncio.Queue = asyncio.Queue()
     output_q: asyncio.Queue = asyncio.Queue()
@@ -95,8 +105,37 @@ def _build(
         model_config=None,
         frontend_count=frontend_count,
         frontend_index=frontend_index,
+        async_chunk=async_chunk,
     )
     return orchestrator, clients, rpc_q, output_q
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsupported", [None, "v2", "async", "cache_off", "no_chunks", "speculative"])
+async def test_qwen_continuation_defaults_follow_engine_configuration(unsupported):
+    configs = _stage_configs(1)
+    entry = configs[0]
+    entry.model_config.use_v2_model_runner = unsupported == "v2"
+    entry.scheduler_config.async_scheduling = unsupported == "async"
+    entry.cache_config.enable_prefix_caching = unsupported != "cache_off"
+    entry.speculative_config = object() if unsupported == "speculative" else None
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
+    assert plugin.capabilities(max_sessions=1).supports_turn_kv_continuation
+    orchestrator, _, rpc_q, _ = _build(
+        plugin=plugin,
+        async_chunk=unsupported != "no_chunks",
+        stage_configs=configs,
+    )
+    try:
+        assert plugin.capabilities(max_sessions=1).supports_turn_kv_continuation is (unsupported is None)
+        assert not plugin.capabilities(max_sessions=1).supports_core_resumable_request
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        session = orchestrator.session_manager.get(SESSION_ID)
+        assert session is not None
+        assert session.capabilities.supports_turn_kv_continuation is (unsupported is None)
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 def _open_message(
@@ -1133,10 +1172,9 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
     from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
     from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
-    orchestrator, clients, rpc_q, _ = _build()
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
-    orchestrator.plugin = orchestrator.session_manager.plugin = plugin
+    orchestrator, clients, rpc_q, _ = _build(plugin=plugin, async_chunk=True)
     seen = []
 
     def process_inputs(**kwargs):
@@ -1168,8 +1206,9 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         assert len(seen) == 1
         assert seen[0]["prompt"]["multi_modal_data"]["audio"][0][0].shape == (16000,)
         submitted = clients[0].add_request_calls[0][0]
-        assert submitted.resumable is False
-        assert not orchestrator.request_states[submitted.request_id].streaming.enabled
+        assert submitted.resumable is True
+        assert submitted.resume_from_full_prompt is True
+        assert orchestrator.request_states[submitted.request_id].streaming.enabled
     finally:
         await _close(orchestrator, rpc_q)
 
