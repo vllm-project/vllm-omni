@@ -23,7 +23,7 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 import vllm.v1.engine.core as engine_core
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.engine import EngineCoreEventType, EngineCoreRequestType, FinishReason
@@ -42,8 +42,10 @@ from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
-    sched = OmniARScheduler.__new__(OmniARScheduler)
+def _make_scheduler(
+    *, stage_id: int = 0, session_mode: str = "turn", scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
+    sched = object.__new__(scheduler_cls)
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
@@ -115,6 +117,96 @@ def test_full_prompt_continuation_retains_only_valid_resident_kv(matching):
     assert session._reset_turn_worker_state
     assert sched._free_request_blocks.call_count == (0 if matching else 1)
     sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+
+@pytest.mark.parametrize("matching", [True, False])
+@pytest.mark.parametrize("in_flight", [0, 1, 2])
+def test_async_full_prompt_continuation_waits_for_previous_turn(matching, in_flight):
+    """Do not reset a resident worker row while its old outputs are pending."""
+    sched = _make_live_session_scheduler(max_model_len=128, scheduler_cls=OmniARAsyncScheduler)
+    sched.cache_config = SimpleNamespace(block_size=16)
+    sched.kv_cache_manager = MagicMock()
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    session = _make_request()
+    sched.requests[session.request_id] = session
+    session.resumable = True
+    session.resume_from_full_prompt = True
+    session.prompt_token_ids = list(range(30))
+    session.num_prompt_tokens = 30
+    session._all_token_ids[:] = session.prompt_token_ids
+    session.append_output_token_ids([30, 31, 32, 33, 999])
+    session.block_hashes[:] = [b"first", b"second"]
+    session.num_computed_tokens = 34 + in_flight
+    session.num_output_placeholders = in_flight
+    session.num_in_flight_tokens = in_flight
+    session.status = RequestStatus.FINISHED_STOPPED
+    # Run the upstream stop path, including rollback and stale-output fencing.
+    assert sched._handle_stopped_request(session) is False
+    assert session.num_computed_tokens == 34
+    assert session.num_output_placeholders == 0
+    assert sched.num_waiting_for_streaming_input == 1
+
+    update = _make_update(list(range(50)))
+    update.resume_from_full_prompt = True
+    update.block_hashes = (b"first", b"second" if matching else b"changed", b"third")
+    sched._update_request_as_session(session, update)
+
+    assert session.num_computed_tokens == (32 if matching else 0)
+    assert session.num_stale_output_tokens == in_flight
+    assert session.num_output_tokens == 0
+    assert sched.num_waiting_for_streaming_input == 0
+    assert sched._handle_blocked_waiting_request(session) is (in_flight == 0)
+    # A different session remains eligible while this one drains.
+    other = _make_request()
+    other.status = RequestStatus.WAITING
+    assert sched._handle_blocked_waiting_request(other)
+
+    for remaining in reversed(range(in_flight)):
+        assert not _run_continuation_output(sched, session, num_scheduled=1, token=777)
+        assert session.num_in_flight_tokens == remaining
+        assert session.num_stale_output_tokens == remaining
+        assert session.num_output_placeholders == 0
+        assert session.num_output_tokens == 0
+    assert sched._handle_blocked_waiting_request(session)
+    assert session.num_computed_tokens == (32 if matching else 0)
+    if matching:
+        sched._free_request_blocks.assert_not_called()
+    else:
+        sched._free_request_blocks.assert_called_once_with(session)
+
+    # The first new-turn result must go through the real AsyncScheduler
+    # placeholder accounting, cache update and EngineCore output emission.
+    num_scheduled = len(update.prompt_token_ids) - session.num_computed_tokens
+    session.status = RequestStatus.RUNNING
+    session.num_computed_tokens += num_scheduled
+    session.num_in_flight_tokens = num_scheduled
+    session.num_output_placeholders = 1
+    outputs = _run_continuation_output(sched, session, num_scheduled=num_scheduled, token=888)
+    assert outputs[session.client_index].outputs[0].new_token_ids == [888]
+    assert list(session.output_token_ids) == [888]
+    assert session.num_output_placeholders == session.num_in_flight_tokens == 0
+    sched.kv_cache_manager.cache_blocks.assert_called_once_with(session, 50)
+
+
+def _run_continuation_output(sched, session, *, num_scheduled: int, token: int):
+    """Deliver one worker result without mocking stop or async token accounting."""
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={session.request_id: num_scheduled},
+        total_num_scheduled_tokens=num_scheduled,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[session.request_id],
+        req_id_to_index={session.request_id: 0},
+        sampled_token_ids=[[token]],
+    )
+    return sched.update_from_output(scheduler_output, model_output)
 
 
 def test_full_prompt_continuation_rebuilds_when_history_shrinks():
@@ -1443,11 +1535,13 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched._enqueue_waiting_request.assert_not_called()
 
 
-def _make_live_session_scheduler(*, max_model_len: int) -> OmniARScheduler:
+def _make_live_session_scheduler(
+    *, max_model_len: int, scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
     """A scheduler whose finish path is real: the queues, ``finish_requests``,
     ``_free_request`` and the finished-request bookkeeping that wakes an idle
     engine all run. Only block freeing and the encoder cache are mocked."""
-    sched = _make_admission_scheduler(max_model_len=max_model_len)
+    sched = _make_admission_scheduler(max_model_len=max_model_len, scheduler_cls=scheduler_cls)
     del sched._free_request  # the admission helper mocks it; run the real one
     sched._omits_kv_transfer_cache = {}
     sched.connector = None
@@ -1733,10 +1827,12 @@ def test_stage0_streaming_update_overflow_counts_an_uncomputed_prompt() -> None:
     assert "5 tokens" in sched._streaming_context_overflow[session.request_id][1]
 
 
-def _make_admission_scheduler(*, max_model_len: int) -> OmniARScheduler:
+def _make_admission_scheduler(
+    *, max_model_len: int, scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
     """A scheduler with real admission queues, so nothing about the terminal
     handling below is mocked away except block freeing."""
-    sched = _make_scheduler(stage_id=0)
+    sched = _make_scheduler(stage_id=0, scheduler_cls=scheduler_cls)
     sched.max_model_len = max_model_len
     sched.policy = SchedulingPolicy.FCFS
     sched.waiting = create_request_queue(sched.policy)

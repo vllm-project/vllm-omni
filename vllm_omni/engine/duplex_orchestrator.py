@@ -102,7 +102,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 reason
                 for active, reason in (
                     (config.model_config.use_v2_model_runner, "model runner V2"),
-                    (config.scheduler_config.async_scheduling, "async scheduling"),
                     (not config.cache_config.enable_prefix_caching, "prefix caching disabled"),
                     (not self.async_chunk, "async_chunk disabled"),
                     (config.speculative_config is not None, "speculative decoding"),

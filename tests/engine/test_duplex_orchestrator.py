@@ -111,12 +111,13 @@ def _build(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unsupported", [None, "v2", "async", "cache_off", "no_chunks", "speculative"])
-async def test_qwen_continuation_defaults_follow_engine_configuration(unsupported):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("unsupported", [None, "v2", "cache_off", "no_chunks", "speculative"])
+async def test_qwen_continuation_defaults_follow_engine_configuration(unsupported, async_scheduling):
     configs = _stage_configs(1)
     entry = configs[0]
     entry.model_config.use_v2_model_runner = unsupported == "v2"
-    entry.scheduler_config.async_scheduling = unsupported == "async"
+    entry.scheduler_config.async_scheduling = async_scheduling
     entry.cache_config.enable_prefix_caching = unsupported != "cache_off"
     entry.speculative_config = object() if unsupported == "speculative" else None
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)

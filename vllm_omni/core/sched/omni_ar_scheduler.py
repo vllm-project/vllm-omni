@@ -835,6 +835,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _handle_blocked_waiting_request(self, request: Request) -> bool:
+        """Drain the old turn before retiring and reinstalling its worker row.
+
+        Full-prompt continuation resets worker and prefix-output delivery state
+        under the same request ID. Keep that reset behind all previous-turn
+        results, which update_from_output discards using the existing stale
+        token fence. Only this request waits; decode within a turn and other
+        requests keep using asynchronous scheduling.
+        """
+        if getattr(request, "_reset_turn_worker_state", False) and request.num_in_flight_tokens > 0:
+            return False
+        return super()._handle_blocked_waiting_request(request)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
