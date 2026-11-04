@@ -161,7 +161,8 @@ def test_frames_and_caches_match_independent_full_history(thinker, batch):
             assert len({s[key].untyped_storage().data_ptr() for s in sessions}) == batch
 
 
-def test_runner_hook_computes_once_and_scalar_fusion_reuses_it(thinker, monkeypatch):
+@pytest.mark.parametrize("repeat_session_metadata", [True, False])
+def test_runner_hook_computes_once_and_scalar_fusion_reuses_it(thinker, monkeypatch, repeat_session_metadata):
     calls = []
     original = thinker.perception.encoder.cache_aware_stream_step
 
@@ -185,7 +186,11 @@ def test_runner_hook_computes_once_and_scalar_fusion_reuses_it(thinker, monkeypa
         thinker._duplex_previous_text_tokens[request] = row + 2
     assert calls == [(2, 0)]
     for row, request in enumerate(["a", "b"]):
-        buffer[request] = {"duplex": append(row, 2)}
+        packet = append(row, 2)
+        if not repeat_session_metadata:
+            for key in ("nvc_prompt_token_ids", "nvc_function_sotc_id", "nvc_function_eotc_id"):
+                del packet["runtime_config"][key]
+        buffer[request] = {"duplex": packet}
     thinker.preprocess_batch(req_ids=["a", "b"], model_intermediate_buffer=buffer, device=DEVICE)
     steady_drop = thinker.perception.encoder.streaming_cfg.drop_extra_pre_encoded
     assert calls == [(2, 0), (2, steady_drop)]
@@ -194,7 +199,7 @@ def test_runner_hook_computes_once_and_scalar_fusion_reuses_it(thinker, monkeypa
             request_id=request,
             input_ids=torch.zeros(1, dtype=torch.long),
             info={"_omni_num_computed_tokens": 3},
-            duplex=append(row, 2),
+            duplex=buffer[request]["duplex"],
         )
         expected = thinker._fuse(torch.tensor([row + 2]), thinker._sessions[request]["duplex_frame"], torch.tensor([0]))
         torch.testing.assert_close(embeds, expected)
@@ -341,8 +346,14 @@ def test_duplicate_request_does_not_publish_a_session(thinker):
     assert not thinker._sessions
 
 
-@pytest.mark.parametrize("fault", ["length", "oom"])
-def test_later_encoder_group_failure_preserves_sessions_for_retry(thinker, monkeypatch, fault):
+@pytest.mark.parametrize(
+    ("fault", "error", "message"),
+    [
+        ("length", RuntimeError, "exactly one frame"),
+        ("oom", torch.OutOfMemoryError, "injected second encoder group failure"),
+    ],
+)
+def test_later_encoder_group_failure_preserves_sessions_for_retry(thinker, monkeypatch, fault, error, message):
     thinker.preprocess_batch(
         req_ids=["old"], model_intermediate_buffer={"old": {"duplex": append(0, 1)}}, device=DEVICE
     )
@@ -364,7 +375,7 @@ def test_later_encoder_group_failure_preserves_sessions_for_retry(thinker, monke
     buffer = {"old": {"duplex": append(0, 2)}, "new": {"duplex": append(1, 1)}}
     with monkeypatch.context() as patch:
         patch.setattr(thinker.perception.encoder, "cache_aware_stream_step", fail_second)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(error, match=message):
             thinker.preprocess_batch(req_ids=list(buffer), model_intermediate_buffer=buffer, device=DEVICE)
     assert calls == 2
     assert session["last_input_seq"] == 1
@@ -379,9 +390,13 @@ def test_later_encoder_group_failure_preserves_sessions_for_retry(thinker, monke
     assert not thinker._sessions
 
 
-def test_failed_prompt_fusion_preserves_prompt_for_retry(thinker, monkeypatch):
+@pytest.mark.parametrize("batch_first", [True, False])
+def test_failed_prompt_fusion_preserves_prompt_for_retry(thinker, monkeypatch, batch_first):
     packet = append(0, 1)
-    thinker.preprocess_batch(req_ids=["a"], model_intermediate_buffer={"a": {"duplex": packet}}, device=DEVICE)
+    if batch_first:
+        thinker.preprocess_batch(req_ids=["a"], model_intermediate_buffer={"a": {"duplex": packet}}, device=DEVICE)
+    else:
+        thinker._sessions["a"] = thinker._get_duplex_session("a", packet["runtime_config"], DEVICE)
     session = thinker._sessions["a"]
     prompt_ids = session["prompt_ids"]
 
@@ -396,8 +411,11 @@ def test_failed_prompt_fusion_preserves_prompt_for_retry(thinker, monkeypatch):
             )
     assert session["prompt_ids"] is prompt_ids
     assert "prefill_embeds" not in session
+    frame = session["duplex_frame"]
     _, embeds, _ = thinker._preprocess_duplex(
         request_id="a", input_ids=torch.zeros(3, dtype=torch.long), info={}, duplex=packet
     )
     assert embeds.shape == (3, thinker._hidden)
     assert "prompt_ids" not in session
+    assert session["duplex_frame"] is frame
+    assert session["last_input_seq"] == 1

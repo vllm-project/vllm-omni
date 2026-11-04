@@ -651,6 +651,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             runtime_config = duplex.get("runtime_config")
             if not isinstance(runtime_config, dict):
                 raise ValueError("Nemotron VoiceChat duplex input lacks runtime_config")
+            # Prompt and function-boundary IDs are session-owned after creation;
+            # the scalar path only rereads the PAD token ID each step.
             try:
                 int(runtime_config["nvc_text_pad_id"])
             except (KeyError, TypeError, ValueError) as exc:
@@ -669,7 +671,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         duplex: dict[str, Any],
         device: torch.device,
     ) -> torch.Tensor:
-        """Compute a new acoustic frame or reuse a replayed append."""
+        """Compute once per source_input_seq; retries reuse the committed frame."""
         self._duplex_stable_frames([(session, duplex)], device)
         return session["duplex_frame"]
 
