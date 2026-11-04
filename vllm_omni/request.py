@@ -145,6 +145,7 @@ class OmniStreamingUpdate:
     model_intermediate_buffer: dict | None = None
     resume_from_full_prompt: bool = False
     block_hashes: "tuple[BlockHash, ...]" = ()
+    cache_salt: str | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
@@ -160,4 +161,5 @@ class OmniStreamingUpdate:
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
             block_hashes=tuple(request.block_hashes) if getattr(request, "resume_from_full_prompt", False) else (),
+            cache_salt=request.cache_salt,
         )

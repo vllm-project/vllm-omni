@@ -69,6 +69,23 @@ Stage-output caching remains required to replay complete conditioning rows to
 each fresh downstream speech pipeline. A worker retirement/arrival pair resets
 per-turn delivery state without releasing scheduler-owned matching KV.
 
+The full-snapshot adapter delegates token extension to vLLM's
+`Scheduler._update_request_as_session`. After prefix validation it normalizes
+the resident request to the retained prefix plus one uncomputed lookahead token
+(discarded by upstream), and passes only the remaining prompt as a
+`StreamingUpdate`. Upstream owns token folding, block-hash generation, feature
+offset rebasing, sampling parameters and the waiting-input counter. Features
+starting before the retained boundary stay at absolute offsets, including one
+that spans the boundary; later feature descriptors are copied into delta-relative
+coordinates. The input snapshot is never rebased in place. Encoder-cache request
+ownership is released before reinstalling the snapshot's feature indices.
+
+This follows the [upstream streaming-input implementation](https://github.com/vllm-project/vllm/blob/d3fb7166e0ac9db82158129face12ae28209757a/vllm/v1/core/sched/scheduler.py#L1921),
+while preserving Omni's complete-block requirement for hidden-state replay.
+Omni still owns connector generation fencing, worker delivery reset and movement
+between its extra waiting queues. These are not provided by upstream token
+extension and do not imply native continuous audio input support.
+
 ### Example
 
 !!! note "Note 3"
