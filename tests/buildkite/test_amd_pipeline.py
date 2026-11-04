@@ -1625,6 +1625,15 @@ def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
 
 
 def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
     step = _find_step("Bagel img2img · 1-GPU", AMD_WEEKLY_PIPELINE)
     command = "\n".join(step["commands"])
     node = "tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
@@ -1644,9 +1653,31 @@ def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
     assert "test_bagel_img2img_online[omni_server0]" in command
     assert "Expected exactly one Bagel weekly ROCm node" in command
     assert "Expected exactly one executed Bagel weekly test" in command
+    assert "collection_status=$$?" in command
+    assert 'exit "$$collection_status"' in command
     assert "skipped != 0" in command
-    bagel_deps = dependencies["diffusion_bagel_weekly"]
-    assert "tests/e2e/online_serving/test_bagel.py" in bagel_deps
+    bagel_deps = flatten_paths(dependencies["diffusion_bagel_weekly"])
+    assert {
+        "tests/e2e/online_serving/test_bagel.py",
+        "tests/conftest.py",
+        "tests/helpers/client.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+        "tests/helpers/stage_config.py",
+        "vllm_omni/config/stage_config.py",
+        "vllm_omni/deploy/bagel.yaml",
+        "vllm_omni/diffusion/models/bagel/",
+        "vllm_omni/diffusion/worker/diffusion_worker.py",
+        "vllm_omni/engine/async_omni_engine.py",
+        "vllm_omni/engine/orchestrator.py",
+        "vllm_omni/engine/stage_engine_core_proc.py",
+        "vllm_omni/engine/stage_pool.py",
+        "vllm_omni/entrypoints/async_omni.py",
+        "vllm_omni/model_executor/models/bagel/",
+        "vllm_omni/model_executor/stage_input_processors/bagel.py",
+        "vllm_omni/model_extras/bagel.py",
+        "vllm_omni/worker/base.py",
+    } <= bagel_deps
     source = Path("tests/e2e/online_serving/test_bagel.py").read_text(encoding="utf-8")
     img2img_marks = source.split("def test_bagel_img2img_online", maxsplit=1)[0]
     assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in img2img_marks

@@ -404,11 +404,18 @@ steps:
           - mkdir -p "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR"
           - |
             node="tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
+            set +e
             pytest --collect-only -q "$$node" \
               --shard-id=0 --num-shards=1 \
               -m "slow and diffusion and rocm and MI325 and cards_1" \
               --run-level full_model \
-              > "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt"
+              > "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" 2>&1
+            collection_status=$$?
+            set -e
+            if [[ "$$collection_status" -ne 0 ]]; then
+              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit "$$collection_status"
+            fi
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt")
             if [[ "$$count" != 1 ]]; then
