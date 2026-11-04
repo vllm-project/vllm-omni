@@ -64,6 +64,10 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import (
     PipelineParallelMixin,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_step_idx,
+    set_forward_context_denoise_total_steps,
+)
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -1029,6 +1033,8 @@ class Cosmos3OmniDiffusersPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    attention_strategy_components = ("transformer",)
+
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -2142,12 +2148,18 @@ class Cosmos3OmniDiffusersPipeline(
         timesteps: torch.Tensor,
         scheduler: Any,
     ) -> None:
+        if getattr(self.transformer, "_attention_strategy_runner", None) is not None:
+            set_forward_context_denoise_step_idx(step_index)
+            set_forward_context_denoise_total_steps(len(timesteps))
         self._current_step_index = step_index
         self._num_timesteps = len(timesteps)
         sigmas = getattr(scheduler, "sigmas", None)
         self._current_sigma = sigmas[step_index] if sigmas is not None and step_index < len(sigmas) else None
 
     def _clear_denoise_step_metadata(self) -> None:
+        if getattr(self.transformer, "_attention_strategy_runner", None) is not None:
+            set_forward_context_denoise_step_idx(None)
+            set_forward_context_denoise_total_steps(None)
         self._current_step_index = None
         self._current_sigma = None
 

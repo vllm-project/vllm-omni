@@ -300,3 +300,35 @@ def test_paged_kv_admission_accepts_shape_at_profile_envelope() -> None:
     )
 
     assert engine._prepare_request_for_admission(request) is request
+
+
+def test_strategy_dummy_run_explicitly_warms_all_layouts():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(diffusion_attention_config=SimpleNamespace(strategy=object()))
+    request = object()
+    engine._make_dummy_request = Mock(return_value=request)
+    engine.warmup_attention_strategy = Mock()
+    engine._dummy_run()
+    engine.warmup_attention_strategy.assert_called_once_with([request])
+    assert engine._make_dummy_request.call_args.kwargs["num_inference_steps"] == 2
+
+
+@pytest.mark.parametrize("failure", [None, "kernel failed"])
+def test_explicit_strategy_warmup_restores_serving_policy(failure):
+    engine = object.__new__(DiffusionEngine)
+    events = []
+    status = [{"transformer": {"layouts_exercised": ("dense", "sparse")}}]
+
+    def rpc(*, method, args):
+        assert method == "attention_strategy_warmup"
+        events.append(args[0])
+        return status
+
+    engine.collective_rpc = rpc
+    engine.add_req_and_wait_for_response = Mock(return_value=SimpleNamespace(error=failure))
+    if failure:
+        with pytest.raises(RuntimeError, match="kernel failed"):
+            engine.warmup_attention_strategy([object()])
+    else:
+        assert engine.warmup_attention_strategy([object()]) == status
+    assert events == [True, False]

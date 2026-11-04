@@ -306,3 +306,36 @@ def test_real_fa4_custom_op_unequal_value_dimension_schema(noncontiguous):
         torch.ops.vllm_omni.fa4_dense_attention.default,
         (query, key, value, 80**-0.5, False, False),
     )
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("head_size", [64, 128])
+@torch.inference_mode()
+def test_real_fa4_dense_hopper_fullgraph(monkeypatch, kv_heads, head_size):
+    """Exercise the optional FA4 wheel on Hopper, where dense defaults to FA3."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Requires Hopper")
+    from flash_attn.cute import flash_attn_func
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    # Select the real FA4 entry point without changing production Hopper defaults.
+    monkeypatch.setattr(fa, "flash_attn_func", flash_attn_func)
+
+    def run(q, k, v):
+        return torch.ops.vllm_omni.fa4_dense_attention(q, k, v, head_size**-0.5, False, False)
+
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)
+    for q_len, kv_len in ((129, 257), (257, 193), (129, 257)):
+        q = torch.randn(1, q_len, 4, head_size, device="cuda", dtype=torch.bfloat16)
+        k, v = (torch.randn(1, kv_len, kv_heads, head_size, device=q.device, dtype=q.dtype) for _ in range(2))
+        with sdpa_kernel(SDPBackend.MATH):
+            expected = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2).float(),
+                k.transpose(1, 2).float(),
+                v.transpose(1, 2).float(),
+                enable_gqa=True,
+            ).transpose(1, 2)
+        eager = run(q, k, v)
+        torch.testing.assert_close(eager.float(), expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(compiled(q, k, v), eager)
