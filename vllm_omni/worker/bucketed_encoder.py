@@ -46,7 +46,7 @@ _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
 _ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
 _ENV_TIME_AXIS = "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"
 _ENV_CONTEXT_MARGIN = "VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN"
-_FRAMES_PER_SECOND = 100  # 10 ms mel hop; seconds ladder -> frames
+_DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
 _EAGER_CHUNK = 8
@@ -122,14 +122,14 @@ class LengthBucketingConfig:
         return self.max_length
 
 
-def _rungs_from_env() -> tuple[int, ...] | None:
+def _rungs_from_env(hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
     raw = os.environ.get(_ENV_SECONDS, "").strip()
     if not raw:
         return None
     seconds = sorted({float(item) for item in raw.split(",") if item.strip()})
     if not seconds:
         raise ValueError(f"{_ENV_SECONDS} did not contain any numbers: {raw!r}")
-    return tuple(max(1, int(round(s * _FRAMES_PER_SECOND))) for s in seconds)
+    return tuple(max(1, int(round(s * 16000 / hop))) for s in seconds)
 
 
 def _context_margin_from_env() -> int | None:
@@ -160,8 +160,8 @@ _VERIFIED_MODELS: dict[str, dict[str, int]] = {
     # than the processor-published samples // 160. A context margin of 3 covers
     # the worst case: the bucketed window copies at most 1 zero-padding frame,
     # which is harmless, so the output stays bit-identical.
-    "step_audio_2": {"context_margin": 3, "time_axis": 2},
-    "covo_audio": {"context_margin": 0, "time_axis": 2},
+    "step_audio_2": {"hop": 160, "context_margin": 3, "time_axis": 2},
+    "covo_audio": {"hop": 160, "context_margin": 0, "time_axis": 2},
 }
 
 
@@ -499,7 +499,7 @@ class _BucketedEncoder:
 # --------------------------------------------------------------- auto install
 
 
-def _install_processor_hook() -> None:
+def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
     try:
         from vllm.multimodal.inputs import MultiModalFieldConfig
         from vllm.multimodal.processing import BaseMultiModalProcessor
@@ -529,7 +529,7 @@ def _install_processor_hook() -> None:
             def _main(mm_items, hf_kwargs):
                 result = main(mm_items, hf_kwargs)
                 try:
-                    frames = _frames_from_mm_items(mm_items)
+                    frames = _frames_from_mm_items(mm_items, hop)
                     if frames is not None:
                         result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
                 except Exception:
@@ -559,7 +559,7 @@ def _install_processor_hook() -> None:
     logger.info("Bucketed encoder processor hook installed")
 
 
-def _frames_from_mm_items(mm_items) -> list[int] | None:
+def _frames_from_mm_items(mm_items, hop: int = _DEFAULT_HOP) -> list[int] | None:
     mm_data: dict[str, object] = {}
     for items in mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0}).values():
         if items:
@@ -575,22 +575,27 @@ def _frames_from_mm_items(mm_items) -> list[int] | None:
             return None
         shape = getattr(item, "shape", None)
         samples = int(shape[-1]) if shape is not None and len(shape) else int(len(item))
-        frames.append(max(1, samples * _FRAMES_PER_SECOND // 16000))
+        frames.append(max(1, samples // hop))
     return frames
 
 
-def install_bucketed_processor_hook() -> bool:
+def install_bucketed_processor_hook(vllm_config=None) -> bool:
     """Install the length-publishing processor hook in the current process.
 
     Request preprocessing (and therefore ``_apply_hf_processor_main``) runs in
     the frontend/orchestrator process, not in the worker that wraps the encoder,
     so the hook must be registered where the frontend builds its multimodal
     processor. Idempotent; returns True when bucketing is enabled (the hook is
-    installed or already was).
+    installed or already was). ``vllm_config`` supplies the model's hop so the
+    published length matches the encoder's real frame rate.
     """
     if _rungs_from_env() is None:
         return False
-    _install_processor_hook()
+    hop = _DEFAULT_HOP
+    verified = _verified_knobs(vllm_config) if vllm_config is not None else None
+    if verified is not None and verified.get("hop"):
+        hop = verified["hop"]
+    _install_processor_hook(hop)
     return True
 
 
@@ -620,8 +625,7 @@ def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder
 
 def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str]:
     """Patch the processor and wrap matching encoders; returns wrapped names."""
-    rungs = _rungs_from_env()
-    if rungs is None:
+    if _rungs_from_env() is None:
         return []
     if model is None or getattr(model, "_bucketed_installed", False):
         return []
@@ -638,6 +642,8 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         )
         return []
 
+    hop = verified.get("hop") or _DEFAULT_HOP
+    rungs = _rungs_from_env(hop)
     ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
     pattern_src = os.environ.get(_ENV_MODULES, "").strip() or _MODULE_PATTERN
     pattern = re.compile(pattern_src)
@@ -678,7 +684,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         logger.warning("Bucketed encoder enabled but no encoder matched %r", pattern_src)
         return []
 
-    _install_processor_hook()
+    _install_processor_hook(hop)
     _wrap_embed_multimodal(model, encoders)
     model._bucketed_installed = True
     logger.info("Bucketed encoder enabled over rungs %s for modules %s", rungs, wrapped)

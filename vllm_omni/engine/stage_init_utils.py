@@ -1688,7 +1688,7 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     # bucketing env var.
     from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
 
-    install_bucketed_processor_hook()
+    install_bucketed_processor_hook(stage_vllm_config)
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
     if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
