@@ -94,10 +94,16 @@ def moe_enable(moe_type, layer_type, layer_idx) -> bool:
     return layer_type in moe_type and start <= layer_idx < end
 
 
-MoeTokenRouting = tuple[torch.Tensor, torch.Tensor]
+TokenRouting = tuple[torch.Tensor, torch.Tensor]
 
 
-def _build_moe_token_routing(gen_token_mask: torch.Tensor | None) -> MoeTokenRouting | None:
+def _build_token_routing(gen_token_mask: torch.Tensor | None) -> TokenRouting | None:
+    """Build generation/base positions partitioning the flattened Boolean mask.
+
+    Consumers trust tuples from this builder for the same token batch. Positions
+    must be disjoint, complete, in range, and agree with any supplied mask or
+    token IDs. Cardinality checks do not validate arbitrary external tuples.
+    """
     if gen_token_mask is None:
         return None
     flat_mask = gen_token_mask.reshape(-1)
@@ -110,7 +116,7 @@ def moe_forward(
     gen_expert: Callable[[torch.Tensor], torch.Tensor] | None,
     gen_token_mask: torch.Tensor | None = None,
     *,
-    token_routing: MoeTokenRouting | None = None,
+    token_routing: TokenRouting | None = None,
 ) -> torch.Tensor:
     """Perform Mixture-of-Experts (MoE) routing and forward pass.
 
@@ -119,12 +125,13 @@ def moe_forward(
 
     Routing Logic:
     - If `gen_expert` is None: All tokens go to `und_expert`.
-    - If `gen_token_mask` is None or all False: All tokens go to `und_expert`.
-    - If `gen_token_mask` is all True: All tokens go to `gen_expert`.
+    - If no routing tuple is provided, derive it from `gen_token_mask`.
+    - If routing is absent or has no generation positions: All tokens go to `und_expert`.
+    - If routing has no understanding positions: All tokens go to `gen_expert`.
     - Otherwise (mixed batch):
         - Tokens where `gen_token_mask` is True go to `gen_expert`.
         - Tokens where `gen_token_mask` is False go to `und_expert`.
-        - Results are concatenated and reordered to match the original input order.
+        - Results are written back to their original token positions.
 
     Args:
         hidden_states (torch.Tensor): Input hidden states. Shape: `(batch_size, seq_len, hidden_size)`
@@ -135,9 +142,10 @@ def moe_forward(
             If provided, takes `(N, D)` tensor, returns `(N, D_out)`.
         gen_token_mask (torch.Tensor | None): Boolean mask indicating generation tokens.
             Shape matches `hidden_states` (excluding feature dim). True for generation tokens.
-        token_routing (MoeTokenRouting | None): Precomputed generation and
-            understanding token positions. When provided, avoids rebuilding
-            routing in each decoder layer.
+        token_routing (TokenRouting | None): Trusted generation and understanding
+            positions from `_build_token_routing` for this token batch. Takes
+            precedence over the mask and avoids rebuilding routing in each
+            decoder layer; arbitrary external tuples are not validated.
 
     Returns:
         torch.Tensor: The processed hidden states with the same shape as input (except potentially
@@ -147,7 +155,7 @@ def moe_forward(
         return und_expert(hidden_states)
 
     if token_routing is None:
-        token_routing = _build_moe_token_routing(gen_token_mask)
+        token_routing = _build_token_routing(gen_token_mask)
     if token_routing is None:
         return und_expert(hidden_states)
 
@@ -285,7 +293,7 @@ class Mammoth2DecoderLayer(Qwen2DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         gen_token_mask: torch.Tensor | None = None,
-        token_routing: MoeTokenRouting | None = None,
+        token_routing: TokenRouting | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -453,17 +461,27 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         *,
-        token_routing: MoeTokenRouting | None = None,
+        token_routing: TokenRouting | None = None,
     ) -> torch.Tensor:
+        """Embed IDs using an optional trusted `_build_token_routing` partition.
+
+        A supplied tuple must describe these IDs' generation/base vocabulary
+        membership. Only its cardinality is checked, not uniqueness or coverage.
+        """
         if not self.extra_gen_vocab or self.gen_embed_tokens is None:
             return self.embed_tokens(input_ids)
 
         if token_routing is None:
             gen_mask = input_ids >= int(self.gen_vocab_start_index)
-            token_routing = _build_moe_token_routing(gen_mask)
+            token_routing = _build_token_routing(gen_mask)
         assert token_routing is not None
         gen_pos, base_pos = token_routing
 
+        if gen_pos.numel() + base_pos.numel() != input_ids.numel():
+            raise ValueError(
+                "token_routing size mismatch: "
+                f"routing={gen_pos.numel() + base_pos.numel()}, input_ids={tuple(input_ids.shape)}"
+            )
         if gen_pos.numel() == 0:
             return self.embed_tokens(input_ids)
         if base_pos.numel() == 0:
@@ -473,11 +491,6 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         flat_ids = input_ids.reshape(-1)
         gen_pos = gen_pos.to(device=flat_ids.device)
         base_pos = base_pos.to(device=flat_ids.device)
-        if gen_pos.numel() + base_pos.numel() != flat_ids.numel():
-            raise ValueError(
-                "token_routing size mismatch: "
-                f"routing={gen_pos.numel() + base_pos.numel()}, input_ids={tuple(input_ids.shape)}"
-            )
         out = torch.empty(
             (flat_ids.shape[0], self.config.hidden_size),
             dtype=self.embed_tokens.weight.dtype,  # type: ignore[attr-defined]
@@ -501,6 +514,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         inputs_embeds: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        """Route generation tokens by ID when IDs are available.
+
+        In the vLLM v1 path, inputs_embeds may arrive without input_ids.
+        Generation tokens then cannot be distinguished by ID, so every
+        MoE layer falls back to the understanding expert.
+        """
         if get_pp_group().is_first_rank:
             # gen_token_mask: True indicates image generation tokens, which use
             # gen_embed_tokens and gen_mlp. Build the routing metadata once for
@@ -509,7 +528,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
                 gen_token_mask = None
             else:
                 gen_token_mask = input_ids >= self.gen_vocab_start_index
-            token_routing = _build_moe_token_routing(gen_token_mask)
+            token_routing = _build_token_routing(gen_token_mask)
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -524,7 +543,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
             gen_token_mask = intermediate_tensors.tensors.get("gen_token_mask")
-            token_routing = _build_moe_token_routing(gen_token_mask)
+            token_routing = _build_token_routing(gen_token_mask)
 
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -658,7 +677,7 @@ class Mammoth3DecoderLayer(Qwen3DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         gen_token_mask: torch.Tensor | None = None,
-        token_routing: MoeTokenRouting | None = None,
+        token_routing: TokenRouting | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
