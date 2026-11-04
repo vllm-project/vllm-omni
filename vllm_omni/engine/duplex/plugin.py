@@ -50,6 +50,8 @@ class DuplexPromptTokenizer(Protocol):
 class DuplexTurnContinuation(DuplexPromptTokenizer, Protocol):
     """Model-owned preparation of deltas against an accepted resident turn."""
 
+    def can_append_turn(self, assistant_text: str) -> bool: ...
+
     def record_output(self, token_ids: list[int], finished: bool) -> None: ...
 
     def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]: ...
@@ -514,6 +516,12 @@ class DuplexModelPlugin(ABC):
         runtime_config: dict[str, object],
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]: ...
+
+    def can_prepare_turn_delta(
+        self, *, state, payload, history_length: int, runtime_config, previous_runtime_config, extra_body
+    ) -> bool:
+        """Whether model window policy permits constructing only a new turn."""
+        return False
 
     def prepare_prompt_config(
         self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]

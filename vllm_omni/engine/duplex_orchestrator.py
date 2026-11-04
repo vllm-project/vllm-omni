@@ -305,6 +305,20 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
 
+    async def can_append_turn(self, request_id: str, assistant_text: str) -> bool:
+        state = self.request_states.get(request_id)
+        if not isinstance(state, DuplexOrchestratorRequestState):
+            return False
+        continuation = state.turn_prompt_tokenizer
+        if not isinstance(continuation, DuplexTurnContinuation):
+            return False
+
+        def check() -> bool:
+            with self._prompt_processing_lock:
+                return continuation.can_append_turn(assistant_text)
+
+        return await asyncio.to_thread(check)
+
     def _observe_stage_tokens(self, stage_id: int, eco: Any, req_state: OrchestratorRequestState) -> None:
         if stage_id == 0 and isinstance(req_state, DuplexOrchestratorRequestState):
             continuation = req_state.turn_prompt_tokenizer

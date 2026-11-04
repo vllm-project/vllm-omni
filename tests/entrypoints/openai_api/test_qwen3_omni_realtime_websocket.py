@@ -1283,6 +1283,7 @@ def _duplex_assert_prompt(
     instructions: str,
     request_count: int,
     assistant_texts: list[str] | None = None,
+    turn_delta: bool = False,
 ):
     captures = []
     for path in runtime.artifacts.glob("*/input.json"):
@@ -1293,7 +1294,7 @@ def _duplex_assert_prompt(
     capture = max(captures, key=lambda item: item[0])[1]
     assert capture["audio_count"] == audio_count
     # The camera belongs to the first user turn and leaves with its audio.
-    image_retained = request_count <= 4
+    image_retained = request_count <= 4 and not turn_delta
     assert len(capture["images"]) == int(image_retained)
     messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
     if assistant_texts is None:
@@ -1306,6 +1307,8 @@ def _duplex_assert_prompt(
         parts.append({"type": "audio"})
         messages.append({"role": "user", "content": parts})
     expected = runtime.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if turn_delta:
+        expected = "<|im_end|>\n" + expected[expected.index("<|im_start|>user\n") :]
     assert capture["prompt"] == expected
     # Use the checkpoint tokenizer too: a repr(messages) processor stub cannot
     # establish that an empty assistant survives as a real turn separator.
@@ -1460,7 +1463,9 @@ async def _duplex_thinker_cache_stats(runtime) -> dict[str, float]:
     return stats
 
 
-async def _run_duplex_history_pruning(runtime, log_path: Path) -> list[dict[str, float]]:
+async def _run_duplex_history_pruning(
+    runtime, log_path: Path, *, direct_append: bool = False
+) -> list[dict[str, float]]:
     cache_stats = [await _duplex_thinker_cache_stats(runtime)]
     async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_SHORT_INSTRUCTIONS, vad=False) as (
         ws,
@@ -1483,10 +1488,11 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> list[dict[str,
             _duplex_assert_prompt(
                 runtime,
                 session_id,
-                audio_count=min(turn + 1, 4),
+                audio_count=1 if direct_append and 0 < turn < 4 else min(turn + 1, 4),
                 instructions=_DUPLEX_SHORT_INSTRUCTIONS,
                 request_count=turn + 1,
-                assistant_texts=heard_texts[-3:],
+                assistant_texts=[] if direct_append and 0 < turn < 4 else heard_texts[-3:],
+                turn_delta=direct_append and 0 < turn < 4,
             )
             # Complete playback so pruning is checked against real assistant
             # answers paired with retained user audio. Repeated empty assistant
@@ -1644,7 +1650,7 @@ class TestQwen3OmniDuplexPlayback:
     @pytest.mark.parametrize("qwen_duplex_server", ["qwen3_omni_duplex.yaml"], indirect=True)
     def test_resident_thinker_history_pruning(self, qwen_duplex_server, tmp_path: Path):
         events_path = tmp_path / "events.json"
-        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, events_path))
+        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, events_path, direct_append=True))
         events = json.loads(events_path.read_text())
         session_id = next(event["session"]["id"] for event in events if event["type"] == "session.updated")
         captures = [json.loads(path.read_text()) for path in qwen_duplex_server.artifacts.glob("*/input.json")]

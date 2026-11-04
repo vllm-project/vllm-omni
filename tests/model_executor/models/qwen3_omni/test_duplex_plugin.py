@@ -2442,3 +2442,66 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
         assert "get_weather" in prompt
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker):
+    turn_kv_continuation = True
+    h = await open_qwen()
+
+    async def can_append(request_id, text):
+        return text == "hello"
+
+    h.port.can_append_turn = can_append
+    h.manager.plugin.processor.apply_chat_template = (
+        lambda messages, **kw: "".join(
+            "<|im_start|>" + m["role"] + "\n" + str(m.get("content", "")) + "<|im_end|>\n" for m in messages
+        )
+        + "<|im_start|>assistant\n"
+    )
+    snapshot = mocker.spy(h.session, "history_snapshot")
+    decode = mocker.spy(h.manager.plugin, "_audio_content")
+    bind_request = mocker.spy(h.session, "bind_request")
+    try:
+        ids = []
+        for i in range(5):
+            bind_request.reset_mock()
+            snapshot.reset_mock()
+            decode.reset_mock()
+            await h.run(append_audio())
+            assert len(h.port.submissions) == i
+            await h.run(Commit(final=True, create_response=True))
+            assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
+            request_id = h.port.submissions[-1].context.request_id
+            assert bind_request.call_args_list[0].args == (request_id,)
+            ids.append(request_id)
+            assert h.port.submissions[-1].resume_from_full_prompt is turn_kv_continuation
+            assert h.port.submissions[-1].already_submitted is (turn_kv_continuation and i > 0)
+            assert h.session.active_request_id == request_id
+            expected_audio = 1 if i < 4 else 4
+            assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == expected_audio
+            assert decode.call_count == expected_audio
+            if 0 < i < 4:
+                assert snapshot.call_count == 0
+                assert h.port.submissions[-1].prompt["_qwen_turn_delta"] is True
+            else:
+                assert snapshot.call_count == 1
+                assert "_qwen_turn_delta" not in h.port.submissions[-1].prompt
+            text = OmniRequestOutput.from_stage_output(
+                tts_output(request_id, samples=0, text="hello", finished=True),
+                request_id=request_id,
+                stage_id=None,
+            )
+            assert not h.deliver(text, stage_id=0), "Thinker output must still forward to Talker"
+            await h.settle()
+            assert text.finished, "projection must not mutate the output forwarded to Talker"
+            assert h.session.active_response_id is not None, "Thinker finished must not end the response"
+            response_id = h.session.active_response_id
+            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert h.session.active_response_id is None
+            assert h.port.cleanups[-1][0] == [request_id]
+        assert len(set(ids)) == (1 if turn_kv_continuation else 2)
+        assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
+    finally:
+        await h.manager.shutdown()

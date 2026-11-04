@@ -120,6 +120,10 @@ class DuplexOutputContext:
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
 
+    async def can_append_turn(self, request_id: str, assistant_text: str) -> bool:
+        """Whether the resident token ledger agrees with the last heard reply."""
+        return False
+
     async def finish_turn(self, request_id: str) -> None:
         """Release per-turn downstream state while retaining entry-stage KV."""
         raise NotImplementedError("This stage port does not support turn KV continuation")
