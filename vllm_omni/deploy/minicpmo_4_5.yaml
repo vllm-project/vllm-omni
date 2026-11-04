@@ -100,3 +100,9 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
+      # Preserve the Code2Wav compile candidate from commit 3e52826f7;
+      # cudagraph replay remains disabled for this stage.
+      - stage_id: 2
+        enforce_eager: false
+        compilation_config:
+          cudagraph_mode: NONE
