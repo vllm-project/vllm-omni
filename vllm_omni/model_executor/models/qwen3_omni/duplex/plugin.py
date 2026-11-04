@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Engine-owned VAD/commit turns with concurrent input and interruptible output.
 
-Qwen3-Omni is a turn model: this plugin does not advertise native streaming KV
-or model-driven turn decisions. Each committed utterance is a fresh request.
+Qwen3-Omni is a turn model: it does not advertise model-driven turn decisions.
+Supported deployments retain Thinker requests across committed utterances.
 """
 
 from __future__ import annotations
@@ -22,10 +22,12 @@ import pybase64 as base64
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
+from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
+from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -406,6 +408,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def create_session_state(self):
         return QwenDuplexSessionState()
+
+    def create_turn_prompt_tokenizer(self, tokenizer: TokenizerLike) -> QwenIncrementalPrompt:
+        return QwenIncrementalPrompt(tokenizer)
 
     def validate_client_extra_body(self, extra_body):
         if not isinstance(extra_body, Mapping):

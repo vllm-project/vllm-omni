@@ -77,7 +77,15 @@ work. Budget host RAM for the
 for resident KV.
 
 The Thinker request and its KV allocation survive a completed turn. Each new
-commit still renders and processes the complete current multimodal history.
+commit still renders the complete current multimodal history. For append-only
+history, a request-owned tokenizer reuses the tokenized prefix ending at a
+Qwen `<|im_start|>` boundary and tokenizes only the remaining suffix. Changes
+to that prefix fall back to full tokenization. The tokenizer is taken from
+the stage input processor, and the cache is discarded with the request epoch.
+All media still pass through the upstream multimodal processor and its cache:
+replaying cached frontend features directly would bypass the coordinated
+sender/receiver cache accesses. This is incremental text token preparation,
+not a delta-only multimodal wire protocol.
 The scheduler compares its block hashes against the resident request: when all
 completed blocks match and the new prompt extends them, it retains those KV
 blocks and computes only the partial-block tail and new suffix. Otherwise it
@@ -103,8 +111,9 @@ the next turn rebuilds it. Closing or expiring a session releases its resident
 resources. New audio may buffer during a response, but another generation must
 wait for that response to complete or be cancelled. Idle sessions retain KV
 until teardown, which must be included in
-deployment memory and session-capacity planning. Full input preprocessing is
-still performed; this feature does not claim a measured latency improvement.
+deployment memory and session-capacity planning. Full history rendering and
+multimodal cache processing remain; this feature does not claim a measured
+latency improvement.
 
 ### Qwen3-Omni voice selection
 

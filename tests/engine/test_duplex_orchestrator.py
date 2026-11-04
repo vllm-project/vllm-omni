@@ -1210,12 +1210,115 @@ async def test_a_dead_replica_closes_the_sessions_it_was_serving() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(monkeypatch):
+@pytest.mark.parametrize("worker_error", [False, True])
+async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, worker_error):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingTokenizer:
+        def tokenize(self, text: str) -> list[int]:
+            started.set()
+            try:
+                assert release.wait(timeout=5)
+                if worker_error:
+                    raise ValueError("tokenization failed after cancellation")
+                return [1, 2]
+            finally:
+                finished.set()
+
+    orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
+        request_id="r", turn_prompt_tokenizer=BlockingTokenizer()
+    )
+    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: None)
+    task = asyncio.create_task(orchestrator._process_stage_inputs(0, request_id="r", prompt={"prompt": "hello"}))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not finished.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bypass", ["kwargs", "lowercase", "special_tokens", "ordinary", "downstream"])
+async def test_incremental_tokenization_preserves_other_input_paths(monkeypatch, bypass):
+    from vllm.renderers.params import TokenizeParams
+
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    orchestrator, _, _, _ = _build(plugin=plugin, async_chunk=True)
+    state_type = OrchestratorRequestState if bypass == "ordinary" else DuplexOrchestratorRequestState
+    orchestrator.request_states["r"] = state_type(request_id="r")
+
+    def unexpected_tokenizer(tokenizer):
+        pytest.fail("incremental tokenizer must not run on this input path")
+
+    monkeypatch.setattr(plugin, "create_turn_prompt_tokenizer", unexpected_tokenizer)
+    defaults = TokenizeParams(
+        max_total_tokens=4096, do_lower_case=bypass == "lowercase", add_special_tokens=bypass != "special_tokens"
+    )
+    processor = SimpleNamespace(tokenizer=object(), renderer=SimpleNamespace(default_cmpl_tok_params=defaults))
+    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: processor)
+    prompt = {"prompt": "hello"}
+
+    async def process(self, stage_id, **kwargs):
+        assert kwargs["prompt"] is prompt
+        return "processed"
+
+    monkeypatch.setattr(Orchestrator, "_process_stage_inputs", process)
+    assert (
+        await orchestrator._process_stage_inputs(
+            1 if bypass == "downstream" else 0,
+            request_id="r",
+            prompt=prompt,
+            tokenization_kwargs={"add_special_tokens": False} if bypass == "kwargs" else None,
+        )
+        == "processed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_tokenization_keeps_upstream_text_length_validation(monkeypatch):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.renderers.params import TokenizeParams
+
+    class UnexpectedTokenizer:
+        def tokenize(self, text: str) -> list[int]:
+            raise AssertionError("overlong text must be rejected before tokenization")
+
+    orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
+        request_id="r", turn_prompt_tokenizer=UnexpectedTokenizer()
+    )
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(max_chars_per_token=1),
+        renderer=SimpleNamespace(default_cmpl_tok_params=TokenizeParams(max_total_tokens=4)),
+    )
+    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: processor)
+    with pytest.raises(VLLMValidationError, match="characters"):
+        await orchestrator._process_stage_inputs(0, request_id="r", prompt={"prompt": "too long"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incremental", [False, True])
+async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(monkeypatch, incremental):
     from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
     from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
+    if incremental:
+        monkeypatch.setattr(
+            plugin, "create_turn_prompt_tokenizer", lambda tokenizer: SimpleNamespace(tokenize=lambda text: [1, 2])
+        )
     orchestrator, clients, rpc_q, _ = _build(plugin=plugin, async_chunk=True)
     seen = []
 
@@ -1230,7 +1333,9 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         )
 
     monkeypatch.setattr(
-        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
+        orchestrator,
+        "_get_stage_input_processor",
+        lambda stage_id: SimpleNamespace(process_inputs=process_inputs, tokenizer=object() if incremental else None),
     )
     await orchestrator._dispatch_message(
         OpenDuplexSessionMessage(
@@ -1247,6 +1352,9 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         await _submit(orchestrator, commands.Commit(final=True, create_response=True))
         assert len(seen) == 1
         assert seen[0]["prompt"]["multi_modal_data"]["audio"][0][0].shape == (16000,)
+        if incremental:
+            assert seen[0]["prompt"]["prompt_token_ids"] == [1, 2]
+            assert "prompt" not in seen[0]["prompt"]
         submitted = clients[0].add_request_calls[0][0]
         assert submitted.resumable is True
         assert submitted.resume_from_full_prompt is True

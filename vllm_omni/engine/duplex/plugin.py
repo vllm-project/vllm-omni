@@ -19,7 +19,7 @@ from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import pybase64 as base64
 
@@ -32,10 +32,17 @@ from vllm_omni.engine.duplex.contracts import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
+    from vllm.tokenizers import TokenizerLike
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+
+
+class DuplexPromptTokenizer(Protocol):
+    """Request-owned incremental tokenizer; full media processing stays upstream."""
+
+    def tokenize(self, text: str) -> list[int]: ...
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -458,6 +465,10 @@ class DuplexModelPlugin(ABC):
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""
         return 0
+
+    def create_turn_prompt_tokenizer(self, tokenizer: TokenizerLike) -> DuplexPromptTokenizer | None:
+        """Optional per-request tokenizer, discarded with the request's epoch."""
+        return None
 
     def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
         """Separate the next ASR-only input from a batched response input.
