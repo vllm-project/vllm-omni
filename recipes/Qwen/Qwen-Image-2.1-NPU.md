@@ -113,9 +113,12 @@ vllm serve /path/to/Qwen-Image-2.1-Turbo \
   --trust-remote-code
 ```
 
-To serve the base checkpoint, replace the model path and set `num_inference_steps`
-per request (`20` for lower latency, `40` for the reference default, `50` is the
-server default). To change the shape, use `size` in the request.
+To serve the base checkpoint, replace the model path **and** the
+`--served-model-name` (use `Qwen/Qwen-Image-2.1`), then send that same name as
+the request `model`; leaving the Turbo alias in place would reject base-model
+requests with HTTP 400. Set `num_inference_steps` per request (`20` for lower
+latency, `40` for the reference default, `50` is the server default). To change
+the shape, use `size` in the request.
 
 ## Scale out on one 8-card machine
 
