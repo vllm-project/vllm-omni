@@ -102,10 +102,16 @@ def _restore_ltx_bwe_resampler_filter(vocoder: nn.Module) -> None:
     expected_kernel_size = 2 * width * ratio + 1
     if kernel_size != expected_kernel_size:
         return
-    time_axis = (torch.arange(kernel_size, device=current_filter.device, dtype=torch.float32) / ratio - width) * rolloff
+    # Platforms without a torch.sinc kernel build the filter on CPU and move
+    # it to the buffer's device once.
+    on_device = current_omni_platform.supports_signal_window_ops()
+    build_device = current_filter.device if on_device else torch.device("cpu")
+    time_axis = (torch.arange(kernel_size, device=build_device, dtype=torch.float32) / ratio - width) * rolloff
     time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
     window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
     filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
+    if not on_device:
+        filter_value = filter_value.to(current_filter.device)
     resampler.filter = filter_value
     resampler._ltx_restored_filter = filter_value
 
