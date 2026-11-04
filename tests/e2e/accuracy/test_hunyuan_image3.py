@@ -389,13 +389,17 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
 def _run_online(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
+    # After #8606, stage_init_timeout is a hard READY deadline. HunyuanImage-3
+    # AR+DiT MoE load regularly exceeds the 300s CLI default on nightly (issue
+    # #9451). Match the 900s used by the prefix-cache online test, and keep
+    # init_timeout above two sequential stage budgets if the GPUs overlap.
     server_args = [
         "--deploy-config",
         deploy_config_path,
         "--stage-init-timeout",
-        "300",
-        "--init-timeout",
         "900",
+        "--init-timeout",
+        "1800",
         "--trust-remote-code",
     ]
     try:

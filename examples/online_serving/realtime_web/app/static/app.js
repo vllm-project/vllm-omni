@@ -54,7 +54,7 @@
     }
   }
   sendTurnButton.hidden = !profile.clientCommit;
-  if (profile.videoOnly) sendTurnButton.textContent = 'Send observation';
+  if (profile.cameraObservations) sendTurnButton.textContent = 'Send observation';
   pttButton.hidden = !profile.pushToTalk;
   promptPreset.replaceChildren();
   for (const name of [...Object.keys(PROMPT_PRESETS), 'custom']) {
@@ -78,6 +78,8 @@
   let startedAt = 0;
   let running = false;
   let muted = false;
+  // Input samples sent this session; locates the server's open model unit.
+  let inputSamplesSent = 0;
   let assistantActive = false;
   let captureRate = INPUT_RATE;
   let cameraStream = null;
@@ -89,6 +91,7 @@
   let visionTurnLocked = false;
   let suppressedPlaybackId = null;
   let pttHeld = false;
+  let pttUploadedInput = false;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
@@ -101,6 +104,9 @@
   let responseComplete = false;
   let playbackComplete = true;
   let turnSubmitted = false;
+  const pendingCommits = new Set();
+  let pendingCommitsOwnBusy = false;
+  let commitCounter = 0;
   let echoTimer = null;
   let sessionGeneration = 0;
   let audioChain = Promise.resolve();
@@ -114,6 +120,11 @@
   let assistantTextChannel = null;
   const assistantRowByResponse = new Map();
   let lastClosedAssistantText = '';
+  let lastClosedUserText = '';
+  let lastClosedUserItemId = '';
+  let lastClosedUserAt = 0;
+  let lastClosedRole = null;
+  const transcriptDoneResponses = new Set();
   let connectionReady = false;
   let turnCounter = 0;
   let stopping = null;
@@ -122,6 +133,25 @@
   function markBusy() {
     assistantActive = true;
     if (profile.halfDuplex) pendingCapture = [];
+  }
+
+  function settleCommitWithoutResponse(eventId) {
+    if (!pendingCommits.delete(eventId) || pendingCommits.size !== 0) return;
+    // Release this group's idle-to-busy state only once every commit has
+    // settled without a response. Another pending commit may still succeed.
+    if (pendingCommitsOwnBusy && !currentResponseId) {
+      clearTimeout(turnTimeout);
+      turnSubmitted = false;
+      assistantActive = false;
+      responseComplete = false;
+      sendTurnButton.disabled = !profile.clientCommit;
+      if (!pttHeld) setModel(profile.waiting);
+    }
+    pendingCommitsOwnBusy = false;
+    if (responseComplete) {
+      clearTimeout(turnTimeout);
+      finishResponseIfReady();
+    }
   }
 
   function armTurnTimeout() {
@@ -139,11 +169,11 @@
   }
 
   function finishResponseIfReady() {
-    if (!responseComplete || !playbackComplete || echoTimer !== null) return;
+    if (!responseComplete || !playbackComplete || pendingCommits.size || echoTimer !== null) return;
     const generation = sessionGeneration;
     echoTimer = window.setTimeout(async () => {
       echoTimer = null;
-      if (!running || generation !== sessionGeneration) return;
+      if (!running || generation !== sessionGeneration || pendingCommits.size) return;
       if (profile.reconnectEachTurn) {
         connectionReady = false;
         const previous = socket;
@@ -156,6 +186,8 @@
       assistantActive = false;
       responseComplete = false;
       turnSubmitted = false;
+      pendingCommits.clear();
+      pendingCommitsOwnBusy = false;
       currentResponseId = null;
       responseHasAudio = false;
       assistantTextChannel = null;
@@ -254,12 +286,26 @@
   function addTranscript(role, delta) {
     if (!delta) return;
     const turn = ensureTurn(role);
+    // Deltas are incremental, including a longer one that starts with the
+    // previous delta ("哈" then "哈哈"). Cumulative text arrives as text-final.
     turn.value += delta;
     turn.text.textContent = turn.value;
     conversation.scrollTop = conversation.scrollHeight;
   }
 
-  function finishTranscript(role, finalText = '') {
+  function rememberClosedTranscript(role, value, itemId = '') {
+    const text = String(value || '').trim();
+    if (!text) return;
+    if (role === 'assistant') lastClosedAssistantText = text;
+    if (role === 'user') {
+      lastClosedUserText = text;
+      lastClosedUserItemId = itemId || '';
+      lastClosedUserAt = Date.now();
+    }
+    lastClosedRole = role;
+  }
+
+  function finishTranscript(role, finalText = '', itemId = '') {
     const turn = role === 'user' ? liveUserTurn : liveAssistantTurn;
     if (!turn && !finalText) return;
     const current = turn || ensureTurn(role);
@@ -267,7 +313,7 @@
       current.value = finalText;
       current.text.textContent = finalText;
     }
-    if (role === 'assistant' && current.value) lastClosedAssistantText = current.value;
+    rememberClosedTranscript(role, current.value, itemId);
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
     else liveAssistantTurn = null;
@@ -407,6 +453,20 @@
 
     if (profile.pushToTalk && !pttHeld) {
       pendingCapture = [];
+      if (profile.cameraObservations && cameraPendingFrame) submitObservation(cameraPendingFrame);
+      return;
+    }
+
+    // MiniCPM VISION units advance on fresh camera frames even with a muted mic.
+    // Never reuse a sticky frame at the faster audio flush cadence.
+    if (profile.videoOnlyMessages && muted) {
+      pendingCapture = [];
+      if (running && connectionReady && cameraPendingFrame) {
+        for (const event of profile.videoOnlyMessages(cameraPendingFrame)) {
+          socket.send(JSON.stringify(event));
+        }
+        cameraPendingFrame = null;
+      }
       return;
     }
 
@@ -415,6 +475,10 @@
       pendingCapture = [];
       return;
     }
+    sendCapturedAudio();
+  }
+
+  function sendCapturedAudio({ padToUnit = false } = {}) {
     const length = pendingCapture.reduce((total, chunk) => total + chunk.length, 0);
     const merged = new Int16Array(length);
     let offset = 0;
@@ -423,13 +487,22 @@
       offset += chunk.length;
     }
     pendingCapture = [];
-    const pcm = resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE);
+    let pcm = length ? resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE) : merged;
+    if (padToUnit && profile.inputUnitSamples) {
+      const unit = profile.inputUnitSamples;
+      const padded = new Int16Array(pcm.length + ((unit - ((inputSamplesSent + pcm.length) % unit)) % unit));
+      padded.set(pcm);
+      pcm = padded;
+    }
+    if (!pcm.length) return;
     const frame = cameraPendingFrame || (profile.stickyCamera ? cameraLastFrame : null);
     cameraPendingFrame = null;
     const appendEvent = profile.pushToTalk
       ? profile.append(int16ToBase64(pcm), frame, { isSpeech: true })
       : profile.append(int16ToBase64(pcm), frame);
     socket.send(JSON.stringify(appendEvent));
+    inputSamplesSent += pcm.length;
+    if (profile.pushToTalk) pttUploadedInput = true;
   }
 
   function submitObservation(frame) {
@@ -440,9 +513,18 @@
   }
 
   function submitTurn() {
-    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    for (const event of profile.commitMessages()) {
+      if (event.type === 'input_audio_buffer.commit') {
+        event.event_id = `web-commit-${++commitCounter}`;
+        pendingCommits.add(event.event_id);
+        if (!assistantActive && !turnSubmitted) pendingCommitsOwnBusy = true;
+      }
+      socket.send(JSON.stringify(event));
+    }
     turnSubmitted = true;
-    responseComplete = false;
+    // A new hold can be rejected while the previous reply is still playing.
+    // Its terminal state belongs to that reply until a new response begins.
+    if (!currentResponseId) responseComplete = false;
     markBusy();
     armTurnTimeout();
     sendTurnButton.disabled = true;
@@ -454,7 +536,8 @@
     if (!profile.pushToTalk || !running || pttHeld === held) return;
     if (held) {
       pttHeld = true;
-      suppressLocalPlayback();
+      pttUploadedInput = false;
+      if (!profile.cameraObservations) suppressLocalPlayback();
       pttButton.classList.toggle('is-active', true);
       pttButton.textContent = 'Release to send';
       setModel('Talking');
@@ -463,13 +546,15 @@
     }
     // Flush remaining speech while still held, then commit.
     flushCapture();
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    const committed = pttUploadedInput && socket && socket.readyState === WebSocket.OPEN;
+    if (committed) {
+      if (profile.cameraObservations) submitTurn();
+      else for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
     }
     // Lock vision before clearing pttHeld. Stage0/1 are max_num_seqs=1: a
     // vision-follow commit in the gap before response.begin aborts the speech
     // turn (server sees a new ephemeral and kills the prior ASR request).
-    if (profile.visionFollowWhileSpeaking) {
+    if (committed && profile.visionFollowWhileSpeaking) {
       visionTurnLocked = true;
       visionFollowQueue = [];
     }
@@ -477,10 +562,12 @@
     pttButton.classList.toggle('is-active', false);
     pttButton.textContent = 'Hold to talk';
     setModel(profile.waiting);
-    appendLog('PTT up · commit');
+    appendLog(committed ? 'PTT up · commit' : 'PTT up · no input');
   }
 
   function beginAssistant(responseId) {
+    pendingCommits.clear();
+    pendingCommitsOwnBusy = false;
     currentResponseId = responseId || currentResponseId;
     responseHasAudio = false;
     assistantActive = true;
@@ -523,8 +610,10 @@
 
   function playbackDrained(message) {
     const responseId = message.responseId || currentResponseId;
-    if (currentResponseId && responseId !== currentResponseId) return;
     if (profile.playbackAck) sendPlaybackAck(responseId, Number(message.playedMs) || 0);
+    // Generation may advance before the previous response finishes playing.
+    // ACK that response's own cursor without completing the newer UI turn.
+    if (currentResponseId && responseId !== currentResponseId) return;
     setPlayback('Idle');
     playbackComplete = true;
     if (message.underrunMs > 0) appendLog(`playback underrun ${message.underrunMs} ms`);
@@ -548,13 +637,33 @@
   }
 
   function handleTranscriptEvent(action) {
+    const text = typeof action.text === 'string' ? action.text.trim() : '';
+    if (
+      action.role === 'user'
+      && text
+      && !liveUserTurn
+      && lastClosedRole === 'user'
+      && text === lastClosedUserText
+      && action.itemId
+      && action.itemId === lastClosedUserItemId
+      && Date.now() - lastClosedUserAt < 3000
+    ) {
+      // Commit and ASR complete the same item twice. A new item with the same
+      // words is a second utterance and keeps its own bubble.
+      return;
+    }
     if (action.role === 'assistant') {
       // Qwen may emit both text and audio-transcript representations.
       // Display one channel per response instead of duplicating the answer.
-      if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel) return;
-      if (action.text) assistantTextChannel = action.channel || assistantTextChannel;
+      // A channel chosen before any visible text must not hide the real reply.
+      const visible = liveAssistantTurn && liveAssistantTurn.value;
+      if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel && visible) return;
+      if (text) assistantTextChannel = action.channel || assistantTextChannel;
     }
     const responseId = action.responseId || null;
+    if (action.kind === 'text-final' && action.role === 'assistant' && responseId) {
+      transcriptDoneResponses.add(responseId);
+    }
     const existing = responseId && action.role === 'assistant' ? assistantRowByResponse.get(responseId) : null;
     if (existing) {
       if (action.kind === 'text') {
@@ -592,7 +701,7 @@
         turn.text.textContent = action.text;
         if (responseId) assistantRowByResponse.set(responseId, turn);
       }
-    } else finishTranscript(action.role, action.text);
+    } else finishTranscript(action.role, action.text, action.itemId);
   }
 
   async function handleEvent(event, action = profile.mapEvent(event)) {
@@ -646,7 +755,24 @@
         if (profile.visionFollowWhileSpeaking) visionTurnLocked = true;
         break;
       case 'audio':
-        await handleAudioEvent(action);
+        if (action.event && action.event.text) {
+          const shown = responseId && assistantRowByResponse.get(responseId);
+          const completedEcho = shown
+            && transcriptDoneResponses.has(responseId)
+            && action.event.text === shown.value;
+          // Audio deltas can carry the transcript already closed by
+          // output_audio_transcript.done. That copy is not a new delta.
+          if (!completedEcho) {
+            handleTranscriptEvent({
+              kind: 'text',
+              role: 'assistant',
+              channel: 'audio',
+              text: action.event.text,
+              responseId,
+            });
+          }
+        }
+        if (action.event && (action.event.delta || action.event.audio)) await handleAudioEvent(action);
         break;
       case 'drain':
         requestPlaybackDrain(responseId);
@@ -656,7 +782,11 @@
         if (action.kind === 'text-final' && action.role === 'assistant') releaseVisionTurn(responseId);
         break;
       case 'done':
-        clearTimeout(turnTimeout);
+        if (!currentResponseId) {
+          pendingCommits.clear();
+          pendingCommitsOwnBusy = false;
+        }
+        if (!pendingCommits.size) clearTimeout(turnTimeout);
         responseComplete = true;
         finishTranscript('assistant');
         releaseVisionTurn(responseId);
@@ -676,8 +806,12 @@
         if (sessionCloseResolver) sessionCloseResolver();
         sessionCloseResolver = null;
         break;
+      case 'commit-settled':
+        settleCommitWithoutResponse(action.eventId);
+        break;
       case 'error':
         if (action.fatal) { await failSession(action.message); break; }
+        settleCommitWithoutResponse(event.error?.event_id);
         // A rejected frame or a refused update costs one operation, not the
         // call: report it and keep listening.
         appendLog(action.message, true);
@@ -852,6 +986,7 @@
       await openSocket();
       running = true;
       muted = false;
+      inputSamplesSent = 0;
       pttHeld = false;
       assistantActive = false;
       visionFollowQueue = [];
@@ -884,9 +1019,10 @@
     cameraPreview.srcObject = cameraStream;
     cameraPreview.style.display = '';
     await cameraPreview.play().catch(() => {});
-    // JPEG quality 0.7; no client-side resize (server scale_resolution=448).
+    // JPEG quality defaults to 0.7; no client-side resize (server scale_resolution=448).
     // Interval is per-profile: AURA 2 fps, MiniCPM/Qwen stay at 1 s.
     const cameraIntervalMs = profile.cameraIntervalMs || 1000;
+    const cameraJpegQuality = profile.cameraJpegQuality || 0.7;
     const captureCameraFrame = () => {
       if (!cameraStream || cameraPreview.videoWidth === 0) return;
       const scale = profile.cameraMaxDimension
@@ -894,7 +1030,7 @@
       cameraCanvas.width = Math.max(1, Math.round(cameraPreview.videoWidth * scale));
       cameraCanvas.height = Math.max(1, Math.round(cameraPreview.videoHeight * scale));
       cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0, cameraCanvas.width, cameraCanvas.height);
-      const frame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+      const frame = cameraCanvas.toDataURL('image/jpeg', cameraJpegQuality).split(',')[1];
       if (profile.imageMessages) {
         if (connectionReady && socket?.readyState === WebSocket.OPEN) {
           for (const event of profile.imageMessages(frame)) socket.send(JSON.stringify(event));
@@ -968,11 +1104,19 @@
     responseComplete = false;
     playbackComplete = true;
     turnSubmitted = false;
+    pendingCommits.clear();
+    pendingCommitsOwnBusy = false;
     assistantTextChannel = null;
     assistantRowByResponse.clear();
+    transcriptDoneResponses.clear();
     lastClosedAssistantText = '';
+    lastClosedUserText = '';
+    lastClosedUserItemId = '';
+    lastClosedUserAt = 0;
+    lastClosedRole = null;
     sendTurnButton.disabled = true;
     pttHeld = false;
+    pttUploadedInput = false;
     pttButton.disabled = true;
     pttButton.classList.remove('is-active');
     pttButton.textContent = 'Hold to talk';
@@ -1031,6 +1175,11 @@
 
   function toggleMute() {
     if (!running) return;
+    // Frame-only units bypass a partial audio unit on the server, so close it
+    // with silence (as a commit would) before unmuted audio splices onto it.
+    if (!muted && profile.inputUnitSamples && socket?.readyState === WebSocket.OPEN && microphoneUploadEnabled()) {
+      sendCapturedAudio({ padToUnit: true });
+    }
     muted = !muted;
     pendingCapture = [];
     muteButton.textContent = muted ? 'Unmute' : 'Mute';
@@ -1044,7 +1193,7 @@
   });
   sendTurnButton.addEventListener('click', () => {
     if (!running || !connectionReady || !profile.clientCommit || turnSubmitted) return;
-    if (profile.videoOnly) {
+    if (profile.videoOnly || (profile.cameraObservations && !pttHeld)) {
       submitObservation(cameraPendingFrame || cameraLastFrame);
       return;
     }

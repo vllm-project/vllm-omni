@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # This script build the XPU docker image and run the offline inference inside the container.
 set -ex
@@ -100,6 +102,8 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
+# Container variables below must expand in the container shell.
+# shellcheck disable=SC2016
 time timeout -k 30 30m docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
@@ -119,7 +123,7 @@ time timeout -k 30 30m docker run \
     echo $ZE_AFFINITY_MASK
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
-    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e"
+    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
     pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
     pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
     pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"

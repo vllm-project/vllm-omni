@@ -18,6 +18,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, _has_async_chunk_payload_to_run
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.engine.serialization import serialize_additional_information
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -27,6 +28,8 @@ class FakeAdapter:
     """Minimal mock of OmniChunkTransferAdapter tracking restore calls."""
 
     def __init__(self):
+        self.receives_chunks = True
+        self.requests_with_ready_chunks: set[str] = set()
         self.waiting_for_chunk_waiting_requests: deque = deque()
         self.waiting_for_chunk_running_requests: deque = deque()
         self.restore_called = False
@@ -40,6 +43,10 @@ class FakeAdapter:
     def is_done_receiving_chunks(self, request_id):
         return request_id in self.done_request_ids
 
+    def collect_timed_out_request_ids(self, timeout_s):
+        """These fixtures have ready chunks, not stalled input waits."""
+        return set()
+
     def collect_failed_send_request_ids(self):
         return {}
 
@@ -48,8 +55,13 @@ class FakeAdapter:
         running.extend(self.waiting_for_chunk_running_requests)
         self.waiting_for_chunk_running_requests = deque()
 
-    def postprocess_scheduler_output(self, output):
-        pass
+    def postprocess_scheduler_output(self, output, requests=None, *, consume_chunks=True):
+        if consume_chunks:
+            for request_id in output.num_scheduled_tokens:
+                self.requests_with_ready_chunks.discard(request_id)
+
+    def mark_chunk_consumed(self, request_id):
+        self.requests_with_ready_chunks.discard(request_id)
 
 
 def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
@@ -66,6 +78,8 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler.requests = {waiting_request.request_id: waiting_request}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.chunk_transfer_adapter = FakeAdapter()
+    scheduler.chunk_transfer_adapter.requests_with_ready_chunks.add(waiting_request.request_id)
+    scheduler._native_data_plane = False
     scheduler.input_coordinator = None
     scheduler.log_stats = False
     scheduler.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
@@ -165,6 +179,8 @@ def _chunk_request(request_id, **kwargs):
         external_req_id=request_id,
         prefill_stats=None,
         record_event=lambda *args, **kwargs: None,
+        # These request stubs represent live chunks, never finished requests.
+        is_finished=lambda: False,
     )
     defaults.update(kwargs)
     return _HashableChunkRequest(**defaults)
@@ -183,9 +199,7 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", create_request_queue)
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
-    scheduler.input_coordinator = SimpleNamespace(
-        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
-    )
+    scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
     scheduler.running = []
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
@@ -233,6 +247,24 @@ def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeyp
     assert output.num_scheduled_tokens == {"terminal": 1}
     assert output.scheduled_new_reqs[0].req_id == "terminal"
     assert scheduler._pending_finish_reqs == []
+
+
+@pytest.mark.parametrize("in_running", [False, True])
+def test_generation_waits_for_in_flight_result_before_finishing(in_running: bool) -> None:
+    request = _chunk_request("in-flight", num_computed_tokens=1, num_in_flight_tokens=1, status=RequestStatus.RUNNING)
+    scheduler = _make_generation_scheduler(request)
+    scheduler.chunk_transfer_adapter.process_pending_chunks = lambda *args, **kwargs: None
+    scheduler.chunk_transfer_adapter.done_request_ids.add(request.request_id)
+    if in_running:
+        scheduler.waiting.pop_request()
+        scheduler.running.append(request)
+
+    output = scheduler.schedule()
+
+    assert not output.num_scheduled_tokens
+    assert not scheduler._pending_finish_reqs
+    assert request.num_computed_tokens == 1
+    assert request.num_in_flight_tokens == 1
 
 
 class TestRestoreQueuesOnError:
@@ -347,9 +379,7 @@ def _express_scheduler():
     scheduler.max_num_running_reqs = 4
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
-    scheduler.input_coordinator = SimpleNamespace(
-        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
-    )
+    scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
     scheduler._first_chunk_express = True
     scheduler._last_step_express = False
     scheduler._chunk_started = {"continuation"}

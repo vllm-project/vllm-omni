@@ -19,10 +19,13 @@ def _update_codec_state(
     valid_ptr,
     done_ptr,
     masked_ptr,
+    code_classes_ptr,
     eos: tl.constexpr,
     window: tl.constexpr,
     cadence: tl.constexpr,
     boundary_steps: tl.constexpr,
+    silent_frames: tl.constexpr,
+    quiet_stop_frames: tl.constexpr,
 ):
     row = tl.program_id(0)
     slot = tl.load(slots_ptr + row)
@@ -33,18 +36,30 @@ def _update_codec_state(
     finished = tl.load(base + 1) != 0
     limit = tl.load(base + 2)
     minimum = tl.load(base + 3)
-    drain = tl.load(base + 4) != 0
+    drain = tl.load(base + 4)
     valid = decode & ~finished & (code != eos)
     step += valid.to(tl.int64)
     done = finished | (decode & (code == eos)) | (step >= limit)
-    boundary = (step >= cadence) & ((step % cadence) < boundary_steps)
-    masked = ~done & ((step < minimum) | (drain & boundary))
     offsets = tl.arange(0, window)
     # Load every old value before overwriting the history in place.
     old = tl.load(history_ptr + slot * window + tl.minimum(offsets + 1, window - 1))
     shifted = tl.where(offsets == window - 1, code, old)
     unchanged = tl.load(history_ptr + slot * window + offsets)
     updated = tl.where(valid, shifted, unchanged)
+    # Turn-end drain kind (minicpmo_4_5_omni_tts._DRAIN_*): 1 masks the cadence
+    # EOS after each boundary; 2 may stop only after `silent_frames` silent codes
+    # in a row and must stop after `quiet_stop_frames` quiet ones. Only codes of
+    # the current condition (the last `step` of the history) count. Code class
+    # bits are minicpmo_4_5_omni_tts._CODEC_CLASS_* (1 silent, 2 quiet).
+    classes = tl.load(code_classes_ptr + updated)
+    current = offsets >= window - step
+    silent = ((classes & 1) != 0) & current & (offsets >= window - silent_frames)
+    quiet = ((classes & 2) != 0) & current & (offsets >= window - quiet_stop_frames)
+    settled = tl.sum(silent.to(tl.int32), axis=0) == silent_frames
+    until_silent = drain == 2
+    done = done | (until_silent & (tl.sum(quiet.to(tl.int32), axis=0) == quiet_stop_frames))
+    boundary = (drain == 1) & (step >= cadence) & ((step % cadence) < boundary_steps)
+    masked = ~done & ((step < minimum) | boundary | (until_silent & ~settled))
     tl.store(history_ptr + slot * window + offsets, updated)
     tl.store(out_history_ptr + row * window + offsets, updated)
     tl.store(base, step)
@@ -87,7 +102,7 @@ class CodecState:
     """Stable request slots, including across duplex prefill/recompute resets.
 
     State columns are frame count, finished, frame limit, minimum frames and
-    turn-end drain. Kernels and slot reuse run on the runner's current stream.
+    turn-end drain kind. Kernels and slot reuse run on the runner's current stream.
     Per-step outputs own their storage so asynchronous payload copies cannot
     observe a subsequent state update.
     """
@@ -131,7 +146,7 @@ class CodecState:
                     bool(state.get("finished")),
                     int(state.get("max_tokens") or (2**31 - 1)) - 1,
                     int(state.get("min_tokens") or 0),
-                    bool(state.get("turn_end_drain")),
+                    int(state.get("turn_end_drain") or 0),
                 ]
             )
             recent = state.get("recent_codes", [])
@@ -143,7 +158,21 @@ class CodecState:
             self.state.index_copy_(0, slots, index_to_device(configs, self.device))
             self.history.index_copy_(0, slots, torch.stack(histories))
 
-    def update(self, rows, ids, *, eos, cadence, boundary):
+    def update(
+        self,
+        rows,
+        ids,
+        *,
+        eos,
+        cadence,
+        boundary,
+        code_classes,
+        silent_frames,
+        quiet_stop_frames,
+    ):
+        """Advance one decode step. ``code_classes`` (an int8 table per codec id,
+        covering the padding id ``vocab_size``) and the two frame counts only
+        affect rows drained until silent."""
         self.prepare([(request_id, state) for request_id, state, _ in rows])
         slots, decode = self.indices(
             tuple(state["_gpu_slot"] for _, state, _ in rows),
@@ -164,10 +193,13 @@ class CodecState:
             valid,
             done,
             masked,
+            code_classes,
             eos,
             self.window,
             cadence,
             boundary,
+            silent_frames,
+            quiet_stop_frames,
         )
         return history, valid, done, masked
 

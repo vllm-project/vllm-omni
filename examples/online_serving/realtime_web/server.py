@@ -75,11 +75,14 @@ def build_app(
     ref_audio: str | None = None,
     profile: str = "minicpm-native",
     turn_mode: str = "manual",
+    speech_input: bool = False,
 ) -> FastAPI:
     if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn"}:
         raise ValueError(f"Unknown profile: {profile}")
-    if turn_mode not in {"manual", "vad"}:
+    if turn_mode not in {"manual", "vad", "semantic_vad"}:
         raise ValueError(f"Unknown turn mode: {turn_mode}")
+    if turn_mode == "semantic_vad" and profile != "qwen3-turn":
+        raise ValueError("--semantic-vad requires --profile qwen3-turn")
     if profile == "qwen3-turn" and ref_audio:
         raise ValueError("Qwen3 profile does not accept --ref-audio")
     if profile == "aura-ptt" and ref_audio:
@@ -123,6 +126,7 @@ def build_app(
                 "model": model,
                 "profile": profile,
                 "turnMode": turn_mode,
+                "speechInput": speech_input,
                 "realtimePath": public_realtime_url or "v1/realtime",
                 "refAudio": ref_audio_uri,
                 "appVersion": app_version,
@@ -200,7 +204,15 @@ def main(default_profile: str = "minicpm-native") -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--manual", dest="turn_mode", action="store_const", const="manual")
     mode.add_argument("--vad", dest="turn_mode", action="store_const", const="vad")
+    mode.add_argument(
+        "--semantic-vad",
+        dest="turn_mode",
+        action="store_const",
+        const="semantic_vad",
+        help="Qwen3 semantic turn detection (requires the Smart Turn artifact).",
+    )
     parser.set_defaults(turn_mode="manual")
+    parser.add_argument("--speech-input", action="store_true", help="Enable JoyAI microphone input (ASR deployment).")
     parser.add_argument(
         "--public-realtime-url",
         help="Browser-visible ws:// or wss:// Realtime URL; defaults to the same-origin proxy.",
@@ -226,6 +238,7 @@ def main(default_profile: str = "minicpm-native") -> None:
             ref_audio=args.ref_audio,
             profile=args.profile,
             turn_mode=args.turn_mode,
+            speech_input=args.speech_input,
         ),
         host=args.host,
         port=args.port,

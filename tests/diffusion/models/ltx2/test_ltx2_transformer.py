@@ -156,11 +156,14 @@ def test_ltx_sp_plan_only_shards_video_stream(rope_type):
 
 def test_ltx_attention_assigns_video_only_sp_modes(monkeypatch):
     modes = {}
+    packed_qkv = {}
 
     class FakeAttention(nn.Module):
         def __init__(self, *, prefix, sequence_parallel_mode="local", **_kwargs):
             super().__init__()
-            modes[prefix.rsplit(".", 1)[-1]] = sequence_parallel_mode
+            name = prefix.rsplit(".", 1)[-1]
+            modes[name] = sequence_parallel_mode
+            packed_qkv[name] = _kwargs.get("pack_qkv", True)
 
     class FakeFeedForward(nn.Module):
         def __init__(self, *_args, **_kwargs):
@@ -189,6 +192,10 @@ def test_ltx_attention_assigns_video_only_sp_modes(monkeypatch):
         "audio_to_video_attn": "local",
         "video_to_audio_attn": "video_to_audio",
     }
+    assert packed_qkv["attn1"] is False
+    assert packed_qkv["audio_attn1"] is False
+    assert packed_qkv["attn2"] is True
+    assert packed_qkv["audio_attn2"] is True
 
 
 def test_ltx_sp_keeps_cross_attention_key_padding_mask(monkeypatch):

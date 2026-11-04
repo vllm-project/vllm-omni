@@ -10,14 +10,22 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from vllm.outputs import PoolingRequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
+from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
-from vllm.v1.metrics.stats import IterationStats, LoRARequestStates, PrefillStats
+from vllm.v1.metrics.stats import (
+    IterationStats,
+    LoRARequestStates,
+    PrefillStats,
+    RequestStateStats,
+)
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.outputs import output_processor
 from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
@@ -536,6 +544,85 @@ def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
     assert torch.equal(result.outputs[0].multimodal_output[AUDIO], torch.ones(5))
 
 
+def _nemotron_snapshot(rows: int, *, cols: int = 4, step: int) -> dict:
+    """One Nemotron talker wake: cumulative code stack + its meta marker."""
+    prefix = torch.arange(rows * cols, dtype=torch.long).reshape(rows, cols)
+    return {
+        "codes.audio": prefix,
+        "meta.nvc_logical_prompt_len": 3,
+        "meta.nvc_tts_step": torch.tensor([step], dtype=torch.long),
+    }
+
+
+def test_nemotron_cumulative_codes_snapshot_keeps_latest_prefix():
+    """A re-shipped cumulative prefix replaces, never concatenates, its predecessor."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(_nemotron_snapshot(2, step=1), mm_type=LATENT)
+    first = s.make_request_output([1], None, None, None)
+    assert first is not None and not isinstance(first, PoolingRequestOutput)
+    assert first.outputs[0].multimodal_output["codes"]["audio"].shape[0] == 2
+
+    s.add_multimodal_tensor(_nemotron_snapshot(5, step=2), mm_type=LATENT)
+    # Storage holds only the latest full prefix (single tensor), never a list
+    # of every prefix seen; total size tracks the current prefix, not the sum.
+    stored = s.mm_accumulated["codes.audio"]
+    assert isinstance(stored, torch.Tensor)
+    assert stored.shape[0] == 5
+
+    second = s.make_request_output([2], None, None, None)
+    assert second is not None and not isinstance(second, PoolingRequestOutput)
+    out = second.outputs[0].multimodal_output["codes"]["audio"]
+    assert out.shape == (5, 4)
+    assert torch.equal(out, _nemotron_snapshot(5, step=2)["codes.audio"])
+    meta = second.outputs[0].multimodal_output["meta"]
+    assert meta["nvc_tts_step"].tolist() == [2]
+    assert meta["nvc_logical_prompt_len"] == 3
+
+
+def test_nemotron_delta_codes_snapshot_retains_only_latest_prefix():
+    s = _make_state(RequestOutputKind.DELTA)
+    for step, rows in enumerate((2, 4, 5), start=1):
+        s.add_multimodal_tensor(_nemotron_snapshot(rows, step=step), mm_type=LATENT)
+        result = s.make_request_output([step], None, None, None)
+        assert result is not None and not isinstance(result, PoolingRequestOutput)
+        out = result.outputs[0].multimodal_output
+        assert out["codes"]["audio"].shape == (rows, 4)
+        assert torch.equal(out["codes"]["audio"], _nemotron_snapshot(rows, step=step)["codes.audio"])
+        # Per-wake tensor metadata is a snapshot, not an accumulated list.
+        assert out["meta"]["nvc_tts_step"].tolist() == [step]
+
+    stored = s.mm_accumulated["codes.audio"]
+    assert isinstance(stored, torch.Tensor)
+    assert stored.shape[0] == 5
+
+
+def test_nemotron_marker_without_codes_key_preserves_prior_prefix():
+    """A marker-only update must not erase content from an earlier wake."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(_nemotron_snapshot(4, step=1), mm_type=LATENT)
+    s.add_multimodal_tensor(
+        {"meta.nvc_logical_prompt_len": 3, "meta.nvc_tts_step": torch.tensor([2], dtype=torch.long)},
+        mm_type=LATENT,
+    )
+    result = s.make_request_output([1], None, None, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    out = result.outputs[0].multimodal_output["codes"]["audio"]
+    assert isinstance(out, torch.Tensor) and out.shape[0] == 4
+    assert result.outputs[0].multimodal_output["meta"]["nvc_tts_step"].tolist() == [2]
+
+
+def test_codes_audio_without_nemotron_marker_still_accumulates():
+    """Other models keep CONCAT semantics for the same key when unmarked."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor({"codes.audio": torch.ones(2, 4, dtype=torch.long)}, mm_type=LATENT)
+    s.add_multimodal_tensor({"codes.audio": torch.full((3, 4), 2, dtype=torch.long)}, mm_type=LATENT)
+    result = s.make_request_output([1], None, None, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    out = result.outputs[0].multimodal_output["codes"]["audio"]
+    assert out.shape == (5, 4)
+    assert out[:2].eq(1).all() and out[2:].eq(2).all()
+
+
 def test_delta_audio_final_tts_chunk_keeps_finish():
     s = _make_state(RequestOutputKind.DELTA)
     s.add_multimodal_tensor(
@@ -591,6 +678,25 @@ def test_final_only_consolidates_drainable_keys(mm_type):
     audio = result.outputs[0].multimodal_output[mm_type]
     assert isinstance(audio, torch.Tensor)
     assert audio.shape == (800,)
+
+
+def test_final_only_audio_exposes_concatenated_public_waveform():
+    """Tensor-only model payloads become one public audio tensor, not a chunk list."""
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    chunks = [torch.arange(4, dtype=torch.float32), torch.arange(4, 7, dtype=torch.float32)]
+    for chunk in chunks:
+        state.add_multimodal_tensor({"model_outputs": chunk, "sr": torch.tensor(24000)}, mm_type=AUDIO)
+        assert state.make_request_output([1], None, None, None) is None
+
+    result = state.make_request_output([2], None, FinishReason.STOP, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    mm = result.outputs[0].multimodal_output
+    assert "model_outputs" not in mm
+    audio = mm["audio"]
+    assert isinstance(audio, torch.Tensor) and audio.dtype == torch.float32
+    assert audio.shape == (7,)
+    torch.testing.assert_close(audio, torch.cat(chunks), atol=0, rtol=0)
+    assert mm["sr"].item() == 24000
 
 
 def test_cumulative_token_ids_always_set():
@@ -733,6 +839,83 @@ def test_no_detokenizer_make_request_output():
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+@pytest.mark.parametrize("cache_miss", [False, True])
+def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss):
+    """Native pooling success and cache-miss errors retain their output types."""
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    request = OmniEngineCoreRequest(
+        request_id="aligner-internal",
+        external_req_id="aligner-external",
+        prompt_token_ids=[10, 11],
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="token_classify"),
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    processor.add_request(request, prompt=None, parent_req=None, request_index=0, queue=None)
+    timestamps = torch.tensor([[0, 125], [125, 300]], dtype=torch.int32)
+
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                pooling_output=None if cache_miss else timestamps,
+                finish_reason=FinishReason.ERROR if cache_miss else FinishReason.STOP,
+                mm_cache_miss_hashes=["audio-feature"] if cache_miss else None,
+            )
+        ]
+    )
+
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert isinstance(output, PoolingRequestOutput)
+    assert output.request_id == request.external_req_id
+    assert output.prompt_token_ids == request.prompt_token_ids
+    assert output.finished
+    if cache_miss:
+        assert output.error is not None
+        assert output.error.code == "multimodal_cache_miss"
+        assert output.error.retryable
+        assert output.outputs.data.numel() == 0
+    else:
+        assert output.error is None
+        torch.testing.assert_close(output.outputs.data, timestamps)
+    assert request.request_id not in processor.request_states
+    assert request.external_req_id not in processor.external_req_ids
+
+
+def test_no_detokenizer_generation_cache_miss_keeps_multimodal_completion():
+    """A generation-stage error must retain its completion type and payload."""
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, output_modality=OutputModality.AUDIO)
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    audio = torch.tensor([0.1, 0.2])
+
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id=state.request_id,
+                new_token_ids=[],
+                multimodal_output={AUDIO: audio},
+                finish_reason=FinishReason.ERROR,
+                mm_cache_miss_hashes=["audio-feature"],
+            )
+        ]
+    )
+
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert isinstance(output, RequestOutput)
+    assert output.finished
+    torch.testing.assert_close(output.outputs[0].multimodal_output[AUDIO], audio)
+    assert state.request_id not in processor.request_states
 
 
 def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypatch):
@@ -945,6 +1128,408 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.num_generation_tokens == 2
 
 
+_PHASE_KEYS = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+
+
+@pytest.mark.parametrize(
+    ("timestamps", "expected"),
+    [
+        pytest.param(
+            dict(num_preemptions=1, queued_ts=100.0, scheduled_ts=100.25, first_token_ts=100.75, last_token_ts=102.0),
+            {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 1},
+            id="all_events",
+        ),
+        pytest.param(
+            # A one-token output and an immediate schedule are measured zeros.
+            dict(queued_ts=10.0, scheduled_ts=10.0, first_token_ts=10.5, last_token_ts=10.5),
+            {"vllm_queued_ms": 0.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0},
+            id="measured_zero",
+        ),
+        pytest.param(dict(), {}, id="nothing_observed"),
+        pytest.param(
+            # No QUEUED/SCHEDULED: "first_token_ts - 0.0" would invent a prefill.
+            dict(first_token_ts=50.0, last_token_ts=50.5),
+            {"vllm_decode_ms": 500.0},
+            id="no_engine_core_events",
+        ),
+        pytest.param(
+            dict(scheduled_ts=5.0, first_token_ts=6.0, last_token_ts=7.0),
+            {"vllm_prefill_ms": 1000.0, "vllm_decode_ms": 1000.0, "vllm_num_preemptions": 0},
+            id="no_queued_event",
+        ),
+        pytest.param(
+            # Finished (e.g. aborted) before it was ever scheduled.
+            dict(queued_ts=7.0),
+            {"vllm_num_preemptions": 0},
+            id="never_scheduled",
+        ),
+        pytest.param(
+            # The first output was processed without stats, so no first token.
+            dict(queued_ts=1.0, scheduled_ts=2.0, last_token_ts=3.0),
+            {"vllm_queued_ms": 1000.0, "vllm_num_preemptions": 0},
+            id="no_first_token",
+        ),
+        pytest.param(
+            dict(queued_ts=5.0, scheduled_ts=4.0, first_token_ts=6.0, last_token_ts=5.5),
+            {"vllm_prefill_ms": 2000.0, "vllm_num_preemptions": 0},
+            id="negative_intervals",
+        ),
+    ],
+)
+def test_native_phase_split_omits_unobserved_intervals(timestamps, expected):
+    metrics = output_processor._native_phase_metrics(RequestStateStats(**timestamps))
+
+    assert metrics == pytest.approx(expected)
+
+
+def _make_text_stage_state(*, stream_input: bool = False) -> OmniRequestState:
+    # vLLM's no-tokenizer detokenizer keeps the output on the AR text path
+    # (upstream process_outputs) instead of the multimodal-only path.
+    return OmniRequestState(
+        **{
+            **_DEFAULT_STATE_KWARGS,
+            "detokenizer": IncrementalDetokenizer(),
+            "logprobs_processor": LogprobsProcessor(
+                tokenizer=None,
+                logprobs=None,
+                prompt_logprobs=None,
+                cumulative_logprob=None,
+                num_logprobs=None,
+                num_prompt_logprobs=None,
+            ),
+        },
+        output_kind=RequestOutputKind.CUMULATIVE,
+        stream_input=stream_input,
+    )
+
+
+def _stats_processor(state: OmniRequestState) -> MultimodalOutputProcessor:
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=True, engine_core_output_type=AUDIO)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    return processor
+
+
+def _stats_output(
+    *, events=None, finish_reason=None, is_segment_finished=False, new_token_ids=(10,)
+) -> OmniEngineCoreOutput:
+    return OmniEngineCoreOutput(
+        request_id="r",
+        new_token_ids=list(new_token_ids),
+        events=events,
+        finish_reason=finish_reason,
+        is_segment_finished=is_segment_finished,
+        multimodal_output={AUDIO: torch.ones(1, 4)},
+    )
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    [_make_text_stage_state, lambda: _make_no_detok_state(RequestOutputKind.CUMULATIVE)],
+    ids=["ar_text_path", "mm_only_path"],
+)
+def test_engine_core_events_reach_native_phase_split(make_state):
+    state = make_state()
+    processor = _stats_processor(state)
+    prefill = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+        ]
+    )
+    processor.process_outputs([prefill], engine_core_timestamp=1.75, iteration_stats=IterationStats())
+    decode = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.PREEMPTED, 2.0),
+            # Re-scheduling after preemption must not move the prefill start.
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.5),
+        ],
+        finish_reason=FinishReason.LENGTH,
+    )
+    iteration_stats = IterationStats()
+    processor.process_outputs([decode], engine_core_timestamp=3.0, iteration_stats=iteration_stats)
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 1}
+    )
+    finished = iteration_stats.finished_requests[0]
+    assert record["vllm_queued_ms"] == pytest.approx(finished.queued_time * 1000.0)
+    assert record["vllm_prefill_ms"] == pytest.approx(finished.prefill_time * 1000.0)
+    assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
+    assert record["vllm_num_preemptions"] == finished.num_preemptions
+
+
+def test_native_phase_split_with_coalesced_decode_output():
+    # A final audio stage folds token-only decode steps into its next emitted
+    # output (is_coalesced). The scheduler never holds the output that carries
+    # prefill stats, and a coalesced output is stamped when it is emitted, so
+    # the split is unchanged; only its ITL sample is dropped.
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor = _stats_processor(state)
+    coalesced = _stats_output(new_token_ids=(11, 12, 13))
+    coalesced.is_coalesced = True
+    steps = [
+        (
+            1.75,
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            ),
+        ),
+        (2.0, _stats_output()),
+        (2.5, coalesced),
+        (3.0, _stats_output(finish_reason=FinishReason.STOP)),
+    ]
+    itls = []
+    for timestamp, output in steps:
+        iteration_stats = IterationStats()
+        processor.process_outputs([output], engine_core_timestamp=timestamp, iteration_stats=iteration_stats)
+        itls += iteration_stats.inter_token_latencies_iter
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 0}
+    )
+    finished = iteration_stats.finished_requests[0]
+    assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
+    assert finished.num_generation_tokens == 6
+    assert itls == pytest.approx([0.25, 0.5])
+
+
+def test_one_shot_generation_phase_split_reports_whole_run_as_prefill():
+    # A generation stage that emits a single token-less output at stop: the
+    # first engine-core output sets the first-token timestamp, so the whole
+    # run is prefill and decode is a measured 0.
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor = _stats_processor(state)
+    only = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+        ],
+        finish_reason=FinishReason.STOP,
+        new_token_ids=(),
+    )
+    processor.process_outputs([only], engine_core_timestamp=2.0, iteration_stats=IterationStats())
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 750.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0}
+    )
+
+
+def test_first_output_without_stats_leaves_prefill_and_decode_out():
+    # The orchestrator flushes a codec stage's first audio frame without
+    # iteration stats, so the native first-token timestamp is never set.
+    processor = _stats_processor(_make_no_detok_state(RequestOutputKind.CUMULATIVE))
+    processor.process_outputs([_stats_output()], engine_core_timestamp=1.5, iteration_stats=None)
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ],
+                finish_reason=FinishReason.STOP,
+            )
+        ],
+        engine_core_timestamp=2.0,
+        iteration_stats=IterationStats(),
+    )
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS if key in record} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_num_preemptions": 0}
+    )
+
+
+@pytest.mark.parametrize(
+    ("stats_on", "is_segment_finished"),
+    [(False, False), (True, True)],
+    ids=["stats_off", "segment_finish"],
+)
+def test_no_native_phase_split_without_finished_request_stats(stats_on, is_segment_finished):
+    # Only a terminal finish with stats on is a finished vLLM request.
+    processor = _stats_processor(_make_no_detok_state(RequestOutputKind.CUMULATIVE))
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ],
+                finish_reason=FinishReason.STOP,
+                is_segment_finished=is_segment_finished,
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats() if stats_on else None,
+    )
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert not set(_PHASE_KEYS) & set(record)
+
+
+def _streaming_input(arrival_time: float, *, resumable: bool = True) -> SimpleNamespace:
+    # The EngineCoreRequest fields the output processor reads for a request
+    # that is already registered: the next input segment, or (resumable=False)
+    # the end of the input stream.
+    return SimpleNamespace(request_id="r", resumable=resumable, prompt_token_ids=[1], arrival_time=arrival_time)
+
+
+def _phase_split(record: dict) -> dict:
+    return {key: record[key] for key in _PHASE_KEYS if key in record}
+
+
+@pytest.mark.parametrize("next_input_before_stop", [True, False], ids=["queued_before_stop", "after_stop"])
+def test_text_path_phase_split_covers_last_streaming_segment(next_input_before_stop):
+    # On the AR text path, vLLM's process_outputs applies the next streaming
+    # update at a segment stop instead of finishing the request, and the
+    # update restarts the request stats.
+    processor = _stats_processor(_make_text_stage_state(stream_input=True))
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats(),
+    )
+    stop_events = None
+    if next_input_before_stop:
+        processor.add_request(_streaming_input(2.9), prompt=None)
+        # The scheduler starts the queued segment at the stop, so its QUEUED
+        # event rides on segment 1's last output, before the stats restart.
+        stop_events = [EngineCoreEvent(EngineCoreEventType.QUEUED, 3.0)]
+    stop_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(events=stop_events, finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=stop_stats,
+    )
+    segment_1 = processor.pop_native_text_metrics("r")
+
+    segment_2_events = [EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0)]
+    if not next_input_before_stop:
+        processor.add_request(_streaming_input(3.4), prompt=None)
+        segment_2_events.insert(0, EngineCoreEvent(EngineCoreEventType.QUEUED, 3.5))
+    processor.add_request(_streaming_input(4.1, resumable=False), prompt=None)
+    processor.process_outputs(
+        [_stats_output(events=segment_2_events)], engine_core_timestamp=4.5, iteration_stats=IterationStats()
+    )
+    final_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP)], engine_core_timestamp=6.0, iteration_stats=final_stats
+    )
+    segment_2 = processor.pop_native_text_metrics("r")
+
+    assert not stop_stats.finished_requests and not _phase_split(segment_1)
+    expected = {"vllm_prefill_ms": 500.0, "vllm_decode_ms": 1500.0, "vllm_num_preemptions": 0}
+    if not next_input_before_stop:
+        expected["vllm_queued_ms"] = 500.0
+    assert _phase_split(segment_2) == pytest.approx(expected)
+    assert len(final_stats.finished_requests) == 1
+
+
+def test_text_path_stop_after_input_end_carries_phase_split():
+    # The end of input reaches the output processor before the engine core,
+    # so the engine core still reports the last segment's stop as a segment
+    # stop. vLLM's process_outputs finishes the request on it, and the split
+    # matches the FinishedRequestStats recorded there.
+    processor = _stats_processor(_make_text_stage_state(stream_input=True))
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats(),
+    )
+    processor.add_request(_streaming_input(2.0, resumable=False), prompt=None)
+    iteration_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=iteration_stats,
+    )
+    record = processor.pop_native_text_metrics("r")
+
+    assert "r" not in processor.request_states
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 0}
+    )
+    (finished,) = iteration_stats.finished_requests
+    assert record["vllm_prefill_ms"] == pytest.approx(finished.prefill_time * 1000.0)
+    assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
+
+
+def test_generation_stage_phase_split_spans_streaming_segments():
+    # The multimodal-only path does not apply streaming updates, so the stats
+    # of a generation stage do not restart between segments.
+    state = OmniRequestState(**_NO_DETOK_STATE_KWARGS, output_kind=RequestOutputKind.CUMULATIVE, stream_input=True)
+    processor = _stats_processor(state)
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats(),
+    )
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=IterationStats(),
+    )
+    segment_1 = processor.pop_native_text_metrics("r")
+    processor.add_request(_streaming_input(3.4), prompt=None)
+    processor.add_request(_streaming_input(4.1, resumable=False), prompt=None)
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 3.5),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0),
+                ]
+            )
+        ],
+        engine_core_timestamp=4.5,
+        iteration_stats=IterationStats(),
+    )
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP)], engine_core_timestamp=6.0, iteration_stats=IterationStats()
+    )
+    record = processor.pop_native_text_metrics("r")
+
+    assert not _phase_split(segment_1)
+    # Prefill is segment 1's; decode runs from segment 1's first output to the
+    # last output; segment 2's QUEUED comes after the first SCHEDULED, so the
+    # queue interval would be negative and is left out.
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_prefill_ms": 500.0, "vllm_decode_ms": 4250.0, "vllm_num_preemptions": 0}
+    )
+
+
 def test_ec_transfer_params_survive_both_construction_paths():
     """v0.28 contract: encoder-cache transfer metadata must reach
     RequestOutput.ec_transfer_params through BOTH omni construction paths —
@@ -1060,3 +1645,23 @@ def test_cumulative_audio_terminal_output_supplies_full_aligner_waveform():
     assert (waveform[800:2000] == 1).all()
     assert (waveform[2000:] == 2).all()
     assert aligned["additional_information"]["aligner_audio_duration_ms"] == [100.0]
+
+
+@pytest.mark.parametrize("streaming_update", [False, True])
+@pytest.mark.parametrize("watermarked,skipped", [(True, False), (False, True), (False, False)])
+def test_native_finished_stats_preserve_watermark_status(watermarked, skipped, streaming_update):
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=True, engine_core_output_type=AUDIO)
+    kwargs = {**_NO_DETOK_STATE_KWARGS, "log_stats": True}
+    state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    assert state.stats is not None
+    state.stats.is_watermarked = watermarked
+    state.stats.is_watermark_skipped = skipped
+    if streaming_update:
+        state.apply_streaming_update(SimpleNamespace(final=True, prompt=None, prompt_token_ids=[], arrival_time=1.0))
+    stats = IterationStats()
+
+    processor._update_stats_from_finished(state, FinishReason.STOP, stats)
+
+    assert stats.num_watermarked_reqs == int(watermarked)
+    assert stats.num_watermark_skipped_reqs == int(skipped)
+    assert stats.num_not_watermarked_reqs == int(not watermarked and not skipped)

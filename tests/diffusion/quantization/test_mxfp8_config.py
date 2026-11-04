@@ -167,6 +167,17 @@ def test_get_quant_method_online(mocker: MockerFixture):
         assert type(method).__name__ == "VllmMxfp8OnlineLinearMethod"
 
 
+def test_xpu_online_method_keeps_vllm_weight_lifecycle():
+    """XPU online MXFP8 must not replace vLLM's create_weights: that is where vLLM
+    builds the meta-device weight and selects the shape-dependent MXFP8 kernel."""
+    from vllm.model_executor.layers.quantization.online.mxfp8 import Mxfp8OnlineLinearMethod
+
+    from vllm_omni.quantization.mxfp8_config import VllmMxfp8OnlineLinearMethod
+
+    for name in ("create_weights", "process_weights_after_loading"):
+        assert getattr(VllmMxfp8OnlineLinearMethod, name) is getattr(Mxfp8OnlineLinearMethod, name)
+
+
 def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Unsupported platform (CUDA, ROCm) must raise NotImplementedError."""
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config

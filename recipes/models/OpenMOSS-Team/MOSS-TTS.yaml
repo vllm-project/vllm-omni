@@ -1,0 +1,141 @@
+meta:
+  title: "MOSS-TTS"
+  slug: "moss-tts"
+  provider: "OpenMOSS"
+  description: "Flagship 8B model of the OpenMOSS MOSS-TTS Family — high-fidelity zero-shot voice cloning, ultra-long stable speech, token-level duration and phoneme control, 20-language code-switched synthesis — served via vLLM-Omni through the OpenAI /v1/audio/speech API (24 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - OpenMOSS-Team/MOSS-TTS-Realtime
+    - OpenMOSS-Team/MOSS-TTSD-v1.0
+    - OpenMOSS-Team/MOSS-VoiceGenerator
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-TTS"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "8B"
+  active_parameters: "8B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--deploy-config"
+    - "vllm_omni/deploy/moss_tts.yaml"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "MOSS-TTS zero-shot voice cloning via /v1/audio/speech (24 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "OpenMOSS-Team/MOSS-TTS",
+            "input": "Hello, this is a voice cloning test.",
+            "voice": "default",
+            "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 32
+    description: "MOSS-TTS 8B (MossTTSDelay) — flagship production TTS (reference run on 1x H100 80 GB)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) is the **flagship 8B
+  model** of OpenMOSS's [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS),
+  a production-grade TTS foundation model served through **vLLM-Omni** with the
+  OpenAI-compatible `/v1/audio/speech` API. It delivers high-fidelity zero-shot
+  voice cloning, **ultra-long stable speech (up to ~1 hour)**, token-level
+  duration control, Pinyin/IPA phoneme control, and **20-language** /
+  code-switched synthesis. Output is **24 kHz mono** via the shared
+  `OpenMOSS-Team/MOSS-Audio-Tokenizer` codec (~7 GB, auto-downloaded; override
+  with `MOSS_TTS_CODEC_PATH`).
+
+  The MOSS-TTS Family ships five production-ready models, each with its own
+  recipe: **MOSS-TTS** (this page, flagship TTS), **MOSS-TTS-Realtime**
+  (low-latency streaming), **MOSS-TTSD** (multi-speaker dialogue),
+  **MOSS-VoiceGenerator** (zero-shot voice design), and **MOSS-SoundEffect**
+  (sound-effect synthesis).
+
+  MOSS-TTS is released in two architectures: the 8B `MossTTSDelay` (this
+  checkpoint, production-recommended) and a 1.7B `MossTTSLocal`
+  (`OpenMOSS-Team/MOSS-TTS-Local-Transformer`) tuned for streaming-oriented
+  systems. A `MOSS-TTS-v1.5` point release adds 31-language support and steadier
+  cloning with `[pause Xs]` markers (same serving path; set `language` for best
+  results).
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU. Reference run: 1x H100 80 GB — ~18 GB for
+    the 8B talker + ~8 GB for the codec decoder on the same device
+    (`gpu_memory_utilization: 0.85` in `moss_tts.yaml`).
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  All MossTTSDelay checkpoints (MOSS-TTS, MOSS-TTSD, MOSS-SoundEffect,
+  MOSS-VoiceGenerator) share `model_type=moss_tts_delay`, so the deploy config
+  must be passed explicitly to select the right pipeline:
+
+  ```bash
+  vllm serve OpenMOSS-Team/MOSS-TTS --omni \
+    --deploy-config vllm_omni/deploy/moss_tts.yaml --port 8000
+  ```
+
+  ## Client usage
+
+  ### Voice cloning (curl)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "OpenMOSS-Team/MOSS-TTS",
+      "input": "Hello, this is a voice cloning test.",
+      "voice": "default",
+      "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
+      "response_format": "wav"
+    }' --output output.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **24 kHz mono**.
+  - `MOSS_TTS_CODEC_PATH` overrides the codec checkpoint location if you have a
+    local copy.
+
+  ## References
+
+  - [MOSS-TTS model card](https://huggingface.co/OpenMOSS-Team/MOSS-TTS)
+  - [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) · [GitHub](https://github.com/OpenMOSS/MOSS-TTS)
+  - [vLLM-Omni MOSS-TTS offline example](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/moss_tts)

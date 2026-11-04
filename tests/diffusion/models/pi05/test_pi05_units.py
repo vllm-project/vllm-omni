@@ -729,7 +729,9 @@ def _shrink_gemma_backbones():
 
 
 def _tiny_pi05_model():
-    """A fresh model. Use for tests that load weights or otherwise mutate it."""
+    """A fresh model. Use for tests that need a pristine model; the two
+    load_weights tests share one via ``remap_model`` instead — they write
+    distinct parameters, so they don't need pristine state."""
     return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
 
 
@@ -737,6 +739,14 @@ def _tiny_pi05_model():
 def tiny_model():
     """Shared read-only model, so the tests that only inspect it pay for one
     construction between them rather than one each."""
+    return _tiny_pi05_model()
+
+
+@pytest.fixture(scope="module")
+def remap_model():
+    """Shared model for the two load_weights remap tests: one fills
+    ``embed_tokens``, the other feeds a π0-shaped key that must raise before
+    anything is written, so a single construction serves both."""
     return _tiny_pi05_model()
 
 
@@ -768,8 +778,8 @@ def test_adarms_norm_returns_gate_only_when_conditioned():
 
 
 @pytest.mark.slow
-def test_lm_head_remap_to_embed_tokens():
-    model = _tiny_pi05_model()
+def test_lm_head_remap_to_embed_tokens(remap_model):
+    model = remap_model
     target = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
     payload = torch.full(dict(model.named_parameters())[target].shape, 0.5)
     model.load_weights([("model.paligemma_with_expert.paligemma.lm_head.weight", payload)], strict=False)
@@ -777,10 +787,10 @@ def test_lm_head_remap_to_embed_tokens():
 
 
 @pytest.mark.slow
-def test_pi0_shaped_keys_are_not_silently_loaded():
+def test_pi0_shaped_keys_are_not_silently_loaded(remap_model):
     """A π0 checkpoint pointed at the π0.5 class would leave the AdaRMS expert
     randomly initialized. ``state_proj`` is the tell."""
-    model = _tiny_pi05_model()
+    model = remap_model
     with pytest.raises(RuntimeError, match="π0-shaped"):
         model.load_weights([("model.state_proj.weight", torch.zeros(1024, 8))])
 
