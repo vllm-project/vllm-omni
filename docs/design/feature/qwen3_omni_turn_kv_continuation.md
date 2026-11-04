@@ -148,8 +148,14 @@ Omni 的阶段输出缓存重放已缓存的历史 hidden states，供本轮新�
 
 ## 适用范围与 MiniCPM 对比
 
-续写能力由现有引擎设置决定：V1、APC、async-chunk，且无 speculative decoding。
-支持同步和异步 scheduling；MRv2 等不支持的组合退回每轮请求模式。
+续写能力由现有引擎设置决定：V1 或 CUDA MRv2、APC、async-chunk，且无 speculative decoding。
+支持同步和异步 scheduling；不支持的组合退回每轮请求模式。
+
+MRv2 的 native data plane 将驻留 Thinker 映射为每轮独立的下游传输，
+在 segment stop 后发送 terminal，但不释放 scheduler 的驻留 KV。
+同 ID 重装先清理旧传输再注册新 token 账本，排队输出按所属请求状态隔离，
+防止旧轮次结果污染新轮次；阶段输出缓存沿用 MRv2 的前缀重放机制。
+本次适配的 CPU 验证不代表 CUDA 实权重、多模态数值等价或延迟收益验证。
 本设计面向 duplex 路径，不把普通非 streaming 请求统一改为 resumable。
 
 下表比较本仓库 Qwen3-Omni duplex 与 MiniCPM-o 4.5 的原生流式接入，
@@ -183,6 +189,16 @@ Omni 的阶段输出缓存重放已缓存的历史 hidden states，供本轮新�
 | `vllm_omni/core/sched/omni_ar_scheduler.py` | delta 校验、快照回退、驻留 KV 更新 |
 
 ## 验证与待完成项
+
+MRv2 适配的本地 CPU 验证：数据传输、前缀缓存、配置与 orchestrator 共 **227 passed**；
+续写 scheduler 共 **11 passed**；共享 streaming scheduler 与 AR/generation runner 共 **199 passed**。
+调度器测试在 Ascend 容器中通过外部 harness 禁用了 Ascend 专属 admission 配置，
+仍使用真实上游调度器和 KV allocator；这不属于 CUDA MRv2 设备执行证据。
+回归覆盖每轮 terminal、停止 token/长度后的输出截断、同 ID 先退役后注册、
+旧轮次排队输出隔离，以及保留 KV 的追加、编辑和缩短上下文。
+CUDA 实权重的多轮音频/图像、中断、数值等价和性能验证仍待完成。
+
+以下为 MRv2 适配前的 V1 验证记录：
 
 本轮直接追加改造的 CPU 回归 **2,125 passed、64 deselected**，耗时 370.45 秒；
 范围包括 Qwen3-Omni 模型、duplex orchestrator、全部 engine duplex 用例及续写 scheduler。

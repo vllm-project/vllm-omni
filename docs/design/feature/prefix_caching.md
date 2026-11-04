@@ -48,9 +48,9 @@ Host footprint: each cached key costs `num_blocks × block_size × D × dtype_by
 The existing CUDA `qwen3_omni_duplex.yaml` profile defaults to a resident
 resumable Thinker request across committed turns. No extra deployment file or
 session switch is required. The capability is resolved from existing engine
-options: V1, prefix caching, async-chunk transport and
+options: V1 or CUDA MRv2, prefix caching, async-chunk transport and
 no speculative decoding. Other combinations log the unsupported condition and
-use fresh per-turn requests, including the MRv2 profile. APC can still reuse
+use fresh per-turn requests. APC can still reuse
 matching prefixes in that path. Non-CUDA profile overrides disable caching.
 Talker and Code2Wav remain per-turn, with caching disabled.
 
@@ -414,8 +414,12 @@ chain. The runners only call `_prefix_cache_step_begin` before retiring
 finished requests, `_prefix_cache_save_mrv2` after postprocess, and
 `_prefix_cache_output_finalizer` when building the async output.
 
-Duplex sessions on MRv2 commit each utterance as a fresh request, so they
-use this path unchanged. The NPU MRv2 runner does not build the cache.
+Qwen3-Omni duplex on CUDA MRv2 retains the Thinker request across turns.
+At continuation, retirement precedes re-admission under the same request ID,
+resetting delivery watermarks while retaining matching scheduler KV blocks.
+The native data plane terminates each downstream turn separately and fences
+queued outputs against the request state that owned them.
+The NPU MRv2 runner does not build the cache.
 
 Fish Omni retains the default `allow` policy: its MRv2 model state saves the
 generated codebooks before a slot is reused and restores full frame rows on
