@@ -137,6 +137,20 @@ def test_error_summary_uses_unknown_rank_sentinel():
     assert summary.rank == -1
 
 
+@pytest.mark.parametrize("overflow", [0, 1])
+def test_error_summary_is_truncated_only_above_the_limit(overflow):
+    header = "[weight-stack][write] "
+    what = "z" * (MAX_ERROR_MESSAGE_CHARS - len(header) + overflow)
+    error = WriteError(what)
+    rendered = str(error)
+    assert len(rendered) == MAX_ERROR_MESSAGE_CHARS + overflow
+
+    summary = error.summary()
+    # A message of exactly MAX_ERROR_MESSAGE_CHARS characters is kept verbatim.
+    assert summary.message == rendered[:MAX_ERROR_MESSAGE_CHARS]
+    assert len(summary.message) == min(len(rendered), MAX_ERROR_MESSAGE_CHARS)
+
+
 def test_step_error_mapping_matches_rfc_table():
     # RFC 01 section 3: every startup step wraps non-WeightStackError exceptions
     # into exactly this type.  The table is pinned here verbatim so a wrong
@@ -172,6 +186,18 @@ def test_wrap_step_error_preserves_cause_and_phase():
     assert wrapped.__cause__ is original
     assert "ValueError: checkpoint shard is missing" in str(wrapped)
     assert str(wrapped).startswith("[weight-stack][write]")
+
+
+@pytest.mark.parametrize("step", sorted(STEP_ERROR_TYPES))
+def test_wrap_step_error_covers_every_rfc_step(step):
+    original = RuntimeError("boom")
+    wrapped = wrap_step_error(step, original)
+
+    assert type(wrapped) is STEP_ERROR_TYPES[step]
+    # The instance phase is the failing step, not the class default of the error type.
+    assert wrapped.phase == step
+    assert str(wrapped).startswith(f"[weight-stack][{step}]")
+    assert wrapped.__cause__ is original
 
 
 def test_wrap_step_error_returns_weight_stack_error_unchanged():
