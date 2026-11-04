@@ -166,6 +166,11 @@ _DIFFUSION_MODELS = {
         "pipeline_stable_audio",
         "StableAudioPipeline",
     ),
+    "StableAudio3Pipeline": (
+        "stable_audio_3",
+        "pipeline_stable_audio_3",
+        "StableAudio3Pipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
@@ -277,6 +282,13 @@ _DIFFUSION_MODELS = {
         "sam3",
         "pipeline_sam3",
         "Sam3Pipeline",
+    ),
+    # The released Video Depth Anything repositories hold one .pth and no config;
+    # ``resolve_native_diffusion_model_class`` recognizes them by checkpoint name.
+    "VideoDepthAnythingPipeline": (
+        "video_depth_anything",
+        "pipeline_video_depth_anything",
+        "VideoDepthAnythingPipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -739,6 +751,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
