@@ -104,6 +104,7 @@ class RainFusionConfig:
     sparsity: float = 0.0
     start_step: int = 0
     end_step: int = 0
+    window_sparsity: float | None = None
     precision: str = "bf16"
     skip_layers: frozenset[int] = frozenset()
 
@@ -114,6 +115,7 @@ class RainFusionConfig:
             sparsity=float(bk.get("sparsity", 0.0)),
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
+            window_sparsity=(None if bk.get("window_sparsity") is None else float(bk["window_sparsity"])),
             precision=str(bk.get("precision", "bf16")),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
@@ -420,7 +422,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             value[:, :used_kv],
             plan,
             dense_forward,
-            sparsity=self.rainfusion.sparsity,
+            sparsity=self._effective_sparsity(),
             scale=self.softmax_scale,
             inner_precise=4 if precision == "mix" else _INNER_PRECISE,
             kernel_dtype=kernel_dtype,
@@ -433,6 +435,32 @@ class RainFusionAttentionImpl(AttentionImpl):
         padded[:, :used_q] = out
         return padded
 
+    def _in_dense_window(self) -> bool | None:
+        """Whether this denoise step falls in the head/tail window.
+
+        Returns None when the step gate cannot be evaluated at all, which keeps the
+        caller dense: a configured window must never be silently ignored.
+        """
+        rf = self.rainfusion
+        if not (rf.start_step or rf.end_step):
+            return False
+        if not is_forward_context_available():
+            return None
+        context = get_forward_context()
+        step_idx, total_steps = context.denoise_step_idx, context.total_denoise_steps
+        if step_idx is None or (rf.end_step and total_steps is None):
+            return None
+        if step_idx < rf.start_step:
+            return True
+        return bool(rf.end_step and step_idx >= total_steps - rf.end_step)
+
+    def _effective_sparsity(self) -> float:
+        """Window steps use ``window_sparsity``; every other step uses ``sparsity``."""
+        rf = self.rainfusion
+        if rf.window_sparsity is None:
+            return rf.sparsity
+        return rf.window_sparsity if self._in_dense_window() else rf.sparsity
+
     def _resolve_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:
         """Return the rf_v2 geometry, or None when this forward must stay dense."""
         rf = self.rainfusion
@@ -440,18 +468,13 @@ class RainFusionAttentionImpl(AttentionImpl):
             return None
         if self.layer_idx is not None and self.layer_idx in rf.skip_layers:
             return None
-        step_idx = total_steps = None
-        if is_forward_context_available():
-            step_idx = get_forward_context().denoise_step_idx
-            total_steps = get_forward_context().total_denoise_steps
-        if (rf.start_step and step_idx is None) or (rf.end_step and (step_idx is None or total_steps is None)):
+        in_window = self._in_dense_window()
+        if in_window is None:
             return None
-        if step_idx is not None:
-            if step_idx < rf.start_step:
-                return None
-            # Tail fallback: keep the last ``end_step`` denoise steps dense.
-            if rf.end_step > 0 and total_steps is not None and step_idx >= total_steps - rf.end_step:
-                return None
+        # Head and tail steps stay fully dense unless a window sparsity is configured,
+        # in which case they run sparse at that gentler rate rather than not at all.
+        if in_window and rf.window_sparsity is None:
+            return None
         if self.qkv_layout is None:
             # The sparse path reads the sequence off dim 1, which the tensors alone
             # do not establish, and the dense fallback resolves an absent layout its
@@ -683,7 +706,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             "input_layout": _INPUT_LAYOUT,
             "inner_precise": 4 if precision != "bf16" else _INNER_PRECISE,
             "block_size": _BLOCK_SIZE,
-            "sparsity": self.rainfusion.sparsity,
+            "sparsity": self._effective_sparsity(),
             "precision": precision,
         }
         if plan.video_spans is not None:

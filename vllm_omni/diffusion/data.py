@@ -2195,11 +2195,14 @@ class BlockSparseSpec:
     index selector such as "0-3,38") exempts individual DiT blocks. Those two are
     the accuracy knobs to trade back quality at a fixed ``sparsity``.
     ``precision`` selects the kernel precision mode (see ``RainFusionPrecision``).
+    ``window_sparsity`` makes the head/tail window a dial rather than a switch: those
+    steps run sparse at that rate instead of fully dense. It must not exceed ``sparsity``.
     """
 
     sparsity: float = 0.8
     start_step: int = 0
     end_step: int = 0
+    window_sparsity: float | None = None
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
@@ -2210,6 +2213,20 @@ class BlockSparseSpec:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
         if self.end_step < 0:
             raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
+        if self.window_sparsity is not None:
+            self.window_sparsity = _in_range(self.window_sparsity, "block_sparse.window_sparsity", 0.0, 1.0)
+            if self.window_sparsity is None:
+                raise ValueError("block_sparse.window_sparsity must be a number in [0, 1].")
+            if not (self.start_step or self.end_step):
+                raise ValueError(
+                    "block_sparse.window_sparsity only applies to the dense head/tail window; "
+                    "set start_step or end_step, or remove window_sparsity."
+                )
+            if self.window_sparsity > self.sparsity:
+                raise ValueError(
+                    f"block_sparse.window_sparsity ({self.window_sparsity}) must not exceed "
+                    f"sparsity ({self.sparsity}); the window is the accuracy-protected region."
+                )
         precision = self.precision.value if isinstance(self.precision, RainFusionPrecision) else self.precision
         valid = {member.value for member in RainFusionPrecision}
         if precision not in valid:
