@@ -18,6 +18,8 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 120
         source_file_dependencies: tts_qwen3_tts_function
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-base-expansion/failed-audio"
         artifact_paths:
           - artifacts/rocm-qwen3-tts-base-expansion/**/*
         commands:
