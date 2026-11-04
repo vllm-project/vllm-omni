@@ -10,13 +10,13 @@ callers provide frame-local KV buffers and PyTorch-generated uniform samples.
 import numpy as np
 import torch
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 from .triton_launch import cuda_pdl_launch_kwargs
 
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
-libdevice = tl.extra.cuda.libdevice
+libdevice = tldevice
 
 # Hopper+ supports programmatic dependent launch. The kernel waits for its
 # predecessor before any global access and lets its successor launch at once; results are unchanged.
