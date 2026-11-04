@@ -277,7 +277,7 @@ class MossLocalModelState(OmniModelState):
             offset = end
         if is_accel:
             # ``non_blocking`` is False on NPU, so this copy blocks the current
-            # stream and orders before the ``_audio_embed`` read above.
+            # stream and orders before the ``_audio_embed`` read below.
             device[:count].copy_(host[:count], non_blocking=embeds.is_cuda)
             if embeds.is_cuda:
                 event.record(torch.cuda.current_stream(embeds.device))
