@@ -48,7 +48,7 @@ def test_window_rebuild_and_next_session(omni_server, mode, reference):
         _assert_complete(result, require_audio=reference)
 
 
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.full_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode,camera", [("basic", False), ("context", False), ("context", True)])

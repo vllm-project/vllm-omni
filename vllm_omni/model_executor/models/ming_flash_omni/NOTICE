@@ -1,0 +1,23 @@
+Ming-derived model implementation
+=================================
+
+This directory contains code adapted from inclusionAI/Ming:
+https://github.com/inclusionAI/Ming
+Revision: e58533db227031990c5a6864dcf5f08fb53ed0d2
+Copyright (c) 2025 inclusionAI
+
+The upstream MIT license is reproduced in LICENSE.Ming. Retain that license
+and the original copyright notices when redistributing the adapted code.
+The repository's Apache-2.0 license applies to vLLM-Omni contributions; it
+does not replace the notices applicable to incorporated third-party code.
+
+Source references for the adapted components:
+- native_text_segment_cut.py: front/text_segment_cut.py
+- text_processing.py: front/ text segmentation and normalization utilities
+- talker_module.py: talker_module/{dit,modules,cfm}.py
+- ming_flash_omni_talker.py and voice_presets.py: modeling_bailing_talker.py
+
+Additional upstream source and copyright notices are retained in the relevant
+files, including the Meta notices in talker_module.py and the Apache-2.0
+notice in talker_tn/token_parser.py. Model weights and reference audio are
+separate artifacts and retain their own licensing terms.

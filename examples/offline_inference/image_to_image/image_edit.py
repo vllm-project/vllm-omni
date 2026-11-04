@@ -39,6 +39,20 @@ Usage (multiple images):
         --cfg-scale 4.0 \
         --guidance-scale 1.0
 
+Usage (JoyAI-Image-Edit, single image):
+    python image_edit.py \
+        --model jdopensource/JoyAI-Image-Edit-Diffusers \
+        --image input.png \
+        --prompt "Change the background to a clean studio while preserving the subject." \
+        --height 1024 \
+        --width 1024 \
+        --num-inference-steps 50 \
+        --guidance-scale 4.0 \
+        --output output_joyai_edit.png
+
+    Note: JoyAI-Image-Edit snaps requested dimensions to the nearest supported
+    Joy bucket; for square outputs, use 1024x1024.
+
 Usage (with cache-dit acceleration):
     python image_edit.py \
         --image input.png \
@@ -270,9 +284,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cfg-scale",
         type=float,
-        default=4.0,
+        default=None,
         help=(
-            "True classifier-free guidance scale (default: 4.0). Guidance scale as defined in Classifier-Free "
+            "True classifier-free guidance scale. When omitted, the pipeline uses its model-specific default. "
+            "Guidance scale as defined in Classifier-Free "
             "Diffusion Guidance. Classifier-free guidance is enabled by setting cfg_scale > 1 and providing "
             "a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, "
             "usually at the expense of lower image quality."
@@ -281,9 +296,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "Guidance scale for guidance-distilled models (default: 1.0, disabled). "
+            "Guidance scale for guidance-distilled models. When omitted, the pipeline uses its model-specific default. "
             "Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale "
             "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
         ),
@@ -523,6 +538,12 @@ def parse_args() -> argparse.Namespace:
             "silently masking with a possibly-wrong prompt."
         ),
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Overall pipeline initialization timeout in seconds.",
+    )
     return parser.parse_args()
 
 
@@ -593,6 +614,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+        init_timeout=args.init_timeout,
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager

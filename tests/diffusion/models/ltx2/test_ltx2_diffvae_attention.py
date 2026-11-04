@@ -7,10 +7,11 @@ import pytest
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.models.ltx2.ops import resolve_ltx2_vae_operators
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 
 def _selected_fna():
@@ -82,6 +83,7 @@ def test_fna_matches_explicit_inward_shift_mask(batch, shape):
     torch.testing.assert_close(actual, expected, atol=0.008, rtol=0.025)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_fna_rejects_cpu_without_fallback():
     fna_ops = _load_fna_ops()
     x = torch.zeros(1, 64, 4, 64, dtype=torch.bfloat16)

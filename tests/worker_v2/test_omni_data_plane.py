@@ -4,6 +4,7 @@
 
 import threading
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ import pytest
 import torch
 from vllm import SamplingParams
 
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -49,6 +52,7 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_closed=False,
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
+        _deferred_shm_releases=set(),
         _async_chunk=True,
         _pending_full_payload_send={},
         _put_req_chunk=defaultdict(int),
@@ -105,6 +109,7 @@ def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
 
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished()
+    assert snapshot.aborted is False
     assert snapshot.output_token_ids == [21, 2150]
     torch.testing.assert_close(payload["codes.audio"], torch.cat([first, last]))
     torch.testing.assert_close(payload["codes.ref"], ref)
@@ -122,6 +127,7 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert plane.abort_requests({"internal"}) == 1
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished() and payload is None
+    assert snapshot.aborted is True
     assert _complete(plane, [{"codes.audio": torch.tensor([[3, 4]])}]) == 0
     assert len(plane.record.batches) == 1
     assert not plane._pending_full_payload_send
@@ -157,6 +163,52 @@ def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk
     assert terminal.output_token_count == 2
     assert plane.record.cleaned == ["internal"]
     assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+@pytest.mark.parametrize("stop", ["token", "length"])
+@pytest.mark.parametrize("text_tokens", [[21], [21, 22, 23]])
+def test_qwen3_full_payload_preserves_last_text_embedding(plane, stop, text_tokens):
+    """A sampled stop has no input embedding; keep the last spoken input row."""
+    from vllm_omni.model_executor.stage_input_processors import qwen3_omni as q3
+
+    plane._async_chunk = False
+    plane._full_payload_replace_keys_cached = frozenset()
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(
+        stop_token_ids=[2150], max_tokens=len(text_tokens) + 1 if stop == "length" else 10
+    )
+    plane.register_request(request)
+    embeddings = torch.arange((len(request.prompt_token_ids) + len(text_tokens)) * 2).reshape(-1, 2).float()
+    hidden = embeddings + 100
+
+    def emit(start, end, sampled):
+        plane.reserve_outputs(["internal"])
+        _complete(
+            plane,
+            [{"hidden_states.layer_0": embeddings[start:end], "hidden_states.layer_24": hidden[start:end]}],
+            token=sampled,
+        )
+
+    prompt_len = len(request.prompt_token_ids)
+    emit(0, prompt_len, text_tokens[0])
+    for i in range(len(text_tokens)):
+        sampled = text_tokens[i + 1] if i + 1 < len(text_tokens) else (2150 if stop == "token" else 24)
+        emit(prompt_len + i, prompt_len + i + 1, sampled)
+    # A forward already in flight after the sampled stop must remain excluded.
+    emit(0, 1, 99)
+    plane.request_terminal({"internal"})
+    [(snapshot, accumulated)] = plane.record.batches[0]
+    plane._get_model_config = lambda: SimpleNamespace(
+        use_v2_model_runner=True,
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24)),
+    )
+    payload = q3.thinker2talker_full_payload(plane, accumulated, snapshot)
+
+    assert payload is not None
+    torch.testing.assert_close(payload["embed"]["prefill"], embeddings)
+    torch.testing.assert_close(payload["hidden_states"]["output"], hidden)
+    assert payload["ids"]["all"] == request.prompt_token_ids + text_tokens + [sampled]
 
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
@@ -308,6 +360,26 @@ def test_emit_cohort_one_batch_and_trims_non_resumable_history(plane):
     )
     request, _ = plane.record.batches[1][0]
     assert request.output_token_count == 1025 and request.all_token_ids == []
+
+
+def test_async_text_producer_opts_into_full_token_history(plane):
+    from vllm_omni.model_executor.stage_input_processors.ming3_audio import thinker2talker_async_chunk
+
+    plane._custom_process_func = thinker2talker_async_chunk
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    plane._put_req_chunk["external"] = 1
+
+    plane.emit_chunks(
+        req_ids=["internal"],
+        inter_stage_outputs=None,
+        sampled_token_ids=[[21]],
+        terminal_req_ids=set(),
+    )
+    [(snapshot, payload)] = plane.record.batches[0]
+    assert payload is None
+    assert snapshot.all_token_ids == [10, 11, 21]
 
 
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
@@ -601,7 +673,7 @@ def test_abort_before_first_chunk_cleans_receiver_state():
         "_async_chunk_updated_req_ids",
     ):
         setattr(plane, name, set())
-    plane.register_receivers([SimpleNamespace(request_id="r", external_req_id="external")])
+    plane.register_receivers([OmniChunkRecvHandle(request_id="r", external_req_id="external")])
     plane._local_stage_payload_cache["r"] = {"codes": torch.ones(1)}
     assert "r" in plane._pending_load_reqs and plane._request_ids_mapping["r"] == "external"
     assert plane.abort_requests({"r"}) == 0
@@ -675,3 +747,87 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
 
     assert plane._get_model_config() is model_config
     assert _get_accept_hidden_layer_index(plane) == 24
+
+
+@pytest.mark.parametrize("factory", ["from_base", "from_request"])
+def test_native_request_preserves_streaming_flag_and_reference_audio(plane, factory):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import tts2code2wav_async_chunk
+
+    base = NewRequestData(
+        req_id="internal",
+        prompt_token_ids=[0, 0],
+        mm_features=[],
+        sampling_params=SamplingParams(stop_token_ids=[6561]),
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    owner = SimpleNamespace(
+        **vars(base),
+        request_id="internal",
+        external_req_id="voice",
+        resumable=True,
+        model_intermediate_buffer={"codes": {"ref": [0.1, -0.1]}, "meta": {"ref_audio_sr": 16000}},
+    )
+    data = (
+        OmniNewRequestData.from_base(base, owner)
+        if factory == "from_base"
+        else OmniNewRequestData.from_request(owner, ([],), prefill_token_ids=[0, 0])
+    )
+    plane.register_request(data)
+    state = plane._native_requests["internal"]
+    assert state.resumable is True
+    state.accept_tokens([6561])
+    snapshot = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
+    payload = tts2code2wav_async_chunk(
+        SimpleNamespace(),
+        {"codes": {"audio": torch.arange(7)}, "meta": {"native_duplex": True, "turn_end": True}},
+        snapshot,
+    )
+    assert payload is not None and payload.meta.last_chunk is True
+    assert payload.meta.ref_audio_sr == 16000
+    torch.testing.assert_close(payload.codes.ref, torch.tensor([0.1, -0.1]))
+
+
+def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
+    plane.register_request(_new_request())
+    _complete(plane, [{"codes.audio": torch.tensor([[1]])}], token=2150)
+    first = plane.record.batches[-1][0][0]
+    assert first.sampled_token_ids == [2150]
+    plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"meta.turn_end": True}], sampled_token_ids=[[]])
+    next_snapshot = plane.record.batches[-1][0][0]
+    assert next_snapshot.last_output_token_id == 2150
+    assert next_snapshot.sampled_token_ids == []
+    assert first.sampled_token_ids == [2150]
+
+
+def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
+    """A text-only request never runs the Talker, so the producer must unlink."""
+    ext_id = f"release_{uuid.uuid4().hex}"
+    connector = SharedMemoryConnector({"stage_id": 0})
+    plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
+    plane.register_request(_new_request(external_req_id=ext_id))
+    sibling_key = f"{ext_id}_1_0_0"
+    try:
+        for key in (f"{ext_id}_0_0", sibling_key):
+            assert connector.put("0", "1", key, key)[0]
+
+        # Released while the terminal marker is still unsent: nothing yet.
+        assert plane.release_shm_resources([ext_id]) == 0
+        assert f"{ext_id}_0_0" in connector._pending_keys
+        assert connector.put("0", "1", f"{ext_id}_0_1", "finish")[0]
+        plane._cleanup_finished_entries(["internal"])
+
+        assert not plane._deferred_shm_releases
+        assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
+        assert connector.get("0", "1", f"{ext_id}_0_1") is None
+        assert connector.get("0", "1", sibling_key)[0] == sibling_key
+
+        assert connector.put("0", "1", f"{ext_id}_0_2", "late")[0]
+        assert plane.release_shm_resources([ext_id, "unknown"]) == 1
+    finally:
+        connector.close()

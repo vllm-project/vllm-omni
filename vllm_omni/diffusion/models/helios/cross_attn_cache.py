@@ -12,13 +12,11 @@ address to an unrelated tensor of the same shape, producing a false cache
 hit and cross-prompt contamination (request B silently reuses request A's
 projected K/V).
 
-``SourceTensorLRUCache`` stores a :mod:`weakref` to the source tensor next
-to the cached value and verifies the source is still alive on every lookup.
-An address reused by a *different* tensor still matches the fingerprint,
-but the original source's weakref is dead by then, so the lookup becomes a
-miss instead of a silent wrong hit.  Within a single request the source
-tensor is held alive across all denoise steps, so legitimate intra-request
-reuse still hits.
+``SourceTensorLRUCache`` stores a :mod:`weakref` to the exact source tensor
+next to the cached value and verifies object identity on every lookup.
+A second live view of the same storage can share the fingerprint, so checking
+liveness alone is insufficient. Within a single request the same source
+tensor object is held across denoise steps, so legitimate reuse still hits.
 """
 
 from __future__ import annotations
@@ -63,17 +61,15 @@ class SourceTensorLRUCache:
     def get(self, source: torch.Tensor):
         """Return the cached value for ``source`` or ``None`` on miss.
 
-        A miss is also returned when the source tensor that originally
-        populated a matching entry has been freed (its weakref is dead),
-        even if the fingerprint now matches a new tensor reusing the
-        address; the stale entry is evicted in that case.
+        A miss is returned when the source object differs, including a new
+        view over the same live storage or a new tensor reusing its address.
         """
         key = self._key(source)
         entry = self._cache.get(key)
         if entry is None:
             return None
         src_ref, value = entry
-        if src_ref() is None:
+        if src_ref() is not source:
             # Source freed: the address may have been reused by an unrelated
             # tensor, so the fingerprint match is a coincidence -> miss.
             self._cache.pop(key, None)

@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -43,9 +44,11 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
 )
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+    QwenImage21KVCache,
     QwenImage21Transformer2DModel,
 )
 from vllm_omni.diffusion.models.utils import create_transformers_model
+from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -162,6 +165,7 @@ def get_qwen_image_21_pre_process_func(
     # The Qwen-Image 2.1 VAE is RGBA (in/out_channels=4): condition images get an
     # opaque alpha channel unless the input already carries one.
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
+    sample_sigmas = (getattr(od_config, "extras", None) or {}).get("sample_sigmas")
 
     def _to_pil(image: Any) -> PIL.Image.Image:
         if isinstance(image, PIL.Image.Image):
@@ -188,6 +192,20 @@ def get_qwen_image_21_pre_process_func(
         request.allow_mixed_step_phases = False
         if request.sampling_params.true_cfg_scale is None:
             request.sampling_params.true_cfg_scale = 1.0
+        # Request-level sigmas may arrive via whitelisted extra-body params,
+        # which the serving layer stores in ``extra_args`` rather than the
+        # typed field (same convention as LTX2). Hoist them so the pipeline
+        # sees the explicit override before the preset grid is injected.
+        if request.sampling_params.sigmas is None:
+            extra_sigmas = (request.sampling_params.extra_args or {}).get("sigmas")
+            if extra_sigmas is not None:
+                request.sampling_params.sigmas = [float(s) for s in extra_sigmas]
+        # Inject the model-level sampling grid as request sigmas so the
+        # step scheduler and cache refresh resolve the total step count from
+        # len(sigmas). prepare_timesteps applies the same grid as a fallback
+        # for paths that bypass this hook; request-level sigmas always win.
+        if request.sampling_params.sigmas is None and sample_sigmas:
+            request.sampling_params.sigmas = list(sample_sigmas)
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
@@ -301,6 +319,7 @@ class QwenImage21Pipeline(
 
         The runner looks this up on the pipeline, not on the transformer.
         """
+        self._prompt_embedding_cache = OrderedDict()
         transformer = getattr(self, "transformer", None)
         release = getattr(transformer, "release_captured_graphs", None)
         if callable(release):
@@ -315,6 +334,11 @@ class QwenImage21Pipeline(
         super().__init__()
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        # Model-level sampling grid from model_index.json (diffusers PR
+        # 14950): when the request carries no explicit sigmas, this grid
+        # drives the schedule and its length decides the step count.
+        sample_sigmas = od_config.extras.get("sample_sigmas")
+        self.sample_sigmas = [float(s) for s in sample_sigmas] if sample_sigmas else None
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -709,13 +733,52 @@ class QwenImage21Pipeline(
                 number of images that should be generated per prompt
         """
         prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(
-            prompt,
-            images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            prompt_name=prompt_name,
+        cacheable = (
+            len(prompt) == 1
+            and isinstance(prompt[0], str)
+            and not (images_per_prompt is not None and any(images_per_prompt))
+            and not torch.is_grad_enabled()
+            and not self.text_encoder.training
+            and not getattr(self.od_config, "lora_config", None)
+            and not offload_enabled(self.od_config)
         )
+        cache = getattr(self, "_prompt_embedding_cache", None)
+        if cache is None or not cacheable:
+            cache = self._prompt_embedding_cache = OrderedDict()
+        key = (
+            (
+                tuple(prompt),
+                max_sequence_length,
+                prompt_name,
+                id(self.text_encoder),
+                id(self.processor),
+                self.text_encoder.dtype,
+                str(self.device),
+                self.prompt_template_t2i,
+                self._drop_idx,
+            )
+            if cacheable
+            else None
+        )
+        encoded = cache.get(key) if cacheable else None
+        if encoded is None:
+            encoded = self._get_qwen_prompt_embeds(
+                prompt,
+                images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name=prompt_name,
+            )
+            size = sum(t.numel() * t.element_size() for t in encoded)
+            if cacheable and size <= 16 * 1024 * 1024:
+                cache[key] = encoded
+                while (
+                    len(cache) > 16
+                    or sum(t.numel() * t.element_size() for entry in cache.values() for t in entry) > 16 * 1024 * 1024
+                ):
+                    cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = encoded
 
         # Request-major expansion (A,A,B,B). ``repeat`` on the 2D masks would
         # prepend a dimension and reshape to A,B,A,B — wrong pairing with embeds.
@@ -822,7 +885,10 @@ class QwenImage21Pipeline(
         return latents, image_latents
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if sigmas is None:
+            sigmas = getattr(self, "sample_sigmas", None)
+        if sigmas is None:
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),
@@ -842,6 +908,18 @@ class QwenImage21Pipeline(
     @property
     def attention_kwargs(self):
         return self._attention_kwargs
+
+    @property
+    def default_num_inference_steps(self):
+        """Step count implied by the model-level sampling grid, when present.
+
+        The model runner falls back to this when the request carries neither
+        num_inference_steps, timesteps, nor sigmas.
+        """
+        sample_sigmas = getattr(self, "sample_sigmas", None)
+        if sample_sigmas is not None:
+            return len(sample_sigmas)
+        return None
 
     @property
     def num_timesteps(self):
@@ -1203,7 +1281,7 @@ class QwenImage21Pipeline(
         state.extra["width"] = width
         cache_enabled = getattr(self.transformer, "causal_condition", False)
         state.extra["kv_cache"] = (
-            [{} for _ in range(len(self.transformer.transformer_blocks))] if cache_enabled else None
+            QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
         )
 
         return state
@@ -1214,6 +1292,26 @@ class QwenImage21Pipeline(
             return "none"
         first = kv_cache[0]
         return "decode" if any("key" in branch for branch in first.values()) else "prefill"
+
+    def _release_idle_decode_graphs(self) -> None:
+        """Free finished requests' static prefix copies before the next prefill allocates."""
+        manager = getattr(self.transformer, "_decode_graph_manager", None)
+        if manager is None:
+            return
+        manager.release_idle_entries()
+
+    def release_step_request(self, state: "StepRequestState") -> None:
+        """Drop this request's prefix KV and geometry when the runner retires it.
+
+        The graph table is left alone here. The owner weakref dies with this
+        cache, and the next prefill drops that dead entry before it allocates.
+        """
+        extra = getattr(state, "extra", None)
+        if isinstance(extra, dict):
+            extra["kv_cache"] = None
+        release_geometry = getattr(self.transformer, "release_request_geometry", None)
+        if release_geometry is not None:
+            release_geometry()
 
     @staticmethod
     def _assemble_kv_cache(
@@ -1233,8 +1331,12 @@ class QwenImage21Pipeline(
             # Batched prefill: a fresh merged cache collects all requests' prefix
             # K/V; written entries are split back per request after the step.
             num_blocks = len(caches[0])
-            return [{} for _ in range(num_blocks)], True
+            return QwenImage21KVCache({} for _ in range(num_blocks)), True
         if phases == {"decode"}:
+            if len(caches) == 1:
+                # Keep the request owner stable across decode steps. Prefill
+                # still scatters and records the padded prefix lengths above.
+                return caches[0], False
             # Decode only reads the cache, so a batched view is enough and the
             # per-request caches stay untouched. Merge every stored part — FP8
             # cache entries carry per-request scale tensors alongside "key"/"value".
@@ -1247,7 +1349,7 @@ class QwenImage21Pipeline(
                     "lengths. denoise_step must sub-batch by prefill_prompt_seq_len first."
                 )
             num_blocks = len(caches[0])
-            merged = []
+            merged = QwenImage21KVCache()
             for block_idx in range(num_blocks):
                 branches: dict[str, dict[str, torch.Tensor]] = {}
                 branch_names = {branch for cache in caches for branch in cache[block_idx]}
@@ -1405,6 +1507,8 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        if self._kv_cache_phase(states[0].extra.get("kv_cache")) == "prefill":
+            self._release_idle_decode_graphs()
 
         latents = input_batch.latents
         timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)

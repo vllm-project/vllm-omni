@@ -56,7 +56,7 @@ from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPo
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.whisper.modeling_whisper import ACT2FN
 
-from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph import EncoderCudaGraph
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph import make_encoder_graph
 
 try:
     from transformers.models.whisper.modeling_whisper import WHISPER_ATTENTION_CLASSES
@@ -1102,7 +1102,7 @@ class SiglipAttention(nn.Module):
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         k_v_seq_len = key_states.shape[-2]
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
 
         if attn_weights.size() != (batch_size, self.num_heads, q_len, k_v_seq_len):
             raise ValueError(
@@ -1115,10 +1115,8 @@ class SiglipAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self._normalize_attention_weights(attn_weights, attention_mask)
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -1135,11 +1133,32 @@ class SiglipAttention(nn.Module):
 
         return attn_output, attn_weights
 
+    def _normalize_attention_weights(
+        self, scores: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if (
+            scores.is_cuda
+            and torch.version.hip is None
+            and scores.dtype == torch.bfloat16
+            and scores.is_contiguous()
+            and 0 < scores.shape[-1] <= 2048
+            and attention_mask is None
+            and not self.training
+            and not scores.requires_grad
+        ):
+            from .ops.scaled_softmax import scaled_softmax
+
+            return scaled_softmax(scores, self.scale)
+        dtype = scores.dtype
+        scores = scores * self.scale
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        return nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
+
     def _attend_unpadded(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Attention over ``(n, L, heads, head_dim)`` items with no padding; same layout out."""
         query, key, value = (x.transpose(1, 2) for x in (query, key, value))
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scale
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_weights = self._normalize_attention_weights(torch.matmul(query, key.transpose(2, 3)))
         return torch.matmul(attn_weights, value).transpose(1, 2)
 
     def forward_packed(self, hidden_states: torch.Tensor, seq_groups: Sequence[tuple[int, int, int]]) -> torch.Tensor:
@@ -1670,7 +1689,7 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
         self.encoder = SiglipEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self._encoder_graph: EncoderCudaGraph | None = None
+        self._encoder_graph = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2968,6 +2987,35 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
             )
         ]
 
+    def embed_mel_features(self, input_features: torch.Tensor) -> torch.Tensor:
+        """Eager conv stem plus positional embedding.
+
+        ``Conv1d`` lowers to an aclop ``Conv2D`` on Ascend, so it cannot sit
+        inside an NPUGraph. This is the non-streaming path: no CNN padding
+        and no KV cache.
+        """
+        input_features = input_features.to(dtype=self.conv1.weight.dtype, device=self.conv1.weight.device)
+        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
+        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        embed_pos = self.embed_positions.weight[: inputs_embeds.shape[1], :]
+        hidden_states = inputs_embeds + embed_pos
+        return nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+    def encode_hidden_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """Whisper encoder layers and final norm, without KV cache or attentions."""
+        for encoder_layer in self.layers:
+            layer_outputs = encoder_layer(
+                hidden_states,
+                attention_mask,
+                layer_head_mask=None,
+                output_attentions=False,
+                past_key_values=None,
+                use_cache=False,
+            )
+            hidden_states = layer_outputs[0]
+        return self.layer_norm(hidden_states)
+
     def forward(
         self,
         input_features,
@@ -4205,6 +4253,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from vllm_omni.platforms import current_omni_platform
+
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
@@ -4213,19 +4263,9 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # grid when ``duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions``.
         self._duplex_max_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1) or 1)
         self._enforce_eager = bool(vllm_config.model_config.enforce_eager)
-        # Model-local opt-out for A/B measurements; --enforce-eager always wins.
-        encoder_graphs = (
-            bool(getattr(config, "encoder_cuda_graph", True)) and not vllm_config.model_config.enforce_eager
-        )
-        # Per-encoder limits, configurable via --hf-overrides. No eviction:
-        # increasing the cap trades retained GPU memory for shape coverage.
-        encoder_graph_options = {
-            "max_graphs": getattr(config, "encoder_cuda_graph_max_graphs", 4),
-            "min_capture_calls": getattr(config, "encoder_cuda_graph_min_capture_calls", 2),
-            "min_free_bytes": getattr(config, "encoder_cuda_graph_min_free_bytes", 1 << 30),
-            "share_pools": getattr(config, "encoder_cuda_graph_share_pools", True),
-        }
-
+        # The packed vision path still needs the CUDA graph opt-out after
+        # encoder construction moved into the shared CUDA/NPU factory.
+        encoder_graphs = bool(getattr(config, "encoder_cuda_graph", True)) and not self._enforce_eager
         # Initialize image processor
         self.image_processor = MiniCPMVImageProcessor(
             max_slice_nums=config.slice_config.max_slice_nums,
@@ -4238,21 +4278,27 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Initialize vision encoder (SigLIP)
         if multimodal_config.get_limit_per_prompt("image"):
             # Set attention implementation
-            # (an engine override, else the vision config, else SDPA: eager math without the (B, H, L, L) scores)
+            # Match the reference vision attention for CUDA duplex: SDPA can
+            # change the generated scene descriptions over a long AV session.
+            # Keep explicit engine/vision overrides and turn/NPU defaults.
             if getattr(getattr(vllm_config, "model_config", None), "_attn_implementation", None) is not None:
                 config.vision_config._attn_implementation = vllm_config.model_config._attn_implementation
             else:
                 vision_implementation = getattr(config.vision_config, "_attn_implementation", None)
-                config.vision_config._attn_implementation = vision_implementation or "sdpa"
+                cuda_duplex = (
+                    current_omni_platform.is_cuda()
+                    and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
+                    and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+                )
+                config.vision_config._attn_implementation = vision_implementation or (
+                    "eager" if cuda_duplex else "sdpa"
+                )
             if config.vision_config._attn_implementation == "flash_attention_2" and not is_flash_attn_2_available():
                 logger.warning("flash_attention_2 requested for the MiniCPM-o vision tower but unavailable; using sdpa")
                 config.vision_config._attn_implementation = "sdpa"
 
             self.vpm = SiglipVisionTransformer(config.vision_config)
-            if encoder_graphs:
-                self.vpm._encoder_graph = EncoderCudaGraph(
-                    self.vpm._encode_last_hidden_state, vllm_config, **encoder_graph_options
-                )
+            self.vpm._encoder_graph = make_encoder_graph(self.vpm._encode_last_hidden_state, vllm_config)
             # Drop last layer if configured
             if config.drop_vision_last_layer:
                 self.vpm.encoder.layers = self.vpm.encoder.layers[:-1]
@@ -4325,11 +4371,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.audio_encoder_layer = None
             self.audio_past_key_values = None
 
-        self._audio_encoder_graph = (
-            EncoderCudaGraph(self._encode_audio_features, vllm_config, **encoder_graph_options)
-            if encoder_graphs
-            else None
+        # Ascend Conv1d must stay outside NPUGraph; CUDA retains the full
+        # stateless encoder/projection/pooling capture merged in #8332.
+        audio_forward = (
+            self._encode_audio_transformer if current_omni_platform.is_npu() else self._encode_audio_features
         )
+        self._audio_encoder_graph = make_encoder_graph(audio_forward, vllm_config)
         self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
@@ -4774,7 +4821,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             # Whisper's FP16 overflow guard reads tensor booleans on the host.
             and self.apm.conv1.weight.dtype != torch.float16
         ):
-            audio_embeds = graph(wavforms, audio_attention_mask)
+            if wavforms.device.type == "npu":
+                # Ascend Conv1d remains eager; graph only the transformer stack.
+                hidden_states = graph(self.apm.embed_mel_features(wavforms), audio_attention_mask)
+                audio_embeds = self._project_pooled_audio(hidden_states)
+            else:
+                audio_embeds = graph(wavforms, audio_attention_mask)
         else:
             audio_embeds = self._encode_audio_features(wavforms, audio_attention_mask)
 
@@ -4793,6 +4845,17 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             final_audio_embeds.append(torch.cat(target_audio_embeds_lst))
 
         return final_audio_embeds
+
+    def _encode_audio_transformer(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        return self.apm.encode_hidden_states(hidden_states, attention_mask)
+
+    def _project_pooled_audio(self, audio_states: torch.Tensor) -> torch.Tensor:
+        audio_embeds = self.audio_projection_layer(audio_states)
+        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self.audio_avg_pooler(audio_embeds)
+        return audio_embeds.transpose(1, 2)
 
     def _encode_audio_features(self, wavforms: torch.Tensor, audio_attention_mask: torch.Tensor) -> torch.Tensor:
         """Stateless audio encoder, projection and pooling (no streaming KV)."""

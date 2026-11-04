@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
+from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
@@ -28,6 +30,55 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+_RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
+    {
+        "devices",
+        "max_batch_size",
+        "num_replicas",
+    }
+)
+
+_TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
+    {
+        "requires_full_payload_input",
+        "scheduling_metadata_adapter",
+    }
+)
+
+
+def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
+    """Normalize promoted backends and enforce their precedence over extras."""
+    kernels = {
+        name: getattr(stage, name) for name in ("moe_backend", "linear_backend") if getattr(stage, name) is not None
+    }
+    normalized = KernelConfig(**kernels)
+    for name in kernels:
+        setattr(stage, name, getattr(normalized, name))
+
+    # Only backend selections gain this precedence rule; unrelated extras keep
+    # their existing merge behavior. Never retain a duplicate legacy key.
+    stage.engine_extras = dict(stage.engine_extras)
+    for name in ("attention_backend", "moe_backend", "linear_backend"):
+        value = getattr(stage, name)
+        if value is not None and name in stage.engine_extras:
+            extra = stage.engine_extras.pop(name)
+            comparable_extra = extra
+            if name in ("moe_backend", "linear_backend"):
+                # First-class fields have already gone through KernelConfig,
+                # while legacy extras may still use mixed case or hyphens.
+                # Compare the same canonical spelling before warning.
+                try:
+                    comparable_extra = getattr(KernelConfig(**{name: extra}), name)
+                except (TypeError, ValueError):
+                    # An invalid shadowed extra is still discarded, as before.
+                    comparable_extra = extra
+            if value != comparable_extra:
+                warnings.warn(
+                    f"stage {stage.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
+                    UserWarning,
+                    stacklevel=3,
+                )
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -154,9 +205,7 @@ def _apply_diffusion_parallel_runtime_overrides(
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
         allgather_degree = parallel_config_dict.get("allgather_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = (
-            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
-        )
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree * allgather_degree
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
@@ -200,6 +249,76 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStageRole(str, Enum):
+    """Role of a diffusion stage within a (possibly disaggregated) pipeline.
+
+    ``execution_type`` answers *which engine* runs a stage; ``stage_role`` is an
+    orthogonal axis that answers *which slice of a diffusion model* the stage
+    runs. Splitting a single diffusion model across stages by role lets many
+    DiT-style models become disaggregatable through configuration alone, with no
+    per-model source changes:
+
+    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
+                   stage. This is the default / single-stage behavior.
+    - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
+                   embeddings for a downstream stage.
+    - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
+                   and emit latents for a downstream decode stage.
+    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
+                          generation stage of E/G disaggregation).
+    - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
+                   stage of a 3-way E/G/D split).
+    """
+
+    FULL = "full"
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DENOISE_DECODE = "denoise_decode"
+    DECODE = "decode"
+
+
+# Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
+# a free-form string ("text_encode"/"dit") before roles existed; keep the map so
+# older stage configs and deploy YAML keep working.
+_MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
+    "text_encode": DiffusionStageRole.ENCODE,
+    "encode": DiffusionStageRole.ENCODE,
+    # Legacy single-stage configs (e.g. wan2_2_ti2v) use "dit" for the whole
+    # pipeline; disaggregated topologies set ``stage_role`` explicitly.
+    "dit": DiffusionStageRole.FULL,
+    "denoise": DiffusionStageRole.DENOISE,
+    "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
+    "decode": DiffusionStageRole.DECODE,
+    "vae_decode": DiffusionStageRole.DECODE,
+    "diffusion": DiffusionStageRole.FULL,
+    "full": DiffusionStageRole.FULL,
+}
+
+
+def resolve_diffusion_stage_role(
+    stage_role: DiffusionStageRole | str | None,
+    model_stage: str | None = None,
+) -> DiffusionStageRole:
+    """Resolve the effective diffusion stage role.
+
+    Prefers an explicit ``stage_role`` and otherwise falls back to the legacy
+    free-form ``model_stage`` string. Unknown values resolve to ``FULL`` so a
+    plain single-stage diffusion model keeps running the whole pipeline.
+    """
+    if isinstance(stage_role, DiffusionStageRole):
+        return stage_role
+    if isinstance(stage_role, str) and stage_role:
+        try:
+            return DiffusionStageRole(stage_role)
+        except ValueError:
+            resolved = _MODEL_STAGE_TO_ROLE.get(stage_role)
+            if resolved is not None:
+                return resolved
+    if model_stage:
+        return _MODEL_STAGE_TO_ROLE.get(model_stage, DiffusionStageRole.FULL)
+    return DiffusionStageRole.FULL
+
+
 def _resolve_scheduler(
     execution_type: StageExecutionType,
     async_scheduling: bool = True,
@@ -234,6 +353,11 @@ class StagePipelineConfig:
     stage_id: int
     model_stage: str
     execution_type: StageExecutionType = StageExecutionType.LLM_AR
+    # Diffusion-only: which slice of a diffusion model this stage runs
+    # (encode / denoise / decode / full). Orthogonal to ``execution_type`` and
+    # only meaningful when ``execution_type == DIFFUSION``. ``None`` falls back
+    # to ``model_stage`` (legacy) and ultimately to ``FULL``.
+    stage_role: DiffusionStageRole | None = None
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
@@ -245,8 +369,18 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # The model may yield output before completing the current input unit.
+    supports_pending_generation: bool = False
     # Some stateful audio stages cannot roll back already consumed frames.
     supports_running_prefix_cache_reset: bool = True
+    # Recompute preemption (upstream's only mode) frees KV and replays the
+    # prompt. A native-AR stage whose decode step feeds more than the sampled
+    # token into the model -- side-channel codes, per-request hidden state,
+    # vocoder progress -- cannot rebuild that KV from the token stream. Under
+    # ``"fail"`` the scheduler reclaims the request's resources and emits one
+    # terminal error instead of requeuing it, so the caller never receives the
+    # spliced audio the replay would produce.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -254,6 +388,7 @@ class StagePipelineConfig:
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
+    supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -265,10 +400,16 @@ class StagePipelineConfig:
     # them is what enables the worker-side connector receive path, so an empty
     # tuple leaves existing deployments untouched.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
     # Mirror of the above on the producing side: keys this stage hands to the
     # next stage over the connector. Only diffusion producers need this; AR
     # stages already send through ``send_full_payload_outputs``.
     stage_output_payload_keys: tuple[str, ...] = ()
+    # Set on an async-chunk receiving stage. The orchestrator calls it with the
+    # original prompt when it submits this stage's prewarm placeholder; it
+    # returns a flat ``{name: Tensor | scalar}`` dict (or ``None``) sent under
+    # ``ASYNC_CHUNK_PREWARM_NS`` so the stage can warm up before chunk 0.
+    async_chunk_prewarm_payload_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -287,6 +428,13 @@ class StagePipelineConfig:
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
+    # Stage 0 only: a chat request carrying none of these input modalities
+    # skips this stage and enters at stage 1 (e.g. Qwen3-ASR runs only for
+    # requests with audio). Empty means every request runs it.
+    bypass_without_modalities: tuple[str, ...] = ()
+    # Optional model-owned adapter for runner payload metadata that affects
+    # scheduling. The scheduler only receives its typed effects.
+    scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -429,6 +577,12 @@ class StageDeployConfig:
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
+    # Upstream AR attention and shared AR/diffusion kernel selection.
+    # None means omitted, so model/platform defaults remain authoritative.
+    attention_backend: str | None = None
+    moe_backend: str | None = None
+    linear_backend: str | None = None
+
     # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
     async_scheduling: bool | None = None
@@ -467,6 +621,8 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None
     lora_scale: float | None = None
@@ -493,12 +649,12 @@ class StageDeployConfig:
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
     vae_fast_path: str | None = None
+    vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
     diffusion_kv_cache_skip_steps: str | None = None
     diffusion_kv_cache_skip_layers: str | None = None
-    auxiliary_text_encoder: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.
     hsdp_weight_load_strategy: str | None = None
@@ -506,6 +662,7 @@ class StageDeployConfig:
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
@@ -513,6 +670,7 @@ class StageDeployConfig:
 
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
+    dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None
@@ -527,6 +685,9 @@ class StageDeployConfig:
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _normalize_stage_backend_fields(self)
 
 
 @dataclass(frozen=True)
@@ -543,6 +704,15 @@ class DuplexSessionRuntimeConfig:
     max_pending_output_bytes_per_session: int = 2 * 1024 * 1024
     max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
+    # Total function-call records one session may track until it closes --
+    # pending calls and terminal tombstones together. At the limit, new calls
+    # are refused without closing the session or evicting records. Keeping
+    # terminal tombstones prevents a late ``function_call_output`` from binding
+    # to a newer call that reuses its call_id.
+    max_tool_calls_per_session: int = 4096
+    replica_policy: Literal["legacy", "least_sessions"] = "legacy"
+    max_sessions_per_replica: int | None = None
+    replica_groups: list[dict[int, int]] | None = None
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
     # framework carries appends as one-way commands on the runner's ordered
@@ -551,6 +721,18 @@ class DuplexSessionRuntimeConfig:
     # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
+    # Local Smart Turn v3.2 ONNX artifact for ``turn_detection: semantic_vad``;
+    # null resolves the pinned file from the Hugging Face cache.
+    semantic_vad_model_path: str | None = None
+    # Experimental Qwen heard-text calibration. Server-owned URL; never accept
+    # a transcription endpoint from a client session.update.
+    history_asr_url: str | None = None
+    history_asr_model: str | None = None
+    history_asr_max_concurrency: int = 4
+    # Opt-in token-rate estimate; fallback ms/token when audio generation is incomplete.
+    history_ms_per_token: float | None = None
+    history_calibration_timeout_ms: int = 1000
+    history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -558,8 +740,36 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Record per-turn stage work and emitted audio and answer the client's
+    # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
+    # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
+    collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.collect_stats, bool):
+            raise ValueError("duplex_session.collect_stats must be a boolean")
+        if self.replica_policy not in ("legacy", "least_sessions"):
+            raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
+        if self.max_sessions_per_replica is not None and (
+            isinstance(self.max_sessions_per_replica, bool)
+            or not isinstance(self.max_sessions_per_replica, int)
+            or self.max_sessions_per_replica < 1
+        ):
+            raise ValueError("duplex_session.max_sessions_per_replica must be an integer >= 1 or null")
+        if self.replica_policy == "least_sessions" and self.max_sessions_per_replica is None:
+            raise ValueError("duplex_session.max_sessions_per_replica is required for replica_policy='least_sessions'")
+        if self.replica_groups is not None:
+            if not isinstance(self.replica_groups, list) or not self.replica_groups:
+                raise ValueError("duplex_session.replica_groups must be a nonempty list of stage-to-replica mappings")
+            for index, group in enumerate(self.replica_groups):
+                if not isinstance(group, dict) or not group:
+                    raise ValueError(
+                        f"duplex_session.replica_groups[{index}] must be a nonempty stage-to-replica mapping"
+                    )
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in group):
+                    raise ValueError(f"duplex_session.replica_groups[{index}] stage IDs must be nonnegative integers")
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in group.values()):
+                    raise ValueError(f"duplex_session.replica_groups[{index}] replica IDs must be nonnegative integers")
         positive = {
             "disconnect_grace_s": self.disconnect_grace_s,
             "reaper_interval_s": self.reaper_interval_s,
@@ -570,17 +780,65 @@ class DuplexSessionRuntimeConfig:
             "max_pending_output_bytes_per_session": self.max_pending_output_bytes_per_session,
             "max_pending_output_events_per_session": self.max_pending_output_events_per_session,
             "max_sessions": self.max_sessions,
+            "max_tool_calls_per_session": self.max_tool_calls_per_session,
             "completed_append_cache_size": self.completed_append_cache_size,
+            "history_calibration_timeout_ms": self.history_calibration_timeout_ms,
+            "history_audio_max_bytes_per_session": self.history_audio_max_bytes_per_session,
+            "history_asr_max_concurrency": self.history_asr_max_concurrency,
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.history_asr_url is not None:
+            from urllib.parse import urlsplit
+
+            if not isinstance(self.history_asr_url, str):
+                raise ValueError("duplex_session.history_asr_url must be a string")
+            parsed = urlsplit(self.history_asr_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+                raise ValueError("duplex_session.history_asr_url requires an HTTP(S) URL without credentials")
+            if not isinstance(self.history_asr_model, str) or not self.history_asr_model.strip():
+                raise ValueError("duplex_session.history_asr_model is required with history_asr_url")
+        if self.history_ms_per_token is not None:
+            rate = self.history_ms_per_token
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+                raise ValueError("duplex_session.history_ms_per_token must be finite and positive")
+            if self.history_asr_url is not None:
+                raise ValueError("Choose history_asr_url or history_ms_per_token, not both")
+        for name in (
+            "history_calibration_timeout_ms",
+            "history_audio_max_bytes_per_session",
+            "history_asr_max_concurrency",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"duplex_session.{name} must be a positive integer")
         if self.server_vad_model_path is not None and (
             not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
         ):
             raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
+        if self.semantic_vad_model_path is not None and (
+            not isinstance(self.semantic_vad_model_path, str) or not self.semantic_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.semantic_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
+        # A record budget is a count, not a measurement. ``True <= 0`` is False
+        # and ``0.5 <= 0`` is False, so the positive check alone would let a
+        # bool become a limit of one and a fraction become a silently truncated
+        # one; ``nan`` would pass it too. Rejecting the shape here keeps the
+        # ledger's ``int(max_calls)`` from inventing a budget nobody configured.
+        budget = self.max_tool_calls_per_session
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            raise ValueError("duplex_session.max_tool_calls_per_session must be an integer")
+
+    @property
+    def worker_max_sessions(self) -> int:
+        """Model-owned state capacity of one worker replica."""
+        if self.replica_policy == "least_sessions":
+            assert self.max_sessions_per_replica is not None
+            return self.max_sessions_per_replica
+        return self.max_sessions
 
 
 @dataclass
@@ -622,6 +880,7 @@ class DeployConfig:
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
+    weight_transfer_config: dict[str, Any] | None = None
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -655,6 +914,7 @@ PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "pipeline_parallel_size",
     "active_stream_window",
     "custom_voice_dir",
+    "weight_transfer_config",
 )
 
 
@@ -907,6 +1167,14 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
     return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
+# Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
+# adapt a platform worker, so an entry is removed only with the real integration.
+# NPU AR stages use the Ascend V2 runner (attention metadata and input state).
+_MRV2_UNSUPPORTED_PLATFORMS = {
+    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
+}
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -954,6 +1222,11 @@ def _apply_platform_overrides(
                     type(po.env).__name__,
                 )
                 base.env = po.env
+        # Remove base legacy values before merging the entire overlay. Nested
+        # extras in the overlay must still be checked regardless of key order.
+        for key in ("attention_backend", "moe_backend", "linear_backend"):
+            if key in po.overrides:
+                base.engine_extras.pop(key, None)
         for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
@@ -968,6 +1241,9 @@ def _apply_platform_overrides(
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
+        # Platform overlays run after construction and can reintroduce nested
+        # backend extras. Reapply normalization and first-class precedence.
+        _normalize_stage_backend_fields(base)
 
     # Validate the final values, including stage entries from the platform
     # overlay. A global V2 default may still apply to omitted pipeline stages.
@@ -975,11 +1251,10 @@ def _apply_platform_overrides(
         if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
             raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
     uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
-    if uses_v2 and platform in {"npu", "xpu"}:
-        raise NotImplementedError(
-            f"Model Runner V2 is not supported on {platform.upper()}: "
-            "the platform worker still uses the legacy chunk-transfer data plane."
-        )
+    if uses_v2 and platform is not None:
+        reason = _MRV2_UNSUPPORTED_PLATFORMS.get(platform)
+        if reason is not None:
+            raise NotImplementedError(f"Model Runner V2 is not supported on {platform.upper()}: {reason}.")
 
     return deploy
 
@@ -1009,9 +1284,11 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
 
     Streaming-session prompt replacement exists only in the V1 chunk adapter,
     so a stage that receives from an upstream stage on MRv2 supports
-    turn-based sessions only.
+    turn-based sessions only unless it explicitly declares supports_duplex_mrv2.
     """
     if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+        return
+    if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:
         return
     if deploy.session_mode != "turn":
         raise ValueError(
@@ -1057,6 +1334,8 @@ def _build_engine_args(
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
+    if ps.supports_pending_generation:
+        engine_args["supports_pending_generation"] = True
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type is not None:
@@ -1075,6 +1354,8 @@ def _build_engine_args(
     engine_args["inline_diffusion"] = ps.inline_diffusion
     if ps.stage_input_payload_keys:
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_input_optional_payload_keys:
+        engine_args["stage_input_optional_payload_keys"] = tuple(ps.stage_input_optional_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
 
@@ -1094,10 +1375,9 @@ def _build_engine_args(
     engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
     engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
-        # The engine admission limit is also the authoritative capacity for
-        # model-owned streaming state. Propagate it to every stage instead of
-        # making individual models duplicate the value in connector extras.
-        engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
+        # Session placement caps model-owned state per replica. Legacy deploys
+        # retain the global admission limit as their worker capacity.
+        engine_args["duplex_max_sessions"] = deploy.duplex_session.worker_max_sessions
     # The runner selection is a deploy-topology decision owned by the
     # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
     # silently veto or force it per stage.
@@ -1127,6 +1407,9 @@ def _build_engine_args(
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     if not ps.supports_running_prefix_cache_reset:
         engine_args["supports_running_prefix_cache_reset"] = False
+    if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":
+        engine_args["recompute_preemption"] = ps.recompute_preemption
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
     return engine_args
 
 
@@ -1167,6 +1450,8 @@ def _build_extras(
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
+    if ps.async_chunk_prewarm_payload_func:
+        extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
     if ps.extras:
         extras.update(ps.extras)
     return extras
@@ -1291,6 +1576,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                stage_role=ps.stage_role.value if ps.stage_role is not None else None,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1319,6 +1605,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    stage_role: str | None = None
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
@@ -1343,6 +1630,11 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
+        # Diffusion disaggregation stage role (see DiffusionStageRole). Only
+        # surfaced when set so non-diffusion stages are unaffected; the payload
+        # key schema rides along in ``yaml_engine_args``.
+        if self.stage_role is not None:
+            engine_args["stage_role"] = self.stage_role
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:
@@ -1361,15 +1653,23 @@ class StageConfig:
         # rationale as the platform-overlay deep-merge. Legacy atomic mappings
         # are handled explicitly below.
         for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                existing = engine_args.get(key)
-                # ``omni_kv_config`` is an atomic legacy override: callers use
-                # a partial mapping to replace the topology-provided transfer
-                # role, rather than to add fields to it.
-                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
-                    engine_args[key] = _get_recursively_merged_dict(existing, value)
-                else:
-                    engine_args[key] = value
+            if value is None or key in _RUNTIME_ONLY_OVERRIDE_FIELDS:
+                continue
+            if key in _TOPOLOGY_OWNED_ENGINE_FIELDS:
+                logger.warning(
+                    "Stage %s: ignoring runtime override for topology-owned field '%s'; keeping the pipeline value.",
+                    self.stage_id,
+                    key,
+                )
+                continue
+            existing = engine_args.get(key)
+            # ``omni_kv_config`` is an atomic legacy override: callers use
+            # a partial mapping to replace the topology-provided transfer
+            # role, rather than to add fields to it.
+            if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                engine_args[key] = _get_recursively_merged_dict(existing, value)
+            else:
+                engine_args[key] = value
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output

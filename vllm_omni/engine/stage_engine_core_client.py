@@ -153,6 +153,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.prompt_transform_func = metadata.prompt_transform_func
             self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func
+            self.async_chunk_prewarm_payload_func = getattr(metadata, "async_chunk_prewarm_payload_func", None)
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})

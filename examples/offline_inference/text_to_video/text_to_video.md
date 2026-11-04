@@ -252,7 +252,7 @@ python text_to_video.py \
 
 ### Kandinsky 6 (TI2VA)
 
-The Hub checkpoint is gated; export `HF_TOKEN` if download returns 401.
+The checkpoint is the public Hub repo `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`.
 `--enable-cpu-offload` is required on an 80 GB H100. Audio is on by default.
 
 ```bash
