@@ -82,6 +82,12 @@ releases the old allocation and rebuilds from the current prompt. Block hashes
 include multimodal identities and cache salt, so equal audio placeholder tokens
 alone do not authorize reuse.
 
+Internally, the validated snapshot becomes a suffix-only streaming update to
+vLLM's upstream resumable scheduler. It folds the retained token history and
+recomputes new block hashes, rebasing new multimodal features without modifying
+the original snapshot. This does not change the commit-triggered generation
+interface or enable audio input during the same generation.
+
 Talker and Code2Wav terminate each turn. Their next requests receive the complete
 Thinker conditioning rows, replayed from the stage-output cache where KV was
 retained. They do not inherit the Thinker's resumable lifetime. The session

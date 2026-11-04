@@ -26,7 +26,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.engine import EngineCoreRequestType, FinishReason
+from vllm.v1.engine import EngineCoreEventType, EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
@@ -62,6 +62,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
     sched._outputs_awaiting_stage_payload = {}
+    sched._omits_kv_transfer_cache = {}
     return sched
 
 
@@ -113,7 +114,7 @@ def test_full_prompt_continuation_retains_only_valid_resident_kv(matching):
     assert sched.num_waiting_for_streaming_input == 0
     assert session._reset_turn_worker_state
     assert sched._free_request_blocks.call_count == (0 if matching else 1)
-    assert sched.encoder_cache_manager.free.call_count == (0 if matching else 1)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
 
 
 def test_full_prompt_continuation_rebuilds_when_history_shrinks():
@@ -129,6 +130,105 @@ def test_full_prompt_continuation_rebuilds_when_history_shrinks():
     sched._update_request_as_session(session, update)
     assert session.num_computed_tokens == 0
     sched._free_request_blocks.assert_called_once_with(session)
+
+
+@pytest.mark.parametrize("change", ["append", "tokens", "audio", "salt", "shrink"])
+def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, mocker):
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    hash_fn = get_hash_fn_by_name("sha256")
+    init_none_hash(hash_fn)
+    hasher = get_request_block_hasher(16, hash_fn)
+
+    def audio(identifier, offset, length):
+        return MultiModalFeatureSpec(
+            data=None,
+            modality="audio",
+            identifier=identifier,
+            mm_position=PlaceholderRange(offset=offset, length=length),
+        )
+
+    session = Request(
+        request_id="resident",
+        prompt_token_ids=list(range(33)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=1.0,
+        block_hasher=hasher,
+        resumable=True,
+        mm_features=[audio("history", 4, 8), audio("straddles-boundary", 30, 4)],
+    )
+    session.append_output_token_ids([33, 34, 999])
+    session.num_computed_tokens = 35  # 999 is sampled but has no KV.
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    tokens = list(range(64))
+    features = [
+        audio("changed" if change == "audio" else "history", 4, 8),
+        audio("straddles-boundary", 30, 4),
+        audio("new", 40, 8),
+    ]
+    if change == "tokens":
+        tokens[5] = 777
+    if change == "shrink":
+        tokens, features = tokens[:16], features[:1]
+    fresh = Request(
+        request_id="resident",
+        prompt_token_ids=tokens,
+        sampling_params=SamplingParams(max_tokens=16),
+        pooling_params=None,
+        arrival_time=2.0,
+        block_hasher=hasher,
+        resumable=True,
+        mm_features=features,
+        cache_salt="new-salt" if change == "salt" else None,
+    )
+    fresh.resume_from_full_prompt = True
+    update = StreamingUpdate.from_request(fresh)
+    original_offsets = [f.mm_position.offset for f in features]
+    upstream_update = VLLMScheduler._update_request_as_session
+
+    def checked_upstream(scheduler, resident, delta):
+        # Both upstream trim conventions see the same computed prefix.
+        assert resident.num_tokens - 1 == resident.num_computed_tokens
+        assert all(f.mm_position.offset >= 0 for f in delta.mm_features)
+        return upstream_update(scheduler, resident, delta)
+
+    upstream = mocker.patch.object(
+        VLLMScheduler, "_update_request_as_session", autospec=True, side_effect=checked_upstream
+    )
+    sched = _make_scheduler()
+    sched.cache_config = SimpleNamespace(block_size=16)
+    sched.max_model_len = 128
+    sched.num_waiting_for_streaming_input = 1
+    sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.kv_holding_waiting.add_request(session)
+    sched.deferred_waiting.add(session)
+    sched.log_stats = True
+    sched._update_request_as_session(session, update)
+
+    retained = 32 if change == "append" else 0
+    upstream.assert_called_once()
+    delta = upstream.call_args.args[2]
+    assert delta.prompt_token_ids == tokens[retained:]
+    assert session.num_computed_tokens == retained
+    assert session.prompt_token_ids == tokens
+    assert list(session.all_token_ids) == tokens
+    assert session.num_output_tokens == 0
+    assert session.block_hashes == fresh.block_hashes
+    assert session.mm_features == fresh.mm_features
+    assert session.cache_salt == fresh.cache_salt
+    assert [f.mm_position.offset for f in update.mm_features] == original_offsets
+    assert all(a is not b for a, b in zip(delta.mm_features, features[-len(delta.mm_features) :]))
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.status == RequestStatus.WAITING
+    assert sched._free_request_blocks.call_count == (0 if retained else 1)
+    assert session not in sched.deferred_waiting
+    assert list(sched.kv_holding_waiting) == ([session] if retained else [])
+    assert list(sched.waiting) == ([] if retained else [session])
+    assert [event.type for event in session.events] == [EngineCoreEventType.QUEUED]
 
 
 def _make_minicpm_window_update(

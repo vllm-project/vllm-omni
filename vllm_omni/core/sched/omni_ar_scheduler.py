@@ -1825,18 +1825,55 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not can_continue:
             self._release_replaced_streaming_prompt_cache(session)
             retained = 0
+        else:
+            # Encoder-cache entries are indexed by feature within the request.
+            # A new full snapshot can change features after the retained KV;
+            # do not let those indices reuse the previous turn's encoder state.
+            self.encoder_cache_manager.free(session)
         self._reset_streaming_session_replacement_state(session)
-        session._output_token_ids.clear()
-        session._all_token_ids[:] = update.prompt_token_ids
-        session.prompt_token_ids = list(update.prompt_token_ids)
-        session.num_prompt_tokens = len(session.prompt_token_ids)
+
+        # Adapt the full snapshot to upstream's streaming-input contract: a
+        # computed prefix, one uncomputed token to discard, and an input delta.
+        # Keeping that lookahead also satisfies upstream versions which trim
+        # at num_tokens - 1 instead of num_computed_tokens. No synthetic token
+        # reaches the worker: upstream discards it before installing the delta.
+        session._all_token_ids[:] = session._all_token_ids[: retained + 1]
+        session.prompt_token_ids = list(session._all_token_ids[:retained])
+        session.num_prompt_tokens = retained
         session.num_computed_tokens = retained
-        session.mm_features = list(update.mm_features or ())
-        session.block_hashes[:] = hashes
-        session.max_tokens = update.max_tokens
+        session.block_hashes[:] = hashes[: retained // self.hash_block_size]
+        session.cache_salt = update.cache_salt
+        session.mm_features = []
+        delta_features = []
+        for feature in update.mm_features or ():
+            if feature.mm_position.offset < retained:
+                # This includes a feature spanning the block boundary. Its
+                # identity was validated by the retained prefix's hashes.
+                session.mm_features.append(feature)
+            else:
+                # Upstream rebases delta features in place; clone descriptors
+                # so the caller's full snapshot keeps its absolute positions.
+                delta_features.append(
+                    replace(
+                        feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset - retained)
+                    )
+                )
+        delta = replace(update, prompt_token_ids=update.prompt_token_ids[retained:], mm_features=delta_features)
+        super()._update_request_as_session(session, delta)
+
+        # Omni transport and queue ownership remain separate from upstream's
+        # token/hash/position update. Upstream already consumed the waiting
+        # counter and recorded QUEUED; do not run _finish_streaming_session_update
+        # a second time.
+        self._omits_kv_transfer_cache.pop(session.request_id, None)
+        session.additional_information = update.additional_information or None
+        session.model_intermediate_buffer = getattr(update, "model_intermediate_buffer", None)
+        self.deferred_waiting.discard(session)
+        if session in self.kv_holding_waiting:
+            self.kv_holding_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
         session._reset_turn_worker_state = True
         self._new_prompt_len_snapshot[session.request_id] = len(session.prompt_token_ids)
-        self._finish_streaming_session_update(session, update)
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
         """Delegate streaming prompt policy to the stage's payload processor."""
