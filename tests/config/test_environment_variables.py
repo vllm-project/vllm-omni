@@ -165,11 +165,11 @@ def test_inventory_matches_reviewed_snapshot_counts():
     category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
     assert category_counts == {
         EnvironmentVariableCategory.PUBLIC_OMNI: 39,
-        EnvironmentVariableCategory.INHERITED_VLLM: 21,
+        EnvironmentVariableCategory.INHERITED_VLLM: 22,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 34,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 97,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 96,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 22,
-        EnvironmentVariableCategory.INTERNAL: 7,
+        EnvironmentVariableCategory.INTERNAL: 10,
     }
 
     disposition_counts = Counter(
@@ -182,7 +182,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 15,
-        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 6,
     }
 
 
