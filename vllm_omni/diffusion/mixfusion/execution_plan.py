@@ -63,10 +63,11 @@ class PackedExecutionPlan:
 
     Holds the flat varlen layout (cu_seqlens / max_seq_len) and the index
     tensors that recover each stream's rows, so per-block work stays on-GPU.
-    The stream set and order come from the model's ``AttentionLayout``; this
-    plan records their lengths and indices.
+    The stream set and order come from the model's ``layout``; this plan
+    records their lengths and indices.
     """
 
+    layout: AttentionLayout
     chunk_size: int
     num_chunks: int
     request_chunk_ranges: list[tuple[int, int]]
@@ -80,7 +81,6 @@ class PackedExecutionPlan:
     # Padded width of each ``"request"`` stream's output buffer. The model
     # supplies this because only it knows the caller-side padded shape.
     stream_padded_lens: dict[str, int]
-    cu_seqlens: list[int]
     cu_seqlens_tensor: torch.Tensor
     max_seq_len: int
     # Stream name -> (gather rows out of the packed result, scatter targets in
@@ -99,40 +99,21 @@ def build_execution_plan(
     chunk_to_request: torch.Tensor,
     device: torch.device,
 ) -> PackedExecutionPlan:
-    stream_names = list(layout.names)
-    if set(request_stream_lens) != set(stream_names):
-        raise ValueError(
-            f"request_stream_lens keys {sorted(request_stream_lens)} "
-            f"do not match attention layout {sorted(stream_names)}."
-        )
+    """Lay each request out as its streams in ``layout`` order.
 
-    num_requests = len(request_chunk_ranges)
-    if sum(int(count) for count in image_row_counts) != num_requests:
-        raise ValueError(f"image_row_counts {tuple(image_row_counts)} span {num_requests} chunked rows.")
-    lens_by_stream: dict[str, tuple[int, ...]] = {}
-    for name in stream_names:
-        lens = tuple(int(length) for length in request_stream_lens[name])
-        if len(lens) != num_requests:
-            raise ValueError(f"request_stream_lens[{name!r}] has {len(lens)} entries, expected {num_requests}.")
-        lens_by_stream[name] = lens
+    Inputs come straight from the adapter that just split the latents, so
+    only the cross-field invariants are asserted.
+    """
+    lens_by_stream = {name: tuple(int(length) for length in request_stream_lens[name]) for name in layout.names}
+    assert sum(image_row_counts) == len(request_chunk_ranges), "image_row_counts must cover every chunked row"
 
-    num_chunks = request_chunk_ranges[-1][1] if request_chunk_ranges else 0
     cu_seqlens = [0]
     max_seq_len = 0
-    gather_rows: dict[str, list[int]] = {name: [] for name in stream_names}
-    for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-        if chunk_end < chunk_start:
-            raise ValueError(f"request {req_idx} has an inverted chunk range ({chunk_start}, {chunk_end}).")
+    gather_rows: dict[str, list[int]] = {name: [] for name in layout.names}
+    for req_idx in range(len(request_chunk_ranges)):
         offset = cu_seqlens[-1]
         for spec in layout.streams:
             length = lens_by_stream[spec.name][req_idx]
-            if spec.kind == "chunked":
-                expected = (chunk_end - chunk_start) * chunk_size
-                if length != expected:
-                    raise ValueError(
-                        f"Stream {spec.name!r} of request {req_idx} has {length} tokens, "
-                        f"expected {expected} from {chunk_end - chunk_start} chunk(s)."
-                    )
             gather_rows[spec.name].extend(range(offset, offset + length))
             offset += length
         cu_seqlens.append(offset)
@@ -142,32 +123,22 @@ def build_execution_plan(
     for spec in layout.streams:
         gather = torch.tensor(gather_rows[spec.name], dtype=torch.long, device=device)
         scatter = None
-        if spec.kind == "request":
-            if spec.name not in stream_padded_lens:
-                raise ValueError(f"Stream {spec.name!r} needs an entry in stream_padded_lens.")
-            padded = int(stream_padded_lens[spec.name])
-            scatter_rows: list[int] = []
-            needs_padding = False
-            for req_idx, length in enumerate(lens_by_stream[spec.name]):
-                if length > padded:
-                    raise ValueError(
-                        f"Stream {spec.name!r} of request {req_idx} has {length} tokens, padded to {padded}."
-                    )
-                scatter_rows.extend(range(req_idx * padded, req_idx * padded + length))
-                needs_padding = needs_padding or length < padded
-            if needs_padding:
-                scatter = torch.tensor(scatter_rows, dtype=torch.long, device=device)
+        lens = lens_by_stream[spec.name]
+        if spec.kind == "request" and any(length < stream_padded_lens[spec.name] for length in lens):
+            padded = stream_padded_lens[spec.name]
+            scatter_rows = [req_idx * padded + pos for req_idx, length in enumerate(lens) for pos in range(length)]
+            scatter = torch.tensor(scatter_rows, dtype=torch.long, device=device)
         output_indices[spec.name] = (gather, scatter)
 
     return PackedExecutionPlan(
+        layout=layout,
         chunk_size=chunk_size,
-        num_chunks=num_chunks,
+        num_chunks=request_chunk_ranges[-1][1] if request_chunk_ranges else 0,
         request_chunk_ranges=request_chunk_ranges,
-        image_row_counts=tuple(int(count) for count in image_row_counts),
+        image_row_counts=tuple(image_row_counts),
         chunk_to_request=chunk_to_request,
         request_stream_lens=lens_by_stream,
-        stream_padded_lens={name: int(stream_padded_lens[name]) for name in stream_names if name in stream_padded_lens},
-        cu_seqlens=cu_seqlens,
+        stream_padded_lens=dict(stream_padded_lens),
         cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
         max_seq_len=max_seq_len,
         output_indices=output_indices,

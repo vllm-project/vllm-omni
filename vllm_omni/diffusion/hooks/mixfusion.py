@@ -3,7 +3,7 @@
 """MixFusion module-boundary hooks.
 
 Mirrors :mod:`vllm_omni.diffusion.hooks.sequence_parallel`: the model declares
-a ``_mixfusion_plan`` and the pipeline arms a
+a ``_mixfusion_plan`` and the MixFusionDriver arms a
 :class:`~vllm_omni.diffusion.forward_context.MixFusionStep` per packed denoise
 step. The hooks execute the chunk-stacked layout at those boundaries, so
 transformer and block ``forward`` code stays free of MixFusion branching.
@@ -14,7 +14,6 @@ adapter. All hooks are inert unless a ``mixfusion_step`` is armed.
 from __future__ import annotations
 
 import inspect
-from collections import OrderedDict
 
 from torch import nn
 
@@ -24,7 +23,7 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 from vllm_omni.diffusion.hooks.sequence_parallel import _get_submodule_by_name
-from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter, PackedInputs
+from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
 from vllm_omni.diffusion.mixfusion.execution_plan import expand_per_chunk
 from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionExpandArg,
@@ -49,15 +48,6 @@ MIXFUSION_HOOK_NAMES = (
 )
 
 
-class MixFusionPackingError(RuntimeError):
-    """An admitted call could not be packed at the root hook.
-
-    The driver preflights ``can_pack``, so this sentinel means admission and
-    the armed hook disagreed. The driver catches it and reruns the batch
-    serially, since the hook runs inside ``transformer.forward``.
-    """
-
-
 def _active_step():
     """Return the armed MixFusionStep, or None when this forward is not packed.
 
@@ -69,68 +59,28 @@ def _active_step():
     return get_forward_context().mixfusion_step
 
 
-def _resolve_adapter(module: nn.Module, step) -> MixFusionAdapter:
-    """Return the model's adapter, falling back to the step-carried one."""
-    adapter = getattr(module, "mixfusion_adapter", None)
-    if adapter is None:
-        adapter = step.adapter
-    if adapter is None:
-        raise TypeError(
-            f"MixFusion is armed but {type(module).__name__} declares no "
-            "`mixfusion_adapter`. Add a MixFusionAdapter attribute to the model "
-            "(see vllm_omni/diffusion/mixfusion/adapter.py) or leave MixFusion off."
-        )
-    return adapter
-
-
 class MixFusionRootHook(ModelHook):
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
-    ``pre_forward`` binds the forward call and delegates packing to the
-    adapter; ``post_forward`` restores one output per request.
+    The driver only arms a step after ``adapter.can_pack`` admitted the batch,
+    so ``pre_forward`` packs unconditionally.
     """
 
-    #: Upper bound on retained branch bundles. Sequential CFG alternates the
-    #: positive and negative branch every step and model variants may change
-    #: layouts, so a few slots are needed.
-    MAX_CACHE_SLOTS = 4
-
     def __init__(self) -> None:
-        # Bundle from the previous call of the same CFG branch. Keyed by branch
-        # because sequential true-CFG interleaves both branches within one
-        # step; the adapter revalidates the layout key, so a stale entry is a
-        # miss, never a wrong reuse.
-        self._cached: OrderedDict[str | None, PackedInputs] = OrderedDict()
+        # Previous bundle per CFG branch: sequential true-CFG interleaves the
+        # positive and negative calls within one step. The adapter revalidates
+        # the layout key, so a stale entry is a miss, never a wrong reuse.
+        self._cached: dict[str | None, PackedInputs] = {}
 
     def pre_forward(self, module, *args, **kwargs):
         step = _active_step()
         if step is None:
             return args, kwargs
-        adapter = _resolve_adapter(module, step)
         bound = inspect.signature(module.forward).bind(*args, **kwargs)
-        can_pack, reason = adapter.can_pack(module, bound)
-        if not can_pack:
-            # Admission already accepted this exact call, so returning the
-            # original args here would hand list latents to the model forward.
-            # Raise a sentinel the driver turns into the serial fallback.
-            raise MixFusionPackingError(
-                f"{type(module).__name__} declined packing after admission: {reason or 'no reason given'}"
-            )
-        # ``cfg_branch`` is stamped by the pipeline around each sequential CFG
-        # call; a call outside CFG uses ``None``.
         branch = getattr(module, "cfg_branch", None)
-        packed = adapter.pack_inputs(module, bound, step=step, cache=self._cached.get(branch))
-        if packed is None:
-            raise MixFusionPackingError(
-                f"{type(adapter).__name__}.pack_inputs returned no bundle for {type(module).__name__} after admission."
-            )
-        self._cached.pop(branch, None)
+        packed = module.mixfusion_adapter.pack_inputs(module, bound, cache=self._cached.get(branch))
         self._cached[branch] = packed
-        while len(self._cached) > self.MAX_CACHE_SLOTS:
-            self._cached.popitem(last=False)
-        step.adapter = adapter
         step.plan = packed.plan
-        step.layout = adapter.build_attention_layout(packed.plan)
         step.packed = packed
         return packed.args, packed.kwargs
 
@@ -138,10 +88,7 @@ class MixFusionRootHook(ModelHook):
         step = _active_step()
         if step is None or step.packed is None:
             return output
-        # ``forward`` always returns Transformer2DModelOutput here (the model
-        # ignores return_dict today); hand the pipeline the bare per-request
-        # list the adapter restores.
-        return step.adapter.restore_output(module, output, step.packed.plan)
+        return module.mixfusion_adapter.restore_output(module, output, step.plan)
 
     def reset_state(self, module):
         self._cached.clear()
@@ -167,7 +114,7 @@ class MixFusionReplaceOutputHook(ModelHook):
         except KeyError:
             raise KeyError(
                 f"MixFusion boundary output {self._boundary!r} was not produced "
-                f"by {type(step.adapter).__name__}; declared on {type(module).__name__}."
+                f"by the adapter; declared on {type(module).__name__}."
             ) from None
 
 
@@ -274,51 +221,30 @@ def plan_foreign_hooks(module: nn.Module, plan: dict | None) -> list[str]:
     return sorted(foreign)
 
 
-def packed_call_rejection(
-    module: nn.Module,
-    *,
-    attention_kwargs: dict | None = None,
-    parallel_config: object | None = None,
-) -> str | None:
-    """Why the packed call cannot run, or ``None`` when it can.
-
-    Model-agnostic invariants shared by the driver's admission and any adapter
-    re-checking them in ``can_pack``. The packed forward has no
-    ``attention_kwargs`` channel, would shard rows again under sequence
-    parallelism, and runs foreign hooks on an unintended layout.
-    """
-    if attention_kwargs:
-        return "attention_kwargs is set"
-    if parallel_config is not None and getattr(parallel_config, "sequence_parallel_size", 1) > 1:
-        return "sequence parallelism is enabled"
-    foreign = plan_foreign_hooks(module, getattr(module, "_mixfusion_plan", None))
-    if foreign:
-        return f"foreign hooks on the packed path ({', '.join(foreign)})"
-    return None
+_SPEC_HOOKS = {
+    MixFusionRoot: (MIXFUSION_PACK_HOOK_NAME, lambda spec: MixFusionRootHook()),
+    MixFusionReplaceOutput: (
+        MIXFUSION_REPLACE_OUTPUT_HOOK_NAME,
+        lambda spec: MixFusionReplaceOutputHook(spec.boundary),
+    ),
+    MixFusionExpandRows: (MIXFUSION_EXPAND_ROWS_HOOK_NAME, lambda spec: MixFusionExpandRowsHook()),
+    MixFusionExpandArg: (
+        MIXFUSION_EXPAND_ARG_HOOK_NAME,
+        lambda spec: MixFusionExpandArgHook(spec.arg_name, spec.expected_dims),
+    ),
+}
 
 
-def _spec_hook_name(spec) -> str:
-    if isinstance(spec, MixFusionRoot):
-        return MIXFUSION_PACK_HOOK_NAME
-    if isinstance(spec, MixFusionReplaceOutput):
-        return MIXFUSION_REPLACE_OUTPUT_HOOK_NAME
-    if isinstance(spec, MixFusionExpandRows):
-        return MIXFUSION_EXPAND_ROWS_HOOK_NAME
-    if isinstance(spec, MixFusionExpandArg):
-        return MIXFUSION_EXPAND_ARG_HOOK_NAME
-    raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})")
+def _spec_entry(spec):
+    try:
+        return _SPEC_HOOKS[type(spec)]
+    except KeyError:
+        raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})") from None
 
 
-def _spec_hook(spec) -> ModelHook:
-    if isinstance(spec, MixFusionRoot):
-        return MixFusionRootHook()
-    if isinstance(spec, MixFusionReplaceOutput):
-        return MixFusionReplaceOutputHook(spec.boundary)
-    if isinstance(spec, MixFusionExpandRows):
-        return MixFusionExpandRowsHook()
-    if isinstance(spec, MixFusionExpandArg):
-        return MixFusionExpandArgHook(spec.arg_name, spec.expected_dims)
-    raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})")
+def _plan_modules(module: nn.Module, name: str) -> list[nn.Module]:
+    submodule = _get_submodule_by_name(module, name)
+    return submodule if isinstance(submodule, list) else [submodule]
 
 
 def apply_mixfusion(module: nn.Module, plan: dict) -> None:
@@ -330,14 +256,10 @@ def apply_mixfusion(module: nn.Module, plan: dict) -> None:
     if getattr(module, "_mixfusion_hooks_applied", False):
         return
     for name, spec in plan.items():
-        hook_name = _spec_hook_name(spec)
-        submodule = _get_submodule_by_name(module, name)
-        if not isinstance(submodule, list):
-            submodule = [submodule]
-        hook = _spec_hook(spec)
-        for m in submodule:
-            registry = HookRegistry.get_or_create(m)
-            registry.register_hook(hook_name, hook)
+        hook_name, make_hook = _spec_entry(spec)
+        hook = make_hook(spec)
+        for m in _plan_modules(module, name):
+            HookRegistry.get_or_create(m).register_hook(hook_name, hook)
     module._mixfusion_hooks_applied = True
 
 
@@ -348,13 +270,9 @@ def remove_mixfusion(module: nn.Module, plan: dict) -> None:
     ``apply_mixfusion`` starts from a clean cache.
     """
     for name, spec in plan.items():
-        hook_name = _spec_hook_name(spec)
-        submodule = _get_submodule_by_name(module, name)
-        if not isinstance(submodule, list):
-            submodule = [submodule]
-        for m in submodule:
+        hook_name, _ = _spec_entry(spec)
+        for m in _plan_modules(module, name):
             registry = getattr(m, "_hook_registry", None)
-            if registry is None:
-                continue
-            registry.remove_hook(hook_name)
+            if registry is not None:
+                registry.remove_hook(hook_name)
     module._mixfusion_hooks_applied = False

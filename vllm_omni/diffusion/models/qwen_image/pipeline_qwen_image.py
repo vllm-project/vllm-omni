@@ -21,7 +21,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
@@ -855,32 +854,23 @@ class QwenImagePipeline(
     ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
         """Build positive/negative kwargs and output_slice for one denoise step.
 
-        ``latents`` is either a dense ``[B, ...]`` tensor or one tensor per
-        request for a packed MixFusion step. The packed list is forwarded
-        unchanged: the model's root hook rewrites ``hidden_states`` into the
-        chunk-stacked layout, so this builder only needs its row count and
-        device/dtype for the timestep.
+        ``latents`` may be one tensor per request (a packed MixFusion step);
+        the list is forwarded unchanged and the transformer's root hook packs
+        it. The driver never packs image-conditioned batches.
 
         Returns:
             (positive_kwargs, negative_kwargs, output_slice)
         """
         extra_transformer_kwargs = extra_transformer_kwargs or {}
 
-        # Broadcast timestep to match batch size.
-        if isinstance(latents, list):
-            num_rows = sum(int(latent.shape[0]) for latent in latents)
-            model_device, model_dtype = latents[0].device, latents[0].dtype
-        else:
-            num_rows = int(latents.shape[0])
-            model_device, model_dtype = latents.device, latents.dtype
-        t_for_model = timestep.expand(num_rows).to(
-            device=model_device,
-            dtype=model_dtype,
+        # Broadcast timestep to match batch size
+        rows = latents if isinstance(latents, list) else [latents]
+        t_for_model = timestep.expand(sum(row.shape[0] for row in rows)).to(
+            device=rows[0].device,
+            dtype=rows[0].dtype,
         )
 
-        # Concatenate image latents if available (editing pipelines). The
-        # driver rejects image-conditioned batches before packing, so a list
-        # of latents never reaches this concatenation.
+        # Concatenate image latents if available (editing pipelines)
         latent_model_input = latents
         if image_latents is not None:
             latent_model_input = torch.cat([latents, image_latents], dim=1)
@@ -909,9 +899,7 @@ class QwenImagePipeline(
         else:
             negative_kwargs = None
 
-        # Every request owns its whole packed output, so there is nothing to
-        # slice off the token axis.
-        output_slice = latents.size(1) if image_latents is not None and not isinstance(latents, list) else None
+        output_slice = latents.size(1) if image_latents is not None else None
         return positive_kwargs, negative_kwargs, output_slice
 
     def _decode_latents(
@@ -944,24 +932,6 @@ class QwenImagePipeline(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
-
-    def predict_noise(
-        self,
-        *args: Any,
-        **kwargs: Any,
-    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...] | IntermediateTensors:
-        """Run the transformer and keep a packed per-request list intact.
-
-        The base mixin unwraps ``result[0]`` (a tuple of outputs, or the bare
-        tensor a standard model returns). A MixFusion packed forward instead
-        returns one latent tensor per request as a list restored by the root
-        hook; taking ``result[0]`` there would silently keep only request 0,
-        so return the list unchanged.
-        """
-        result = self.transformer(*args, **kwargs)
-        if isinstance(result, (IntermediateTensors, list)):
-            return result
-        return result[0]
 
     def denoise_step(
         self,

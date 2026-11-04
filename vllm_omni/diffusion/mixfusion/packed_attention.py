@@ -8,9 +8,9 @@ attention-layer boundary gathers each request into its logical ``text +
 image`` order, runs one packed forward, and scatters back to every stream
 layout.
 
-The armed ``MixFusionStep`` carries the model's ``AttentionLayout``; the
-per-step plan travels in ``extra[MIXFUSION_PLAN_KEY]`` and ``"request"``-kind
-streams pass Q/K/V through ``extra[MIXFUSION_STREAMS_KEY]``. The positional
+The per-step plan (carrying the model's ``AttentionLayout``) travels in
+``extra[MIXFUSION_PLAN_KEY]`` and ``"request"``-kind streams pass Q/K/V
+through ``extra[MIXFUSION_STREAMS_KEY]``. The positional
 ``query``/``key``/``value`` belong to the single ``"chunked"`` stream. The
 output is a ``dict`` keyed by stream name.
 """
@@ -20,7 +20,6 @@ from __future__ import annotations
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
 from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
 
@@ -38,16 +37,6 @@ def _backend_supports_attention_mask(attn) -> bool:
     if backend is None:
         return False
     return bool(backend.supports_attention_mask(getattr(attn, "attn_spec", None)))
-
-
-def _active_layout() -> AttentionLayout:
-    if is_forward_context_available():
-        step = get_forward_context().mixfusion_step
-        if step is not None and step.layout is not None:
-            return step.layout
-    raise ValueError(
-        "MixFusion packed attention requires an armed MixFusionStep with an AttentionLayout (step.layout)."
-    )
 
 
 def _stream_rows(
@@ -68,10 +57,6 @@ def _stream_rows(
         stream_query, stream_key, stream_value = streams[spec.name]
         if spec.kind == "request":
             length = plan.request_stream_lens[spec.name][req_idx]
-            if stream_query.shape[0] <= req_idx or stream_query.shape[1] < length:
-                raise ValueError(
-                    f"Stream {spec.name!r} of request {req_idx} has fewer rows than its {length}-token length."
-                )
             queries.append(stream_query[req_idx, :length])
             keys.append(stream_key[req_idx, :length])
             values.append(stream_value[req_idx, :length])
@@ -185,25 +170,9 @@ def run_mixfusion_packed_attention(
     stream name in each stream's input layout.
     """
     plan: PackedExecutionPlan = attn_metadata.extra[MIXFUSION_PLAN_KEY]
-    layout = _active_layout()
-    streams = attn_metadata.extra.get(MIXFUSION_STREAMS_KEY)
-    if streams is None:
-        raise ValueError(
-            f"MixFusion packed attention requires the extra streams in attn_metadata.extra[{MIXFUSION_STREAMS_KEY!r}]"
-        )
-
-    chunked_names = [spec.name for spec in layout.streams if spec.kind == "chunked"]
-    if len(chunked_names) != 1:
-        raise ValueError(
-            f"MixFusion packed attention needs exactly one chunked stream to bind query/key/value, got {chunked_names}."
-        )
-    chunked_name = chunked_names[0]
-    if chunked_name in streams:
-        raise ValueError(f"Chunked stream {chunked_name!r} takes its Q/K/V positionally; do not also pass it in extra.")
-    missing = [name for name in layout.names if name != chunked_name and name not in streams]
-    if missing:
-        raise ValueError(f"MixFusion packed attention is missing Q/K/V for streams {missing}.")
-    all_streams = {**streams, chunked_name: (query, key, value)}
+    layout = plan.layout
+    chunked_name = next(spec.name for spec in layout.streams if spec.kind == "chunked")
+    all_streams = {**attn_metadata.extra[MIXFUSION_STREAMS_KEY], chunked_name: (query, key, value)}
 
     num_query_heads = query.shape[2]
     num_kv_heads = key.shape[2]
@@ -229,11 +198,13 @@ def run_mixfusion_packed_attention(
         flat_keys.append(req_key)
         flat_values.append(req_value)
 
+    # A varlen-capable backend takes the whole flat packing in one kernel; a
+    # dense backend that takes masks fuses documents of the same image length
+    # by padding and masking their text stream. The capability is probed
+    # without a kv dtype on purpose: a quantized policy (which rejects both
+    # cu_seqlens and masks) then reaches ``forward_packed``, whose mask-free
+    # exact-length buckets are the only path it can run.
     if not attn.supports_multi_doc_packed_varlen() and _backend_supports_attention_mask(attn):
-        # A varlen-capable backend takes the whole flat packing in one kernel;
-        # a dense-only backend fuses documents of the same image length by
-        # padding their text stream and masking it, one forward per image shape
-        # instead of one per distinct text length.
         packed_hidden_states = _packed_dense_with_text_mask(
             attn,
             flat_queries,
@@ -251,9 +222,6 @@ def run_mixfusion_packed_attention(
         packed_key = torch.cat(flat_keys, dim=0)
         packed_value = torch.cat(flat_values, dim=0)
         del flat_queries, flat_keys, flat_values
-        # Varlen-capable backends get one packed kernel; every other backend
-        # is served by equal-length bucketed dense attention that keeps the
-        # same document isolation. Either way the result is the flat layout.
         packed_hidden_states = attn.forward_packed(
             packed_query,
             packed_key,

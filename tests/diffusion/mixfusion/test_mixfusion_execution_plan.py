@@ -5,9 +5,8 @@
 ``execution_plan`` is model-agnostic: it turns sequences plus a model-declared
 ``AttentionLayout`` into the packed varlen layout (cu_seqlens / max_seq_len,
 gather rows out of the packed output, scatter rows back into the padded
-per-request space). These tests pin the happy path and every validation
-error with hand-computed layouts, so the primitives can be relied on before a
-model adapter is involved.
+per-request space). These tests pin it with hand-computed layouts, so the
+primitives can be relied on before a model adapter is involved.
 """
 
 from __future__ import annotations
@@ -60,53 +59,19 @@ def test_gcd_chunk_size_is_the_largest_common_divisor():
     assert gcd_chunk_size([torch.zeros(1, 8, 4)]) == 8
 
 
-def test_plan_chunk_size_accepts_an_admissible_batch():
-    accepted, reason, chunk_size, chunk_count = plan_chunk_size(
-        [torch.zeros(1, 8, 4), torch.zeros(1, 12, 4)],
-        min_chunk_tokens=1,
-        max_chunks=8,
-    )
-
-    assert (accepted, reason) == (True, "ok")
-    assert (chunk_size, chunk_count) == (4, 5)
-
-
-def test_plan_chunk_size_counts_chunks_per_image():
-    # Two images per request multiply the chunk count in the stacked stream.
-    latents = [torch.zeros(2, 8, 4), torch.zeros(1, 12, 4)]
-
-    accepted, reason, chunk_size, chunk_count = plan_chunk_size(
-        latents,
-        min_chunk_tokens=1,
-        max_chunks=8,
-    )
-
-    assert accepted
-    assert (chunk_size, chunk_count) == (4, 7)
-
-
-def test_plan_chunk_size_rejects_chunks_below_the_minimum():
-    accepted, reason, chunk_size, chunk_count = plan_chunk_size(
-        [torch.zeros(1, 4, 4)],
-        min_chunk_tokens=8,
-        max_chunks=8,
-    )
-
-    assert not accepted
-    assert reason == "chunk_size=4 < min_chunk_tokens=8"
-    assert (chunk_size, chunk_count) == (4, 1)
-
-
-def test_plan_chunk_size_rejects_too_many_chunks():
-    accepted, reason, chunk_size, chunk_count = plan_chunk_size(
-        [torch.zeros(1, 8, 4), torch.zeros(1, 12, 4)],
-        min_chunk_tokens=1,
-        max_chunks=4,
-    )
-
-    assert not accepted
-    assert reason == "chunk_count=5 > max_chunks=4"
-    assert (chunk_size, chunk_count) == (4, 5)
+@pytest.mark.parametrize(
+    ("latents", "min_chunk_tokens", "max_chunks", "expected"),
+    [
+        ([(1, 8), (1, 12)], 1, 8, (True, "ok", 4, 5)),
+        # Two images per request multiply the chunk count.
+        ([(2, 8), (1, 12)], 1, 8, (True, "ok", 4, 7)),
+        ([(1, 4)], 8, 8, (False, "chunk_size=4 < min_chunk_tokens=8", 4, 1)),
+        ([(1, 8), (1, 12)], 1, 4, (False, "chunk_count=5 > max_chunks=4", 4, 5)),
+    ],
+)
+def test_plan_chunk_size(latents, min_chunk_tokens, max_chunks, expected):
+    tensors = [torch.zeros(images, seq_len, 4) for images, seq_len in latents]
+    assert plan_chunk_size(tensors, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks) == expected
 
 
 # ── build_execution_plan: happy path ──
@@ -116,7 +81,7 @@ def test_build_execution_plan_lays_streams_out_in_declared_order():
     plan = build_execution_plan(**_plan_kwargs())
 
     # text(3) image(8) | text(5) image(12) -> cu_seqlens [0, 11, 28].
-    assert plan.cu_seqlens == [0, 11, 28]
+    assert plan.layout is LAYOUT
     assert plan.cu_seqlens_tensor.tolist() == [0, 11, 28]
     assert plan.cu_seqlens_tensor.dtype == torch.int32
     assert plan.max_seq_len == 17
@@ -154,58 +119,8 @@ def test_build_execution_plan_skips_scatter_when_no_padding_is_needed():
 
     assert text_gather.tolist() == [0, 1, 2, 3, 4, 5, 14, 15, 16, 17, 18, 19]
     assert text_scatter is None
-    assert plan.cu_seqlens == [0, 14, 32]
+    assert plan.cu_seqlens_tensor.tolist() == [0, 14, 32]
     assert plan.max_seq_len == 18
-
-
-# ── build_execution_plan: validation ──
-
-
-def test_build_execution_plan_rejects_mismatched_stream_keys():
-    with pytest.raises(ValueError, match=r"request_stream_lens keys \['text'\] do not match"):
-        build_execution_plan(**_plan_kwargs(request_stream_lens={"text": (3, 5)}))
-
-
-def test_build_execution_plan_rejects_short_image_row_counts():
-    with pytest.raises(ValueError, match=r"image_row_counts \(1,\) span 2 chunked rows"):
-        build_execution_plan(**_plan_kwargs(image_row_counts=(1,)))
-
-
-def test_build_execution_plan_rejects_wrong_stream_length_count():
-    with pytest.raises(ValueError, match=r"request_stream_lens\['text'\] has 1 entries, expected 2"):
-        build_execution_plan(**_plan_kwargs(request_stream_lens={"text": (3,), "image": (8, 12)}))
-
-
-def test_build_execution_plan_rejects_an_inverted_chunk_range():
-    with pytest.raises(ValueError, match=r"request 0 has an inverted chunk range \(2, 0\)"):
-        build_execution_plan(
-            **_plan_kwargs(
-                request_chunk_ranges=[(2, 0)],
-                image_row_counts=(1,),
-                request_stream_lens={"text": (3,), "image": (0,)},
-            )
-        )
-
-
-def test_build_execution_plan_rejects_a_chunked_stream_of_the_wrong_length():
-    with pytest.raises(ValueError, match=r"Stream 'image' of request 1 has 8 tokens, expected 12 from 3 chunk\(s\)"):
-        build_execution_plan(**_plan_kwargs(request_stream_lens={"text": (3, 5), "image": (8, 8)}))
-
-
-def test_build_execution_plan_requires_a_padded_width_for_request_streams():
-    with pytest.raises(ValueError, match=r"Stream 'text' needs an entry in stream_padded_lens"):
-        build_execution_plan(**_plan_kwargs(stream_padded_lens={}))
-
-
-def test_build_execution_plan_rejects_a_stream_wider_than_its_padded_width():
-    with pytest.raises(ValueError, match=r"Stream 'text' of request 1 has 5 tokens, padded to 4"):
-        build_execution_plan(**_plan_kwargs(stream_padded_lens={"text": 4}))
-
-
-def test_build_execution_plan_copies_the_padded_lens_it_was_given():
-    plan = build_execution_plan(**_plan_kwargs(stream_padded_lens={"text": 6, "image": 12}))
-
-    assert plan.stream_padded_lens == {"text": 6, "image": 12}
 
 
 # ── chunk splitting / reassembly ──

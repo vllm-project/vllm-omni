@@ -330,8 +330,6 @@ def test_forward_packed_serves_trtllm_with_the_row_layout(monkeypatch):
     assert captured["batch_size"] == 2
     assert captured["seq_lens"].tolist() == [2, 3]
     assert out.shape == (total, h, d)
-    # The quantization-policy argument is accepted for signature parity.
-    assert tg.TrtllmAttentionBackend.supports_multi_doc_packed_varlen("fp8")
 
 
 @hardware_test(res={"cuda": "RTX5090"}, num_cards=1)

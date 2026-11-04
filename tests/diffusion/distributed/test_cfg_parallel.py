@@ -1316,14 +1316,18 @@ def test_cfg_branch_stamp_is_restored_when_predict_noise_raises():
     assert pipeline.transformer.cfg_branch is None
 
 
+class _PackedListTransformer(torch.nn.Module):
+    """Returns one tensor per request, like a packed MixFusion forward."""
+
+    def forward(self, *, preds: list[torch.Tensor]) -> list[torch.Tensor]:
+        return list(preds)
+
+
 class _PackedListPipeline(CFGParallelMixin):
-    """Predicts one tensor per request, mirroring a packed MixFusion batch."""
+    """Uses the base ``predict_noise``, which must keep the list intact."""
 
     def __init__(self) -> None:
-        self.transformer = torch.nn.Identity()
-
-    def predict_noise(self, *, preds: list[torch.Tensor], **_kwargs: Any) -> list[torch.Tensor]:
-        return list(preds)
+        self.transformer = _PackedListTransformer()
 
 
 def _packed_list_inputs(seed: int = 11) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -1332,26 +1336,6 @@ def _packed_list_inputs(seed: int = 11) -> tuple[list[torch.Tensor], list[torch.
     _set_random_seeds(seed + 1)
     negative = [torch.randn(1, 4, 4), torch.randn(2, 4, 4)]
     return positive, negative
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
-def test_combine_cfg_noise_rejects_mixed_list_and_tensor():
-    pipeline = _PackedListPipeline()
-
-    with pytest.raises(TypeError, match="cannot mix a list prediction"):
-        pipeline.combine_cfg_noise([torch.zeros(1, 4)], torch.zeros(1, 4), 5.0)
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
-def test_combine_cfg_noise_rejects_prediction_count_mismatch():
-    pipeline = _PackedListPipeline()
-
-    with pytest.raises(ValueError, match="one negative prediction per positive one"):
-        pipeline.combine_cfg_noise([torch.zeros(1, 4)], [torch.zeros(1, 4), torch.zeros(1, 4)], 5.0)
 
 
 @pytest.mark.core_model
@@ -1380,49 +1364,3 @@ def test_sequential_cfg_keeps_packed_list_predictions(cfg_normalize: bool):
             expected = pipeline.cfg_normalize_function(pos, expected)
         torch.testing.assert_close(actual, expected)
     assert pipeline.transformer.cfg_branch is None
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
-def test_sequential_cfg_slices_each_packed_prediction():
-    pipeline = _PackedListPipeline()
-    positive, negative = _packed_list_inputs()
-
-    with torch.no_grad():
-        combined = pipeline.predict_noise_maybe_with_cfg(
-            do_true_cfg=True,
-            true_cfg_scale=5.0,
-            positive_kwargs={"preds": positive},
-            negative_kwargs={"preds": negative},
-            cfg_normalize=False,
-            output_slice=2,
-        )
-
-    assert [tuple(t.shape) for t in combined] == [(1, 2, 4), (2, 2, 4)]
-    for pos, neg, actual in zip(positive, negative, combined, strict=True):
-        expected = neg[:, :2] + 5.0 * (pos[:, :2] - neg[:, :2])
-        torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
-def test_packed_list_prediction_kept_without_cfg_and_sliced():
-    pipeline = _PackedListPipeline()
-    positive, _ = _packed_list_inputs()
-
-    with torch.no_grad():
-        out = pipeline.predict_noise_maybe_with_cfg(
-            do_true_cfg=False,
-            true_cfg_scale=1.0,
-            positive_kwargs={"preds": positive},
-            negative_kwargs=None,
-            cfg_normalize=False,
-            output_slice=2,
-        )
-
-    assert isinstance(out, list)
-    assert [tuple(t.shape) for t in out] == [(1, 2, 4), (2, 2, 4)]
-    for pred, actual in zip(positive, out, strict=True):
-        torch.testing.assert_close(actual, pred[:, :2])

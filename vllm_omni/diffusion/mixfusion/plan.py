@@ -8,7 +8,7 @@ in :mod:`vllm_omni.diffusion.hooks.mixfusion` implement *how*.
 
 A ``_mixfusion_plan`` maps module names (same syntax as ``_sp_plan``: ``""``
 for the root, dotted paths, one ``*`` per ModuleList wildcard) to the types
-below. The layout depends on the per-step batch, so the pipeline arms a
+below. The layout depends on the per-step batch, so the MixFusionDriver arms a
 :class:`~vllm_omni.diffusion.forward_context.MixFusionStep` and the root hook
 asks the model's :class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`
 for the concrete

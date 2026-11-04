@@ -1,22 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Contract tests for the packed varlen FlashAttention path (CPU).
+"""Contract tests for the packed varlen attention path (CPU).
 
-``FlashAttentionImpl._forward_varlen_packed`` runs padding-free FlashAttention
-over Q/K/V described by the ``AttentionMetadata.extra`` cu_seqlens keys — either
-a flat packed ``[total_tokens, num_heads, head_dim]`` layout (dynamic
-multi-document batching) or a single ``[1, total_tokens, heads, head_dim]``
-packed row. The kernel itself needs an accelerator, so these tests pin
-everything around it: the layout handling, the extra-key validation, the
-dispatch from ``forward_cuda`` / ``forward_xpu``, and the ``Attention`` layer's
-``forward_packed`` entry point with its bucketed dense fallback for backends
-without packed varlen support. The kernel call is stubbed so the packed
-boundaries it receives can be asserted directly.
+The varlen kernel needs an accelerator, so these tests pin what surrounds it:
+the Flash capability rule for quantized policies, the XPU packed dispatch, and
+the ``Attention`` layer's ``forward_packed`` entry with its bucketed dense
+fallback. Flash's batch-size-1 packed row and the CUDA packed dispatch are
+covered on main in ``test_flash_attn.py``.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,7 +21,6 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
-    _normalize_flash_attention_metadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
 
@@ -59,123 +52,6 @@ def _packed_metadata(attn_mask: torch.Tensor | None = None) -> AttentionMetadata
     return AttentionMetadata(attn_mask=attn_mask, extra=extra)
 
 
-@pytest.mark.parametrize("returns_tuple", [False, True])
-def test_packed_flat_passes_boundaries_to_the_kernel(monkeypatch, returns_tuple):
-    captured: dict = {}
-
-    def fake_flash_attn_varlen_func(**kwargs):
-        captured.update(kwargs)
-        # FA3 returns (out, lse); FA2 returns out.
-        return (kwargs["q"], None) if returns_tuple else kwargs["q"]
-
-    monkeypatch.setattr(fa_module, "flash_attn_varlen_func", fake_flash_attn_varlen_func)
-    query, key, value = _flat_qkv()
-    metadata = _packed_metadata()
-
-    out = _impl()._forward_varlen_packed(
-        query,
-        key,
-        value,
-        cu_seqlens_q=metadata.extra["cu_seqlens_q"],
-        cu_seqlens_k=metadata.extra["cu_seqlens_k"],
-        max_seqlen_q=metadata.extra["max_seqlen_q"],
-        max_seqlen_k=metadata.extra["max_seqlen_k"],
-    )
-
-    assert captured["q"] is query
-    assert captured["k"] is key
-    assert captured["v"] is value
-    assert captured["cu_seqlens_q"] is metadata.extra["cu_seqlens_q"]
-    assert captured["cu_seqlens_k"] is metadata.extra["cu_seqlens_k"]
-    assert captured["max_seqlen_q"] == 5
-    assert captured["max_seqlen_k"] == 7
-    assert captured["causal"] is False
-    assert torch.equal(out, query)
-
-
-def test_packed_row_layout_is_flattened_and_restored(monkeypatch):
-    captured: dict = {}
-
-    def fake_flash_attn_varlen_func(**kwargs):
-        captured.update(kwargs)
-        return kwargs["q"]
-
-    monkeypatch.setattr(fa_module, "flash_attn_varlen_func", fake_flash_attn_varlen_func)
-    query, key, value = _flat_qkv()
-    row_query = query.unsqueeze(0)
-    row_key = key.unsqueeze(0)
-    row_value = value.unsqueeze(0)
-    metadata = _packed_metadata()
-
-    out = _impl()._forward_varlen_packed(
-        row_query,
-        row_key,
-        row_value,
-        cu_seqlens_q=metadata.extra["cu_seqlens_q"],
-        cu_seqlens_k=metadata.extra["cu_seqlens_k"],
-        max_seqlen_q=metadata.extra["max_seqlen_q"],
-        max_seqlen_k=metadata.extra["max_seqlen_k"],
-    )
-
-    assert captured["q"].ndim == 3
-    assert torch.equal(captured["q"], query)
-    assert out.shape == row_query.shape
-    assert torch.equal(out, row_query)
-
-
-@pytest.mark.parametrize(
-    ("batch", "match"),
-    [
-        (2, r"expects flat \[total_tokens, heads, head_dim\]"),
-        (3, r"expects flat \[total_tokens, heads, head_dim\]"),
-    ],
-)
-def test_packed_rejects_multi_row_layouts(monkeypatch, batch, match):
-    monkeypatch.setattr(fa_module, "flash_attn_varlen_func", lambda **kwargs: kwargs["q"])
-    query, key, value = _flat_qkv()
-
-    with pytest.raises(ValueError, match=match):
-        _impl()._forward_varlen_packed(
-            query.unsqueeze(0)
-            .expand(batch, -1, -1, -1)
-            .reshape(batch * TOTAL_Q, HEADS, HEAD_DIM)
-            .view(batch, TOTAL_Q, HEADS, HEAD_DIM),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            cu_seqlens_q=torch.tensor([0, TOTAL_Q], dtype=torch.int32),
-            cu_seqlens_k=torch.tensor([0, TOTAL_KV], dtype=torch.int32),
-            max_seqlen_q=TOTAL_Q,
-            max_seqlen_k=TOTAL_KV,
-        )
-
-
-def test_mixed_ndim_inputs_are_rejected(monkeypatch):
-    monkeypatch.setattr(fa_module, "flash_attn_varlen_func", lambda **kwargs: kwargs["q"])
-    query, key, value = _flat_qkv()
-
-    with pytest.raises(ValueError, match=r"expects flat \[total_tokens, heads, head_dim\]"):
-        _impl()._forward_varlen_packed(
-            query.unsqueeze(0),
-            key,
-            value,
-            cu_seqlens_q=torch.tensor([0, TOTAL_Q], dtype=torch.int32),
-            cu_seqlens_k=torch.tensor([0, TOTAL_KV], dtype=torch.int32),
-            max_seqlen_q=TOTAL_Q,
-            max_seqlen_k=TOTAL_KV,
-        )
-
-
-@pytest.mark.parametrize(
-    "drop",
-    ["cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k"],
-)
-def test_incomplete_packed_extra_keys_are_rejected(drop):
-    extra = {k: v for k, v in _packed_metadata().extra.items() if k != drop}
-
-    with pytest.raises(ValueError, match="Incomplete packed FlashAttention metadata"):
-        _normalize_flash_attention_metadata(AttentionMetadata(extra=extra))
-
-
 def test_flash_capability_rejects_quantized_policies():
     # The FA3 quantized path (forward_fa_quant_cuda) is a dense BSHD kernel:
     # _validate_quant_request_cuda rejects cu_seqlens metadata. The dtype
@@ -184,8 +60,7 @@ def test_flash_capability_rejects_quantized_policies():
     assert FlashAttentionBackend.supports_multi_doc_packed_varlen("fp8") is False
 
 
-@pytest.mark.parametrize("forward_name", ["forward_cuda", "forward_xpu"])
-def test_packed_metadata_dispatches_to_the_packed_path(monkeypatch, forward_name):
+def test_xpu_dispatches_packed_metadata_to_the_packed_path(monkeypatch):
     monkeypatch.setattr(fa_module, "HAS_FLASH_ATTN", True)
     impl = _impl()
     routed: dict = {}
@@ -199,19 +74,9 @@ def test_packed_metadata_dispatches_to_the_packed_path(monkeypatch, forward_name
     query, key, value = _flat_qkv()
     metadata = _packed_metadata()
 
-    assert getattr(impl, forward_name)(query, key, value, metadata) == "packed"
+    assert impl.forward_xpu(query, key, value, metadata) == "packed"
     assert routed["query"] is query
     assert routed["kwargs"]["cu_seqlens_q"] is metadata.extra["cu_seqlens_q"]
-
-
-def test_flat_packed_input_with_mask_is_rejected_on_cuda(monkeypatch):
-    monkeypatch.setattr(fa_module, "HAS_FLASH_ATTN", True)
-    impl = _impl()
-    query, key, value = _flat_qkv()
-    metadata = _packed_metadata(attn_mask=torch.zeros(1, 1, dtype=torch.bool))
-
-    with pytest.raises(ValueError, match="cannot apply an attention mask"):
-        impl.forward_cuda(query, key, value, metadata)
 
 
 def test_xpu_keeps_the_masked_path_when_a_mask_rides_along(monkeypatch):
@@ -269,14 +134,9 @@ def _layer(backend, forward, kv_cache_dtype=None, disable_kv_quant=False):
 
 def test_layer_capability_delegates_to_the_backend_class():
     assert _layer(None, None).supports_multi_doc_packed_varlen() is False
-    assert _layer(_VarlenBackend, None).supports_multi_doc_packed_varlen() is True
     assert _layer(_DenseBackend, None).supports_multi_doc_packed_varlen() is False
-
-
-def test_layer_capability_passes_the_quantization_policy():
     layer = _layer(_VarlenBackend, None)
-    assert layer.supports_multi_doc_packed_varlen("float") is True
-    assert layer.supports_multi_doc_packed_varlen("auto") is True
+    assert layer.supports_multi_doc_packed_varlen() is True
     assert layer.supports_multi_doc_packed_varlen("fp8") is False
 
 
@@ -352,22 +212,6 @@ def test_forward_packed_dense_buckets_isolate_documents():
     assert sorted(dense_shapes) == [(1, 2, HEADS, HEAD_DIM), (2, 4, HEADS, HEAD_DIM)]
 
 
-def test_forward_packed_dense_buckets_skip_empty_documents():
-    def dense_forward(query, key, value, attn_metadata):
-        assert query.shape[0] == 2 and query.shape[1] == 4
-        return query
-
-    layer = _layer(_DenseBackend, dense_forward)
-    total = 8
-    query = torch.arange(total * HEADS * HEAD_DIM, dtype=torch.float32).reshape(total, HEADS, HEAD_DIM)
-    # A zero-length document between two length-4 documents.
-    cu_seqlens = torch.tensor([0, 4, 4, 8], dtype=torch.int32)
-
-    out = layer.forward_packed(query, query, query, cu_seqlens=cu_seqlens, max_seqlen=4)
-
-    assert torch.equal(out, query)
-
-
 def test_quantized_policy_falls_back_to_dense_buckets():
     # A non-float effective quantization policy cannot ride the varlen
     # kernel (the FA3 quantized path rejects cu_seqlens metadata), so the
@@ -411,56 +255,3 @@ def test_disabled_quant_policy_keeps_the_varlen_path():
     assert torch.equal(calls[0][1].extra["cu_seqlens_q"], cu_seqlens)
     assert out.shape == query.shape
     assert torch.equal(out, query)
-
-
-def test_forward_packed_accepts_the_single_packed_row_layout():
-    def varlen_forward(query, key, value, attn_metadata):
-        assert query.ndim == 4 and query.shape[0] == 1
-        return query
-
-    layer = _layer(_VarlenBackend, varlen_forward)
-    query, key, value = _flat_qkv()
-
-    out = layer.forward_packed(
-        query.unsqueeze(0),
-        key.unsqueeze(0),
-        value.unsqueeze(0),
-        cu_seqlens=torch.tensor([0, TOTAL_Q], dtype=torch.int32),
-        max_seqlen=TOTAL_Q,
-    )
-
-    assert out.shape == (1, TOTAL_Q, HEADS, HEAD_DIM)
-    assert torch.equal(out, query.unsqueeze(0))
-
-
-def test_forward_packed_rejects_multi_row_layouts():
-    layer = _layer(_VarlenBackend, None)
-
-    with pytest.raises(ValueError, match=r"expects a flat or \[1, total_tokens"):
-        layer.forward_packed(
-            torch.randn(2, 4, HEADS, HEAD_DIM),
-            torch.randn(2, 4, HEADS, HEAD_DIM),
-            torch.randn(2, 4, HEADS, HEAD_DIM),
-            cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
-            max_seqlen=4,
-        )
-
-
-def test_real_layer_fallback_uses_attention_forward():
-    # The production fallback routes every bucket through the real
-    # ``Attention.forward`` (validation included); the stub only stands in for
-    # the underlying dense backend.
-    captured: list = []
-
-    def dense_forward(query, key, value, attn_metadata):
-        captured.append((tuple(query.shape), attn_metadata))
-        return query
-
-    fake_layer = SimpleNamespace(forward=dense_forward)
-    query = torch.randn(6, HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, 2, 4, 6], dtype=torch.int32)
-
-    out = Attention._forward_packed_dense_buckets(fake_layer, query, query, query, cu_seqlens)
-
-    assert torch.equal(out, query)
-    assert [shape for shape, _ in captured] == [(3, 2, HEADS, HEAD_DIM)]

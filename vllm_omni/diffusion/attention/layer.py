@@ -499,51 +499,14 @@ class Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        """Run attention over a flat concatenation of N documents.
+        """Run attention over a flat ``[total_tokens, heads, head_dim]`` packing.
 
-        ``query``/``key``/``value`` hold the packed documents in
-        ``[total_tokens, heads, head_dim]`` (or the equivalent
-        ``[1, total_tokens, heads, head_dim]`` row). ``cu_seqlens`` are the
-        cumulative document boundaries; documents never attend across them.
-        The result keeps the input layout.
-
-        Backends advertising ``supports_multi_doc_packed_varlen`` for the
-        current effective quantization policy receive a single varlen
-        forward. Every other backend -- custom attention modules, or a
-        quantized policy whose kernel cannot consume cu_seqlens metadata --
-        is served by an equal-length bucketed dense fallback with the same
-        document-isolation semantics.
+        ``cu_seqlens`` are the cumulative document boundaries; documents never
+        attend across them. Backends advertising
+        ``supports_multi_doc_packed_varlen`` for the effective quantization
+        policy receive one varlen forward; every other backend is served by
+        mask-free equal-length dense buckets with the same isolation.
         """
-        if query.ndim == 4 and key.ndim == 4 and value.ndim == 4:
-            if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
-                raise ValueError(
-                    f"forward_packed expects a flat or [1, total_tokens, heads, head_dim] "
-                    f"packing, got batch size {query.shape[0]}"
-                )
-            out = self._forward_packed_flat(
-                query.flatten(0, 1),
-                key.flatten(0, 1),
-                value.flatten(0, 1),
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
-            return out.reshape(query.shape)
-        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
-            raise ValueError(
-                f"forward_packed expects flat [total_tokens, heads, head_dim] Q/K/V, "
-                f"got ndim={query.ndim}/{key.ndim}/{value.ndim}"
-            )
-        return self._forward_packed_flat(query, key, value, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-
-    def _forward_packed_flat(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ) -> torch.Tensor:
         if self.supports_multi_doc_packed_varlen(kv_cache_dtype=self._effective_kv_cache_dtype()):
             metadata = AttentionMetadata(
                 extra={
@@ -577,9 +540,6 @@ class Attention(nn.Module):
         though the underlying backend never sees cu_seqlens.
         """
         seqlens = cu_seqlens.diff().tolist()
-        nonempty = [length for length in seqlens if length > 0]
-        if not nonempty:
-            raise ValueError("cu_seqlens must describe at least one nonempty document")
         buckets: dict[int, list[int]] = {}
         for segment, length in enumerate(seqlens):
             if length > 0:

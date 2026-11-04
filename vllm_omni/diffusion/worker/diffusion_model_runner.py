@@ -377,11 +377,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
-        if bool(getattr(self.od_config, "enable_mixfusion", False)) and not getattr(
-            self.od_config, "step_execution", False
-        ):
-            logger.warning("enable_mixfusion=True requires step_execution=True; enabling step execution.")
-            self.od_config.step_execution = True
 
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
@@ -1309,31 +1304,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     ) -> None:
         """Step-after update: clear cached state for completed request."""
         if isinstance(input_batch.latents, list):
-            input_batch.latents = [state.latents for state in states if state.latents is not None]
-            self.input_batch = input_batch
-            scatter_latents(states, input_batch)
-            # Include per-request errors, whose cache entries were already removed.
-            # Releasing (rather than popping the cache directly) also calls
-            # pipeline.release_step_request() and invalidates input_batch when a
-            # retired request is still in it, matching the tensor branch below.
-            self.release_step_requests(
-                [
-                    state.request_id
-                    for state in states
-                    if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
-                ]
-            )
-            return
-
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
+            input_batch.latents = [state.latents for state in states]
         else:
-            input_batch.latents = gathered_latents.clone()
+            gathered_latents = torch.cat([state.latents for state in states], dim=0)
+            if (
+                input_batch.latents.size() == gathered_latents.size()
+                and input_batch.latents.dtype == gathered_latents.dtype
+                and input_batch.latents.device == gathered_latents.device
+            ):
+                input_batch.latents.copy_(gathered_latents)
+            else:
+                input_batch.latents = gathered_latents.clone()
 
         self.input_batch = input_batch
         scatter_latents(states, input_batch)

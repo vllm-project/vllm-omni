@@ -38,21 +38,12 @@ def _get_cfg_world_size_or_one() -> int:
 
 
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-    """Normalize prediction to tuple form."""
-    return pred if isinstance(pred, tuple) else (pred,)
+    """Normalize prediction to tuple form.
 
-
-def _as_sequence(
-    pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
-) -> list[torch.Tensor] | tuple[torch.Tensor, ...]:
-    """Normalize to a sequence, keeping list and tuple inputs unchanged.
-
-    ``_wrap`` predates packed batches: a list prediction (MixFusion's
-    per-request output) is a sequence of predictions, not one prediction, so
-    wrapping it into a 1-tuple would make the CFG formula apply to the list
-    container itself. Lists therefore pass through as lists.
+    A list (MixFusion's per-request packed output) passes through unchanged so
+    ``combine_cfg_noise`` can combine it request by request.
     """
-    return pred if isinstance(pred, (list, tuple)) else (pred,)
+    return pred if isinstance(pred, (tuple, list)) else (pred,)
 
 
 def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -60,21 +51,9 @@ def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor
     return pred[0] if len(pred) == 1 else pred
 
 
-def _slice_pred(pred, output_slice: int):
-    """Slice each prediction along dim 1, preserving the container type.
-
-    Accepts a tensor (sliced directly), a list (one slice per element, list
-    out) or a tuple (tuple out). Packed batches carry a list, so the CFG path
-    must keep it a list end to end: the runner indexes packed outputs by
-    request.
-    """
-    if isinstance(pred, list):
-        return [p[:, :output_slice] for p in pred]
-    if isinstance(pred, tuple):
-        return tuple(p[:, :output_slice] for p in pred)
-    if isinstance(pred, torch.Tensor):
-        return pred[:, :output_slice]
-    return pred
+def _slice_pred(pred: tuple[torch.Tensor, ...], output_slice: int) -> tuple[torch.Tensor, ...]:
+    """Slice each element along dim 1."""
+    return tuple(p[:, :output_slice] for p in pred)
 
 
 def _dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
@@ -196,11 +175,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     **({} if kwargs is None else {"kwargs": kwargs}),
                 )
             else:
-                # Sequential CFG: compute both positive and negative. Packed
-                # batches predict one tensor per request and return a list;
-                # keep the list so the combine stays per request.
-                positive_noise_pred = _as_sequence(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
-                negative_noise_pred = _as_sequence(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
+                # Sequential CFG: compute both positive and negative
+                positive_noise_pred = _wrap(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
+                negative_noise_pred = _wrap(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -214,14 +191,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     **({} if kwargs is None else {"kwargs": kwargs}),
                 )
         else:
-            # No CFG: only compute positive/conditional prediction. A packed
-            # list keeps its per-request shape through the optional slice.
+            # No CFG: only compute positive/conditional prediction
             pred = self._predict_noise_for_cfg_branch("positive", positive_kwargs)
             if output_slice is not None:
-                pred = _slice_pred(pred, output_slice)
-                if not isinstance(pred, list):
-                    # Keep the legacy 1-tuple collapse for dense predictions.
-                    pred = _unwrap(_wrap(pred))
+                pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
 
     def _predict_noise_for_cfg_branch(self, branch: str, predict_kwargs: dict[str, Any] | None) -> Any:
@@ -295,18 +268,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Combined noise prediction(s) — same type as inputs
         """
-        as_list = isinstance(positive_noise_pred, list) or isinstance(negative_noise_pred, list)
-        if as_list and not (isinstance(positive_noise_pred, list) and isinstance(negative_noise_pred, list)):
-            raise TypeError(
-                "CFG combine cannot mix a list prediction with a non-list one: "
-                f"got {type(positive_noise_pred).__name__} and {type(negative_noise_pred).__name__}."
-            )
-        pos_t = _as_sequence(positive_noise_pred)
-        neg_t = _as_sequence(negative_noise_pred)
-        if len(pos_t) != len(neg_t):
-            raise ValueError(
-                f"CFG combine expects one negative prediction per positive one: got {len(pos_t)} and {len(neg_t)}."
-            )
+        if isinstance(positive_noise_pred, list):
+            # Packed MixFusion batch: one prediction per request.
+            return [
+                self.combine_cfg_noise(p, n, true_cfg_scale, cfg_normalize, kwargs)
+                for p, n in zip(positive_noise_pred, negative_noise_pred, strict=True)
+            ]
+        pos_t = _wrap(positive_noise_pred)
+        neg_t = _wrap(negative_noise_pred)
 
         results = []
         for p, n in zip(pos_t, neg_t):
@@ -314,8 +283,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
             if cfg_normalize:
                 comb = self.cfg_normalize_function(p, comb)
             results.append(comb)
-        if as_list:
-            return results
         return _unwrap(tuple(results))
 
     # ── N-branch CFG interface (for 3+ branch models) ──
@@ -513,7 +480,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             instead of final noise tensors wrapped in a tuple.
         """
         result = self.transformer(*args, **kwargs)
-        return result if isinstance(result, IntermediateTensors) else result[0]
+        # A MixFusion packed forward returns one tensor per request as a list.
+        return result if isinstance(result, (IntermediateTensors, list)) else result[0]
 
     def diffuse(
         self,

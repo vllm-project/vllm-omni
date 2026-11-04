@@ -7,7 +7,11 @@ from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler, _apply_mixfusion_shape_relaxation
+from vllm_omni.diffusion.sched.base_scheduler import (
+    BaseScheduler,
+    _has_per_prompt_inputs,
+    _mixfusion_requested,
+)
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -109,22 +113,21 @@ class RequestScheduler(BaseScheduler):
         )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey | None:
-        """Build a request-batch compatibility key from sampling parameters."""
-        key_kwargs = build_request_batch_sampling_params_key(request)
-        values = {f.name: getattr(key_kwargs, f.name) for f in fields(key_kwargs)}
-        # Request-mode batches resolve one height/width for the whole batch from
-        # the first request's sampling params, so mixed-resolution requests
-        # must not share a batch; keep resolution in the key (see
-        # QwenImagePipeline.forward).
-        values = _apply_mixfusion_shape_relaxation(
+        """Build a request-batch compatibility key from sampling parameters.
+
+        Request-mode batches resolve one height/width for the whole batch from
+        the first request (see ``QwenImagePipeline.forward``), so resolution
+        stays in the key even for MixFusion requests; only per-prompt inputs
+        make a MixFusion request unbatchable.
+        """
+        requested = _mixfusion_requested(
             request,
-            values,
-            relax_shapes=False,
-            mixfusion_supported=self._mixfusion_supported,
+            server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
+            supported=self._mixfusion_supported,
         )
-        if values is None:
+        if requested and _has_per_prompt_inputs(request):
             return None
-        return RequestBatchSamplingParamsKey(**values)
+        return build_request_batch_sampling_params_key(request)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

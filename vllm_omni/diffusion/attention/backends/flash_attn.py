@@ -543,11 +543,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         Some diffusion transformers already maintain exact packed-document
         boundaries. Reusing those boundaries avoids rebuilding boolean masks
         and gathering/scattering Q/K/V in every attention layer.
-
-        Accepts either a flat packed ``[total_tokens, heads, head_dim]`` layout
-        (dynamic multi-document batching) or a single packed row
-        ``[1, total_tokens, heads, head_dim]``; both return the same layout as
-        their input.
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
@@ -556,29 +551,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         if flash_attn_varlen_func is None:
             raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
-        if query.ndim == 3 and key.ndim == 3 and value.ndim == 3:
-            q_flat, k_flat, v_flat = query, key, value
-            out_shape = None
-        elif (
-            query.ndim == 4
-            and key.ndim == 4
-            and value.ndim == 4
-            and query.shape[0] == 1
-            and key.shape[0] == 1
-            and value.shape[0] == 1
-        ):
-            q_flat, k_flat, v_flat = query.flatten(0, 1), key.flatten(0, 1), value.flatten(0, 1)
-            out_shape = query.shape
-        else:
-            raise ValueError(
-                "Packed variable-length attention expects flat [total_tokens, heads, head_dim] "
-                "or [1, total_tokens, heads, head_dim] Q/K/V."
-            )
+        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
+            raise ValueError("Packed variable-length attention currently requires batch size 1")
 
         out = flash_attn_varlen_func(
-            q=q_flat,
-            k=k_flat,
-            v=v_flat,
+            q=query.flatten(0, 1),
+            k=key.flatten(0, 1),
+            v=value.flatten(0, 1),
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
@@ -588,9 +567,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
         out = self._unwrap_flash_output(out)
-        if out_shape is not None:
-            out = out.reshape(out_shape)
-        return out
+        return out.reshape_as(query)
 
     def _forward_varlen_dense(
         self,
@@ -805,11 +782,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if metadata_plan.packing_mode is not PackingMode.NONE:
-            if query.ndim == 3 and attention_mask is not None:
-                raise ValueError(
-                    "Flat packed varlen attention cannot apply an attention mask; "
-                    "pass the document boundaries via cu_seqlens instead."
-                )
             self._warn_fa_deterministic_non_dense("packed-varlen")
             return self._forward_varlen_packed(
                 query,

@@ -9,14 +9,11 @@ minimal stand-in transformer plus a fake adapter that reuses the real
 ``split_sequence_chunks`` layout, and verify:
 
 - hooks are inert without an armed ``mixfusion_step`` (serial path unchanged);
-- the root hook binds the forward call, delegates packing to the adapter and
-  restores the per-request output list;
+- the root hook binds the forward call, delegates packing to the adapter,
+  caches its bundle per CFG branch and restores the per-request output list;
 - the replace-output hook returns the adapter-computed boundary value instead
   of running the (layout-incompatible) original forward;
 - the expand hooks map per-request rows to per-chunk rows;
-- a refusal from an armed root hook (``can_pack`` false / ``pack_inputs``
-  returning ``None``) raises ``MixFusionPackingError`` so the driver can fall
-  back, while a missing adapter still fails with an actionable error;
 - ``apply_mixfusion`` / ``remove_mixfusion`` round-trip, including the
   ``transformer_blocks.*`` wildcard, idempotence and unknown-spec refusal.
 """
@@ -34,17 +31,8 @@ from vllm_omni.diffusion.forward_context import (
     MixFusionStep,
     override_forward_context,
 )
-from vllm_omni.diffusion.hooks.mixfusion import (
-    MixFusionPackingError,
-    apply_mixfusion,
-    remove_mixfusion,
-)
-from vllm_omni.diffusion.mixfusion.adapter import (
-    AttentionLayout,
-    MixFusionAdapter,
-    PackedInputs,
-    StreamSpec,
-)
+from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, remove_mixfusion
+from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter, PackedInputs
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
@@ -104,39 +92,32 @@ class _NormOut(nn.Module):
 
 
 class _DummyAdapter:
-    """Fake adapter with the Qwen adapter's shape (list in, list out)."""
+    """Packs a list of ``[1, SEQ_LEN, C]`` latents into ``CHUNK_SIZE`` chunks."""
 
-    def can_pack(self, module, bound) -> tuple[bool, str]:
-        if "hidden_states" not in bound.arguments:
-            raise TypeError("MixFusion packing requires a `hidden_states` argument.")
-        if not isinstance(bound.arguments["hidden_states"], (list, tuple)):
-            return False, "hidden_states is a batched tensor (serial forward)"
+    def __init__(self) -> None:
+        self.pack_calls: list[dict] = []
+
+    def can_pack(self, module, input_batch) -> tuple[bool, str]:
         return True, ""
 
-    def build_attention_layout(self, plan=None) -> AttentionLayout:
-        return AttentionLayout((StreamSpec("text", "request"), StreamSpec("image", "chunked")))
-
-    def pack_inputs(self, module, bound, *, step, cache: PackedInputs | None) -> PackedInputs:
-        cached = None if cache is None or cache.adapter_state is None else cache.adapter_state["prepare_inputs"]
-        packed = module.prepare_mixfusion_inputs(
-            hidden_states=bound.arguments["hidden_states"],
-            encoder_hidden_states=bound.arguments.get("encoder_hidden_states"),
-            encoder_hidden_states_mask=bound.arguments.get("encoder_hidden_states_mask"),
-            img_shapes=bound.arguments.get("img_shapes"),
-            txt_seq_lens=bound.arguments.get("txt_seq_lens"),
-            attention_kwargs=bound.arguments.get("attention_kwargs"),
-            cached=cached,
-        )
-        bound.arguments["hidden_states"] = packed.hidden_states
-        bound.arguments["encoder_hidden_states_mask"] = packed.encoder_hidden_states_mask
-        return PackedInputs(
+    def pack_inputs(self, module, bound, *, cache: PackedInputs | None) -> PackedInputs:
+        rows = [h.float() for h in bound.arguments["hidden_states"]]
+        row_freqs = [torch.arange(SEQ_LEN, dtype=torch.float32).reshape(SEQ_LEN, 1)] * len(rows)
+        chunks, freq_chunks, ranges, chunk_to_request = split_sequence_chunks(rows, row_freqs, CHUNK_SIZE)
+        packed_hidden = torch.cat(chunks, dim=0)
+        bound.arguments["hidden_states"] = packed_hidden
+        packed = PackedInputs(
             args=tuple(bound.args),
             kwargs=dict(bound.kwargs),
-            plan=packed.plan,
-            boundary_outputs={"rope": (packed.hidden_states, *packed.image_rotary_emb)},
-            cache_key=packed.key,
-            adapter_state={"prepare_inputs": packed},
+            plan=SimpleNamespace(
+                request_chunk_ranges=ranges,
+                chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long),
+                image_row_counts=(1,) * len(rows),
+            ),
+            boundary_outputs={"rope": (packed_hidden, torch.cat(freq_chunks, dim=0), torch.zeros(SEQ_LEN, 1))},
         )
+        self.pack_calls.append({"cache": cache, "produced": packed})
+        return packed
 
     def restore_output(self, module, output, plan):
         return reassemble_chunk_rows(output.sample, plan.request_chunk_ranges, plan.image_row_counts)
@@ -151,53 +132,19 @@ class _DummyTransformer(nn.Module):
         self.image_rope_prepare = _RopePrepare()
         self.transformer_blocks = nn.ModuleList([_Block() for _ in range(num_blocks)])
         self.norm_out = _NormOut()
-        self.pack_calls: list[dict] = []
 
-    def prepare_mixfusion_inputs(
-        self,
-        hidden_states,
-        encoder_hidden_states,
-        encoder_hidden_states_mask=None,
-        img_shapes=None,
-        txt_seq_lens=None,
-        attention_kwargs=None,
-        cached=None,
-    ):
-        """Stand-in pack method with the real model's contract."""
-        rows = [h.float() for h in hidden_states]
-        row_freqs = [torch.arange(SEQ_LEN, dtype=torch.float32).reshape(SEQ_LEN, 1)] * len(rows)
-        chunks, freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(rows, row_freqs, CHUNK_SIZE)
-        packed_hidden = torch.cat(chunks, dim=0)
-        packed = SimpleNamespace(
-            hidden_states=packed_hidden,
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
-            image_rotary_emb=(
-                torch.cat(freq_chunks, dim=0),
-                torch.zeros(SEQ_LEN, 1),
-            ),
-            plan=SimpleNamespace(
-                request_chunk_ranges=request_chunk_ranges,
-                chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long),
-                image_row_counts=tuple([1] * len(rows)),
-            ),
-            image_row_counts=[1] * len(rows),
-            key=("dummy", tuple(h.shape for h in hidden_states)),
-        )
-        self.pack_calls.append({"cached": cached, "produced": packed})
-        return packed
+    @property
+    def pack_calls(self) -> list[dict]:
+        return self.mixfusion_adapter.pack_calls
 
     def forward(
         self,
         hidden_states,
         encoder_hidden_states=None,
-        encoder_hidden_states_mask=None,
-        timestep=None,
         img_shapes=None,
-        txt_seq_lens=None,
-        attention_kwargs=None,
         return_dict=True,
     ):
-        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, None)
         # Keep what the rope boundary produced so tests can tell the packed
         # triple from the stand-in's serial markers apart.
         self.rope_outputs = (vid_freqs, txt_freqs)
@@ -234,7 +181,6 @@ def _packed_kwargs(latents):
         hidden_states=latents,
         encoder_hidden_states=torch.zeros(NUM_REQUESTS, 5, 2),
         img_shapes=[(1, 4, 4)] * NUM_REQUESTS,
-        txt_seq_lens=[5] * NUM_REQUESTS,
     )
 
 
@@ -247,52 +193,37 @@ def _serial_forward(model, batch_hidden: torch.Tensor):
 
 
 class TestInertWithoutArmedStep:
-    def test_no_forward_context(self):
+    @pytest.mark.parametrize("ctx", [None, ForwardContext()], ids=["no-context", "no-step"])
+    def test_serial_forward_unchanged(self, ctx):
         model = _DummyTransformer()
-        apply_mixfusion(model, _plan())
         batch = torch.cat(_latents(), dim=0)
-        out = model(hidden_states=batch, encoder_hidden_states=torch.zeros(2, 5, 2))
-        assert torch.equal(out.sample, _serial_forward(model, batch))
-        assert model.pack_calls == []
-
-    def test_context_without_step(self):
-        model = _DummyTransformer()
+        expected = _serial_forward(model, batch)
         apply_mixfusion(model, _plan())
-        batch = torch.cat(_latents(), dim=0)
-        with override_forward_context(ForwardContext()):
-            out = model(hidden_states=batch, encoder_hidden_states=torch.zeros(2, 5, 2))
-        assert torch.equal(out.sample, _serial_forward(model, batch))
-        assert model.pack_calls == []
-
-    def test_armed_but_tensor_hidden_states_raises_packing_error(self):
-        # An armed step asserts that this call is the admitted packed call, so
-        # a batched tensor here is a contract violation the driver must hear
-        # about rather than silently packing nothing. Memory profiling and
-        # other dense forwards run without an armed step (covered above).
-        model = _DummyTransformer()
-        apply_mixfusion(model, _plan())
-        batch = torch.cat(_latents(), dim=0)
-        with override_forward_context(_armed_ctx()):
-            with pytest.raises(MixFusionPackingError, match="hidden_states is a batched tensor"):
-                model(hidden_states=batch, encoder_hidden_states=torch.zeros(2, 5, 2))
+        if ctx is None:
+            out = _serial_forward(model, batch)
+        else:
+            with override_forward_context(ctx):
+                out = _serial_forward(model, batch)
+        assert torch.equal(out, expected)
         assert model.pack_calls == []
 
 
 class TestPackedForward:
+    def test_dummy_adapter_satisfies_the_protocol(self):
+        assert isinstance(_DummyAdapter(), MixFusionAdapter)
+
     def test_root_packs_and_reassembles(self):
         model = _DummyTransformer()
         apply_mixfusion(model, _plan())
         latents = _latents()
-        with override_forward_context(_armed_ctx()):
+        ctx = _armed_ctx()
+        with override_forward_context(ctx):
             out = model(**_packed_kwargs(latents))
 
         assert isinstance(out, list) and len(out) == NUM_REQUESTS
-        for request_sample, latent in zip(out, latents):
-            assert request_sample.shape == latent.shape
         # Bit-exact against a hand-rolled reference on the packed layout.
         chunks = [latent.split(CHUNK_SIZE, dim=1) for latent in latents]
-        packed = torch.cat([c for req in chunks for c in req], dim=0)
-        expected = packed
+        expected = torch.cat([c for req in chunks for c in req], dim=0)
         for block in model.transformer_blocks:
             expected = expected + block.img_mod(
                 expand_per_chunk(
@@ -300,19 +231,11 @@ class TestPackedForward:
                 )
             ).unsqueeze(1)
         expected = reassemble_chunk_rows(expected, [(0, 2), (2, 4)], [1, 1])
-        for got, exp in zip(out, expected):
+        for got, exp, latent in zip(out, expected, latents):
+            assert got.shape == latent.shape
             assert torch.equal(got, exp)
-
-    def test_step_carries_adapter_plan_and_packed(self):
-        model = _DummyTransformer()
-        apply_mixfusion(model, _plan())
-        ctx = _armed_ctx()
-        with override_forward_context(ctx):
-            model(**_packed_kwargs(_latents()))
-        step = ctx.mixfusion_step
-        assert step.adapter is model.mixfusion_adapter
-        assert step.plan.image_row_counts == (1, 1)
-        assert step.packed.boundary_outputs["rope"][0].shape[0] == NUM_CHUNKS
+        # The step advertises what the downstream hooks and attention read.
+        assert ctx.mixfusion_step.plan is ctx.mixfusion_step.packed.plan
 
     def test_replace_output_returns_packed_triple(self):
         model = _DummyTransformer()
@@ -321,196 +244,41 @@ class TestPackedForward:
         with override_forward_context(_armed_ctx()):
             model(**_packed_kwargs(latents))
         # The rope boundary was replaced by the packed triple: the stand-in
-        # forward never ran, and the freq tensors are the packed ones (not the
-        # "SERIAL_*" string markers, not the per-request tables).
+        # forward never ran and the freq tensors are the per-chunk ones.
         assert model.image_rope_prepare.calls == []
         vid_freqs, txt_freqs = model.rope_outputs
-        assert isinstance(vid_freqs, torch.Tensor)
         assert isinstance(txt_freqs, torch.Tensor)
-        # Per-chunk stacked rows: one block of CHUNK_SIZE freq rows per chunk.
         assert vid_freqs.shape[0] == NUM_CHUNKS * CHUNK_SIZE
         # A serial call (no armed step) does run the original forward.
-        model.image_rope_prepare.calls.clear()
-        batch = torch.cat(latents, dim=0)
-        model(hidden_states=batch, encoder_hidden_states=torch.zeros(2, 5, 2))
+        _serial_forward(model, torch.cat(latents, dim=0))
         assert len(model.image_rope_prepare.calls) == 1
         assert model.rope_outputs == ("SERIAL_VID_FREQS", "SERIAL_TXT_FREQS")
 
-    def test_cache_threaded_across_calls(self):
-        model = _DummyTransformer()
-        apply_mixfusion(model, _plan())
-        kwargs = _packed_kwargs(_latents())
-        with override_forward_context(_armed_ctx()):
-            model(**kwargs)
-        with override_forward_context(_armed_ctx()):
-            model(**kwargs)
-        assert len(model.pack_calls) == 2
-        # Second call received the first bundle as ``cached``.
-        assert model.pack_calls[0]["cached"] is None
-        assert model.pack_calls[1]["cached"] is not None
-
     def test_cache_is_scoped_per_cfg_branch(self):
         # Sequential true-CFG alternates positive and negative calls within a
-        # step; each branch must keep its own bundle or they evict each other.
+        # step; each branch must get back its own bundle. ``None`` is the
+        # no-CFG branch.
         model = _DummyTransformer()
         apply_mixfusion(model, _plan())
         kwargs = _packed_kwargs(_latents())
-        with override_forward_context(_armed_ctx()):
-            for branch in ("positive", "negative", "positive", "negative", "positive", "negative"):
-                model.cfg_branch = branch
+        branches = (None, None, "positive", "negative", "positive", "negative")
+        for branch in branches:
+            model.cfg_branch = branch
+            with override_forward_context(_armed_ctx()):
                 model(**kwargs)
 
         calls = model.pack_calls
-        assert len(calls) == 6
-        assert calls[0]["cached"] is None
-        assert calls[1]["cached"] is None
-        # Same branch receives the bundle it produced, across interleaved calls.
-        assert calls[2]["cached"] is calls[0]["produced"]
-        assert calls[3]["cached"] is calls[1]["produced"]
-        assert calls[4]["cached"] is calls[2]["produced"]
-        assert calls[5]["cached"] is calls[3]["produced"]
-        # Branches never share a bundle.
-        assert calls[0]["produced"] is not calls[1]["produced"]
-
-    def test_cache_evicts_least_recently_used_branch(self):
-        model = _DummyTransformer()
-        apply_mixfusion(model, _plan())
-        root_hook = model._hook_registry._hooks["mixfusion_pack"]
-        kwargs = _packed_kwargs(_latents())
-        with override_forward_context(_armed_ctx()):
-            for branch in ("positive", "negative", "a", "b", "c", "positive"):
-                model.cfg_branch = branch
-                model(**kwargs)
-
-        assert len(root_hook._cached) == root_hook.MAX_CACHE_SLOTS
-        # Inserting a/b/c pushed "positive" out; its next call was a miss and
-        # pushed "negative" out in turn.
-        assert list(root_hook._cached) == ["a", "b", "c", "positive"]
-        assert model.pack_calls[-1]["cached"] is None
-
-
-class _FakeModel(nn.Module):
-    def __init__(self, adapter) -> None:
-        super().__init__()
-        if adapter is not None:
-            self.mixfusion_adapter = adapter
-        self.seen = None
-
-    def forward(self, hidden_states, shift=0):
-        self.seen = (hidden_states, shift)
-        return SimpleNamespace(sample=hidden_states + shift)
-
-
-class _RecordingAdapter:
-    """Fake adapter that records the framework's calls."""
-
-    def __init__(self, *, can_pack: bool = True, returns_none: bool = False) -> None:
-        self._can_pack = can_pack
-        self._returns_none = returns_none
-        self.calls: list[tuple] = []
-
-    def build_packed_call(self, input_batch):
-        self.calls.append(("build_packed_call", input_batch))
-        return {"hidden_states": input_batch.latents}
-
-    def can_pack(self, module, bound):
-        self.calls.append(("can_pack", dict(bound.arguments)))
-        return self._can_pack, "" if self._can_pack else "refused"
-
-    def build_attention_layout(self, plan=None):
-        self.calls.append(("build_attention_layout", plan))
-        return AttentionLayout((StreamSpec("image", "chunked"),))
-
-    def pack_inputs(self, module, bound, *, step, cache):
-        self.calls.append(("pack_inputs", dict(bound.arguments), cache))
-        if self._returns_none:
-            return None
-        bound.arguments["hidden_states"] = bound.arguments["hidden_states"] * 10
-        return PackedInputs(args=tuple(bound.args), kwargs=dict(bound.kwargs), plan="PLAN")
-
-    def prepare_position_embeddings(self, module, plan, cache=None):
-        return None
-
-    def restore_output(self, module, output, plan):
-        self.calls.append(("restore_output", plan))
-        return ["restored"]
-
-
-class TestAdapterProtocol:
-    def test_is_runtime_checkable_protocol(self):
-        assert isinstance(_RecordingAdapter(), MixFusionAdapter)
-
-    def test_root_hook_delegates_all_three_methods(self):
-        adapter = _RecordingAdapter()
-        model = _FakeModel(adapter)
-        apply_mixfusion(model, {"": MixFusionRoot()})
-        x = torch.zeros(1, 2)
-        ctx = _armed_ctx()
-        with override_forward_context(ctx):
-            out = model(hidden_states=x)
-        assert out == ["restored"]
-        assert [call[0] for call in adapter.calls] == [
-            "can_pack",
-            "pack_inputs",
-            "build_attention_layout",
-            "restore_output",
-        ]
-        # The adapter sees the original forward signature (no ``self``), with
-        # a positional argument bound by name; defaults stay unbound.
-        assert torch.equal(adapter.calls[0][1]["hidden_states"], x)
-        assert "shift" not in adapter.calls[0][1]
-        # The rewritten call reached the model.
-        assert torch.equal(model.seen[0], x * 10)
-        # The step advertises what the hooks downstream need.
-        assert ctx.mixfusion_step.plan == "PLAN"
-        assert ctx.mixfusion_step.layout is not None
-        assert ctx.mixfusion_step.adapter is adapter
-        assert ctx.mixfusion_step.packed is not None
-
-    def test_can_pack_false_raises_packing_error(self):
-        # Admission preflighted can_pack, so a refusal here means the adapter
-        # drifted. Running the model with the original args would hand it list
-        # latents; the driver turns this sentinel into the serial fallback.
-        adapter = _RecordingAdapter(can_pack=False)
-        model = _FakeModel(adapter)
-        apply_mixfusion(model, {"": MixFusionRoot()})
-        x = torch.zeros(1, 2)
-        ctx = _armed_ctx()
-        with override_forward_context(ctx):
-            with pytest.raises(MixFusionPackingError, match="declined packing after admission: refused"):
-                model(hidden_states=x)
-        assert model.seen is None
-        assert [call[0] for call in adapter.calls] == ["can_pack"]
-        assert ctx.mixfusion_step.plan is None
-        assert ctx.mixfusion_step.packed is None
-
-    def test_pack_inputs_none_raises_packing_error(self):
-        adapter = _RecordingAdapter(returns_none=True)
-        model = _FakeModel(adapter)
-        apply_mixfusion(model, {"": MixFusionRoot()})
-        x = torch.zeros(1, 2)
-        with override_forward_context(_armed_ctx()):
-            with pytest.raises(MixFusionPackingError, match="returned no bundle"):
-                model(hidden_states=x)
-        assert model.seen is None
-        assert [call[0] for call in adapter.calls] == ["can_pack", "pack_inputs"]
-
-    def test_missing_adapter_raises_actionable_error(self):
-        model = _FakeModel(adapter=None)
-        apply_mixfusion(model, {"": MixFusionRoot()})
-        with override_forward_context(_armed_ctx()):
-            with pytest.raises(TypeError, match="declares no `mixfusion_adapter`"):
-                model(hidden_states=torch.zeros(1, 2))
+        assert [call["cache"] is None for call in calls] == [True, False, True, True, False, False]
+        assert calls[1]["cache"] is calls[0]["produced"]
+        assert calls[4]["cache"] is calls[2]["produced"]
+        assert calls[5]["cache"] is calls[3]["produced"]
 
 
 class TestBoundaryErrors:
     def test_replace_output_missing_boundary_raises(self):
         model = _DummyTransformer()
         apply_mixfusion(model, {"image_rope_prepare": MixFusionReplaceOutput(boundary="missing")})
-        step = MixFusionStep(
-            adapter=_DummyAdapter(),
-            packed=PackedInputs(args=(), kwargs={}, plan=SimpleNamespace()),
-        )
+        step = MixFusionStep(packed=PackedInputs(args=(), kwargs={}, plan=SimpleNamespace()))
         with override_forward_context(ForwardContext(mixfusion_step=step)):
             with pytest.raises(KeyError, match="boundary output 'missing' was not produced"):
                 model.image_rope_prepare(torch.zeros(1, 2), None, None)

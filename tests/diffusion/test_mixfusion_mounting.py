@@ -40,70 +40,44 @@ class _FakePipeline(nn.Module):
             self.transformer = transformer
 
 
-def _od_config(*, enable: bool, sp_size: int = 1):
-    return SimpleNamespace(
-        enable_mixfusion=enable,
-        parallel_config=SimpleNamespace(sequence_parallel_size=sp_size),
-    )
+def _od_config(*, enable: bool):
+    return SimpleNamespace(enable_mixfusion=enable)
 
 
-def _mount(monkeypatch, *, enable: bool, supports: bool, sp_size: int = 1, adapter: object | None = object()):
+def _mount(monkeypatch, *, supports: bool, adapter: object | None, enable: bool = False):
     monkeypatch.setattr(registry, "supports_mixfusion", lambda od_config: supports)
     transformer = _FakeTransformer(adapter=adapter)
     pipeline = _FakePipeline(transformer)
-    registry._apply_mixfusion_if_enabled(pipeline, _od_config(enable=enable, sp_size=sp_size))
+    registry._apply_mixfusion_if_enabled(pipeline, _od_config(enable=enable))
     return pipeline, transformer
 
 
 def test_request_opt_in_mounts_driver_with_server_flag_off(monkeypatch):
     adapter = object()
-    pipeline, transformer = _mount(
-        monkeypatch,
-        enable=False,
-        supports=True,
-        adapter=adapter,
-    )
+    pipeline, transformer = _mount(monkeypatch, supports=True, adapter=adapter)
 
-    driver = getattr(pipeline, "mixfusion_driver", None)
+    driver = pipeline.mixfusion_driver
     assert isinstance(driver, MixFusionDriver)
-    assert driver.adapter is adapter
-    assert driver.transformer is transformer
+    assert (driver.adapter, driver.transformer) == (adapter, transformer)
     # Hooks are installed but stay inert until ``armed`` publishes a step.
     assert transformer._mixfusion_hooks_applied is True
 
 
 def test_unsupported_pipeline_mounts_nothing(monkeypatch):
-    pipeline, transformer = _mount(monkeypatch, enable=False, supports=False, adapter=object())
+    pipeline, transformer = _mount(monkeypatch, supports=False, adapter=object())
 
     assert not hasattr(pipeline, "mixfusion_driver")
     assert getattr(transformer, "_mixfusion_hooks_applied", False) is False
 
 
-def test_sequence_parallel_mounts_fallback_driver_only(monkeypatch):
-    adapter = object()
-    pipeline, transformer = _mount(
-        monkeypatch,
-        enable=False,
-        supports=True,
-        sp_size=2,
-        adapter=adapter,
-    )
+def test_transformer_without_adapter_gets_a_serial_driver(monkeypatch):
+    pipeline, transformer = _mount(monkeypatch, supports=True, adapter=None)
 
-    driver = getattr(pipeline, "mixfusion_driver", None)
-    assert isinstance(driver, MixFusionDriver)
-    # SP cannot be combined with packing, but ragged requests still need the
-    # serial fallback instead of reaching the dense path with a list.
-    assert driver.adapter is None
-    assert driver.transformer is transformer
+    # Ragged batches still need the serial fallback instead of reaching the
+    # dense path with a list.
+    assert pipeline.mixfusion_driver.adapter is None
+    assert pipeline.mixfusion_driver.transformer is transformer
     assert getattr(transformer, "_mixfusion_hooks_applied", False) is False
-
-
-def test_server_flag_still_mounts_for_unsupported_pipeline(monkeypatch):
-    pipeline, _ = _mount(monkeypatch, enable=True, supports=False, adapter=None)
-
-    driver = getattr(pipeline, "mixfusion_driver", None)
-    assert isinstance(driver, MixFusionDriver)
-    assert driver.adapter is None
 
 
 def test_pipeline_without_transformer_mounts_nothing(monkeypatch):

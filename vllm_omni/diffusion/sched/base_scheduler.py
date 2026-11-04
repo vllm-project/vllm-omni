@@ -54,35 +54,38 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
 }
 
 
+def _mixfusion_requested(request: OmniDiffusionRequest, *, server_default: bool, supported: bool) -> bool:
+    """Whether ``request`` opts into MixFusion on a capable pipeline.
+
+    On a pipeline without the capability a request-level flag is a no-op, so
+    resolution keeps splitting the key as if MixFusion were off. (A
+    server-level flag on such a pipeline is rejected at engine startup.)
+    """
+    extra_args = request.sampling_params.extra_args or {}
+    return supported and bool(extra_args.get("enable_mixfusion", server_default))
+
+
+def _has_per_prompt_inputs(request: OmniDiffusionRequest) -> bool:
+    prompt = request.prompt
+    return isinstance(prompt, dict) and bool(prompt.get("additional_information"))
+
+
 def _apply_mixfusion_shape_relaxation(
     request: OmniDiffusionRequest,
     values: dict,
     *,
-    relax_shapes: bool = True,
-    server_default: bool = False,
-    mixfusion_supported: bool = True,
+    server_default: bool,
+    supported: bool,
 ) -> dict | None:
-    sampling = request.sampling_params
-    extra_args = getattr(sampling, "extra_args", {}) or {}
-    # A request-level enable_mixfusion flag on a pipeline without the
-    # capability degrades to a no-op: resolution stays in the batch key, so
-    # requests simply group by shape as if MixFusion were off. (Server-level
-    # enable_mixfusion on such a pipeline is rejected at engine startup.)
-    if not mixfusion_supported or not bool(extra_args.get("enable_mixfusion", server_default)):
-        return values
+    """Drop resolution from a step-batch key when the request opts in.
 
-    prompt = request.prompt
-    if isinstance(prompt, dict) and prompt.get("additional_information"):
+    Step batches resolve shapes per request (packed or serial ragged). A
+    prompt with per-request ``additional_information`` cannot share a key.
+    """
+    if not _mixfusion_requested(request, server_default=server_default, supported=supported):
+        return values
+    if _has_per_prompt_inputs(request):
         return None
-
-    if not relax_shapes:
-        # Only the step-execution batch handles mixed resolutions correctly
-        # (packed mixfusion and serial-ragged both resolve shapes per request).
-        # Request-mode batches run one full forward per batch whose height/width
-        # is resolved from the first request's sampling params, so resolution
-        # must keep splitting the key until that path supports mixed shapes.
-        return values
-
     values["height"] = None
     values["width"] = None
     values["resolution"] = None
@@ -795,7 +798,7 @@ class BaseScheduler(ABC):
             request,
             key_kwargs,
             server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
-            mixfusion_supported=self._mixfusion_supported,
+            supported=self._mixfusion_supported,
         )
         if key_kwargs is None:
             return None

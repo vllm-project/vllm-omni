@@ -1399,39 +1399,43 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
         hidden_states_mask = None  # default
-        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
-            # SP-only bookkeeping. ``get_forward_context`` raises when no
-            # context is set, and the packed MixFusion path never runs with SP
-            # enabled, so fetch the context only under SP.
-            ctx = get_forward_context()
-            if self.parallel_config.mask_sp_padding and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                # Create mask for the full (padded) sequence
-                # valid positions = True, padding positions = False
-                batch_size = hidden_states.shape[0]
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    batch_size,
-                    padded_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-                if hidden_states_mask.all():
-                    hidden_states_mask = None
-            elif (
-                not self.parallel_config.mask_sp_padding
-                and ctx.sp_original_seq_len is not None
-                and ctx.sp_padding_size > 0
-            ):
-                logger.warning_once(
-                    "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
-                    "Padding tokens are not masked from attention (mask_sp_padding=False), "
-                    "which avoids the varlen attention path but may produce minor numerical differences. "
-                    "Set parallel_config.mask_sp_padding=True to restore strict masking.",
-                    ctx.sp_padding_size,
-                    ctx.sp_original_seq_len,
-                    self.parallel_config.sequence_parallel_size,
-                )
+        ctx = get_forward_context()
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            # Create mask for the full (padded) sequence
+            # valid positions = True, padding positions = False
+            batch_size = hidden_states.shape[0]
+            padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            hidden_states_mask = torch.ones(
+                batch_size,
+                padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+        elif (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
 
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None

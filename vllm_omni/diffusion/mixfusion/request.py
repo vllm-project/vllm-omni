@@ -28,22 +28,13 @@ def mixfusion_request_extras(sampling: Any, od_config: Any, *, supported: bool) 
     """
     if not supported:
         return {}
-    extra_args = getattr(sampling, "extra_args", {}) or {}
-    if not bool(
-        extra_args.get(
-            "enable_mixfusion",
-            bool(getattr(od_config, "enable_mixfusion", False)),
-        )
-    ):
+    extra_args = sampling.extra_args or {}
+    if not extra_args.get("enable_mixfusion", getattr(od_config, "enable_mixfusion", False)):
         return {}
     return {
         "use_ragged_latents": True,
         "mixfusion_min_chunk_tokens": extra_args.get(
-            "mixfusion_min_chunk_tokens",
-            getattr(od_config, "mixfusion_min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
+            "mixfusion_min_chunk_tokens", od_config.mixfusion_min_chunk_tokens
         ),
-        "mixfusion_max_chunks": extra_args.get(
-            "mixfusion_max_chunks",
-            getattr(od_config, "mixfusion_max_chunks", DEFAULT_MAX_CHUNKS),
-        ),
+        "mixfusion_max_chunks": extra_args.get("mixfusion_max_chunks", od_config.mixfusion_max_chunks),
     }

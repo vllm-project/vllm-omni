@@ -265,7 +265,7 @@ model-specific one:
 |---|---|---|
 | Driver | `vllm_omni/diffusion/mixfusion/driver.py` (`MixFusionDriver`) | Step dispatch, admission, chunk-policy aggregation, arming/restoring `MixFusionStep`, serial-ragged fallback |
 | Hooks + execution plan | `vllm_omni/diffusion/hooks/mixfusion.py`, `mixfusion/plan.py`, `mixfusion/execution_plan.py` | Applying `_mixfusion_plan` at module boundaries, the chunk-stacked layout (`PackedExecutionPlan`, gather/scatter, chunk split/reassembly), carrying opaque `PackedInputs` payloads |
-| Adapter | `vllm_omni/diffusion/models/<model>/mixfusion_adapter.py` | The model's forward signature and packed-call shape, attention-stream declaration, packing/preparation and output restoration |
+| Adapter | `vllm_omni/diffusion/models/<model>/mixfusion_adapter.py` | Model-specific admission limits, attention-stream declaration, packing/preparation and output restoration |
 
 Framework responsibilities:
 
@@ -282,18 +282,18 @@ Framework responsibilities:
 
 Model responsibilities:
 
-- Implement the `MixFusionAdapter` protocol: `build_packed_call`,
-  `can_pack`, `build_attention_layout`, `pack_inputs`,
-  `prepare_position_embeddings`, `restore_output`. The protocol is
-  structural (`runtime_checkable`): an adapter only needs the methods, not
-  a base class.
+- Implement the `MixFusionAdapter` protocol: `can_pack` (model-specific
+  admission limits, asked once per step by the driver), `pack_inputs` and
+  `restore_output`. The protocol is structural (`runtime_checkable`): an
+  adapter only needs the methods, not a base class.
 - Declare `_mixfusion_plan` on the transformer and register the adapter as
   `mixfusion_adapter`.
-- Prepare the step-invariant position embeddings in
-  `prepare_position_embeddings` and call it from `pack_inputs`; the
-  framework never interprets that payload.
+- Build the `AttentionLayout` and the `PackedExecutionPlan` (which carries
+  it) inside `pack_inputs`; step-invariant work is reused through the
+  `cache` bundle the root hook hands back per CFG branch.
 - Keep mixed-resolution attention in the model's attention leaf, which reads
-  the stream layout from the armed step instead of a forward argument.
+  the plan (and its stream layout) from the armed step instead of a forward
+  argument.
 
 `QwenImageMixFusionAdapter` is the reference implementation. Porting a model
 therefore means adding `models/<model>/mixfusion_adapter.py`, registering the
@@ -341,8 +341,8 @@ _mixfusion_plan = {
   step instead of a forward argument.
 - Paths the packed layout cannot express are refused by the driver's
   admission guards (above); model-specific refusals live in the adapter.
-  For Qwen-Image, `can_pack` keeps a batched tensor on the serial forward,
-  and `prepare_inputs` raises on `zero_cond_t` (editing). The fused joint
+  For Qwen-Image, `can_pack` refuses `zero_cond_t` (editing) and batches
+  without `img_shapes` / `txt_seq_lens`. The fused joint
   QK-norm-RoPE table is disabled while a step is armed, because text
   (per-request) and image rows (per-chunk) cannot share one table.
 

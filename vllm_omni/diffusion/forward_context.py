@@ -24,31 +24,19 @@ if TYPE_CHECKING:
 
 @dataclass
 class MixFusionStep:
-    """Pipeline-armed record of one packed MixFusion denoise step.
+    """Record of one packed MixFusion denoise step.
 
-    The driver sets the activation policy (chunk-size bounds from the
-    per-request extras) and optionally the model adapter; the MixFusion root
-    hook fills ``adapter`` / ``layout`` / ``plan`` / ``packed`` while the
-    forward runs. A new ForwardContext is created per ``execute_model`` call,
-    and the pipeline restores ``mixfusion_step`` in a ``finally``, so nothing
-    here leaks across steps.
+    The MixFusionDriver arms an empty step around the packed forward and
+    restores the previous one afterwards; the root hook fills ``plan`` and
+    ``packed`` for the boundary hooks and the packed attention to read.
 
-    All tensor/plan fields are deliberately opaque (``Any``): the common
-    context module must not import the MixFusion layout or adapter types.
+    Fields are opaque (``Any``): the common context module must not import
+    the MixFusion layout or adapter types.
     """
 
-    # Packing policy, read by the driver (per-request extras defaults).
-    min_chunk_tokens: int = 256
-    max_chunks: int = 128
-    # Model-side adapter; the root hook falls back to ``module.mixfusion_adapter``
-    # when the driver does not set one here.
-    adapter: Any = None
-    # Attention stream layout (opaque; set by the adapter).
-    layout: Any = None
-    # Filled by the root hook while the packed forward runs:
+    # ``PackedExecutionPlan`` of the running call (carries its AttentionLayout).
     plan: Any = None
-    # ``PackedInputs`` from the adapter: rewritten call, boundary outputs and
-    # its private state. Opaque to the framework.
+    # ``PackedInputs`` from the adapter: rewritten call and boundary outputs.
     packed: Any = None
 
 

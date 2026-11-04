@@ -752,114 +752,52 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
     serial forward unchanged when MixFusion is not requested.
 
     It also mounts the model-agnostic
-    :class:`~vllm_omni.diffusion.mixfusion.driver.MixFusionDriver` on the
-    pipeline. The driver is the entry point for ragged batches even when no
-    plan or adapter exists: its serial fallback still has to run, because the
-    dense path cannot accept list latents.
-
-    The server-level ``enable_mixfusion`` flag only supplies the request-level
-    default. A request may opt in by itself whenever the pipeline declares
-    ``supports_mixfusion``, which makes the scheduler relax the shape key and
-    turns ``InputBatch.latents`` into a list. The driver (and the inert hooks)
-    therefore have to be mounted for every capable pipeline, regardless of the
-    server flag.
+    :class:`~vllm_omni.diffusion.mixfusion.driver.MixFusionDriver`, the entry
+    point for ragged batches even without a plan: its serial fallback has to
+    run because the dense path cannot accept list latents. A request may opt in
+    on any ``supports_mixfusion`` pipeline (the server flag only sets the
+    default), so the driver is mounted for every capable pipeline.
 
     Args:
         model: The pipeline model (e.g., QwenImagePipeline).
         od_config: The OmniDiffusion configuration.
     """
 
-    server_enabled = bool(getattr(od_config, "enable_mixfusion", False))
-    try:
-        pipeline_supports = supports_mixfusion(od_config)
-    except Exception:
-        logger.debug("Could not resolve the pipeline's MixFusion capability", exc_info=True)
-        pipeline_supports = False
-    if not (server_enabled or pipeline_supports):
+    if not (getattr(od_config, "enable_mixfusion", False) or supports_mixfusion(od_config)):
         return
 
-    try:
-        # Prefer the pipeline's declared DiT components so custom component
-        # names receive the same hooks as conventional transformer names.
-        pipeline = model
-        transformer_attrs = getattr(model, "_dit_modules", None)
-        if not transformer_attrs:
-            transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
-        transformers = []
-        search_root = model
-        for attr in transformer_attrs:
-            if not hasattr(search_root, attr):
-                # Some pipelines have recursive
-                # modules that have the transformer
-                module = find_module_with_attr(search_root, attr)
-                if module is None:
-                    continue
-                search_root = module
-
-            transformer = getattr(search_root, attr)
-            if transformer is None:
+    # Prefer the pipeline's declared DiT components so custom component names
+    # receive the same hooks as conventional transformer names.
+    transformer_attrs = getattr(model, "_dit_modules", None) or ("transformer", "transformer_2", "dit", "unet")
+    transformers = []
+    search_root = model
+    for attr in transformer_attrs:
+        if not hasattr(search_root, attr):
+            # Some pipelines nest the module that owns the transformer.
+            module = find_module_with_attr(search_root, attr)
+            if module is None:
                 continue
+            search_root = module
+        transformer = getattr(search_root, attr)
+        if transformer is not None:
             transformers.append((attr, transformer))
+    if not transformers:
+        return
 
-        if not transformers:
-            return
-        first_transformer = transformers[0][1]
-
-        parallel_config = od_config.parallel_config
-        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
-            # Packed batching splits and stacks the image stream itself; SP
-            # would shard rows a second time. Requests can still opt in and
-            # produce ragged latents, so keep a fallback driver mounted.
-            logger.warning_once("MixFusion requires sequence parallelism disabled; MixFusion hooks not applied.")
-            pipeline.mixfusion_driver = MixFusionDriver(pipeline, first_transformer, None)
-            return
-
-        applied_count = 0
-        driver = None
-
-        for attr, transformer in transformers:
-            plan = getattr(transformer, "_mixfusion_plan", None)
-            adapter = getattr(transformer, "mixfusion_adapter", None)
-
-            # The driver only knows the model through this adapter; prefer the
-            # first DiT that has one. A second packable DiT cannot be driven by
-            # the same step, so its hooks stay inert.
-            if driver is None and adapter is not None:
-                driver = MixFusionDriver(pipeline, transformer, adapter)
-                pipeline.mixfusion_driver = driver
-            elif driver is not None and plan is not None and driver.transformer is not transformer:
-                logger.warning_once(
-                    "MixFusion packs one DiT per step; hooks on %s stay inert.",
-                    transformer.__class__.__name__,
-                )
-
-            if plan is None:
-                continue
-            if adapter is None:
-                logger.warning_once(
-                    "%s declares _mixfusion_plan but no `mixfusion_adapter`; MixFusion stays on the "
-                    "serial per-request path.",
-                    transformer.__class__.__name__,
-                )
-                continue
-
+    # The driver only knows the model through its adapter, and one step packs
+    # one DiT: mount the first DiT that declares both a plan and an adapter.
+    # Without one, the driver still serves ragged batches serially. Admission
+    # rejects SP per step, so the hooks stay inert there.
+    for attr, transformer in transformers:
+        plan = getattr(transformer, "_mixfusion_plan", None)
+        adapter = getattr(transformer, "mixfusion_adapter", None)
+        if plan is not None and adapter is not None:
             logger.info(f"Applying MixFusion hooks to {transformer.__class__.__name__} ({attr}): {', '.join(plan)}")
             apply_mixfusion(transformer, plan)
-            applied_count += 1
-
-        if driver is None:
-            # No adapter anywhere: still mount the driver so ragged batches use
-            # its serial fallback instead of reaching the dense path with list
-            # latents.
-            pipeline.mixfusion_driver = MixFusionDriver(pipeline, first_transformer, None)
-
-        if applied_count == 0:
-            logger.warning(
-                "MixFusion is enabled but no transformer with _mixfusion_plan found. MixFusion hooks not applied."
-            )
-
-    except Exception as e:
-        logger.warning(f"Failed to apply MixFusion hooks: {e}. Continuing without MixFusion hooks.")
+            model.mixfusion_driver = MixFusionDriver(model, transformer, adapter)
+            return
+    logger.warning("No transformer declares a _mixfusion_plan and adapter; MixFusion requests run serially.")
+    model.mixfusion_driver = MixFusionDriver(model, transformers[0][1], None)
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

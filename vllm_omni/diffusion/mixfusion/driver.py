@@ -12,7 +12,6 @@ model's :class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`.
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -21,7 +20,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import MixFusionStep, get_forward_context
-from vllm_omni.diffusion.hooks.mixfusion import MixFusionPackingError, packed_call_rejection
+from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter
 from vllm_omni.diffusion.mixfusion.execution_plan import plan_chunk_size
 from vllm_omni.diffusion.mixfusion.request import DEFAULT_MAX_CHUNKS, DEFAULT_MIN_CHUNK_TOKENS
@@ -60,19 +59,11 @@ class MixFusionDriver:
         packed branch still calls ``dense_step`` inside the armed step (the
         root hook rewrites the call into the packed layout), so both paths
         share one keyword builder.
-
-        Admission preflights ``adapter.can_pack``. If the armed root hook
-        nevertheless declines, :class:`MixFusionPackingError` reruns the batch
-        serially rather than let list latents reach the model forward.
         """
         if not isinstance(input_batch.latents, list):
             return dense_step(input_batch, states=states)
-
         if self.pipeline.interrupt:
             return None
-        # Model code reads ``pipeline._current_timestep``; set it before
-        # dispatch so a rebuilt sub-batch never observes a stale step.
-        self.pipeline._current_timestep = input_batch.timesteps
 
         min_chunk_tokens, max_chunks = self._chunk_policy(input_batch)
         accepted, reason = self.admit(input_batch, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks)
@@ -83,15 +74,8 @@ class MixFusionDriver:
             )
             return self.serial_ragged(input_batch, states, dense_step)
 
-        try:
-            with self.armed(min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks):
-                return dense_step(input_batch, states=states)
-        except MixFusionPackingError as exc:
-            logger.warning(
-                "MixFusion packing failed after admission: %s. Falling back to per-request denoise.",
-                exc,
-            )
-            return self.serial_ragged(input_batch, states, dense_step)
+        with self.armed():
+            return dense_step(input_batch, states=states)
 
     def admit(
         self,
@@ -102,51 +86,35 @@ class MixFusionDriver:
     ) -> tuple[bool, str]:
         """Whether this ragged batch may take the packed path.
 
-        Returns ``(accepted, reason)``; rejections cover layout features the
-        packed path cannot express and batches the packer declines on size.
+        The single admission point: once accepted, the armed hooks pack
+        unconditionally. Returns ``(accepted, reason)``.
         """
         if self.adapter is None:
             return False, f"{type(self.transformer).__name__} declares no MixFusion adapter"
         if not getattr(self.transformer, "_mixfusion_hooks_applied", False):
-            logger.warning_once(
-                "MixFusion hooks are not installed on %s; falling back to the serial "
-                "per-request path. Check that enable_mixfusion is set and the model "
-                "declares a _mixfusion_plan.",
-                type(self.transformer).__name__,
-            )
             return False, "mixfusion hooks not applied"
-        # Model-agnostic invariants of the packed layout (attention_kwargs,
-        # sequence parallelism, foreign hooks); adapters may re-run the same
-        # check in ``can_pack`` for the root hook's benefit.
+        # The packed forward has no ``attention_kwargs`` channel; the serial
+        # path threads them into every block.
+        if getattr(self.pipeline, "attention_kwargs", None):
+            return False, "attention_kwargs is set"
         parallel_config = getattr(self.pipeline, "parallel_config", None)
-        rejection = packed_call_rejection(
-            self.transformer,
-            attention_kwargs=getattr(self.pipeline, "attention_kwargs", None),
-            parallel_config=parallel_config,
-        )
-        if rejection:
-            return False, rejection
-        # Sequential true-CFG is supported: both branches run through the same
-        # armed step and the packed output stays a per-request list. CFG
-        # parallel instead has each rank compute one branch and all-gathers
-        # tensor predictions, which has no per-request list semantics, so keep
-        # that configuration on the serial path.
-        if parallel_config is not None and getattr(parallel_config, "cfg_parallel_size", 1) > 1:
+        # Packing stacks the image stream itself; SP would shard rows again.
+        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+            return False, "sequence parallelism is enabled"
+        # CFG parallel all-gathers tensor predictions per rank, which has no
+        # per-request list semantics. Sequential true-CFG is fine.
+        if parallel_config is not None and parallel_config.cfg_parallel_size > 1:
             return False, "CFG parallel is enabled"
         if input_batch.image_latents is not None:
             return False, "image_latents is set"
-
-        # Preflight the adapter on the exact call the driver would make: once
-        # the root hook runs, the model is inside ``transformer.forward`` with
-        # list latents and cannot fall back. ``build_packed_call`` only shapes
-        # arguments, so binding it costs nothing next to running the model.
-        try:
-            bound = inspect.signature(self.transformer.forward).bind(**self.adapter.build_packed_call(input_batch))
-            packable, pack_reason = self.adapter.can_pack(self.transformer, bound)
-        except TypeError as exc:
-            return False, f"adapter cannot bind the packed call: {exc}"
+        # Hooks on modules the packed path drives would see a layout they were
+        # not written for (layerwise offload, FSDP2, cache hooks).
+        foreign = plan_foreign_hooks(self.transformer, getattr(self.transformer, "_mixfusion_plan", None))
+        if foreign:
+            return False, f"foreign hooks on the packed path ({', '.join(foreign)})"
+        packable, pack_reason = self.adapter.can_pack(self.transformer, input_batch)
         if not packable:
-            return False, f"adapter declined packing: {pack_reason or 'no reason given'}"
+            return False, f"adapter declined packing: {pack_reason}"
 
         accepted, reason, _, _ = plan_chunk_size(
             input_batch.latents,
@@ -205,15 +173,11 @@ class MixFusionDriver:
         return outputs
 
     @contextmanager
-    def armed(self, *, min_chunk_tokens: int, max_chunks: int) -> Iterator[None]:
+    def armed(self) -> Iterator[None]:
         """Activate the packed layout for the wrapped forward call."""
         ctx = get_forward_context()
         previous = ctx.mixfusion_step
-        ctx.mixfusion_step = MixFusionStep(
-            min_chunk_tokens=min_chunk_tokens,
-            max_chunks=max_chunks,
-            adapter=self.adapter,
-        )
+        ctx.mixfusion_step = MixFusionStep()
         try:
             yield
         finally:
