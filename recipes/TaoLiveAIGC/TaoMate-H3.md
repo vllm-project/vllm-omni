@@ -132,7 +132,8 @@ running. A subsequent request starts with fresh request-owned state.
 Use the diffusion serving benchmark to measure serial video jobs through receipt
 of the complete MP4. Set a 50 ms polling interval for this comparison; job cleanup
 and media decoding are outside the reported request latency. The custom request
-also uses 124 frames for warmup, matching the original experiment.
+also uses 124 frames for warmup, matching the original experiment: the JSONL
+`num_frames` field takes precedence over the benchmark's one-frame warmup override.
 
 ```bash
 cat > requests.jsonl <<'JSONL'
