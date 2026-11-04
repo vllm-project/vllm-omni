@@ -33,6 +33,7 @@ class MiniMaxH3ReferenceKVStats:
     max_device_staging_bytes: int = 0
     dequantized_layers: int = 0
     quantization_fallbacks: int = 0
+    reuse_steps: int = 0
 
 
 class _MiniMaxH3ReferenceKVBase:
@@ -785,6 +786,234 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         self._consumed_events = [None] * self.ring_size
         self._host_pool = None
         self._host_scale_pool = None
+        self._local_sequence_rows = None
+        self._global_non_reference_positions = None
+        self._global_reference_positions = None
+        self._global_sequence_rows = None
+        self._compact_rope_table = None
+
+
+class MiniMaxH3ReferenceKVDeviceState(MiniMaxH3ReferenceKVTier2State):
+    """Device-resident reference KV: the pool lives in HBM, so reuse needs no H2D.
+
+    Refresh steps write the post-Ulysses reference shard into the pool on the
+    compute stream instead of making a blocking device-to-host copy per layer.
+    Reuse steps read each layer back as a view, with no staging ring, copy
+    stream or clone. The pool costs ``2 * layers * reference_rows * heads *
+    head_dim`` elements of HBM per rank; ``kv_host_quantization`` selects its
+    storage dtype exactly as it does for the Tier2 host pool.
+    """
+
+    tier_name = "Tier1"
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        config: ReferenceKVConfig | None,
+        num_layers: int,
+        global_reference_rows: int,
+        device: torch.device,
+    ) -> MiniMaxH3ReferenceKVDeviceState | None:
+        if config is None:
+            return None
+        if config.mode != "on":
+            raise ValueError(f"unsupported MiniMax-H3 reference-KV mode: {config.mode!r}")
+        if global_reference_rows <= 0:
+            _log.info("MiniMax-H3 reference-KV skipped: request has no visual condition rows")
+            return None
+        if config.kv_refresh_interval == 0:
+            _log.warning("MiniMax-H3 reference-KV populate-once mode is lossy with bidirectional attention")
+        state = cls(
+            num_layers=num_layers,
+            global_reference_rows=global_reference_rows,
+            device=device,
+            refresh_interval=config.kv_refresh_interval,
+            host_quantization=config.kv_host_quantization,
+        )
+        _log.info(
+            "MiniMax-H3 reference-KV enabled: layers=%d, global_ref_rows=%d, "
+            "refresh_interval=%d, device=%s, location=device, storage_quantization=%s, "
+            "skip_reference_projection=True, cache_layout=post_ulysses",
+            num_layers,
+            global_reference_rows,
+            config.kv_refresh_interval,
+            device,
+            state.host_quantization,
+        )
+        return state
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._device_pool: torch.Tensor | None = None
+        self._device_scale_pool: torch.Tensor | None = None
+
+    @property
+    def device_staging_bytes(self) -> int:
+        total = 0
+        for pool in (self._device_pool, self._device_scale_pool):
+            if pool is not None:
+                total += pool.numel() * pool.element_size()
+        return total
+
+    def _is_refresh_step(self, step: int) -> bool:
+        if self._device_pool is None:
+            return True
+        return self.refresh_interval > 0 and step % self.refresh_interval == 0
+
+    def _allocate_device_pool(self, reference_k: torch.Tensor) -> None:
+        if self.effective_host_quantization == "fp8":
+            try:
+                reference_k.reshape(-1)[:16].to(torch.float8_e4m3fn).to(reference_k.dtype)
+            except (AttributeError, RuntimeError, TypeError) as exc:
+                self._fall_back_to_int8(exc)
+        mode = self.effective_host_quantization
+        if mode == "none":
+            storage_dtype = reference_k.dtype
+        elif mode == "int8":
+            storage_dtype = torch.int8
+        else:
+            storage_dtype = torch.float8_e4m3fn
+        shape = (2, self.num_layers, *reference_k.shape)
+        try:
+            self._device_pool = torch.empty(shape, dtype=storage_dtype, device=self.device)
+            if mode == "int8":
+                self._device_scale_pool = torch.empty(
+                    (2, self.num_layers, int(reference_k.shape[-2])), dtype=torch.float32, device=self.device
+                )
+        except RuntimeError as exc:
+            self._device_pool = self._device_scale_pool = None
+            raise RuntimeError(
+                f"MiniMax-H3 reference-KV Tier1 could not allocate a {mode} device pool of shape {shape}; "
+                "set kv_host_quantization to int8 or kv_cache_location to host"
+            ) from exc
+        self.stats.max_device_staging_bytes = self.device_staging_bytes
+        _log.info(
+            "MiniMax-H3 reference-KV Tier1 device pool allocated: shape=%s, source_dtype=%s, "
+            "storage_dtype=%s, quantization=%s, bytes=%d",
+            shape,
+            reference_k.dtype,
+            storage_dtype,
+            mode,
+            self.device_staging_bytes,
+        )
+
+    def _capture_post_ulysses_layer(
+        self,
+        layer_index: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        if key.shape != value.shape or key.ndim != 4 or key.shape[0] != 1:
+            raise ValueError(
+                f"post-Ulysses reference K/V must be matching [1, S, H, D] tensors, got {key.shape} and {value.shape}"
+            )
+        if self._global_sequence_rows != int(key.shape[1]):
+            raise ValueError(f"post-Ulysses sequence length mismatch: {key.shape[1]} != {self._global_sequence_rows}")
+        positions = self.global_reference_positions
+        reference_k = key[0].index_select(0, positions)
+        reference_v = value[0].index_select(0, positions)
+        if self._device_pool is None:
+            self._allocate_device_pool(reference_k)
+        assert self._device_pool is not None
+        expected = tuple(self._device_pool.shape[2:])
+        if tuple(reference_k.shape) != expected:
+            raise ValueError(
+                f"post-Ulysses reference K/V shape changed: expected {expected}, got {tuple(reference_k.shape)}"
+            )
+        with record_function("minimax_h3.ref_kv_tier1.populate_post_ulysses"):
+            if self.effective_host_quantization == "none":
+                self._device_pool[0, layer_index].copy_(reference_k)
+                self._device_pool[1, layer_index].copy_(reference_v)
+            else:
+                encoded, scales = self._encode_reference_pair(reference_k, reference_v)
+                self._device_pool[:, layer_index].copy_(encoded)
+                if scales is not None:
+                    if self._device_scale_pool is None:
+                        raise RuntimeError("INT8 device scale pool is missing")
+                    self._device_scale_pool[:, layer_index].copy_(scales)
+        self.stats.captured_layers += 1
+        self._layers_seen.add(layer_index)
+
+    def begin_step(self, step: int, *, sigma: float | None = None) -> None:
+        del sigma
+        if self._step is not None:
+            raise RuntimeError(f"reference-KV Tier1 step {self._step} is still active")
+        self._step = int(step)
+        self._layers_seen.clear()
+        self._global_refresh = step == 0 or (self.refresh_interval > 0 and step % self.refresh_interval == 0)
+        self._refresh = self._is_refresh_step(step)
+        if self._refresh:
+            self.stats.refresh_steps += 1
+            return
+        if self._device_pool is None:
+            raise RuntimeError("reference-KV Tier1 reuse requested before populate")
+        self.stats.reuse_steps += 1
+
+    def mark_block_cache_skipped(self, layer_indices: list[int]) -> None:
+        _MiniMaxH3ReferenceKVBase.mark_block_cache_skipped(self, layer_indices)
+
+    def take_cached_reference_layer(
+        self,
+        layer_index: int,
+        like: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._step is None or self._global_refresh:
+            raise RuntimeError("cached reference K/V requested outside a reuse step")
+        if not 0 <= layer_index < self.num_layers:
+            raise IndexError(f"layer_index {layer_index} outside [0, {self.num_layers})")
+        if layer_index in self._layers_seen:
+            raise RuntimeError(f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}")
+        if self._device_pool is None:
+            raise RuntimeError("Tier1 device pool is missing on a reuse step")
+
+        # Unquantized reads alias the pool. It is rewritten only by a later
+        # refresh step, which runs on the same stream after every reader.
+        with record_function("minimax_h3.ref_kv_tier1.take_cached"):
+            cached = self._device_pool[:, layer_index]
+            mode = self.effective_host_quantization
+            if mode == "fp8":
+                cached = cached.to(dtype=like.dtype)
+                self.stats.dequantized_layers += 1
+            elif mode == "int8":
+                if self._device_scale_pool is None:
+                    raise RuntimeError("INT8 device scale pool is missing")
+                scales = self._device_scale_pool[:, layer_index]
+                cached = cached.to(dtype=like.dtype) * scales.to(dtype=like.dtype)[:, None, :, None]
+                self.stats.dequantized_layers += 1
+        self.stats.substituted_layers += 1
+        self._layers_seen.add(layer_index)
+        return cached[0], cached[1]
+
+    def abort_step(self) -> None:
+        self._step = None
+        self._layers_seen.clear()
+
+    def close(self) -> None:
+        if self._step is not None:
+            self.abort_step()
+        _log.info(
+            "MiniMax-H3 reference-KV Tier1 summary: device_pool_bytes=%d, refresh_steps=%d, "
+            "reuse_steps=%d, captured_layers=%d, substituted_layers=%d, block_cached_layers=%d, "
+            "projection_skipped_layers=%d, projection_skipped_rows=%d, projection_total_rows=%d, "
+            "cache_layout=post_ulysses, location=device, storage_quantization=%s, "
+            "effective_storage_quantization=%s, dequantized_layers=%d, quantization_fallbacks=%d",
+            self.device_staging_bytes,
+            self.stats.refresh_steps,
+            self.stats.reuse_steps,
+            self.stats.captured_layers,
+            self.stats.substituted_layers,
+            self.stats.block_cached_layers,
+            self.stats.projection_skipped_layers,
+            self.stats.projection_skipped_rows,
+            self.stats.projection_total_rows,
+            self.host_quantization,
+            self.effective_host_quantization,
+            self.stats.dequantized_layers,
+            self.stats.quantization_fallbacks,
+        )
+        self._device_pool = None
+        self._device_scale_pool = None
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
         self._global_reference_positions = None
