@@ -275,14 +275,20 @@ async def _run_camera_update_scheduler(
 class _StreamingFrameCounter:
     """Count frames once on a worker, retaining fMP4 context between messages.
 
-    PyAV reads from this non-seekable input. An empty queue waits for more
-    bytes; only finish() signals EOF. Feed and snapshots never wait for decoding.
+    PyAV reads from this non-seekable input on a daemon thread. Reads wait
+    for bytes until finish() or a failure closes the input. Feed and snapshots
+    never wait for decoding; accounting failures make the count unknown.
     """
 
     _MAX_PENDING_BYTES = 64 * 1024 * 1024
     _JOIN_TIMEOUT = 5.0
 
     def __init__(self, *, stream_format: str) -> None:
+        """Initialize an empty counter; start decoding on the first nonempty feed.
+
+        ``stream_format='m4s'`` selects the MP4 demuxer; other values let PyAV
+        detect the container format from the input bytes.
+        """
         self._format = "mp4" if stream_format == "m4s" else None
         self._condition = threading.Condition()
         self._pending: deque[memoryview] = deque()
@@ -294,15 +300,22 @@ class _StreamingFrameCounter:
 
     @property
     def count(self) -> int | None:
+        """Return a decoded-frame snapshot, or None after any accounting failure.
+
+        The snapshot can lag received input. Use finish() to drain the stream
+        before reading its final count, including any decodable trailer frames.
+        """
         with self._condition:
             return self._count if self._error is None else None
 
     @property
     def error(self) -> str | None:
+        """Return the first accounting failure code, or None if none was recorded."""
         with self._condition:
             return self._error
 
     def _fail(self, reason: str) -> None:
+        """Latch the first failure reason, discard queued bytes, and wake readers at EOF."""
         with self._condition:
             self._error = self._error or reason
             self._pending.clear()
@@ -311,6 +324,13 @@ class _StreamingFrameCounter:
             self._condition.notify_all()
 
     def feed(self, data: bytes) -> None:
+        """Queue immutable media bytes without waiting for them to be decoded.
+
+        The first nonempty input starts the worker. Empty input and input after
+        a failure are ignored. Exceeding the pending-byte limit or feeding a
+        closed input disables accounting, clears the queue, and makes count
+        return None; it does not raise an accounting error in the receive loop.
+        """
         with self._condition:
             if not data or self._error is not None:
                 return
@@ -328,6 +348,13 @@ class _StreamingFrameCounter:
             self._condition.notify_all()
 
     def read(self, size: int) -> bytes:
+        """Block the decoder worker until size bytes are available or input closes.
+
+        Positive reads coalesce message boundaries so a short queued piece is
+        not interpreted as EOF inside an MP4 box. At EOF, return remaining
+        bytes, then b"". Failures discard queued bytes and also signal EOF.
+        A nonpositive size returns b"" immediately.
+        """
         if size <= 0:
             return b""
         with self._condition:
@@ -346,6 +373,11 @@ class _StreamingFrameCounter:
             return b"".join(pieces)
 
     def _decode(self) -> None:
+        """Decode one stream on the worker and publish frame counts under the lock.
+
+        Decoder exceptions latch decode_failed instead of exposing a partial
+        count as a successful total. Worker exit closes the input to new feeds.
+        """
         try:
             with av.open(
                 self,
@@ -369,6 +401,17 @@ class _StreamingFrameCounter:
                 self._eof = True
 
     async def finish(self) -> int | None:
+        """Signal EOF and drain the worker without blocking the event loop.
+
+        Return the decoded count (zero for no input), or None after a failure.
+        Interrupted input counts only decodable received frames. The worker
+        join is bounded by _JOIN_TIMEOUT; expiry latches shutdown_timeout.
+
+        Cancellation latches shutdown_cancelled, waits for the same bounded
+        join, then re-raises CancelledError. Further cancellation may interrupt
+        that wait. A native codec call cannot be forcibly stopped, so the daemon
+        worker may outlive this method after timeout or repeated cancellation.
+        """
         with self._condition:
             self._eof = True
             self._condition.notify_all()
