@@ -9,6 +9,16 @@ Use this skill to run a disciplined optimization loop for vLLM Omni diffusion wo
 
 When the task is to add or extend CI performance coverage (a benchmark config plus its Buildkite Perf step) rather than diagnose an optimization, use [diffusion-perf-test](../diffusion-perf-test/SKILL.md). This skill's baseline and stage-attribution guidance still applies once an optimization needs to be watched in CI.
 
+## Ascend NPU tasks
+
+For Ascend NPU diffusion model or operator optimization, read the
+[MindIE-SD router](../dit-npu-fusion-analysis/SKILL.md)
+first and load the selected external skill. MindIE-SD owns NPU optimization
+methods and acceptance guidance; supply Omni code/workload context and keep
+Omni tests and changes in this repository. The CUDA-oriented workflow below
+continues to apply to CUDA tasks. Do not infer NVLink/NCCL or GPU profiler
+requirements for an NPU task.
+
 ## First Questions
 
 Before proposing changes, ask for the optimization scene if it is not already known:

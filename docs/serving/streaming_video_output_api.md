@@ -33,7 +33,10 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
 
 Control events are JSON text frames. Each `video.chunk_metadata` event is
 immediately followed by one binary WebSocket frame containing fragmented MP4
-bytes.
+bytes. If an encoding call emits no bytes yet, the server still sends its
+metadata followed by an empty binary frame (`byte_length: 0`). This preserves
+source counts and interaction events. Empty binary frames add no media to the
+stream and do not indicate completion; wait for `session.done`.
 
 | Direction | Event or frame | Purpose |
 | ----------- | ---------------- | --------- |
@@ -67,6 +70,48 @@ Start a minimal session with:
 Only `m4s` output is currently accepted. Concatenate the binary frames in
 receive order, then remux the fragmented stream if the target player requires
 a progressive MP4 file.
+
+### Audio and chunk boundaries
+
+A generation result containing audio must contain exactly one video; multiple
+videos with one audio payload are rejected before encoding any of that result.
+Video-only results may contain multiple videos. Their generation chunk index,
+interaction event IDs, pacing fields and output chunk index are reported only
+with the first video. Each video retains its own submitted frame count and
+emitted byte length.
+
+If the first video chunk includes audio, the server creates an AAC track. Every
+later video chunk must then include nonempty audio. An explicit sample rate must
+be a positive integer and must match the track's initial rate; invalid chunks
+are rejected before advancing either media timeline. Omitting a later sample
+rate keeps the track's rate. If no initial rate is provided, the server uses
+24,000 Hz. Audio cannot be added after a video-only MP4 header has been emitted.
+
+The binary frames form one continuous fMP4 stream, rather than independently
+decodable files. In `video.chunk_metadata`, `byte_length` describes the following
+binary frame. `num_frames`, `num_audio_samples`, `generation_chunk_index` and
+interaction event IDs describe the source media submitted during that encoding
+call; they do not count the media packets already present in those bytes.
+`audio_sample_rate` reports the rate used for the audio track.
+
+The audio/video muxer uses a 100 ms fragment-duration threshold and retains an
+incomplete final fragment. AAC also buffers incomplete 1024-sample frames and
+encoder delay. A chunk's tail can therefore arrive with the next chunk or the
+final trailer. This is buffering across chunk boundaries, not an additional
+100 ms of timestamp drift accumulated on every chunk. A trailer reports zero
+submitted frames but can contain buffered media. Clients must append bytes in
+receive order and use the MP4 timestamps for playback and playback feedback,
+rather than treating the source counts or event IDs as exact playback markers.
+When progressive-MP4 finalization fails, saving retains the received fMP4 bytes.
+
+AAC encoder priming is represented by the MP4 edit list, rather than by dropping
+generated samples. The initialization header is delayed until FFmpeg has the
+initial timestamps. Encoded AAC packets can start at negative timestamps;
+presented audio and video start at zero after the player's priming adjustment.
+Clients must honor the edit list (`elst`) in the fMP4 initialization segment,
+including when using Media Source Extensions (MSE). Ignoring it can delay audio
+by one AAC frame (1024 samples, or 32 ms at 32 kHz). Playback checks here use
+PyAV/FFmpeg; browser MSE playback has not been validated.
 
 ## Playback Backpressure
 
