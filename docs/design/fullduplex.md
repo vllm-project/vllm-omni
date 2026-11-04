@@ -687,7 +687,9 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 config for the worker-side model hooks.
 
 Qwen3-Omni defaults to resident Thinker requests in the existing V1 duplex
-profile, using the upstream resumable streaming-input request path. The
+profile, using asynchronous scheduling and the upstream resumable streaming-input
+request path. A continued request drains its previous turn's in-flight outputs
+before worker delivery state is reset; other sessions remain schedulable. The
 `supports_turn_kv_continuation` capability is resolved from engine settings;
 unsupported configurations log a reason and use per-turn requests with ordinary
 prefix caching where available. No separate deployment or session switch is

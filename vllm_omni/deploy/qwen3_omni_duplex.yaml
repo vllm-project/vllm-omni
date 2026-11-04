@@ -6,9 +6,9 @@ model_runner: v1
 session_mode: duplex
 stages:
   - stage_id: 0
-    # Synchronous V1 scheduling retains Thinker KV across committed turns.
+    # Async V1 scheduling retains Thinker KV across committed turns.
     # Prefix-output rows are replayed to each fresh downstream speech request.
-    async_scheduling: false
+    async_scheduling: true
     enable_prefix_caching: true
     limit_mm_per_prompt:
       audio: 4

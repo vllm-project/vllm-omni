@@ -48,7 +48,7 @@ Host footprint: each cached key costs `num_blocks × block_size × D × dtype_by
 The existing CUDA `qwen3_omni_duplex.yaml` profile defaults to a resident
 resumable Thinker request across committed turns. No extra deployment file or
 session switch is required. The capability is resolved from existing engine
-options: V1, synchronous scheduling, prefix caching, async-chunk transport and
+options: V1, prefix caching, async-chunk transport and
 no speculative decoding. Other combinations log the unsupported condition and
 use fresh per-turn requests, including the MRv2 profile. APC can still reuse
 matching prefixes in that path. Non-CUDA profile overrides disable caching.
@@ -61,6 +61,11 @@ allocation is released before rebuilding. The partial block is recomputed.
 Stage-output caching remains required to replay complete conditioning rows to
 each fresh downstream speech pipeline. A worker retirement/arrival pair resets
 per-turn delivery state without releasing scheduler-owned matching KV.
+Both synchronous and asynchronous scheduling are supported. With async
+scheduling, a continued request waits for its previous turn's in-flight outputs
+to drain before worker retirement and arrival. The existing stale-output fence
+discards those results without appending tokens or forwarding conditioning rows.
+Other requests and decode steps within a turn remain asynchronous.
 
 The full-snapshot adapter delegates token extension to vLLM's
 `Scheduler._update_request_as_session`. After prefix validation it normalizes
