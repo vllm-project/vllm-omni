@@ -13,7 +13,7 @@ PD_RNG_STATE_KEY = "pd_rng_state"
 
 
 def needs_pd_rng_state(params) -> bool:
-    return params is not None and params.temperature != 0
+    return params is not None and getattr(params, "temperature", 0) != 0
 
 
 class PDContinuation(msgspec.Struct):

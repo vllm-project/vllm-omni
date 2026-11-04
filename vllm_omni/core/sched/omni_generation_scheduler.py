@@ -342,7 +342,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
-        if self.aux_output_connector is not None:
+        if getattr(self, "aux_output_connector", None) is not None:
             scheduler_output.aux_output_connector_metadata = self.aux_output_connector.build_connector_meta(
                 scheduler_output, self.requests
             )
@@ -1053,7 +1053,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if stopped:
                 if (
-                    self.aux_output_connector is not None
+                    getattr(self, "aux_output_connector", None) is not None
                     and (aux_output := model_runner_output.aux_output_connector_output) is not None
                 ):
                     routed_experts = self.aux_output_connector.take_output(request, aux_output)

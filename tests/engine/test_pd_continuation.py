@@ -182,6 +182,7 @@ def _receiver(req, scheduler_cls=OmniARScheduler):
     scheduler.finished_recving_kv_req_ids = set()
     scheduler.failed_recving_kv_req_ids = set()
     scheduler._pd_completed_outputs = []
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler._kv_wait_start_ts = {}
     scheduler.chunk_transfer_adapter = None
     scheduler._free_request = Mock(return_value=({"kv_ready": True}, None))
@@ -553,6 +554,7 @@ def test_producer_output_carries_rng_with_connector_completion(rng_state):
     scheduler.perf_metrics = None
     scheduler.connector = None
     scheduler._pd_completed_outputs = []
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler._maybe_decode_pooling_output = Mock(return_value=None)
     scheduler._handle_stopped_request = Mock(return_value=True)
     connector_params = {"remote_engine_id": "P", "transfer_id": "xfer-req"}

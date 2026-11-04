@@ -218,7 +218,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return
         params = request.sampling_params
         is_pd_resume = getattr(request, "pd_continuation", None) is not None
-        is_pd_prefill = params is not None and (params.extra_args or {}).get(PD_PREFILL_KEY)
+        is_pd_prefill = params is not None and (getattr(params, "extra_args", None) or {}).get(PD_PREFILL_KEY)
         if is_pd_resume or is_pd_prefill:
             parallel = self.vllm_config.parallel_config
             # P's one-sample budget is enforced when its output arrives, so
@@ -246,7 +246,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _update_request_with_output(self, request: Request, new_token_ids: list[int], *args, **kwargs):
         token_ids, stopped = super()._update_request_with_output(request, new_token_ids, *args, **kwargs)
         params = request.sampling_params
-        if params is not None and (params.extra_args or {}).get(PD_PREFILL_KEY) and token_ids:
+        if params is not None and (getattr(params, "extra_args", None) or {}).get(PD_PREFILL_KEY) and token_ids:
             # This is an execution boundary, not the user's logical stop rule.
             # Keep the actual first-token sampler masks, but satisfy Mooncake's
             # length-finished contract so it retains the prompt blocks for D.
@@ -1378,7 +1378,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
                 if (
-                    self.aux_output_connector is not None
+                    getattr(self, "aux_output_connector", None) is not None
                     and (aux_output := model_runner_output.aux_output_connector_output) is not None
                 ):
                     routed_experts = self.aux_output_connector.take_output(request, aux_output)
@@ -1442,7 +1442,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     params = request.sampling_params
                     if (
                         params is not None
-                        and (params.extra_args or {}).get(PD_PREFILL_KEY)
+                        and (getattr(params, "extra_args", None) or {}).get(PD_PREFILL_KEY)
                         and needs_pd_rng_state(params)
                     ):
                         rng_state = (getattr(model_runner_output, "pd_rng_states", None) or {}).get(req_id)
@@ -2276,7 +2276,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # coordinator is None, so the unconditional finally is safe.
         try:
             # 2. Omni Specific: Check if we need to transfer KV
-            if request.status in _NON_TRANSFERABLE_FINISH_STATUSES:
+            if getattr(request, "status", None) in _NON_TRANSFERABLE_FINISH_STATUSES:
                 # A failed request must never create a new downstream KV
                 # payload. Drop work that has not reached the runner yet. If
                 # extraction is already active, keep the blocks alive until

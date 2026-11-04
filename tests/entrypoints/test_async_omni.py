@@ -84,7 +84,7 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._paused = False
     omni.engine = SimpleNamespace(
         num_stages=1,
-        stage_configs=[SimpleNamespace(stage_id=0)],
+        stage_configs=[],
         add_request_async=fake_add_request,
         abort_async=fake_abort_request,
     )

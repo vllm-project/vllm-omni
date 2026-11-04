@@ -252,7 +252,7 @@ class AsyncOmniEngine(OmniEngineBase):
             effective_sampling_params_list = disable_watermarking(effective_sampling_params_list)
 
         params = effective_sampling_params_list[0]
-        pd_pair = self._pd_pair
+        pd_pair = getattr(self, "_pd_pair", None)
         effective_sampling_params_list = PDDisaggregationMixin._resolve_pd_sampling_params(
             effective_sampling_params_list, pd_pair
         )

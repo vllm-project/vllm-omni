@@ -41,6 +41,13 @@ def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
     sched._free_blocks = MagicMock()
     sched._free_input_coordinator_request = MagicMock()
     sched.chunk_transfer_adapter = chunk_transfer_adapter
+    # State a real OmniARScheduler.__init__ always creates; the PR-added
+    # finished-status branch touches it before the _should_transfer_kv lambda.
+    sched.requests_needing_kv_transfer = {}
+    sched.pending_stop_after_extraction = set()
+    sched.active_kv_transfers = set()
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
     return sched
 
 
