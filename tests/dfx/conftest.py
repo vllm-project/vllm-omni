@@ -766,8 +766,17 @@ def run_benchmark(
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
+    # Accuracy is published only in ``result_acc_*.json`` below; the perf result
+    # must not carry a second copy of it. ``result`` keeps it in memory so the
+    # caller's IA-QTF1 floor assertions still see it.
+    persisted = result
+    if isinstance(omniinteract_summary := result.get("omniinteract"), dict) and "accuracy" in omniinteract_summary:
+        persisted = {
+            **result,
+            "omniinteract": {key: value for key, value in omniinteract_summary.items() if key != "accuracy"},
+        }
     with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(persisted, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
         from tests.e2e.accuracy.helpers import (
             _DUPLEX_EVAL_DEFAULT_ACC_DIR,

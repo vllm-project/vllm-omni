@@ -757,7 +757,9 @@ run and deleted afterwards; they are not kept under `tests/dfx/perf/results/omni
 (`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After each subset finishes it
 scores All Global IA-QTF1 through that local judge and writes a `result_acc_*.json` next to the performance
 JSON (`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). After all three subsets finish, pooled TP/FP/FN are written as
-`result_acc_*_omniinteract_aggregate_*.json`. This is protocol-compatible with the paper metric, not a GPT-4o
+`result_acc_*_omniinteract_aggregate_*.json`. Accuracy is published only in those `result_acc_*.json` files; the
+perf `result_test_*.json` keeps generation and latency metrics but no `omniinteract.accuracy` block.
+This is protocol-compatible with the paper metric, not a GPT-4o
 paper-table score. Run it from the repository root with two visible GPUs:
 
 ```bash

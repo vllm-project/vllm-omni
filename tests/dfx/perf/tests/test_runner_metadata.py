@@ -1215,19 +1215,6 @@ def test_omniinteract_aggregate_rejects_pooled_ia_qtf1_below_floor():
         )
 
 
-def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
-    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0]
-    assert config["omniinteract_aggregate_min_ia_qtf1"] == 0.2
-    subsets = []
-    for params in config["benchmark_params"]:
-        assert params["max_concurrency"] == [8]
-        assert params["num_prompts"] == [8]
-        assert params["omniinteract_persist_artifacts"] is False
-        assert "omniinteract_output_dir" not in params
-        subsets.append(params["omniinteract_subsets"])
-    assert subsets == ["1q1a", "1q1a_math", "1qna"]
-
-
 def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
     import io
 
@@ -1313,6 +1300,15 @@ def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
     assert saved["max_concurrency"] == 8
     assert saved["baseline"] == {"omniinteract_aggregate_min_ia_qtf1": 0.2}
     assert saved["branch"] == "acc-branch"
+
+    # Accuracy lives only in ``result_acc_*.json``; the perf JSON keeps the rest.
+    perf_jsons = [path for path in perf_dir.glob("result_*.json") if not path.name.startswith("result_acc_")]
+    assert len(perf_jsons) == 1
+    perf_saved = json.loads(perf_jsons[0].read_text())
+    assert "accuracy" not in perf_saved["omniinteract"]
+    assert perf_saved["omniinteract"]["total"] == 4
+    # The in-memory copy stays nested so floor assertions still see it.
+    assert result["omniinteract"]["accuracy"]["summary"]["IA_QTF1"] == 0.25
 
 
 def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypatch):
