@@ -147,6 +147,29 @@ This prevents a model from interpreting serialized weights with an online
 loader or silently applying the wrong method to one transformer in a
 multi-transformer pipeline.
 
+## NPU online MXFP8 BF16 prefix policy
+
+`DiffusionMXFP8Config` accepts `prefix_bf16_steps` (default `0`) and
+`prefix_bf16_master_mode` (`cpu`, `resident`, or `dlo`). A positive prefix
+requires online NPU MXFP8: serialized checkpoints lack the original master,
+and XPU does not implement this policy. Configuration reconciliation preserves
+both runtime settings.
+
+MindIE-SD owns `MXFP8BF16Fallback` and the explicit `MXFP8BF16Master` handle.
+Omni prepares and stores the handle before online weight quantization, then
+passes it and `ForwardContext.denoise_step_idx` to MindIE-SD. Steps in
+`0 <= step < prefix_bf16_steps` use the retained master; subsequent steps and
+calls without a published step retain the MXFP8 path. CFG passes at one step
+therefore share one precision policy.
+
+Omni owns master residency and DLO lifecycle. A CPU master is transferred as
+needed; a resident master stays on the loading device; `dlo` exposes the CPU
+master to the offloader's phase-aware payload provider. The handle is not a
+registered parameter or buffer, so `state_dict` and `module.to()` do not manage
+it. See the [MXFP8 guide](../../user_guide/quantization/mxfp8.md) for usage and
+the [DLO contract](offloader/distributed_layerwise_offload.md) for transfer
+boundaries. CPU contract tests do not establish NPU generation quality.
+
 ## Model and layer integration
 
 Diffusion model constructors receive the resolved configuration and pass it to

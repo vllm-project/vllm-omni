@@ -114,9 +114,14 @@ def _forget_active_hwr_registration(
 # ones stay resident for lower latency.
 
 
-def _layerwise_prefix_layout(module: nn.Module) -> tuple[int, dict, set, list]:
+def _layerwise_prefix_layout(
+    module: nn.Module,
+) -> tuple[int, dict[str, torch.Tensor], set[str], list[nn.Module]]:
     """Discover optional quant-method prefix tensors without registering buffers."""
-    steps, auxiliary, replaced, owners = 0, {}, set(), []
+    steps = 0
+    auxiliary: dict[str, torch.Tensor] = {}
+    replaced: set[str] = set()
+    owners: list[nn.Module] = []
     for path, child in module.named_modules():
         provider = getattr(getattr(child, "quant_method", None), "get_layerwise_prefix_weights", None)
         layout = provider(child) if callable(provider) else None
@@ -129,7 +134,7 @@ def _layerwise_prefix_layout(module: nn.Module) -> tuple[int, dict, set, list]:
             raise ValueError("DLO prefix provider K must be a positive integer")
         steps = count
 
-        def qualify(name, path=path):
+        def qualify(name: str, path: str = path) -> str:
             return f"{path}.{name}" if path else name
 
         auxiliary.update({qualify(name): tensor for name, tensor in tensors.items()})
@@ -664,9 +669,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             return
         sizes: dict[torch.dtype, int] = {}
         for hook in selected:
+            assert hook._prefix_payload is not None
             for dtype, shard in hook._prefix_payload["cpu_shards"].items():
                 sizes[dtype] = max(sizes.get(dtype, 0), shard.numel())
-        buffers = [
+        buffers: list[dict[torch.dtype, torch.Tensor] | None] = [
             {dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=True) for dtype, size in sizes.items()}
             for _ in range(2)
         ]

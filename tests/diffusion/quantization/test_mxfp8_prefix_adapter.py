@@ -69,18 +69,18 @@ class _FakeFallback:
 
 def _install_fake_mindiesd(monkeypatch):
     quantization = ModuleType("mindiesd.quantization")
-    quantization.MXFP8BF16Fallback = _FakeFallback
-    quantization.TimestepPolicyConfig = _FakePolicy
+    setattr(quantization, "MXFP8BF16Fallback", _FakeFallback)
+    setattr(quantization, "TimestepPolicyConfig", _FakePolicy)
     mindiesd = ModuleType("mindiesd")
-    mindiesd.quantization = quantization
+    setattr(mindiesd, "quantization", quantization)
     monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
     monkeypatch.setitem(sys.modules, "mindiesd.quantization", quantization)
 
 
 def _install_real_mindiesd(monkeypatch):
     """Load the real fallback and policy without importing MindIE-SD's NPU package init."""
-    source = os.environ.get("MINDIE_SD_ROOT")
-    if source is None:
+    source = os.environ.get("MINDIE_SD_ROOT", "")
+    if not source:
         pytest.skip("Set MINDIE_SD_ROOT to run the real MindIE-SD adapter contract")
     root = Path(source) / "mindiesd"
     mindiesd = ModuleType("mindiesd")
@@ -92,12 +92,12 @@ def _install_real_mindiesd(monkeypatch):
     class ContractError(Exception):
         pass
 
-    utils.ModelInitError = ContractError
-    utils.ParametersInvalid = ContractError
+    setattr(utils, "ModelInitError", ContractError)
+    setattr(utils, "ParametersInvalid", ContractError)
     monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
     monkeypatch.setitem(sys.modules, "mindiesd.quantization", quantization)
     monkeypatch.setitem(sys.modules, "mindiesd.utils", utils)
-    mindiesd.quantization = quantization
+    setattr(mindiesd, "quantization", quantization)
     for name in ("mode", "config", "mxfp8"):
         module_name = f"mindiesd.quantization.{name}"
         spec = importlib.util.spec_from_file_location(module_name, root / "quantization" / f"{name}.py")
@@ -106,9 +106,11 @@ def _install_real_mindiesd(monkeypatch):
         monkeypatch.setitem(sys.modules, module_name, module)
         spec.loader.exec_module(module)
         setattr(quantization, name, module)
-    quantization.TimestepPolicyConfig = quantization.config.TimestepPolicyConfig
-    quantization.MXFP8BF16Fallback = quantization.mxfp8.MXFP8BF16Fallback
-    quantization.MXFP8BF16Master = quantization.mxfp8.MXFP8BF16Master
+    config_module = sys.modules["mindiesd.quantization.config"]
+    fallback_module = sys.modules["mindiesd.quantization.mxfp8"]
+    setattr(quantization, "TimestepPolicyConfig", getattr(config_module, "TimestepPolicyConfig"))
+    setattr(quantization, "MXFP8BF16Fallback", getattr(fallback_module, "MXFP8BF16Fallback"))
+    setattr(quantization, "MXFP8BF16Master", getattr(fallback_module, "MXFP8BF16Master"))
     return quantization
 
 
@@ -280,9 +282,7 @@ def test_real_mindiesd_handle_adapter_and_dlo_contract(monkeypatch, mocker: Mock
         layer.bias.copy_(torch.tensor([0.5, -0.25]))
     expected_master = layer.weight.detach().to(torch.bfloat16).transpose(0, 1).contiguous()
     quantize = mocker.Mock(side_effect=lambda weight, **kwargs: (weight, torch.ones(2, 2, dtype=torch.uint8)))
-    monkeypatch.setitem(
-        sys.modules, "torch_npu", SimpleNamespace(npu_dynamic_mx_quant=quantize, float8_e4m3fn="fp8")
-    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_dynamic_mx_quant=quantize, float8_e4m3fn="fp8"))
 
     method.process_weights_after_loading(layer)
     master = layer._mxfp8_prefix_master
