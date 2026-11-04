@@ -14,7 +14,6 @@ It is off by default.
 | ---------- | --------------------------- |
 | Wan2.1 / Wan2.2 (`Wan22Pipeline`) | `Wan DiT` |
 | Z-Image (`ZImagePipeline`) | `ZImage DiT` |
-| HunyuanImage3 (`HunyuanImage3Pipeline`) | `HunyuanImage3 DiT` |
 
 Capture and replay use the platform's graphed-forward class
 (`current_omni_platform.get_graphed_forward_cls()`: CUDA graphs on CUDA, XPU
@@ -38,6 +37,13 @@ Per-stage deploy configuration:
 stages:
   - stage_id: 0
     diffusion_use_graph: true
+```
+
+Online serving, without a deploy file:
+
+```bash
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni \
+  --stage-overrides '{"0": {"diffusion_use_graph": true}}'
 ```
 
 The log states the decision for each pipeline, for example
@@ -65,6 +71,9 @@ value. In these cases the runner is not built, a warning starting with
 - Any CPU offload strategy, including layerwise, distributed layerwise, and
   `diffusion_offload_config`.
 - Pipeline parallelism.
+- Data parallelism (`data_parallel_size` > 1): replicas serve different
+  requests, so they would capture at different times while every capture is
+  agreed across all ranks.
 - Intel XPU with the DiT on more than one rank (tensor, sequence or expert
   parallelism): with torch 2.14.0+xpu and oneCCL 2022.1.2, an XPU graph never
   frees the buffers of the collectives it captured, so every recapture leaks
@@ -82,10 +91,8 @@ its first step. If a capture fails on any rank, every rank turns graphs off for
 that runner and continues eager.
 
 The prompt length is part of the shape for Z-Image, which trims the prompt
-embeddings to the token count. HunyuanImage3 keeps its prompt KV storage across
-requests, but reallocates it, and drops its graphs, when a longer prompt
-arrives. Workloads with many distinct prompt lengths therefore capture on
-almost every request.
+embeddings to the token count. Workloads with many distinct prompt lengths
+therefore capture on almost every request.
 
 Measured on one Intel Arc Pro B70 with Z-Image-Turbo, 1024x1024, 8 steps:
 
