@@ -2529,19 +2529,26 @@ class DuplexSessionRunner:
         """
         session = self.session
         model_state = self.model_state
-        if (
-            helpers.response_in_progress(self.session, self.tasks)
-            or self.tasks.append_tasks
-            # Listen-only commit prefixes can still own the data-plane stream.
-            # The retained terminal append follows them in the same wire order.
-            or (self.run.stream_request_id is not None and model_state.committed_audio_payload is None)
-        ):
+        if helpers.response_in_progress(self.session, self.tasks) or self.tasks.append_tasks:
+            # NOTE: a listen stream can still hold the data-plane claim here
+            # with nothing committed -- in a native session that claim
+            # survives its input on purpose (model_channel deliberately keeps
+            # the stream bound for the next turn). Treating it as pending
+            # work would strand the create forever: no later append releases
+            # it once the input has stopped, and the client only finds out
+            # when its drain times out. Fall through instead, so the
+            # nothing-to-answer refusals below answer it immediately.
             if session.active_response_id is None and (
                 session.active_request_id is not None
                 or self.tasks.append_tasks
                 or self.run.stream_request_id is not None
             ):
                 return
+            self._emit_error(
+                "response_already_active", "response.create cannot start while another response is active."
+            )
+            session.discard_response_options()
+            return
             self._emit_error(
                 "response_already_active", "response.create cannot start while another response is active."
             )
