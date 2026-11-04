@@ -317,7 +317,9 @@ def test_preprocess_derives_output_size_from_condition_aspect(preprocess, size, 
 
 
 def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess):
-    processed = preprocess(make_request("staged", [(96, 64)]))
+    request = make_request("staged", [(96, 64)])
+    original_prompt = request.prompt
+    processed = preprocess(request)
     info = processed.prompt["additional_information"]
 
     (vae_image,) = info["vae_images"]
@@ -330,6 +332,7 @@ def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess)
     assert isinstance(prompt_image, Image.Image)
     (width, height) = info["input_image_sizes"][0]
     assert prompt_image.size == (width, height)
+    assert "additional_information" not in original_prompt
     assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),), None, False)
 
 

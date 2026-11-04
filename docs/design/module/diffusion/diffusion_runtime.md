@@ -333,6 +333,8 @@ worker receives tensors. A denoise-only stage emits packed target latents plus
 this geometry; the decoder reuses the native unpack/denormalize/decode path.
 Qwen preprocessing shallow-copies the prompt and its mutable
 `additional_information` container, retaining references to tensor payloads.
+Its preparation contract replaces complete fields rather than mutating nested
+caller-owned lists or dictionaries in place.
 It clears unused supplied negative prompts to `None` before batch compatibility
 and cache-input preparation, including on downstream stages. Missing
 negative-prompt fields stay absent. CFG-enabled single requests require a string

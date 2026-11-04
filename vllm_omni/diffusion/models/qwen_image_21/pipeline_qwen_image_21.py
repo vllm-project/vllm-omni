@@ -260,7 +260,9 @@ def get_qwen_image_21_pre_process_func(
             # keys, cache preparation and role handoff must not see placeholders.
             prompt["negative_prompt"] = None
         # Image preparation writes into this container. Keep its fields local
-        # to the request, while retaining references to tensor payloads.
+        # to the request, while retaining references to tensor payloads. The
+        # preparation contract is replace-only: assign complete field values;
+        # do not append to or mutate nested caller-owned values in place.
         prompt["additional_information"] = dict(prompt.get("additional_information") or {})
 
         metadata = DiffusionRequestBatch.get_prompt_field(prompt, "qwen_image_21_metadata")
