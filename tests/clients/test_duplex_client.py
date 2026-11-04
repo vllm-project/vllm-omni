@@ -390,6 +390,29 @@ async def test_websocket_handshake_sends_session_update_and_acks_sequenced_event
 
 
 @pytest.mark.asyncio
+async def test_get_session_stats_times_out_when_send_stalls():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        original_send = sock.send
+
+        async def hang(_raw: str) -> None:
+            await asyncio.Event().wait()
+
+        sock.send = hang
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError, match="sending session.stats"):
+            await client.get_session_stats(timeout_s=0.05)
+        assert asyncio.get_running_loop().time() - started < 1.0
+        sock.send = original_send
+        close_task = asyncio.create_task(client.close())
+        await _drain(lambda: "session.close" in sock.sent_types())
+        sock.feed(SESSION_CLOSED)
+        await close_task
+
+
+@pytest.mark.asyncio
 async def test_resync_required_drops_resume_credential():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -1410,6 +1433,20 @@ def test_summarize_session_request_metrics_averages_audio_turns():
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 0.6, "p50": 0.5, "p99": 0.7},
     }
+
+
+def test_summarize_session_request_metrics_counts_turns_with_final_server_stats():
+    summary = summarize_session_request_metrics(
+        [
+            {"busy_rtf": 0.2, "stall_ratio": 0.5, "server_stats_final": True},
+            {"busy_rtf": None, "stall_ratio": None, "server_stats_final": False},
+        ],
+        session_id="sess-1",
+    )
+    # The means cover one turn; the count says so.
+    assert summary["busy_rtf"]["count"] == 1
+    assert (summary["audio_turn_count"], summary["server_stats_final_count"]) == (2, 1)
+    assert "server_stats_final_count" not in summarize_session_request_metrics([{"rtf": 0.5}], session_id="s")
 
 
 def test_summarize_session_request_metrics_includes_client_append_fields():
