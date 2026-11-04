@@ -14,6 +14,9 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # Existing three-step candidate (47d770537); the code default is 10.
+      # Source: models/minicpmo_4_5/minicpmo_4_5_code2wav.py.
+      token2wav_n_timesteps: 3
 
 stages:
   - stage_id: 0
