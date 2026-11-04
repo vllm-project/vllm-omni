@@ -331,6 +331,9 @@ and timesteps. Its request and step paths share this preparation. Lightweight
 preprocessing can recover output dimensions and batch compatibility before the
 worker receives tensors. A denoise-only stage emits packed target latents plus
 this geometry; the decoder reuses the native unpack/denormalize/decode path.
+Qwen preprocessing clears unused raw negative prompts to `None` before batch
+compatibility and cache-input preparation, including on downstream stages.
+This preserves CFG-off ignore semantics across role handoffs.
 
 Native Qwen generator batches share a padded joint sequence layout. The current
 Transformer counts padded prefix slots when positioning image tokens with RoPE,

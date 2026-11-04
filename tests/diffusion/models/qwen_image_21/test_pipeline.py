@@ -585,6 +585,15 @@ def test_negative_conditioning_presence_accepts_explicit_string_batches(true_cfg
     )
 
 
+@pytest.mark.parametrize("true_cfg_scale", ["bad", "1.0", [], {}])
+def test_encode_conditioning_rejects_non_numeric_cfg_scale_before_encoding(mocker, true_cfg_scale):
+    pipeline = _toy_pipeline()
+    encoder = mocker.patch.object(pipeline, "encode_prompt")
+    with pytest.raises(ValueError, match="true_cfg_scale must be a real number"):
+        pipeline._encode_conditioning(["prompt"], None, [], true_cfg_scale, 128)
+    encoder.assert_not_called()
+
+
 @pytest.mark.parametrize("negative_prompt", [[], [None], ["blurry", 1], ("blurry",), 1])
 def test_encode_conditioning_rejects_invalid_negative_prompts_before_encoding(mocker, negative_prompt):
     pipeline = _toy_pipeline()

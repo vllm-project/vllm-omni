@@ -377,7 +377,7 @@ contains normalized latents, and G passes them to `prepare_latents()` with
 | `true_cfg_scale` | 1.0 | Disables the negative-prompt branch by default. Set above 1 with a `negative_prompt` to enable true CFG. Qwen-Image 2.1 supports true CFG only — there is no `guidance_scale` parameter. |
 | `num_inference_steps` | 50 | Number of denoising steps. |
 | `height` / `width` | 1024×1024 | Must be multiples of 32. For image-conditioned requests, leaving them unset derives the output size from the last condition image's aspect ratio at ~1024×1024. |
-| `negative_prompt` | None | Ignored (and not validated) when `true_cfg_scale <= 1`; used and validated only when `true_cfg_scale > 1`. |
+| `negative_prompt` | None | When `true_cfg_scale <= 1`, model preprocessing clears this field to `None` without validating it, before admission, cache preparation and role handoff. Used and validated only when `true_cfg_scale > 1`. HTTP request schemas still apply. |
 | condition images | — | Up to 4 input images per request; more than 4 raises an error. |
 | `seed` | — | Fix for reproducible outputs. |
 
@@ -385,6 +385,11 @@ The default CFG scale of 1.0 runs only the positive-prompt branch at each
 denoising step. To enable negative-prompt guidance, explicitly set
 `--cfg-scale` (offline) or `true_cfg_scale` (API) above 1 and provide a
 negative prompt. This changes the generated output as well as compute cost.
+
+The image HTTP API validates `true_cfg_scale` as a numeric field. Direct Python
+callers must also pass a real number or `None`; model preprocessing rejects
+non-numeric values with `ValueError`, including when receiving an encoded stage
+payload. An omitted scale defaults to 1.0.
 
 ### Prefix KV cache
 

@@ -9,6 +9,7 @@ import logging
 import os
 from collections import OrderedDict
 from collections.abc import Iterable
+from numbers import Real
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -157,6 +158,8 @@ def _should_encode_negative_prompt(true_cfg_scale: float | None, negative_prompt
     An absent negative prompt does not imply an empty/default negative prompt.
     Explicit empty strings do request negative conditioning when CFG is enabled.
     """
+    if true_cfg_scale is not None and not isinstance(true_cfg_scale, Real):
+        raise ValueError("true_cfg_scale must be a real number or None.")
     if true_cfg_scale is None or true_cfg_scale <= 1 or negative_prompt is None:
         return False
     if isinstance(negative_prompt, list):
@@ -175,8 +178,8 @@ def get_qwen_image_21_pre_process_func(
     Reads condition images from ``request.prompt["multi_modal_data"]["image"]``
     (single image or list), resizes them once for both the vision-language
     prompt encoder and the VAE, and stores the results under
-    ``prompt["additional_information"]``. Pure text-to-image requests (no
-    image) pass through unchanged.
+    ``prompt["additional_information"]``. Unused negative prompts are cleared
+    before admission and cross-role handoff, including for text-only requests.
     """
     vae_scale_factor = _read_vae_scale_factor(od_config)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
@@ -237,6 +240,13 @@ def get_qwen_image_21_pre_process_func(
                 raw_image = multi_modal_data.get("img2img")
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
+        encode_negative_prompt = _should_encode_negative_prompt(
+            request.sampling_params.true_cfg_scale, prompt.get("negative_prompt")
+        )
+        if not encode_negative_prompt:
+            # Preserve CFG-off ignore semantics beyond encoding: compatibility
+            # keys, cache preparation and role handoff must not see placeholders.
+            prompt["negative_prompt"] = None
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
@@ -267,7 +277,7 @@ def get_qwen_image_21_pre_process_func(
                 "qwen_image_21",
                 (),
                 request.sampling_params.max_sequence_length,
-                _should_encode_negative_prompt(request.sampling_params.true_cfg_scale, prompt.get("negative_prompt")),
+                encode_negative_prompt,
             )
             request.prompt = prompt
             return request
@@ -317,7 +327,7 @@ def get_qwen_image_21_pre_process_func(
             "qwen_image_21",
             tuple(input_image_sizes),
             request.sampling_params.max_sequence_length,
-            _should_encode_negative_prompt(request.sampling_params.true_cfg_scale, prompt.get("negative_prompt")),
+            encode_negative_prompt,
         )
         request.prompt = prompt
         return request

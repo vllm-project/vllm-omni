@@ -172,6 +172,64 @@ def test_preprocess_defaults_true_cfg_scale(preprocess):
     assert preprocess(request).sampling_params.true_cfg_scale == 4.0
 
 
+@pytest.mark.parametrize("true_cfg_scale", [None, 0.0, 1.0])
+@pytest.mark.parametrize("negative_prompt", ["blurry", [], [None], ("placeholder",), 1, {"unserializable"}])
+def test_preprocess_clears_unused_negative_prompt(preprocess, true_cfg_scale, negative_prompt):
+    request = make_request("cfg-off", [])
+    request.sampling_params.true_cfg_scale = true_cfg_scale
+    request.prompt["negative_prompt"] = negative_prompt
+
+    processed = preprocess(request)
+    reference = preprocess(make_request("no-negative", []))
+
+    assert processed.prompt["negative_prompt"] is None
+    assert processed.batch_compatibility_key == reference.batch_compatibility_key
+    # Even non-serializable placeholders must disappear before role handoff.
+    json.dumps(processed.prompt)
+
+
+@pytest.mark.parametrize("handoff_uses_original_prompt", [False, True])
+@pytest.mark.parametrize(
+    "payload_key", ["qwen_image_21_metadata", "qwen_image_21_conditioning", "_stage_payload_transfer"]
+)
+def test_cfg_off_negative_prompt_is_cleared_across_role_handoff(preprocess, handoff_uses_original_prompt, payload_key):
+    from vllm_omni.model_executor.stage_input_processors.diffusion_disagg import diffusion_stage_handoff
+
+    request = make_request("encode", [])
+    request.prompt["negative_prompt"] = {"unserializable"}
+    original_prompt = dict(request.prompt)
+    encoded = preprocess(request)
+    payload = {"height": 1024, "width": 1024, "input_image_sizes": [], "has_negative_conditioning": False}
+    source = SimpleNamespace(custom_output={payload_key: payload})
+    next_prompt = diffusion_stage_handoff(
+        [source], prompt=original_prompt if handoff_uses_original_prompt else encoded.prompt
+    )[0]
+    if not handoff_uses_original_prompt:
+        assert "negative_prompt" not in next_prompt
+        json.dumps(next_prompt)
+    downstream = make_request("downstream", [])
+    downstream.prompt = next_prompt
+
+    processed = preprocess(downstream)
+
+    assert processed.prompt["negative_prompt"] is None
+    assert processed.prompt[payload_key] is payload
+    assert processed.batch_compatibility_key == encoded.batch_compatibility_key
+    json.dumps(processed.prompt)
+
+
+@pytest.mark.parametrize("true_cfg_scale", ["bad", "1.0", [], {}])
+@pytest.mark.parametrize("encoded", [False, True])
+def test_preprocess_rejects_non_numeric_cfg_scale(preprocess, true_cfg_scale, encoded):
+    request = make_request("bad-cfg", [])
+    request.sampling_params.true_cfg_scale = true_cfg_scale
+    if encoded:
+        request.prompt["qwen_image_21_metadata"] = {"height": 1024, "width": 1024}
+
+    with pytest.raises(ValueError, match="true_cfg_scale must be a real number"):
+        preprocess(request)
+
+
 @pytest.mark.parametrize("size,expected_wider", [((128, 64), True), ((64, 128), False)])
 def test_preprocess_derives_output_size_from_condition_aspect(preprocess, size, expected_wider):
     request = make_request("aspect", [size])
