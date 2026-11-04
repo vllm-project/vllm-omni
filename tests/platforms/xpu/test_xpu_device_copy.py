@@ -11,7 +11,7 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.omni,
-    *hardware_marks(res={"xpu": "B70"}, num_cards=1),
+    *hardware_marks(res={"xpu": "B60"}, num_cards=1),
     pytest.mark.skipif(not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="XPU required"),
 ]
 
