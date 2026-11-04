@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Control of one duplex session: server VAD, and the events that reconfigure it.
+"""Control of one duplex session: server/semantic VAD, and the events that reconfigure it.
 
 Server turn detection and ``session.update`` are the same concern seen from two
 sides. The detector is per-session mutable state, and ``session.update`` is the
@@ -27,17 +27,19 @@ from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_h
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
-from vllm_omni.engine.duplex.session.emitter import SessionEmitter
+from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto_responds
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
 from vllm_omni.engine.duplex.turn_detection import (
     PendingTurnDetectionUpdate,
-    ServerTurnDetector,
+    SemanticVADUnavailableError,
     ServerVADUnavailableError,
     SileroVADBackendProvider,
+    SmartTurnBackendProvider,
     TurnDetectionConfig,
     TurnDetectionResult,
+    TurnDetector,
     apply_turn_detection_result,
 )
 from vllm_omni.protocol.duplex.events import error_event
@@ -61,18 +63,21 @@ class SessionControl:
         self._model = model
         self._wait_for_append_tail = wait_for_append_tail
         self._config: TurnDetectionConfig | None = None
-        self._detector: ServerTurnDetector | None = None
+        self._detector: TurnDetector | None = None
 
     def init_turn_detection(self) -> None:
         turn_detection = self._ctx.session.config.extra_body.get("realtime_turn_detection")
-        if not isinstance(turn_detection, dict) or turn_detection.get("type") != "server_vad":
+        if not isinstance(turn_detection, dict) or turn_detection.get("type") not in ("server_vad", "semantic_vad"):
             self._config = None
             self._detector = None
             return
         try:
             config = TurnDetectionConfig.from_realtime(turn_detection)
+            unsupported = self._semantic_vad_unsupported(config, self._ctx.session.config.extra_body)
+            if unsupported is not None:
+                raise ValueError(unsupported)
             self._config = config
-            self._detector = config.build_detector(self._vad_backend_provider())
+            self._detector = config.build_detector(self._vad_backend_provider(), self._semantic_vad_backend_provider())
         except Exception as exc:
             logger.warning("Duplex session %s: turn detection disabled: %s", self._ctx.session.session_id, exc)
             self._config = None
@@ -86,50 +91,93 @@ class SessionControl:
         """
         return getattr(self._ctx.manager, "vad_backend_provider", None)
 
+    def _semantic_vad_backend_provider(self) -> SmartTurnBackendProvider | None:
+        """The engine-wide Smart Turn backend (``duplex_session.semantic_vad_model_path``)."""
+        return getattr(self._ctx.manager, "semantic_vad_backend_provider", None)
+
+    def _semantic_vad_unsupported(self, config: TurnDetectionConfig | None, extra_body: object) -> str | None:
+        """``semantic_vad`` only decides turn ends, so it needs a session that commits turns.
+
+        An auto-responding (native duplex) session never commits on the
+        detector; there semantic pauses would only hold ``force_listen`` on the
+        model for seconds at a time.
+        """
+        if config is None or config.type != "semantic_vad":
+            return None
+        if session_auto_responds(self._ctx.session.capabilities, extra_body):
+            return "turn_detection.type='semantic_vad' requires a turn-based (committing) session"
+        return None
+
     def reset_vad(self) -> None:
         """Drop the detector's speech state (a barge-in or a clear starts a new turn)."""
         if self._detector is not None:
             self._detector.reset()
 
-    async def run_turn_detection(self, event: dict[str, object]) -> TurnDetectionResult | None:
+    async def run_turn_detection(
+        self, event: dict[str, object]
+    ) -> list[tuple[dict[str, object], TurnDetectionResult | None]]:
         detector = self._detector
         if detector is None:
-            return None
+            return [(event, None)]
         audio = event.get("audio")
         if not isinstance(audio, str) or not audio:
-            return None
+            return [(event, None)]
         fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm_f32le"
         sample_rate_hz = event.get("sample_rate_hz")
         try:
-            result = await self._ctx.services.offload(
-                detector.process,
+            segments = await self._ctx.services.offload(
+                detector.process_segments,
                 audio,
                 fmt=fmt,
                 sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else None,
-                audio_end_ms=event.get("audio_end_ms") if isinstance(event.get("audio_end_ms"), int) else None,
             )
+        except SemanticVADUnavailableError as exc:
+            self._out.emit_error("semantic_vad_unavailable", str(exc))
+            self._detector = None
+            return [(event, None)]
         except ServerVADUnavailableError as exc:
             self._out.emit_error("server_vad_unavailable", str(exc))
             self._detector = None
-            return None
+            return [(event, None)]
         except ValueError as exc:
             self._out.emit_error("bad_audio", str(exc))
-            return None
-        if result.speech_started or result.speech_stopped:
+            return []
+        detected: list[tuple[dict[str, object], TurnDetectionResult | None]] = []
+        for index, segment in enumerate(segments):
+            payload = dict(event, audio=segment.audio, format="pcm_f32le", sample_rate_hz=16000)
+            if index:
+                # Video frames and transcript hints belong to the original
+                # append; splitting its audio must not duplicate them.
+                payload.pop("video_frames", None)
+                payload.pop("transcript", None)
+            self._log_turn_detection(segment.result)
+            apply_turn_detection_result(payload, segment.result)
+            detected.append((payload, segment.result))
+        return detected
+
+    def _log_turn_detection(self, result: TurnDetectionResult) -> None:
+        if (
+            result.speech_started
+            or result.speech_stopped
+            or result.turn_complete_probability is not None
+            or result.semantic_decision is not None
+        ):
             logger.info(
-                "Duplex VAD session=%s started=%s stopped=%s active=%s probability=%.3f "
-                "start_ms=%s end_ms=%s commit=%s",
+                "Duplex VAD session=%s backend=%s started=%s stopped=%s active=%s probability=%.3f "
+                "turn_complete=%s start_ms=%s end_ms=%s commit=%s semantic_decision=%s commit_reason=%s",
                 self._ctx.session.session_id,
+                result.backend,
                 result.speech_started,
                 result.speech_stopped,
                 result.speech_active,
                 result.speech_probability,
+                result.turn_complete_probability,
                 result.audio_start_ms,
                 result.audio_end_ms,
                 result.should_commit,
+                result.semantic_decision,
+                result.commit_reason,
             )
-        apply_turn_detection_result(event, result)
-        return result
 
     # ------------------------------------------------------------------ #
     # Control events                                                     #
@@ -177,6 +225,13 @@ class SessionControl:
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None
             audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
+            if isinstance(item_id, str) and not session.history_item_has_audio(item_id):
+                self._out.emit_error(
+                    "bad_event",
+                    "conversation.item.truncate requires an item that produced audio",
+                    event_id=realtime_event_id,
+                )
+                return
             truncated = (
                 session.truncate_history_item(
                     item_id,
@@ -202,15 +257,15 @@ class SessionControl:
     async def on_session_update(self, payload: dict[str, object], *, realtime_event_id: str | None) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
+        # Staged detectors have not processed audio, so a rejected candidate
+        # needs no cleanup. Upstream dropped PendingTurnDetectionUpdate.reject.
         pending_turn_detection: PendingTurnDetectionUpdate | None = None
-
-        def reject_update() -> None:
-            if pending_turn_detection is not None:
-                pending_turn_detection.reject()
 
         try:
             pending_turn_detection = PendingTurnDetectionUpdate.prepare(
-                payload, backend_provider=self._vad_backend_provider()
+                payload,
+                backend_provider=self._vad_backend_provider(),
+                semantic_backend_provider=self._semantic_vad_backend_provider(),
             )
         except Exception as exc:
             self._out.emit_error("unsupported_turn_detection", str(exc), event_id=realtime_event_id)
@@ -221,13 +276,33 @@ class SessionControl:
                 "session.update was not applied because the preceding append failed",
                 event_id=realtime_event_id,
             )
-            reject_update()
+            return
+        if (
+            pending_turn_detection is not None
+            and (
+                pending_turn_detection.config != self._config
+                or (pending_turn_detection.config is not None and self._detector is None)
+            )
+            and (
+                model_state.input_since_commit
+                or model_state.audio_buffer.has_pending()
+                or model_state.audio_buffer.has_reserved()
+            )
+        ):
+            # A fresh detector cannot reconstruct the turn/pause represented by
+            # buffered audio, including recovery with identical settings after
+            # backend failure. Refuse before adopting any config.
+            self._out.emit_error(
+                "unsupported_turn_detection",
+                "session.update cannot replace or restart turn_detection while input is pending; "
+                "commit or clear input first",
+                event_id=realtime_event_id,
+            )
             return
         try:
             self._ctx.plugin.validate_client_extra_body(payload.get("extra_body"))
         except DuplexRuntimeConfigError as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
-            reject_update()
             return
         candidate_config = deepcopy(session.config)
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
@@ -239,7 +314,19 @@ class SessionControl:
             )
         except DuplexConfigError as exc:
             self._out.emit_error(exc.code, str(exc) or "session.update was rejected", event_id=realtime_event_id)
-            reject_update()
+            return
+        except Exception as exc:
+            # Still before the live session adopts the candidate. A stamped
+            # error means nothing was applied, including a staged detector.
+            self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            return
+        # Also when the update only turns auto_response on under a live semantic_vad.
+        unsupported = self._semantic_vad_unsupported(
+            pending_turn_detection.config if pending_turn_detection is not None else self._config,
+            candidate_config.extra_body,
+        )
+        if unsupported is not None:
+            self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
             return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(
@@ -247,7 +334,6 @@ class SessionControl:
                 "session.update cannot change instructions after the native duplex context is initialized",
                 event_id=realtime_event_id,
             )
-            reject_update()
             return
         requests_audio = any(str(modality).lower() == "audio" for modality in candidate_config.modalities)
         if (
@@ -258,7 +344,6 @@ class SessionControl:
             self._out.emit_error(
                 "ref_audio_required", "Native duplex audio output requires ref_audio", event_id=realtime_event_id
             )
-            reject_update()
             return
         try:
             candidate_runtime_config = self._ctx.plugin.runtime_config_for_update(
@@ -272,23 +357,112 @@ class SessionControl:
             )
         except (DuplexRuntimeConfigError, DuplexConfigError) as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
-            reject_update()
             return
         except Exception as exc:
             self._out.emit_error("runtime_signal_failed", str(exc), event_id=realtime_event_id)
-            reject_update()
             return
-        session.replace_config(candidate_config)
-        session.replace_runtime_config(candidate_runtime_config)
         try:
-            session.touch_lease(DuplexLeaseActivity.SIGNAL)
+            # Projection defaults do not depend on the live config. A failure
+            # here is still a rejection: the session has not adopted anything.
+            projector = self._out.require_projector()
+            projector.apply_session_defaults(payload)
+        except Exception as exc:
+            self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            return
+
+        # Past this point the projector has the new wire defaults. Do not emit
+        # a stamped error: serving would keep the old format and rate.
+        def adopted_session() -> dict[str, object]:
+            # The object serving applies. This is the patch apply_session_defaults
+            # already accepted. Copy so a later mutation cannot rewrite the event.
+            public = dict(payload)
+            public["id"] = session.session_id
+            return public
+
+        def without_turn_detection(public: dict[str, object]) -> dict[str, object]:
+            # Shallow-copy the nested audio maps before dropping turn detection,
+            # so the live payload the projector already read stays intact.
+            public.pop("turn_detection", None)
+            audio = public.get("audio")
+            if isinstance(audio, dict):
+                audio = dict(audio)
+                audio_input = audio.get("input")
+                if isinstance(audio_input, dict):
+                    audio_input = dict(audio_input)
+                    audio_input.pop("turn_detection", None)
+                    audio["input"] = audio_input
+                public["audio"] = audio
+            return public
+
+        previous_config = session.config
+        runtime_adopted = False
+        turn_committed = pending_turn_detection is None
+        try:
+            session.replace_config(candidate_config)
+            session.replace_runtime_config(candidate_runtime_config)
+            runtime_adopted = True
+            try:
+                session.touch_lease(DuplexLeaseActivity.SIGNAL)
+            except Exception:
+                pass
+            if pending_turn_detection is not None:
+                self._config, self._detector = pending_turn_detection.commit(self._detector)
+                turn_committed = True
+            try:
+                public: dict[str, object] = session.as_public_dict()
+            except Exception:
+                logger.exception(
+                    "session.update %s was adopted but its public snapshot failed",
+                    realtime_event_id,
+                )
+                public = adopted_session()
+            self._out.emit({"type": "session.updated", "session": public})
         except Exception:
-            pass
-        if pending_turn_detection is not None:
-            self._config, self._detector = pending_turn_detection.commit(self._detector)
-        projector = self._out.require_projector()
-        projector.apply_session_defaults(payload)
-        self._out.emit({"type": "session.updated", "session": session.as_public_dict()})
+            logger.exception(
+                "session.update %s was adopted but publishing it failed",
+                realtime_event_id,
+            )
+            # replace_config assigns before it can raise. Finish the runtime
+            # config and the staged detector once that assignment happened.
+            # Otherwise the echo would advertise a VAD config that is not live,
+            # and the engine would keep the new config against the old runtime
+            # config. If the runtime replace cannot be finished, put the
+            # previous config back. A staged detector has not processed audio,
+            # so dropping it is enough.
+            if session.config is candidate_config and not runtime_adopted:
+                try:
+                    session.replace_runtime_config(candidate_runtime_config)
+                    runtime_adopted = True
+                except Exception:
+                    logger.exception(
+                        "session.update %s could not finish replacing its runtime config",
+                        realtime_event_id,
+                    )
+                    try:
+                        # Not replace_config: that would count the candidate's
+                        # seed again and bump config_generation a second time.
+                        session.restore_config(previous_config)
+                    except Exception:
+                        logger.exception(
+                            "session.update %s could not restore its previous config",
+                            realtime_event_id,
+                        )
+            if session.config is candidate_config:
+                if pending_turn_detection is not None and not turn_committed:
+                    try:
+                        self._config, self._detector = pending_turn_detection.commit(self._detector)
+                        turn_committed = True
+                    except Exception:
+                        logger.exception(
+                            "session.update %s could not commit its turn detection",
+                            realtime_event_id,
+                        )
+                public = adopted_session()
+                if not turn_committed:
+                    public = without_turn_detection(public)
+            else:
+                public = {"id": session.session_id}
+            self._out.emit({"type": "session.updated", "session": public})
 
     async def _on_conversation_item_create(self, event: dict[str, object]) -> None:
         session = self._ctx.session

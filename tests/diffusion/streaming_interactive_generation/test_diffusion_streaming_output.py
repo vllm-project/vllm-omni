@@ -272,7 +272,6 @@ class TestPipelineStreamingOutputToEntrypoint:
             ):
                 outputs.append(output)
 
-            assert audio_calls == [(None, None), (None, None)]
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id.startswith("req-omni-")
             assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
@@ -355,6 +354,7 @@ class TestPipelineStreamingOutputToEntrypoint:
                     assert done["type"] == "session.done"
                     assert done["chunks"] == 2
 
+            assert audio_calls == [(None, None), (None, None)]
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id
         finally:
@@ -420,8 +420,8 @@ class TestPipelineStreamingOutputToEntrypoint:
         def is_alive(self) -> bool:
             return self._fixture.thread.is_alive()
 
-        async def abort_async(self, request_ids: list[str]) -> None:
-            del request_ids
+        async def abort_async(self, request_ids: list[str], timeout: float = 1.0) -> None:
+            del request_ids, timeout
 
     @classmethod
     def _make_inline_pipeline_client(cls, pipeline: _StepStreamingPipeline) -> InlineStageDiffusionClient:

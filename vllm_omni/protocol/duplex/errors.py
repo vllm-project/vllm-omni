@@ -43,6 +43,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "unsupported_nemotron_duplex_mode": "invalid_request_error",
     "unsupported_native_response_options": "invalid_request_error",
     "runtime_touch_failed": "server_error",
+    "session_stats_disabled": "invalid_request_error",
     "engine_error": "server_error",
     "input_backpressure": "rate_limit_error",
     "output_backpressure": "rate_limit_error",
@@ -76,6 +77,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "tool_call_settlement_failed": "server_error",
     "tool_result_retirement_failed": "server_error",
     "server_vad_unavailable": "server_error",
+    "semantic_vad_unavailable": "server_error",
 }
 
 

@@ -12,6 +12,7 @@ from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
+from vllm.v1.serial_utils import run_method
 
 from vllm_omni.engine.stage_engine_core_proc import (
     StageEngineCoreProc,
@@ -30,6 +31,21 @@ def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
     engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
 
     engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
+
+
+def test_release_reaches_native_data_plane_runner(mocker):
+    """MRv2 sends from the runner, so the release must reach its data plane."""
+    runner = mocker.Mock()
+    worker_wrapper = SimpleNamespace(worker=SimpleNamespace(model_runner=runner))
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = SimpleNamespace(chunk_transfer_adapter=None, _native_data_plane=True)
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=lambda method, args=(): [run_method(worker_wrapper, method, args, {})]
+    )
+
+    engine.omni_release_request_resources(["a", "b"])
+
+    runner.release_omni_shm_resources.assert_called_once_with(["a", "b"])
 
 
 class WrappedUniProcExecutor(UniProcExecutor):
@@ -144,3 +160,22 @@ def test_handshake_wait_is_extended_but_never_shortened(monkeypatch, timeout_s, 
     monkeypatch.setattr(engine_core_module, "HANDSHAKE_TIMEOUT_MINS", 5)
     _extend_handshake_timeout(timeout_s)
     assert engine_core_module.HANDSHAKE_TIMEOUT_MINS == expected_minutes
+
+
+def test_platform_compat_runs_before_engine_construction(monkeypatch):
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    calls = []
+
+    class ConstructionStoppedError(Exception):
+        pass
+
+    def construct(self, *args, **kwargs):
+        calls.append("engine")
+        raise ConstructionStoppedError
+
+    monkeypatch.setattr(module.current_omni_platform, "prepare_stage_engine", lambda: calls.append("platform"))
+    monkeypatch.setattr(EngineCoreProc, "__init__", construct)
+    with pytest.raises(ConstructionStoppedError):
+        StageEngineCoreProc()
+    assert calls == ["platform", "engine"]

@@ -10,7 +10,7 @@ no AR / Mooncake connector) so this stays a cheap ready-path smoke. The DiT is
 sharded across 4 cards on both CUDA and NPU (see the ``platforms.npu`` block in the
 deploy yaml); heavier multi-config / parallel coverage lives in the perf
 (``tests/dfx/perf/tests/test_hunyuan_image_tp*.json``) and reliability
-(``tests/dfx/reliability/test_reliability_hunyuan_image.py``) suites.
+(``tests/dfx/reliability/test_hunyuan_image.py``) suites.
 
 From ``tests/``::
 

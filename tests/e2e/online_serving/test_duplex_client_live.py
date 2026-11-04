@@ -113,7 +113,7 @@ async def _run_live_session(*, url: str, model: str, ref_audio: Path, input_wav:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", CORE_SERVER_PARAMS, indirect=True)
 def test_duplex_client_live_session(omni_server) -> None:
     summary = asyncio.run(
@@ -128,8 +128,10 @@ def test_duplex_client_live_session(omni_server) -> None:
         )
     )
     assert summary["decision"] == "speak", summary
-    assert summary["audio_chunks"] > 0, summary
-    assert summary["played_ms"] > 0, summary
+    audio_chunks = summary["audio_chunks"]
+    played_ms = summary["played_ms"]
+    assert isinstance(audio_chunks, int) and audio_chunks > 0, summary
+    assert isinstance(played_ms, int | float) and played_ms > 0, summary
     assert summary["transcript"], summary
     assert summary["resume_token_issued"] is True, summary
     assert summary["post_resume_heartbeat_ok"] is True, summary

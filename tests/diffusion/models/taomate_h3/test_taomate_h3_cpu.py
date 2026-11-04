@@ -953,8 +953,8 @@ def test_teacher_warm_shapes_cover_the_request_cycle(monkeypatch) -> None:
     """Session-start warming runs one forward per distinct teacher document shape (three)."""
     from types import SimpleNamespace
 
+    from vllm_omni.diffusion.cuda_graph import kwargs_signature
     from vllm_omni.diffusion.models.taomate_h3.audio_teacher import TaoMateAudioTeacher
-    from vllm_omni.diffusion.models.taomate_h3.cuda_graph import kwargs_signature
     from vllm_omni.diffusion.models.taomate_h3.geometry import CanvasGeometry
 
     teacher = TaoMateAudioTeacher(SimpleNamespace(), manager=None, device=torch.device("cpu"))
@@ -1219,7 +1219,7 @@ def test_flush_device_overlap_path_matches_eager_flush_path() -> None:
         assert np.array_equal(frames_overlap, frames_eager)
     # The final chunk must carry the held overlap: one 17-frame window per
     # push, plus the five-frame tail concatenated on the final one.
-    assert [frames.shape[0] for _, frames in eager] == [17, 17 + 5]
+    assert [None if frames is None else frames.shape[0] for _, frames in eager] == [17, 17 + 5]
 
 
 def test_decode_range_device_matches_host_decode_range() -> None:

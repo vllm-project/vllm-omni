@@ -31,6 +31,10 @@ EXCLUDED_MODELS = [
     # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
     # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
     "QwenImage21Pipeline",
+    # Custom DiT/scheduler with a Qwen3.5 encoder; no tiny builder yet.
+    # Covered by tests/diffusion/test_mossimage_*.py and
+    # test_mossimage_registry.py.
+    "MOSSImagePipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
@@ -54,6 +58,9 @@ EXCLUDED_MODELS = [
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
+    # Loads a single upstream model.safetensors + T5Gemma, no diffusers tiny
+    # config; covered by the gated-checkpoint offline/online E2E tests.
+    "StableAudio3Pipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
     "WanT2VDMD2Pipeline",
@@ -99,13 +106,11 @@ EXCLUDED_MODELS = [
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
-    "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
     # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
-    "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "Pi05Pipeline",
@@ -114,6 +119,15 @@ EXCLUDED_MODELS = [
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Segmentation, not generation: the tiny-model suite checks generated
+    # images/videos. Covered by tests/diffusion/models/sam3 and the
+    # /v1/images/segmentations endpoint tests.
+    "Sam3Model",
+    "Sam3VideoModel",
+    # Depth estimation, not generation. Covered by
+    # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
+    # endpoint tests.
+    "VideoDepthAnythingPipeline",
 ]
 
 

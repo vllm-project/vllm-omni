@@ -166,6 +166,11 @@ _DIFFUSION_MODELS = {
         "pipeline_stable_audio",
         "StableAudioPipeline",
     ),
+    "StableAudio3Pipeline": (
+        "stable_audio_3",
+        "pipeline_stable_audio_3",
+        "StableAudio3Pipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
@@ -265,6 +270,25 @@ _DIFFUSION_MODELS = {
         "pi05",
         "pipeline_pi05",
         "Pi05Pipeline",
+    ),
+    # SAM3 image checkpoints report ``Sam3Model``; the released combined
+    # image/video checkpoint reports ``Sam3VideoModel``. Both carry the detector.
+    "Sam3Model": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    "Sam3VideoModel": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    # The released Video Depth Anything repositories hold one .pth and no config;
+    # ``resolve_native_diffusion_model_class`` recognizes them by checkpoint name.
+    "VideoDepthAnythingPipeline": (
+        "video_depth_anything",
+        "pipeline_video_depth_anything",
+        "VideoDepthAnythingPipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -396,11 +420,6 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
-    "HiDreamImagePipeline": (
-        "hidream_image",
-        "pipeline_hidream_image",
-        "HiDreamImagePipeline",
-    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -436,6 +455,11 @@ _DIFFUSION_MODELS = {
         "pipeline_kandinsky6",
         "Kandinsky6TI2VAPipeline",
     ),
+    "MOSSImagePipeline": (
+        "mossimage",
+        "pipeline_mossimage",
+        "MOSSImagePipeline",
+    ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
@@ -461,6 +485,9 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # SAM3 is a single forward pass with no denoising steps to cache.
+    "Sam3Model",
+    "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
     "CausVidWanPipeline",
@@ -527,9 +554,10 @@ def initialize_model(
                 vae_pp_size,
                 od_config.model_class_name,
             )
-        if vae_pp_size > 1 and is_distributed_vae and vae_mode != "batch" and not od_config.vae_use_tiling:
+        # Only tile mode distributes the tiled path's tiles; spatial_shard_* decodes the full frame.
+        if vae_pp_size > 1 and is_distributed_vae and vae_mode == "tile" and not od_config.vae_use_tiling:
             logger.info(
-                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                "vae_patch_parallel_size=%d in tile mode requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
             )
             od_config.vae_use_tiling = True
@@ -562,15 +590,15 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA is supported; other platforms
-    keep the reference implementation. Failures never abort model loading.
+    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
+    platforms keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
     if level == "off" and encode_level == "off":
         return
-    if not current_omni_platform.is_cuda():
-        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+    if not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
+        logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
@@ -723,6 +751,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
@@ -764,12 +793,12 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
-    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
+    "MOSSImagePipeline": "get_mossimage_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -784,6 +813,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,

@@ -123,6 +123,21 @@ class SupportsStepExecution(Protocol):
 
 
 @runtime_checkable
+class SupportsSkipLayerGuidance(Protocol):
+    """Transformer with request-local identity skips for complete DiT blocks.
+
+    Layer IDs are defined by the model. Its forward accepts ``skip_layers``
+    without changing weights, hooks, or other requests' execution state.
+    """
+
+    supports_skip_layer_guidance: ClassVar[bool]
+
+    def validate_skip_layers(self, skip_layers: tuple[int, ...]) -> None:
+        """Reject layer IDs that cannot be skipped by this transformer."""
+        ...
+
+
+@runtime_checkable
 class SupportsComponentDiscovery(Protocol):
     """Declares which submodules serve as pipeline components.
 

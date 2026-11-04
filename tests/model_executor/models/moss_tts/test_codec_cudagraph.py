@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for MossTTSCUDAGraphCodecWrapper numerical equivalence.
 
 Verifies that CUDA Graph-accelerated decoding produces results equivalent
@@ -19,7 +22,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 
 pytestmark = [
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
 ]
 DEVICE = torch.device("cuda:0")
 NUM_QUANTIZERS = 8
