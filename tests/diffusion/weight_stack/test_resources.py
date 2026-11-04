@@ -113,6 +113,18 @@ def test_transfer_moves_entries_and_leaves_source_empty():
     assert _CLOSE_LOG == ["device", "host"]
 
 
+def test_transfer_target_accepts_new_resources_and_closes_them_in_kind_order():
+    source = ResourceLedger()
+    _register(source, "host", ResourceKind.HOST_STORAGE)
+
+    target = source.transfer()
+    _register(target, "device", ResourceKind.DEVICE)
+
+    target.close()
+    # The moved entry keeps its kind, so the new device resource closes first.
+    assert _CLOSE_LOG == ["device", "host"]
+
+
 def test_register_and_transfer_after_transfer_are_rejected():
     source = ResourceLedger()
     source.transfer()
