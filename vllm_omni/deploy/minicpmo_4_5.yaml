@@ -81,6 +81,7 @@ connectors:
       # MINICPMO_TOKEN2WAV_TRT and token2wav_device_spk: false win when both
       # are set.
       token2wav_spk_cpu_reference: true
+      token2wav_n_timesteps: 5
 
 stages:
   - stage_id: 0
