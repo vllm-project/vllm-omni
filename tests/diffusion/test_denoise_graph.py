@@ -28,7 +28,6 @@ from vllm_omni.diffusion.graph import (
     build_denoise_graph_runner,
     invalidate_denoise_graphs,
     release_denoise_graphs_after_denoise,
-    write_through,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -197,6 +196,7 @@ _GATED_SKIP_SOFTMAX = AttentionSpec(
         ({"enable_distributed_layerwise_offload": True}, None),
         ({"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}}, None),
         ({"parallel_config": SimpleNamespace(pipeline_parallel_size=2)}, None),
+        ({"parallel_config": SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=2)}, None),
         ({"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": (1,)}, None),
         ({"diffusion_attention_config": AttentionConfig(default=_GATED_SKIP_SOFTMAX)}, None),
         ({"diffusion_attention_config": AttentionConfig(per_role={"self": _GATED_SKIP_SOFTMAX})}, None),
@@ -237,24 +237,6 @@ def test_multi_rank_xpu_stays_eager(platform, monkeypatch, device_type, multi_ra
     runner = build_denoise_graph_runner(_od_config(), _affine, "T")
 
     assert (runner is None) is refused
-
-
-def test_write_through_reuses_storage_only_when_layout_matches():
-    dst = torch.zeros(2, 3)
-    src = torch.ones(2, 3)
-    assert write_through(dst, src) is dst
-    torch.testing.assert_close(dst, src)
-
-    for other in (torch.ones(3, 2), torch.ones(2, 3, dtype=torch.float64)):
-        assert write_through(dst, other) is other
-    assert write_through(None, src) is src
-
-
-def test_is_capturing_follows_the_platform_on_its_device(platform):
-    assert graph_mod.is_capturing(torch.device("cpu")) is False
-    platform.outer_capture = True
-    assert graph_mod.is_capturing(torch.device("cpu")) is True
-    assert graph_mod.is_capturing(torch.device("meta")) is False
 
 
 @pytest.mark.parametrize(

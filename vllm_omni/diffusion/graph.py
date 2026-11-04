@@ -19,8 +19,8 @@ the pipeline drop the graphs that froze it (:func:`invalidate_denoise_graphs`).
 Safety contract for the step function: a replay re-runs the recorded kernels on
 the captured buffers, so everything the step reads from outside its arguments
 (module attributes, forward context) must keep the same storage while a graph is
-resident, and must not change per step. :func:`write_through` helps with the
-former; the refusals below cover the configurations that break the latter.
+resident, and must not change per step. The refusals below cover the
+configurations that break the latter.
 """
 
 from __future__ import annotations
@@ -47,30 +47,6 @@ DENOISE_GRAPH_MAX_ENTRIES = 2
 # Every live runner in this process, so state owned outside the pipeline (LoRA
 # adapters) can drop the graphs that froze it.
 _RUNNERS: weakref.WeakSet[GraphedForward] = weakref.WeakSet()
-
-
-def write_through(dst: torch.Tensor | None, src: torch.Tensor) -> torch.Tensor:
-    """Write ``src`` into ``dst``'s storage when they match, otherwise return ``src``.
-
-    For state that a graph body reads off a module rather than off its arguments:
-    rebinding such a tensor would leave the replay pointing at a freed
-    allocation, so the buffer has to keep the same storage once its shape has
-    settled. The caller must invalidate its graphs whenever this returns ``src``,
-    because that is the case where the storage did move.
-    """
-    if dst is not None and dst.shape == src.shape and dst.dtype == src.dtype and dst.device == src.device:
-        dst.copy_(src)
-        return dst
-    return src
-
-
-def is_capturing(device: torch.device) -> bool:
-    """Whether a device graph is recording on ``device``'s current stream.
-
-    For host-side checks that read a device tensor (``.item()``, ``bool()``):
-    such a read synchronizes, which a capture rejects.
-    """
-    return device.type == current_omni_platform.device_type and current_omni_platform.is_graph_capturing()
 
 
 class _StepForward(nn.Module):
@@ -169,8 +145,14 @@ def _refusal(od_config: Any) -> str | None:
         # Every strategy (model-level, layerwise, distributed layerwise) and the
         # diffusion_offload_config API: hooks move or all-gather the weights.
         return "CPU offload moves the weights that a captured graph reads"
-    if getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) > 1:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
         return "pipeline parallelism hands intermediate tensors between stages"
+    if getattr(parallel_config, "data_parallel_size", 1) > 1:
+        # Replicas serve different requests, so one can capture a new shape while
+        # another replays; the world-group capture agreement would then pair with
+        # another replica's next collective and hang.
+        return "data parallel replicas capture independently, so the capture agreement across ranks would deadlock"
     return None
 
 
@@ -188,7 +170,8 @@ def _capture_agreement_group() -> torch.distributed.ProcessGroup | None:
 def _multi_rank_refusal(group: torch.distributed.ProcessGroup | None) -> str | None:
     # torch 2.14.0+xpu / oneCCL 2022.1.2: an XPU graph never frees the buffers of
     # the collectives it recorded, so every recapture leaks activation-sized memory
-    # until the device runs out (HunyuanImage3 TP4 dies within a few requests).
+    # until the device runs out (a TP4 + EP DiT on B70 dies within a few requests).
+    # Lift this refusal once the leak is fixed upstream.
     if group is not None and current_omni_platform.device_type == "xpu":
         return "XPU graphs leak the buffers of every captured collective, so a multi-rank DiT runs out of memory"
     return None
