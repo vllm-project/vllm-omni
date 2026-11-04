@@ -694,11 +694,14 @@ before worker delivery state is reset; other sessions remain schedulable. The
 unsupported configurations log a reason and use per-turn requests with ordinary
 prefix caching where available. No separate deployment or session switch is
 required. Commit, playback and VAD policy remain turn-based. A request-owned
-Qwen tokenizer reuses unchanged text prefixes at special-token boundaries;
-history edits fall back to full tokenization. Its lifetime follows the resident
-request epoch, and cancellation joins tokenization before releasing the input
-submission guard. Full prompt snapshots still go through normal multimodal preprocessing before scheduler-side
-prefix validation. `DuplexStagePort.finish_turn` releases only downstream turn
+Qwen input ledger records accepted output tokens. Unchanged history with a
+completed assistant boundary sends only newly processed tokens and media to
+EngineCore; resident feature data is reused there, never replayed from frontend
+cache handles. The engine validates the expected prefix length and salt without
+comparing history hashes. APC and hidden-state prefix replay remain enabled.
+History edits and incompatible boundaries use the full-snapshot fallback.
+The ledger follows the request epoch, and cancellation joins input preparation
+before releasing the submission guard. `DuplexStagePort.finish_turn` releases only downstream turn
 state. Cancel, close and expiry still clean up every owned stage, including the
 resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#resident-thinker-kv-continuation)
 for runner restrictions and fallback behavior.

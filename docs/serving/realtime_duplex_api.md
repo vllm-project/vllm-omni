@@ -77,23 +77,34 @@ work. Budget host RAM for the
 for resident KV.
 
 The Thinker request and its KV allocation survive a completed turn. Each new
-commit still renders the complete current multimodal history. For append-only
-history, a request-owned tokenizer reuses the tokenized prefix ending at a
-Qwen `<|im_start|>` boundary and tokenizes only the remaining suffix. Changes
-to that prefix fall back to full tokenization. The tokenizer is taken from
-the stage input processor, and the cache is discarded with the request epoch.
-All media still pass through the upstream multimodal processor and its cache:
-replaying cached frontend features directly would bypass the coordinated
-sender/receiver cache accesses. This is incremental text token preparation,
-not a delta-only multimodal wire protocol.
-The scheduler compares its block hashes against the resident request: when all
+commit still renders the current history to check that earlier conversation
+content is unchanged. A request-owned input ledger records the actual accepted
+Thinker output token IDs. After a completed `<|im_end|>` turn, if the history and
+rendered assistant text agree with that ledger, only the new text and media
+are processed. The wire request contains only the new tokens and multimodal
+features, plus the expected resident prefix length. The sampled terminator is
+re-injected exactly once because upstream discards the final uncomputed sample.
+Old media features remain owned by EngineCore; both multimodal caches visit
+only the new media. Frontend output processing and downstream prewarm retain
+the complete token context, including the actual previously generated IDs.
+
+The direct-append path validates the resident prefix length and cache salt,
+then extends the existing request without comparing full-history block hashes.
+Prefix caching stays enabled: upstream still maintains block hashes for APC,
+and Omni replays complete cached hidden-state blocks for Talker. The partial
+block tail is recomputed. A missing or stale resident fails only that request.
+
+Changed/pruned history, playback-truncated text, or an unsupported completion
+boundary falls back to full-snapshot processing. Its tokenizer can reuse a
+matching special-token prefix. For this fallback, the scheduler compares block
+hashes against the resident request: when all
 completed blocks match and the new prompt extends them, it retains those KV
 blocks and computes only the partial-block tail and new suffix. Otherwise it
 releases the old allocation and rebuilds from the current prompt. Block hashes
 include multimodal identities and cache salt, so equal audio placeholder tokens
 alone do not authorize reuse.
 
-Internally, the validated snapshot becomes a suffix-only streaming update to
+Internally, both paths become a suffix-only streaming update to
 vLLM's upstream resumable scheduler. It folds the retained token history and
 recomputes new block hashes, rebasing new multimodal features without modifying
 the original snapshot. This does not change the commit-triggered generation

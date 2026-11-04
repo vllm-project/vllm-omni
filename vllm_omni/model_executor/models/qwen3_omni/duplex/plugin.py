@@ -27,7 +27,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
-from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import HISTORY_KEY, QwenIncrementalPrompt
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -1195,6 +1195,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             except (OSError, ValueError):
                 logger.exception("Failed to capture Qwen visual input request=%s", request_id)
         prompt_payload: dict[str, object] = {"prompt": prompt, "multi_modal_data": mm}
+        prompt_payload[HISTORY_KEY] = history
         if remaining_tool_turns is not None:
             # Private write-back for the session after a successful submit.
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns

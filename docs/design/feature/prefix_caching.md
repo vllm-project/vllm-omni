@@ -54,10 +54,15 @@ use fresh per-turn requests, including the MRv2 profile. APC can still reuse
 matching prefixes in that path. Non-CUDA profile overrides disable caching.
 Talker and Code2Wav remain per-turn, with caching disabled.
 
-The resident path uses block hashes to validate
-the resident KV rather than looking those KV blocks up in the shared prefix
-cache. Reuse requires all completed blocks to match; otherwise the old
-allocation is released before rebuilding. The partial block is recomputed.
+The normal resident path appends new tokens and media to the actual generated
+sequence. An input ledger checks unchanged history and the completed assistant
+boundary before preparing a delta. EngineCore validates the resident prefix
+length and salt, without comparing history block hashes. Old materialized media
+remain in the resident request; only new media touch the sender/receiver caches.
+APC stays enabled and upstream maintains hashes for newly completed blocks.
+History changes and incompatible boundaries use the full-snapshot fallback,
+which validates all completed block hashes before retaining their allocation.
+The partial block is recomputed in both paths.
 Stage-output caching remains required to replay complete conditioning rows to
 each fresh downstream speech pipeline. A worker retirement/arrival pair resets
 per-turn delivery state without releasing scheduler-owned matching KV.
