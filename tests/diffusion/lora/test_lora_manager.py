@@ -721,6 +721,7 @@ def test_failed_activation_republishes_no_adapter_moe_mapping(monkeypatch):
 
 def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
     import vllm_omni.diffusion.lora.utils as utils_mod
+    import vllm_omni.lora.binding as binding_mod
 
     class _Runner(torch.nn.Module):
         def __init__(self):
@@ -745,8 +746,8 @@ def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
         def reset_lora(self, *_args, **_kwargs):
             pass
 
-    monkeypatch.setattr(utils_mod, "MoERunner", _Runner)
-    monkeypatch.setattr(utils_mod, "_select_moe_lora_wrapper_cls", lambda: _Wrapper)
+    monkeypatch.setattr(binding_mod, "MoERunner", _Runner)
+    monkeypatch.setattr(binding_mod, "_select_moe_lora_wrapper_cls", lambda: _Wrapper)
 
     wrapper = utils_mod.from_layer_diffusion(
         _Runner(),

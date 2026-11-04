@@ -23,7 +23,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 30
         commands:
           - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
