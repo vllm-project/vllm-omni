@@ -770,9 +770,12 @@ results use their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
 
 The ledger keeps a fingerprint (name plus canonical JSON arguments) of each
-timed-out or cancelled call. `model_channel._expose_function_call` refuses a
-matching call before registering it, so a suppressed repeat uses no call budget
-and arms no timer. The ledger takes the session's `user_turn_seq` only when
+pending, timed-out or cancelled call. A pending call needs this too: Qwen keeps
+tool pairs out of history until a result arrives, so the model sees an unanswered
+question on the next turn and asks again.
+`model_channel._expose_function_call` refuses a matching call before registering
+it, so a suppressed repeat uses no call budget and arms no timer. A repeat of a
+pending call gets no notice, because its result may still arrive. The ledger takes the session's `user_turn_seq` only when
 `tool_retry_policy` is `user_turn` and the model declares
 `clears_tool_block_on_user_commit`, because a commit is not always a user turn:
 JoyAI commits are camera observations and native models free-run. An entry stays

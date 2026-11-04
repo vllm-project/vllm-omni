@@ -262,6 +262,7 @@ async def test_timeout_of_a_preserves_b_and_its_independent_timer(monkeypatch):
     async with open_timed_harness(monkeypatch) as h:
         call_a = await prepare(h)
         h.clock.advance(1.0)
+        decode_a_different_call(h)
         call_b, _ = await expose_function_call(h)
         observed = install_recorder(monkeypatch, h)
         record_b = h.runner.tool_calls.record(call_b)
@@ -587,6 +588,7 @@ async def test_teardown_disposes_pending_and_queued_terminal_calls_once(monkeypa
     async with open_timed_harness(monkeypatch) as h:
         call_a = await prepare(h)
         h.clock.advance(1.0)
+        decode_a_different_call(h)
         call_b, _ = await expose_function_call(h)
         record_a = h.runner.tool_calls.record(call_a)
         record_b = h.runner.tool_calls.record(call_b)
@@ -693,7 +695,7 @@ async def test_string_arguments_are_identical_in_origin_and_wire(monkeypatch):
         await prepare(h)
         captured = []
         real_emit = h.runner.out.emit
-        arguments = '{"x": 1}'
+        arguments = '{"x": 3}'
 
         def emit(payload):
             if payload.get("type") == "function_call.done":
@@ -708,7 +710,7 @@ async def test_string_arguments_are_identical_in_origin_and_wire(monkeypatch):
         call = h.runner.tool_calls.record("structured-call")
         assert call is not None
         assert call.origin.arguments == captured[0]["arguments"] == arguments
-        assert json.loads(call.origin.arguments) == {"x": 1}
+        assert json.loads(call.origin.arguments) == {"x": 3}
 
 
 @pytest.mark.asyncio

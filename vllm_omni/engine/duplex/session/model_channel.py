@@ -1180,8 +1180,13 @@ class ModelChannel:
         )
 
     async def _suppress_function_call(self, call_id: str, name: str, arguments: str, blocked_by: str) -> None:
-        """Refuse a repeat of an abandoned call without exposing or recording it."""
+        """Refuse a repeat without exposing or recording it.
+
+        Only an abandoned call gets a notice: a pending call's result may still
+        arrive, so telling the model it failed would be false.
+        """
         session = self._ctx.session
+        blocker = self._ctx.tool_calls.record(blocked_by)
         self._out.emit(
             {
                 "type": "tool_call.suppressed",
@@ -1190,8 +1195,11 @@ class ModelChannel:
                 "name": name,
                 "arguments": arguments,
                 "blocked_by_call_id": blocked_by,
+                "blocked_by_state": blocker.state.value if blocker is not None else None,
             }
         )
+        if blocker is not None and blocker.is_pending:
+            return
         origin = ToolCallOrigin(
             call_id=call_id,
             epoch=session.epoch,

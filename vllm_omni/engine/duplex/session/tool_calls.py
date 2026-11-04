@@ -35,10 +35,12 @@ terminal together, until close). Exceeding the budget is an explicit failure,
 never an eviction -- evicting a tombstone is exactly the reuse the tombstones
 exist to prevent.
 
-The ledger also stops the model repeating a call that did not complete. A
-timed-out or cancelled call leaves a fingerprint (name plus canonical
-arguments); ``blocked_by`` answers whether a new call repeats one. Whether a
-later user turn lifts that block is the owner's choice, made by passing
+The ledger also stops the model repeating a call that is still pending or did
+not complete. Each call has a fingerprint (name plus canonical arguments), and
+``blocked_by`` answers whether a new call repeats a pending or abandoned one.
+A model that cannot see a pending call in its prompt asks again on the next
+turn, so that block holds until the call settles. Whether a later user turn
+lifts the block on an abandoned call is the owner's choice, made by passing
 ``user_turn_seq``. Exposing the repeat, or not, stays with the caller.
 """
 
@@ -248,6 +250,8 @@ class ToolCallLedger:
         #: Fingerprint -> abandoned call id and the user turn it was abandoned in.
         #: Bounded by ``max_calls``: only a recorded call can add an entry.
         self._abandoned: dict[str, tuple[str, int]] = {}
+        #: Fingerprint -> pending call id, for the same reason and the same bound.
+        self._pending: dict[str, str] = {}
         self._scheduler: TimerScheduler | None = None
         self._closed = False
 
@@ -275,8 +279,11 @@ class ToolCallLedger:
         return tuple(call.origin for call in self._calls.values())
 
     def blocked_by(self, name: str, arguments: str | None) -> str | None:
-        """The abandoned call this one repeats, if a block still applies."""
+        """The pending or abandoned call this one repeats, if a block applies."""
         fingerprint = tool_call_fingerprint(name, arguments)
+        pending = self._pending.get(fingerprint)
+        if pending is not None:
+            return pending
         entry = self._abandoned.get(fingerprint)
         if entry is None:
             return None
@@ -316,6 +323,8 @@ class ToolCallLedger:
         now = self._clock()
         call = ToolCall(origin=origin, deadline=None if self._timeout_s is None else now + self._timeout_s)
         self._calls[origin.call_id] = call
+        if origin.name is not None:
+            self._pending[tool_call_fingerprint(origin.name, origin.arguments)] = origin.call_id
         self._arm(call, now=now)
         return call
 
@@ -482,10 +491,13 @@ class ToolCallLedger:
         call.state = state
         call.reason = reason
         call.settled_epoch = call.admission_epoch if epoch is None else epoch
-        if reason is not None and call.origin.name is not None:
-            seq = self._user_turn_seq() if self._user_turn_seq is not None else 0
+        if call.origin.name is not None:
             fingerprint = tool_call_fingerprint(call.origin.name, call.origin.arguments)
-            self._abandoned[fingerprint] = (call.origin.call_id, seq)
+            if self._pending.get(fingerprint) == call.origin.call_id:
+                del self._pending[fingerprint]
+            if reason is not None:
+                seq = self._user_turn_seq() if self._user_turn_seq is not None else 0
+                self._abandoned[fingerprint] = (call.origin.call_id, seq)
         timer, call.timer = call.timer, None
         if timer is not None:
             timer.cancel()
@@ -509,4 +521,5 @@ class ToolCallLedger:
                 timer.cancel()
         self._calls.clear()
         self._abandoned.clear()
+        self._pending.clear()
         self._closed = True

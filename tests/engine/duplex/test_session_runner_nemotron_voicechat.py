@@ -330,6 +330,7 @@ async def test_call_budget_refuses_new_calls_without_interrupting_pending_result
     async with open_nemotron_harness(monkeypatch, runtime_config=limits) as h:
         call_id = await prepare(h)
         pending = h.runner.tool_calls.record(call_id)
+        decode_a_different_call(h)
         events = []
         for token_id in (20, 7, 21):
             events.extend(await deliver(h, nvc_function_token=[token_id]))

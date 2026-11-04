@@ -236,6 +236,10 @@ def modify_stage_config(
                 # Direct top-level key
                 config[key] = value
 
+    # The copy lives elsewhere, and a relative base_config resolves next to the file.
+    if isinstance(config.get("base_config"), str):
+        config["base_config"] = str((path.parent / config["base_config"]).resolve())
+
     # Unique suffix: multiple modify_stage_config calls in one process often run
     # within the same second (e.g. test_qwen3_omni_expansion imports both
     # get_chunk_config and get_batch_token_config). int(time.time()) would collide

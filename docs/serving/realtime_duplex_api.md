@@ -856,13 +856,16 @@ cannot tell an error string from a result, and would pass it to the model. A
 `client_cancelled` or `client_failed`) and `epoch`. Stop the tool and discard its
 result when this arrives.
 
-**Repeated calls.** A timed-out or cancelled call blocks later calls with the same
-name and arguments, compared as JSON so key order does not matter. A blocked call
-is not published or recorded; the client gets `duplex.tool_call.suppressed`, whose
-`event` body carries `name`, `arguments`, `blocked_by_call_id` and `epoch`. A
-retry with different arguments is not blocked.
+**Repeated calls.** A pending, timed-out or cancelled call blocks later calls with
+the same name and arguments, compared as JSON so key order does not matter. A
+blocked call is not published or recorded; the client gets
+`duplex.tool_call.suppressed`, whose `event` body carries `name`, `arguments`,
+`blocked_by_call_id`, `blocked_by_state` and `epoch`. A retry with different
+arguments is not blocked.
 
-`extra_body.tool_retry_policy` sets when a block lifts. It is fixed at session
+A pending call blocks only until it settles, and the model gets no notice, because
+its result may still arrive. For a timed-out or cancelled call,
+`extra_body.tool_retry_policy` sets when the block lifts. It is fixed at session
 open.
 
 | Value | Meaning |

@@ -87,12 +87,29 @@ def test_fingerprint_ignores_key_order_but_not_values_or_names():
 def test_a_cancelled_call_blocks_its_repeat_for_the_session_by_default():
     ledger, _ = ledger_with()
     ledger.register(origin())
-    assert ledger.blocked_by("get_weather", '{"city":"Taipei","unit":"c"}') is None
 
     assert ledger.cancel("call_a", reason=ToolCallAbandonReason.CLIENT_CANCELLED, epoch=3) is None
 
     assert ledger.blocked_by("get_weather", '{"unit":"c","city":"Taipei"}') == "call_a"
     assert ledger.blocked_by("get_weather", '{"city":"Paris","unit":"c"}') is None
+
+
+def test_a_pending_call_blocks_its_repeat_until_it_settles():
+    user_turns = [4]
+    ledger, _ = ledger_with(user_turn_seq=lambda: user_turns[0])
+    ledger.register(origin())
+    arguments = '{"unit":"c","city":"Taipei"}'
+
+    assert ledger.blocked_by("get_weather", arguments) == "call_a"
+    # A user turn lifts a block on an abandoned call, not on a pending one.
+    user_turns[0] = 5
+    assert ledger.blocked_by("get_weather", arguments) == "call_a"
+    assert ledger.blocked_by("get_weather", '{"city":"Paris","unit":"c"}') is None
+
+    acceptance = ledger.begin_accept("call_a")
+    assert isinstance(acceptance, ToolCallAcceptance)
+    assert ledger.commit_accept(acceptance, epoch=3) is True
+    assert ledger.blocked_by("get_weather", arguments) is None
 
 
 def test_an_accepted_call_does_not_block_its_repeat():
@@ -133,8 +150,10 @@ def test_close_forgets_abandoned_calls():
     ledger, _ = ledger_with()
     ledger.register(origin())
     ledger.cancel("call_a", reason=ToolCallAbandonReason.CLIENT_CANCELLED, epoch=3)
+    ledger.register(origin("call_b", arguments="{}"))
     ledger.close()
     assert ledger.blocked_by("get_weather", '{"city":"Taipei","unit":"c"}') is None
+    assert ledger.blocked_by("get_weather", "{}") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -371,6 +390,21 @@ async def test_a_repeat_is_suppressed_and_not_shown_to_the_client(monkeypatch):
         assert [item["blocked_by_call_id"] for item in suppressed] == [call_id]
         assert not [event for event in events if event.type == "response.function_call_arguments.done"]
         assert len(h.runner.tool_calls) == records
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_of_a_pending_call_is_suppressed_without_a_notice(monkeypatch):
+    async with open_nemotron_harness(monkeypatch) as h:
+        call_id = await prepare(h)
+
+        events = await repeat_call(h)
+
+        suppressed = wire(events, "duplex.tool_call.suppressed")
+        assert [(item["blocked_by_call_id"], item["blocked_by_state"]) for item in suppressed] == [(call_id, "pending")]
+        assert not [event for event in events if event.type == "response.function_call_arguments.done"]
+        assert batches(h) == []
+        assert error_codes(await answer(h, call_id)) == []
+        assert h.runner.tool_calls.record(call_id).state is ToolCallState.ACCEPTED
 
 
 @pytest.mark.asyncio
