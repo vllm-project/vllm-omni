@@ -77,6 +77,11 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             )
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
+        # ET capture enabled via vLLM's flag (getattr: no-op on older vLLM).
+        self._capture_et = getattr(profiler_config, "torch_profiler_execution_trace", False) and not _is_uri_path(
+            self._trace_dir
+        )
+        self.execution_trace_observer = None
         self.profiler = self._create_profiler(profiler_config, activities)
 
     def _rank(self) -> int:
@@ -383,9 +388,27 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._artifact_paths[name] = path
         return path
 
+    def _start_execution_trace(self) -> None:
+        if not self._capture_et or not hasattr(torch.profiler, "ExecutionTraceObserver"):
+            return
+        et_file = self._artifact_path("execution_trace", ".json")
+        self.execution_trace_observer = torch.profiler.ExecutionTraceObserver()
+        self.execution_trace_observer.register_callback(et_file)
+        self.execution_trace_observer.start()
+        if self._rank() == 0:
+            logger.info_once("Execution trace capture enabled: %s", et_file)
+
+    def _stop_execution_trace(self) -> None:
+        if self.execution_trace_observer is None:
+            return
+        self.execution_trace_observer.stop()
+        self.execution_trace_observer.cleanup()
+        self._artifact_paths["execution_trace"] = self.execution_trace_observer.get_output_file_path()
+
     @override
     def _start(self) -> None:
         self._ensure_session_dir()
+        self._start_execution_trace()
         self._try_enable_memory_history()
         self.profiler.start()
 
@@ -393,6 +416,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
     def _stop(self) -> None:
         """Stop profiler, export trace via on_trace_ready, and dump table."""
         self.profiler.stop()
+        self._stop_execution_trace()
         try:
             self._on_stop_hook()
         finally:
@@ -487,6 +511,13 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         if self.dump_cpu_time_total and rank == 0:
             logger.info(self.profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=50))
+
+    @override
+    def shutdown(self) -> None:
+        super().shutdown()
+        # Safety net: cleanup() is idempotent, so this is safe after _stop() too.
+        if self.execution_trace_observer is not None:
+            self.execution_trace_observer.cleanup()
 
     @override
     def annotate_context_manager(self, name: str):
