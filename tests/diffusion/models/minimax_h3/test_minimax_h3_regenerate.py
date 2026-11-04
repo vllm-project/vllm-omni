@@ -80,6 +80,9 @@ def test_adapter_fuses_every_lora_into_the_native_layout(tmp_path):
     lora = _write_bundle(tmp_path)
     adapter = _load(tmp_path)
     assert adapter is not None
+    # This CPU test reconstructs real deltas on the host.
+    # Production fusion selects the serving accelerator for checkpoint loading.
+    adapter.fusion._device = torch.device("cpu")
 
     def delta(prefix, target):
         return lora[f"{prefix}{target}.lora_B.weight"] @ lora[f"{prefix}{target}.lora_A.weight"]
