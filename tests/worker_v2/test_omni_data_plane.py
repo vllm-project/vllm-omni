@@ -55,6 +55,7 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_terminal_pending=set(),
         _deferred_shm_releases=set(),
         _async_chunk=True,
+        _can_send=True,
         _pending_full_payload_send={},
         _put_req_chunk=defaultdict(int),
         _ramp_chunk_count=defaultdict(int),
@@ -647,7 +648,15 @@ def test_native_worker_capacity_error_cache_and_tp_gates():
 
 @pytest.mark.parametrize(
     "publication,can_send",
-    [("worker", True), ("worker", False), ("inline", True), ("inline", False), ("legacy", False)],
+    [
+        ("worker", True),
+        ("worker", False),
+        ("inline", True),
+        ("inline", False),
+        ("direct", True),
+        ("direct", False),
+        ("legacy", False),
+    ],
 )
 @pytest.mark.parametrize("pooler_kind", ["alias", "shallow_copy", "independent"])
 def test_native_publication_omits_only_transported_pooler_payload(
@@ -690,6 +699,9 @@ def test_native_publication_omits_only_transported_pooler_payload(
             result = worker.submit(source, plane).get_output()
         finally:
             worker.close()
+    elif publication == "direct":
+        plane.publish_output(output)
+        result = output
     else:
         runner = object.__new__(OmniGPUModelRunner)
         runner._omni_data_plane = None if publication == "legacy" else plane
