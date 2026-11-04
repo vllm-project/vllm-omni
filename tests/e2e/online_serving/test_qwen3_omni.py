@@ -24,8 +24,8 @@ _MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
-# The production YAML turns the Thinker (stage 0) prefix cache on and the CI
-# overlay inherits it; these args also enable it on the Talker and pin the
+# The production YAML leaves the Thinker prefix cache off with model runner
+# v2. These args turn it back on for the Thinker and Talker and pin the
 # block size. CI overlay pins ``async_chunk: False``; the existing server
 # keeps ``--no-async-chunk``. Production Qwen YAML is ``async_chunk: true``,
 # so a sibling server boots with ``--async-chunk`` and the same cache

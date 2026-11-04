@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 from inspect import Parameter, signature
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -394,6 +394,58 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
     assert not hasattr(omni_config, "pipeline")
     assert "hf_config_predicate" in {f.name for f in fields(PipelineConfig)}
     assert omni_config.pipeline_config.hf_config_predicate is pipeline.hf_config_predicate
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "minicpmo_4_5.yaml",
+        "minicpmo_4_5_turn.yaml",
+        "minicpmo_4_5_turn_mrv2.yaml",
+        "minicpmo_4_5_turn_mrv2_h200.yaml",
+    ],
+)
+@pytest.mark.parametrize("cli_prefix", [None, "", "stage_0_"], ids=["defaults", "global-cli", "stage-cli"])
+def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_prefix, monkeypatch):
+    from vllm_omni import platforms
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    # Select CUDA before resolving a fresh deploy; the production merge applies its overlay once.
+    monkeypatch.setattr(platforms.current_omni_platform, "device_name", "cuda")
+    monkeypatch.setattr(platforms.current_omni_platform, "device_type", "cuda")
+    cli = None
+    if cli_prefix is not None:
+        cli = {
+            cli_prefix + "kernel_config": {
+                "ir_op_priority": {"rms_norm": ["native"], "fused_add_rms_norm": ["native"]}
+            },
+            cli_prefix + "compilation_config": {
+                "custom_ops": ["none"],
+                "pass_config": {"enable_qk_norm_rope_fusion": False},
+            },
+        }
+    config = _from_pipeline_key("minicpmo_4_5", deploy_config_path=str(_DEPLOY_DIR / filename), cli_overrides=cli)
+    args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+    resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
+
+    if cli_prefix is not None:
+        assert resolved.kernel_config.ir_op_priority.rms_norm == ["native"]
+        assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["native"]
+        assert resolved.compilation_config.custom_ops == ["none"]
+        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is False
+    elif filename == "minicpmo_4_5.yaml":
+        assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
+        assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
+        assert resolved.compilation_config.custom_ops == ["none", "+silu_and_mul", "+rotary_embedding"]
+        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is True
+        assert resolved.compilation_config.pass_config.fuse_norm_quant is False
+        assert resolved.compilation_config.pass_config.fuse_act_quant is False
+    else:
+        defaults = OmniEngineArgs(model="test-model")
+        assert asdict(resolved.kernel_config) == asdict(defaults.kernel_config)
+        assert asdict(resolved.compilation_config) == asdict(defaults.compilation_config)
 
 
 def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
@@ -1119,6 +1171,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "runtime_config",
         "parallel_config",
         "compilation_config",
+        "kernel_config",
         "profiler_config",
         "quantization_config",
         # Stage-level speculative_config is passed straight through to the
@@ -2633,3 +2686,34 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+def test_kernel_config_mapping_has_a_typed_owner_and_projects_to_engine_args():
+    from vllm.config import KernelConfig
+
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={"kernel_config": {"ir_op_priority": {"rms_norm": ["vllm_c", "native"]}}},
+            )
+        ]
+    )
+    stage_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+
+    assert isinstance(stage_config.kernel_config, KernelConfig)
+    assert stage_config.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
+    projected = _project_omni_stage_engine_args(stage_config)
+    assert projected["kernel_config"] == stage_config.kernel_config
+    assert projected["kernel_config"] is not stage_config.kernel_config
+
+
+def test_kernel_config_mapping_rejects_unknown_upstream_fields():
+    with pytest.raises(ValidationError):
+        VllmOmniARStageConfig(
+            stage_pipeline_config=_resolve_pipeline_or_skip("qwen3_tts").stages[0],
+            kernel_config={"unknown_kernel_option": True},
+        )
