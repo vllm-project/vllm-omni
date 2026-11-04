@@ -121,15 +121,17 @@ def test_plain_chat_handoff_after_a_prefix_hit_has_no_rows_for_the_cached_prompt
     torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17)]))
 
 
-def test_plain_chat_handoff_without_reply_rows_hands_over_nothing() -> None:
-    """A Thinker that stopped at its first token has no row at or after the reply's position."""
+@pytest.mark.parametrize("repeat", [1, 2], ids=["v1", "mrv2_both_channels"])
+def test_plain_chat_handoff_without_reply_rows_is_an_empty_condition(repeat) -> None:
+    """A Thinker that stopped at its first token has no reply rows; the Talker finishes such a request."""
     prompt_ids, output_ids = [101, 102], [11]
 
-    info = llm2tts([_ledger_output(prompt_ids, output_ids, [(101, 0), (102, 1)] * 2)], prompt=[{}])[0][
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, [(101, 0), (102, 1)] * repeat)], prompt=[{}])[0][
         "model_intermediate_buffer"
     ]
 
-    assert "tts" not in info.get("ids", {})
+    assert info["ids"]["tts"] == []
+    assert torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])).numel() == 0
 
 
 def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:
