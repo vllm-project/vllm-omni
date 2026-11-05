@@ -16,6 +16,7 @@ import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -39,7 +40,12 @@ except ModuleNotFoundError:  # pragma: no cover - vllm-less dev machines
     class AdditionalInformationPayload:  # noqa: D101 - stub only
         pass
 
+    # Mirrors vllm_omni.engine.PayloadSenderInfo (added upstream in
+    # #6883): output.py imports the name and uses it as a field type.
+    PayloadSenderInfo = dict[str, Any] | bytes
+
     _engine.AdditionalInformationPayload = AdditionalInformationPayload
+    _engine.PayloadSenderInfo = PayloadSenderInfo
     sys.modules["vllm_omni.engine"] = _engine
 
     @dataclass
