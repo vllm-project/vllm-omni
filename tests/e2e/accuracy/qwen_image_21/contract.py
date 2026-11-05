@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 MODEL_ID = "Qwen/Qwen-Image-2.1"
-REFERENCE_REVISION = "6256aa7666cedd47443adc8f82da9a10e110b09c"
+REFERENCE_REVISION = "2a1433913c7044f34fa4767dd84b28bba0bb0ecf"
 REFERENCE_TORCHAO_VERSION = "0.16.0"
 ROOT = Path(__file__).resolve().parents[4]
 EXECUTION_SETTINGS = {
