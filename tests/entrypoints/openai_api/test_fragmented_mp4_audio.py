@@ -202,24 +202,28 @@ def test_audio_video_chunk_tail_is_flushed_without_timestamp_drift() -> None:
 
 
 @pytest.mark.parametrize("cut", [1, 64, 256, 1024])
-def test_finalize_truncated_audio_video_stream_is_best_effort(cut: int) -> None:
+@pytest.mark.parametrize("with_audio", [False, True], ids=["video-only", "audio-video"])
+def test_finalize_truncated_audio_video_stream_is_best_effort(cut: int, with_audio: bool) -> None:
     encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
-    streamed = encoder.encode(_frames(34), _sine(34 * 32000 // 24), audio_sample_rate=32000)
+    streamed = encoder.encode(_frames(34), _sine(34 * 32000 // 24) if with_audio else None, audio_sample_rate=32000)
     streamed += encoder.close()
     truncated = streamed[:-cut]
     saved = finalize_streaming_video_bytes(truncated, input_format="m4s", fps=24)
     assert saved
     with av.open(io.BytesIO(saved)) as container:
-        assert len(container.streams.video) == len(container.streams.audio) == 1
+        assert len(container.streams.video) == 1
+        assert len(container.streams.audio) == int(with_audio)
 
 
-def test_finalize_nonmonotonic_fragment_timestamps_returns_received_bytes() -> None:
+@pytest.mark.parametrize("with_audio", [False, True], ids=["video-only", "audio-video"])
+def test_finalize_nonmonotonic_fragment_timestamps_returns_received_bytes(with_audio: bool) -> None:
     encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
-    streamed = encoder.encode(_frames(34), _sine(34 * 32000 // 24), audio_sample_rate=32000)
+    streamed = encoder.encode(_frames(34), _sine(34 * 32000 // 24) if with_audio else None, audio_sample_rate=32000)
     streamed += encoder.close()
     damaged = bytearray(streamed)
     offset = 0
     changed = 0
+    kept_nonzero = False
     while True:
         offset = damaged.find(b"tfdt", offset)
         if offset < 0:
@@ -228,8 +232,13 @@ def test_finalize_nonmonotonic_fragment_timestamps_returns_received_bytes() -> N
         width = 8 if damaged[offset + 4] == 1 else 4
         start = offset + 8
         if int.from_bytes(damaged[start : start + width], "big"):
-            damaged[start : start + width] = bytes(width)
-            changed += 1
+            # Retain an early positive time so one-packet video fragments also
+            # regress, rather than merely repeating the initial zero DTS.
+            if not kept_nonzero:
+                kept_nonzero = True
+            else:
+                damaged[start : start + width] = bytes(width)
+                changed += 1
         offset += 4
     assert changed > 1
     received = bytes(damaged)

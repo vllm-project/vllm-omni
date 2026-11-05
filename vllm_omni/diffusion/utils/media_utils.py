@@ -435,7 +435,15 @@ def finalize_streaming_video_bytes(
     fps: float = 25.0,
     video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
-    """Convert streamed video bytes into a progressive MP4 for local playback."""
+    """Save a progressive MP4 while preserving encoded packets and timestamps.
+
+    By default, both video-only and audio/video streams are remuxed without
+    decoding or re-encoding; ``fps`` does not retime the received stream.
+    For video-only streams, explicitly passing ``video_codec_options`` (even
+    an empty dict) retains the opt-in re-encoding path at ``fps``. Audio/video
+    streams always preserve both tracks, as before. On demux/remux failure,
+    retain the received bytes for best-effort playback.
+    """
     if not video_bytes:
         return video_bytes
 
@@ -447,8 +455,8 @@ def finalize_streaming_video_bytes(
 
     try:
         with cast(Any, av.open(io.BytesIO(video_bytes), format=demux_format)) as container:
-            if container.streams.audio:
-                # Preserve both compressed tracks and their timestamps when saving.
+            if container.streams.audio or video_codec_options is None:
+                # Preserve compressed tracks and their timestamps when saving.
                 playback_buffer = io.BytesIO()
                 media_streams = [stream for stream in container.streams if stream.type in ("video", "audio")]
                 with cast(Any, av.open(playback_buffer, mode="w", format="mp4")) as output:
