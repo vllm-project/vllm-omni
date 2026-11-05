@@ -4,7 +4,10 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 ## Notes
 
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`,
+`openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`,
+`openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends.
+It also adds the `omniinteract` and `full-duplex-bench` datasets.
 
 `openai-chat-omni` retries explicit `ServiceUnavailableError` responses with
 code 503 up to three times, provided no text, reasoning, tool, audio, or image
@@ -40,7 +43,8 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
 
 - `--dataset-name`
   The name of the dataset used; `random-mm` generates random multimodal inputs (images, videos, audio),
-  `omniinteract` replays official OmniInteract videos, and `videomme` loads Video-MME MCQ videos
+  `omniinteract` replays official OmniInteract videos, `full-duplex-bench` replays local
+  Full-Duplex-Bench v1.0/v1.5 audio, and `videomme` loads Video-MME MCQ videos
   (`lmms-eval/Video-MME`, MiniCPM OmniEvalKit packing).
 
 - `--num-prompts`
@@ -300,6 +304,51 @@ Notes:
 We use audio generation time / audio duration to calculate RTF.
 
 </details>
+
+### Full-Duplex-Bench Native Realtime Replay
+
+`full-duplex-bench` streams the official v1.0 or v1.5 audio into one native
+`/v1/realtime` session per benchmark session. It measures serving performance;
+it does not run the Full-Duplex-Bench ASR or quality evaluators.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name full-duplex-bench \
+  --dataset-path /path/to/Full-Duplex-Bench/dataset \
+  --fdb-version 1.5 --fdb-max-per-subset 2 \
+  --fdb-ref-audio /path/to/reference.wav \
+  --num-prompts 8 --disable-shuffle --max-concurrency 1 \
+  --num-warmups 0 --ready-check-timeout-sec 0 \
+  --save-result --result-dir ./fdb-runs
+```
+
+`--dataset-path` may point directly at a version directory containing the
+subset directories, or at its parent containing `v1.0/` and `v1.5/`.
+`--fdb-subsets` and `--fdb-sample-ids subset/sample ...` select exact inputs;
+`--fdb-max-per-subset` takes the first N samples in natural numeric order.
+`--num-prompts` remains the global session cap over that candidate pool. Unless
+`--disable-shuffle` is set, source samples are shuffled with `--seed`.
+
+Every v1.0 source sample produces one session from `input.wav`. Every v1.5
+source pair produces two adjacent sessions, first `input.wav` (overlap) and
+then `clean_input.wav` (control). Accordingly, `--num-prompts` counts sessions
+and must be even for v1.5; `0` selects all complete pairs. Pair selection and
+shuffling happen before expansion, so a run never drops one half of a pair.
+The default is two sessions and one concurrent session.
+
+The adapter uses the same realtime pacing, commit/drain behavior, playback
+acknowledgements and server session metrics as the native duplex serving
+benchmark. `--fdb-turn-detection none` is the default for MiniCPM-o. Reference
+audio is encoded once and shared by all sessions. Each invocation creates a
+new `run-*` artifact directory under `--result-dir`, containing per-session
+response metadata and `duplex_metrics.json`. If `--result-dir` is omitted,
+artifacts default to `full-duplex-bench-output/`. Standard TTFT, audio TTFP and
+per-response RTF use the backend-provided response metrics when present;
+separately named `duplex_client_*` and `duplex_stream_*` fields retain
+client-observed timing.
 
 ### Omni-DuplexEval Realtime Benchmark
 
