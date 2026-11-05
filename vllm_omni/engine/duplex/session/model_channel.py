@@ -215,9 +215,7 @@ class ModelChannel:
     ) -> dict[str, object]:
         session = self._ctx.session
         response_config = session.response_config
-        if (
-            not session.capabilities.supports_core_resumable_request or session.capabilities.supports_turn_commit_only
-        ) and self.should_commit_response_to_history(session, response_id):
+        if session.capabilities.commits_turns and self.should_commit_response_to_history(session, response_id):
             # Committed-turn models can receive the next utterance before the
             # speaker drains. Reserve the response's chronological slot now;
             # an ACK fills it later without moving it past newer user input.
@@ -345,9 +343,9 @@ class ModelChannel:
         operation_started = False
         stage_id = self._ctx.plugin.input_stage_id(payload)
         resumable = session.capabilities.supports_core_resumable_request and (
-            stage_id == 0 or not session.capabilities.supports_turn_commit_only
+            stage_id == 0 or not session.capabilities.commits_turns
         )
-        turn_continuation = resumable and session.capabilities.supports_turn_commit_only
+        turn_continuation = resumable and session.capabilities.resident_turn_entry
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
         # Bump turn_id and open a fresh ephemeral request instead.
@@ -745,12 +743,7 @@ class ModelChannel:
         # stays true for plugins; the projector object keeps the source finished flag.
         # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
         source_finished = bool(getattr(output, "finished", False))
-        capabilities = self._ctx.session.capabilities
-        if (
-            capabilities.supports_core_resumable_request
-            and capabilities.supports_turn_commit_only
-            and item.context.segment_finished
-        ):
+        if self._ctx.session.capabilities.resident_turn_entry and item.context.segment_finished:
             source_finished = True
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
@@ -1017,9 +1010,9 @@ class ModelChannel:
         if not isinstance(request_id, str) or not request_id:
             return
         session = self._ctx.session
-        if session.capabilities.supports_core_resumable_request and not session.capabilities.supports_turn_commit_only:
+        if not session.capabilities.commits_turns:
             return
-        if session.capabilities.supports_core_resumable_request:
+        if session.capabilities.resident_turn_entry:
             await self._ctx.stage_port.finish_turn(request_id)
             for key in list(session.request_resources):
                 if key[0] != 0 and key[1] == request_id:
@@ -1268,10 +1261,7 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
-            if model_result.get("end_of_turn") is True and (
-                not session.capabilities.supports_core_resumable_request
-                or session.capabilities.supports_turn_commit_only
-            ):
+            if model_result.get("end_of_turn") is True and session.capabilities.commits_turns:
                 # A failed ephemeral turn owns the same stage resources as a
                 # successful one. Release them before accepting another turn.
                 self._complete_model_turn_without_output(
@@ -1855,7 +1845,7 @@ class ModelChannel:
         # resident. Only native streaming requests may continue decoding here.
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
-        if not session.capabilities.supports_core_resumable_request or session.capabilities.supports_turn_commit_only:
+        if session.capabilities.commits_turns:
             # While stage0 is still producing, closing here clears
             # active_request_id and the later final cannot own the stream.
             # A finished segment may close only when that same request is still

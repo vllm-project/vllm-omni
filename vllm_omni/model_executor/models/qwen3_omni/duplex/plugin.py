@@ -45,9 +45,11 @@ logger = init_logger(__name__)
 #: the engine and this one in the deploy config; the prompt is the only place
 #: that can keep them from drifting apart into a rejected submission.
 MAX_PROMPT_IMAGES = 8
-# Same window ``prepare_prompt_config`` keeps. Anchors older than this cannot
-# still point at a message the next prompt will retain.
-_TOOL_ANCHOR_WINDOW = 16
+#: ``prepare_prompt_config``'s history window. Turn deltas and tool anchors
+#: are valid only while the next full prompt would retain the same context.
+_HISTORY_MESSAGE_WINDOW = 16
+_MAX_PROMPT_AUDIOS = 4
+_MAX_PROMPT_AUDIO_BYTES = 8 * 1024 * 1024
 
 
 def _anchored_history_len(
@@ -73,7 +75,7 @@ def _anchored_history_len(
 
 def _split_call_anchors(anchors: Mapping[str, object], *, history_len: int) -> tuple[dict[str, int], list[str]]:
     """Keep anchors inside the prompt window. The rest were published and expired."""
-    floor = history_len - _TOOL_ANCHOR_WINDOW
+    floor = history_len - _HISTORY_MESSAGE_WINDOW
     kept: dict[str, int] = {}
     expired: list[str] = []
     for key, value in anchors.items():
@@ -883,12 +885,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return False
         if extra_body.get("realtime_tools"):
             return False
-        return history_length <= 16 and (
+        return history_length <= _HISTORY_MESSAGE_WINDOW and (
             not payload.get("audio")
             or (
-                len(state.audio_history) < 4
+                len(state.audio_history) < _MAX_PROMPT_AUDIOS
                 and sum(len(value.get("audio", "")) for _, value in state.audio_history) + len(payload.get("audio", ""))
-                <= 8 * 1024 * 1024
+                <= _MAX_PROMPT_AUDIO_BYTES
             )
         )
 
@@ -935,9 +937,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             state.audio_history.append((tuple(current_contents), payload))
         # Reserve one of the four audio slots for the actual submitted input,
         # including when deferred input has no trailing user history entry.
-        history_limit = 4 if current_is_in_history or not has_audio else 3
+        history_limit = _MAX_PROMPT_AUDIOS if current_is_in_history or not has_audio else _MAX_PROMPT_AUDIOS - 1
         retained = state.audio_history[-history_limit:]
-        while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > 8 * 1024 * 1024:
+        while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > _MAX_PROMPT_AUDIO_BYTES:
             retained.pop(0)
         state.audio_history = retained
         # Match the official demo's unit of history: consecutive user items
@@ -954,7 +956,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         for index, turn in turns:
             # Keep the existing recent-message window, rounded outwards to a
             # complete turn. Never retain an answer whose input was cut off.
-            if index + len(turn) <= len(history) - 16:
+            if index + len(turn) <= len(history) - _HISTORY_MESSAGE_WINDOW:
                 continue
             if turn[0].get("role") == "assistant":
                 continue

@@ -14,6 +14,7 @@ import contextlib
 import math
 import os
 import signal
+from concurrent.futures import Future
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -190,20 +191,23 @@ class StageEngineCoreProc(EngineCoreProc):
             except Exception as e:
                 logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
 
-    def omni_finish_turn(self, request_id: str) -> None:
+    def omni_finish_turn(self, request_id: str) -> Future[None] | None:
         """Acknowledge turn transport retirement while retaining paused KV.
 
         The orchestrator has stopped downstream consumers. Reject retirement
         of a still-running producer, and propagate failures to prevent ID reuse.
+        The SHM unlink runs on the save thread; returning its future lets the
+        utility reply after completion without stalling this engine loop.
         """
         request = self.scheduler.requests.get(request_id)
         if request is not None and request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
             raise RuntimeError(f"Cannot retire an unfinished turn: {request_id}")
         adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
         if adapter is not None:
-            adapter.release_shm_resources(request_id, wait=True)
-        elif getattr(self.scheduler, "_native_data_plane", False):
+            return adapter.release_shm_resources(request_id, wait=True)
+        if getattr(self.scheduler, "_native_data_plane", False):
             self.model_executor.collective_rpc(_finish_runner_turn, args=(request_id,))
+        return None
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

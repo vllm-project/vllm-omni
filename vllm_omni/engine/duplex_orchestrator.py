@@ -109,7 +109,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         capabilities = plugin.capabilities(max_sessions=duplex_session_config.max_sessions)
-        if capabilities.supports_core_resumable_request and capabilities.supports_turn_commit_only:
+        if capabilities.resident_turn_entry:
             config = self.stage_pools[0].stage_vllm_config
             unsupported = [
                 reason
@@ -281,8 +281,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             output.finished = False
         finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
         if (
-            capabilities.supports_core_resumable_request
-            and capabilities.supports_turn_commit_only
+            capabilities.resident_turn_entry
             and stage_id > 0
             and stage_id == req_state.final_stage_id
             and finished
@@ -322,12 +321,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
-        if (
-            capabilities.supports_core_resumable_request
-            and capabilities.supports_turn_commit_only
-            and stage_id == 0
-            and finished
-        ):
+        if capabilities.resident_turn_entry and stage_id == 0 and finished:
             req_state.turn_entry_finished = True
             pending = req_state.pending_turn_terminal
             req_state.pending_turn_terminal = None
@@ -440,7 +434,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> bool:
         if not req_state.session_owned:
             return False
-        # Resumable resident Stage0: stage failure closes the session.
+        # Resumable resident Stage0: stage failure closes the session. A resident
+        # Qwen Thinker shares its ID with every downstream stage of the turn, so
+        # even a Talker/Code2Wav failure aborts its KV and closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
         close_session = (
             not duplex_is_auxiliary_request(req_id)
@@ -644,9 +640,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     def _upgrade_processed_stage_request(self, request, raw_prompt):
         request = super()._upgrade_processed_stage_request(request, raw_prompt)
         capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
-        if (
-            not capabilities.supports_core_resumable_request or capabilities.supports_turn_commit_only
-        ) and not isinstance(request, OmniEngineCoreRequest):
+        if capabilities.commits_turns and not isinstance(request, OmniEngineCoreRequest):
             request = OmniEngineCoreRequest.from_request(request)
         return request
 
@@ -667,8 +661,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
         if (
             stage_id == 0
-            and capabilities.supports_core_resumable_request
-            and capabilities.supports_turn_commit_only
+            and capabilities.resident_turn_entry
             and isinstance(state, DuplexOrchestratorRequestState)
             and isinstance(prompt, dict)
             and isinstance(prompt.get("prompt"), str)
@@ -911,13 +904,21 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if not isinstance(state, DuplexOrchestratorRequestState):
             return
         state.turn_resources_released = False
-        for stage_id, pool in enumerate(self.stage_pools[1:], 1):
-            await pool.abort_requests([request_id])
-            pool.output_processor.remove_request(request_id)
-        # Unlike final request cleanup, this must be acknowledged: a delayed
-        # best-effort prefix release could unlink the next turn's same-ID chunks.
-        for pool in self.stage_pools:
-            await pool.finish_turn(request_id)
+        try:
+            for stage_id, pool in enumerate(self.stage_pools[1:], 1):
+                await pool.abort_requests([request_id])
+                pool.output_processor.remove_request(request_id)
+            # Unlike final request cleanup, this must be acknowledged: a delayed
+            # best-effort prefix release could unlink the next turn's same-ID chunks.
+            for pool in self.stage_pools:
+                await pool.finish_turn(request_id)
+        except Exception as exc:
+            # The resident ID can never be reused safely after an unacknowledged
+            # retirement. Fail closed through the resident-stage failure path.
+            logger.warning("Resident turn retirement failed for %s: %s", request_id, exc)
+            if self.request_states.get(request_id) is state:
+                await self._handle_forward_failure(request_id, 0, state, exc)
+            return
         if self.request_states.get(request_id) is not state:
             return
         for stage_id, pool in enumerate(self.stage_pools[1:], 1):

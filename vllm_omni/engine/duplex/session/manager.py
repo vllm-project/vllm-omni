@@ -543,7 +543,7 @@ class DuplexSessionManager:
             return None
         effective_fence = fence or session.fence
         resumable = session.capabilities.supports_core_resumable_request and (
-            stage_id == 0 or not session.capabilities.supports_turn_commit_only
+            stage_id == 0 or not session.capabilities.commits_turns
         )
         request_id = self.stage_request_id(effective_fence, stage_id=stage_id, resumable=resumable)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)

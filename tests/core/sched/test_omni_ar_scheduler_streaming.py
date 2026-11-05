@@ -31,6 +31,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreRequestType, FinishRea
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.engine import token_prefix_digest
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -236,6 +237,7 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     update = StreamingUpdate.from_request(fresh)
     if change == "delta":
         update.append_prefix_length = 35
+        update.append_prefix_digest = token_prefix_digest(tokens[:35])
         update.prompt_token_ids = tokens[35:]
         update.mm_features = [replace(features[-1], mm_position=replace(features[-1].mm_position, offset=5))]
         update.block_hashes = ()

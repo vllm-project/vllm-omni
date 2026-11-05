@@ -29,7 +29,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput, token_prefix_digest
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
@@ -1835,7 +1835,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _resume_from_turn_delta(self, session: Request, update: StreamingUpdate) -> None:
         """Append to the actual resident sequence without comparing history hashes."""
         confirmed = self._get_confirmed_num_computed_tokens(session)
-        if update.append_prefix_length != confirmed or update.cache_salt != session.cache_salt:
+        # The frontend ledger also feeds output processing and downstream
+        # prewarm; equal length alone would hide a diverged token history.
+        if (
+            update.append_prefix_length != confirmed
+            or update.cache_salt != session.cache_salt
+            or update.append_prefix_digest != token_prefix_digest(session._all_token_ids[:confirmed])
+        ):
             self._reject_turn_delta(session, "Resident turn prefix changed; restart the session")
             return
         features = list(session.mm_features or ())

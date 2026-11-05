@@ -172,7 +172,7 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
     group_count = engine.duplex_frontend_group_count
     unit = warmup_silence_unit(plugin)
     capabilities = getattr(plugin, "capabilities", None)
-    native_append = not capabilities(max_sessions=1).supports_turn_commit_only if callable(capabilities) else True
+    native_append = not capabilities(max_sessions=1).commits_turns if callable(capabilities) else True
     session: dict[str, object] = {
         "modalities": ["audio", "text"],
         "input_audio_format": unit["format"],
@@ -289,7 +289,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
         unit = warmup_silence_unit(plugin)
         frame_samples = len(base64.b64decode(str(unit["audio"]))) // 4
         capabilities = getattr(plugin, "capabilities", None)
-        native_append = not capabilities(max_sessions=1).supports_turn_commit_only if callable(capabilities) else True
+        native_append = not capabilities(max_sessions=1).commits_turns if callable(capabilities) else True
         from vllm_omni.clients.duplex import build_realtime_url
 
         url = (

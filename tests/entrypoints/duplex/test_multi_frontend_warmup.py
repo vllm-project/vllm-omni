@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.entrypoints.duplex import warmup
 from vllm_omni.protocol.duplex import RealtimeInputDefaults
@@ -23,8 +23,8 @@ class _Plugin:
         self.turn_commit_only = turn_commit_only
 
     def capabilities(self, *, max_sessions):
-        return SimpleNamespace(
-            required_input_modalities={"audio"},
+        return DuplexCapabilities(
+            required_input_modalities=frozenset({"audio"}),
             supports_core_resumable_request=True,
             supports_turn_commit_only=self.turn_commit_only,
         )

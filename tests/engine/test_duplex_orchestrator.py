@@ -24,7 +24,7 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, token_prefix_digest
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
@@ -628,6 +628,42 @@ async def test_resident_turn_cannot_reopen_until_transfer_retirement_completes(e
     finally:
         gate.set()
         await finish
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_retirement_closes_through_resident_failure(ephemeral_submissions, mocker):
+    from dataclasses import replace
+
+    orchestrator, _, submissions, _ = ephemeral_submissions
+    submission = replace(submissions[0], resumable=True, resume_from_full_prompt=True)
+    await orchestrator.submit(submission)
+    request_id = submission.context.request_id
+    state = orchestrator.request_states[request_id]
+    failure = TimeoutError("retirement timed out")
+    for pool in orchestrator.stage_pools:
+        mocker.patch.object(pool.output_processor, "remove_request", create=True)
+    mocker.patch.object(orchestrator.stage_pools[0], "finish_turn", side_effect=failure, create=True)
+    handle = mocker.patch.object(orchestrator, "_handle_forward_failure", new_callable=mocker.AsyncMock)
+
+    # A retirement failure must not leave a resident that rejects every later turn.
+    await orchestrator.finish_turn(request_id)
+
+    handle.assert_awaited_once_with(request_id, 0, state, failure)
+    assert not state.turn_resources_released
+
+
+@pytest.mark.asyncio
+async def test_resident_downstream_failure_closes_the_session(mocker) -> None:
+    orchestrator, _, _, _ = _build(stages=2, plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    assert orchestrator.plugin.capabilities(max_sessions=1).resident_turn_entry
+    request_state = DuplexOrchestratorRequestState(request_id="resident", session_owned=True)
+    cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
+    try:
+        # Talker shares the resident ID; aborting it also discards Thinker KV.
+        assert await orchestrator._handle_forward_failure("resident", 1, request_state, ValueError("talker"))
+        cleanup.assert_awaited_once_with(["resident"], abort=True, release_owners=True, trace_error="ValueError")
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1328,6 +1364,8 @@ async def test_turn_delta_transport_keeps_full_frontend_context():
     wire = clients[0].add_request_calls[0][0]
     assert wire.prompt_token_ids == [12, 13]
     assert wire.append_prefix_length == 2
+    # The suffix-only wire request still lets EngineCore verify prefix content.
+    assert wire.append_prefix_digest == token_prefix_digest([10, 11])
     assert not wire.resume_from_full_prompt
     assert pool.output_processor.add_request_calls[0][1]["request"].prompt_token_ids == [10, 11, 12, 13]
     assert request.prompt_token_ids == [10, 11, 12, 13]
