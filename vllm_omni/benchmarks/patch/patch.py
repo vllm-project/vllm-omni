@@ -78,6 +78,14 @@ from vllm_omni.benchmarks.data_modules.videomme_dataset import (
     VideoMMESampleRequest,
     resolve_videomme_local_root,
 )
+from vllm_omni.benchmarks.duplex.full_duplex_bench_serving import (
+    FullDuplexBenchSampleRequest,
+    annotate_full_duplex_bench_result,
+    attach_full_duplex_bench,
+    finalize_full_duplex_bench,
+    get_full_duplex_bench_samples,
+    prepare_full_duplex_bench_sample,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_serving import (
     OmniDuplexEvalSampleRequest,
     attach_duplex_eval,
@@ -695,6 +703,8 @@ def get_samples(args, tokenizer, **kwargs):
         "sound-effect",
     )
     is_omniinteract = args.dataset_name == "omniinteract"
+    if args.dataset_name == "full-duplex-bench":
+        return get_full_duplex_bench_samples(args)
     if args.dataset_name == "omni-duplex-eval":
         return get_duplex_eval_samples(args)
 
@@ -3122,14 +3132,19 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
     output.prompt_len = request.prompt_len
     output.start_time = time.perf_counter()
     output.tpot_measured = False
+    benchmark_name = "Duplex dataset"
     try:
         sample = getattr(request, "duplex_eval_sample", None)
-        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None:
-            raise ValueError("Omni-DuplexEval requires a dataset sample")
+        if not isinstance(sample, OmniDuplexEvalSampleRequest | FullDuplexBenchSampleRequest) or sample.sample is None:
+            raise ValueError("Duplex dataset replay requires a dataset sample")
+        benchmark_name = "Full-Duplex-Bench" if isinstance(sample, FullDuplexBenchSampleRequest) else "Omni-DuplexEval"
         # The benchmark's concurrency slot bounds live decoded inputs. Keep
         # preparation off the event loop and outside this session's latency;
         # throughput still includes any client preparation stalls.
-        prepared = await asyncio.to_thread(prepare_duplex_eval_sample, sample)
+        if isinstance(sample, FullDuplexBenchSampleRequest):
+            prepared = await asyncio.to_thread(prepare_full_duplex_bench_sample, sample)
+        else:
+            prepared = await asyncio.to_thread(prepare_duplex_eval_sample, sample)
         headers = _get_headers()
         _update_headers_common(headers, request)
         result = None
@@ -3170,7 +3185,8 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                     raise
                 output.duplex_retries += 1
                 logger.warning(
-                    "Omni-DuplexEval sample %s %s; retrying (%d/%d)",
+                    "%s sample %s %s; retrying (%d/%d)",
+                    benchmark_name,
                     sample.sample.id,
                     "timed out on an inner wait before the per-request timeout"
                     if inner_timeout
@@ -3183,7 +3199,8 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
             if retryable is not None and attempt + 1 < _DUPLEX_EVAL_ATTEMPTS:
                 output.duplex_retries += 1
                 logger.warning(
-                    "Omni-DuplexEval sample %s stalled at the transport level (%s); retrying (%d/%d)",
+                    "%s sample %s stalled at the transport level (%s); retrying (%d/%d)",
+                    benchmark_name,
                     sample.sample.id,
                     retryable,
                     attempt + 1,
@@ -3192,9 +3209,11 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 continue
             break
         if result is None:  # pragma: no cover - the loop either returns or raises
-            raise RuntimeError("Omni-DuplexEval produced no session result")
+            raise RuntimeError("Duplex dataset replay produced no session result")
         # Next to ``*.meta.json`` so CI can tell a retried sample from a clean one.
         result.metadata["retry_count"] = output.duplex_retries
+        if isinstance(sample, FullDuplexBenchSampleRequest):
+            annotate_full_duplex_bench_result(sample, result)
         output.generated_text = " ".join(str(row["sentence"]) for row in result.timed_sentences)
         output.output_tokens = result.output_tokens
         output.audio_frames = result.audio_bytes // 2
@@ -3221,7 +3240,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
             setattr(output, "duplex_eval_result", result)
     except Exception:
         output.error = traceback.format_exc()
-        logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
+        logger.error("%s Realtime request failed: %s", benchmark_name, output.error)
     output.latency = time.perf_counter() - output.start_time
     if pbar:
         pbar.update(1)
@@ -3886,6 +3905,7 @@ async def benchmark(
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
     attach_duplex_eval(input_requests[0], test_input)
+    attach_full_duplex_bench(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -4055,6 +4075,7 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        attach_full_duplex_bench(request, request_func_input)
         request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
@@ -4090,6 +4111,9 @@ async def benchmark(
                 duplex_eval_summary["duplex_retried_samples"],
                 duplex_eval_summary["duplex_retry_count"],
             )
+    full_duplex_bench_summary = await asyncio.to_thread(finalize_full_duplex_bench, input_requests, outputs)
+    if full_duplex_bench_summary is not None:
+        full_duplex_bench_summary.update(_duplex_retry_tally(outputs))
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
     omniinteract_evaluation = await _evaluate_omniinteract_batch(input_requests, outputs)
     if omniinteract_summary is not None and omniinteract_evaluation is not None:
@@ -4259,6 +4283,8 @@ async def benchmark(
         if (accuracy := duplex_eval_summary.get("accuracy")) is not None:
             print("\nOmni-DuplexEval accuracy:")
             print(json.dumps(accuracy, indent=2))
+    if full_duplex_bench_summary is not None:
+        result["full_duplex_bench"] = full_duplex_bench_summary
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,
