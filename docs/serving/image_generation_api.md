@@ -136,7 +136,7 @@ Content-Type: application/json
 | `prompt` | string | **required** | Text description of the desired image |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `n` | integer | 1 | Number of images to generate (1-10) |
-| `size` | string | model defaults | Image dimensions in WxH format (e.g., "1024x1024", "512x512") |
+| `size` | string | model defaults | Image dimensions in WxH format (e.g., "1024x1024", "512x512") or aspect-ratio format (e.g., "1:1", "16:9"); see [Size formats](#size-formats) |
 | `response_format` | string | "b64_json" | Response format (`"b64_json"` or `"file"`) |
 | `user` | string | null | User identifier for tracking |
 
@@ -196,6 +196,26 @@ response = requests.post(
 )
 ```
 
+## Size Formats
+
+The `size` parameter accepts two formats:
+
+- **Explicit dimensions** in `WIDTHxHEIGHT` format (e.g., `"1024x1024"`, `"512x512"`). Values are forwarded to the model as-is.
+- **Aspect ratio** in `W:H` format (e.g., `"1:1"`, `"16:9"`). The ratio is resolved to concrete dimensions with a total pixel area of about one megapixel (1024x1024), with each side aligned to a multiple of 32 pixels. This matches the default canvas of the Qwen-Image family and the ratio-derived sizing used by their edit pipelines.
+
+Common ratio resolutions:
+
+| Ratio | Resolved size | Ratio | Resolved size |
+| --------- | ----------------- | --------- | ----------------- |
+| `1:1` | 1024x1024 | `16:9` | 1376x768 |
+| `4:3` | 1184x896 | `9:16` | 768x1376 |
+| `3:4` | 896x1184 | `21:9` | 1568x672 |
+| `3:2` | 1248x832 | `2:3` | 832x1248 |
+
+Any positive integer pair is accepted (e.g., `"5:4"`, `"32:18"`); extreme ratios that cannot be resolved to 32-aligned positive dimensions are rejected with a 400 error. If you need a different total pixel area for a given ratio, request explicit `WIDTHxHEIGHT` dimensions instead.
+
+The same formats are accepted for the `size` field of `/v1/images/edits` and for the `size` extra-body field of image generation via `/v1/chat/completions` (where an invalid value is logged and ignored).
+
 ## Parameter Handling
 
 The API passes parameters directly to the diffusion pipeline without model-specific transformation:
@@ -222,7 +242,7 @@ Invalid parameters (e.g., model mismatch):
 
 ```json
 {
-  "detail": "Invalid size format: '1024x'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024')."
+  "detail": "Invalid size format: '1024:9:16'. Aspect-ratio format is 'W:H' (e.g., '16:9')."
 }
 ```
 

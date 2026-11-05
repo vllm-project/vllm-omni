@@ -23,18 +23,33 @@ See ``openai/README.md`` and ``images/README.md`` (utils vs helpers, no overlap)
 
 import base64
 import io
+import math
 
 import PIL.Image
 
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 SUPPORTED_LAYERED_LAYERS_RANGE = range(2, 11)
 
+# Target pixel area used to resolve aspect-ratio size strings (e.g., "16:9")
+# into concrete dimensions. Matches the ~1 megapixel default canvas of the
+# Qwen-Image family; keep in sync with calculate_dimensions() call sites in
+# vllm_omni/diffusion/models/qwen_image/.
+RATIO_SIZE_TARGET_AREA = 1024 * 1024
+# Dimensions resolved from an aspect ratio are aligned to multiples of this
+# many pixels so they stay valid for the Qwen-Image family VAE.
+RATIO_SIZE_ALIGNMENT = 32
 
-def parse_size(size_str: str) -> tuple[int, int]:
+
+def parse_size(size_str: str, *, allow_ratio: bool = False) -> tuple[int, int]:
     """Parse size string to width and height tuple.
 
     Args:
-        size_str: Size in format "WIDTHxHEIGHT" (e.g., "1024x1024")
+        size_str: Size in format "WIDTHxHEIGHT" (e.g., "1024x1024"). When
+            ``allow_ratio`` is True, aspect-ratio format "W:H" (e.g., "1:1",
+            "16:9") is also accepted and resolved to the nearest
+            RATIO_SIZE_ALIGNMENT-aligned dimensions with a total pixel area of
+            about RATIO_SIZE_TARGET_AREA.
+        allow_ratio: Whether to accept the "W:H" aspect-ratio format.
 
     Returns:
         Tuple of (width, height)
@@ -47,11 +62,15 @@ def parse_size(size_str: str) -> tuple[int, int]:
             f"Size must be a non-empty string in format 'WIDTHxHEIGHT' (e.g., '1024x1024'), got: {size_str}"
         )
 
+    if allow_ratio and ":" in size_str:
+        return _parse_ratio_size(size_str)
+
     parts = size_str.split("x")
     if len(parts) != 2:
         raise ValueError(
-            f"Invalid size format: '{size_str}'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024'). "
-            f"Did you mean to use 'x' as separator?"
+            f"Invalid size format: '{size_str}'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024')"
+            + (" or aspect-ratio 'W:H' (e.g., '16:9')" if allow_ratio else "")
+            + ". Did you mean to use 'x' as separator?"
         )
 
     try:
@@ -62,6 +81,42 @@ def parse_size(size_str: str) -> tuple[int, int]:
 
     if width <= 0 or height <= 0:
         raise ValueError(f"Invalid size: {width}x{height}. Width and height must be positive integers.")
+
+    return width, height
+
+
+def _parse_ratio_size(size_str: str) -> tuple[int, int]:
+    """Resolve an aspect-ratio size string (e.g., "16:9") to pixel dimensions.
+
+    The ratio is scaled to RATIO_SIZE_TARGET_AREA total pixels and each side is
+    rounded to the nearest multiple of RATIO_SIZE_ALIGNMENT.
+
+    Raises:
+        ValueError: If the ratio format is invalid or too extreme to resolve
+            to aligned positive dimensions.
+    """
+    parts = size_str.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid size format: '{size_str}'. Aspect-ratio format is 'W:H' (e.g., '16:9').")
+
+    try:
+        ratio_w = int(parts[0])
+        ratio_h = int(parts[1])
+    except ValueError:
+        raise ValueError(f"Invalid size format: '{size_str}'. Aspect-ratio values must be integers.")
+
+    if ratio_w <= 0 or ratio_h <= 0:
+        raise ValueError(f"Invalid size: '{size_str}'. Aspect-ratio values must be positive integers.")
+
+    ratio = ratio_w / ratio_h
+    width = round(math.sqrt(RATIO_SIZE_TARGET_AREA * ratio) / RATIO_SIZE_ALIGNMENT) * RATIO_SIZE_ALIGNMENT
+    height = round(math.sqrt(RATIO_SIZE_TARGET_AREA / ratio) / RATIO_SIZE_ALIGNMENT) * RATIO_SIZE_ALIGNMENT
+
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"Invalid size: '{size_str}'. Aspect ratio is too extreme to resolve to dimensions "
+            f"aligned to {RATIO_SIZE_ALIGNMENT} pixels."
+        )
 
     return width, height
 

@@ -86,7 +86,7 @@ Content-Type: multipart/form-data
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `image` | string or array | **required** | The image(s) to edit. |
 | `n` | integer | 1 | Number of images to generate (1-10) |
-| `size` | string | "auto" | Image dimensions in WxH format (e.g., "1024x1024", "512x512"), when set to auto, it decide size from first input image. |
+| `size` | string | "auto" | Image dimensions in WxH format (e.g., "1024x1024", "512x512") or aspect-ratio format (e.g., "1:1", "16:9", resolved to ~1 megapixel with 32-pixel alignment, see [Size formats](image_generation_api.md#size-formats)), when set to auto, it decide size from first input image. |
 | `response_format` | string | "b64_json" | Response format (only "b64_json" supported) |
 | `user` | string | null | User identifier for tracking |
 | `output_format` | string | "png" | The format in which the generated images are returned. Must be one of "png", "jpg", "jpeg", "webp". |

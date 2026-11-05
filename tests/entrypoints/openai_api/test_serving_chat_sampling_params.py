@@ -732,6 +732,20 @@ class TestResolveHeightWidth:
         assert w == 768
         assert h == 512
 
+    def test_size_ratio_string(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "16:9"})
+        assert w == 1376
+        assert h == 768
+
+    def test_invalid_ratio_format_ignored(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "16:9:4"})
+        assert h is None
+        assert w is None
+
     def test_size_fallback_when_height_missing(self):
         from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
