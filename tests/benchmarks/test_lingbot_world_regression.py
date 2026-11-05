@@ -386,6 +386,13 @@ def test_final_generation_gate_applies_profile_owned_reference_noise_calibration
     calibration["workload"] = copy.deepcopy(profile)
     calibration["qualified_profile_sha256"] = contract_digest(profile)
     calibration["hardware"]["platform"] = platform
+    if source_digest := profile.get("inference_runtime", {}).get("source_snapshot_sha256"):
+        lock = read_json(root / "runtime_sources.lock.json")
+        calibration["hardware"]["source_attestations"] = {
+            "schema_version": 1,
+            "source_snapshot_sha256": source_digest,
+            "packages": copy.deepcopy(lock["packages"]),
+        }
     calibration["deploy_sha256"] = sha256(Path(__file__).resolve().parents[2] / profile["deploy_config"])
     calibration_path = source / profile["reference_calibration"]
     if calibration_state != "missing_record":
@@ -1121,10 +1128,23 @@ def test_current_production_reference_is_pinned_for_both_platforms_and_all_profi
 
 
 def test_runtime_compatibility_reference_rebinds_preserve_frozen_training_rules():
+    from benchmarks.lingbot_world.regression import contract_digest
+
     root = Path(__file__).resolve().parents[2]
     calibration = root / "tests/dfx/lingbot_world/calibration"
     protocol = read_json(calibration / "v033_reference_protocol.json")
     assert protocol["reference_revision"] == "3094f0ea747cb2563d99d049da25725cc45f0d2e"
+    snapshot = protocol.pop("npu_vendor_source_snapshot")
+    archived = calibration / snapshot["superseded_protocol_archive"]
+    assert (
+        sha256(archived)
+        == snapshot["superseded_protocol_sha256"]
+        == ("30e12aca10b953436d2802843bba48bad47874576316b2c026b125a0c6fb6de8")
+    )
+    assert protocol == read_json(archived)
+    assert sha256(root / snapshot["lock"]) == snapshot["lock_sha256"]
+    assert contract_digest(read_json(root / snapshot["lock"])["packages"]) == snapshot["packages_sha256"]
+    assert snapshot["training_cohorts_collected_before_update"] is False
     updates = [
         ("npu_scheduler_compatibility", "37c63fc54e1d47358e703481e0d246aaa612b54cfd3d8e7600a3939a134f091c"),
         ("streaming_metadata_compatibility", "c1f7ceb8929d529633d565053b73e99e75b66580b54145ab908d4d3c47d4eb2f"),

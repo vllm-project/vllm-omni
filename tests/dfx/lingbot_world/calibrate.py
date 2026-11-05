@@ -34,6 +34,7 @@ from benchmarks.lingbot_world.regression import (
 from benchmarks.lingbot_world.video_quality import compare_video_pair_in_environment
 from tests.dfx.lingbot_world.prepare import profile_for_case_shard
 from tests.dfx.lingbot_world.runner import ROOT, _measured_metrics
+from tests.dfx.lingbot_world.runtime_sources import verify_source_attestations
 
 PROTOCOL = ROOT / "tests/dfx/lingbot_world/calibration/v033_reference_protocol.json"
 POLICY = ROOT / "tests/dfx/lingbot_world/quality.json"
@@ -211,6 +212,13 @@ def _load_cohort(generation: Path, quality: Path, protocol_sha: str, policy: dic
         or len(hardware.get("devices", [])) != profile["dies"]
     ):
         raise RegressionError("Hardware topology differs from the pinned profile")
+    snapshot = profile["inference_runtime"].get("source_snapshot_sha256")
+    if snapshot is not None:
+        verify_source_attestations(hardware.get("source_attestations"), expected_sha256=snapshot)
+        if contract_digest(hardware["source_attestations"]["packages"]) != profile["inference_runtime"].get(
+            "source_packages_sha256"
+        ):
+            raise RegressionError("Runtime source packages differ from the pinned profile")
     for name, expected in profile["inference_runtime"]["packages"].items():
         actual = hardware["packages"].get(name)
         if not isinstance(actual, str):

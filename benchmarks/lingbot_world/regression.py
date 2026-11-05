@@ -339,6 +339,51 @@ def _verify_engine_environment(actual: object, expected: object, description: st
         raise RegressionError(f"{description} engine environment is missing or changed")
 
 
+def _verify_source_attestation_binding(
+    profile: Mapping[str, Any], hardware: Mapping[str, Any], expected_hardware: Mapping[str, Any]
+) -> None:
+    runtime = profile.get("inference_runtime", {})
+    if not isinstance(runtime, Mapping) or not {"source_snapshot_sha256", "source_packages_sha256"}.intersection(
+        runtime
+    ):
+        return
+    digest = runtime.get("source_snapshot_sha256")
+    packages_digest = runtime.get("source_packages_sha256")
+    revisions = runtime.get("source_revisions", {})
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or not isinstance(packages_digest, str)
+        or len(packages_digest) != 64
+        or any(character not in "0123456789abcdef" for character in packages_digest)
+        or not isinstance(revisions, Mapping)
+        or not revisions
+    ):
+        raise RegressionError("Invalid runtime source snapshot contract")
+    observed = hardware.get("source_attestations")
+    expected = expected_hardware.get("source_attestations")
+    for attestation in (observed, expected):
+        if (
+            not isinstance(attestation, Mapping)
+            or set(attestation) != {"schema_version", "source_snapshot_sha256", "packages"}
+            or type(attestation["schema_version"]) is not int
+            or attestation["schema_version"] != 1
+            or attestation["source_snapshot_sha256"] != digest
+            or not isinstance(attestation["packages"], Mapping)
+            or set(attestation["packages"]) != set(revisions)
+            or contract_digest(attestation["packages"]) != packages_digest
+            or any(
+                not isinstance(attestation["packages"][package], Mapping)
+                or attestation["packages"][package].get("head") != revision
+                for package, revision in revisions.items()
+            )
+        ):
+            raise RegressionError("Missing or mismatched runtime source attestation")
+    if contract_digest(observed) != contract_digest(expected):
+        raise RegressionError("Runtime source attestation differs from frozen calibration")
+
+
 def verify_reference_calibration_contract(contract: Mapping[str, Any], calibration: Mapping[str, Any]) -> None:
     """Reject reuse of reference-noise budgets after runtime/model changes.
 
@@ -368,6 +413,7 @@ def verify_reference_calibration_contract(contract: Mapping[str, Any], calibrati
     for field in ("platform", "cards", "dies", "devices", "packages"):
         if contract["hardware"][field] != calibration["hardware"][field]:
             raise RegressionError(f"Reference calibration hardware/runtime changed: {field}")
+    _verify_source_attestation_binding(contract["profile"], contract["hardware"], calibration["hardware"])
     _verify_engine_environment(
         contract.get("engine_environment"), calibration.get("engine_environment"), "Reference calibration"
     )
@@ -418,6 +464,7 @@ def verify_quality_population_contract(
     for key in ("platform", "cards", "dies", "devices", "packages"):
         if contract["hardware"][key] != expected["hardware"][key]:
             raise RegressionError(f"Quality reference population hardware/runtime changed: {key}")
+    _verify_source_attestation_binding(contract["profile"], contract["hardware"], expected["hardware"])
     _verify_engine_environment(
         contract.get("engine_environment"), expected.get("engine_environment"), "Quality reference population"
     )

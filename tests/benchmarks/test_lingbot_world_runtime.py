@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, write_json
+from benchmarks.lingbot_world.regression import RegressionError, contract_digest, read_json, sha256, write_json
 from tests.dfx.lingbot_world import prepare, runner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -44,13 +44,45 @@ def test_npu_checks_integrated_runtime_without_installing_cuda_packages(monkeypa
         return versions[package]
 
     monkeypatch.setattr(prepare.importlib.metadata, "version", version)
-    monkeypatch.setattr(prepare, "verify_editable_runtime_sources", lambda expected: dict(expected))
+    attestation = {"source_snapshot_sha256": prepare.NPU_SOURCE_SNAPSHOT_SHA256}
+    monkeypatch.setattr(prepare, "attest_runtime_sources", lambda expected, **kwargs: attestation)
     if missing:
         with pytest.raises(RegressionError, match=f"integrated {missing}"):
             prepare.verify_inference_runtime("npu")
     else:
         observed = prepare.verify_inference_runtime("npu")
-        assert observed == {"packages": versions, "source_revisions": prepare.NPU_RUNTIME["source_revisions"]}
+        assert observed == {
+            "packages": versions,
+            "source_revisions": prepare.NPU_RUNTIME["source_revisions"],
+            "source_attestations": attestation,
+        }
+
+
+@pytest.mark.parametrize("mutation", [None, "missing", "wrong", "boolean"])
+def test_npu_profile_requires_reviewed_source_packages_digest(monkeypatch, mutation):
+    lock = read_json(prepare.ROOT / "tests/dfx/lingbot_world/runtime_sources.lock.json")
+    assert prepare.NPU_SOURCE_PACKAGES_SHA256 == contract_digest(lock["packages"])
+    profile = json.loads(json.dumps(prepare.NPU_RUNTIME))
+    if mutation == "missing":
+        profile.pop("source_packages_sha256")
+    elif mutation is not None:
+        profile["source_packages_sha256"] = True if mutation == "boolean" else "0" * 64
+    calls = []
+
+    def attest(expected, *, expected_sha256):
+        calls.append((expected, expected_sha256))
+        return {"packages": lock["packages"]}
+
+    monkeypatch.setattr(prepare.importlib.metadata, "version", prepare.NPU_PACKAGES.__getitem__)
+    monkeypatch.setattr(prepare, "attest_runtime_sources", attest)
+    if mutation is None:
+        observed = prepare.verify_inference_runtime("npu", profile_runtime=profile)
+        assert observed["source_attestations"] == {"packages": lock["packages"]}
+        assert calls == [(prepare.NPU_SOURCE_REVISIONS, prepare.NPU_SOURCE_SNAPSHOT_SHA256)]
+    else:
+        with pytest.raises(RegressionError, match="pinned runtime contract"):
+            prepare.verify_inference_runtime("npu", profile_runtime=profile)
+        assert calls == []
 
 
 @pytest.mark.parametrize("mutation", [None, "source", "dirty", "missing_provenance", "remote_provenance"])

@@ -21,20 +21,27 @@ from packaging.version import Version
 
 from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, verify_environment, write_json
 from tests.dfx.lingbot_world.opencv_provider import PROVIDER, validate_opencv_provider_record
+from tests.dfx.lingbot_world.runtime_sources import attest_runtime_sources
 
 ROOT = Path(__file__).resolve().parents[3]
 CUDA_RUNTIME = {"packages": {"vllm": "0.33.0", "torch": "2.14.0"}}
+NPU_PACKAGES = {
+    "vllm": "0.33.0+empty",
+    "torch": "2.10.0+cpu",
+    "torch-npu": "2.10.0.post7",
+    "vllm-ascend": "0.19.1rc2.dev3349+g221fb096c.d20261104",
+}
+NPU_SOURCE_REVISIONS = {
+    "vllm": "4ba787ec9959e566d3b587a796dff07673324da5",
+    "vllm-ascend": "221fb096cd1cdf9f0b273da9b9624fbf4bb7f200",
+}
+NPU_SOURCE_SNAPSHOT_SHA256 = "451a176d926f1f6e029475067eae84f13c9a62e187d8266dc1e4c79c9b2613cb"
+NPU_SOURCE_PACKAGES_SHA256 = "f7d639d3a41ad11a60685668cd01036ce534fda66a621bb350cf28e00688a89b"
 NPU_RUNTIME = {
-    "packages": {
-        "vllm": "0.33.0+empty",
-        "torch": "2.10.0+cpu",
-        "torch-npu": "2.10.0.post7",
-        "vllm-ascend": "0.19.1rc2.dev3349+g221fb096c.d20261104",
-    },
-    "source_revisions": {
-        "vllm": "4ba787ec9959e566d3b587a796dff07673324da5",
-        "vllm-ascend": "221fb096cd1cdf9f0b273da9b9624fbf4bb7f200",
-    },
+    "packages": NPU_PACKAGES,
+    "source_revisions": NPU_SOURCE_REVISIONS,
+    "source_snapshot_sha256": NPU_SOURCE_SNAPSHOT_SHA256,
+    "source_packages_sha256": NPU_SOURCE_PACKAGES_SHA256,
 }
 
 
@@ -203,30 +210,34 @@ def verify_editable_runtime_sources(expected: dict[str, str]) -> dict[str, str]:
 
 
 def verify_inference_runtime(
-    platform: str = "cuda", *, profile_runtime: dict[str, dict[str, str]] | None = None
-) -> dict[str, dict[str, str]]:
+    platform: str = "cuda", *, profile_runtime: dict[str, object] | None = None
+) -> dict[str, object]:
     # A local vendor suffix is allowed; RC/dev builds cannot impersonate the
     # final release used for the paired measurements. Ascend owns its Torch
     # stack and must never receive the CUDA wheel to satisfy this check.
     if profile_runtime is not None and profile_runtime != {"cuda": CUDA_RUNTIME, "npu": NPU_RUNTIME}.get(platform):
         raise RegressionError("Profile inference runtime does not match the pinned runtime contract")
     expected = {"vllm": "0.33.0"}
-    observed: dict[str, dict[str, str]] = {"packages": {}}
+    packages: dict[str, str] = {}
+    observed: dict[str, object] = {"packages": packages}
     if platform == "cuda":
         expected["torch"] = "2.14.0"
     elif platform == "npu":
         # Vendor images can retain a development plugin version even when
         # built for final vLLM 0.33. Source imports and measured package/image
         # identities establish compatibility; the image tag alone does not.
-        for package, version in NPU_RUNTIME["packages"].items():
+        for package, version in NPU_PACKAGES.items():
             try:
                 actual = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError as error:
                 raise RegressionError(f"LingBot NPU reference requires the integrated {package} runtime") from error
             if actual != version:
                 raise RegressionError(f"LingBot NPU reference requires {package} {version}, found {actual}")
-            observed["packages"][package] = actual
-        observed["source_revisions"] = verify_editable_runtime_sources(NPU_RUNTIME["source_revisions"])
+            packages[package] = actual
+        observed["source_attestations"] = attest_runtime_sources(
+            NPU_SOURCE_REVISIONS, expected_sha256=NPU_SOURCE_SNAPSHOT_SHA256
+        )
+        observed["source_revisions"] = dict(NPU_SOURCE_REVISIONS)
     else:
         raise RegressionError(f"Unsupported LingBot inference platform: {platform}")
     for package, release in expected.items():
@@ -237,7 +248,7 @@ def verify_inference_runtime(
         parsed = Version(version)
         if parsed.base_version != release or parsed.is_prerelease or parsed.is_devrelease:
             raise RegressionError(f"LingBot {platform} reference requires {package} {release}, found {version}")
-        observed["packages"][package] = version
+        packages[package] = version
     return observed
 
 
