@@ -95,7 +95,8 @@ async def test_result_is_sent_and_continued_only_where_the_model_needs_it(contin
 
     await run_with(sock, {"get_weather": get_weather}, body)
     assert seen == [{"city": "Taipei"}]
-    assert sent(sock, "conversation.item.create")[0]["item"]["output"] == "25C"
+    item = sent(sock, "conversation.item.create")[0]["item"]
+    assert isinstance(item, dict) and item["output"] == "25C"
     assert len(sent(sock, "response.create")) == creates
 
 
