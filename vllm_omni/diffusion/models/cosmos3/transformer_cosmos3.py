@@ -487,6 +487,14 @@ def _apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
+    if q.device.type in ("npu", "privateuseone"):
+        import torch_npu
+
+        return (
+            torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half"),
+            torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half"),
+        )
+
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
