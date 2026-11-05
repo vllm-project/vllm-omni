@@ -16,12 +16,8 @@ DELTA_KEY = "_qwen_turn_delta"
 class QwenIncrementalPrompt:
     """Append to accepted model tokens, or tokenize a changed history snapshot."""
 
-    _boundary = "<|im_start|>"
-
     def __init__(self, tokenizer: TokenizerLike):
         self.tokenizer = tokenizer
-        self._prefix = ""
-        self._prefix_ids: list[int] = []
         self._prompt_ids: list[int] = []
         self._output_ids: list[int] = []
         self._finished = False
@@ -59,45 +55,11 @@ class QwenIncrementalPrompt:
         self._output_ids = []
         self._finished = False
 
-    def _encode_full(self, text: str) -> list[int]:
-        ids = self.tokenizer.encode(text, add_special_tokens=True)
-        # Tokenizers may omit chat delimiters from their special-token catalog
-        # or omit AddedToken metadata. That disables text-prefix splitting,
-        # but not continuation of the actual sampled token sequence.
-        self._append_safe = ids == self.tokenizer.encode(text, add_special_tokens=False)
-        return ids
-
     def tokenize(self, text: str) -> list[int]:
-        tokenizer = self.tokenizer
+        # Deltas already contain only the new turn. Snapshots are encoded in
+        # full; do not maintain a second, rendered-text prefix cache.
         self._append_safe = False
-        # Qwen's chat template embeds its special tokens explicitly. Refuse
-        # the optimization if a tokenizer adds implicit BOS/EOS tokens.
-        if self._boundary not in tokenizer.all_special_tokens:
-            return self._encode_full(text)
-        token = tokenizer.convert_tokens_to_ids(self._boundary)
-        added = getattr(tokenizer, "added_tokens_decoder", {}).get(token)
-        if added is None or added.lstrip or added.rstrip or added.single_word:
-            # A token whose match depends on adjacent text is not a stable split.
-            return self._encode_full(text)
-        if self._prefix and text.startswith(self._prefix):
-            ids = self._prefix_ids + tokenizer.encode(text[len(self._prefix) :], add_special_tokens=False)
-        else:
-            ids = self._encode_full(text)
-            if not self._append_safe:
-                self._prefix = ""
-                self._prefix_ids = []
-                return ids
-        self._append_safe = True
-
-        # End at an atomic special token, never an arbitrary text boundary:
-        # BPE merges cannot cross it. Keep the generation header in the suffix
-        # so assistant text from the previous turn is encoded canonically.
-        end = text.rfind(self._boundary)
-        if end >= 0 and token in ids:
-            self._prefix = text[: end + len(self._boundary)]
-            last = len(ids) - 1 - ids[::-1].index(token)
-            self._prefix_ids = ids[: last + 1]
-        else:
-            self._prefix = ""
-            self._prefix_ids = []
+        ids = self.tokenizer.encode(text, add_special_tokens=True)
+        # Implicit BOS/EOS tokens would break continuation at a turn boundary.
+        self._append_safe = ids == self.tokenizer.encode(text, add_special_tokens=False)
         return ids

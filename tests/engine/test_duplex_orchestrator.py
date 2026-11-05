@@ -1279,7 +1279,9 @@ async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, w
     release = threading.Event()
     finished = threading.Event()
 
-    class BlockingTokenizer:
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
+    class BlockingTokenizer(QwenIncrementalPrompt):
         def tokenize(self, text: str) -> list[int]:
             started.set()
             try:
@@ -1292,7 +1294,7 @@ async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, w
 
     orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
     orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
-        request_id="r", turn_prompt_tokenizer=BlockingTokenizer()
+        request_id="r", turn_prompt_tokenizer=BlockingTokenizer(None)
     )
     monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: None)
     task = asyncio.create_task(orchestrator._process_stage_inputs(0, request_id="r", prompt={"prompt": "hello"}))
@@ -1373,13 +1375,15 @@ async def test_incremental_tokenization_keeps_upstream_text_length_validation(mo
     from vllm.exceptions import VLLMValidationError
     from vllm.renderers.params import TokenizeParams
 
-    class UnexpectedTokenizer:
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
+    class UnexpectedTokenizer(QwenIncrementalPrompt):
         def tokenize(self, text: str) -> list[int]:
             raise AssertionError("overlong text must be rejected before tokenization")
 
     orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
     orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
-        request_id="r", turn_prompt_tokenizer=UnexpectedTokenizer()
+        request_id="r", turn_prompt_tokenizer=UnexpectedTokenizer(None)
     )
     processor = SimpleNamespace(
         tokenizer=SimpleNamespace(max_chars_per_token=1),
@@ -1399,8 +1403,12 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
     if incremental:
+        from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
         monkeypatch.setattr(
-            plugin, "create_turn_prompt_tokenizer", lambda tokenizer: SimpleNamespace(tokenize=lambda text: [1, 2])
+            plugin,
+            "create_turn_prompt_tokenizer",
+            lambda tokenizer: QwenIncrementalPrompt(SimpleNamespace(encode=lambda text, **kwargs: [1, 2])),
         )
     orchestrator, clients, rpc_q, _ = _build(plugin=plugin, async_chunk=True)
     seen = []

@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from unittest.mock import patch
-
 import pytest
-from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers, processors, trainers
+from tokenizers import Tokenizer, models, pre_tokenizers, processors, trainers
 from transformers import PreTrainedTokenizerFast
 
 from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
@@ -25,18 +23,6 @@ def tokenizer():
         unk_token="[UNK]",
         additional_special_tokens=["<|im_start|>", "<|im_end|>"],
     )
-
-
-def test_append_tokenizes_only_suffix_and_matches_full_encoding(tokenizer):
-    incremental = QwenIncrementalPrompt(tokenizer)
-    first = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
-    assert incremental.tokenize(first) == tokenizer.encode(first)
-    next_prompt = first + "world<|im_end|>\n<|im_start|>user\n天气<|im_end|>\n<|im_start|>assistant\n"
-    expected = tokenizer.encode(next_prompt)
-    with patch.object(tokenizer, "encode", wraps=tokenizer.encode) as encode:
-        assert incremental.tokenize(next_prompt) == expected
-    assert encode.call_count == 1
-    assert encode.call_args.args[0] == next_prompt[len(first) - len("assistant\n") :]
 
 
 @pytest.mark.parametrize("change", ["edit", "prune", "system", "assistant"])
@@ -64,29 +50,7 @@ def test_implicit_special_tokens_disable_reuse(tokenizer):
     first = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
     for prompt in (first, first + "world<|im_end|>\n<|im_start|>assistant\n"):
         assert incremental.tokenize(prompt) == tokenizer.encode(prompt)
-
-
-@pytest.mark.parametrize("options", [{"lstrip": True}, {"rstrip": True}, {"single_word": True}])
-def test_context_dependent_boundary_disables_reuse(tokenizer, options):
-    tokenizer.add_special_tokens({"additional_special_tokens": [AddedToken("<|im_start|>", special=True, **options)]})
-    incremental = QwenIncrementalPrompt(tokenizer)
-    prompt = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
-    incremental.tokenize(prompt)
-    prompt += "world<|im_end|>\n<|im_start|>assistant\n"
-    expected = tokenizer.encode(prompt)
-    with patch.object(tokenizer, "encode", wraps=tokenizer.encode) as encode:
-        assert incremental.tokenize(prompt) == expected
-    assert encode.call_args.args[0] == prompt
-
-
-def test_no_chat_boundary_clears_previous_prefix(tokenizer):
-    incremental = QwenIncrementalPrompt(tokenizer)
-    prompt = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
-    incremental.tokenize(prompt)
-    assert incremental.tokenize("hello world") == tokenizer.encode("hello world")
-    with patch.object(tokenizer, "encode", wraps=tokenizer.encode) as encode:
-        assert incremental.tokenize(prompt) == tokenizer.encode(prompt)
-    assert encode.call_args_list[0].args[0] == prompt
+        assert not incremental._append_safe
 
 
 @pytest.mark.parametrize("change", [None, "unlisted_start", "assistant", "unfinished"])

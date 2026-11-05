@@ -133,8 +133,7 @@ class PlaybackLedger:
 class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
     revision: int = 0
-    append_cursor: int = 0
-    append_invalidated: bool = True
+    append_cursor: int | None = None
     #: User items added by ``conversation.item.create`` that no response has
     #: answered yet. A turn can start from these alone, the way the Realtime
     #: protocol allows, without any audio having been committed.
@@ -483,7 +482,6 @@ class DuplexEngineSession:
 
     def checkpoint_append_history(self, cursor: int) -> None:
         self._conversation.append_cursor = cursor
-        self._conversation.append_invalidated = False
 
     @property
     def history_storage_length(self) -> int:
@@ -498,7 +496,7 @@ class DuplexEngineSession:
     def append_history_tail(self) -> tuple[str, tuple[dict[str, object], ...]] | None:
         """Return only the completed reply and new user items after the checkpoint."""
         history = self._conversation
-        if history.append_invalidated or not history.append_cursor:
+        if not history.append_cursor:
             return None
         tail = [item for item in history.messages[history.append_cursor :] if item]
         if len(tail) < 2 or tail[0].get("role") != "assistant":
@@ -510,8 +508,10 @@ class DuplexEngineSession:
 
     def _invalidate_appended_history(self, message: dict[str, object]) -> None:
         history = self._conversation
-        if any(item is message for item in history.messages[: history.append_cursor]):
-            history.append_invalidated = True
+        if history.append_cursor is not None and any(
+            item is message for item in history.messages[: history.append_cursor]
+        ):
+            history.append_cursor = None
 
     def history_snapshot(self) -> tuple[tuple[dict[str, object], ...], tuple[str | None, ...]]:
         """Snapshot committed messages and their aligned, optional item identities."""
@@ -1678,7 +1678,7 @@ class DuplexEngineSession:
         if message is None:
             return pending is not None or removed_placeholder or audio_only
         self._conversation.revision += 1
-        self._conversation.append_invalidated = True
+        self._conversation.append_cursor = None
         # Distinct response items can have identical (including empty) content.
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not message
