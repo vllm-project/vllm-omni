@@ -29,6 +29,34 @@ logger = init_logger(__name__)
 
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
+
+def get_default_deploy_config_path(name: str | Path) -> Path:
+    """Find a pipeline default in the active platform, then bundled configs."""
+    from vllm_omni.platforms import current_omni_platform
+
+    platform_dir: str | None
+    try:
+        platform_dir = current_omni_platform.get_default_stage_config_path()
+    except NotImplementedError:
+        # Unspecified platforms and older plugins may not implement the hook.
+        platform_dir = None
+    if platform_dir is not None:
+        candidate = Path(platform_dir) / name
+        if candidate.is_file():
+            return candidate.absolute()
+    return _DEPLOY_DIR / name
+
+
+def resolve_deploy_config_path(path: str | Path) -> Path:
+    """Preserve explicit paths; search platform defaults for missing bare names."""
+    deploy_path = Path(path)
+    if not deploy_path.exists() and deploy_path.parent == Path("."):
+        candidate = get_default_deploy_config_path(deploy_path)
+        if candidate.is_file():
+            return candidate
+    return deploy_path
+
+
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
 _RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(

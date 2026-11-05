@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from functools import cache
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -275,7 +276,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/deploy"
+        return str(Path(__file__).resolve().parents[2] / "deploy")
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:

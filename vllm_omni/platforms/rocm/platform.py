@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from pathlib import Path
+
 import torch
 from vllm import envs
 from vllm.config import VllmConfig
@@ -137,7 +139,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/deploy"
+        return str(Path(__file__).resolve().parents[2] / "deploy")
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:

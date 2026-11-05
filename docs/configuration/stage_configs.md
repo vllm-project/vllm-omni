@@ -5,6 +5,15 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
+Pipeline defaults are looked up in the directory returned by the active
+`OmniPlatform.get_default_stage_config_path()` first, then in the bundled
+`vllm_omni/deploy/` directory. Out-of-tree platforms can use this hook to ship
+hardware-specific deploy profiles. The same lookup applies to a bare
+`--deploy-config` filename when no matching file exists in the working
+directory. Existing user files take precedence; explicit paths containing a
+directory are used as given. Pipeline defaults do not use working-directory
+files. Relative `base_config` paths remain relative to the selected YAML.
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions
