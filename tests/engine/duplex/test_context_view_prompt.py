@@ -10,6 +10,7 @@ import pytest
 from tests.engine.duplex.test_session_runner import Harness, append_audio, close_harness, open_harness
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexContextViewPolicy
+from vllm_omni.engine.duplex.session import engine_session
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
@@ -103,6 +104,38 @@ async def test_render_skipped_without_policy(monkeypatch):
 
         assert len(plugin.prompt_configs) == 1
         assert len(h.port.submissions) == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_default_append_does_not_copy_history_containers(monkeypatch):
+    plugin = RecordingPlugin()
+    h = await open_harness(plugin=plugin)
+    try:
+        seeded = _seed_history(h.session)
+        copied = []
+        original = engine_session.copy_history_message
+
+        def record_copy(message):
+            copied.append(message)
+            return original(message)
+
+        monkeypatch.setattr(engine_session, "copy_history_message", record_copy)
+        await h.run(append_audio())
+
+        assert len(h.port.submissions) == 1
+        assert copied == []
+        config = plugin.prompt_configs[0]
+        conversation = _messages(config["conversation"])
+        item_ids = config["conversation_item_ids"]
+        assert isinstance(item_ids, tuple)
+        assert item_ids[:2] == ("u-earlier", "a-earlier")
+        assert len(item_ids) == len(conversation)
+        assert conversation[:2] == list(seeded)
+        assert conversation[0]["content"] is seeded[0]["content"]
+        assert "conversation_view" not in config
+        assert h.session.context_ledger.nodes() == ()
     finally:
         await close_harness(h)
 
