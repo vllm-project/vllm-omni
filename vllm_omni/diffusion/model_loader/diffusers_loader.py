@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import contextlib
 import dataclasses
+import fnmatch
 import glob
 import json
 import os
@@ -51,6 +52,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.component_utils import encoder_component_type
 from vllm_omni.diffusion.offloader.config import (
@@ -202,6 +204,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
+
+        weight_name_patterns: tuple[str, ...] | None = None
+        """Optional tensor-name globs applied before safetensor materialization."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -385,6 +390,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
+            and source.weight_name_patterns is None
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
         )
@@ -411,6 +417,22 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self.load_config.use_tqdm_on_load,
                 self.load_config.pt_load_map_location,
             )
+        elif use_safetensors and source.weight_name_patterns is not None:
+            if self.load_config.safetensors_load_strategy == "torchao":
+                raise ValueError("Tensor-name filtered loading does not support safetensors_load_strategy='torchao'.")
+
+            from safetensors import safe_open
+
+            patterns = source.weight_name_patterns
+
+            def filtered_safetensors_iterator():
+                for filename in sorted(hf_weights_files, key=_natural_sort_key):
+                    with safe_open(filename, framework="pt") as handle:
+                        for name in handle.keys():  # noqa: SIM118
+                            if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+                                yield name, handle.get_tensor(name)
+
+            weights_iterator = filtered_safetensors_iterator()
         else:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
@@ -511,6 +533,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             "Stream-offloaded %d online-quantized layers to CPU during weight loading",
             offloaded,
         )
+
+    @staticmethod
+    def _finalize_online_quant_weights_to_cpu(model: nn.Module) -> None:
+        """Bound deferred quantization after the weight consumer has returned."""
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            finalize_layerwise_processing,
+            get_layerwise_info,
+        )
+
+        # A consumer may buffer the iterator before assigning weights. Do not
+        # finalize at generator exhaustion: the last buffered tensors may not
+        # have reached their layers yet.
+        for module in model.modules():
+            if not getattr(getattr(module, "quant_method", None), "uses_meta_device", False):
+                continue
+            if get_layerwise_info(module).can_load():
+                # Padded linears cannot finish during checkpoint consumption.
+                # Finalizing the whole model would accumulate them on device.
+                finalize_layerwise_processing(module, model_config=None)
+            # Also catch the final layer if the consumer processed it after
+            # the streaming generator's last offload_completed() call.
+            module.to("cpu")
 
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
@@ -1131,6 +1175,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
         loaded_weights = model.load_weights(weights)
+        if stream_online_quant_to_cpu:
+            self._finalize_online_quant_weights_to_cpu(model)
         if loaded_weights is not None:
             loaded_weights = set(loaded_weights).union(planned_weights)
 
@@ -1260,6 +1306,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
+        prepare_model_for_weight_reload(model, self.od_config, target_device)
         return model
 
     def _load_model_with_pre_sharded_hsdp(

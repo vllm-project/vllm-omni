@@ -10,12 +10,13 @@ tolerance scheme as the frozen suite; golden = forward_native real behavior.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNorm,
     _adaln_fused_forward,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 TOL_STRICT = {"bf16": (2e-2, 2e-2), "fp32": (1e-3, 1e-3)}
 # Matches the frozen suite: the double-rounded golden chain deviates from a

@@ -11,11 +11,11 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import math
 import os
 import signal
+from collections.abc import Mapping
 from types import FrameType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,8 +24,15 @@ from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.config.watermarking import WATERMARK_CONFIG_EXAMPLE, WatermarkConfig
 from vllm_omni.diffusion.registry import resolve_native_single_file
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, is_frontend_only
+from vllm_omni.entrypoints.api_server_shared_dir import (
+    create_api_server_shared_dir,
+    remove_api_server_shared_dir,
+)
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -60,6 +67,8 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
   Use `--help=all` to show all available flags at once.
 """
 
+_WATERMARK_CONFIG_HELP = f"JSON watermark configuration. Example: {WATERMARK_CONFIG_EXAMPLE}."
+
 
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     """Adapt shared stage-override validation to argparse's error type."""
@@ -70,6 +79,20 @@ def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     if parsed is None:
         raise argparse.ArgumentTypeError("--stage-overrides requires a JSON object")
     return parsed
+
+
+def _parse_stage_id(value: str) -> int:
+    """Parse `--stage-id` as a non-negative int, or `none` (no local stage) as `FRONTEND_ONLY_ID_FILTER`."""
+    if value.lower() == "none":
+        return FRONTEND_ONLY_ID_FILTER
+    msg = f"Stage ID must be a non-negative integer or 'none', got {value!r}"
+    try:
+        stage_id = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(msg) from exc
+    if stage_id < 0:
+        raise argparse.ArgumentTypeError(msg)
+    return stage_id
 
 
 def _nonneg_finite_float(value: str) -> float:
@@ -91,6 +114,20 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("must be a JSON object")
     return parsed
+
+
+def _parse_watermark_config(value: str) -> WatermarkConfig:
+    """Parse a watermark config from the CLI."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(_WATERMARK_CONFIG_HELP) from exc
+    if not isinstance(config, Mapping):
+        raise argparse.ArgumentTypeError(_WATERMARK_CONFIG_HELP)
+    try:
+        return WatermarkConfig.from_dict(config)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _ensure_vllm_platform():
@@ -160,8 +197,20 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        # Only the head owns stage-metric collection; API statistics default on.
+        if (
+            not bool(getattr(args, "headless", False))
+            and not bool(getattr(args, "disable_log_stats", False))
+            and not bool(getattr(args, "collect_stage_metrics", True))
+        ):
+            raise ValueError(
+                "--no-collect-stage-metrics requires --disable-log-stats when statistics logging is enabled"
+            )
+
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        if args.headless and is_frontend_only(args.stage_id):
+            raise ValueError("--stage-id none cannot be used with --headless")
 
         # Require an explicit model under --omni. ``args.model`` always carries
         # vLLM's ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent:
@@ -252,8 +301,8 @@ class OmniServeCommand(CLISubcommand):
         if omni_dp_size_local is not None:
             if omni_dp_size_local < 1:
                 raise ValueError(f"--omni-dp-size-local must be >= 1, got {omni_dp_size_local}")
-            if omni_dp_size_local != 1 and args.stage_id is None:
-                raise ValueError("--omni-dp-size-local != 1 requires --stage-id to be set")
+            if omni_dp_size_local != 1 and (args.stage_id is None or is_frontend_only(args.stage_id)):
+                raise ValueError("--omni-dp-size-local != 1 requires a numeric --stage-id")
 
         # vLLM CLI args that omni does not honor: parallelism comes from the
         # per-stage YAML (parallel_config:, enable_expert_parallel:) and the
@@ -315,7 +364,7 @@ class OmniServeCommand(CLISubcommand):
             return
         validate_parsed_serve_args(args)
 
-    def subparser_init(self, subparsers: argparse._SubParsersAction) -> TrackingArgumentParser:
+    def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,
@@ -324,6 +373,8 @@ class OmniServeCommand(CLISubcommand):
 
         _ensure_vllm_platform()
         serve_parser = make_arg_parser(serve_parser)
+        if not isinstance(serve_parser, TrackingArgumentParser):
+            raise TypeError("Omni serve requires a TrackingArgumentParser")
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
 
         # Create OmniConfig argument group for omni-related parameters
@@ -336,6 +387,13 @@ class OmniServeCommand(CLISubcommand):
             "--omni",
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
+        )
+        serve_parser.maybe_override_argument(
+            omni_config_group,
+            "--watermark-config",
+            argument_type=_parse_watermark_config,
+            default=None,
+            help=_WATERMARK_CONFIG_HELP,
         )
 
         try:
@@ -416,9 +474,12 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--stage-id",
-            type=int,
+            type=_parse_stage_id,
             default=None,
-            help="Select and launch a single stage by stage_id.",
+            help=(
+                "Select and launch a single stage by stage_id. Pass 'none' on the "
+                "head to launch no local stage (API server + orchestrator only)."
+            ),
         )
         omni_config_group.add_argument(
             "--replica-id",
@@ -452,6 +513,16 @@ class OmniServeCommand(CLISubcommand):
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
+        )
+        omni_config_group.add_argument(
+            "--collect-stage-metrics",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Collect per-request stage diagnostics. Enabled by default; "
+                "use --no-collect-stage-metrics with --disable-log-stats to skip diagnostics "
+                "while preserving completion and usage metadata."
+            ),
         )
         omni_config_group.add_argument(
             "--log-file",
@@ -559,6 +630,12 @@ class OmniServeCommand(CLISubcommand):
                 "How to load the diffusion pipeline: native/registry (default), "
                 "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
             ),
+        )
+        omni_config_group.add_argument(
+            "--controlnet-model-path",
+            type=str,
+            default=None,
+            help="Local original MiniMax H3 Fun ControlNet Union safetensors checkpoint.",
         )
         omni_config_group.add_argument(
             "--hsdp-weight-load-strategy",
@@ -858,6 +935,18 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
 
+        omni_config_group.add_argument(
+            "--vae-encode-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Cosmos3/Wan2.2 residual VAE encoder fast path, independent of --vae-fast-path. "
+                "'lossless' (default) preserves reference values; 'channels_last' also switches "
+                "encoder convolution layouts and fuses reductions (not bit-exact); 'off' uses "
+                "the reference encoder."
+            ),
+        )
+
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
             "--disable-multithread-weight-load",
@@ -890,6 +979,15 @@ class OmniServeCommand(CLISubcommand):
             "components, and put layer-only tuning under layer_options. "
             "Layer settings are weight_transfer (rank-local or allgather) and "
             "resident_layers (DiT only).",
+        )
+        omni_config_group.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help="MiniMax-H3 reference-KV cache as JSON: mode=on, "
+            "kv_refresh_interval (default 2), kv_host_quantization=none|fp8|int8. "
+            "Reference projections are skipped on reuse steps. "
+            "Omit to keep the existing attention path.",
         )
         omni_config_group.add_argument(
             "--enable-cpu-offload",
@@ -935,6 +1033,13 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=0,
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-chunk-size-mb",
+            type=int,
+            default=64,
+            help="Full-chunk target size in MiB for distributed layerwise offload "
+            "(each chunk is one host-to-device copy + AllGather unit).",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-mode",
@@ -1106,15 +1211,6 @@ class OmniServeCommand(CLISubcommand):
             help="Enable orchestrator window monitor and write a JSON log at shutdown.",
         )
 
-        # Supplementary auxiliary text encoder parameters
-        # (e.g., the meta llama/meta llama-3.1-8b-instrument used by hidream)
-        omni_config_group.add_argument(
-            "--auxiliary-text-encoder",
-            type=str,
-            default=None,
-            help="Auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
-        )
-
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
@@ -1225,39 +1321,40 @@ def _wait_for_multi_api_server_completion(
                 )
 
 
-def _start_api_server_process_manager(
-    *,
-    cleanup_timeout: float,
-    **manager_kwargs: object,
-) -> APIServerProcessManager:
-    """Construct vLLM's manager with rollback for a partial ``__init__``.
+class _EngineAddressListener:
+    """Present an engine-bound ZMQ address as vLLM's ``ZmqListener`` interface.
 
-    ``APIServerProcessManager`` starts workers one by one in ``__init__`` and
-    installs its finalizer only after every ``Process.start`` succeeds. Keep a
-    reference to the partially initialized object so workers started before a
-    later failure are still terminated.
+    Omni stage engines bind their own ZMQ sockets (stable IPC paths), so the
+    API-server manager receives the already-bound address instead of a
+    frontend-owned listener socket; workers connect by address exactly as
+    before upstream f226af0e11 switched ``APIServerProcessManager`` to
+    inherited listeners.
     """
-    from vllm.v1.utils import APIServerProcessManager, shutdown
 
-    manager = APIServerProcessManager.__new__(APIServerProcessManager)
-    try:
-        APIServerProcessManager.__init__(manager, **manager_kwargs)
-    except BaseException:
-        try:
-            for pipe in getattr(manager, "_address_pipes", ()):
-                with contextlib.suppress(Exception):
-                    pipe.close()
-            # A Process whose start() raised is still present in the upstream
-            # manager's list, but calling is_alive() on it raises because it
-            # has no Popen object. Only hand successfully started children to
-            # vLLM's shutdown helper.
-            started_processes = [process for process in getattr(manager, "processes", ()) if process.pid is not None]
-            if started_processes:
-                shutdown(started_processes, timeout=cleanup_timeout)
-        except Exception:
-            logger.exception("Failed to clean up partially started API server processes")
-        raise
-    return manager
+    def __init__(self, address: str) -> None:
+        self.address = address
+
+    @property
+    def socket(self) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        pass
+
+
+def _start_api_server_process_manager(**manager_kwargs: object) -> APIServerProcessManager:
+    """Construct vLLM's API server process manager.
+
+    Since upstream f226af0e11 the manager owns its own rollback: when a worker
+    ``Process.start`` fails inside ``__init__``, it shuts down the previously
+    started processes and cleans up every ZMQ listener itself.
+    """
+    from vllm.v1.utils import APIServerProcessManager
+
+    return APIServerProcessManager(**manager_kwargs)
 
 
 def run_multi_api_server_omni(args: TrackingNamespace) -> None:
@@ -1283,6 +1380,9 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=True)
+    # API processes share one server-scoped scratch directory.
+    shared_dir = create_api_server_shared_dir()
+    args._omni_api_server_shared_dir = shared_dir
     stage_runtime = None
     api_server_manager = None
     engine_launch = None
@@ -1295,19 +1395,15 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
                 raise RuntimeError("Primary stage engine returned no addresses")
             timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
             api_server_manager = _start_api_server_process_manager(
-                cleanup_timeout=timeout,
                 listen_address=listen_address,
                 sock=sock,
                 args=args,
                 num_servers=num_api_servers,
-                input_addresses=primary_addresses.inputs,
-                output_addresses=primary_addresses.outputs,
+                input_listeners=[_EngineAddressListener(addr) for addr in primary_addresses.inputs],
+                output_listeners=[_EngineAddressListener(addr) for addr in primary_addresses.outputs],
                 target_server_fn=run_omni_api_server_worker_proc,
             )
             engine_launch.watched_frontend_processes.extend(api_server_manager.processes)
-            actual_inputs, actual_outputs = api_server_manager.gather_actual_addresses()
-            primary_addresses.inputs = actual_inputs
-            primary_addresses.outputs = actual_outputs
 
         _wait_for_multi_api_server_completion(api_server_manager, engine_launch)
     finally:
@@ -1319,6 +1415,7 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
         if stage_runtime is not None:
             stage_runtime.shutdown()
         sock.close()
+        remove_api_server_shared_dir(shared_dir)
         if shutdown_requested:
             logger.info("Shared API server shutdown completed")
 
@@ -1460,6 +1557,7 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_connector_spec=stage_connector_spec,
         engine_args_dict=engine_args_dict,
         headless=True,
+        watermark_config=args.watermark_config,
     )
     parallel_config = vllm_config.parallel_config
 

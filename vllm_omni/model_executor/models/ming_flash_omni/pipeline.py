@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ming-flash-omni-2.0 pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation.
@@ -52,6 +52,7 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             # it does not share the thinker backbone, so it gets its own arch.
             model_arch="MingFlashOmniTalkerForConditionalGeneration",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_pending_generation=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
@@ -74,6 +75,7 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="ming_tts",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_pending_generation=True,
             input_sources=(),
             final_output=True,
             final_output_type="audio",

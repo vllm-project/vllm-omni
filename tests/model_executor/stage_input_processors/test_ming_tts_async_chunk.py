@@ -10,7 +10,9 @@ import torch
 
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_CHUNK_ID,
+    KEY_FINAL_DECODE_STEP,
     KEY_REQUEST_ID,
+    KEY_STOP_REASON,
     LATENT_DIM,
     PATCH_SIZE,
 )
@@ -18,10 +20,8 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import MING_TTS_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.ming_tts import (
     MING_EMIT_PATCH_COUNT_KEY,
     MING_ESTIMATED_BYTES_KEY,
-    MING_FINAL_DECODE_STEP_KEY,
     MING_FINAL_FLUSH_KEY,
     MING_LATENT_SHAPE_KEY,
-    MING_STOP_REASON_KEY,
     _extract_ming_output_snapshot,
     _select_snapshot_value,
     llm2audio_vae,
@@ -82,7 +82,7 @@ def test_ming_output_snapshot_selects_last_active_row():
         "ming_has_patch": torch.tensor([1, 0, 1], dtype=torch.bool),
         "ming_latent_patch": patches,
         "ming_decode_step": torch.tensor([11, 22, 33]),
-        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+        KEY_STOP_REASON: torch.tensor([0, 1, 2]),
     }
 
     patch, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
@@ -102,7 +102,7 @@ def test_ming_output_snapshot_selects_all_active_rows_for_full_payload():
         "ming_has_patch": torch.tensor([1, 0, 1], dtype=torch.bool),
         "ming_latent_patch": patches,
         "ming_decode_step": torch.tensor([11, 22, 33]),
-        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+        KEY_STOP_REASON: torch.tensor([0, 1, 2]),
     }
 
     selected, decode_step, stop_reason = _extract_ming_output_snapshot(
@@ -120,7 +120,7 @@ def test_ming_output_snapshot_returns_empty_when_no_row_is_active():
         "ming_has_patch": torch.tensor([0, 0], dtype=torch.bool),
         "ming_latent_patch": torch.ones(2, PATCH_SIZE, LATENT_DIM),
         "ming_decode_step": torch.tensor([11, 22]),
-        MING_STOP_REASON_KEY: torch.tensor([0, 1]),
+        KEY_STOP_REASON: torch.tensor([0, 1]),
     }
 
     assert _extract_ming_output_snapshot(pooling_output) == (None, None, None)
@@ -136,7 +136,7 @@ def test_ming_output_snapshot_preserves_list_metadata_fallback():
         "ming_has_patch": torch.tensor([0, 1], dtype=torch.bool),
         "ming_latent_patch": patches,
         "ming_decode_step": [11, 22],
-        MING_STOP_REASON_KEY: [0, 1],
+        KEY_STOP_REASON: [0, 1],
     }
 
     patch, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
@@ -166,12 +166,14 @@ def test_ming_snapshot_value_preserves_empty_sequence(metadata_type, selected_in
     assert _select_snapshot_value(metadata_type(), selected_index) is None
 
 
-def test_ming_final_decode_step_key_is_shared_with_audio_vae():
-    from vllm_omni.model_executor.models.ming_tts import ming_tts_audio_vae, patch_emission
+def test_ming_snapshot_keys_use_canonical_constants():
+    from vllm_omni.model_executor.models.common.ming.continuous_tts import STOP_REASON_BY_CODE
+    from vllm_omni.model_executor.stage_input_processors import ming_tts
 
-    assert getattr(patch_emission, "MING_FINAL_DECODE_STEP_KEY", None) == "ming_final_decode_step"
-    assert MING_FINAL_DECODE_STEP_KEY == patch_emission.MING_FINAL_DECODE_STEP_KEY
-    assert ming_tts_audio_vae.MING_FINAL_DECODE_STEP_KEY == patch_emission.MING_FINAL_DECODE_STEP_KEY
+    assert KEY_FINAL_DECODE_STEP == "ming_final_decode_step"
+    assert ming_tts.KEY_FINAL_DECODE_STEP == KEY_FINAL_DECODE_STEP
+    assert ming_tts.KEY_STOP_REASON == KEY_STOP_REASON
+    assert ming_tts.STOP_REASON_BY_CODE is STOP_REASON_BY_CODE
 
 
 @pytest.mark.parametrize("all_patches", [False, True])
@@ -182,7 +184,7 @@ def test_ming_output_snapshot_tensor_mask_selects_sequence_metadata_once(monkeyp
         "ming_has_patch": torch.tensor([1, 1, 0], dtype=torch.bool),
         "ming_latent_patch": patches,
         "ming_decode_step": metadata_type([11, 22, 33]),
-        MING_STOP_REASON_KEY: metadata_type([0, 1, 2]),
+        KEY_STOP_REASON: metadata_type([0, 1, 2]),
     }
     original_item = torch.Tensor.item
     original_int = torch.Tensor.__int__
@@ -216,7 +218,7 @@ def test_ming_two_dimensional_patch_preserves_consumer_payload(full_payload):
         "ming_has_patch": torch.tensor([1], dtype=torch.bool),
         "ming_latent_patch": patch,
         "ming_decode_step": torch.tensor([17]),
-        MING_STOP_REASON_KEY: torch.tensor([2]),
+        KEY_STOP_REASON: torch.tensor([2]),
     }
 
     if full_payload:
@@ -238,8 +240,8 @@ def test_ming_two_dimensional_patch_preserves_consumer_payload(full_payload):
     torch.testing.assert_close(latents, patch.float().unsqueeze(0))
     assert latents.device.type == "cpu"
     assert metadata[KEY_REQUEST_ID] == "req"
-    assert metadata[MING_FINAL_DECODE_STEP_KEY] == 17
-    assert metadata[MING_STOP_REASON_KEY] == "max_decode_steps"
+    assert metadata[KEY_FINAL_DECODE_STEP] == 17
+    assert metadata[KEY_STOP_REASON] == "max_decode_steps"
 
 
 def test_ming_full_payload_reuses_snapshot_for_patches_and_metadata():
@@ -252,7 +254,7 @@ def test_ming_full_payload_reuses_snapshot_for_patches_and_metadata():
         "ming_has_patch": torch.tensor([1, 0, 1], dtype=torch.bool),
         "ming_latent_patch": patches,
         "ming_decode_step": torch.tensor([11, 22, 33]),
-        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+        KEY_STOP_REASON: torch.tensor([0, 1, 2]),
     }
     stage_output = SimpleNamespace(
         finished=True,
@@ -268,8 +270,8 @@ def test_ming_full_payload_reuses_snapshot_for_patches_and_metadata():
         additional_information["ming_latent_patches"],
         patches[[0, 2]],
     )
-    assert additional_information[MING_FINAL_DECODE_STEP_KEY] == 33
-    assert additional_information[MING_STOP_REASON_KEY] == "max_decode_steps"
+    assert additional_information[KEY_FINAL_DECODE_STEP] == 33
+    assert additional_information[KEY_STOP_REASON] == "max_decode_steps"
 
 
 def test_ming_async_chunk_emits_small_initial_chunk_then_steady_chunks():
@@ -311,7 +313,7 @@ def test_ming_async_chunk_preserves_selected_final_metadata():
         "ming_has_patch": torch.tensor([1, 1, 0], dtype=torch.bool),
         "ming_latent_patch": patches,
         "ming_decode_step": torch.tensor([11, 22, 33]),
-        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+        KEY_STOP_REASON: torch.tensor([0, 1, 2]),
     }
 
     payload = llm2audio_vae_async_chunk(transfer_manager, multimodal_output, _make_request(), is_finished=True)
@@ -320,8 +322,8 @@ def test_ming_async_chunk_preserves_selected_final_metadata():
     torch.testing.assert_close(payload.latent, patches[1:2])
     assert payload.kv_metadata[KEY_REQUEST_ID] == "req"
     assert payload.kv_metadata[KEY_CHUNK_ID] == 3
-    assert payload.kv_metadata[MING_FINAL_DECODE_STEP_KEY] == 22
-    assert payload.kv_metadata[MING_STOP_REASON_KEY] == "stop_head"
+    assert payload.kv_metadata[KEY_FINAL_DECODE_STEP] == 22
+    assert payload.kv_metadata[KEY_STOP_REASON] == "stop_head"
     assert payload.kv_metadata[MING_EMIT_PATCH_COUNT_KEY] == 1
     assert payload.kv_metadata[MING_LATENT_SHAPE_KEY] == (1, PATCH_SIZE, LATENT_DIM)
     assert payload.kv_metadata[MING_ESTIMATED_BYTES_KEY] == PATCH_SIZE * LATENT_DIM * 4
@@ -336,7 +338,7 @@ def test_ming_async_chunk_zero_patch_terminal_flush_preserves_metadata():
     transfer_manager.put_req_chunk["req"] = 1
     multimodal_output = {
         "ming_decode_step": torch.tensor([23]),
-        MING_STOP_REASON_KEY: torch.tensor([2]),
+        KEY_STOP_REASON: torch.tensor([2]),
     }
 
     payload = llm2audio_vae_async_chunk(transfer_manager, multimodal_output, _make_request(finished=True))
@@ -346,8 +348,8 @@ def test_ming_async_chunk_zero_patch_terminal_flush_preserves_metadata():
     assert payload.codes.audio.numel() == 0
     assert payload.kv_metadata[KEY_REQUEST_ID] == "req"
     assert payload.kv_metadata[KEY_CHUNK_ID] == 1
-    assert payload.kv_metadata[MING_FINAL_DECODE_STEP_KEY] == 23
-    assert payload.kv_metadata[MING_STOP_REASON_KEY] == "max_decode_steps"
+    assert payload.kv_metadata[KEY_FINAL_DECODE_STEP] == 23
+    assert payload.kv_metadata[KEY_STOP_REASON] == "max_decode_steps"
     assert payload.kv_metadata[MING_EMIT_PATCH_COUNT_KEY] == 0
     assert payload.kv_metadata[MING_LATENT_SHAPE_KEY] is None
     assert payload.kv_metadata[MING_ESTIMATED_BYTES_KEY] == 0
@@ -396,14 +398,14 @@ def test_ming_worker_loads_hook_and_builds_terminal_payload(metadata_only):
         if metadata_only:
             multimodal_output = {
                 "ming_decode_step": torch.tensor([22]),
-                MING_STOP_REASON_KEY: torch.tensor([1]),
+                KEY_STOP_REASON: torch.tensor([1]),
             }
         else:
             multimodal_output = {
                 "ming_has_patch": torch.tensor([1, 1, 0], dtype=torch.bool),
                 "ming_latent_patch": patches,
                 "ming_decode_step": torch.tensor([11, 22, 33]),
-                MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+                KEY_STOP_REASON: torch.tensor([0, 1, 2]),
             }
 
         payload = worker._build_custom_process_payload("internal-req", request, multimodal_output)
@@ -411,8 +413,8 @@ def test_ming_worker_loads_hook_and_builds_terminal_payload(metadata_only):
         assert payload is not None
         assert payload.kv_metadata[KEY_REQUEST_ID] == "external-req"
         assert payload.kv_metadata[KEY_CHUNK_ID] == 3
-        assert payload.kv_metadata[MING_FINAL_DECODE_STEP_KEY] == 22
-        assert payload.kv_metadata[MING_STOP_REASON_KEY] == "stop_head"
+        assert payload.kv_metadata[KEY_FINAL_DECODE_STEP] == 22
+        assert payload.kv_metadata[KEY_STOP_REASON] == "stop_head"
         assert payload.meta.finished.item() is True
         assert payload.meta.stream_finished.item() is True
         assert payload.kv_metadata[MING_FINAL_FLUSH_KEY] is True

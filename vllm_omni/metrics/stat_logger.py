@@ -23,13 +23,19 @@ Contents:
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram
+from threading import Lock
+from weakref import WeakKeyDictionary
+
+from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.metrics import MetricWrapperBase
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm, KVConnectorPromMetrics
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.perf import PerfMetricsProm
 from vllm.v1.spec_decode.metrics import SpecDecodingProm
+
+from vllm_omni.metrics import definitions as defs
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 # Process-wide translation table written by OmniPrometheusStatLogger at init.
 # Keys are flat engine_idx values (as upstream PrometheusStatLogger sees them);
@@ -40,6 +46,37 @@ from vllm.v1.spec_decode.metrics import SpecDecodingProm
 # StatLogger that owns them. vLLM runs a single Orchestrator/StatLogger per
 # process, so a module global is safe; tests isolate by .clear()ing first.
 _ENGINE_INDEX_MAP: dict[int, tuple[str, str]] = {}
+_STAGE_POST_WARMUP_MEMORY_FAMILIES: WeakKeyDictionary[CollectorRegistry, tuple[Gauge, Gauge]] = WeakKeyDictionary()
+_STAGE_POST_WARMUP_MEMORY_FAMILIES_LOCK = Lock()
+
+
+def _get_stage_post_warmup_memory_families(registry: CollectorRegistry) -> tuple[Gauge, Gauge]:
+    with _STAGE_POST_WARMUP_MEMORY_FAMILIES_LOCK:
+        families = _STAGE_POST_WARMUP_MEMORY_FAMILIES.get(registry)
+        if families is None:
+            labels = list(defs.STAGE_LABELS)
+            families = (
+                Gauge(
+                    defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES,
+                    "Rank-0 worker process PyTorch allocator bytes allocated on its device "
+                    "after decoder graph warmup during model loading, before KV-cache allocation "
+                    "and later graph captures.",
+                    labelnames=labels,
+                    multiprocess_mode="mostrecent",
+                    registry=registry,
+                ),
+                Gauge(
+                    defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES,
+                    "Rank-0 worker process PyTorch allocator bytes reserved on its device "
+                    "after decoder graph warmup during model loading, before KV-cache allocation "
+                    "and later graph captures.",
+                    labelnames=labels,
+                    multiprocess_mode="mostrecent",
+                    registry=registry,
+                ),
+            )
+            _STAGE_POST_WARMUP_MEMORY_FAMILIES[registry] = families
+        return families
 
 
 def _rewrite_labelnames(labelnames):
@@ -264,6 +301,7 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
         # its first join so every per-engine table has a binding template.
         if stage_replica_map:
             super().__init__(vllm_config=vllm_config, engine_indexes=self.engine_indexes)
+        self._init_stage_post_warmup_memory_families()
 
     def register_replica(self, engine_idx: int, stage: str, replica: str) -> None:
         """Register a replica without resetting existing metric series."""
@@ -281,6 +319,11 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
         self.per_engine_labelvalues[engine_idx] = [self.vllm_config.model_config.served_model_name, stage, replica]
         self.engine_indexes.append(engine_idx)
         self.gauge_engine_sleep_state["awake"][engine_idx].set(1)
+
+    def _init_stage_post_warmup_memory_families(self, registry: CollectorRegistry = REGISTRY) -> None:
+        self._stage_post_warmup_memory_allocated_family, self._stage_post_warmup_memory_reserved_family = (
+            _get_stage_post_warmup_memory_families(registry)
+        )
 
     @property
     def stage_replica_map(self) -> dict[int, tuple[str, str]]:
@@ -301,3 +344,22 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
             stage, replica = self._stage_replica_map[idx]
             rewritten[idx] = [model_name, stage, replica]
         self._omni_per_engine_labelvalues = rewritten
+
+    def record_stage_post_warmup_memory(
+        self,
+        stats: StagePostWarmupMemoryStats,
+        *,
+        engine_idx: int,
+    ) -> None:
+        model_name, stage, replica = self.per_engine_labelvalues[engine_idx]
+        labels = (model_name, stage, replica)
+        self._stage_post_warmup_memory_allocated_family.labels(*labels).set(stats.allocated_bytes)
+        self._stage_post_warmup_memory_reserved_family.labels(*labels).set(stats.reserved_bytes)
+
+    def remove_stage_post_warmup_memory(self, *, engine_idx: int) -> None:
+        """Remove a detached replica's snapshot while retaining its metric slot."""
+        labels = self.per_engine_labelvalues.get(engine_idx)
+        if labels is None:
+            return
+        self._stage_post_warmup_memory_allocated_family.remove(*labels)
+        self._stage_post_warmup_memory_reserved_family.remove(*labels)

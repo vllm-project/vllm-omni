@@ -11,19 +11,22 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.common.ming.continuous_tts import (
+    STOP_REASON_BY_CODE,
+)
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     INITIAL_LATENT_CHUNK_SIZE,
     KEY_CHUNK_ID,
     KEY_REQUEST_ID,
+    KEY_STOP_REASON,
     LATENT_CHUNK_SIZE,
     LATENT_DIM,
     LATENT_LEFT_CONTEXT,
     PATCH_SIZE,
 )
-from vllm_omni.model_executor.models.ming_tts.patch_emission import (
-    MING_FINAL_DECODE_STEP_KEY,
-    MING_STOP_REASON_CODES,
-    MING_STOP_REASON_KEY,
+from vllm_omni.model_executor.models.ming_tts.constants import (
+    KEY_DECODE_STEP,
+    KEY_FINAL_DECODE_STEP,
 )
 
 logger = init_logger(__name__)
@@ -32,7 +35,6 @@ MING_EMIT_PATCH_COUNT_KEY = "ming_emit_patch_count"
 MING_LATENT_SHAPE_KEY = "ming_latent_shape"
 MING_ESTIMATED_BYTES_KEY = "ming_estimated_bytes"
 MING_FINAL_FLUSH_KEY = "ming_final_flush"
-MING_STOP_REASON_BY_CODE = {code: reason for reason, code in MING_STOP_REASON_CODES.items()}
 
 
 def _select_snapshot_value(value: Any, selected_index: int | torch.Tensor) -> Any:
@@ -57,8 +59,8 @@ def _extract_snapshot_metadata(
     pooling_output: Mapping[str, Any],
     selected_index: int | torch.Tensor,
 ) -> tuple[Any, Any]:
-    decode_step_value = pooling_output.get("ming_decode_step")
-    stop_reason_value = pooling_output.get(MING_STOP_REASON_KEY)
+    decode_step_value = pooling_output.get(KEY_DECODE_STEP)
+    stop_reason_value = pooling_output.get(KEY_STOP_REASON)
     if isinstance(selected_index, torch.Tensor) and (
         isinstance(decode_step_value, (list, tuple)) or isinstance(stop_reason_value, (list, tuple))
     ):
@@ -153,7 +155,7 @@ def _decode_stop_reason(value: Any) -> str | None:
         return None
     if isinstance(value, str):
         return value
-    return MING_STOP_REASON_BY_CODE.get(int(value))
+    return STOP_REASON_BY_CODE.get(int(value))
 
 
 def _get_async_chunk_config(transfer_manager: Any) -> tuple[int, int, int]:
@@ -259,9 +261,9 @@ def llm2audio_vae_async_chunk(
                 **observability,
             }
             if final_decode_step is not None:
-                kv_meta[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
+                kv_meta[KEY_FINAL_DECODE_STEP] = int(final_decode_step)
             if stop_reason is not None:
-                kv_meta[MING_STOP_REASON_KEY] = stop_reason
+                kv_meta[KEY_STOP_REASON] = stop_reason
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -295,9 +297,9 @@ def llm2audio_vae_async_chunk(
         **observability,
     }
     if final_decode_step is not None:
-        kv_meta[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
+        kv_meta[KEY_FINAL_DECODE_STEP] = int(final_decode_step)
     if stop_reason is not None:
-        kv_meta[MING_STOP_REASON_KEY] = stop_reason
+        kv_meta[KEY_STOP_REASON] = stop_reason
     if finished:
         state["terminal_sent"] = True
     return OmniPayloadStruct(
@@ -339,9 +341,9 @@ def llm2audio_vae(
             "finished": torch.tensor(finished, dtype=torch.bool),
         }
         if final_decode_step is not None:
-            additional_information[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
+            additional_information[KEY_FINAL_DECODE_STEP] = int(final_decode_step)
         if stop_reason is not None:
-            additional_information[MING_STOP_REASON_KEY] = stop_reason
+            additional_information[KEY_STOP_REASON] = stop_reason
         outputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0],

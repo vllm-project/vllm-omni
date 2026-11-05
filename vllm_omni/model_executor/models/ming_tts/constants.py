@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,7 @@ MAX_DECODE_STEPS = 200
 
 KEY_LATENT_HISTORY = "ming_latent_history"
 KEY_DECODE_STEP = "ming_decode_step"
+KEY_FINAL_DECODE_STEP = "ming_final_decode_step"
 KEY_LAST_STOP_PROB = "ming_last_stop_prob"
 KEY_NEXT_EMBEDS = "ming_next_embeds"
 KEY_PROMPT_LATENTS = "ming_prompt_latents"
@@ -84,4 +85,5 @@ KEY_SIGMA = "ming_sigma"
 KEY_TEMPERATURE = "ming_temperature"
 KEY_MAX_DECODE_STEPS = "ming_max_decode_steps"
 KEY_MIN_DECODE_STEPS = "ming_min_decode_steps"
+KEY_STOP_REASON = "ming_stop_reason"
 KEY_TEXT_MODE = "ming_text_mode"
