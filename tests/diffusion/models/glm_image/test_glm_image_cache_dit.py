@@ -19,6 +19,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def test_diffuse_cache_dit_counts_steps_for_each_request_cfg_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vllm_omni.diffusion.cache.cachedit.backend._cfg_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.glm_image.pipeline_glm_image.get_classifier_free_guidance_world_size",
+        lambda: 1,
+    )
 
     class TinyBlock(nn.Module):
         def forward(self, hidden_states, encoder_hidden_states, **kwargs):
