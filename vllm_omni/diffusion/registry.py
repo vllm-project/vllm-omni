@@ -35,6 +35,8 @@ def resolve_native_single_file(model_class_name: str | None) -> str | None:
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "HyNomasPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
+    "HyNomasModularPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
     "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
     "QwenImagePipeline": (
         "qwen_image",
@@ -256,6 +258,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Alpamayo2SuperPipeline": (
+        "alpamayo2_super",
+        "pipeline_alpamayo2_super",
+        "Alpamayo2SuperPipeline",
+    ),
     "Gr00tN1d7Pipeline": (
         "gr00t",
         "pipeline_gr00t",
@@ -435,6 +442,9 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
+    "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
+    "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
     "CausVidWanPipeline": (
         "causvid_wan",
         "pipeline_causvid_wan",
@@ -485,12 +495,18 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
+    # transferred KV prefix, with no DiT block list.
+    "Alpamayo2SuperPipeline",
     # SAM3 is a single forward pass with no denoising steps to cache.
     "Sam3Model",
     "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
     "CausVidWanPipeline",
+    "PhysisWanPipeline",
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
@@ -720,6 +736,9 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {
+    "PhysisWanPipeline": "get_wan22_post_process_func",
+    "PhysisH3Pipeline": "get_wan22_post_process_func",
+    "PhysisLTXPipeline": "get_wan22_post_process_func",
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
