@@ -854,7 +854,12 @@ async def generate_sample(
                         await silence_task
                     except asyncio.CancelledError:
                         pass
-                    except Exception:  # noqa: BLE001 - padding is best effort
+                    except (ConnectionClosed, OSError):
+                        # A transport that is already dead is the expected way
+                        # padding ends here; the sample still reports its own
+                        # timeouts. Anything else is a coding error in the
+                        # padding path and must surface instead of silently
+                        # looking like a drain timeout.
                         pass
         finally:
             ack_task.cancel()

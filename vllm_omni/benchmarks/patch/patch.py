@@ -308,16 +308,20 @@ def _duplex_retryable_stall(result: object) -> str | None:
     Only a client-side timeout that came alone is retried. Anything the session
     reported — a ``server_errors`` entry or any other recorded failure in
     ``result.error`` — gets exactly one attempt: it is a deterministic failure,
-    and retrying it could turn a reported error into a pass. A completed
-    response is a finished sample: its stalled close or ack is advisory and
-    must not be re-run either.
+    and retrying it could turn a reported error into a pass. A completed reply
+    does not establish that the whole input reached the server, so an input or
+    commit stall under one is still a recoverable transport failure and is
+    retried; only the advisory close of a finished sample is exempt.
     """
     metadata = getattr(result, "metadata", None) or {}
-    if metadata.get("response_done") is True:
-        return None
     if metadata.get("server_errors") or _duplex_reported_error(result):
         return None
-    return _duplex_timeout_reason(metadata)
+    reason = _duplex_timeout_reason(metadata)
+    if reason is None:
+        return None
+    if metadata.get("response_done") is True and reason.startswith("close_timeout"):
+        return None
+    return reason
 
 
 def _duplex_retry_tally(outputs: list[RequestFuncOutput]) -> dict[str, int]:

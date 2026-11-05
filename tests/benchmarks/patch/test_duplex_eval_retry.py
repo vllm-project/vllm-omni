@@ -371,6 +371,35 @@ async def test_a_stalled_input_or_commit_write_is_retried_once(monkeypatch, time
     assert output.success is True
 
 
+@pytest.mark.parametrize("timeout_key", ["input_timeout", "commit_timeout"])
+async def test_an_input_or_commit_stall_under_a_completed_reply_is_retried(monkeypatch, timeout_key) -> None:
+    """A finished reply does not prove the whole input reached the server.
+
+    The reply can complete from a partially delivered clip, so the sample with
+    ``response_done=True`` and an ``input_timeout``/``commit_timeout`` is the
+    same recoverable transport failure as the one above, not a finished
+    sample: retry it once. Only the advisory close (and ack) of a completed
+    reply stays exempt.
+    """
+    clock = _FakeClock()
+    timeout_text = f"{timeout_key}: stalled write"
+    stalled = _session_result({timeout_key: timeout_text}, error=timeout_text)
+    recovered = _session_result()
+    returned = iter([stalled, recovered])
+
+    async def generate_sample(*_args, **_kwargs):
+        clock.advance(_SESSION_S)
+        return next(returned)
+
+    _install_fakes(monkeypatch, clock, generate_sample)
+    output = await patch._async_request_duplex_eval(_request(), pbar=None)
+
+    assert output.duplex_retries == 1
+    assert next(returned, None) is None  # exactly two attempts, no third
+    assert output.success is True
+    assert recovered.metadata["retry_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("advance_s", "expected"),
     [

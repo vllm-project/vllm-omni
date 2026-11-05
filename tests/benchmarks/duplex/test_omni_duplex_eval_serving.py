@@ -850,6 +850,47 @@ async def test_drain_settles_when_the_committed_clip_gets_only_a_listen(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_a_padding_coding_error_surfaces_through_the_sample(tmp_path, prepared, monkeypatch):
+    """An unexpected padding failure must not masquerade as a drain timeout.
+
+    ``_pad_silence_until_stopped`` only stops quietly for a dead transport; a
+    coding error in the padding path (here an ``AttributeError`` from
+    ``append_silence``) has to leave the sample visibly failed through
+    ``generate_sample`` instead of being swallowed while the drain settles on
+    the reply that the fake already finished.
+    """
+
+    async def broken_append_silence(self, duration_ms):
+        raise AttributeError("append_silence is broken")
+
+    monkeypatch.setattr(runner.RealtimeDuplexClient, "append_silence", broken_append_silence)
+
+    async def handler(socket):
+        async for raw in socket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                for response in [
+                    {"type": "response.created", "response": {"id": "r1"}},
+                    {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                ]:
+                    await socket.send(json.dumps(response))
+            elif event["type"] == "session.close":
+                await socket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        sample = _samples(tmp_path)[0]
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success is False
+    assert "AttributeError" in output.error
+
+
+@pytest.mark.asyncio
 async def test_lazy_preparation_keeps_loop_responsive_and_excludes_decode_latency(tmp_path, prepared, monkeypatch):
     sample = _samples(tmp_path)[0]
     entered = asyncio.Event()
