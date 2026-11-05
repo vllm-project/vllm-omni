@@ -109,10 +109,13 @@ def concat_frames(frames: Sequence[Any]) -> Any:
     )
     for index, image in enumerate(images[: rows * cols]):
         row, col = divmod(index, cols)
-        canvas.paste(
-            _letterbox(image, cell_w, cell_h),
-            (col * (cell_w + _LINE_WIDTH), row * (cell_h + _LINE_WIDTH)),
-        )
+        pos = (col * (cell_w + _LINE_WIDTH), row * (cell_h + _LINE_WIDTH))
+        if image.size == (cell_w, cell_h):
+            # Same-size frames (the common live-stream case) fill their cell
+            # exactly; skip the letterbox resize and its extra canvas.
+            canvas.paste(image if image.mode == "RGB" else image.convert("RGB"), pos)
+        else:
+            canvas.paste(_letterbox(image, cell_w, cell_h), pos)
     return canvas
 
 
