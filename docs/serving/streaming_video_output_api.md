@@ -38,6 +38,17 @@ metadata followed by an empty binary frame (`byte_length: 0`). This preserves
 source counts and interaction events. Empty binary frames add no media to the
 stream and do not indicate completion; wait for `session.done`.
 
+An append-only decoder can produce a generation chunk with no stable frames
+yet. Its metadata is still sent with `num_frames=0` and `byte_length=0`, followed
+by an empty binary frame. This preserves chunk positions and interaction
+acknowledgements while the decoder holds future-dependent pixels.
+
+Models may also provide `frame_start` (the cumulative visible output position),
+`generated_raw_frames` (decoder positions before segment padding is omitted),
+`generated_frames` (available visible frames), and `withheld_frames` (available
+frames waiting for future context). Normal completion flushes withheld frames;
+cancellation discards them.
+
 | Direction | Event or frame | Purpose |
 | ----------- | ---------------- | --------- |
 | Client to server | `session.start` | Starts generation with a prompt and video parameters |

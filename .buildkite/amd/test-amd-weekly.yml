@@ -475,6 +475,93 @@ steps:
             fi
             (exit "$$status")
 
+  # CUDA weekly "TTS · Moss · L4" selects these three slow MI325 cards_1
+  # nodes at full_model. That CUDA job failed twice on build 18613; this
+  # lane stays NonBlocking until an exact-head MI300 run executes them.
+  - group: "TTS E2E Weekly"
+    steps:
+      - label: "Moss TTS expansion · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: tts_moss_tts_expansion
+        artifact_paths:
+          - artifacts/rocm-moss-tts-weekly/**/*
+        commands:
+          - export ROCM_MOSS_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-moss-tts-weekly"
+          - mkdir -p "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_english[omni_runner0]"
+              "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_chinese[omni_runner0]"
+              "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_batch[omni_runner0]"
+            )
+            printf '%s\n' "$${nodes[@]}" | sort > \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/expected-nodes.txt"
+            pytest -q tests/e2e/offline_inference/test_moss_tts_expansion.py \
+              -m "slow and tts and rocm and MI325 and cards_1" \
+              --collect-only \
+              --run-level full_model \
+              --shard-id=0 --num-shards=1 \
+              | tee "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collection.log"
+            collection_status="$${PIPESTATUS[0]}"
+            if [[ "$$collection_status" -ne 0 ]]; then
+              exit "$$collection_status"
+            fi
+            sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collection.log" \
+              | sort > "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            if ! diff -u \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/expected-nodes.txt" \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            then
+              echo "Expected exactly three Moss TTS weekly ROCm nodes; collection drifted." >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 75m \
+                pytest -s -v -ra \
+                tests/e2e/offline_inference/test_moss_tts_expansion.py \
+                -m "slow and tts and rocm and MI325 and cards_1" \
+                --run-level full_model \
+                --shard-id=0 --num-shards=1 \
+                --junitxml="$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly three executed Moss TTS weekly tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
   - group: "HunyuanImage Expert Parallel"
     steps:
       - label: "HunyuanImage Expert Parallel Startup"
