@@ -107,6 +107,11 @@ Content-Type: multipart/form-data
 | `reference_image` | string or array | null | Reference image for inpainting |
 | `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |
 
+URL and base64 data-URL inputs are bounded before image decoding. Each image
+input is limited to 30 MiB; oversized or continuously streamed HTTP responses
+are rejected with a client error. Remote downloads also have a 60-second total
+time limit. Response bytes are counted after HTTP content decoding.
+
 ### Response Format
 
 When `stream=false` or omitted, the endpoint returns the standard image edit response:

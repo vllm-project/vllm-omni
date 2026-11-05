@@ -47,6 +47,11 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.openai.app_state import Omnivideo
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.media_input import (
+    MAX_AUDIO_INPUT_BYTES,
+    MAX_IMAGE_INPUT_BYTES,
+    MAX_VIDEO_INPUT_BYTES,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
@@ -82,11 +87,11 @@ from vllm_omni.errors import OmniClientError
 logger = init_logger(__name__)
 
 
-MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
+MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = MAX_IMAGE_INPUT_BYTES
 
-MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES = 50 * 1024 * 1024
+MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES = MAX_VIDEO_INPUT_BYTES
 
-MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
+MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES = MAX_AUDIO_INPUT_BYTES
 
 MINIMAX_H3_MAX_REFERENCE_COUNT = 12
 
