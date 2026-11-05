@@ -527,7 +527,11 @@ def test_keep_steps_rejects_latent_offload_features(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         pipeline,
         "_resolve_latent_continuation",
-        lambda extra, conditioning, *, inherit_canvas: (conditioning, SimpleNamespace()),
+        # The switch check lives in the helper now, so the resolver must
+        # behave as it does for a non-continuation request (no latent
+        # continuation); a stub object would crash the audio_t attribute
+        # access before the rejection is reached.
+        lambda extra, conditioning, *, inherit_canvas: (conditioning, None),
     )
     with pytest.raises(OmniClientError, match="continue_from"):
         pipeline._prepare_encoder_conditioning_inputs(
