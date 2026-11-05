@@ -637,7 +637,9 @@ def _local_pipeline(monkeypatch: pytest.MonkeyPatch):
     ]
     encode_prompt = Mock(side_effect=encoded)
     monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
-    return pipeline, prepared, encode_prompt
+    # Mock turns a list side_effect into an iterator, so the expected values
+    # travel back separately for the assertions.
+    return pipeline, prepared, encode_prompt, encoded
 
 
 def _local_sampling(**extra_args):
@@ -650,14 +652,14 @@ def _local_sampling(**extra_args):
 
 
 def test_local_conditioning_encodes_image_only_presentation(monkeypatch: pytest.MonkeyPatch):
-    pipeline, prepared, encode_prompt = _local_pipeline(monkeypatch)
+    pipeline, prepared, encode_prompt, encoded = _local_pipeline(monkeypatch)
     conditioning, window = pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
 
     assert window is None
     assert encode_prompt.call_count == 2
-    torch.testing.assert_close(conditioning.hidden_states, encode_prompt.side_effect[0][0])
-    torch.testing.assert_close(conditioning.base_hidden_states, encode_prompt.side_effect[1][0])
-    torch.testing.assert_close(conditioning.base_token_tags, encode_prompt.side_effect[1][1])
+    torch.testing.assert_close(conditioning.hidden_states, encoded[0][0])
+    torch.testing.assert_close(conditioning.base_hidden_states, encoded[1][0])
+    torch.testing.assert_close(conditioning.base_token_tags, encoded[1][1])
     base_prepared = encode_prompt.call_args_list[1].args[0]
     assert base_prepared is not prepared
     assert base_prepared.qwen_videos == []
@@ -669,7 +671,7 @@ def test_local_conditioning_encodes_image_only_presentation(monkeypatch: pytest.
 def test_degenerate_keep_steps_skips_the_second_encoder_pass(monkeypatch: pytest.MonkeyPatch):
     # keep_steps == num_inference_steps degrades to full-video conditioning
     # during normalization, so the image-only presentation is never encoded.
-    pipeline, _, encode_prompt = _local_pipeline(monkeypatch)
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     conditioning, _ = pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=4))
     assert encode_prompt.call_count == 1
     assert conditioning.base_hidden_states is None
@@ -677,7 +679,7 @@ def test_degenerate_keep_steps_skips_the_second_encoder_pass(monkeypatch: pytest
 
 
 def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
-    pipeline, _, encode_prompt = _local_pipeline(monkeypatch)
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     with pytest.raises(OmniClientError, match="must be an integer"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=9))
     assert encode_prompt.call_count == 0
@@ -685,7 +687,7 @@ def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.Mo
 
 def test_plain_requests_never_touch_the_keep_steps_resolver(monkeypatch: pytest.MonkeyPatch):
     """Requests without keep_steps keep their original code path untouched."""
-    pipeline, _, encode_prompt = _local_pipeline(monkeypatch)
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     resolver = Mock()
     monkeypatch.setattr(pipeline, "_resolve_sigma_positions", resolver)
     conditioning, _ = pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling())

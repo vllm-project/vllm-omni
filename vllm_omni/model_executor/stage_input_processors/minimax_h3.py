@@ -57,14 +57,16 @@ def prepare_encoder_prompt(
     omits the video from ``qwen_mm_data`` and ``condition_labels``, then merge
     its hidden states/tags into the encoder output payload under the two
     ``base_*`` keys before the payload is handed to the DiT stage.
-    Until this is wired, keep_steps requests that would actually switch are
+    Until this is wired, keep_steps requests that would switch are
     rejected HERE, at intake, so split-stage clients get the 400 without
     paying for the encoder stage; the ``keep_steps == num_inference_steps``
     no-op passes through (the diffusion stage normalizes it away), matching
-    the combined deployment's contract. A pinned distilled schedule can make
-    the effective step count smaller than ``num_inference_steps``; such a
-    request passes intake and the diffusion stage's authoritative check
-    rejects it with the ``pinned distilled sigma schedules`` error. The
+    the combined deployment's contract. Intake only sees the requested (or
+    default) step count: on checkpoints that pin a distilled schedule the
+    effective count can be smaller, so a value the diffusion stage would
+    treat as a no-op may be conservatively rejected here. The diffusion
+    stage owns the authoritative validation either way (requested-step
+    consistency, range, and the pinned-schedule rejection). The
     local-text-encoder path (tests/offline) already works end to end via
     ``_prepare_local_conditioning``.
     """

@@ -544,7 +544,10 @@ curl -s http://localhost:8091/v1/videos/sync \
   LoRA, FastH3, or step execution. Deployments that split the encoder into
   its own stage reject `keep_steps` requests that would switch at intake
   (HTTP 400) until the second encoder pass is wired there; the
-  `keep_steps == num_inference_steps` no-op passes through unchanged.
+  `keep_steps == num_inference_steps` no-op passes through unchanged. Intake
+  judges by the requested (or default) step count, so on checkpoints with a
+  pinned distilled schedule a value the diffusion stage would treat as a
+  no-op can be conservatively rejected at intake.
 
 ### Speech-to-Video
 
