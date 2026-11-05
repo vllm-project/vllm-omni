@@ -422,11 +422,15 @@ class _LockstepSpGroup:
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         self.slots[self.tls.rank] = tensor
         self.barrier.wait(timeout=60)
-        total = self.slots[0].clone()
-        for part in self.slots[1:]:
+        parts: list[torch.Tensor] = []
+        for part in self.slots:
+            assert part is not None
+            parts.append(part)
+        total = parts[0].clone()
+        for part in parts[1:]:
             total = total + part
         if self.tls.rank == 0:
-            self.reduce_inputs.append([part.clone() for part in self.slots])
+            self.reduce_inputs.append([part.clone() for part in parts])
         self.barrier.wait(timeout=60)
         return total
 
@@ -434,8 +438,11 @@ class _LockstepSpGroup:
         assert separate_tensors
         self.slots[self.tls.rank] = tensor
         self.barrier.wait(timeout=60)
-        assert all(part.shape == tensor.shape for part in self.slots), "all_gather requires equal shards"
-        parts = [part.clone() for part in self.slots]
+        parts: list[torch.Tensor] = []
+        for part in self.slots:
+            assert part is not None
+            assert part.shape == tensor.shape, "all_gather requires equal shards"
+            parts.append(part.clone())
         if self.tls.rank == 0:
             with self.lock:
                 self.gather_calls += 1
@@ -535,6 +542,7 @@ def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_ge
         outs = list(pool.map(run_rank, range(world_size)))
 
     num_layers = _TINY_SP_CONFIG["num_layers"]
+    assert isinstance(num_layers, int)
     # One attn1 state reduce per block, its inputs distinct per rank (the ranks
     # really processed different frames), one neighbour halo exchange per block
     # per rank, and only the final frame gather is a full collective.
