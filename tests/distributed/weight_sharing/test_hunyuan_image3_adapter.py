@@ -212,6 +212,7 @@ def test_publish_collects_bindings_once(adapter, backbone, session_module, monke
         device_uuid="GPU-test",
         model_id="model",
         checkpoint_revision="revision",
+        layout="hunyuan_image3_backbone_v1",
     )
     enumerate_params = Mock(wraps=backbone.named_parameters)
     monkeypatch.setattr(backbone, "named_parameters", enumerate_params)
@@ -369,6 +370,7 @@ def test_session_builders(session_module):
         device_uuid="GPU-00000000-0000-0000-0000-000000000000",
         model_id="model",
         checkpoint_revision="revision",
+        layout="hunyuan_image3_backbone_v1",
     )
     assert group.payload is None
 

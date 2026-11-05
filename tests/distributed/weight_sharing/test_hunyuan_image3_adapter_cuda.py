@@ -108,6 +108,7 @@ def _make_group(session, *, role, device_uuid):
         device_uuid=device_uuid,
         model_id="synthetic",
         checkpoint_revision="revision",
+        layout="hunyuan_image3_backbone_v1",
     )
 
 

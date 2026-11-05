@@ -47,7 +47,7 @@ class SharedWeightGroupConfig:
     device_uuid: str
     model_id: str
     checkpoint_revision: str
-    layout: str = "hunyuan_image3_backbone_v1"
+    layout: str
     payload: bytes | None = None
 
 
