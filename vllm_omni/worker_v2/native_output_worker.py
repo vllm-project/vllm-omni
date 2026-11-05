@@ -92,12 +92,7 @@ class NativeOutputWorker:
     @staticmethod
     def _materialize(output: AsyncModelRunnerOutput, plane: Any) -> Any:
         result = output.get_output()
-        plane.enqueue_outputs(
-            req_ids=list(result.req_ids),
-            inter_stage_outputs=getattr(result, "inter_stage_outputs", None),
-            sampled_token_ids=getattr(result, "sampled_token_ids", None),
-        )
-        result.inter_stage_outputs = None
+        plane.publish_output(result)
         return result
 
     def submit(self, output: AsyncModelRunnerOutput, plane: Any) -> NativeAsyncOutput:
