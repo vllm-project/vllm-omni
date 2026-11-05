@@ -424,7 +424,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
         if self.cache_backend is not None:
-            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
+            qwen_image21_teacache = (
+                self.od_config.model_class_name == "QwenImage21Pipeline" and self.od_config.cache_backend == "tea_cache"
+            )
+            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION and not qwen_image21_teacache:
                 logger.warning(
                     "Cache backend '%s' is not supported for %s; disabling cache acceleration.",
                     self.od_config.cache_backend,

@@ -16,7 +16,7 @@ transformer execution, and postprocessing logic.
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import QwenImage21TransformerBlock
+    from vllm_omni.diffusion.models.qwen_image_21.teacache import QwenImage21DenoisingAdapter
 
 logger = init_logger(__name__)
 
@@ -1807,7 +1811,50 @@ def extract_cosmos3_context(
 #
 # Note: Use the transformer class name as specified in pipelines as TeaCache hooks operate
 # on the transformer module and multiple pipelines can share the same transformer.
+def extract_qwen_image21_context(
+    module: "QwenImage21DenoisingAdapter",
+    hidden_states: torch.Tensor,
+    modulation: torch.Tensor,
+    *,
+    skip_allowed: bool = True,
+    rel_l1_thresh: float | None = None,
+    **block_kwargs: Any,
+) -> CacheContext:
+    """Target-only decode; the original model retains preparation and output layers."""
+    prepared = block_kwargs.get("prepared_modulation")
+    if prepared is not None:
+        scale = prepared[0]
+    else:
+        # The final modulation row is t=0 for prefix tokens. Decode has only
+        # target tokens, so select the sampled timestep rows explicitly.
+        scale = 1 + modulation.chunk(4, dim=-1)[0][: hidden_states.shape[0]].unsqueeze(1)
+    first_block = cast("QwenImage21TransformerBlock", module.transformer.transformer_blocks[0])
+    modulated_input = first_block.img_norm1(hidden_states) * scale
+
+    def run_blocks():
+        return (module.transformer._run_transformer_blocks(hidden_states, modulation, **block_kwargs),)
+
+    extra_states: dict[str, Any] = {
+        "teacache_branch": "positive" if block_kwargs["cache_branch"] == "cond" else "negative"
+    }
+    if rel_l1_thresh is not None:
+        extra_states["rel_l1_thresh"] = rel_l1_thresh
+    if not skip_allowed:
+        # Forcing the decision also resets the accumulated distance in the hook.
+        extra_states["synchronize_cache_decision"] = lambda local_should_compute: True
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=modulation,
+        run_transformer_blocks=run_blocks,
+        postprocess=lambda output: output,
+        extra_states=extra_states,
+    )
+
+
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
+    "QwenImage21DenoisingAdapter": extract_qwen_image21_context,
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
     "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,

@@ -11,12 +11,15 @@ This module tests the cache backend implementations:
 - DiffusionCacheConfig: configuration dataclass
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import cache_dit
 import pytest
+import torch
 from cache_dit import ForwardPattern
+from torch import nn
 
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTAdapterConfig,
@@ -32,6 +35,44 @@ from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def qwen_image21_pipeline():
+    """Keep the real enabler/hook; replace only the expensive block stack."""
+
+    @dataclass
+    class Config:
+        step_execution: bool = False
+        quantization_config: object = None
+        lora_path: str | None = None
+
+    class Transformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = nn.Module()
+            block.img_norm1 = nn.LayerNorm(2, elementwise_affine=False)
+            self.transformer_blocks = nn.ModuleList([block])
+            self.causal_condition = True
+            self.parallel_config = None
+            self.prefix_kv_cache_dtype = None
+            self._decode_graph_manager = None
+            self.enable_cuda_graph_decode = True
+            self.do_true_cfg = True
+            self.calls = 0
+            self.multiplier = 1
+
+        def _run_transformer_blocks(self, hidden_states, modulation, **kwargs):
+            self.calls += 1
+            residual = 2 if kwargs["cache_branch"] == "cond" else -3
+            return hidden_states + residual * self.multiplier
+
+    class QwenImage21Pipeline:
+        def __init__(self):
+            self.transformer = Transformer()
+            self.od_config = Config()
+
+    return QwenImage21Pipeline()
 
 
 class TestCacheDiTBackend:
@@ -448,6 +489,75 @@ class TestCacheDiTBackend:
 class TestTeaCacheBackend:
     """Test TeaCacheBackend implementation."""
 
+    @torch.inference_mode()
+    def test_qwen_image21_config_dispatch_policy_and_refresh(self, qwen_image21_pipeline):
+        """Losing the custom enabler, extra policy keys or refresh changes real outputs/calls."""
+        pipeline = qwen_image21_pipeline
+        config = DiffusionCacheConfig.from_dict(
+            {
+                "rel_l1_thresh": 0.2,
+                "cfg_rel_l1_thresh": 0.05,
+                "skip_timestep_range": [0.30, 0.855],
+                "coefficients": [0, 0, 0, 0, 0.1],
+            }
+        )
+        backend = get_cache_backend("tea_cache", config)
+        backend.enable(pipeline)
+        transformer = pipeline.transformer
+        adapter = pipeline.denoising_transformer
+        hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+
+        def decode(branch, timestep=0.5):
+            return adapter.run(
+                hidden_states.clone(),
+                torch.zeros(2, 8),
+                is_decode=True,
+                timestep=torch.tensor(timestep),
+                cache_branch=branch,
+                kv_cache=[{}],
+            )
+
+        # The CFG-specific 0.05 threshold forces recomputation at distance 0.1.
+        for branch, residual in (("cond", 2), ("uncond", -3)):
+            for _ in range(2):
+                torch.testing.assert_close(decode(branch), hidden_states + residual)
+        assert transformer.calls == 4
+
+        transformer.do_true_cfg = False
+        backend.refresh(pipeline, 50, verbose=False)
+        for _ in range(2):
+            torch.testing.assert_close(decode("cond"), hidden_states + 2)
+        # The base threshold 0.2 permits a real cached call.
+        assert transformer.calls == 5
+        transformer.multiplier = 2
+        torch.testing.assert_close(decode("cond", timestep=0.9), hidden_states + 4)
+        assert transformer.calls == 6
+
+        # A new request must recompute both branches with the new conditioning.
+        backend.refresh(pipeline, 50, verbose=False)
+        transformer.multiplier = 3
+        for branch, residual in (("cond", 6), ("uncond", -9)):
+            torch.testing.assert_close(decode(branch), hidden_states + residual)
+        assert transformer.calls == 8
+        assert backend.is_enabled()
+        assert not transformer.enable_cuda_graph_decode
+
+    @pytest.mark.parametrize(
+        "overrides, error",
+        [
+            ({"coefficients": None}, "five explicit"),
+            ({"cfg_rel_l1_thresh": 0}, "cfg_rel_l1_thresh"),
+            ({"skip_timestep_range": [0.8, 0.3]}, "skip_timestep_range"),
+        ],
+    )
+    def test_qwen_image21_rejects_invalid_dict_config(self, qwen_image21_pipeline, overrides, error):
+        values = {"rel_l1_thresh": 0.1, "coefficients": [0, 0, 0, 0, 0.1], **overrides}
+        backend = get_cache_backend("tea_cache", DiffusionCacheConfig.from_dict(values))
+        with pytest.raises(ValueError, match=error):
+            backend.enable(qwen_image21_pipeline)
+        assert not backend.is_enabled()
+        assert not hasattr(qwen_image21_pipeline, "denoising_transformer")
+
     def test_init(self):
         """Test initialization."""
         config = DiffusionCacheConfig(rel_l1_thresh=0.3)
@@ -582,6 +692,7 @@ class TestTeaCacheBackend:
     def test_refresh(self, mock_apply_hook):
         """Test refreshing TeaCache state."""
         mock_pipeline = Mock()
+        del mock_pipeline.denoising_transformer
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
         mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
@@ -636,6 +747,7 @@ class TestTeaCacheBackend:
     def test_refresh_mammoth_moda2_resets_gen_transformer_hook(self, mock_apply_hook):
         """Refresh should find the hook through the transformer alias set by the enabler."""
         mock_pipeline = Mock()
+        del mock_pipeline.denoising_transformer
         mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
         mock_pipeline.gen_transformer = Mock()
         del mock_pipeline.transformer

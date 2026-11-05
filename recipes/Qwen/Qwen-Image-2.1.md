@@ -502,10 +502,119 @@ unless noted; 4× NVIDIA H200):
   Quality Comparison table uses a separate single-run A/B vs Diffusers
   (compile+graph **6.04 s**, eager **7.31 s**).
 
+## TeaCache acceleration (experimental)
+
+TeaCache optionally reuses the decode block-stack residual. Prefill always runs
+every block and writes each layer's condition-prefix KV. This is distinct from
+the model's built-in prefix KV cache. See the [TeaCache guide](../../docs/user_guide/diffusion/cache_acceleration/teacache.md#qwen-image-21-experimental)
+for calibration, quality gates and the full measurement record.
+
+The qualified scope is the base Qwen-Image 2.1 checkpoint, single GPU, BF16,
+batch size 1 and eager request mode. Whole-decode CUDA graphs must be disabled
+(the enabler also disables them). Step mode, parallel execution, offload,
+quantization, FP8 prefix storage and LoRA are rejected. The Turbo checkpoint
+and compiled TeaCache have not been qualified.
+
+Both five model-specific polynomial coefficients and a finite positive
+`rel_l1_thresh` are required; enabling the backend alone raises an error.
+The following configuration was evaluated with base revision
+`d26bb61231c349cf6b7896fa83353113880e1ba3`, 1024x1024 output and 50 explicit
+linear sigmas. Use a local snapshot of that revision for these examples:
+
+```bash
+export MODEL_PATH=/models/Qwen-Image-2.1-d26bb612
+export DIFFUSION_ATTENTION_BACKEND=CUDNN_ATTN
+export TEACACHE_CONFIG='{
+  "rel_l1_thresh": 0.10,
+  "cfg_rel_l1_thresh": 0.05,
+  "skip_timestep_range": [0.30, 0.855],
+  "coefficients": [489544.41506285727, -65325.67451621187, 3012.825475742039, -55.92014411118746, 0.4159928016209747]
+}'
+```
+
+The timestep window permits skips at denoising loop indices 13–40 for that
+schedule (0-based, with prefill at index 0). Recalibrate and validate when the
+checkpoint, resolution or schedule changes; do not reuse older Qwen-Image
+coefficients. `cfg_rel_l1_thresh` applies when true CFG is active.
+
+### Offline (Python API)
+
+After setting the environment variables above:
+
+```python
+import json
+import os
+
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model=os.environ["MODEL_PATH"],
+    dtype="bfloat16",
+    max_num_seqs=1,
+    enforce_eager=True,
+    enable_cuda_graph_decode=False,
+    cache_backend="tea_cache",
+    cache_config=json.loads(os.environ["TEACACHE_CONFIG"]),
+)
+outputs = omni.generate(
+    "A red ceramic teapot on a wooden table.",
+    OmniDiffusionSamplingParams(
+        height=1024,
+        width=1024,
+        num_inference_steps=50,
+        sigmas=[1 - i / 50 for i in range(50)],
+        true_cfg_scale=1.0,
+        seed=2026,
+    ),
+)
+```
+
+### Online serving
+
+Use the same environment variables and policy:
+
+```bash
+vllm serve "$MODEL_PATH" --omni \
+  --dtype bfloat16 --max-num-seqs 1 --enforce-eager \
+  --no-enable-cuda-graph-decode \
+  --cache-backend tea_cache --cache-config "$TEACACHE_CONFIG"
+```
+
+Send requests with 1024x1024 output and the same 50 explicit sigmas as the
+offline example. For true CFG, also set `true_cfg_scale=4.0` and a negative
+prompt; keep the validated CFG threshold at 0.05.
+
+### Quality and performance limits
+
+On the RTX PRO 6000 Blackwell confirmation set, the windowed policy passed
+16/16 comparisons at CFG1 (threshold 0.10) and 16/16 at CFG4 (threshold 0.05).
+Summed in-process generation time fell by 30.3% and 5.3%, respectively, against
+matched dense eager execution. Each comparison ran once: these are not HTTP,
+tail-latency or throughput results. CFG4 threshold 0.06 passed only 14/16 and
+is not qualified. Earlier no-window measurements and the default compile/graph
+comparison are documented separately in the guide. Gains depend on the
+request: no skip means full computation plus cache-decision overhead. Numerical
+gates do not replace visual review of text, editing identity and alpha edges.
+
+An opt-in model-backed serving smoke covers CFG1 and CFG4 output contracts:
+
+```bash
+QWEN_IMAGE_21_TEST_MODEL="$MODEL_PATH" QWEN_IMAGE_21_TEST_TEACACHE=1 \
+  pytest -sv tests/e2e/online_serving/test_qwen_image_21.py::test_teacache_request_mode \
+  -m 'core_model and cuda and diffusion' --run-level core_model
+```
+
+Provision the pinned base snapshot and a suitable single CUDA GPU first. This
+smoke checks response count, RGBA mode and dimensions; it does not measure
+quality, speed or cache-hit counts. CI collects this module in the Qwen Image
+functional job, but skips it unless the checkpoint environment is supplied;
+the TeaCache cases additionally require `QWEN_IMAGE_21_TEST_TEACACHE=1`.
+
 ## Known Limitations
 
-- Cache acceleration backends (`cache_dit`, `tea_cache`) are not supported;
-  `QwenImage21Pipeline` is registered in `_NO_CACHE_ACCELERATION`.
+- Cache-DiT is not supported. TeaCache is experimental and limited to the
+  explicitly calibrated configuration and operating scope described above.
 - Ulysses sequence parallelism is wired; ring attention is not a supported path.
   A short H200 smoke (1024×1024, 8 steps, seed 42, true CFG 1.0, eager) finished:
   Ulysses SP=2 vs SP=1 is **46.5 dB**. That size's target length is divisible by 4,
