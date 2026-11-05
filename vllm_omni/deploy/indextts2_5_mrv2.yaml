@@ -55,6 +55,7 @@ stages:
       inference_cfg_rate: 0.7
       s2mel_dit_cuda_graph: true
       s2mel_dit_cuda_graph_max_graphs: 16
+      s2mel_allow_tf32: true
       s2mel_dit_torch_compile: false
       s2mel_vocoder_bf16: true
       s2mel_vocoder_cuda_graph: true

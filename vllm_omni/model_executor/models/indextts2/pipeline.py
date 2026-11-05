@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 pipeline: GPT AR talker (text → mel codes) → S2Mel + BigVGAN (mel → audio).
 
 Two-stage non-streaming pipeline. S2Mel flow matching (25 Euler steps) requires
