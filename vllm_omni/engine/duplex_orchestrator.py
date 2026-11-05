@@ -41,7 +41,6 @@ from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.engine.duplex.plugin import (
     DuplexInputCapacityError,
     DuplexModelPlugin,
-    DuplexPromptTokenizer,
     DuplexTurnContinuation,
     validate_duplex_replica_policy,
 )
@@ -74,7 +73,7 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
-    turn_prompt_tokenizer: DuplexPromptTokenizer | None = None
+    turn_prompt_tokenizer: DuplexTurnContinuation | None = None
     # Set only while a submission owns the stage's input-processing guard.
     input_history_revision: int | None = None
     turn_entry_finished: bool = False
@@ -342,7 +341,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if not isinstance(state, DuplexOrchestratorRequestState):
             return False
         continuation = state.turn_prompt_tokenizer
-        if not isinstance(continuation, DuplexTurnContinuation):
+        if continuation is None:
             return False
 
         def check() -> bool:
@@ -354,7 +353,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     def _observe_stage_tokens(self, stage_id: int, eco: Any, req_state: OrchestratorRequestState) -> None:
         if stage_id == 0 and isinstance(req_state, DuplexOrchestratorRequestState):
             continuation = req_state.turn_prompt_tokenizer
-            if isinstance(continuation, DuplexTurnContinuation):
+            if continuation is not None:
                 continuation.record_output(eco.new_token_ids, bool(eco.is_segment_finished))
 
     def _collect_duplex_stage_work(
@@ -689,16 +688,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     state.turn_prompt_tokenizer = self.plugin.create_turn_prompt_tokenizer(tokenizer)
             if state.turn_prompt_tokenizer is not None:
                 prompt_tokenizer = state.turn_prompt_tokenizer
-                prepare_turn = None
-                if isinstance(prompt_tokenizer, DuplexTurnContinuation):
-                    prepare_turn = prompt_tokenizer.prepare_turn
-                    complete_turn = prompt_tokenizer.complete_turn
+                complete_turn = prompt_tokenizer.complete_turn
 
                 def tokenize() -> tuple[dict, list[int] | None]:
                     # Tokenizer instances can be shared by stage processors.
                     # Use the same worker-thread lock as upstream preprocessing.
                     with self._prompt_processing_lock:
-                        prepared, prefix = prepare_turn(prompt) if prepare_turn is not None else (prompt, None)
+                        prepared, prefix = prompt_tokenizer.prepare_turn(prompt)
                         prepared = dict(prepared)
                         text = prepared.pop("prompt")
                         if defaults is not None:

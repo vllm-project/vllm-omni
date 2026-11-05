@@ -19,7 +19,7 @@ from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol
 
 import pybase64 as base64
 
@@ -40,15 +40,10 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
-class DuplexPromptTokenizer(Protocol):
-    """Request-owned incremental tokenizer; full media processing stays upstream."""
+class DuplexTurnContinuation(Protocol):
+    """Request-owned token ledger and model policy for committed-turn deltas."""
 
     def tokenize(self, text: str) -> list[int]: ...
-
-
-@runtime_checkable
-class DuplexTurnContinuation(DuplexPromptTokenizer, Protocol):
-    """Model-owned preparation of deltas against an accepted resident turn."""
 
     def can_append_turn(self, assistant_text: str) -> bool: ...
 
@@ -480,7 +475,7 @@ class DuplexModelPlugin(ABC):
         """Select the entry stage for one append before reserving its request."""
         return 0
 
-    def create_turn_prompt_tokenizer(self, tokenizer: TokenizerLike) -> DuplexPromptTokenizer | None:
+    def create_turn_prompt_tokenizer(self, tokenizer: TokenizerLike) -> DuplexTurnContinuation | None:
         """Optional per-request tokenizer, discarded with the request's epoch."""
         return None
 

@@ -98,8 +98,9 @@ block tail is recomputed. A missing or stale resident fails only that request.
 
 Changed/pruned history, playback-truncated text, or an unsupported completion
 boundary falls back to full-snapshot processing. Tool turns, changed prompt
-settings and the existing message/audio window limits also use that fallback. Its tokenizer can reuse a
-matching special-token prefix. For this fallback, the scheduler compares block
+settings and the existing message/audio window limits also use that fallback.
+Fallback snapshots are tokenized in full without a rendered-text prefix cache.
+For this fallback, the scheduler compares block
 hashes against the resident request: when all
 completed blocks match and the new prompt extends them, it retains those KV
 blocks and computes only the partial-block tail and new suffix. Otherwise it
