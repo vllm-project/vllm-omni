@@ -142,12 +142,17 @@ def get_omnivoice_pre_process_func(od_config: OmniDiffusionConfig):
     ``OmniDiffusionSamplingParams()``) would fail admission. The pipeline
     already falls back to ``config.num_step``; apply the same default here so
     step and non-step execution behave identically.
+
+    Like other pre-process hooks, this mutates ``request.sampling_params`` in
+    place, so a caller's params object will carry the filled-in step count.
     """
     default_num_step: int | None = None
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         nonlocal default_num_step
         sampling = request.sampling_params
+        # timesteps or sigmas alone are enough: StepScheduler._get_total_steps
+        # sizes the request from them before it asserts num_inference_steps.
         if sampling.num_inference_steps is None and sampling.timesteps is None and sampling.sigmas is None:
             if default_num_step is None:
                 default_num_step = int(_load_omnivoice_config(od_config.model)[1].num_step)

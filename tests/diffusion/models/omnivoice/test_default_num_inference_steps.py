@@ -49,6 +49,13 @@ def test_explicit_timesteps_are_not_overridden(pre_process):
     assert request.sampling_params.num_inference_steps is None
 
 
+def test_sigmas_only_is_admitted_without_default(pre_process):
+    request = pre_process(_request(sigmas=[1.0, 0.5, 0.0]))
+
+    assert request.sampling_params.num_inference_steps is None
+    assert StepScheduler._get_total_steps(None, request) == 3
+
+
 @pytest.mark.parametrize("model_class_name", ["OmniVoice", "OmniVoicePipeline"])
 def test_pre_process_is_registered_for_both_class_names(model_class_name):
     # The HF checkpoint declares architectures=["OmniVoice"], so the engine
