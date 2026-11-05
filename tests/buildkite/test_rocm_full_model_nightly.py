@@ -62,7 +62,7 @@ def test_nightly_runner_fails_closed(
         path.chmod(0o755)
 
     executable("rocminfo", "exit 0\n")
-    executable("git", "echo fixture-commit\n")
+    executable("git", "exit 1\n")
     executable("rocm-smi", "exit 0\n")
     executable("sleep", "exit 0\n")
     executable(
@@ -105,6 +105,7 @@ def test_nightly_runner_fails_closed(
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "REAL_PYTHON": sys.executable,
         "BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path),
+        "BUILDKITE_COMMIT": "fixture-buildkite-commit",
         "STATE": str(tmp_path),
         "COLLECTED": "5",
         "COLLECTION_STATUS": "0",
@@ -131,4 +132,7 @@ def test_nightly_runner_fails_closed(
     args = (tmp_path / "pytest-args").read_text()
     assert "--run-level\nfull_model\n" in args
     assert "--shard-id\n0\n--num-shards\n1\n" in args
+    inventory = (tmp_path / "artifacts/nightly-test/runtime-inventory.txt").read_text()
+    assert "buildkite_commit=fixture-buildkite-commit" in inventory
+    assert "checkout_head=" not in inventory
     assert (tmp_path / "artifacts/nightly-test/process-cleanup.txt").exists() != (overrides.get("PS_FAILURE") == "1")

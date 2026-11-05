@@ -53,7 +53,10 @@ check_cleanup() {
 trap check_cleanup EXIT
 
 {
-    git rev-parse HEAD
+    printf 'buildkite_commit=%s\n' "${BUILDKITE_COMMIT:?}"
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        printf 'checkout_head=%s\n' "$(git rev-parse HEAD)"
+    fi
     echo "target=$test_target expected_tests=$expected_tests run_level=full_model"
     rocminfo
     python3 - <<'PY'
