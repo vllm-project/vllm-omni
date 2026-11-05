@@ -70,7 +70,6 @@ CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS: list[str] = [
 
 _DIFFUSERS_CONFIG_LOAD_KWARGS = {
     "cache_dir",
-    "dduf_entries",
     "force_download",
     "local_dir",
     "local_dir_use_symlinks",
@@ -242,6 +241,12 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _raise_unsupported_features(self) -> None:
         """Raise an error for incompatible feature switches."""
+        if {"dduf_file", "dduf_entries"} & self.od_config.diffusers_load_kwargs.keys():
+            raise NotImplementedError(
+                "DDUF loading is not supported with Diffusers 0.42.1. Remove "
+                "diffusers_load_kwargs.dduf_file/dduf_entries and load a standard "
+                "Diffusers model directory instead."
+            )
         if self.od_config.diffusion_offload_config is not None:
             raise NotImplementedError(
                 "diffusion_offload_config is not supported with the diffusers backend. "
@@ -281,15 +286,6 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             and "quantization_config" not in self.od_config.diffusers_load_kwargs
         ):
             ensure_supported_diffusers_quantization(self.od_config.quantization_config)
-            if self.od_config.diffusers_load_kwargs.get("dduf_file"):
-                raise NotImplementedError(
-                    "Diffusers backend quantization conversion does not support "
-                    "diffusers_load_kwargs.dduf_file yet. The preflight component "
-                    "discovery would need to mirror Diffusers' DDUF config loading. "
-                    "Use diffusers_load_kwargs.quantization_config for a native "
-                    "Diffusers quantization config, or omit dduf_file for vLLM-Omni "
-                    "quantization conversion."
-                )
 
     def _load_diffusers_component_names(
         self,

@@ -53,7 +53,7 @@ guide: |
 
   - Hardware: 1x GPU with >=40 GB VRAM
   - vLLM-Omni with final vLLM 0.33.0 and its CUDA 13 / PyTorch 2.14 runtime
-  - diffusers 0.40.0 (installed by the source checkout)
+  - diffusers 0.42.1 (installed by the source checkout)
 
   ## Installation
 

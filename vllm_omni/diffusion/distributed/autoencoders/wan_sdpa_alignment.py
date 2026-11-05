@@ -76,7 +76,7 @@ def align_sdpa_qkv(
 
 
 def split_wan_attention_qkv(qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Match diffusers 0.40 ``WanAttentionBlock`` QKV views from ``[B*T, 3C, H, W]``."""
+    """Match diffusers 0.42.1 ``WanAttentionBlock`` QKV views from ``[B*T, 3C, H, W]``."""
     batch_time, channels_times_3, _, _ = qkv.shape
     fused = qkv.reshape(batch_time, 1, channels_times_3, -1).permute(0, 1, 3, 2).contiguous()
     query, key, value = fused.chunk(3, dim=-1)
@@ -86,7 +86,7 @@ def split_wan_attention_qkv(qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 def aligned_wan_attention_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``WanAttentionBlock.forward`` with SDPA inputs realigned when required.
 
-    The arithmetic matches diffusers 0.40.0. The only extra work is
+    The arithmetic matches diffusers 0.42.1. The only extra work is
     :func:`align_sdpa_qkv`, which is a no-op for every tile whose sequence
     stride is already legal.
     """
@@ -113,14 +113,14 @@ def install_wan_attention_sdpa_alignment(root: nn.Module) -> None:
     while the model is loading. Existing spatial-shard wrappers are preserved:
     they gather the full spatial extent before attention, rather than tiles.
     Warn on unverified diffusers versions because the forward is copied from
-    0.40.0; keep the alignment fix active rather than restoring the tile crash.
+    0.42.1; keep the alignment fix active rather than restoring the tile crash.
     """
     if getattr(root, _ROOT_ATTR, False):
         return
     diffusers_version = metadata.version("diffusers")
-    if diffusers_version != "0.40.0":
+    if diffusers_version != "0.42.1":
         warnings.warn(
-            "Wan attention SDPA alignment was validated against diffusers 0.40.0, "
+            "Wan attention SDPA alignment was validated against diffusers 0.42.1, "
             f"but {diffusers_version} is installed. The copied WanAttentionBlock.forward "
             "must be checked against this version for compatibility.",
             RuntimeWarning,
