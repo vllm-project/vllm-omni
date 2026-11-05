@@ -1684,7 +1684,9 @@ def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
         "vllm_omni/worker/base.py",
     } <= bagel_deps
     source = Path("tests/e2e/online_serving/test_bagel.py").read_text(encoding="utf-8")
-    assert "stage_init_timeout=600" in source
+    params_source = source.split("test_params =", maxsplit=1)[1].split("def _build_text2img_messages", maxsplit=1)[0]
+    assert "stage_init_timeout=1800" in params_source
+    assert "init_timeout=2100" in params_source
     img2img_marks = source.split("def test_bagel_img2img_online", maxsplit=1)[0]
     assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in img2img_marks
     text2img_marks = img2img_marks.split("def test_bagel_text2img_online", maxsplit=1)[0]
