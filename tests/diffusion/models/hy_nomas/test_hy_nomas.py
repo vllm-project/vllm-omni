@@ -740,7 +740,7 @@ def test_native_transformer_factory_places_every_parameter(checkpoint):
 
 
 def test_decoder_factory_places_every_parameter():
-    decoder = build_decoder(DECODER_CONFIG, torch.device("meta"))
+    decoder = build_decoder(DECODER_CONFIG, torch.device("meta"), backend="reference")
     parameters = dict(decoder.named_parameters())
     assert len(parameters) == 476
     assert all(name.startswith("decoder.") for name in parameters)

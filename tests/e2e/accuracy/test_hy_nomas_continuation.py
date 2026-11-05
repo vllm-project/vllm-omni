@@ -143,6 +143,8 @@ def run_worker(args):
         distributed_executor_backend="mp",
         enforce_eager=True,
         custom_pipeline_args={
+            # Bitwise parity holds for the in-tree reference decoder, not the native one.
+            "decoder_backend": "reference",
             "ar_height": height,
             "ar_width": width,
             "ar_max_latent_frames": max_latents,

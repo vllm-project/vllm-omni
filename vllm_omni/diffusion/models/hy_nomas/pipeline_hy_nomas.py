@@ -110,7 +110,7 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
     return config
 
 
-def build_decoder(config: dict[str, Any], device: torch.device, *, backend: str = "reference") -> nn.Module:
+def build_decoder(config: dict[str, Any], device: torch.device, *, backend: str = "native") -> nn.Module:
     if backend == "native":
         # Diffusers metadata such as `_class_name` is not a constructor argument.
         kwargs = {}
@@ -186,7 +186,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
     ):
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
-    if custom.get("decoder_backend", "reference") not in ("reference", "native"):
+    if custom.get("decoder_backend", "native") not in ("reference", "native"):
         raise ValueError("Hy-Nomas decoder_backend must be reference or native.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
@@ -298,7 +298,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .requires_grad_(False)
         )
         custom_args = od_config.custom_pipeline_args or {}
-        self.vae = build_decoder(decoder_config, self.device, backend=custom_args.get("decoder_backend", "reference"))
+        self.vae = build_decoder(decoder_config, self.device, backend=custom_args.get("decoder_backend", "native"))
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
