@@ -488,7 +488,10 @@ async def _drain_forced_post_commit_response(
     runner rides the in-flight answer instead of precreating, so that settle
     belongs to the old response and the answer's own ``response.created``
     follows. A settle is treated as final only when none of the conditions
-    above applies.) Errors reported after the commit suppress the re-ask
+    above applies; a session whose model does not auto-respond always takes
+    the park-and-promote deferral, so its commits are always treated as
+    deferring ``(not auto_response)``.) Errors reported after the commit
+    suppress the re-ask
     either way, since the server is refusing rather than slow. The flip side
     for CI triage on a deferring session: if the server drops the deferred
     create after such activity, the drain can only end in ``TimeoutError`` --
