@@ -43,10 +43,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import (
-    get_forward_context,
-    is_forward_context_available,
-)
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     QK_NORM_ROPE_TABLE_KEY,
@@ -64,12 +61,13 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.mixfusion.plan import (
+    ChunkedOutput,
+    MixFusionChunkOutputs,
     MixFusionExpandArg,
     MixFusionExpandRows,
-    MixFusionReplaceOutput,
     MixFusionRoot,
+    PerRequestOutput,
 )
-from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import QwenImageMixFusionAdapter
 
 logger = init_logger(__name__)
 
@@ -97,10 +95,10 @@ def _packed_qk_norm_rope_table(
     kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
     gate.
     """
-    if is_forward_context_available() and get_forward_context().mixfusion_step is not None:
-        # The packed path has no fused joint QK-norm-RoPE table: text is
-        # per-request while image rows are per-chunk, so one table cannot
-        # serve both streams.
+    if vid_freqs.dim() == 3:
+        # Per-row RoPE tables (MixFusion's chunk-stacked layout): text rows
+        # are per request while image rows are per chunk, so one joint table
+        # cannot serve both streams.
         return None
     freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
     if batch_size * freqs.shape[0] < _fused_min_tokens():
@@ -1194,10 +1192,29 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # the chunk-stacked layout without any MixFusion branching in forward().
     _mixfusion_plan = {
         "": MixFusionRoot(),
-        "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
+        # The _sp_plan split_output boundary: run per request, then chunk-stack
+        # hidden_states / vid_freqs and stack the per-request txt_freqs.
+        "image_rope_prepare": MixFusionChunkOutputs(
+            per_request_args=("hidden_states", "img_shapes"),
+            outputs=(ChunkedOutput(seq_dim=1), ChunkedOutput(seq_dim=0), PerRequestOutput()),
+        ),
         "transformer_blocks.*.img_mod": MixFusionExpandRows(),
         "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
+
+    def mixfusion_can_pack(self, input_batch) -> tuple[bool, str]:
+        """Qwen-specific MixFusion limits (the framework checks the rest)."""
+        if self.zero_cond_t:
+            # The editing path passes per-token modulate indices that the
+            # packed layout does not build yet.
+            return False, "zero_cond_t/editing path is not supported"
+        if input_batch.image_latents is not None:
+            # Reference-image tokens need their own RoPE and per-token
+            # conditioning in the packed layout, which is not built yet.
+            return False, "image_latents (reference images) are not supported"
+        if input_batch.img_shapes is None or input_batch.txt_seq_lens is None:
+            return False, "img_shapes and txt_seq_lens are required"
+        return True, ""
 
     def __init__(
         self,
@@ -1303,10 +1320,6 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
-        # Model-side MixFusion adapter (see _mixfusion_plan above): the common
-        # hooks delegate all model-specific packing to it.
-        self.mixfusion_adapter = QwenImageMixFusionAdapter()
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1325,8 +1338,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         Args:
             hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-                Input `hidden_states`. When the MixFusion root hook is armed it
-                rewrites this to the chunk-stacked batch before the body runs.
+                Input `hidden_states`. Under an armed MixFusion step it is one
+                `[num_images, S_i, C]` tensor per request; `image_rope_prepare`
+                turns it into the chunk-stacked batch.
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):

@@ -7,14 +7,17 @@ a ``_mixfusion_plan`` and the MixFusionDriver arms a
 :class:`~vllm_omni.diffusion.forward_context.MixFusionStep` per packed denoise
 step. The hooks execute the chunk-stacked layout at those boundaries, so
 transformer and block ``forward`` code stays free of MixFusion branching.
-Packing, boundary outputs and output restoration are delegated to the model's
-adapter. All hooks are inert unless a ``mixfusion_step`` is armed.
+The root hook delegates packing and output restoration to the resolved
+adapter (the framework's chunked adapter for a declarative plan); the
+chunk-outputs hook runs a declared module once per request. All hooks are
+inert unless a ``mixfusion_step`` is armed.
 """
 
 from __future__ import annotations
 
 import inspect
 
+import torch
 from torch import nn
 
 from vllm_omni.diffusion.forward_context import (
@@ -26,6 +29,8 @@ from vllm_omni.diffusion.hooks.sequence_parallel import _get_submodule_by_name
 from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
 from vllm_omni.diffusion.mixfusion.execution_plan import expand_per_chunk
 from vllm_omni.diffusion.mixfusion.plan import (
+    ChunkedOutput,
+    MixFusionChunkOutputs,
     MixFusionExpandArg,
     MixFusionExpandRows,
     MixFusionReplaceOutput,
@@ -39,12 +44,14 @@ MIXFUSION_PACK_HOOK_NAME = "mixfusion_pack"
 MIXFUSION_REPLACE_OUTPUT_HOOK_NAME = "mixfusion_replace_output"
 MIXFUSION_EXPAND_ROWS_HOOK_NAME = "mixfusion_expand_rows"
 MIXFUSION_EXPAND_ARG_HOOK_NAME = "mixfusion_expand_arg"
+MIXFUSION_CHUNK_OUTPUTS_HOOK_NAME = "mixfusion_chunk_outputs"
 
 MIXFUSION_HOOK_NAMES = (
     MIXFUSION_PACK_HOOK_NAME,
     MIXFUSION_REPLACE_OUTPUT_HOOK_NAME,
     MIXFUSION_EXPAND_ROWS_HOOK_NAME,
     MIXFUSION_EXPAND_ARG_HOOK_NAME,
+    MIXFUSION_CHUNK_OUTPUTS_HOOK_NAME,
 )
 
 
@@ -63,10 +70,12 @@ class MixFusionRootHook(ModelHook):
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
     The driver only arms a step after ``adapter.can_pack`` admitted the batch,
-    so ``pre_forward`` packs unconditionally.
+    so ``pre_forward`` packs unconditionally. ``adapter`` is the model's
+    explicit ``mixfusion_adapter`` or the framework's chunked one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, adapter) -> None:
+        self._adapter = adapter
         # Previous bundle per CFG branch: sequential true-CFG interleaves the
         # positive and negative calls within one step. The adapter revalidates
         # the layout key, so a stale entry is a miss, never a wrong reuse.
@@ -78,7 +87,7 @@ class MixFusionRootHook(ModelHook):
             return args, kwargs
         bound = inspect.signature(module.forward).bind(*args, **kwargs)
         branch = getattr(module, "cfg_branch", None)
-        packed = module.mixfusion_adapter.pack_inputs(module, bound, cache=self._cached.get(branch))
+        packed = self._adapter.pack_inputs(module, bound, cache=self._cached.get(branch))
         self._cached[branch] = packed
         step.plan = packed.plan
         step.packed = packed
@@ -88,7 +97,7 @@ class MixFusionRootHook(ModelHook):
         step = _active_step()
         if step is None or step.packed is None:
             return output
-        return module.mixfusion_adapter.restore_output(module, output, step.plan)
+        return self._adapter.restore_output(module, output, step.plan)
 
     def reset_state(self, module):
         self._cached.clear()
@@ -164,6 +173,96 @@ class MixFusionExpandArgHook(ModelHook):
         return bound.args, bound.kwargs
 
 
+class MixFusionChunkOutputsHook(ModelHook):
+    """Run the module once per request and chunk-stack its outputs.
+
+    The packed counterpart of an ``_sp_plan`` ``split_output`` boundary: each
+    request's call sees its own latents and geometry, so the model's own
+    projection and RoPE code builds every table, and the per-request results
+    are cut into the plan's chunks (or stacked per request).
+    """
+
+    def __init__(self, spec: MixFusionChunkOutputs) -> None:
+        self._spec = spec
+
+    def new_forward(self, module, *args, **kwargs):
+        step = _active_step()
+        if step is None or step.plan is None:
+            return module._omni_original_forward(*args, **kwargs)
+        plan = step.plan
+        signature = inspect.signature(module._omni_original_forward)
+        num_requests = len(plan.image_row_counts)
+        per_request = []
+        for req_idx in range(num_requests):
+            bound = signature.bind(*args, **kwargs)
+            for name in self._spec.per_request_args:
+                if name not in bound.arguments:
+                    raise TypeError(
+                        f"MixFusionChunkOutputs on {type(module).__name__} expects a forward argument "
+                        f"named {name!r}; signature is {signature}."
+                    )
+                bound.arguments[name] = _slice_request(bound.arguments[name], req_idx, num_requests)
+            per_request.append(module._omni_original_forward(*bound.args, **bound.kwargs))
+        outputs = []
+        for out_idx, layout in enumerate(self._spec.outputs):
+            values = [result[out_idx] for result in per_request]
+            if isinstance(layout, ChunkedOutput):
+                outputs.append(_chunk_stack(values, layout.seq_dim, plan))
+            else:
+                outputs.append(_request_stack(values, layout.batched, plan, num_requests))
+        return tuple(outputs)
+
+
+def _slice_request(value, req_idx: int, num_requests: int):
+    """Request ``req_idx``'s share of a per-request forward argument."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != num_requests:
+            raise ValueError(f"MixFusion per-request argument has {len(value)} entries for {num_requests} requests.")
+        item = value[req_idx]
+        # A list entry stays a batch of one so the module sees its usual type.
+        return item if isinstance(item, torch.Tensor) else [item]
+    if isinstance(value, torch.Tensor) and value.shape[0] == num_requests:
+        return value[req_idx : req_idx + 1]
+    raise ValueError("MixFusion per-request argument must be a per-request list or a [num_requests, ...] tensor.")
+
+
+def _chunk_stack(values, seq_dim: int, plan) -> torch.Tensor:
+    """Cut per-request outputs into the plan's ``[num_chunks, chunk_size, ...]`` rows.
+
+    ``seq_dim=1``: a request returns ``[num_images, S, ...]``, images back to
+    back. ``seq_dim=0``: it returns one ``[S, ...]`` table shared by its
+    images (e.g. image RoPE), repeated once per image row.
+    """
+    pieces = []
+    for value, count in zip(values, plan.image_row_counts, strict=True):
+        if seq_dim == 1:
+            rows = value.reshape(-1, *value.shape[2:])
+        else:
+            rows = torch.cat([value] * count, dim=0) if count > 1 else value
+        pieces.append(rows.reshape(-1, plan.chunk_size, *rows.shape[1:]))
+    stacked = torch.cat(pieces, dim=0)
+    if stacked.shape[0] != plan.num_chunks:
+        raise ValueError(
+            f"MixFusion chunked output has {stacked.shape[0]} chunks, the plan has {plan.num_chunks}; "
+            "check the MixFusionChunkOutputs declaration."
+        )
+    return stacked
+
+
+def _request_stack(values, batched: bool, plan, num_requests: int) -> torch.Tensor:
+    """Stack one ``[L, ...]`` value per image row, trimmed to the text width.
+
+    A request with several images contributes its table once per image row,
+    matching the per-image text rows of the packed call.
+    """
+    width = plan.stream_padded_lens["text"]
+    rows = []
+    for value, count in zip(values, plan.image_row_counts, strict=True):
+        table = value[0] if batched else value
+        rows.extend([table[:width]] * count)
+    return torch.stack(rows, dim=0)
+
+
 def _iter_module_path(root: nn.Module, name: str):
     """Yield the module(s) named by ``name`` plus their ancestors.
 
@@ -222,7 +321,8 @@ def plan_foreign_hooks(module: nn.Module, plan: dict | None) -> list[str]:
 
 
 _SPEC_HOOKS = {
-    MixFusionRoot: (MIXFUSION_PACK_HOOK_NAME, lambda spec: MixFusionRootHook()),
+    MixFusionRoot: (MIXFUSION_PACK_HOOK_NAME, None),
+    MixFusionChunkOutputs: (MIXFUSION_CHUNK_OUTPUTS_HOOK_NAME, MixFusionChunkOutputsHook),
     MixFusionReplaceOutput: (
         MIXFUSION_REPLACE_OUTPUT_HOOK_NAME,
         lambda spec: MixFusionReplaceOutputHook(spec.boundary),
@@ -247,17 +347,25 @@ def _plan_modules(module: nn.Module, name: str) -> list[nn.Module]:
     return submodule if isinstance(submodule, list) else [submodule]
 
 
-def apply_mixfusion(module: nn.Module, plan: dict) -> None:
+def apply_mixfusion(module: nn.Module, plan: dict, adapter=None) -> None:
     """Register MixFusion boundary hooks on ``module`` per its plan.
 
-    Idempotent; stamps ``_mixfusion_hooks_applied`` on the model for pipeline
-    gating.
+    ``adapter`` packs and restores the root call; ``None`` resolves it from
+    the module (an explicit ``mixfusion_adapter``, else the framework's
+    chunked adapter for a declarative ``MixFusionRoot``). Idempotent; stamps
+    ``_mixfusion_hooks_applied`` on the model for pipeline gating.
     """
     if getattr(module, "_mixfusion_hooks_applied", False):
         return
+    if adapter is None:
+        from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
+
+        adapter = resolve_mixfusion_adapter(module, plan)
+    if adapter is None and "" in plan:
+        raise ValueError(f"{type(module).__name__} declares a MixFusion root but no adapter can pack it.")
     for name, spec in plan.items():
         hook_name, make_hook = _spec_entry(spec)
-        hook = make_hook(spec)
+        hook = MixFusionRootHook(adapter) if isinstance(spec, MixFusionRoot) else make_hook(spec)
         for m in _plan_modules(module, name):
             HookRegistry.get_or_create(m).register_hook(hook_name, hook)
     module._mixfusion_hooks_applied = True

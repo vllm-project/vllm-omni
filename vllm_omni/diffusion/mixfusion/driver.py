@@ -6,8 +6,10 @@ The model-agnostic entry point for a denoise step: it decides whether the
 per-request latents may be packed, arms the
 :class:`~vllm_omni.diffusion.forward_context.MixFusionStep` around the packed
 forward, and otherwise falls back to a serial per-request pass. Model-specific
-knowledge (forward signature, token layout, output shape) lives in the
-model's :class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`.
+knowledge (forward signature, token layout, output shape) comes from the
+model's ``_mixfusion_plan`` through its adapter (the framework's
+:class:`~vllm_omni.diffusion.mixfusion.chunked.ChunkedJointAdapter` for a
+declarative plan).
 """
 
 from __future__ import annotations
@@ -36,8 +38,8 @@ logger = init_logger(__name__)
 class MixFusionDriver:
     """Run one denoise step through the packed path when it is admissible.
 
-    ``adapter`` is the transformer's model-side adapter; ``None`` keeps the
-    driver on the serial ragged path.
+    ``adapter`` packs the transformer's root call; ``None`` keeps the driver
+    on the serial ragged path.
     """
 
     def __init__(
@@ -94,7 +96,7 @@ class MixFusionDriver:
         unconditionally. Returns ``(accepted, reason)``.
         """
         if self.adapter is None:
-            return False, f"{type(self.transformer).__name__} declares no MixFusion adapter"
+            return False, f"{type(self.transformer).__name__} declares no packable MixFusion plan"
         if not getattr(self.transformer, "_mixfusion_hooks_applied", False):
             return False, "mixfusion hooks not applied"
         # The packed forward has no ``attention_kwargs`` channel; the serial

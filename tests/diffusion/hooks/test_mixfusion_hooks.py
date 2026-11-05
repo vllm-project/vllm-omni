@@ -6,7 +6,7 @@ The hooks implement the packed chunk-stacked layout purely at declared module
 boundaries (see ``mixfusion/plan.py``), mirroring the SP hook mechanism. The
 model-specific half lives behind a ``MixFusionAdapter``; these tests use a
 minimal stand-in transformer plus a fake adapter that reuses the real
-``split_sequence_chunks`` layout, and verify:
+chunk layout, and verify:
 
 - hooks are inert without an armed ``mixfusion_step`` (serial path unchanged);
 - the root hook binds the forward call, delegates packing to the adapter,
@@ -36,7 +36,6 @@ from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter, PackedInputs
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
-    split_sequence_chunks,
 )
 from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionExpandArg,
@@ -103,7 +102,11 @@ class _DummyAdapter:
     def pack_inputs(self, module, bound, *, cache: PackedInputs | None) -> PackedInputs:
         rows = [h.float() for h in bound.arguments["hidden_states"]]
         row_freqs = [torch.arange(SEQ_LEN, dtype=torch.float32).reshape(SEQ_LEN, 1)] * len(rows)
-        chunks, freq_chunks, ranges, chunk_to_request = split_sequence_chunks(rows, row_freqs, CHUNK_SIZE)
+        chunks = [chunk for row in rows for chunk in row.split(CHUNK_SIZE, dim=1)]
+        freq_chunks = [chunk for freqs in row_freqs for chunk in freqs.split(CHUNK_SIZE, dim=0)]
+        per_row = SEQ_LEN // CHUNK_SIZE
+        ranges = [(idx * per_row, (idx + 1) * per_row) for idx in range(len(rows))]
+        chunk_to_request = [idx for idx in range(len(rows)) for _ in range(per_row)]
         packed_hidden = torch.cat(chunks, dim=0)
         bound.arguments["hidden_states"] = packed_hidden
         packed = PackedInputs(

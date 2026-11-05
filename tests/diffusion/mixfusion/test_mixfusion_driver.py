@@ -245,7 +245,7 @@ def _hooked_root() -> _FakeTransformer:
         ({"pipeline": _pipeline(attention_kwargs={})}, {}, {}, "ok"),
         # Sequential true-CFG packs both branches in one armed step.
         ({}, {"do_true_cfg": True}, {}, "ok"),
-        ({"adapter": None}, {}, {}, "_FakeTransformer declares no MixFusion adapter"),
+        ({"adapter": None}, {}, {}, "_FakeTransformer declares no packable MixFusion plan"),
         ({"transformer": lambda: _FakeTransformer(hooks_applied=False)}, {}, {}, "mixfusion hooks not applied"),
         ({"pipeline": _pipeline(attention_kwargs={"scale": 0.5})}, {}, {}, "attention_kwargs is set"),
         ({"pipeline": _pipeline(sp_size=2)}, {}, {}, "sequence parallelism is enabled"),

@@ -4,25 +4,30 @@
 
 Mirrors :mod:`vllm_omni.diffusion.distributed.sp_plan`: models declare *where*
 the chunk-stacked layout starts, ends and has to be expanded, while the hooks
-in :mod:`vllm_omni.diffusion.hooks.mixfusion` implement *how*.
+in :mod:`vllm_omni.diffusion.hooks.mixfusion` and the framework's
+:class:`~vllm_omni.diffusion.mixfusion.chunked.ChunkedJointAdapter` implement
+*how*. A ``_mixfusion_plan`` maps module names (same syntax as ``_sp_plan``:
+``""`` for the root, dotted paths, one ``*`` per ModuleList wildcard) to the
+types below.
 
-A ``_mixfusion_plan`` maps module names (same syntax as ``_sp_plan``: ``""``
-for the root, dotted paths, one ``*`` per ModuleList wildcard) to the types
-below. The layout depends on the per-step batch, so the MixFusionDriver arms a
-:class:`~vllm_omni.diffusion.forward_context.MixFusionStep` and the root hook
-asks the model's :class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`
-for the concrete
-:class:`~vllm_omni.diffusion.mixfusion.execution_plan.PackedExecutionPlan`.
-
-Example::
+Example (Qwen-Image)::
 
     _mixfusion_plan = {
-        "": MixFusionRoot(),  # pack before forward, restore the list after
-        # Hand out adapter-computed packed hidden states / RoPE tables.
-        "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
+        # Per-request latent list in, one prediction per request out.
+        "": MixFusionRoot(),
+        # Run the model's own projection + RoPE boundary once per request and
+        # chunk-stack its outputs (the _sp_plan "split_output" boundary).
+        "image_rope_prepare": MixFusionChunkOutputs(
+            per_request_args=("hidden_states", "img_shapes"),
+            outputs=(ChunkedOutput(seq_dim=1), ChunkedOutput(seq_dim=0), PerRequestOutput()),
+        ),
         "transformer_blocks.*.img_mod": MixFusionExpandRows(),  # per chunk
         "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
+
+The model's joint attention hands its named streams to
+``Attention.forward_streams``; nothing else in ``forward`` branches on
+MixFusion.
 """
 
 from __future__ import annotations
@@ -38,19 +43,67 @@ from dataclasses import dataclass
 class MixFusionRoot:
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
-    It is the only boundary that sees both the per-request latent list and the
-    text stream (whose padded width participates in every RoPE table), so both
-    directions delegate to the model's :class:`MixFusionAdapter`.
+    The fields name the forward's per-request latent list, its request-level
+    text stream (one row per image) with the optional text padding mask, and
+    the output attribute holding the image prediction. The defaults follow the
+    diffusers DiT convention. The joint attention streams are named ``"text"``
+    and ``"image"``.
     """
+
+    ragged_arg: str = "hidden_states"
+    text_arg: str = "encoder_hidden_states"
+    text_mask_arg: str | None = "encoder_hidden_states_mask"
+    output_attr: str = "sample"
+
+
+@dataclass(frozen=True)
+class ChunkedOutput:
+    """Chunk-stack one output along its sequence dimension.
+
+    ``seq_dim=0``: each request returns ``[S, ...]`` and the result is
+    ``[num_chunks, chunk_size, ...]``. ``seq_dim=1``: each request returns
+    ``[1, S, ...]`` and the result has the same ``[num_chunks, chunk_size,
+    ...]`` layout.
+    """
+
+    seq_dim: int
+
+
+@dataclass(frozen=True)
+class PerRequestOutput:
+    """Stack one output per request (e.g. a text RoPE table).
+
+    ``batched=False``: each request returns ``[L, ...]`` and the result is
+    ``[num_requests, L, ...]``; ``batched=True``: each returns ``[1, L, ...]``.
+    """
+
+    batched: bool = False
+
+
+@dataclass(frozen=True)
+class MixFusionChunkOutputs:
+    """Run this module once per request and chunk-stack its outputs.
+
+    The packed-path counterpart of an ``_sp_plan`` ``split_output`` boundary:
+    the module still receives the per-request latent list, so each request's
+    call sees its own geometry. ``per_request_args`` are sliced per request
+    (a per-request list gives its item as a batch of one, a per-image tensor
+    its row); every other argument is passed through unchanged. ``outputs``
+    says how each returned value is combined, in return order.
+    """
+
+    per_request_args: tuple[str, ...]
+    outputs: tuple[ChunkedOutput | PerRequestOutput, ...]
 
 
 @dataclass(frozen=True)
 class MixFusionReplaceOutput:
     """Return an adapter-computed value instead of running this forward.
 
-    The value is ``PackedInputs.boundary_outputs[boundary]``, computed once by
-    the adapter at the root where the text stream is still visible; the
-    module's original forward never runs on the packed batch.
+    Only for a custom ``MixFusionAdapter`` (the escape hatch for layouts the
+    declarative plan cannot express): the value is
+    ``PackedInputs.boundary_outputs[boundary]``, computed by the adapter at
+    the root; the module's original forward never runs on the packed batch.
     """
 
     boundary: str

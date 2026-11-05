@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Model-side MixFusion adapter protocol.
+"""MixFusion adapter protocol and attention-stream layout types.
 
-MixFusion has three layers: a common driver (admission and step lifecycle), a
-common layout/hook layer (:class:`PackedExecutionPlan` and the module-boundary
-hooks), and a model-side adapter implementing this protocol, which alone knows
-the model's forward signature, packed-call shape and output layout.
+The root hook packs and restores a forward call through an object
+implementing :class:`MixFusionAdapter`. Models with a declarative
+``_mixfusion_plan`` get the framework's
+:class:`~vllm_omni.diffusion.mixfusion.chunked.ChunkedJointAdapter`; an
+explicit ``mixfusion_adapter`` is the escape hatch for a layout family the
+declarative plan cannot express.
 
-The framework never interprets the model-specific payloads in
-:class:`PackedInputs` (``boundary_outputs`` and ``adapter_state``); adding a
-model needs a new adapter and plan declaration, not driver or hook changes.
+The hooks never interpret the payloads in :class:`PackedInputs`
+(``boundary_outputs`` and ``adapter_state``); they only move them between the
+boundaries the plan declares.
 """
 
 from __future__ import annotations
@@ -44,8 +46,8 @@ class StreamSpec:
 class AttentionLayout:
     """The model's attention streams, in per-request token order.
 
-    Exactly one stream is ``"chunked"``: it is the positional Q/K/V of the
-    packed attention call. The adapter stores the layout on the plan.
+    Exactly one stream is ``"chunked"``. The adapter stores the layout on the
+    plan; ``Attention.forward_streams`` receives the streams by name.
     """
 
     streams: tuple[StreamSpec, ...]
@@ -82,7 +84,7 @@ class MixFusionAdapter(Protocol):
     def can_pack(self, module: nn.Module, input_batch: Any) -> tuple[bool, str]:
         """Whether this ragged batch is packable; ``(False, reason)`` stays serial.
 
-        Only model-specific limits belong here; the driver already checks the
+        Only layout/model-specific limits belong here; the driver already checks the
         model-agnostic ones (adapter/hooks present, attention kwargs, SP, CFG
         parallel, foreign hooks, chunk policy).
         """

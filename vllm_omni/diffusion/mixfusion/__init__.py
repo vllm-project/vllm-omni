@@ -7,7 +7,6 @@ from vllm_omni.diffusion.mixfusion.execution_plan import (
     build_execution_plan,
     expand_per_chunk,
     reassemble_chunk_rows,
-    split_sequence_chunks,
 )
 
 __all__ = [
@@ -15,5 +14,4 @@ __all__ = [
     "build_execution_plan",
     "expand_per_chunk",
     "reassemble_chunk_rows",
-    "split_sequence_chunks",
 ]

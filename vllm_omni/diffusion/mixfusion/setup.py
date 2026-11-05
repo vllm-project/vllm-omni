@@ -15,6 +15,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
+from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 
@@ -90,17 +91,17 @@ def mount_mixfusion(model: nn.Module, od_config: Any, *, supported: bool) -> Non
     if not transformers:
         return
 
-    # The driver only knows the model through its adapter, and one step packs
-    # one DiT: mount the first DiT that declares both a plan and an adapter.
-    # Without one, the driver still serves ragged batches serially. Admission
-    # rejects SP per step, so the hooks stay inert there.
+    # One step packs one DiT: mount the first DiT whose plan resolves to an
+    # adapter (the framework's chunked one for a declarative plan). Without
+    # one, the driver still serves ragged batches serially. Admission rejects
+    # SP per step, so the hooks stay inert there.
     for attr, transformer in transformers:
         plan = getattr(transformer, "_mixfusion_plan", None)
-        adapter = getattr(transformer, "mixfusion_adapter", None)
+        adapter = resolve_mixfusion_adapter(transformer, plan)
         if plan is not None and adapter is not None:
             logger.info("Applying MixFusion hooks to %s (%s): %s", type(transformer).__name__, attr, ", ".join(plan))
-            apply_mixfusion(transformer, plan)
+            apply_mixfusion(transformer, plan, adapter)
             model.mixfusion_driver = MixFusionDriver(model, transformer, adapter)
             return
-    logger.warning("No transformer declares a _mixfusion_plan and adapter; MixFusion requests run serially.")
+    logger.warning("No transformer declares a packable _mixfusion_plan; MixFusion requests run serially.")
     model.mixfusion_driver = MixFusionDriver(model, transformers[0][1], None)

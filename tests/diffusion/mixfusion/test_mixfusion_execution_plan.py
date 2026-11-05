@@ -21,7 +21,6 @@ from vllm_omni.diffusion.mixfusion.execution_plan import (
     gcd_chunk_size,
     plan_chunk_size,
     reassemble_chunk_rows,
-    split_sequence_chunks,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -124,29 +123,6 @@ def test_build_execution_plan_skips_scatter_when_no_padding_is_needed():
 
 
 # ── chunk splitting / reassembly ──
-
-
-def test_split_sequence_chunks_keeps_states_and_freqs_aligned():
-    rows = [torch.arange(8.0).reshape(1, 8, 1), torch.arange(12.0).reshape(1, 12, 1)]
-    freqs = [torch.arange(8.0).reshape(8, 1), torch.arange(12.0).reshape(12, 1)]
-
-    chunks, freq_chunks, ranges, chunk_to_request = split_sequence_chunks(rows, freqs, chunk_size=4)
-
-    assert len(chunks) == len(freq_chunks) == 5
-    assert ranges == [(0, 2), (2, 5)]
-    assert chunk_to_request == [0, 0, 1, 1, 1]
-    assert [chunk.shape for chunk in chunks] == [(1, 4, 1)] * 5
-    assert torch.equal(chunks[2][0, :, 0], rows[1][0, :4, 0])
-    assert torch.equal(freq_chunks[2][:, 0], freqs[1][:4, 0])
-
-
-def test_split_sequence_chunks_rejects_a_non_divisible_sequence():
-    with pytest.raises(ValueError, match=r"seq_len=10 is not divisible by chunk_size=4"):
-        split_sequence_chunks(
-            [torch.zeros(1, 10, 1)],
-            [torch.zeros(10, 1)],
-            chunk_size=4,
-        )
 
 
 def test_expand_per_chunk_duplicates_request_conditioning():

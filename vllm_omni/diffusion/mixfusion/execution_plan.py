@@ -5,10 +5,9 @@
 Every non-attention computation is token-local and runs on sequence chunks
 stacked along the local batch dimension; attention needs the complete logical
 sequence and is reassembled per request at the attention boundary. This module
-owns the layout side: sequence-dim chunking with aligned RoPE frequencies, the
-chunk-to-request mapping, per-chunk conditioning expansion, and the packed
-varlen layout (cu_seqlens / max_seqlen). Layout only: no model-specific
-semantics, no ``nn.Module`` state.
+owns the layout side: the chunk-to-request mapping, per-chunk conditioning
+expansion, chunk reassembly and the packed varlen layout (cu_seqlens /
+max_seqlen). Layout only: no model-specific semantics, no ``nn.Module`` state.
 """
 
 from __future__ import annotations
@@ -143,35 +142,6 @@ def build_execution_plan(
         max_seq_len=max_seq_len,
         output_indices=output_indices,
     )
-
-
-def split_sequence_chunks(
-    rows: Sequence[torch.Tensor],
-    row_freqs: Sequence[torch.Tensor],
-    chunk_size: int,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[tuple[int, int]], list[int]]:
-    """Split per-row states and their aligned RoPE frequencies into chunks.
-
-    ``rows[i]`` is a ``[1, S_i, C]`` latent row and ``row_freqs[i]`` the
-    ``[S_i, D/2]`` frequency table for the same positions, so both land under
-    the same partition. Returns the per-chunk tensors of both, the per-row
-    chunk ranges and the chunk-to-request mapping.
-    """
-    chunks: list[torch.Tensor] = []
-    freq_chunks: list[torch.Tensor] = []
-    request_chunk_ranges: list[tuple[int, int]] = []
-    chunk_to_request: list[int] = []
-    for row_idx, sample in enumerate(rows):
-        seq_len = int(sample.shape[1])
-        if seq_len % chunk_size != 0:
-            raise ValueError(f"MixFusion seq_len={seq_len} is not divisible by chunk_size={chunk_size}.")
-        chunk_start = len(chunks)
-        chunks.extend(sample.split(chunk_size, dim=1))
-        freq_chunks.extend(row_freqs[row_idx].split(chunk_size, dim=0))
-        chunk_end = len(chunks)
-        request_chunk_ranges.append((chunk_start, chunk_end))
-        chunk_to_request.extend([row_idx] * (chunk_end - chunk_start))
-    return chunks, freq_chunks, request_chunk_ranges, chunk_to_request
 
 
 def expand_per_chunk(temb: torch.Tensor, chunk_to_request: torch.Tensor) -> torch.Tensor:

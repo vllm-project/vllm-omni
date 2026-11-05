@@ -17,6 +17,7 @@ import pytest
 from torch import nn
 
 from vllm_omni.diffusion.hooks.mixfusion import MixFusionRoot
+from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.setup import mount_mixfusion, validate_mixfusion_config
 
@@ -24,11 +25,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 class _FakeTransformer(nn.Module):
-    def __init__(self, *, adapter: object | None) -> None:
+    def __init__(self, *, adapter: object | None, plan: dict | None = None) -> None:
         super().__init__()
         # A root-only plan keeps the fake module free of block structure while
         # still exercising the real hook registration path.
-        self._mixfusion_plan = {"": MixFusionRoot()}
+        self._mixfusion_plan = {"": MixFusionRoot()} if plan is None else plan
         if adapter is not None:
             self.mixfusion_adapter = adapter
 
@@ -44,8 +45,8 @@ def _od_config(*, enable: bool):
     return SimpleNamespace(enable_mixfusion=enable)
 
 
-def _mount(*, supports: bool, adapter: object | None, enable: bool = False):
-    transformer = _FakeTransformer(adapter=adapter)
+def _mount(*, supports: bool, adapter: object | None, enable: bool = False, plan: dict | None = None):
+    transformer = _FakeTransformer(adapter=adapter, plan=plan)
     pipeline = _FakePipeline(transformer)
     mount_mixfusion(pipeline, _od_config(enable=enable), supported=supports)
     return pipeline, transformer
@@ -69,8 +70,16 @@ def test_unsupported_pipeline_mounts_nothing():
     assert getattr(transformer, "_mixfusion_hooks_applied", False) is False
 
 
-def test_transformer_without_adapter_gets_a_serial_driver():
+def test_declarative_plan_mounts_the_framework_adapter():
     pipeline, transformer = _mount(supports=True, adapter=None)
+
+    # No model-side adapter: a MixFusionRoot plan gets the chunked one.
+    assert isinstance(pipeline.mixfusion_driver.adapter, ChunkedJointAdapter)
+    assert transformer._mixfusion_hooks_applied is True
+
+
+def test_transformer_without_a_packable_plan_gets_a_serial_driver():
+    pipeline, transformer = _mount(supports=True, adapter=None, plan={})
 
     # Ragged batches still need the serial fallback instead of reaching the
     # dense path with a list.

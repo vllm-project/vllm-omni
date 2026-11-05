@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Model-side tests for the Qwen-Image MixFusion adapter (CPU).
+"""Model-side tests for Qwen-Image's declarative MixFusion plan (CPU).
 
-The generic driver, hooks and layout primitives are covered under
-``tests/diffusion/mixfusion`` and ``tests/diffusion/hooks``. This module pins
-what is Qwen-specific:
+The generic driver, hooks, chunked adapter and layout primitives are covered
+under ``tests/diffusion/mixfusion`` and ``tests/diffusion/hooks``. This module
+pins what is Qwen-specific:
 
-* the adapter's own admission limits and that the real ``_mixfusion_plan``
-  exposes the block boundaries to the foreign-hook guard;
+* ``mixfusion_can_pack`` and that the real ``_mixfusion_plan`` exposes the
+  block boundaries to the foreign-hook guard;
 * the pipeline's dense keyword builder feeding a packed list through an armed
   step, with and without sequential true-CFG;
 * the serial-ragged fallback keeping each request's spatial RoPE when
   equal-area images differ in aspect ratio;
-* ``prepare_inputs``: row expansion, chunk split, RoPE tables, plan and the
-  step-invariant cache;
-* the packed cross-attention: one ``forward_packed`` call over mixed requests
-  that keeps the eager RoPE dtype contract (#7494), and the mask-capable dense
-  route matching it.
+* the real ``ImageRopePrepare`` boundary under the plan: per-request RoPE
+  identical to individual execution, chunk-stacked;
+* the packed cross-attention through ``Attention.forward_streams``: one
+  ``forward_packed`` call over mixed requests that keeps the eager RoPE dtype
+  contract (#7494), and the mask-capable dense route matching it.
 """
 
 from __future__ import annotations
@@ -36,13 +36,11 @@ from vllm_omni.diffusion.forward_context import (
     override_forward_context,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
-from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
+from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
+from vllm_omni.diffusion.mixfusion.chunked import JOINT_TEXT_IMAGE_LAYOUT, ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.execution_plan import build_execution_plan
-from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import (
-    QWEN_ATTENTION_LAYOUT,
-    QwenImageMixFusionAdapter,
-)
+from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     ImageRopePrepare,
@@ -91,22 +89,24 @@ def _transformer(blocks: list[nn.Module] | None = None) -> tuple[QwenImageTransf
 # ---------------------------------------------------------------------------
 
 
-def test_can_pack_rejects_zero_cond_t_and_missing_shapes():
-    adapter = QwenImageMixFusionAdapter()
+def test_can_pack_rejects_zero_cond_t_reference_images_and_missing_shapes():
     transformer, _ = _transformer()
-    batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=None)
-    assert adapter.can_pack(transformer, batch) == (True, "")
-    assert adapter.can_pack(transformer, SimpleNamespace(img_shapes=None, txt_seq_lens=[4], image_latents=None)) == (
+    adapter = ChunkedJointAdapter(MixFusionRoot())
+
+    def batch(**overrides):
+        return SimpleNamespace(**{"img_shapes": [(16, 2, 2)], "txt_seq_lens": [4], "image_latents": None, **overrides})
+
+    assert adapter.can_pack(transformer, batch()) == (True, "")
+    assert adapter.can_pack(transformer, batch(img_shapes=None)) == (
         False,
         "img_shapes and txt_seq_lens are required",
     )
-    edit_batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=torch.zeros(1, 4, 8))
-    assert adapter.can_pack(transformer, edit_batch) == (
+    assert adapter.can_pack(transformer, batch(image_latents=torch.zeros(1, 4, 8))) == (
         False,
         "image_latents (reference images) are not supported",
     )
     object.__setattr__(transformer, "zero_cond_t", True)
-    assert adapter.can_pack(transformer, batch) == (False, "zero_cond_t/editing path is not supported")
+    assert adapter.can_pack(transformer, batch()) == (False, "zero_cond_t/editing path is not supported")
 
 
 def _offloaded_block() -> nn.Module:
@@ -205,7 +205,7 @@ def _packed_input_batch(*, do_true_cfg: bool = False):
 def test_driver_runs_the_pipeline_denoise_step_packed(do_true_cfg):
     transformer = _StubTransformer()
     pipeline = _StubPipeline(transformer)
-    driver = MixFusionDriver(pipeline, transformer, QwenImageMixFusionAdapter())
+    driver = MixFusionDriver(pipeline, transformer, ChunkedJointAdapter(MixFusionRoot()))
     batch = _packed_input_batch(do_true_cfg=do_true_cfg)
 
     with override_forward_context(ForwardContext()):
@@ -268,7 +268,9 @@ def test_serial_fallback_keeps_each_requests_rope_for_equal_area_aspect_ratios()
     batch = InputBatch.make_batch(states)
     for extra in batch.request_extras:
         extra["mixfusion_min_chunk_tokens"] = 1024
-    driver = MixFusionDriver(_StubPipeline(_StubTransformer()), _StubTransformer(), QwenImageMixFusionAdapter())
+    driver = MixFusionDriver(
+        _StubPipeline(_StubTransformer()), _StubTransformer(), ChunkedJointAdapter(MixFusionRoot())
+    )
     with override_forward_context(ForwardContext()):
         outputs = driver.run(batch, states, dense_step)
 
@@ -278,59 +280,89 @@ def test_serial_fallback_keeps_each_requests_rope_for_equal_area_aspect_ratios()
 
 
 # ---------------------------------------------------------------------------
-# prepare_inputs: packed-layout preparation and its step-invariant cache.
+# The declared ImageRopePrepare boundary under an armed step.
 # ---------------------------------------------------------------------------
 
 
-def _prepare(transformer, latents, *, mask=None, cached=None):
-    return QwenImageMixFusionAdapter().prepare_inputs(
-        transformer,
-        hidden_states=latents,
-        encoder_hidden_states=torch.zeros(sum(latent.shape[0] for latent in latents), 4, 8),
+class _QwenRopeOnly(nn.Module):
+    """The real Qwen plan's root and RoPE boundaries around a recording body."""
+
+    _mixfusion_plan = {
+        "": QwenImageTransformer2DModel._mixfusion_plan[""],
+        "image_rope_prepare": QwenImageTransformer2DModel._mixfusion_plan["image_rope_prepare"],
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.image_rope_prepare = ImageRopePrepare(
+            nn.Linear(4, 6), QwenEmbedRope(theta=10000, axes_dim=[4, 6, 6], scale_rope=True)
+        )
+        self.seen: list[tuple] = []
+
+    def forward(
+        self, hidden_states, encoder_hidden_states, encoder_hidden_states_mask=None, img_shapes=None, txt_seq_lens=None
+    ):
+        hidden, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+        self.seen.append((hidden, vid_freqs, txt_freqs))
+        return SimpleNamespace(sample=hidden)
+
+
+def test_rope_boundary_matches_individual_execution_per_request():
+    torch.manual_seed(0)
+    model = _QwenRopeOnly()
+    apply_mixfusion(model, model._mixfusion_plan)
+    # Two images for request 0 (one prompt row each), one for request 1, and
+    # a 2x4 vs 4x2 aspect pair so a shared table would be wrong.
+    grids = [(1, 2, 4), (1, 4, 2)]
+    latents = [torch.randn(2, 8, 4), torch.randn(1, 8, 4)]
+    text = torch.zeros(3, 5, 8)
+    mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.bool)
+    kwargs = dict(
+        encoder_hidden_states=text,
         encoder_hidden_states_mask=mask,
-        img_shapes=[(int(latent.shape[1]), 2, 2) for latent in latents],
-        txt_seq_lens=[4] * len(latents),
-        cached=cached,
+        img_shapes=[[grid] for grid in grids],
+        txt_seq_lens=[5, 5, 5],
     )
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
+        out = model(hidden_states=latents, **kwargs)
+        plan = get_forward_context().mixfusion_step.plan
+
+    packed_hidden, packed_vid, packed_txt = model.seen[0]
+    assert plan.chunk_size == 8 and plan.num_chunks == 3
+    assert plan.request_stream_lens == {"text": (3, 3, 5), "image": (8, 8, 8)}
+    rows = [(0, 0), (0, 1), (1, 0)]
+    for chunk, (req, image) in enumerate(rows):
+        hidden_ref, vid_ref, txt_ref = model.image_rope_prepare(latents[req][image : image + 1], [[grids[req]]], [5])
+        assert torch.equal(packed_hidden[chunk], hidden_ref[0])
+        assert torch.equal(packed_vid[chunk], vid_ref)
+        assert torch.equal(packed_txt[chunk], txt_ref[:5])
+    # The root reassembles one [num_images, S, C] prediction per request.
+    assert [tuple(o.shape) for o in out] == [(2, 8, 6), (1, 8, 6)]
 
 
-def test_prepare_splits_mixed_lengths_into_equal_chunks():
-    transformer, pos_embed_calls = _transformer()
-    latents = [torch.ones(1, 8, 2), torch.ones(1, 12, 2)]
-    # An all-valid mask is normalized away: the plan sees full text lengths.
-    prepared = _prepare(transformer, latents, mask=torch.ones(2, 4))
-
-    # gcd(8, 12) = 4: 2 + 3 chunks stacked on the batch dimension; img_in is
-    # an identity, so hidden_states are the chunk-stacked latents.
-    assert prepared.plan.chunk_size == 4
-    assert prepared.hidden_states.shape == (5, 4, 2)
-    assert prepared.plan.chunk_to_request.tolist() == [0, 0, 1, 1, 1]
-    assert prepared.plan.image_row_counts == (1, 1)
-    assert prepared.plan.request_stream_lens == {"text": (4, 4), "image": (8, 12)}
-    assert prepared.encoder_hidden_states_mask is None
-    # One RoPE build per image row; tables stacked per chunk / per image row.
-    assert pos_embed_calls[0] == 2
-    assert prepared.image_rotary_emb[0].shape == (5, 4, ROPE_DIM)
-    assert prepared.image_rotary_emb[1].shape == (2, 4, ROPE_DIM)
-
-
-def test_prepare_reuses_the_step_invariant_layout():
-    transformer, pos_embed_calls = _transformer()
-    first = _prepare(transformer, [torch.ones(1, 8, 2), 2 * torch.ones(1, 8, 2)])
-    step_2 = [3 * torch.ones(1, 8, 2), 4 * torch.ones(1, 8, 2)]
-    second = _prepare(transformer, step_2, cached=first)
-
-    # Same request shapes: no RoPE or plan rebuild, only the latents change.
-    assert pos_embed_calls[0] == 2
-    assert second.plan is first.plan
-    assert second.image_rotary_emb is first.image_rotary_emb
-    assert torch.equal(second.hidden_states, torch.cat(step_2, dim=0))
-
-    # A different request mix must not reuse the cached layout.
-    third = _prepare(transformer, [torch.ones(1, 8, 2)], cached=second)
-    assert pos_embed_calls[0] == 3
-    assert third.plan is not first.plan
-    assert third.hidden_states.shape == (1, 8, 2)
+def test_root_reuses_the_plan_while_the_layout_is_unchanged():
+    model = _QwenRopeOnly()
+    apply_mixfusion(model, model._mixfusion_plan)
+    kwargs = dict(
+        encoder_hidden_states=torch.zeros(2, 4, 8), img_shapes=[[(1, 2, 4)], [(1, 4, 4)]], txt_seq_lens=[4, 4]
+    )
+    plans = []
+    for latents in ([torch.ones(1, 8, 4), torch.ones(1, 16, 4)],) * 2 + ([torch.ones(1, 8, 4)],):
+        shapes = (
+            kwargs
+            if len(latents) == 2
+            else {
+                **kwargs,
+                "encoder_hidden_states": torch.zeros(1, 4, 8),
+                "img_shapes": [[(1, 2, 4)]],
+                "txt_seq_lens": [4],
+            }
+        )
+        with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
+            model(hidden_states=latents, **shapes)
+            plans.append(get_forward_context().mixfusion_step.plan)
+    assert plans[1] is plans[0]
+    assert plans[2] is not plans[0] and plans[2].num_chunks == 1
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +476,7 @@ def _forward(module, *, txt_lens, chunks_per_request, txt_padded):
         ranges.append((start, start + count))
         start += count
     plan = build_execution_plan(
-        layout=QWEN_ATTENTION_LAYOUT,
+        layout=JOINT_TEXT_IMAGE_LAYOUT,
         chunk_size=CHUNK_SIZE,
         request_chunk_ranges=ranges,
         image_row_counts=[1] * len(ranges),
