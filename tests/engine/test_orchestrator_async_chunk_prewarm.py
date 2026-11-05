@@ -214,11 +214,15 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry_stage_id", [0, 1])
-async def test_prewarm_does_not_forward_the_entry_stage_input_stream(entry_stage_id) -> None:
+@pytest.mark.parametrize("flattened", [False, True])
+async def test_prewarm_does_not_forward_the_entry_stage_input_stream(entry_stage_id, flattened) -> None:
     orchestrator = _orchestrator()
     prompt = _prompt(None)
     stream = {"token_ids": [31, 32], "final": False}
-    prompt["additional_information"]["input_stream"] = stream
+    stream_info = (
+        {f"input_stream.{key}": value for key, value in stream.items()} if flattened else {"input_stream": stream}
+    )
+    prompt["additional_information"].update(stream_info)
     req_state = OrchestratorRequestState(
         request_id="req",
         prompt=prompt,
@@ -229,7 +233,7 @@ async def test_prewarm_does_not_forward_the_entry_stage_input_stream(entry_stage
 
     assert await orchestrator._prewarm_async_chunk_stages("req", _stage0(resumable=False), req_state)
 
-    assert prompt["additional_information"]["input_stream"] == stream
+    assert prompt["additional_information"] == {"global_request_id": ["req"], **stream_info}
     for stage in orchestrator.stage_pools[entry_stage_id + 1 :]:
         (placeholder,) = stage.submitted
         assert deserialize_additional_information(placeholder.additional_information) == {"global_request_id": ["req"]}

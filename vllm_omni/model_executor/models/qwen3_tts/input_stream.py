@@ -7,12 +7,11 @@
 class Qwen3TTSTextInput:
     """Scheduler-owned text and the stock interleaved Talker's readiness rule."""
 
-    def __init__(self, token_ids, capacity, vocab_size, *, final=False, timeout_s=10.0):
+    def __init__(self, token_ids, capacity, vocab_size, *, final=False):
         self.token_ids = []
         self.capacity = capacity
         self.vocab_size = vocab_size
         self.final = False
-        self.timeout_s = timeout_s
         self.wait_started_at = None
         self.delivered_tokens = 0
         self.delivered_final = False

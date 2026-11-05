@@ -444,7 +444,7 @@ def test_profile_is_explicit_and_unknown_profiles_are_rejected() -> None:
     ("packets", "releases", "remaining"),
     [
         (("今天", "天气很好"), (("今天",), ("天气很好",)), ()),
-        (("hel", "lo world "), ((), ("hello world ",)), ()),
+        (("good", "bye world "), ((), ("goodbye world ",)), ()),
         (("金额为2026", "元", "，继续"), (("金额为",), (), ("2026元，继续",)), ()),
         (("数量为3",), (("数量为",),), ("3",)),
         (("Hello world. ", "Next part "), (("Hello world. ",), ("Next part ",)), ()),

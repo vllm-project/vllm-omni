@@ -321,12 +321,15 @@ def test_native_append_error_cancels_audio_and_waits_for_input_done(native_app):
     assert not native_app.engine.active
 
 
-def test_native_generation_ending_before_eof_reports_error_and_rejects_more_text(native_app):
+@pytest.mark.parametrize("finish_reason", ["stop", "length", None])
+def test_native_generation_ending_before_eof_reports_error_and_rejects_more_text(native_app, finish_reason):
     generate = native_app.engine.generate
 
     async def end_after_first_chunk(**kwargs):
         async with aclosing(generate(**kwargs)) as outputs:
             yield await anext(outputs)
+            if finish_reason is not None:
+                yield SimpleNamespace(metrics={"stage_metrics": {"0": {"finish_reason": finish_reason}}})
 
     native_app.engine.generate = end_after_first_chunk
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -335,7 +338,15 @@ def test_native_generation_ending_before_eof_reports_error_and_rejects_more_text
         assert ws.receive_json()["type"] == "audio.start"
         assert ws.receive_bytes()
         error = ws.receive_json()
-        assert "ended before closing its text input" in error["message"]
+        if finish_reason == "length":
+            assert "token budget" in error["message"]
+        else:
+            assert "ended before closing its text input" in error["message"]
+            if finish_reason is not None:
+                assert f"finish_reason={finish_reason}" in error["message"]
+            else:
+                assert "finish_reason=" not in error["message"]
+        assert set(error) == {"type", "message", "partial_audio", "action"}
         assert error["partial_audio"] and error["action"] == "discard"
         done = ws.receive_json()
         assert done["type"] == "audio.done" and done["error"]
@@ -343,9 +354,17 @@ def test_native_generation_ending_before_eof_reports_error_and_rejects_more_text
         assert "failed" in ws.receive_json()["message"]
         ws.send_json({"type": "input.done"})
         assert ws.receive_json()["type"] == "session.done"
-    assert len(native_app.engine.submissions) == 1
+        native_app.engine.generate = generate
+        ws.send_json({"type": "input.text", "text": "Another "})
+        assert ws.receive_json()["utterance_index"] == 1
+        assert ws.receive_bytes()
+        ws.send_json({"type": "input.done"})
+        events, _ = _finish_utterance(ws)
+        assert [event["type"] for event in events] == ["audio.done", "session.done"]
+        assert not events[0]["error"] and events[-1]["utterance_index"] == 1
+    assert len(native_app.engine.submissions) == 2
     assert not native_app.engine.active
-    native_app.engine.append_text.assert_not_awaited()
+    assert native_app.engine.appends == [(native_app.engine.submissions[1]["request_id"], [], True)]
 
 
 def test_native_utterance_limit_is_enforced_before_submission(native_app, monkeypatch):
@@ -626,11 +645,11 @@ def test_incremental_commitment_appends_releases_without_closing_the_request(nat
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         config = _NATIVE_CONFIG
         ws.send_json(config)
-        ws.send_json({"type": "input.text", "text": "hel"})
+        ws.send_json({"type": "input.text", "text": "good"})
         ws.send_json(config)
         assert "utterance" in ws.receive_json()["message"]
         assert not engine.submissions
-        ws.send_json({"type": "input.text", "text": "lo world "})
+        ws.send_json({"type": "input.text", "text": "bye world "})
         assert engine.submitting.wait(3)
         assert ws.receive_json()["type"] == "audio.start"
         assert ws.receive_bytes()
@@ -646,7 +665,7 @@ def test_incremental_commitment_appends_releases_without_closing_the_request(nat
         assert not events[-2]["error"]
         assert events[-1]["total_sentences"] == 1
     params = engine.submissions[0]["prompt"]["additional_information"]
-    assert params["input_stream"]["token_ids"] == text_tokenizer.encode("hello world ", add_special_tokens=False)
+    assert params["input_stream"]["token_ids"] == text_tokenizer.encode("goodbye world ", add_special_tokens=False)
     assert [token for _, tokens, _ in engine.appends for token in tokens] == (
         text_tokenizer.encode("Next sentence. ", add_special_tokens=False)
         + text_tokenizer.encode("Third sentence. ", add_special_tokens=False)
@@ -761,7 +780,7 @@ def test_incremental_handler_uses_a_non_qwen_adapter_contract(native_app, mocker
         async def build(self, request, sampling_params_list, has_inline_ref_audio):
             raise AssertionError("Complete-request builder must not handle incremental input")
 
-        async def create_incremental_input(self, request, *, timeout_s):
+        async def create_incremental_input(self, request):
             requests.append(request)
             return OtherInput()
 
@@ -874,12 +893,12 @@ def test_incremental_pending_text_does_not_start_the_processing_deadline(native_
     monkeypatch.setattr(stream_module, "_MAX_INCREMENTAL_UTTERANCE_SECONDS", 0.1)
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
-        ws.send_json({"type": "input.text", "text": "Hel"})
+        ws.send_json({"type": "input.text", "text": "Good"})
         client.portal.call(asyncio.sleep, 0.15)
         ws.send_json(_NATIVE_CONFIG)
         assert "utterance" in ws.receive_json()["message"]
         assert not native_app.engine.submissions
-        ws.send_json({"type": "input.text", "text": "lo "})
+        ws.send_json({"type": "input.text", "text": "bye "})
         assert ws.receive_json()["type"] == "audio.start"
         assert ws.receive_bytes()
         ws.send_json({"type": "input.done"})
@@ -889,7 +908,7 @@ def test_incremental_pending_text_does_not_start_the_processing_deadline(native_
     assert not native_app.engine.active and not native_app.engine.cancelled
 
 
-@pytest.mark.parametrize("text", ["Hel", "Hello "])
+@pytest.mark.parametrize("text", ["Good", "Hello "])
 def test_incremental_open_input_idle_uses_normal_session_timeout(native_app, text):
     native_app.handler._idle_timeout = 0.05
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -908,7 +927,7 @@ def test_incremental_disconnect_before_first_release_cleans_input_without_submit
     cleanup = mocker.spy(native_app.handler, "_cleanup_incremental_utterance")
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
-        ws.send_json({"type": "input.text", "text": "Hel"})
+        ws.send_json({"type": "input.text", "text": "Good"})
         ws.send_json(_NATIVE_CONFIG)
         assert "utterance" in ws.receive_json()["message"]
         if close:

@@ -991,7 +991,7 @@ class AsyncOmniEngine(OmniEngineBase):
         Returning means queued, not acknowledged by the scheduler. Each call
         appends new text; callers must not retry a submitted chunk.
         """
-        self.request_queue.sync_q.put(TextInputUpdate(request_id=request_id, token_ids=list(token_ids), final=final))
+        await self._put_request_queue(TextInputUpdate(request_id=request_id, token_ids=list(token_ids), final=final))
 
     def submit_interaction(
         self,

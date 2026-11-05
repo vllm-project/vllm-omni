@@ -3433,7 +3433,9 @@ class OrchestratorBase:
                         )
                         additional_information = base_input["additional_information"]
                         if isinstance(additional_information, dict):
-                            additional_information.pop("input_stream", None)
+                            for key in list(additional_information):
+                                if key == "input_stream" or key.startswith("input_stream."):
+                                    additional_information.pop(key)
                 else:
                     base_input = {}
 

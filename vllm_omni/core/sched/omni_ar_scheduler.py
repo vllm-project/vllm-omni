@@ -37,6 +37,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import t
 
 logger = init_logger(__name__)
 
+_TEXT_INPUT_WAIT_TIMEOUT_SECONDS = 10.0
+
 
 def _should_emit_engine_output(
     model_config: Any,
@@ -794,9 +796,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             elif stream.wait_started_at is None:
                 stream.wait_started_at = now
                 blocked_ids.add(request_id)
-            elif now - stream.wait_started_at >= stream.timeout_s:
+            elif now - stream.wait_started_at >= _TEXT_INPUT_WAIT_TIMEOUT_SECONDS:
                 self._fail_input_stream_request(
-                    request, f"Timed out waiting for text input after {stream.timeout_s:g}s"
+                    request, f"Timed out waiting for text input after {_TEXT_INPUT_WAIT_TIMEOUT_SECONDS:g}s"
                 )
             else:
                 blocked_ids.add(request_id)

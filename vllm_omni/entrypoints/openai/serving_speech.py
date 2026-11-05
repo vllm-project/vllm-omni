@@ -2438,6 +2438,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         target_sample_rate: int | None = None,
         cumulative_audio: bool = False,
         audio_format: dict[str, int] | None = None,
+        usage_acc: SpeechOutputTokenCounter | None = None,
     ):
         """Yield raw PCM byte chunks from the engine generator.
 
@@ -2459,6 +2460,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 target_sample_rate=target_sample_rate,
                 cumulative_audio=cumulative_audio,
                 audio_format=audio_format,
+                usage_acc=usage_acc,
             )
         ) as chunks:
             async for chunk in chunks:

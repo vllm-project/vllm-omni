@@ -363,9 +363,7 @@ class TTSModelAdapter(ABC):
         the ``voice_name`` / ``voice_created_at`` metadata.
         """
 
-    async def create_incremental_input(
-        self, request: "OpenAICreateSpeechRequest", *, timeout_s: float
-    ) -> IncrementalTTSInput:
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
         """Create fresh model input state; ordinary request validation is shared."""
         raise ValueError(f"Incremental model input is not supported by {self.name}")
 

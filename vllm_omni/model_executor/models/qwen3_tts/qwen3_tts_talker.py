@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -814,13 +813,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     info[key] = value
         stream = info.get("input_stream")
         if not isinstance(stream, dict):
-            raise ValueError("Qwen3-TTS input_stream requires token_ids and optional final / timeout_s")
+            raise ValueError("Qwen3-TTS input_stream requires token_ids and optional final")
         tokens = stream.get("token_ids")
         if not tokens:
             raise ValueError("An input stream requires at least one initial token")
-        timeout_s = stream.get("timeout_s", 10.0)
-        if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError("input_stream.timeout_s must be a finite positive number")
         task = info.get("task_type", ["CustomVoice"])
         task = task[0] if isinstance(task, list) and task else task
         mode = info.get("non_streaming_mode", False)
@@ -846,7 +842,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             capacity,
             final=stream.get("final", False),
             vocab_size=model_config.hf_config.talker_config.text_vocab_size,
-            timeout_s=timeout_s,
         )
 
     def apply_text_input_update(self, runtime: dict, payload: dict, *, replace: bool = False) -> None:
@@ -859,6 +854,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             runtime["input_stream"] = stream = dict(runtime.get("input_stream", {}))
             stream["token_ids"] = list(update["token_ids"])
         else:
+            if "input_stream" not in runtime:
+                raise RuntimeError("Cannot apply a text input delta without an installed input_stream snapshot")
             stream = runtime["input_stream"]
             stream["token_ids"].extend(update["token_ids"])
         stream["final"] = update["final"]

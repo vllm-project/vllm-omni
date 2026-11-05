@@ -84,6 +84,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
+from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.entrypoints.openai.tts_adapters.base import IncrementalTTSInput
 from vllm_omni.model_executor.stage_input_processors.streaming_text_frontend import (
     StreamingTextFrontend,
@@ -104,7 +105,6 @@ _MAX_COMMITMENT_UTTERANCE_CHARS = 128 * 1024
 _MAX_COMMITMENT_PENDING_CHARS = 4096
 _MAX_COMMITMENT_QUEUE_SIZE = 8
 _MAX_INCREMENTAL_UTTERANCE_SECONDS = 300.0
-_INCREMENTAL_INPUT_TIMEOUT_SECONDS = 10.0
 _INCREMENTAL_SEND_TIMEOUT_SECONDS = 10.0
 
 _UTTERANCE_EOF = object()
@@ -615,15 +615,17 @@ class OmniStreamingSpeechHandler:
 
     async def _incremental_audio_worker(
         self, websocket: WebSocket, state: _IncrementalUtterance, generator, tts_params
-    ) -> None:
+    ) -> str | None:
         assert state.request_id is not None
         audio_format: dict[str, int] = {}
+        usage_acc = SpeechOutputTokenCounter()
         async with aclosing(
             self._speech_service._generate_pcm_chunks(
                 generator,
                 state.request_id,
                 tts_params=tts_params,
                 audio_format=audio_format,
+                usage_acc=usage_acc,
             )
         ) as chunks:
             async for chunk in chunks:
@@ -631,6 +633,7 @@ class OmniStreamingSpeechHandler:
                     await self._send_incremental_start(websocket, state, audio_format)
                     await asyncio.wait_for(websocket.send_bytes(chunk), timeout=_INCREMENTAL_SEND_TIMEOUT_SECONDS)
                     state.total_bytes += len(chunk)
+        return usage_acc.stage0_finish_reason
 
     async def _run_incremental_utterance(
         self, websocket: WebSocket, state: _IncrementalUtterance, initial_text: str, final: bool
@@ -640,7 +643,7 @@ class OmniStreamingSpeechHandler:
         adapter = self._speech_service._get_tts_adapter()
         assert adapter is not None
         request = self._incremental_request(state.config, initial_text)
-        model_input = await adapter.create_incremental_input(request, timeout_s=_INCREMENTAL_INPUT_TIMEOUT_SECONDS)
+        model_input = await adapter.create_incremental_input(request)
         state.request_id = f"speech-stream-{random_uuid()}"
         submitted = asyncio.get_running_loop().create_future()
         request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
@@ -660,7 +663,11 @@ class OmniStreamingSpeechHandler:
                 for task in done:
                     await task
                 if consumer in done and not producer.done():
-                    raise RuntimeError("Incremental generation ended before closing its text input")
+                    message = "Incremental generation ended before closing its text input"
+                    finish_reason = consumer.result()
+                    if finish_reason is not None:
+                        message += f" (finish_reason={finish_reason})"
+                    raise RuntimeError(message)
                 await producer
                 await consumer
                 if not state.total_bytes:

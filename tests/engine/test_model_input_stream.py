@@ -4,9 +4,10 @@
 """Ordered input append, wire transport, and request ownership contracts."""
 
 import asyncio
-from queue import Queue
+import threading
 from types import SimpleNamespace
 
+import janus
 import msgspec
 import pytest
 
@@ -21,10 +22,31 @@ from vllm_omni.errors import OmniClientError
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.asyncio
-async def test_append_uses_the_sender_side_of_the_cross_thread_queue():
+@pytest.fixture
+def append_engine():
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine.request_queue = SimpleNamespace(sync_q=Queue())
+    engine.request_queue = janus.Queue(maxsize=2)
+    engine.orchestrator_loop = loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        asyncio.run_coroutine_threadsafe(
+            engine.request_queue.async_q.put(TextInputUpdate(request_id="existing", token_ids=[31])), loop
+        ).result(timeout=5)
+        engine.request_queue.sync_q.get_nowait()
+        yield engine
+    finally:
+        engine.request_queue.close()
+        asyncio.run_coroutine_threadsafe(engine.request_queue.wait_closed(), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_append_uses_the_queue_owner_loop_and_preserves_tokens(append_engine):
+    engine = append_engine
     tokens = [32]
     await engine.append_text_async("request", tokens)
     tokens.clear()
@@ -34,6 +56,40 @@ async def test_append_uses_the_sender_side_of_the_cross_thread_queue():
         TextInputUpdate(request_id="request", token_ids=[32]),
         TextInputUpdate(request_id="request", token_ids=[], final=True),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_append_waits_for_queue_capacity_without_blocking_and_can_be_cancelled(append_engine, cancel):
+    engine = append_engine
+    queue = engine.request_queue.sync_q
+    existing = TextInputUpdate(request_id="existing", token_ids=[31])
+    queue.put_nowait(existing)
+    queue.put_nowait(existing)
+    pending = asyncio.create_task(engine.append_text_async("request", [32]))
+    try:
+        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            asyncio.wrap_future(asyncio.run_coroutine_threadsafe(asyncio.sleep(0), engine.orchestrator_loop)),
+            timeout=5,
+        )
+        assert not pending.done()
+        if cancel:
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=5)
+            assert [queue.get_nowait(), queue.get_nowait()] == [existing, existing]
+        else:
+            assert queue.get_nowait() == existing
+            await asyncio.wait_for(pending, timeout=5)
+            assert [queue.get_nowait(), queue.get_nowait()] == [
+                existing,
+                TextInputUpdate(request_id="request", token_ids=[32]),
+            ]
+        assert queue.empty()
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio

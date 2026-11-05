@@ -39,8 +39,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.engine.messages import TextInputUpdate
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.model_executor.models.qwen3_tts.input_stream import Qwen3TTSTextInput
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration as Talker
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -1689,21 +1690,9 @@ def _route_request(request_id, *, max_tokens, resumable=False, prompt_token_ids=
 
 def _admit_route_request(scheduler, request):
     """Model the engine's prevalidated stream handoff before scheduler admission."""
+    stream = Talker.create_input_stream(request, scheduler.vllm_config)
     scheduler.add_request(request)
-    stream = request.additional_information["input_stream"]
-    model_config = scheduler.vllm_config.model_config
-    text_vocab_size = model_config.hf_config.talker_config.text_vocab_size
-    capacity = min(request.max_tokens - 1, model_config.max_model_len - request.num_prompt_tokens - 1)
-    scheduler.register_input_stream(
-        request.request_id,
-        Qwen3TTSTextInput(
-            stream["token_ids"],
-            capacity,
-            text_vocab_size,
-            final=stream.get("final", False),
-            timeout_s=stream.get("timeout_s", 10.0),
-        ),
-    )
+    scheduler.register_input_stream(request.request_id, stream)
     return request
 
 
@@ -1770,7 +1759,7 @@ def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requ
     clock = [100.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
     first = _route_request("waiting", max_tokens=8)
-    first.additional_information = {"input_stream": {"token_ids": [31], "timeout_s": 2}}
+    first.additional_information = {"input_stream": {"token_ids": [31]}}
     second = _route_request("running", max_tokens=12)
     third = _route_request("queued", max_tokens=8)
     _admit_route_request(scheduler, first)
@@ -1785,7 +1774,7 @@ def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requ
     original_active_limit = scheduler.max_num_active_reqs
     original_blocks = scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()
     if expires:
-        clock[0] += 2
+        clock[0] += 10
 
     def fail_schedule(current, throttle_prefills=False):
         assert current is scheduler
@@ -1819,7 +1808,7 @@ def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requ
     errors = [output for batch in outputs.values() for output in batch.outputs if output.request_id == "waiting"]
     if expires:
         assert len(errors) == 1 and errors[0].finish_reason == FinishReason.ERROR
-        assert errors[0].stop_reason == "Timed out waiting for text input after 2s"
+        assert errors[0].stop_reason == "Timed out waiting for text input after 10s"
     else:
         assert errors == []
     scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
@@ -1911,12 +1900,23 @@ def test_text_input_preemption_resends_latest_input(route_scheduler_factory, asy
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_text_input_timeout_releases_kv_and_seat_with_one_error(route_scheduler_factory, monkeypatch, async_scheduling):
+@pytest.mark.parametrize("channel", ["plain", "wire", "native"])
+@pytest.mark.parametrize("timeout_s", [None, 0.1, 1e9])
+def test_text_input_timeout_releases_kv_and_seat_with_one_error(
+    route_scheduler_factory, monkeypatch, async_scheduling, channel, timeout_s
+):
     scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
     clock = [100.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
     waiting = _route_request("waiting", max_tokens=8)
-    waiting.additional_information = {"input_stream": {"token_ids": [31], "timeout_s": 2}}
+    waiting.additional_information = {"input_stream": {"token_ids": [31]}}
+    if timeout_s is not None:
+        waiting.additional_information["input_stream"]["timeout_s"] = timeout_s
+    if channel == "wire":
+        waiting.additional_information = serialize_additional_information(waiting.additional_information)
+    elif channel == "native":
+        waiting.model_intermediate_buffer = waiting.additional_information
+        waiting.additional_information = None
     other = _route_request("other", max_tokens=12)
     newcomer = _route_request("newcomer", max_tokens=8)
     _admit_route_request(scheduler, waiting)
@@ -1927,7 +1927,11 @@ def test_text_input_timeout_releases_kv_and_seat_with_one_error(route_scheduler_
     assert held.num_scheduled_tokens == {"other": 1}
     assert scheduler.kv_cache_manager.get_blocks("waiting").get_block_ids()[0]
     _complete_route_step(scheduler, held)
-    clock[0] += 2
+    clock[0] += 9
+    before_timeout = scheduler.schedule()
+    assert waiting.status == RequestStatus.RUNNING and not before_timeout.finished_req_ids
+    _complete_route_step(scheduler, before_timeout)
+    clock[0] += 1
     released = scheduler.schedule()
     assert released.finished_req_ids == {"waiting"}
     assert "newcomer" in released.num_scheduled_tokens
@@ -1937,7 +1941,7 @@ def test_text_input_timeout_releases_kv_and_seat_with_one_error(route_scheduler_
     outputs = _complete_route_step(scheduler, released)
     errors = [output for batch in outputs.values() for output in batch.outputs if output.request_id == "waiting"]
     assert len(errors) == 1 and errors[0].finish_reason == FinishReason.ERROR
-    assert errors[0].stop_reason == "Timed out waiting for text input after 2s"
+    assert errors[0].stop_reason == "Timed out waiting for text input after 10s"
     following = _complete_route_step(scheduler, scheduler.schedule())
     assert all(output.request_id != "waiting" for batch in following.values() for output in batch.outputs)
     with pytest.raises(ValueError, match="No active"):
@@ -1949,20 +1953,20 @@ def test_new_text_and_eof_clear_only_the_actual_input_wait(route_scheduler_facto
     clock = [100.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
     request = _route_request("request", max_tokens=8)
-    request.additional_information = {"input_stream": {"token_ids": [31], "timeout_s": 2}}
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
     _admit_route_request(scheduler, request)
     _complete_route_step(scheduler, scheduler.schedule())
     _complete_route_step(scheduler, scheduler.schedule())
     assert scheduler._model_input_streams["request"].wait_started_at == 100.0
-    clock[0] += 1
+    clock[0] += 9
     scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[32]))
     _complete_route_step(scheduler, scheduler.schedule())
     assert scheduler._model_input_streams["request"].wait_started_at is None
-    clock[0] += 1.5
+    clock[0] += 9
     _complete_route_step(scheduler, scheduler.schedule())
     assert request.status == RequestStatus.RUNNING
     scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[], final=True))
-    clock[0] += 3
+    clock[0] += 11
     drained = scheduler.schedule()
     assert drained.num_scheduled_tokens == {"request": 1} and not drained.finished_req_ids
     _complete_route_step(scheduler, drained)
@@ -1974,11 +1978,11 @@ def test_last_text_wait_timeout_emits_error_without_any_model_step(route_schedul
     clock = [100.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
     request = _route_request("request", max_tokens=8)
-    request.additional_information = {"input_stream": {"token_ids": [31], "timeout_s": 2}}
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
     _admit_route_request(scheduler, request)
     _complete_route_step(scheduler, scheduler.schedule())
     _complete_route_step(scheduler, scheduler.schedule())
-    clock[0] += 2
+    clock[0] += 10
     expired = scheduler.schedule()
     assert expired.total_num_scheduled_tokens == 0 and expired.finished_req_ids == {"request"}
     outputs = _complete_route_step(scheduler, expired)

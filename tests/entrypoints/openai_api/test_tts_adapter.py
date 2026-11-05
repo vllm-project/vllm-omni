@@ -855,7 +855,7 @@ def test_qwen3_tts_incremental_input_reuses_tokenizer_and_keeps_the_whole_reques
     request = OpenAICreateSpeechRequest(input="Hello", voice="vivian", language="English")
 
     async def prepare():
-        model_input = await adapter.create_incremental_input(request, timeout_s=10)
+        model_input = await adapter.create_incremental_input(request)
         prepared = await model_input.build("Hello", final=False)
         await model_input.append("request", " world", final=False)
         await model_input.append("request", "", final=True)
@@ -870,7 +870,7 @@ def test_qwen3_tts_incremental_input_reuses_tokenizer_and_keeps_the_whole_reques
         mocker.call("", add_special_tokens=False),
     ]
     assert prepared.prompt["prompt_token_ids"] == [1, 1, 1]
-    assert prepared.tts_params["input_stream"] == {"token_ids": [31, 32], "final": False, "timeout_s": 10}
+    assert prepared.tts_params["input_stream"] == {"token_ids": [31, 32], "final": False}
     assert prepared.tts_params["non_streaming_mode"] == [False]
     assert engine_client.append_text.await_args_list == [
         mocker.call("request", [33], final=False),

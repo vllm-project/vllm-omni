@@ -153,10 +153,9 @@ class Qwen3TTSCodecLimitError(TTSGenerationError):
 class _Qwen3TTSIncrementalInput:
     """Ordinary tokenization of released text for one interleaved request."""
 
-    def __init__(self, adapter: "Qwen3TTSAdapter", request: "OpenAICreateSpeechRequest", timeout_s: float) -> None:
+    def __init__(self, adapter: "Qwen3TTSAdapter", request: "OpenAICreateSpeechRequest") -> None:
         self.adapter = adapter
         self.request = request
-        self.timeout_s = timeout_s
 
     async def _encode(self, text: str) -> list[int]:
         def encode() -> list[int]:
@@ -171,7 +170,7 @@ class _Qwen3TTSIncrementalInput:
             raise ValueError("Incremental text input requires interleaved prompt construction")
         params = self.adapter._build_tts_params(self.request)
         params["non_streaming_mode"] = [False]
-        params["input_stream"] = {"token_ids": tokens, "final": final, "timeout_s": self.timeout_s}
+        params["input_stream"] = {"token_ids": tokens, "final": final}
         prompt_len = await self.adapter._estimate_prompt_len_async(params)
         prompt = tokens_input(prompt_token_ids=[1] * prompt_len)
         prompt["additional_information"] = params
@@ -607,11 +606,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
-    async def create_incremental_input(
-        self, request: "OpenAICreateSpeechRequest", *, timeout_s: float
-    ) -> IncrementalTTSInput:
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
         await make_async(self._load_text_tokenizer, executor=getattr(self.ctx.server, "_tts_executor", None))()
-        return _Qwen3TTSIncrementalInput(self, request, timeout_s)
+        return _Qwen3TTSIncrementalInput(self, request)
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

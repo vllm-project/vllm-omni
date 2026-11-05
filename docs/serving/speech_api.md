@@ -356,6 +356,13 @@ The separate `model_input_mode` selects complete or incremental model input;
 incremental input uses the commitment frontend and keeps one request alive for
 the utterance.
 
+The incremental-input scheduler enforces a fixed 10-second conditioning-starvation
+timeout that request payloads cannot override. It starts when the model cannot
+execute its next step because the required text conditioning is unavailable,
+not at every WebSocket message gap. The commitment frontend may still be
+withholding text during this wait. Normal model drain after text EOF is not
+subject to this timeout.
+
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
     boundaries say only that the configured finite policy no longer needs to
@@ -496,6 +503,10 @@ connection can return to idle. That event is only an utterance boundary; use
 `error` and `audio.done.error` to determine success. In commitment mode, client
 disconnect and `session.close` abort active generation, discard unsubmitted or
 queued work, and do not emit `session.done`.
+
+In incremental mode, generation ending before text EOF is submitted is also
+reported as a failure. The error message includes the model's finish reason
+when available; `audio.done.error=true` and the same EOF/reuse rules apply.
 
 ### Flushing vs. Closing
 
