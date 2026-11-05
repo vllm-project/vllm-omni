@@ -137,6 +137,13 @@ def test_trained_cfm_long_stream_matches_independent_graphs(
                 mu = torch.randn(batch, channels, width, device="npu") * 0.1
                 widths = [width - 2 * row if variable_queries else width for row in range(batch)]
                 cond = torch.zeros_like(mu)
+                if variable_queries:
+                    # Poison invalid conditioning frames: a real ragged NPU
+                    # solve must exclude them from valid outputs and caches.
+                    # Independent solves below see only each row's valid slice.
+                    for row, valid_width in enumerate(widths):
+                        mu[row, :, valid_width:] = 7.0
+                        cond[row, :, valid_width:] = -11.0
                 expected = []
                 for row in range(batch):
                     cnn, att = reference[row]

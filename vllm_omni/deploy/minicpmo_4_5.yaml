@@ -60,7 +60,10 @@ connectors:
       # trimming; HiFT runs in compatible subgroups. CNN/HiFT cache shapes,
       # dtypes, devices and the configured cache-epoch policy still constrain
       # batching. No effect off NPU; set false to restore same-shape batching.
-      cfm_npu_mixed_history_batching: true
+      # Opt in by setting this to true in a deployment copy or overlay.
+      # Keep same-shape batching as the shipped default while broader
+      # production mixed-history occupancy is evaluated.
+      cfm_npu_mixed_history_batching: false
       # Small exact encoder batches share one startup arena; larger batches
       # replay in groups, preserving cache lengths without batch padding.
       enable_code2wav_encoder_graph: true
