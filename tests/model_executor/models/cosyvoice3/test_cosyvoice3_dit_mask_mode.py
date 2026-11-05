@@ -6,12 +6,20 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from vllm_omni.diffusion.attention import layer as attention_layer
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.models.cosyvoice3_audio import cosyvoice3_dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 DEPTH = 2
+
+
+@pytest.fixture(autouse=True)
+def _sdpa_backend(monkeypatch):
+    # Building the DiT resolves an attention backend; a host without an accelerator has no platform default.
+    monkeypatch.setattr(attention_layer, "get_attn_backend_for_role", lambda *args, **kwargs: (SDPABackend, None))
 
 
 class _HostReads(TorchDispatchMode):
