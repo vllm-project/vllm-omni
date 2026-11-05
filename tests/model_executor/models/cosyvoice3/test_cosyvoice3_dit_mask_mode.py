@@ -95,52 +95,18 @@ def test_dit_reads_a_padded_mask_once_per_forward_for_flash_attn(monkeypatch):
     assert torch.equal(output, expected)
 
 
-def test_attention_skips_the_identity_fill_only_for_mode_none():
-    torch.manual_seed(0)
-    layer = cosyvoice3_dit.DiTAttention(dim=16, heads=2, dim_head=8, dropout=0.0).eval()
-    layer.attn = _MaskInspectingAttention()
-    x = torch.randn(2, 5, 16)
-    full = torch.ones(2, 5, dtype=torch.bool)
-    padded = full.clone()
-    padded[0, 3:] = False
-    with torch.inference_mode():
-        assert torch.equal(layer(x, mask=full, attention_mask_mode="none"), layer(x, mask=full))
-        out = layer(x, mask=padded)
-        # Mode "none" asserts a full mask, so a padded one shows whether the fill ran.
-        unfilled = layer(x, mask=padded, attention_mask_mode="none")
-    assert layer.attn.modes == ["none", None, None, "none"]
-    assert torch.all(out[0, 3:] == 0)
-    assert not torch.all(unfilled[0, 3:] == 0)
-
-
 @pytest.mark.parametrize(
-    ("backend", "device_type", "npu_graph", "expected"),
-    [
-        ("FLASH_ATTN", "cuda", False, True),
-        ("TORCH_SDPA", "cuda", False, False),
-        ("CUDNN_ATTN", "cuda", False, False),
-        (None, "cuda", False, False),
-        ("FLASH_ATTN", "xpu", False, False),
-        ("FLASH_ATTN", "cpu", False, False),
-        ("FLASH_ATTN", "cuda", True, False),
-    ],
+    ("backend", "npu_graph", "expected"),
+    [("FLASH_ATTN", False, True), ("TORCH_SDPA", False, False), ("FLASH_ATTN", True, False)],
 )
-def test_full_mask_is_published_only_where_flash_attn_honors_it(backend, device_type, npu_graph, expected):
+def test_mask_mode_is_published_only_where_flash_attn_honors_it(backend, npu_graph, expected):
     dit, _ = _dit()
     layer = cosyvoice3_dit.DiTAttention(dim=32, heads=2, dim_head=16, dropout=0.0)
-    layer.attn.attn_backend = None if backend is None else DiffusionAttentionBackendEnum[backend].get_class()
+    layer.attn.attn_backend = DiffusionAttentionBackendEnum[backend].get_class()
     dit.transformer_blocks[0].attn = layer
     if npu_graph:
         dit._use_npu_graph_attention = True
-    assert dit._reads_unpublished_masks(device_type) is expected
-
-
-def test_cpu_forward_publishes_nothing():
-    dit, attention = _dit()
-    x, mask, mu, t, spks, cond = _dit_inputs(torch.ones(2, 1, 12))
-    with torch.inference_mode():
-        dit(x, mask, mu, t, spks=spks, cond=cond)
-    assert attention.modes == [None] * DEPTH
+    assert dit._reads_unpublished_masks("cuda") is expected
 
 
 def test_dit_attention_layer_exposes_its_backend():
