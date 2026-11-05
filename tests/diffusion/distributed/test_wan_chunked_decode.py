@@ -257,11 +257,16 @@ def _bare_distributed_vae(monkeypatch, *, mode, use_tiling, world_size=2):
 
 @pytest.mark.parametrize("use_tiling", [True, False])
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
-@pytest.mark.parametrize("temporal_chunk_size", [1, 4])
-def test_decode_forwards_spatial_temporal_chunk_override(monkeypatch, mode, use_tiling, temporal_chunk_size):
+@pytest.mark.parametrize("temporal_chunk_size", [None, 1, 4])
+@pytest.mark.parametrize("latent_extent", [1, 2, 3])
+def test_decode_forwards_spatial_temporal_chunk_override(
+    monkeypatch, mode, use_tiling, temporal_chunk_size, latent_extent
+):
     vae = _bare_distributed_vae(monkeypatch, mode=mode, use_tiling=use_tiling)
     vae.spatial_temporal_chunk_size = temporal_chunk_size
-    z = torch.zeros(1, 2, 6, 2, 2)
+    # Exercise spatial dispatch below, at, and above the native tiling threshold.
+    vae.tile_sample_min_height = vae.tile_sample_min_width = 4
+    z = torch.zeros(1, 2, 6, latent_extent, latent_extent)
     sample = torch.ones(1, 3, 6, 4, 4)
     decode = Mock(return_value=SimpleNamespace(sample=sample))
     monkeypatch.setattr(wan_spatial_shard, "spatial_shard_decode", decode)
@@ -281,7 +286,8 @@ def test_decode_forwards_spatial_temporal_chunk_override(monkeypatch, mode, use_
 
 @pytest.mark.parametrize("use_tiling", [True, False])
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width", "tile"])
-def test_distributed_chunked_routing(monkeypatch, mode, use_tiling):
+@pytest.mark.parametrize("latent_extent", [1, 2, 3])
+def test_distributed_chunked_routing(monkeypatch, mode, use_tiling, latent_extent):
     # use_tiling=False is a fresh serving instance: the registry no longer forces tiling for spatial_shard_*.
     vae = _bare_distributed_vae(monkeypatch, mode=mode, use_tiling=use_tiling)
     decode = Mock()
@@ -289,8 +295,9 @@ def test_distributed_chunked_routing(monkeypatch, mode, use_tiling):
     temporal = Mock()
     monkeypatch.setattr(vae, "_decode_temporal", temporal)
     callback = Mock()
-    z = torch.zeros(1, 2, 2, 2, 2)
-    if mode == "tile" and use_tiling:
+    vae.tile_sample_min_height = vae.tile_sample_min_width = 4
+    z = torch.zeros(1, 2, 2, latent_extent, latent_extent)
+    if mode == "tile" and use_tiling and latent_extent > 2:
         with pytest.raises(ValueError, match="require spatial-shard"):
             vae.decode_with_chunks(z, on_chunk=callback)
         decode.assert_not_called()
