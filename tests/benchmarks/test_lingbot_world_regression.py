@@ -1099,7 +1099,7 @@ def test_current_production_reference_is_pinned_for_both_platforms_and_all_profi
     root = Path(__file__).resolve().parents[2] / "tests/dfx/lingbot_world/configs"
     names = ["cuda_smoke", "cuda_nightly", "cuda_weekly", "cuda_long", "npu_nightly", "npu_weekly", "npu_long"]
     assert {read_json(root / f"{name}.json")["reference_revision"] for name in names} == {
-        "61d19b6094189136ad047bf8b060d4180c3c60bf"
+        "16cd96494784192ca4cfdad23e409d2ffab171dc"
     }
     for name in names:
         historical = read_json(root.parent / f"calibration/history/profiles/{name}.json")
@@ -1116,8 +1116,23 @@ def test_current_production_reference_is_pinned_for_both_platforms_and_all_profi
         }
         assert {key: value for key, value in profile.items() if key not in metadata} == {
             **historical,
-            "reference_revision": "61d19b6094189136ad047bf8b060d4180c3c60bf",
+            "reference_revision": "16cd96494784192ca4cfdad23e409d2ffab171dc",
         }
+
+
+def test_streaming_reference_rebind_preserves_frozen_training_rules():
+    root = Path(__file__).resolve().parents[2]
+    calibration = root / "tests/dfx/lingbot_world/calibration"
+    protocol = read_json(calibration / "v033_reference_protocol.json")
+    compatibility = protocol.pop("streaming_metadata_compatibility")
+    archived = calibration / compatibility["superseded_protocol_archive"]
+    previous_digest = "c1f7ceb8929d529633d565053b73e99e75b66580b54145ab908d4d3c47d4eb2f"
+    assert sha256(archived) == compatibility["superseded_protocol_sha256"] == previous_digest
+    previous = read_json(archived)
+    assert previous["reference_revision"] == compatibility["parent_revision"]
+    assert protocol == {**previous, "reference_revision": "16cd96494784192ca4cfdad23e409d2ffab171dc"}
+    assert compatibility["training_cohorts_collected_before_update"] is False
+    assert sha256(root / compatibility["shared_source"]) == compatibility["shared_source_sha256"]
 
 
 @pytest.mark.parametrize("chunks,profile_name", [(40, "cuda_nightly"), (600, "cuda_long")])

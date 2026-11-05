@@ -6,15 +6,32 @@ gate logic separately and are not model performance evidence.
 ## vLLM 0.33 reference and qualification status
 
 The inference source is frozen at
-`61d19b6094189136ad047bf8b060d4180c3c60bf` in
+`16cd96494784192ca4cfdad23e409d2ffab171dc` in
 `https://github.com/tzhouam/vllm-omni.git`. Every profile records both the
 repository and full revision, so provisioning can fetch the immutable source
 without relying on an upstream branch containing the reference commit.
 This reference starts from accepted main
 `02286829737a54167e890185bcbb6948ed9afbcf` and carries exactly the three established
 LingBot compiler and offload files from
-`48cebe5a248d4b0160f20c7fc18b5d1c46883872`. It contains no candidate harness or
-new performance optimization. Updating a candidate must not advance this pin.
+`48cebe5a248d4b0160f20c7fc18b5d1c46883872`, plus the same small
+`vllm_omni/diffusion/output_formatter.py` compatibility fix used by the
+candidate. Configured streaming must retain the model-provided generation index
+even when a request finishes in one block. Real local diagnostic requests proved
+that the preceding `61d19b6094189136ad047bf8b060d4180c3c60bf` emitted the correct
+nine frames but omitted that index; the unchanged strict benchmark therefore
+rejected single-block requests and single-block prewarming diagnostics. The fix preserves
+ordinary nonstreaming output and changes no generation or numerical behavior.
+The reference and candidate formatter file bytes are identical. It contains no
+candidate harness or new performance optimization. Updating a candidate must
+not advance this pin.
+
+No training cohorts had been collected when this reference was replaced. The
+preceding frozen protocol is preserved byte for byte in
+[calibration/history/v033_reference_protocol_before_single_block_streaming.json](calibration/history/v033_reference_protocol_before_single_block_streaming.json).
+The active protocol records the source fix and former protocol hash; all fitting
+rules, workload settings and candidate allowances remain unchanged. Minimal
+local functionality diagnostics are excluded from calibration and hardware
+qualification.
 
 The runtime migration is necessary: the previous reference `48cebe5a` fails
 actual serving startup on vLLM 0.33 because
