@@ -127,6 +127,50 @@ async def test_other_models_keep_forced_json_tool_semantics(mock_engine_client, 
     parser.assert_not_called()
 
 
+@pytest.mark.parametrize("continue_second", [False, True])
+@pytest.mark.asyncio
+async def test_required_tools_announced_together_keep_unique_stream_ids(mock_engine_client, mocker, continue_second):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    instance.enable_auto_tools = True
+    instance.model_config.hf_config.model_type = "kimi_k2"
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "weather in three cities"}],
+        modalities=["text"],
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+        tool_choice="required",
+        stream=True,
+    )
+    first = '[{"name":"weather","parameters":{"city":"杭州"}},'
+    second = '{"name":"weather","parameters":{"city":"上海"}}'
+    third = ',{"name":"weather","parameters":{"city":"北京"}}]'
+    split = second.index("上海") + 1 if continue_second else len(second)
+
+    async def results():
+        yield make_text_omni_output(text=first + second[:split], token_ids=[10])
+        yield make_text_omni_output(text=second[split:] + third, token_ids=[11], finish_reason="stop")
+
+    chunks = parse_sse_chunks(
+        await collect_stream(
+            instance.chat_completion_stream_generator(
+                request, results(), "test-req", "test", [], mocker.Mock(), mocker.Mock()
+            )
+        )
+    )
+    calls = [
+        call
+        for chunk in chunks
+        for item in chunk.get("choices", [])
+        for call in item.get("delta", {}).get("tool_calls", [])
+    ]
+    announced = [call for call in calls if call.get("id") is not None]
+    assert [call["index"] for call in announced] == [0, 1, 2]
+    assert [call["id"] for call in announced] == [f"functions.weather:{i}" for i in range(3)]
+    for index, city in enumerate(("杭州", "上海", "北京")):
+        arguments = "".join(call.get("function", {}).get("arguments", "") for call in calls if call["index"] == index)
+        assert json.loads(arguments) == {"city": city}
+
+
 @pytest.mark.asyncio
 async def test_tool_request_without_chat_parser_is_validation_error(mock_engine_client, mocker):
     instance = build_serving_chat(engine_client=mock_engine_client)

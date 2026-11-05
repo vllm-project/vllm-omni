@@ -30,6 +30,12 @@ defaults, not a throughput recommendation. The thinker-only deploy config
 `drvexo_unified_thinker_only.yaml` isolates text, image, audio input and decisions;
 speech output requires the complete three-stage pipeline.
 
+The complete package always binds its decision head. Startup therefore rejects
+`max_num_seqs != 1` or enabled prefix caching even for plain-chat deployments
+that never call a decision endpoint. The eager/BF16, TP1 and 2048-token chunk
+requirements are likewise enforced; incompatible settings are named in the
+startup error. These constraints also apply to the thinker-only profile.
+
 ## Requests
 
 Use `/v1/chat/completions` with `modalities: ["text"]` for text, one image or one

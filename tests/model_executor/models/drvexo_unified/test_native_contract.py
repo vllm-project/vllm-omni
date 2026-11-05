@@ -120,6 +120,13 @@ def test_direct_speech_budget_and_finish_reason_belong_to_talker(monkeypatch):
     assert counter.total() == 24
 
 
+@pytest.mark.parametrize("stage_count", [0, 1, 2, 4])
+def test_direct_speech_rejects_sampling_list_without_full_pipeline(stage_count):
+    adapter = object.__new__(DRVEXOTTSAdapter)
+    with pytest.raises(ValueError, match="full stage-0-indexed"):
+        adapter.apply_sampling_overrides([object()] * stage_count, None)
+
+
 def test_default_speaker_does_not_override_reference_or_leak_to_next_request(monkeypatch):
     talker = object.__new__(DRVEXOSpeech8BTalker)
     torch.nn.Module.__init__(talker)
@@ -181,13 +188,13 @@ def test_head_captures_final_normalized_token_across_long_prefill_once():
 def test_nonfinite_head_failure_is_logged_and_next_request_can_score(mocker):
     scorer = mocker.Mock()
     scorer.score.side_effect = [ValueError("Nonfinite native candidate score"), torch.tensor([7.0])]
-    warning = mocker.patch.object(decision_module.logger, "warning")
+    debug = mocker.patch.object(decision_module.logger, "debug")
     prefill = UnifiedPrefill(scorer)
     broken = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
     failed = prefill.process(torch.zeros(1, 2560), [broken], [(0, 1)], [0])
     assert failed["drvexo_general_status"][0].item() == -1
     assert failed["drvexo_general_scores"][0].numel() == 0
-    assert "Nonfinite native candidate score" in str(warning.call_args)
+    assert "Nonfinite native candidate score" in str(debug.call_args)
     healthy = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
     recovered = prefill.process(torch.zeros(1, 2560), [healthy], [(0, 1)], [0])
     assert recovered["drvexo_general_status"][0].item() == 1

@@ -105,7 +105,7 @@ class UnifiedPrefill:
                         prior["done"] = True
                         status = 1
                 except (ValueError, KeyError, TypeError) as exc:
-                    logger.warning("Rejecting invalid DRVEXO decision prefill: %s", exc)
+                    logger.debug("Rejecting invalid DRVEXO decision prefill: %s", exc)
                     status = -1
             scores.append(score)
             statuses.append(torch.tensor([status], dtype=torch.int64))

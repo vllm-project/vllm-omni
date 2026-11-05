@@ -249,6 +249,11 @@ reference speech. Other Qwen3-TTS deployments keep their existing adapter.
 The speech adapter owns the entry stage: direct speech skips the Thinker and
 targets Talker; token budgets, request sampling and EOS validation use that same
 stage. The default remains stage zero for dedicated TTS pipelines.
+DRVEXO sampling overrides receive the complete stage-0-indexed list, including
+Talker and Codec, and reject an already sliced list before applying overrides.
 Chat JSON Schema constraints apply to the comprehension stage only. Forced and
 required native-format tool calls use the configured tool parser rather than
 passing XML through as JSON function arguments.
+For the shared required-JSON stream, one delta can announce multiple tool calls;
+the history counter advances by the number of newly emitted IDs, including when
+the delta first continues arguments of an existing call.

@@ -1107,7 +1107,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         should_parse_tools = (
             tool_parser is not None and hasattr(request, "tool_choice") and request.tool_choice != "none"
         )
-        if should_parse_tools and self.parser_cls is None:
+        parser_cls = self.parser_cls
+        if should_parse_tools and parser_cls is None:
             raise ValueError("Tool parsing was requested but no chat parser is configured")
 
         # Keep OMNI compatibility args wired while delegating rendering
@@ -1158,18 +1159,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
         # is set, we want to prevent parsing a tool_call hallucinated by the LLM
-        should_parse_tools = tool_parser is not None and (
-            hasattr(request, "tool_choice") and request.tool_choice != "none"
-        )
-
-        if should_parse_tools:
+        if should_parse_tools and parser_cls is not None:
             if not isinstance(request, ChatCompletionRequest):
                 msg = "Tool usage is only supported for Chat Completions API"
                 raise NotImplementedError(msg)
 
-            if self.parser_cls is None:
-                raise ValueError("Tool parsing was requested but no chat parser is configured")
-            request = self.parser_cls(tokenizer, request.tools).adjust_request(request=request)
+            request = parser_cls(tokenizer, request.tools).adjust_request(request=request)
 
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
         # For image generation, we want the raw user caption instead of a rendered template.
@@ -2064,12 +2059,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     tool_call_idx=history_tool_call_cnt,
                                     tool_call_id_type=self.tool_call_id_type,
                                 )
-                                if (
-                                    delta_message
-                                    and delta_message.tool_calls
-                                    and delta_message.tool_calls[0].id is not None
-                                ):
-                                    history_tool_call_cnt += 1
+                                if delta_message and delta_message.tool_calls:
+                                    # A single delta can announce several calls,
+                                    # or continue one before announcing another.
+                                    history_tool_call_cnt += sum(
+                                        call.id is not None for call in delta_message.tool_calls
+                                    )
                                     tools_streamed[i] = True
 
                         # handle streaming deltas for tools with "auto" tool choice

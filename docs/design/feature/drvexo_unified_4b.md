@@ -69,7 +69,8 @@ request is not acceptance of the head paired with the newly merged backbone.
 This complete deployment always binds the head, including for chat-only
 requests; startup errors name each incompatible scheduler/model setting.
 Invalid prefill/scoring results retain their explicit failed status and log
-the reason, including nonfinite numerical failures, without logging user text.
+the reason at debug level, including nonfinite numerical failures, without
+logging user text or emitting a warning for each malformed client request.
 
 Shared chat sampling preserves JSON Schema on the comprehension stage. Forced
 and required DRVEXO tool calls use the configured parser's native extraction
@@ -80,7 +81,9 @@ Speech stage sampling remains independent of text formatting constraints.
 The same comprehension-only constraint rule is covered for Qwen3-Omni; its
 downstream Talker/Codec defaults stay unchanged. The DRVEXO speech adapter is
 covered for both 4B and 8B caller-text/reference-audio requests and takes its
-sampling slice from the declared Talker entry-stage ID.
+sampling slice from the declared Talker entry-stage ID. It requires the full
+stage-0-indexed sampling list, including Talker and Codec; pre-sliced lists are
+rejected. Standard speech dispatch tests pin this input contract for both models.
 
 ## Acceptance
 

@@ -6192,8 +6192,12 @@ class TestTTSAsyncOffloading:
             SamplingParams(max_tokens=400, seed=17),
             SamplingParams(max_tokens=500),
         ]
+        apply_overrides = mocker.spy(server._adapter, "apply_sampling_overrides")
         request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=80, seed=42)
         _, _, params = asyncio.run(server._prepare_speech_generation(request))
+        # The adapter receives the full stage-0-indexed pipeline even though
+        # generation enters at Talker. It must not receive an already sliced list.
+        assert [p.max_tokens for p in apply_overrides.call_args.args[0]] == [100, 400, 500]
         call = server.engine_client.generate.call_args.kwargs
         assert call["entry_stage_id"] == 1
         assert call["prompt"]["additional_information"]["drvexo_fixed_reply"] is True
