@@ -788,7 +788,10 @@ class OmniPrefixCacheManager:
                     session_id = session_for_req.get(req_id)
                     if not hit or session_id is None:
                         continue
-                    hit_upto, _ = hit
+                    # Index read, not a 2-tuple unpack: upstream extended
+                    # hits to (hit_upto, blocks, read_start), and this
+                    # branch must keep working on both shapes.
+                    hit_upto = hit[0]
                     for key in self._policy.get_hit_keys(cached_keys):
                         parts = self._session_store.snapshot(session_id, key, hit_upto)
                         if parts is None:
@@ -1626,7 +1629,9 @@ class OmniPrefixCacheManager:
             session_id = session_for_req.get(req_id)
             if not hit or session_id is None:
                 continue
-            hit_upto, _ = hit
+            # Index read, not a 2-tuple unpack: upstream extended hits
+            # to (hit_upto, blocks, read_start); this works on both.
+            hit_upto = hit[0]
             if hit_upto <= 0:
                 continue
             merged_by_key: dict[str, torch.Tensor] = {}
