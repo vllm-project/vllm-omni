@@ -35,6 +35,8 @@ def resolve_native_single_file(model_class_name: str | None) -> str | None:
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "HyNomasPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
+    "HyNomasModularPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
     "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
     "QwenImagePipeline": (
         "qwen_image",
@@ -594,6 +596,8 @@ def initialize_model(
         # known. This runs inside the weight-loading memory pool, so any weight
         # re-layout it performs stays offloadable by sleep mode.
         _apply_wan_vae_fastpath_if_enabled(model, od_config)
+
+        current_omni_platform.apply_diffusion_model_patches(model, od_config)
 
         return model
     else:
