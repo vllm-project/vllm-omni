@@ -1,4 +1,4 @@
-# TaoMate-H3: realtime streaming MiniMax-H3
+# TaoMate-H3: ordinary inference and realtime streaming
 
 [TaoLiveAIGC/TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3) is a rank-128 LoRA
 for the [MiniMax-H3 FL2VA checkpoint](https://huggingface.co/MiniMaxAI/MiniMax-H3).
@@ -80,6 +80,53 @@ audio length and the later 198/198/199-latent cycle. Capturing teacher and encod
 for a wide prompt-length range can take several minutes; size the startup timeouts and
 capture range for the deployment.
 
+## Ordinary full-request inference
+
+Use `taomate_h3_usp4_full_request.yaml` to return a complete video with stereo audio
+through the ordinary `/v1/videos` job API:
+
+```bash
+vllm serve /path/to/MiniMax-H3/FL2VA --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/taomate_h3_usp4_full_request.yaml \
+  --lora-path /path/to/TaoMate-H3 --port 8000
+```
+
+This configuration uses four GPUs, eager BF16, Ulysses 4, text encoder TP4 and
+tile-parallel VAE decoding. It disables step execution and streaming output while
+retaining the AR-Diffusion engine that owns the session's KV. The pipeline runs all
+requested phases, joins their audio and video, and returns one final MP4. The prompt
+is fixed for the request; the default `close_session: true` releases its history and
+decoder state after completion or cancellation. Requests are served one at a time.
+
+Create a job:
+
+```bash
+curl --fail-with-body --silent --show-error http://localhost:8000/v1/videos \
+  -F 'prompt=A friendly presenter in a quiet studio explains how to grow a small garden, speaking clearly with natural gestures.' \
+  -F 'size=480x864' -F 'num_frames=124' -F 'fps=24' \
+  -F 'seed=8301' -F 'num_inference_steps=3'
+```
+
+Copy the returned `id` into `VIDEO_ID`. Poll the job until its status is `completed`,
+then download the content:
+
+```bash
+VIDEO_ID='video_gen_replace_with_returned_id'
+curl --fail-with-body --silent --show-error "http://localhost:8000/v1/videos/$VIDEO_ID"
+# After the job reports completed:
+curl --fail-with-body --silent --show-error \
+  "http://localhost:8000/v1/videos/$VIDEO_ID/content" --output taomate.mp4
+```
+
+Use native frame budgets `124 + 119 * (n - 1)`, such as 124 or 243. The current
+pipeline expands other budgets to complete internal requests, so the actual result
+can be longer than the requested frame budget. At 24 fps, 124 frames are about
+5.167 seconds and 243 frames are 10.125 seconds.
+
+To cancel a job that is `in_progress`, use `DELETE /v1/videos/{id}`. Cancellation is
+checked at student denoise-step boundaries; it does not preempt a kernel already
+running. A subsequent request starts with fresh request-owned state.
+
 ## Client and prompt updates
 
 ```bash
@@ -92,8 +139,8 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
 A `session.start` specifies `prompt`, `width`, `height`, `fps: 24`, `seed` and
 `num_frames`. A budget of `124 + 119 * (n - 1)` frames requests `n` windows.
 Binary messages carry fragmented MP4; `video.chunk_metadata` describes each chunk.
-Audio transport requires the separate fMP4 audio support in PR #8314. Without it,
-the WebSocket MP4 contains video only even though the model produces aligned audio.
+The WebSocket fMP4 carries aligned video and audio tracks. Saving the stream as
+MP4 preserves both tracks and their timestamps.
 
 Send prompt updates using the interaction envelope:
 

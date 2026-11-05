@@ -2,11 +2,7 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_image>.
 
-
-This example demonstrates online text-to-image generation with vLLM-Omni. The
-startup script and Python clients default to Qwen-Image, but `MODEL` can select
-any supported text-to-image model. The existing curl helper remains a concrete
-Qwen-Image request through the standard Images API.
+This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
 ## Start Server
 
@@ -15,6 +11,7 @@ Qwen-Image request through the standard Images API.
 ```bash
 vllm serve Qwen/Qwen-Image --omni --port 8091
 ```
+
 !!! note
     If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
 
@@ -100,12 +97,6 @@ with open("output.png", "wb") as f:
     f.write(base64.b64decode(b64_data))
 ```
 
-!!! note
-    The OpenAI SDK's `extra_body` keyword argument merges parameters into the
-    top-level request body automatically. When using curl or Python `requests`,
-    wrap generation parameters inside a literal `"extra_body"` key in the JSON
-    instead (as shown in the curl example above).
-
 ### Method 3: Using Python Client Script
 
 ```bash
@@ -114,6 +105,18 @@ python openai_chat_client.py --prompt "A beautiful landscape painting" --output 
 
 ### Method 4: Using Gradio Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
+
 ```bash
 python gradio_demo.py
 # Visit http://localhost:7860
@@ -121,23 +124,7 @@ python gradio_demo.py
 
 ## LoRA
 
-This example supports both startup-time distilled LoRAs and request-time
-PEFT-compatible adapters. The LoRA path must be readable on the **server**
-machine (usually a local path or a mounted directory).
-
-### Start Server with a Distilled LoRA
-
-```bash
-vllm serve Qwen/Qwen-Image-2512 \
-  --omni \
-  --port 8091 \
-  --lora-backend distill \
-  --lora-path /path/to/Qwen-Image-2512-Lightning-4steps.safetensors
-```
-
-The distilled LoRA is fused once during server initialization and applies to
-every request. Use the checkpoint's few-step sampling settings, for example
-`num_inference_steps=4` and `true_cfg_scale=1.0`.
+This example supports Peft-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. The LoRA adapter path must be readable on the **server** machine (usually a local path or a mounted directory).
 
 ### Using Python Client with LoRA
 
@@ -182,7 +169,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
 
 LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
@@ -202,7 +189,7 @@ lora_adapter/
 
 ### Generation with Parameters
 
-Use `extra_body` to pass generation parameters:
+Wrap generation parameters inside `extra_body` in the request JSON:
 
 ```json
 {
@@ -218,6 +205,21 @@ Use `extra_body` to pass generation parameters:
   }
 }
 ```
+
+!!! tip "Using the OpenAI SDK"
+    When using the OpenAI Python SDK, pass these parameters via the `extra_body`
+    keyword argument. The SDK merges them into the top-level request body automatically:
+
+    ```python
+    client.chat.completions.create(
+        model="Qwen/Qwen-Image",
+        messages=[...],
+        extra_body={"height": 1024, "width": 1024, "num_inference_steps": 50},
+    )
+    ```
+
+    For details on how generation parameters are handled across different clients, see the
+    [Chat Completions API guide](../../../../serving/chat_completions_api.md).
 
 ### Multimodal Input (Text + Structured Content)
 
@@ -237,24 +239,23 @@ Use `extra_body` to pass generation parameters:
 ## Generation Parameters
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
-JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK.
-When using the dedicated `/v1/images/generations` endpoint, pass the supported
-generation controls as top-level JSON fields directly. For image dimensions and
-count, use `size` and `n` rather than `height`, `width`, or
-`num_outputs_per_prompt`.
+JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
+[Chat Completions API guide](../../../../serving/chat_completions_api.md)).
+When using the dedicated [`/v1/images/generations`](../../../../serving/image_generation_api.md)
+endpoint, pass the supported generation controls as top-level JSON fields
+directly. For image dimensions and count, use `size` and `n` rather than
+`height`, `width`, or `num_outputs_per_prompt`.
 
 | Parameter                | Type  | Default | Description                    |
 | ------------------------ | ----- | ------- | ------------------------------ |
 | `height`                 | int   | None    | Image height in pixels         |
 | `width`                  | int   | None    | Image width in pixels          |
 | `size`                   | str   | None    | Image size (e.g., "1024x1024") |
-| `num_inference_steps`    | int   | model   | Number of denoising steps      |
-| `true_cfg_scale`         | float | model   | True CFG scale when supported  |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps      |
+| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale           |
 | `seed`                   | int   | None    | Random seed (reproducible)     |
 | `negative_prompt`        | str   | None    | Negative prompt                |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
-| `use_system_prompt` | str | None | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text string. Only for HunyuanImage-3.0. |
-| `system_prompt` | str | None | Custom system prompt text. Only used when `use_system_prompt` is set to `custom`. Only for HunyuanImage-3.0. |
 
 ## Response Format
 

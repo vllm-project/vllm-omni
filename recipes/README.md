@@ -25,6 +25,14 @@ published recipe when available and otherwise to the corresponding recipe in
 this directory. The recipe files remain the source of truth for commands and
 validation details.
 
+This source checkout targets final vLLM 0.33.0. Use the matching runtime in
+[the installation guide](../docs/getting_started/installation/README.md).
+Recipes explicitly pinned to an older Omni release, commit, external PR or
+container retain their historical runtime. Their measured hardware and quality
+results do not establish acceptance for this checkout. Source installs must not
+combine current Omni with an older vLLM wheel; ROCm, XPU and NPU qualification
+limits are recorded in the installation guide.
+
 Example layout:
 
 ```text
@@ -108,11 +116,13 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
 | [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy KV / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (SF: S=1; Latest-KV: S=D+1) |
+| [`Physis-AI/Physis-Same-Step.md`](./Physis-AI/Physis-Same-Step.md) | Experimental Same-Step video on five Physis checkpoints | Multi-GPU CUDA |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
 | [`NVIDIA/SANA-WM.md`](./NVIDIA/SANA-WM.md) | First-frame image-to-video serving with camera control | 1x 24GB+ CUDA GPU; ~40GB disk |
 | [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4; offline text-to-image on XPU | 1x A100 80GB / 2x B200 / 1x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen-Image-2.1.md`](./Qwen/Qwen-Image-2.1.md) | Text-to-image and image-conditioned generation (editing) with prefix KV cache and CUDA graph decode | 1x GPU with CPU offload / 1x H200 |
+| [`Qwen/Qwen-Image-2.1-NPU.md`](./Qwen/Qwen-Image-2.1-NPU.md) | Low-latency text-to-image and image-conditioned generation (editing) serving with Ulysses sequence parallelism | 1x Ascend 910B1 64GB / up to 8x data parallel |
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
 | [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
