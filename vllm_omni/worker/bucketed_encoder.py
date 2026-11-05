@@ -154,12 +154,25 @@ def _context_margin_from_env() -> int | None:
 # is served unchanged). ``model_type`` is the same identifier an author writes
 # in the PipelineConfig when registering a model, so the reference table and the
 # whitelist share one name.
+#
+# Per-model fields (determined by reading the model's feature-extraction code):
+#   hop             — STFT hop length in samples, i.e. the mel frame rate. The
+#                     processor publishes encoder_bucket_frames = samples // hop,
+#                     and the seconds ladder becomes seconds * 16000 / hop frames.
+#                     e.g. 160 = 10 ms at 16 kHz (100 fps).
+#   context_margin  — the max extra mel frames the front conv reads beyond the
+#                     published length. For a model whose real frame count is
+#                     (samples + C) // hop + D, it is C // hop + D + 1, so the
+#                     bucketed window copies at most one zero-padding frame past
+#                     the real content and stays bit-identical. StepAudio2
+#                     right-pads 479 (C=479, D=0), so the offset is 2..3 and the
+#                     margin is 3. Deployment-wide override:
+#                     VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN.
+#   time_axis       — which feature axis is time: 1 = (B, T, D) time-major,
+#                     2 = (B, mel, T) channels-first. Read the encoder's input
+#                     tensor shape / forward docstring. Override:
+#                     VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS (or ``auto`` to infer).
 _VERIFIED_MODELS: dict[str, dict[str, int]] = {
-    # StepAudio2's log_mel_spectrogram right-pads 479 samples before the STFT, so
-    # its real mel frame count T = (samples + 479) // 160 is 2..3 frames longer
-    # than the processor-published samples // 160. A context margin of 3 covers
-    # the worst case: the bucketed window copies at most 1 zero-padding frame,
-    # which is harmless, so the output stays bit-identical.
     "step_audio_2": {"hop": 160, "context_margin": 3, "time_axis": 2},
     "covo_audio": {"hop": 160, "context_margin": 0, "time_axis": 2},
 }
