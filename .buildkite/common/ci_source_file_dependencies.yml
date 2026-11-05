@@ -179,12 +179,17 @@ x-qwen-image-21: &qwen_image_21
 x-bagel: &bagel
   - vllm_omni/config/stage_config.py
   - vllm_omni/deploy/bagel.yaml
+  - vllm_omni/diffusion/stage_diffusion_client.py
+  - vllm_omni/diffusion/stage_diffusion_proc.py
   - vllm_omni/diffusion/models/bagel/
   - vllm_omni/diffusion/worker/diffusion_worker.py
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/engine/orchestrator.py
   - vllm_omni/engine/stage_engine_core_proc.py
+  - vllm_omni/engine/stage_init_deadline.py
+  - vllm_omni/engine/stage_init_utils.py
   - vllm_omni/engine/stage_pool.py
+  - vllm_omni/engine/stage_runtime.py
   - vllm_omni/entrypoints/async_omni.py
   - vllm_omni/model_executor/models/bagel/
   - vllm_omni/model_executor/stage_input_processors/bagel.py

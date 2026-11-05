@@ -46,7 +46,9 @@ test_params = [
     OmniServerParams(
         model=MODEL,
         stage_config_path=STAGE_CONFIGS_PATH,
-        stage_init_timeout=300,
+        # Cold ROCm AITER compilation can consume nearly the old 300-second
+        # deadline before the diffusion stage reports READY.
+        stage_init_timeout=600,
     ),
 ]
 
