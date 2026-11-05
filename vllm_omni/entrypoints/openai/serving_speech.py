@@ -1863,6 +1863,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         source_sample_rate: int | None = None
         resampler: StreamingAudioResampler | None = None
         last_audio_result: Any = None
+        last_audio_output: dict[str, Any] | None = None
 
         def record_stream_abort(reason: str) -> None:
             mod_metrics = getattr(getattr(self, "engine_client", None), "mod_metrics", None)
@@ -1908,6 +1909,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         collect["aligner_res"] = res
                     continue
                 audio_output = cast(dict, audio_output)
+                last_audio_output = audio_output
 
                 sr_raw = audio_output.get("sr")
                 if sr_raw is not None:
@@ -2037,6 +2039,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
             if adapter is not None:
                 adapter.validate_stream_audio(has_audio=first_audio_chunk_s is not None)
+            # Same contract as ``validate_stream_audio``: partial bytes may have
+            # been emitted, but a flagged synthesis failure must end the stream
+            # as an error instead of completing cleanly.
+            if collect is not None and last_audio_output is not None:
+                self._collect_and_raise_synthesis_error(last_audio_output, collect)
             # Check before committing the reference-audio artifact or logging
             # success. Streaming protocols may already have emitted partial
             # bytes, but they must terminate as an error rather than cleanly.
@@ -2450,6 +2457,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             async for chunk in chunks:
                 yield chunk
 
+    def _collect_and_raise_synthesis_error(self, audio_output: Any, collect: dict) -> None:
+        """Let the adapter flag a per-request synthesis failure, then surface it.
+
+        Every generation path must run this on its terminal output: the flag is
+        the only way a model can report that the audio it produced is unusable
+        (e.g. YuE2's terminal NAR/VAE pass). Streaming callers may already have
+        emitted partial audio, but they must terminate as an error rather than
+        complete cleanly -- the same contract ``validate_stream_audio`` follows.
+        """
+        adapter = self._get_tts_adapter()
+        if adapter is not None:
+            adapter.collect_response_metadata(audio_output, collect)
+        if collect.get("audio_synthesis_error"):
+            raise TTSGenerationError(
+                "The model failed to synthesize audio for this request",
+                retryable=False,
+            )
+
     async def _generate_audio_bytes(
         self,
         request: OpenAICreateSpeechRequest,
@@ -2545,21 +2570,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if ts is not None:
                 collect["word_timestamps"] = ts
 
-        # Let the adapter fold engine-side metadata (e.g. YuE2's
-        # meta.truncated) into ``collect`` for response headers.
-        if collect is not None and (adapter := self._get_tts_adapter()) is not None:
-            adapter.collect_response_metadata(audio_output, collect)
-
-        # A model can flag a per-request synthesis failure through the
-        # adapter (e.g. YuE2's terminal NAR/VAE pass OOMing on one
-        # request); answer 500 instead of shipping a zero-length WAV.
-        # Raising (not returning a Response) keeps this function's
-        # tuple contract; create_speech maps TTSGenerationError to 500.
-        if collect is not None and collect.get("audio_synthesis_error"):
-            raise TTSGenerationError(
-                "The model failed to synthesize audio for this request",
-                retryable=False,
-            )
+        # Fold engine-side metadata (e.g. YuE2's meta.truncated) into ``collect``
+        # for response headers, and answer 500 instead of shipping a zero-length
+        # WAV when the model flagged the synthesis as failed.
+        if collect is not None:
+            self._collect_and_raise_synthesis_error(audio_output, collect)
 
         audio_tensor = audio_output[audio_key]
         sr_raw = audio_output.get("sr", 24000)
@@ -3157,9 +3172,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error is not None:
                 return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
             usage_box: list[SpeechTokenUsage] = []
+            # Without ``collect`` the adapter never runs, so a flagged synthesis
+            # failure used to report ``success`` for this item.
+            collect: dict[str, Any] = {}
             try:
                 audio_data, media_type = await self._generate_audio_bytes(
-                    req, base64_encode=True, usage_out=usage_box, has_inline_ref_audio=has_inline_ref_audio
+                    req,
+                    base64_encode=True,
+                    usage_out=usage_box,
+                    has_inline_ref_audio=has_inline_ref_audio,
+                    collect=collect,
                 )
             except Exception as e:
                 logger.exception("Batch item %d failed: %s", idx, e)
