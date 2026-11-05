@@ -765,6 +765,15 @@ class LingBotWorldCausalDMDPipeline(
         if sequence_parallel_size > 1 and vae_sharding:
             self._install_sharded_vae_decode(sequence_parallel_size)
         fast_path_level = _vae_decode_fast_path(model_config)
+        npu_spatial_padding = model_config.get("lingbot_npu_vae_spatial_padding", False)
+        if type(npu_spatial_padding) is not bool:
+            raise ValueError("lingbot_npu_vae_spatial_padding must be boolean")
+        if npu_spatial_padding:
+            if vae_sharding or fast_path_level is not None:
+                raise ValueError("NPU VAE spatial padding requires unsharded VAE and no other decoder fast path")
+            from .npu_vae import install_spatial_padding
+
+            logger.info("LingBot NPU VAE padding: %d convolutions", install_spatial_padding(self.vae))
         if fast_path_level is not None:
             # Install after sharding so its conv wrappers get persistent buffers. The VAE parameters
             # already use the stage dtype, so no autocast parameter cast is needed.
