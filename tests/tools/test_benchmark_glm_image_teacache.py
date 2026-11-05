@@ -9,7 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.teacache.benchmark_glm_image import OmniSession, sampling_params_for_engine, warm_and_time
+import yaml
+
+from tools.teacache.benchmark_glm_image import (
+    OmniSession,
+    deploy_config_with_teacache,
+    sampling_params_for_engine,
+    warm_and_time,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -141,3 +148,23 @@ def test_omni_session_constructs_once_per_config():
 
     assert _FakeOmni.constructions == 2
     assert _FakeOmni.closes == 2
+
+
+def test_deploy_config_with_teacache_patches_last_stage(tmp_path):
+    base = tmp_path / "glm_image.yaml"
+    base.write_text(
+        yaml.safe_dump(
+            {
+                "stages": [
+                    {"stage_id": 0, "stage_type": "llm"},
+                    {"stage_id": 1, "stage_type": "diffusion"},
+                ]
+            },
+            sort_keys=False,
+        )
+    )
+    out = deploy_config_with_teacache(base, rel_l1_thresh=0.2)
+    patched = yaml.safe_load(out.read_text())
+    assert patched["stages"][0].get("cache_backend") is None
+    assert patched["stages"][1]["cache_backend"] == "tea_cache"
+    assert patched["stages"][1]["cache_config"] == {"rel_l1_thresh": 0.2}

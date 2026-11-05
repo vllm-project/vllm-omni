@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -33,6 +34,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import yaml
 
 
 def _load_prompts(path: Path) -> list[str]:
@@ -121,6 +123,31 @@ class OmniSession:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+
+def deploy_config_with_teacache(
+    base_deploy: str | Path,
+    *,
+    rel_l1_thresh: float,
+) -> Path:
+    """Write a temp deploy YAML with tea_cache on the diffusion stage.
+
+    Matches the e2e GLM-Image pattern (``cache_backend`` on stage 1). Relying
+    only on top-level ``Omni(cache_backend=...)`` is easy to misread in logs
+    when AR dominates E2E time.
+    """
+    base_path = Path(base_deploy)
+    raw = yaml.safe_load(base_path.read_text())
+    stages = raw.get("stages") or []
+    if not stages:
+        raise ValueError(f"No stages in deploy config {base_path}")
+    # Diffusion is the last stage for GLM-Image (AR=0, DiT=1).
+    dit = stages[-1]
+    dit["cache_backend"] = "tea_cache"
+    dit["cache_config"] = {"rel_l1_thresh": rel_l1_thresh}
+    out = Path(tempfile.mkdtemp(prefix="glm_teacache_")) / f"glm_teacache_{rel_l1_thresh}.yaml"
+    out.write_text(yaml.safe_dump(raw, sort_keys=False))
+    return out
 
 
 def sampling_params_for_engine(omni: Any, diffusion_params: Any) -> Any:
@@ -221,17 +248,33 @@ def main() -> None:
             extra_args=extra_args,
         )
 
+    if args.deploy_config is None:
+        raise SystemExit(
+            "GLM-Image needs --deploy-config (e.g. vllm_omni/deploy/glm_image.yaml). "
+            "TeaCache is applied by patching stage 1 in that file."
+        )
+
     def engine_kwargs(cache_backend: str | None, thresh: float | None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": args.model,
             "enable_diffusion_pipeline_profiler": True,
         }
-        if args.deploy_config:
+        if cache_backend is None:
             kwargs["deploy_config"] = args.deploy_config
-        if cache_backend is not None:
+        else:
+            # Put tea_cache on the DiT stage in the deploy YAML (same as e2e tests).
+            assert thresh is not None
+            kwargs["deploy_config"] = str(deploy_config_with_teacache(args.deploy_config, rel_l1_thresh=thresh))
+            # Also pass top-level knobs for single-stage / ingress paths.
             kwargs["cache_backend"] = cache_backend
             kwargs["cache_config"] = {"rel_l1_thresh": thresh}
         return kwargs
+
+    print(
+        "Note: E2E wall time includes the uncached AR stage. Prefer the "
+        "[DiffusionPipelineProfiler] GlmImagePipeline.diffuse lines for DiT "
+        "speedup. Confirm TeaCache attached with a 'TeaCache applied' log."
+    )
 
     # Baseline images (no cache): one engine, warm once, time repeats, then quality.
     baselines: list[torch.Tensor] = []
