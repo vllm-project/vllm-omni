@@ -380,6 +380,10 @@ class TestResolveOmniConfig:
         )
         mocker.patch("vllm_omni.config.stage_config._DEPLOY_DIR", tmp_path)
         mocker.patch(
+            "vllm_omni.platforms.current_omni_platform.get_default_stage_config_path",
+            return_value=str(tmp_path / "platform_without_profile"),
+        )
+        mocker.patch(
             "vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config",
             return_value=QWEN3_OMNI_PIPELINE,
         )
