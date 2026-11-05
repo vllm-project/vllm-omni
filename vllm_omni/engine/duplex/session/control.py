@@ -23,7 +23,7 @@ from copy import deepcopy
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import CancelToolCall
+from vllm_omni.engine.duplex.commands import CancelFunctionCall
 from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_history_message
 from vllm_omni.engine.duplex.contracts import ToolCallAbandonReason
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_session_tools
@@ -665,7 +665,7 @@ class SessionControl:
                 name="duplex-continue",
             )
 
-    def on_tool_call_cancel(self, command: CancelToolCall) -> None:
+    def on_function_call_cancel(self, command: CancelFunctionCall) -> None:
         """End one pending call for the client. Any tool output stays with the client."""
         reason = (
             ToolCallAbandonReason.CLIENT_FAILED
@@ -676,11 +676,11 @@ class SessionControl:
         if rejection is None:
             return
         message = (
-            f"tool_call.cancel requires a function call this session exposed, got {command.call_id}"
+            f"function_call.cancel requires a function call this session exposed, got {command.call_id}"
             if rejection is ToolCallRejection.UNKNOWN
             else f"function call {command.call_id} has already settled"
         )
-        self._out.emit_error("invalid_tool_call_cancel", message, event_id=command.event_id)
+        self._out.emit_error("invalid_function_call_cancel", message, event_id=command.event_id)
 
     def _reject_function_call_output(self, reason: ToolCallRejection, call_id: object, *, event_id: object) -> None:
         """Report a refused result with the wire shape the public contract kept.

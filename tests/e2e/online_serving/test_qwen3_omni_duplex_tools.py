@@ -130,7 +130,7 @@ class ToolSession:
     async def wait_for_settled(self, call_id: str) -> dict[str, object]:
         deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
         while asyncio.get_running_loop().time() < deadline:
-            for event in self.duplex_events("duplex.tool_call.settled"):
+            for event in self.duplex_events("duplex.function_call.settled"):
                 if event.get("call_id") == call_id:
                     return event
             await asyncio.sleep(0.05)
@@ -138,7 +138,7 @@ class ToolSession:
 
     async def continue_with_result(self, call_id: str, output: str) -> str:
         start = len(self.collector.events)
-        await self.client.send_tool_result(call_id, output)
+        await self.client.send_function_call_output(call_id, output)
         await self.client.send({"type": "response.create"})
         return await self.finish_response(start)
 
@@ -146,11 +146,11 @@ class ToolSession:
         """Keep what the model did in the test output, pass or fail."""
         print(
             f"[qwen-tools] calls={len(self.calls())} "
-            f"suppressed={len(self.duplex_events('duplex.tool_call.suppressed'))} errors={self.error_codes()}"
+            f"suppressed={len(self.duplex_events('duplex.function_call.suppressed'))} errors={self.error_codes()}"
         )
         for event in self.collector.events:
             event_type = str(event.get("type"))
-            if event_type in {"response.created", "response.done", "duplex.tool_call.suppressed"}:
+            if event_type in {"response.created", "response.done", "duplex.function_call.suppressed"}:
                 print(f"[qwen-tools] {event_type} {self.collector.response_id(event)}")
             elif event_type == "response.output_item.done":
                 print(f"[qwen-tools] output_item {json.dumps(event.get('item'))[:200]}")
@@ -200,7 +200,7 @@ def test_the_client_can_keep_talking_while_a_tool_is_pending(omni_server):
 
         reply = await session.ask("Before that, what is the capital of Japan?")
         assert "tokyo" in reply.lower(), reply
-        assert session.duplex_events("duplex.tool_call.settled") == []
+        assert session.duplex_events("duplex.function_call.settled") == []
         assert len(session.calls()) == 1, session.calls()
 
         await session.continue_with_result(call_id, WEATHER_RESULT)
@@ -251,7 +251,7 @@ def test_a_late_result_never_reaches_the_answer(omni_server):
         call_id = await session.ask_for_weather()
         await session.wait_for_settled(call_id)
 
-        await session.client.send_tool_result(call_id, json.dumps({"city": "Paris", "temperature_c": 93}))
+        await session.client.send_function_call_output(call_id, json.dumps({"city": "Paris", "temperature_c": 93}))
         answer = await session.ask("Thanks. What is the capital of Japan?")
 
         assert "invalid_function_call_output" in session.error_codes()
@@ -272,7 +272,7 @@ def test_a_repeated_question_cannot_republish_an_abandoned_call(omni_server):
         await session.ask(WEATHER_QUESTION)
 
         assert len(session.calls()) == 1, session.calls()
-        for suppressed in session.duplex_events("duplex.tool_call.suppressed"):
+        for suppressed in session.duplex_events("duplex.function_call.suppressed"):
             assert suppressed["blocked_by_call_id"] == call_id
 
     config = session_config(tool_result_timeout_s=RESULT_TIMEOUT_S, tool_retry_policy="never")
@@ -285,7 +285,7 @@ def test_a_failed_tool_ends_the_call_and_the_session_carries_on(omni_server):
     async def body(session: ToolSession) -> None:
         call_id = await session.ask_for_weather()
 
-        await session.client.cancel_tool_call(call_id, reason="failed")
+        await session.client.cancel_function_call(call_id, reason="failed")
         settled = await session.wait_for_settled(call_id)
         assert (settled["state"], settled["reason"]) == ("cancelled", "client_failed")
 

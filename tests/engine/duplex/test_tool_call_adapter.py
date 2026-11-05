@@ -189,28 +189,28 @@ def test_a_cancel_racing_an_acceptance_voids_it():
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        ({"type": "tool_call.cancel", "call_id": "call_a"}, "cancelled"),
-        ({"type": "tool_call.cancel", "call_id": "call_a", "reason": "failed"}, "failed"),
+        ({"type": "function_call.cancel", "call_id": "call_a"}, "cancelled"),
+        ({"type": "function_call.cancel", "call_id": "call_a", "reason": "failed"}, "failed"),
     ],
 )
 def test_cancel_command_decodes(payload, expected):
     command = translate_realtime_command(payload)
-    assert isinstance(command, commands.CancelToolCall)
+    assert isinstance(command, commands.CancelFunctionCall)
     assert (command.call_id, command.reason) == ("call_a", expected)
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {"type": "tool_call.cancel"},
-        {"type": "tool_call.cancel", "call_id": ""},
-        {"type": "tool_call.cancel", "call_id": "call_a", "reason": "because"},
+        {"type": "function_call.cancel"},
+        {"type": "function_call.cancel", "call_id": ""},
+        {"type": "function_call.cancel", "call_id": "call_a", "reason": "because"},
     ],
 )
 def test_a_malformed_cancel_is_refused(payload):
     with pytest.raises(RealtimeProtocolError) as refused:
         translate_realtime_command(payload)
-    assert refused.value.code == "invalid_tool_call_cancel"
+    assert refused.value.code == "invalid_function_call_cancel"
 
 
 # --------------------------------------------------------------------------- #
@@ -378,7 +378,7 @@ async def test_a_timeout_reaches_the_client_and_the_model_and_refuses_the_late_r
         h.scheduler.fire_all()
         events = await h.settle()
 
-        settled = wire(events, "duplex.tool_call.settled")
+        settled = wire(events, "duplex.function_call.settled")
         assert [(item["call_id"], item["state"], item["reason"]) for item in settled] == [
             (call_id, "timed_out", "timeout")
         ]
@@ -393,27 +393,27 @@ async def test_a_failed_tool_never_reaches_the_model_as_a_result(monkeypatch):
     async with open_nemotron_harness(monkeypatch) as h:
         call_id = await prepare(h)
 
-        events = await h.run(commands.CancelToolCall(call_id=call_id, reason="failed"))
+        events = await h.run(commands.CancelFunctionCall(call_id=call_id, reason="failed"))
 
-        assert [item["reason"] for item in wire(events, "duplex.tool_call.settled")] == ["client_failed"]
+        assert [item["reason"] for item in wire(events, "duplex.function_call.settled")] == ["client_failed"]
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.CANCELLED
         assert len(batches(h)) == 1
 
-        again = await h.run(commands.CancelToolCall(call_id=call_id))
-        assert error_codes(again) == ["invalid_tool_call_cancel"]
-        assert len(wire(again, "duplex.tool_call.settled")) == 0
+        again = await h.run(commands.CancelFunctionCall(call_id=call_id))
+        assert error_codes(again) == ["invalid_function_call_cancel"]
+        assert len(wire(again, "duplex.function_call.settled")) == 0
 
 
 @pytest.mark.asyncio
 async def test_a_repeat_is_suppressed_and_not_shown_to_the_client(monkeypatch):
     async with open_nemotron_harness(monkeypatch) as h:
         call_id = await prepare(h)
-        await h.run(commands.CancelToolCall(call_id=call_id))
+        await h.run(commands.CancelFunctionCall(call_id=call_id))
         records = len(h.runner.tool_calls)
 
         events = await repeat_call(h)
 
-        suppressed = wire(events, "duplex.tool_call.suppressed")
+        suppressed = wire(events, "duplex.function_call.suppressed")
         assert [item["blocked_by_call_id"] for item in suppressed] == [call_id]
         assert not [event for event in events if event.type == "response.function_call_arguments.done"]
         assert len(h.runner.tool_calls) == records
@@ -426,7 +426,7 @@ async def test_a_repeat_of_a_pending_call_is_suppressed_without_a_notice(monkeyp
 
         events = await repeat_call(h)
 
-        suppressed = wire(events, "duplex.tool_call.suppressed")
+        suppressed = wire(events, "duplex.function_call.suppressed")
         assert [(item["blocked_by_call_id"], item["blocked_by_state"]) for item in suppressed] == [(call_id, "pending")]
         assert not [event for event in events if event.type == "response.function_call_arguments.done"]
         assert batches(h) == []
@@ -439,7 +439,7 @@ async def test_a_tool_result_is_not_a_user_turn_and_lifts_no_block(monkeypatch):
     async with open_nemotron_harness(monkeypatch) as h:
         h.runner.tool_calls._user_turn_seq = h.session.user_turn_seq
         call_a = await prepare(h)
-        await h.run(commands.CancelToolCall(call_id=call_a))
+        await h.run(commands.CancelFunctionCall(call_id=call_a))
         original_decode = h.tokenizer.decode
         decode_a_different_call(h)
         call_b = await prepare(h)
@@ -449,7 +449,7 @@ async def test_a_tool_result_is_not_a_user_turn_and_lifts_no_block(monkeypatch):
 
         assert h.session.user_turn_seq() == turns
         h.tokenizer.decode = original_decode
-        suppressed = wire(await repeat_call(h), "duplex.tool_call.suppressed")
+        suppressed = wire(await repeat_call(h), "duplex.function_call.suppressed")
         assert [item["blocked_by_call_id"] for item in suppressed] == [call_a]
 
 
@@ -463,12 +463,12 @@ async def test_the_session_reports_the_policy_it_applies(monkeypatch):
 async def test_nemotron_has_no_user_turn_so_a_repeat_stays_blocked(monkeypatch):
     async with open_nemotron_harness(monkeypatch) as h:
         call_id = await prepare(h)
-        await h.run(commands.CancelToolCall(call_id=call_id))
+        await h.run(commands.CancelFunctionCall(call_id=call_id))
         await h.run(append_audio(samples=1280))
 
         events = await repeat_call(h)
 
-        assert len(wire(events, "duplex.tool_call.suppressed")) == 1
+        assert len(wire(events, "duplex.function_call.suppressed")) == 1
 
 
 @pytest.mark.asyncio
@@ -478,7 +478,7 @@ async def test_an_effective_cancel_is_reported_and_keeps_nemotron_queue_clean(mo
 
         events = await h.run(commands.CancelInput())
 
-        settled = wire(events, "duplex.tool_call.settled")
+        settled = wire(events, "duplex.function_call.settled")
         assert [(item["call_id"], item["reason"]) for item in settled] == [(call_id, "epoch_cancelled")]
         assert batches(h) == []
 
@@ -492,7 +492,7 @@ async def test_keep_policy_admits_a_result_after_an_effective_cancel(monkeypatch
         cancelled = await h.run(commands.CancelInput())
 
         assert h.session.epoch == epoch + 1
-        assert wire(cancelled, "duplex.tool_call.settled") == []
+        assert wire(cancelled, "duplex.function_call.settled") == []
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.PENDING
         result = await answer(h, call_id)
         assert error_codes(result) == []

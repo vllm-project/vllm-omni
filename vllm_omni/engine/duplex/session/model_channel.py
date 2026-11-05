@@ -1189,7 +1189,7 @@ class ModelChannel:
         blocker = self._ctx.tool_calls.record(blocked_by)
         self._out.emit(
             {
-                "type": "tool_call.suppressed",
+                "type": "function_call.suppressed",
                 "session_id": session.session_id,
                 "epoch": session.epoch,
                 "name": name,

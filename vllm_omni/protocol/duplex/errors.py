@@ -70,7 +70,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "invalid_input_modality": "invalid_request_error",
     "invalid_function_call": "invalid_request_error",
     "invalid_function_call_output": "invalid_request_error",
-    "invalid_tool_call_cancel": "invalid_request_error",
+    "invalid_function_call_cancel": "invalid_request_error",
     "invalid_tool_policy": "invalid_request_error",
     "invalid_tool_result_timeout": "invalid_request_error",
     "too_many_tools": "invalid_request_error",

@@ -37,9 +37,9 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
-    CancelToolCall,
     ClearInput,
     ClearOutputAudio,
     CloseSession,
@@ -812,8 +812,8 @@ class DuplexSessionRunner:
                 await self._on_cancel(payload)
         elif isinstance(command, CancelInput | BargeIn):
             await self._on_cancel(command.payload())
-        elif isinstance(command, CancelToolCall):
-            self.control.on_tool_call_cancel(command)
+        elif isinstance(command, CancelFunctionCall):
+            self.control.on_function_call_cancel(command)
         elif isinstance(command, SignalTurn):
             if command.event == "conversation.item.retrieve":
                 self._emit_events(
@@ -1118,7 +1118,7 @@ class DuplexSessionRunner:
         if reason is not None and call_id not in self._applied_tool_call_settlements:
             self.emit(
                 {
-                    "type": "tool_call.settled",
+                    "type": "function_call.settled",
                     "session_id": session.session_id,
                     "epoch": settlement.settled_epoch,
                     "call_id": call_id,

@@ -794,7 +794,7 @@ two events the call is *pending*, and it settles exactly once:
 | --- | --- |
 | `accepted` | the result was admitted and the item was created |
 | `timed_out` | the deadline passed (only when `tool_result_timeout_s` is set) |
-| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`), or the client sent `tool_call.cancel` |
+| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`), or the client sent `function_call.cancel` |
 
 Admission is authoritative per session, and it is about the *call*, not about
 conversation history: only a call this session exposed can be answered, and only
@@ -847,14 +847,14 @@ by itself make the model abandon a call or guarantee that it emits another one;
 the notice and repeat guard below address that, and how a model responds to a
 notice depends on the model.
 
-**Ending a call from the client.** Send `tool_call.cancel` to end one pending
+**Ending a call from the client.** Send `function_call.cancel` to end one pending
 call. `reason` is `cancelled` (the default) or `failed`. Report a failed tool
 this way rather than sending its error as `function_call_output`: the session
 cannot tell an error string from a result, and would pass it to the model. A
-`call_id` that is unknown or already settled gets `invalid_tool_call_cancel`.
+`call_id` that is unknown or already settled gets `invalid_function_call_cancel`.
 
 **Knowing a call ended.** Every call that ends without a result produces
-`duplex.tool_call.settled`, whose `event` body carries `call_id`, `state`
+`duplex.function_call.settled`, whose `event` body carries `call_id`, `state`
 (`timed_out` or `cancelled`), `reason` (`timeout`, `epoch_cancelled`,
 `client_cancelled` or `client_failed`) and `epoch`. Stop the tool and discard its
 result when this arrives.
@@ -862,7 +862,7 @@ result when this arrives.
 **Repeated calls.** A pending, timed-out or cancelled call blocks later calls with
 the same name and arguments, compared as JSON so key order does not matter. A
 blocked call is not published or recorded; the client gets
-`duplex.tool_call.suppressed`, whose `event` body carries `name`, `arguments`,
+`duplex.function_call.suppressed`, whose `event` body carries `name`, `arguments`,
 `blocked_by_call_id`, `blocked_by_state` and `epoch`. A retry with different
 arguments is not blocked.
 
@@ -891,7 +891,7 @@ It never contains client text.
 **Interruptions.** `extra_body.tool_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
 they settle as `cancelled`. With `keep`, they stay pending and can still be
-answered, so only the deadline, `tool_call.cancel` or close ends them. A result
+answered, so only the deadline, `function_call.cancel` or close ends them. A result
 already accepted follows the model's existing retirement rules either way.
 
 **Discovering what a model supports.** `capabilities` reports these fields:
@@ -907,10 +907,10 @@ Non-empty `tools` on a `none` model is refused with `tools_unsupported`.
 `tool_choice` other than `auto` is refused with `unsupported_tool_choice`, because
 no duplex model honours it.
 
-**Client library.** `DuplexClientBase.send_tool_result` and `cancel_tool_call`
+**Client library.** `DuplexClientBase.send_function_call_output` and `cancel_function_call`
 send these events. `vllm_omni.clients.tool_calls.DuplexToolRunner` runs each tool
 in its own task, so audio keeps streaming; reports failures with
-`tool_call.cancel`; stops a tool when its call settles; and sends `response.create`
+`function_call.cancel`; stops a tool when its call settles; and sends `response.create`
 only when the model needs it. Pass `tool_session_defaults()` as `extra_body` when
 opening the session to keep pending tools across an interruption.
 
@@ -1253,7 +1253,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input.commit` | 3 | Alias of `input_audio_buffer.commit` accepted by the runner. |
 | `input_audio_buffer.clear` | 1 | Drop un-committed input audio. |
 | `input.cancel` | 3 | Cancel pending input; advances `epoch`. |
-| `tool_call.cancel` | 3 | End one pending function call (`call_id`, `reason`: `cancelled` or `failed`). |
+| `function_call.cancel` | 3 | End one pending function call (`call_id`, `reason`: `cancelled` or `failed`). |
 | `input.text.append` | 3 | Append text input; model-native sessions reject it with `native_text_append_unsupported`. |
 | `conversation.item.create` | 1 | Add a completed user item (text, audio, or `function_call_output`) to history. |
 | `conversation.item.retrieve` | 1 | Fetch a stored item by id. |
@@ -1308,8 +1308,8 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.function_call_arguments.delta` | 1 | Tool-call arguments delta (Nemotron VoiceChat). |
 | `response.function_call_arguments.done` | 1 | Tool-call arguments complete. |
 | `duplex.function_call.done` | 3 | Raw fallback when a model tool call is malformed. |
-| `duplex.tool_call.settled` | 3 | A function call ended without a result; details under `event`. |
-| `duplex.tool_call.suppressed` | 3 | The session refused to publish a repeat of a pending or abandoned call; `blocked_by_state` says which. Details under `event`. |
+| `duplex.function_call.settled` | 3 | A function call ended without a result; details under `event`. |
+| `duplex.function_call.suppressed` | 3 | The session refused to publish a repeat of a pending or abandoned call; `blocked_by_state` says which. Details under `event`. |
 | `output_audio_buffer.cleared` | 1 | Reply to `output_audio_buffer.clear`. |
 | `playback.acknowledged` | 3 | Reply to `playback.ack`; returns the playback ledger and `history_committed`. |
 | `overlap.decision` | 3 | How an append that overlapped an active response was handled (`drop` \| `listen` \| `barge_in`); details under `metadata`. |

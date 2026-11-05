@@ -218,8 +218,8 @@ class CancelInput(DuplexCommand, _duplex_wire.CancelInput):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class CancelToolCall(DuplexCommand, _duplex_wire.CancelToolCall):
-    type: ClassVar[str] = "tool_call.cancel"
+class CancelFunctionCall(DuplexCommand, _duplex_wire.CancelFunctionCall):
+    type: ClassVar[str] = "function_call.cancel"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -278,7 +278,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "turn.signal",
         "input.text.append",
         "input.cancel",
-        "tool_call.cancel",
+        "function_call.cancel",
         "barge_in",
     }
 )
@@ -310,7 +310,7 @@ __all__ = [
     "BargeIn",
     "CancelInput",
     "CancelResponse",
-    "CancelToolCall",
+    "CancelFunctionCall",
     "ClearInput",
     "ClearOutputAudio",
     "CloseSession",

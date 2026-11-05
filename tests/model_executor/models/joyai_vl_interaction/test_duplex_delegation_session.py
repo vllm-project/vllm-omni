@@ -222,7 +222,9 @@ async def test_a_repeat_of_a_cancelled_delegation_tells_the_model():
         )
 
         assert function_calls(h, events) == []
-        suppressed = [event for event in realtime_events(h, events) if event["type"] == "duplex.tool_call.suppressed"]
+        suppressed = [
+            event for event in realtime_events(h, events) if event["type"] == "duplex.function_call.suppressed"
+        ]
         assert len(suppressed) == 1
         assert str(call["call_id"]) in json.dumps(suppressed)
         results = h.session.runtime_config["joyai_delegation_results"]

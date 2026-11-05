@@ -419,7 +419,7 @@ for queue updates and the final validity check before delivery.
   `function_call_output` is admitted only against that record:
   `pending -> accepted | timed_out | cancelled`, one transition, no rebinding
   of a call id, and terminal records kept as tombstones until the session
-  closes. A client can also settle one call with `tool_call.cancel`. Conversation history is not admission authority -- it is history-wide
+  closes. A client can also settle one call with `function_call.cancel`. Conversation history is not admission authority -- it is history-wide
   and epoch-blind, so a result arriving after a barge-in could otherwise be
   admitted against a call the session had already moved past. The epoch
   consequences hang off the single epoch-advance path: pending calls from older

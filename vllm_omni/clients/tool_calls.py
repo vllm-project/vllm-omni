@@ -3,7 +3,7 @@
 """Run an application's tools for one duplex session.
 
 This module depends on ``DuplexClientBase``, never the reverse: an application
-can read the same events and call ``send_tool_result`` / ``cancel_tool_call``
+can read the same events and call ``send_function_call_output`` / ``cancel_function_call``
 itself. The server never executes a tool; each handler here runs in its own
 task, so the application keeps streaming audio while a tool works.
 """
@@ -63,7 +63,7 @@ class DuplexToolRunner:
             item = event.raw.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
                 self._start(item)
-        elif event.type == "duplex.tool_call.settled":
+        elif event.type == "duplex.function_call.settled":
             details = event.raw.get("event")
             call_id = details.get("call_id") if isinstance(details, dict) else None
             if not isinstance(call_id, str):
@@ -102,11 +102,11 @@ class DuplexToolRunner:
             # Report the failure, not its text: a failed call's output must not
             # reach the model.
             logger.exception("Tool call %s failed", call_id)
-            await self._finish(self._client.cancel_tool_call(call_id, reason="failed"))
+            await self._finish(self._client.cancel_function_call(call_id, reason="failed"))
             return
         if call_id in self._settled:
             return
-        await self._finish(self._client.send_tool_result(call_id, output))
+        await self._finish(self._client.send_function_call_output(call_id, output))
         if call_id in self._settled:
             return
         capabilities = self._client.session_info.get("capabilities")

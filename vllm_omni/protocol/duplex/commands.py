@@ -107,10 +107,10 @@ class BargeIn(RealtimeCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class CancelToolCall(RealtimeCommand):
+class CancelFunctionCall(RealtimeCommand):
     """End one pending function call: the client gave up on it, or it failed."""
 
-    wire_type: ClassVar[str] = "tool_call.cancel"
+    wire_type: ClassVar[str] = "function_call.cancel"
     call_id: str
     reason: str = "cancelled"
 
@@ -179,7 +179,7 @@ __all__ = [
     "AppendText",
     "BargeIn",
     "CancelInput",
-    "CancelToolCall",
+    "CancelFunctionCall",
     "CloseSession",
     "GetSessionStats",
     "Heartbeat",

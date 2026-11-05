@@ -26,7 +26,7 @@ def call_event(call_id="call_a", name="get_weather", arguments='{"city":"Taipei"
 
 def settled_event(call_id="call_a"):
     return {
-        "type": "duplex.tool_call.settled",
+        "type": "duplex.function_call.settled",
         "event": {"call_id": call_id, "state": "timed_out", "reason": "timeout"},
     }
 
@@ -67,10 +67,10 @@ async def test_client_helpers_send_documented_events():
     sock.feed(SESSION_CREATED)
     client, _ = make_client(sock)
     async with client:
-        await client.send_tool_result("call_a", "20")
-        await client.cancel_tool_call("call_a", reason="failed")
+        await client.send_function_call_output("call_a", "20")
+        await client.cancel_function_call("call_a", reason="failed")
         items = sent(sock, "conversation.item.create")
-        cancels = sent(sock, "tool_call.cancel")
+        cancels = sent(sock, "function_call.cancel")
         sock.feed(SESSION_CLOSED)
     assert items[0]["item"] == {"type": "function_call_output", "call_id": "call_a", "output": "20"}
     assert (cancels[0]["call_id"], cancels[0]["reason"]) == ("call_a", "failed")
@@ -113,8 +113,8 @@ async def test_a_failed_handler_reports_failure_without_its_text():
 
     await run_with(sock, {"get_weather": broken}, body)
     assert sent(sock, "conversation.item.create") == []
-    assert sent(sock, "tool_call.cancel")[0]["reason"] == "failed"
-    assert "secret detail" not in json.dumps(sent(sock, "tool_call.cancel"))
+    assert sent(sock, "function_call.cancel")[0]["reason"] == "failed"
+    assert "secret detail" not in json.dumps(sent(sock, "function_call.cancel"))
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ async def test_an_unusable_call_is_reported_as_failed(event):
         sock.feed(event)
 
     await run_with(sock, {"get_weather": get_weather}, body)
-    assert sent(sock, "tool_call.cancel")[0]["reason"] == "failed"
+    assert sent(sock, "function_call.cancel")[0]["reason"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -197,7 +197,7 @@ async def test_a_non_string_output_is_reported_as_a_failed_tool():
 
     await run_with(sock, {"get_weather": returns_a_dict}, body)
     assert sent(sock, "conversation.item.create") == []
-    assert sent(sock, "tool_call.cancel")[0]["reason"] == "failed"
+    assert sent(sock, "function_call.cancel")[0]["reason"] == "failed"
 
 
 @pytest.mark.asyncio
