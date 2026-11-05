@@ -10,6 +10,7 @@ from vllm.utils import numa_utils
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine import stage_engine_core_proc_manager as module
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -47,7 +48,7 @@ def spawn_boundary(mocker, monkeypatch):
     return observed
 
 
-def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, tp_size=1):
+def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, tp_size=1, model_arch=None):
     # No model is constructed: the manager consumes only these config fields.
     config = VllmConfig.__new__(VllmConfig)
     config.parallel_config = ParallelConfig(
@@ -60,6 +61,8 @@ def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, 
         numa_bind_cpus=cpus if numa_bind else None,
     )
     config.shutdown_timeout = 5.0
+    config.model_config = OmniModelConfig.__new__(OmniModelConfig)
+    config.model_config.model_arch = model_arch
     manager = module.StageEngineCoreProcManager(
         local_engine_count=dp_size,
         start_index=0,
@@ -73,6 +76,7 @@ def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, 
     )
     # Fake processes need no finalizer; all patches are fixture-scoped.
     manager._finalizer.detach()
+    return manager
 
 
 @pytest.mark.parametrize("executor_class", [UniProcExecutor, CustomUniProcExecutor])
@@ -108,3 +112,13 @@ def test_in_process_binding_restores_the_parent_environment(spawn_boundary, monk
     assert spawn_boundary[0]["binding"] == "--physcpubind=2 --membind=0"
     assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=1"
     assert os.environ[numa_utils._NUMACTL_PYTHON_EXECUTABLE_ENV] == "/parent/python"
+
+
+@pytest.mark.parametrize("model_arch", [None, "SparkQwen2ForCausalLM", "SparkBiCodecDecoder", "OtherDecoder"])
+@pytest.mark.parametrize("timeout", [None, 0.0, 2.0])
+def test_shutdown_extra_grace_is_scoped_to_spark_codec(spawn_boundary, mocker, model_arch, timeout):
+    manager = start_manager(UniProcExecutor, stage_id=1, cpus=None, numa_bind=False, model_arch=model_arch)
+    parent_shutdown = mocker.patch.object(module.CoreEngineProcManager, "shutdown")
+    manager.shutdown(timeout=timeout)
+    expected = 15.0 if model_arch == "SparkBiCodecDecoder" and timeout is None else timeout
+    parent_shutdown.assert_called_once_with(timeout=expected)

@@ -9,15 +9,15 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.spark_tts.tokenizer import (
+    END_GLOBAL,
+    GLOBAL_OFFSET,
+    GLOBAL_SIZE,
+    SEMANTIC_OFFSET,
+    SEMANTIC_SIZE,
+    START_GLOBAL,
+)
 
-# Verified against Spark-TTS-0.5B/LLM tokenizer at revision
-# 642071559bfc6346c2359d19dcb6be3f9dd8a05d.
-GLOBAL_OFFSET = 151665
-GLOBAL_SIZE = 4096
-SEMANTIC_OFFSET = 155761
-SEMANTIC_SIZE = 8192
-START_GLOBAL = 165150
-END_GLOBAL = 165156
 logger = init_logger(__name__)
 
 
@@ -74,7 +74,7 @@ def bicodec_token_only(
     for source in source_outputs:
         if not getattr(source, "finished", False):
             continue
-        output = source.outputs[0]
-        ids = getattr(output, "cumulative_token_ids", None) or getattr(output, "token_ids", None) or []
-        inputs.append(OmniTokensPrompt(prompt_token_ids=[0] * max(1, len(ids))))
+        # The full codec payload travels through the connector. One token makes
+        # this a single generation input unit regardless of the source length.
+        inputs.append(OmniTokensPrompt(prompt_token_ids=[0]))
     return inputs

@@ -118,8 +118,9 @@ process managers, or membership registrations.
 
 On POSIX, a local LLM stage wakes its input queue when it receives a signal.
 This lets an idle worker's main thread run its shutdown handler even when
-another thread received SIGTERM. The stage process manager allows 15 seconds
-for cleanup by default and preserves an explicitly supplied timeout.
+another thread received SIGTERM. The Spark BiCodec process manager allows
+15 seconds for cleanup when no timeout is supplied. Other stages inherit the
+upstream timeout policy, and explicit caller timeouts are preserved.
 
 ## Invariant namespace
 

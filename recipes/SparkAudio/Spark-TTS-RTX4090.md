@@ -52,6 +52,14 @@ PyTorch. The Spark-specific imports used by the CI job are `einops==0.8.2`,
 `einx==0.4.3`, `omegaconf==2.3.1`, and `soxr==1.1.0`; install their
 dependencies as needed and verify the environment with `pip check`.
 
+The CUDA CI dependency image caches that pinned source at `SPARK_TTS_SOURCE`
+and installs the codec dependencies during image construction. The offline
+GPU test uses those installed files.
+
+Stage 0 validates the selected tokenizer's global and semantic code ranges
+and stop markers before constructing the model. A mismatched tokenizer raises
+an error. Keep the checkpoint and its tokenizer together.
+
 ## Offline command
 
 Run from the vLLM-Omni repository root. Set `SPARK_TTS_MODEL_DIR` to a local
@@ -117,6 +125,11 @@ PY
 
 For voice cloning, set `SPARK_TTS_REF_AUDIO` before the same command. Use a
 reference recording that you have permission to use.
+
+An empty or whitespace-only `SPARK_TTS_REF_TEXT` selects cloning without a
+transcript. A nonempty transcript requires semantic codes from the reference
+encoder. The decoder receives one scheduling placeholder per finished
+request; all speech codes are delivered through the stage connector.
 
 ## Verification and limits
 
