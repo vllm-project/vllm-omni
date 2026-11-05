@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -61,10 +61,24 @@ class TestParallelConfigPropagation:
             tensor_parallel_size=2,
             ulysses_degree=2,
             ring_degree=1,
+            ulysses_a2a_backend="ce",
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
+        assert od.parallel_config.ulysses_a2a_backend == "ce"
+
+    @pytest.mark.parametrize(
+        "kwargs, message",
+        [
+            ({"ulysses_degree": 1, "ulysses_a2a_backend": "ce"}, "ulysses_degree > 1"),
+            ({"ulysses_degree": 2, "ulysses_mode": "advanced_uaa", "ulysses_a2a_backend": "ce"}, "strict"),
+            ({"ulysses_degree": 2, "ulysses_a2a_backend": "unknown"}, "must be"),
+        ],
+    )
+    def test_unsupported_ulysses_a2a_backend_rejected(self, kwargs, message):
+        with pytest.raises((AssertionError, ValueError), match=message):
+            DiffusionParallelConfig(**kwargs)
 
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)

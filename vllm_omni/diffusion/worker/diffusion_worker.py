@@ -372,6 +372,12 @@ class DiffusionWorker:
                     format_gib(self.requested_memory),
                 )
             init_workspace_manager(self.device)
+            if getattr(parallel_config, "ulysses_a2a_backend", None) == "ce":
+                if not current_omni_platform.is_cuda():
+                    raise ValueError("CE Ulysses requires the CUDA platform")
+                from vllm_omni.diffusion.distributed.ce_ulysses import initialize_ulysses_groups
+
+                initialize_ulysses_groups(get_sp_group())
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config
@@ -966,6 +972,9 @@ class DiffusionWorker:
                         mgr.shutdown_prefetch()
         finally:
             try:
+                ce_ulysses = sys.modules.get("vllm_omni.diffusion.distributed.ce_ulysses")
+                if ce_ulysses is not None:
+                    ce_ulysses.clear_ulysses_groups()
                 a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
                 if a2a_permute is not None:
                     a2a_permute.clear_a2a_permute_workspaces()

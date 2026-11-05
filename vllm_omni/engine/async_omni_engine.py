@@ -1052,6 +1052,7 @@ class AsyncOmniEngine:
             allgather_degree = normalized_kwargs.get("allgather_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             ulysses_a2a_permute = bool(normalized_kwargs.get("ulysses_a2a_permute", False))
+            ulysses_a2a_backend = normalized_kwargs.get("ulysses_a2a_backend")
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             data_parallel_size = normalized_kwargs.get("data_parallel_size")
@@ -1079,6 +1080,7 @@ class AsyncOmniEngine:
                 allgather_degree=allgather_degree,
                 ulysses_mode=ulysses_mode,
                 ulysses_a2a_permute=ulysses_a2a_permute,
+                ulysses_a2a_backend=ulysses_a2a_backend,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,

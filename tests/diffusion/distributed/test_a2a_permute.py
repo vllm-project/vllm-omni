@@ -41,6 +41,29 @@ def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatc
     assert load_kwargs["extra_ldflags"] == [str(nccl_lib)]
 
 
+def test_jit_headers_preserve_compiler_runtime_and_add_missing_libraries(tmp_path) -> None:
+    toolkit = tmp_path / "toolkit" / "include"
+    wheel = tmp_path / "wheel" / "include"
+    nccl = tmp_path / "nccl" / "include"
+    for directory in (toolkit, wheel, nccl):
+        directory.mkdir(parents=True)
+    for directory in (toolkit, wheel):
+        (directory / "cuda_runtime.h").touch()
+        (directory / "crt").mkdir()
+        (directory / "crt" / "host_runtime.h").touch()
+    (wheel / "cusparse.h").touch()
+    (nccl / "nccl.h").touch()
+    cache = tmp_path / "build"
+    includes = a2a_permute._cuda_dependency_includes([str(wheel), str(nccl)], toolkit, cache)
+    bridge = cache / "cuda_dependency_headers"
+    assert includes == [str(bridge), str(nccl)]
+    assert (bridge / "cusparse.h").resolve() == wheel / "cusparse.h"
+    assert not (bridge / "cuda_runtime.h").exists()
+    assert not (bridge / "crt").exists()
+    # Concurrent/repeated preparation must reuse the same header view.
+    assert a2a_permute._cuda_dependency_includes([str(wheel), str(nccl)], toolkit, cache) == includes
+
+
 @dataclass
 class _FakeAllocation:
     size: int

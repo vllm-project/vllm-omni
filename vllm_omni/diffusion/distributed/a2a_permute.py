@@ -24,6 +24,7 @@ import os
 import sysconfig
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -53,6 +54,33 @@ class _SymmWorkspace:
 _SYMM_WORKSPACES: dict[tuple[torch.device, str], _SymmWorkspace] = {}
 
 
+def _cuda_dependency_includes(include_paths: list[str], toolkit: Path, build_directory: Path) -> list[str]:
+    """Supplement nvcc's toolkit without overriding its runtime/CRT headers.
+
+    Consolidated NVIDIA wheels can contain both library headers and a CUDA
+    runtime newer than CUDA_HOME. Passing that whole directory to nvcc mixes
+    incompatible compiler internals. Expose only its missing dependencies.
+    """
+    result = []
+    bridge = build_directory / "cuda_dependency_headers"
+    for directory in include_paths:
+        source = Path(directory)
+        if not any((source / header).exists() for header in ("cuda.h", "cuda_runtime.h")):
+            result.append(directory)
+            continue
+        bridge.mkdir(parents=True, exist_ok=True)
+        for header in source.iterdir():
+            if (toolkit / header.name).exists():
+                continue
+            try:
+                (bridge / header.name).symlink_to(header.resolve(), target_is_directory=header.is_dir())
+            except FileExistsError:
+                pass  # Another worker may be preparing the same build cache.
+        if str(bridge) not in result:
+            result.append(str(bridge))
+    return result
+
+
 def _ensure_built() -> None:
     """JIT-compile + load the kernel once (process-wide). Cached by torch."""
     global _BUILT
@@ -61,7 +89,7 @@ def _ensure_built() -> None:
     with _BUILD_LOCK:
         if _BUILT:
             return
-        from torch.utils.cpp_extension import load
+        from torch.utils.cpp_extension import CUDA_HOME, _get_build_directory, load
 
         here = os.path.dirname(__file__)
         src = os.path.join(here, "csrc", "a2a_permute.cu")
@@ -73,6 +101,12 @@ def _ensure_built() -> None:
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
         if not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl nccl.h")
+        if CUDA_HOME is not None:
+            include_paths = _cuda_dependency_includes(
+                include_paths,
+                Path(CUDA_HOME) / "include",
+                Path(_get_build_directory("vllm_omni_a2a_permute", verbose=False)),
+            )
         load(
             name="vllm_omni_a2a_permute",
             sources=[src],
@@ -142,14 +176,19 @@ def _get_symm_buffer(
                 stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
-        return workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
+        buffer = workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
+        # In PyTorch 2.13 the handle view can point at a non-zero offset inside
+        # the rendezvous allocation. The NCCL kernel validates the allocation
+        # base, so return an equivalent typed view of our registered allocation
+        # rather than forwarding a window-relative pointer.
+        if isinstance(buffer, torch.Tensor) and buffer.data_ptr() != workspace.allocation.data_ptr():
+            return workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
+        return buffer
 
 
 def clear_a2a_permute_workspaces() -> None:
     """Release cached symmetric-memory workspaces during worker shutdown."""
     with _WORKSPACE_LOCK:
-        if not _SYMM_WORKSPACES:
-            return
         devices = {workspace.allocation.device for workspace in _SYMM_WORKSPACES.values()}
         for device in devices:
             torch.accelerator.synchronize(device)
