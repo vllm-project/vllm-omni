@@ -21,8 +21,6 @@ import yaml
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-pytest.importorskip("pre_commit", reason="the integration cases drive the pre-commit runner")
-
 ROOT_DIR = Path(__file__).parents[2]
 HOOK_PATH = ROOT_DIR / "tools/pre_commit/sync_example_docs.py"
 GENERATOR_PATH = ROOT_DIR / "docs/mkdocs/hooks/generate_examples.py"
@@ -95,6 +93,7 @@ def _repo(tmp_path: Path) -> Path:
 
 
 def _pre_commit(repo: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    pytest.importorskip("pre_commit", reason="this case drives the pre-commit runner")
     env = dict(os.environ, PRE_COMMIT_HOME=str(tmp_path / "pre-commit-home"))
     return subprocess.run(
         [sys.executable, "-m", "pre_commit", "run"],

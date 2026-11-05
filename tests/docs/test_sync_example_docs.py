@@ -153,6 +153,29 @@ def test_removing_an_example_updates_the_generated_navigation(tmp_path, monkeypa
     assert "text_to_image" not in (tmp_path / NAV).read_text(encoding="utf-8")
 
 
+def test_a_hand_written_page_survives_the_stale_page_sweep(tmp_path, monkeypatch):
+    """The examples/ tree also holds hand-written pages for model-specific examples.
+
+    Only a page whose slug the generator produces is its to delete; touching
+    examples/ must not take `online_serving/glm_image.md` with it.
+    """
+    run = _repo_with_generator(tmp_path)
+    example = tmp_path / "examples/offline_inference/text_to_image/README.md"
+    example.parent.mkdir(parents=True)
+    example.write_text("# Text to image", encoding="utf-8")
+
+    handwritten = tmp_path / "docs/user_guide/examples/online_serving/glm_image.md"
+    handwritten.parent.mkdir(parents=True)
+    handwritten.write_text("# GLM-Image Online Serving\n\nWritten by hand.\n", encoding="utf-8")
+    run("add", "-A")
+
+    monkeypatch.chdir(tmp_path)
+    assert sync.main() == 0
+
+    assert handwritten.exists()
+    assert "Written by hand." in handwritten.read_text(encoding="utf-8")
+
+
 def test_removing_a_generated_page_on_its_own_is_rejected(tmp_path, monkeypatch):
     """A deletion-only commit cannot slip past the generated-page guard."""
     run = _repo(tmp_path)

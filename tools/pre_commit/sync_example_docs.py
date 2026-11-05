@@ -135,7 +135,7 @@ def export_index(root: Path, destination: Path) -> None:
     )
 
 
-def apply_snapshot(root: Path, snapshot: Path) -> tuple[list[str], list[str]]:
+def apply_snapshot(root: Path, snapshot: Path, generated_slugs: frozenset[str]) -> tuple[list[str], list[str]]:
     """Write the snapshot's pages back and report (to_stage, to_remove).
 
     Every page the snapshot produced is returned for staging, even when the
@@ -144,8 +144,10 @@ def apply_snapshot(root: Path, snapshot: Path) -> tuple[list[str], list[str]]:
     would leave the source committed without it. Redundant writes are still
     skipped, which is a separate concern from what reaches the index.
 
-    A page the snapshot did not produce is removed only if git tracks it; a
-    local untracked page is left alone.
+    A page the snapshot did not produce is removed only if git tracks it and its
+    slug is one the generator produces. `docs/user_guide/examples/` also holds
+    hand-written pages for model-specific examples — thirteen of the 25 tracked
+    pages — and those are never the generator's to delete.
     """
     produced_root = snapshot / GENERATED_PAGE_PREFIX
     target_root = root / GENERATED_PAGE_PREFIX
@@ -176,7 +178,7 @@ def apply_snapshot(root: Path, snapshot: Path) -> tuple[list[str], list[str]]:
         for page in sorted(target_root.rglob("*.md")):
             relative = page.relative_to(target_root).as_posix()
             path = f"{GENERATED_PAGE_PREFIX}{relative}"
-            if relative not in produced and path in tracked:
+            if relative not in produced and path in tracked and Path(relative).stem in generated_slugs:
                 to_remove.append(path)
     return to_stage, to_remove
 
@@ -216,14 +218,24 @@ def regenerate(root: Path) -> tuple[list[str], list[str]]:
                 generate_examples.EXAMPLE_DIR = snapshot / EXAMPLES_PREFIX
                 generate_examples.EXAMPLE_DOC_DIR = snapshot / GENERATED_PAGE_PREFIX
                 generate_examples.NAV_FILE = snapshot / NAV_FILE
+                # The display names are read once at import, from the working
+                # tree. Point the file at the snapshot and reload, or the page
+                # titles come from whatever the contributor has open. A manifest
+                # missing from the index keeps the working-tree copy, so a commit
+                # that only touches examples/ cannot start failing on this.
+                snapshot_names = snapshot / EXAMPLES_PREFIX / "model_display_names.yml"
+                if snapshot_names.exists():
+                    generate_examples.MODEL_DISPLAY_NAMES_FILE = snapshot_names
+                    generate_examples.MODEL_DISPLAY_NAMES = generate_examples.load_model_display_names()
                 generate_examples.on_startup("build", False)
+                generated_slugs = generate_examples.GENERAL_EXAMPLE_SLUGS
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 f"the mkdocs generator needs '{exc.name}', which this hook does not "
                 f"install. Add it to additional_dependencies under the "
                 f"'sync-example-docs' entry in .pre-commit-config.yaml."
             ) from exc
-        return apply_snapshot(root, snapshot)
+        return apply_snapshot(root, snapshot, generated_slugs)
 
 
 def main() -> int:
@@ -263,6 +275,12 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - surface any generator failure to the user
         print(
             f"error: generating the example pages failed: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "\nThis is the hook failing, not something wrong with your commit. To commit "
+            "without it, run it again with SKIP=sync-example-docs (Windows: "
+            "set SKIP=sync-example-docs) and paste the error above into an issue.",
             file=sys.stderr,
         )
         return 1
