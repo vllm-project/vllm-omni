@@ -51,9 +51,8 @@ Prerequisites
 Bucketing env vars (applied automatically for the "on" pass)
 ------------------------------------------------------------
 * ``--bucket-seconds 2,4,8,16,30`` — the rung ladder in seconds (rung mel
-  frames = seconds x 100).
+  frames = seconds x 16000 / hop, where ``hop`` is the model's verified hop).
 * ``--bucket-modules encoder`` — which encoder modules to bucket.
-* ``--bucket-time-axis 2`` — the time axis of the feature tensor.
 
 ``--max-seconds 29`` drops clips longer than 29 s: Step-Audio-2's positional
 embedding caps at 30 s (``n_audio_ctx=1500`` at 100 fps), so longer clips crash.
@@ -91,7 +90,6 @@ SEED = 42
 _BUCKET_ENV = (
     "VLLM_OMNI_AUDIO_BUCKET_SECONDS",
     "VLLM_OMNI_AUDIO_BUCKET_MODULES",
-    "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS",
 )
 
 
@@ -195,7 +193,6 @@ def transcribe(args, clips: list[str], on: bool) -> dict[str, str]:
     if on:
         os.environ["VLLM_OMNI_AUDIO_BUCKET_SECONDS"] = args.bucket_seconds
         os.environ["VLLM_OMNI_AUDIO_BUCKET_MODULES"] = args.bucket_modules
-        os.environ["VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"] = args.bucket_time_axis
     else:
         for k in _BUCKET_ENV:
             os.environ.pop(k, None)
@@ -354,7 +351,6 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N clips (0 = all).")
     parser.add_argument("--bucket-seconds", type=str, default="2,4,8,16,30")
     parser.add_argument("--bucket-modules", type=str, default="encoder")
-    parser.add_argument("--bucket-time-axis", type=str, default="2")
     parser.add_argument(
         "--max-extra",
         type=int,

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -44,8 +45,6 @@ __all__ = [
 
 _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
 _ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
-_ENV_TIME_AXIS = "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"
-_ENV_CONTEXT_MARGIN = "VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN"
 _DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
@@ -132,34 +131,29 @@ def _rungs_from_env(hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
     return tuple(max(1, int(round(s * 16000 / hop))) for s in seconds)
 
 
-def _context_margin_from_env() -> int | None:
-    """Return the deployment-wide conv context margin, or None if unset.
-
-    Kept parallel to ``VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS``: a deployment knob so
-    a model does not have to declare ``bucketing_context_margin`` on its encoder.
-    """
-    raw = os.environ.get(_ENV_CONTEXT_MARGIN, "").strip()
-    if not raw:
-        return None
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        logger.warning("Ignoring invalid %s=%r", _ENV_CONTEXT_MARGIN, raw)
-        return None
-
-
 # Verified models: the pipeline ``model_type`` -> the per-encoder knobs that have
 # been validated end-to-end. A model NOT listed here cannot use bucketing —
 # install_bucketed_encoders logs a warning and returns [] (the original forward
 # is served unchanged). ``model_type`` is the same identifier an author writes
 # in the PipelineConfig when registering a model, so the reference table and the
 # whitelist share one name.
+#
+# Per-model fields (determined by reading the model's feature-extraction code):
+#   hop             — STFT hop length in samples, i.e. the mel frame rate. The
+#                     processor publishes encoder_bucket_frames = samples // hop,
+#                     and the seconds ladder becomes seconds * 16000 / hop frames.
+#                     e.g. 160 = 10 ms at 16 kHz (100 fps).
+#   context_margin  — the max extra mel frames the front conv reads beyond the
+#                     published length. For a model whose real frame count is
+#                     (samples + C) // hop + D, it is C // hop + D + 1, so the
+#                     bucketed window copies at most one zero-padding frame past
+#                     the real content and stays bit-identical. StepAudio2
+#                     right-pads 479 (C=479, D=0), so the offset is 2..3 and the
+#                     margin is 3.
+#   time_axis       — which feature axis is time: 1 = (B, T, D) time-major,
+#                     2 = (B, mel, T) channels-first. Read the encoder's input
+#                     tensor shape / forward docstring.
 _VERIFIED_MODELS: dict[str, dict[str, int]] = {
-    # StepAudio2's log_mel_spectrogram right-pads 479 samples before the STFT, so
-    # its real mel frame count T = (samples + 479) // 160 is 2..3 frames longer
-    # than the processor-published samples // 160. A context margin of 3 covers
-    # the worst case: the bucketed window copies at most 1 zero-padding frame,
-    # which is harmless, so the output stays bit-identical.
     "step_audio_2": {"hop": 160, "context_margin": 3, "time_axis": 2},
     "covo_audio": {"hop": 160, "context_margin": 0, "time_axis": 2},
 }
@@ -167,19 +161,9 @@ _VERIFIED_MODELS: dict[str, dict[str, int]] = {
 
 def _verified_knobs(vllm_config) -> dict[str, int] | None:
     """Return the verified bucketing knobs, or None if the model is unverified."""
+    if vllm_config is None:
+        return None
     return _VERIFIED_MODELS.get(vllm_config.model_config.hf_config.model_type)
-
-
-def _context_margin_for(module: nn.Module, verified_margin: int = 0) -> int:
-    """Env var wins, then the encoder's class attribute, then the verified
-    whitelist value, then 0."""
-    from_env = _context_margin_from_env()
-    if from_env is not None:
-        return from_env
-    declared = getattr(module, "bucketing_context_margin", None)
-    if declared is not None:
-        return int(declared)
-    return verified_margin
 
 
 def _as_tensor(output):
@@ -242,55 +226,29 @@ class _BucketedEncoder:
         self._disabled = False
         self._truncation_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
-        # Verified time axis from the whitelist, used when neither the env var
-        # nor a class attribute nor a fixed-window shim pins the layout.
+        # Verified time axis from the whitelist (the fixed-window shim overrides
+        # it to channels-first 2).
         self._default_time_axis: int | None = None
         # Extra feature frames the encoder's front conv reads beyond the
         # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
         # Bucketing and copying add this margin; the attention mask length is
         # unchanged (it still uses the reported valid length). Set per encoder
-        # by the installer (env var -> class attribute -> whitelist -> 0).
+        # by the installer from the whitelist.
         self._context_margin = 0
 
     def publish(self, lengths: tuple[int, ...] | None) -> None:
         self._lengths = lengths
 
-    def _resolve_time_axis(self, features, lengths) -> int:
+    def _resolve_time_axis(self) -> int:
         """1 = time on dim 1 (B, T, D); 2 = time on dim 2 (B, mel, T).
-        Explicit env wins; a per-module ``bucketing_time_axis`` contract wins
-        over the length-scale heuristic (which is unreliable for all-short
-        batches), and the heuristic is the last-resort fallback."""
-        spec = os.environ.get(_ENV_TIME_AXIS, "auto").strip().lower()
-        if spec in ("1", "2"):
-            return int(spec)
-        declared = getattr(self.module, "bucketing_time_axis", None)
-        if declared is not None:
-            try:
-                axis = int(declared)
-            except (TypeError, ValueError):
-                axis = None
-            if axis in (1, 2):
-                return axis
-            logger.warning(
-                "Bucketed encoder %r declares invalid bucketing_time_axis %r; "
-                "falling back to the length-scale heuristic",
-                self.name,
-                declared,
-            )
-        # The fixed-window Whisper recipe operates on the module's native
-        # channels-first (B, mel, T) layout by construction — mel bins on
-        # dim 1, padded time on dim 2 — regardless of how short the true
-        # lengths are (a 1s clip has fewer frames than mel bins, which would
-        # defeat the length-scale heuristic below).
+
+        The verified whitelist ``time_axis`` is authoritative. The fixed-window
+        Whisper recipe forces channels-first (2) regardless, since it operates
+        on the module's native (B, mel, T) layout by construction.
+        """
         if self._shim is not None:
             return 2
-        if self._default_time_axis is not None:
-            return self._default_time_axis
-        time_on_1, time_on_2 = features.size(1), features.size(2)
-        longest = max(lengths)
-        if longest > time_on_1 and time_on_2 >= longest:
-            return 2
-        return 1
+        return self._default_time_axis if self._default_time_axis is not None else 1
 
     def _time_dim(self, features) -> int:
         return features.size(1) if self._axis == 1 else features.size(2)
@@ -311,17 +269,21 @@ class _BucketedEncoder:
 
         lengths, mask, length_arg = self._host_lengths(features, args[1:])
         if lengths is None or len(lengths) != features.size(0):
+            logger.debug(
+                "Bucketed encoder %r: no per-item lengths (got %r); falling back to the original forward",
+                self.name,
+                None if lengths is None else len(lengths),
+            )
             return self._original(*args, **kwargs)
 
         # Route empty batches and batches containing an item longer than the
         # largest rung through the untouched forward (cheap host-side checks).
-        # max(lengths) is only valid on a non-empty sequence, and
-        # _resolve_time_axis also calls max(lengths), so the empty case must be
-        # handled first. len() == 0 also stays valid if lengths is ever a tensor.
+        # max(lengths) is only valid on a non-empty sequence, so the empty case
+        # must be handled first.
         if len(lengths) == 0:
             return self._original(*args, **kwargs)
 
-        self._axis = self._resolve_time_axis(features, lengths)
+        self._axis = self._resolve_time_axis()
 
         # An over-long item cannot be bucketed without truncating its tail,
         # which would silently change that item's output length downstream.
@@ -499,6 +461,9 @@ class _BucketedEncoder:
 # --------------------------------------------------------------- auto install
 
 
+_installed_hop: int | None = None
+
+
 def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
     try:
         from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -507,7 +472,16 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
         from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
     except Exception:
         return
+    global _installed_hop
     if getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False):
+        if _installed_hop is not None and _installed_hop != hop:
+            logger.warning(
+                "Bucketed encoder processor hook already installed with hop %d; "
+                "a second install with hop %d is ignored (mixed-hop models in one "
+                "process are unsupported).",
+                _installed_hop,
+                hop,
+            )
         return
 
     # Wrap the two concrete orchestration methods so that, for every multimodal
@@ -520,35 +494,47 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
 
     def _wrap(orig):
         def wrapped(self, *args, **kwargs):
-            # Both callbacks are assigned as plain functions on the instance, so
-            # they are invoked WITHOUT binding self; the captured originals are
-            # already bound methods.
-            main = self._apply_hf_processor_main
-            get = self._get_mm_fields_config
+            # The per-call instance-attribute swap is guarded by a per-instance
+            # reentrant lock: _cached_apply_hf_processor calls back into
+            # _apply_hf_processor, so the outer and inner wraps nest on the same
+            # thread, while distinct processor instances stay concurrent. Only the
+            # same instance must serialize (its _main/_get can hold one closure at
+            # a time); different instances never touch each other's attributes.
+            lock = self.__dict__.get("_bucket_processor_lock")
+            if lock is None:
+                # setdefault resolves the first-use race atomically; both threads
+                # reuse whichever lock wins rather than two disjoint locks.
+                lock = self.__dict__.setdefault("_bucket_processor_lock", threading.RLock())
+            with lock:
+                # Both callbacks are assigned as plain functions on the instance,
+                # so they are invoked WITHOUT binding self; the captured originals
+                # are already bound methods.
+                main = self._apply_hf_processor_main
+                get = self._get_mm_fields_config
 
-            def _main(mm_items, hf_kwargs):
-                result = main(mm_items, hf_kwargs)
+                def _main(mm_items, hf_kwargs):
+                    result = main(mm_items, hf_kwargs)
+                    try:
+                        frames = _frames_from_mm_items(mm_items, hop)
+                        if frames is not None:
+                            result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
+                    except Exception:
+                        logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
+                    return result
+
+                def _get(hf_inputs, hf_processor_mm_kwargs):
+                    fields = dict(get(hf_inputs, hf_processor_mm_kwargs))
+                    if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
+                        fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
+                    return fields
+
+                self._apply_hf_processor_main = _main
+                self._get_mm_fields_config = _get
                 try:
-                    frames = _frames_from_mm_items(mm_items, hop)
-                    if frames is not None:
-                        result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
-                except Exception:
-                    logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
-                return result
-
-            def _get(hf_inputs, hf_processor_mm_kwargs):
-                fields = dict(get(hf_inputs, hf_processor_mm_kwargs))
-                if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
-                    fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
-                return fields
-
-            self._apply_hf_processor_main = _main
-            self._get_mm_fields_config = _get
-            try:
-                return orig(self, *args, **kwargs)
-            finally:
-                self._apply_hf_processor_main = main
-                self._get_mm_fields_config = get
+                    return orig(self, *args, **kwargs)
+                finally:
+                    self._apply_hf_processor_main = main
+                    self._get_mm_fields_config = get
 
         return wrapped
 
@@ -556,6 +542,7 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
     BaseMultiModalProcessor._cached_apply_hf_processor = _wrap(_orig_cached)
 
     OmniMultiModalProcessor._bucket_frames_installed = True
+    _installed_hop = hop
     logger.info("Bucketed encoder processor hook installed")
 
 
@@ -591,8 +578,12 @@ def install_bucketed_processor_hook(vllm_config=None) -> bool:
     """
     if _rungs_from_env() is None:
         return False
+    verified = _verified_knobs(vllm_config)
+    if vllm_config is not None and verified is None:
+        # Unverified model: leave it fully untouched (the worker's wrapper is
+        # also skipped), matching the warning in install_bucketed_encoders.
+        return False
     hop = _DEFAULT_HOP
-    verified = _verified_knobs(vllm_config) if vllm_config is not None else None
     if verified is not None and verified.get("hop"):
         hop = verified["hop"]
     _install_processor_hook(hop)
@@ -632,11 +623,12 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
 
     verified = _verified_knobs(vllm_config)
     if verified is None:
+        model_type = vllm_config.model_config.hf_config.model_type if vllm_config is not None else "<unknown>"
         logger.warning(
             "Bucketed encoder is not verified for model_type %r; disabling the "
             "feature and serving the untouched forward. Verified model_type values: "
             "%s. Remove %s to silence this warning.",
-            vllm_config.model_config.hf_config.model_type,
+            model_type,
             sorted(_VERIFIED_MODELS),
             _ENV_SECONDS,
         )
@@ -655,7 +647,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
-        encoder._context_margin = _context_margin_for(module, verified["context_margin"])
+        encoder._context_margin = verified["context_margin"]
         encoder._default_time_axis = verified["time_axis"]
         for klass in type(module).__mro__:
             shim = _FORWARD_SHIMS.get(klass.__name__)
