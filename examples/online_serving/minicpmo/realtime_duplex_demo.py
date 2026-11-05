@@ -479,12 +479,17 @@ async def _drain_forced_post_commit_response(
     post-commit settle is final -- the server is idle, and suppressing the
     re-ask there would strand an already-answered session in ``TimeoutError``;
     the re-ask stays armed and settles it on the forced answer or on the
-    definitive refusal. (The one deferral a native session still has is the
-    video-only commit -- no audio in the buffer while a response runs, on a
-    model that accepts video without audio and has no concurrent-turn
-    capability. This driver's commits all carry audio, so they never take
-    that path.) Errors reported after the commit suppress the re-ask either
-    way, since the server is refusing rather than slow. The flip side for CI
+    definitive refusal.     (The deferrals a native session still has: a video-only commit -- no
+    audio in the buffer while a response runs, on a model that accepts video
+    without audio and has no concurrent-turn capability, and only when the
+    session ever appended video frames; and a commit that landed while a
+    response was already running -- there the runner rides the in-flight
+    answer instead of precreating, so that settle belongs to the old
+    response and the answer's own ``response.created`` follows. The caller
+    keys ``commit_may_defer_create`` on both conditions plus its
+    non-auto-response sessions, so a settle is treated as final only when
+    none of them applies.) Errors reported after the commit suppress the
+    re-ask either way, since the server is refusing rather than slow. The flip side for CI
     triage on a deferring session: if the server drops the deferred create
     after such activity, the drain can only end in ``TimeoutError`` -- no
     re-ask will have fired -- so a client timeout in that situation points
@@ -972,6 +977,16 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # answer opt in.
         final_create_response = bool(getattr(args, "final_create_response", False))
         forced_response_fallback_sent = False
+        # Whether this session ever appended video frames: only such a session
+        # can take the runner's video-only commit deferral (see the drain call
+        # below). The recognition driver never appends video, so CI runs
+        # record False here by construction.
+        video_frames_appended = bool(video_frames)
+        # Whether a response was still running when the final commit was
+        # issued: the runner then rides the in-flight answer instead of
+        # precreating, so a settle right after the commit belongs to the old
+        # response rather than to an idle server.
+        response_in_progress_at_commit = False
         # A drain timeout must not erase the fact that the re-ask reached the
         # server: record it as soon as the send succeeds, then fold it back in
         # after the wait ends.
@@ -1000,27 +1015,40 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
             if wait_for_post_commit_decision:
                 if final_create_response:
+                    response_in_progress_at_commit = _response_in_progress(collector.events[: committed_index + 1])
                     forced_response_fallback_sent = await _drain_forced_post_commit_response(
                         client,
                         collector,
                         committed_index=committed_index,
                         timeout_s=args.timeout_s,
                         create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
-                        # The MiniCPM-o session runs the native auto-response
-                        # scheduler: its audio commits never park the forced
-                        # create behind an active response (the one deferral
-                        # left is a video-only commit, and this driver's
-                        # commits all carry audio), so a settle that lands
-                        # after the commit is final instead of the preamble
-                        # of a promotion -- the re-ask must stay armed for it.
-                        # The flag is read from the client config rather than
-                        # guessed: ``SessionConfig.to_payload`` puts this same
-                        # ``auto_response`` value into the session's
-                        # ``extra_body`` at connect time, and the server
-                        # derives its auto-response scheduling from exactly
-                        # that key, so the client copy is the value the
-                        # server is acting on.
-                        commit_may_defer_create=not client.config.auto_response,
+                        # When may a settle that lands after the commit be the
+                        # preamble of more server work, so the re-ask must
+                        # stay armed instead of firing?
+                        # - A session whose model does not auto-respond can
+                        #   park the forced create behind an active response
+                        #   and promote it later.
+                        # - A session that ever appended video frames can take
+                        #   the video-only deferral (a commit with no audio
+                        #   while a response runs, on a model that accepts
+                        #   video without audio; the runner drops the deferral
+                        #   when the payload carries audio). This driver's
+                        #   recognition runs never append video, so the flag
+                        #   is False for them by construction -- recorded in
+                        #   ``post_commit.video_frames_appended``.
+                        # - The commit landed while a response was running:
+                        #   the runner then drops the forced precreate and the
+                        #   terminal input rides the in-flight answer instead,
+                        #   so that settle belongs to the old response and the
+                        #   answer's own ``response.created`` follows.
+                        # The client-side flag is the server's own value, not
+                        # a guess: ``SessionConfig.to_payload`` puts this same
+                        # ``auto_response`` into the session's ``extra_body``
+                        # at connect time and the server derives its
+                        # auto-response scheduling from exactly that key.
+                        commit_may_defer_create=(
+                            not client.config.auto_response or bool(video_frames) or response_in_progress_at_commit
+                        ),
                         on_fallback_sent=lambda: fallback_progress.__setitem__("sent", True),
                     )
                 else:
@@ -1143,6 +1171,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "final_create_response": final_create_response,
                 "forced_response_fallback_sent": forced_response_fallback_sent,
                 "input_had_residual_model_unit": input_has_residual_model_unit,
+                "video_frames_appended": video_frames_appended,
+                "response_in_progress_at_commit": response_in_progress_at_commit,
                 "response_created_count": _event_count_after(
                     collector.events,
                     "response.created",

@@ -131,6 +131,21 @@ def _fake_encode_audio(audio: object, sample_rate_hz: int, response_format: str,
     return f"wav-{samples}" if samples > 0 else None
 
 
+class _NoNativeTurnPolicyPlugin(MiniCPMO45DuplexPlugin):
+    """Same plugin with ``supports_model_native_turn_policy`` off from open.
+
+    Session setup itself sees the flag down, so a runner that ever caches the
+    capability at open time cannot make the dropped-flag tests pass for the
+    wrong reason.
+    """
+
+    def capabilities(self, *, max_sessions: int):
+        return replace(
+            super().capabilities(max_sessions=max_sessions),
+            supports_model_native_turn_policy=False,
+        )
+
+
 @dataclass
 class Harness:
     manager: DuplexSessionManager
@@ -1424,20 +1439,37 @@ async def test_create_response_commit_is_dropped_while_a_response_is_still_runni
         assert base64.b64decode(final_append["payload"]["audio"]) == (
             pcm_f32(3200, value=0.05) + pcm_f32(12800, value=0.0)
         )
+        # Close the loop on the armed re-ask: once the running answer settles,
+        # the submitted terminal input is the model's to answer, so a plain
+        # response.create neither duplicates the response nor reports an
+        # error -- the in-flight terminal append carries the turn.
+        events = await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, turn_end=True, turn_id=0))
+        assert "response.done" in types(events)
+        events = await h.run(commands.CreateResponse())
+        await h.settle()
+        post_create_types = [event.type for event in h.events]
+        tail = post_create_types[post_create_types.index("response.done") + 1 :]
+        assert "response.created" not in tail
+        assert "error" not in tail
     finally:
         await close_harness(h)
 
 
 @pytest.mark.asyncio
 async def test_create_response_commit_is_dropped_without_model_native_turn_policy() -> None:
-    h = await open_harness(extra_body={"force_listen_count": 0})
+    # The session opens with the capability already off, so the commit path
+    # cannot cache a stale value from session setup.
+    h = await open_harness(
+        plugin=_NoNativeTurnPolicyPlugin(_fake_encode_audio),
+        extra_body={"force_listen_count": 0},
+    )
     try:
         # The session's extra_body still drives the auto-response scheduler
         # while the capability flag is off: a non-native session keeps opening
         # its responses on model output, so the commit's forced create must
         # not precreate there either -- only the retained committed input,
         # which keeps the client's re-ask armed.
-        h.session.capabilities = replace(h.session.capabilities, supports_model_native_turn_policy=False)
+        assert h.session.capabilities.supports_model_native_turn_policy is False
         for _ in range(7):
             await h.run(append_audio(3200, value=0.05))
         events = await h.run(commands.Commit(create_response=True))
