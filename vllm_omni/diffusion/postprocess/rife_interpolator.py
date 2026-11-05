@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 RIFE 4.22.lite frame interpolation for vLLM-Omni video generation.
 
@@ -13,8 +13,10 @@ The FrameInterpolator wrapper and vLLM-Omni integration code are original work.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -22,11 +24,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.postprocess.frame_timing import FrameInterpolationPlan
+
 logger = init_logger(__name__)
 
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
 _MODEL_CACHE: dict[tuple[str, str], Model] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+_DEFAULT_MAX_OUTPUT_BYTES = 1 << 30
 
 
 def warp(ten_input: torch.Tensor, ten_flow: torch.Tensor) -> torch.Tensor:
@@ -184,7 +189,7 @@ class IFNet(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        timestep: float = 0.5,
+        timestep: float | torch.Tensor = 0.5,
         scale_list: list[float] | None = None,
     ) -> tuple[list[torch.Tensor], torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | torch.Tensor]]:
         if scale_list is None:
@@ -194,7 +199,7 @@ class IFNet(nn.Module):
         img0 = x[:, :channel]
         img1 = x[:, channel:]
 
-        if not torch.is_tensor(timestep):
+        if not isinstance(timestep, torch.Tensor):
             timestep = (x[:, :1].clone() * 0 + 1) * timestep
         else:
             timestep = timestep.repeat(1, 1, img0.shape[2], img0.shape[3])
@@ -431,6 +436,90 @@ class FrameInterpolator:
         result = torch.stack(result_frames, dim=2)
         return restore_layout(restore_range(result)), 2**exp
 
+    @torch.no_grad()
+    def resample_tensor(
+        self,
+        video: torch.Tensor,
+        plan: FrameInterpolationPlan,
+        scale: float = 1.0,
+        *,
+        max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+        check_cancel: Callable[[], None] | None = None,
+    ) -> torch.Tensor:
+        """Resample canonical ``[B, 3, T, H, W]`` frames onto ``plan``.
+
+        Input is uint8 or float16/bfloat16/float32 in [0, 1]. Output retains
+        that dtype/layout and uses the cached model's execution device. The
+        caller must encode at ``plan.output_fps``; no serving FPS metadata is
+        changed here. ``max_output_bytes`` bounds only the float32 result,
+        excluding source conversion, weights and inference workspaces.
+        Cancellation propagates from the callback; the execution owner is
+        responsible for draining any already queued device work.
+        """
+        if not isinstance(plan, FrameInterpolationPlan):
+            raise TypeError("plan must be a FrameInterpolationPlan")
+        if video.ndim != 5 or video.shape[1] != 3:
+            raise ValueError("resampling requires canonical [B, 3, T, H, W] video")
+        if any(size <= 0 for size in video.shape):
+            raise ValueError("resampling requires nonempty video dimensions")
+        if video.shape[2] != plan.source_frames:
+            raise ValueError("video frame count does not match plan.source_frames")
+        if video.dtype not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError("resampling requires uint8, float16, bfloat16 or float32 video")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise TypeError("resampling scale must be a finite positive number")
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("resampling scale must be finite and positive")
+        if isinstance(max_output_bytes, bool) or not isinstance(max_output_bytes, int):
+            raise TypeError("max_output_bytes must be an integer")
+        if max_output_bytes <= 0:
+            raise ValueError("max_output_bytes must be positive")
+
+        output_frames = plan.output_frames
+        batch, channels, _, height, width = video.shape
+        output_bytes = batch * channels * output_frames * height * width * 4
+        if output_bytes > max_output_bytes:
+            raise ValueError(
+                f"float32 resampling output requires {output_bytes} bytes, "
+                f"exceeding max_output_bytes={max_output_bytes}"
+            )
+        if video.is_floating_point():
+            # Reductions produce scalars instead of allocating a video-sized
+            # boolean validation mask or a converted copy before admission.
+            minimum, maximum = torch.aminmax(video)
+            lower, upper = minimum.item(), maximum.item()
+            if not math.isfinite(lower) or not math.isfinite(upper) or lower < 0 or upper > 1:
+                raise ValueError("floating resampling input must be finite and within [0, 1]")
+        if check_cancel is not None:
+            check_cancel()
+
+        preferred_device = video.device
+        if preferred_device.type == "cpu":
+            preferred_device = _select_torch_device()
+        model = self._ensure_model_loaded(preferred_device=preferred_device)
+        frames = video.detach().to(device=model.device(), dtype=torch.float32)
+        if video.dtype == torch.uint8:
+            frames.div_(255.0)
+        result = torch.empty(
+            (batch, channels, output_frames, height, width), dtype=torch.float32, device=model.device()
+        )
+        for slot in range(output_frames):
+            if check_cancel is not None:
+                check_cancel()
+            left, right, fraction = plan.source_position(slot)
+            if fraction == 0.0 or left == right:
+                frame = frames[:, :, left]
+            else:
+                frame = model.inference(frames[:, :, left], frames[:, :, right], scale=scale, timestep=fraction)
+            result[:, :, slot].copy_(frame)
+
+        if video.dtype == torch.uint8:
+            result.mul_(255.0).round_().clamp_(0, 255)
+        result = result.to(dtype=video.dtype)
+        if check_cancel is not None:
+            check_cancel()
+        return result
+
 
 def interpolate_video_tensor(
     video: torch.Tensor,
@@ -441,3 +530,19 @@ def interpolate_video_tensor(
     """Interpolate a video tensor and return the FPS multiplier."""
     interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate_tensor(video, exp=exp, scale=scale)
+
+
+def resample_video_tensor(
+    video: torch.Tensor,
+    plan: FrameInterpolationPlan,
+    scale: float = 1.0,
+    model_path: str | None = None,
+    *,
+    max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    check_cancel: Callable[[], None] | None = None,
+) -> torch.Tensor:
+    """Resample CFR frames; consumers must use ``plan.output_fps`` directly."""
+    interpolator = FrameInterpolator(model_path=model_path)
+    return interpolator.resample_tensor(
+        video, plan, scale=scale, max_output_bytes=max_output_bytes, check_cancel=check_cancel
+    )
