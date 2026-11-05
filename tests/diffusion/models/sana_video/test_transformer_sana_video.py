@@ -8,7 +8,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @pytest.fixture(autouse=True)
-def _init_distributed(monkeypatch):
+def _init_distributed(monkeypatch, tmp_path):
     """The native transformer uses vLLM parallel linear layers, which require a
     tensor-parallel group; initialize a single-process group for CPU tests."""
     from vllm.distributed.parallel_state import (
@@ -18,17 +18,21 @@ def _init_distributed(monkeypatch):
     )
     from vllm.model_executor.layers.utils import default_unquantized_gemm
 
-    from tests.helpers.runtime import assign_ephemeral_master_port
-
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda *_args, **_kwargs: default_unquantized_gemm,
     )
-    assign_ephemeral_master_port()
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{tmp_path / 'sana-video-distributed'}",
+    )
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 _TINY_CONFIG = {
