@@ -530,7 +530,9 @@ def test_keep_steps_rejects_latent_offload_features(monkeypatch: pytest.MonkeyPa
         lambda extra, conditioning, *, inherit_canvas: (conditioning, SimpleNamespace()),
     )
     with pytest.raises(OmniClientError, match="continue_from"):
-        pipeline._prepare_encoder_conditioning_inputs(_keep_steps_conditioning(), _sampling(keep_steps=2))
+        pipeline._prepare_encoder_conditioning_inputs(
+            _keep_steps_conditioning(), _sampling(keep_steps=2, continue_from="job-1")
+        )
 
     pipeline = _validation_pipeline()
     monkeypatch.setattr(pipeline, "_resolve_latent_refine", lambda extra: SimpleNamespace())
@@ -609,7 +611,7 @@ def _local_pipeline(monkeypatch: pytest.MonkeyPatch):
         qwen_videos=[object()],
         video_timestamps=[[0.0]],
         condition_labels=[("image", 1), ("video", 1)],
-        media=SimpleNamespace(num_frames=NUM_FRAMES),
+        media=SimpleNamespace(num_frames=NUM_FRAMES, height=64, width=64),
     )
     media_conditioning = MiniMaxH3EncoderMediaConditioning(
         task="ref2va",
@@ -682,6 +684,15 @@ def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.Mo
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     with pytest.raises(OmniClientError, match="must be an integer"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=9))
+    assert encode_prompt.call_count == 0
+
+
+def test_config_incompatible_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    """Restrictions decidable from the config alone reject before any Qwen pass."""
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    pipeline.od_config.kv_offload_config = "tier2"
+    with pytest.raises(OmniClientError, match="reference-KV offload"):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
     assert encode_prompt.call_count == 0
 
 

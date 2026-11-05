@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, unflatten_payload
+from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -17,7 +18,6 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_PRESENTATION_TASK_KEY,
     MiniMaxH3EncoderConditioning,
 )
-from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
 from vllm_omni.model_executor.models.minimax_h3.timeline_guides import MINIMAX_H3_TIMELINE_GUIDES_KEY
 

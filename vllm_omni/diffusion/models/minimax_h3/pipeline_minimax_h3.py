@@ -3025,27 +3025,35 @@ class MiniMaxH3Pipeline(
         task: str | None = None,
         condition_labels: Sequence[tuple[str, int]] | None = None,
         timeline_guides: bool = False,
+        latent_hw: tuple[int, int] | None = None,
     ) -> int | None:
         """Validate and normalize ``keep_steps`` before the second encoder pass.
 
         Shared by ``_prepare_local_conditioning`` (before the optional second
         Qwen pass over the image-only presentation) and
         ``_prepare_encoder_conditioning_inputs`` (the authoritative check), so
-        requests that can never switch -- malformed ``keep_steps``, the
-        degenerate ``== num_steps`` value, or a combination the switch rejects
-        -- do not pay for that pass. Rejection here happens after media
-        preparation (``prepare_encoder_inputs`` already decoded the
-        references) but before any Qwen/VAE model encode. Returns the
-        validated integer, or ``None`` when ``keep_steps`` is absent or
-        equals the step count (degenerate: the historical full-video path).
+        requests that can never switch do not pay for that pass. Covered here:
+        malformed ``keep_steps``, the degenerate ``== num_steps`` value, and
+        every restriction decidable from the request config alone (pinned
+        schedules, task, audio labels, timeline guides, ``continue_from``,
+        ``pad_seq_len``, step execution, reference-KV offload, turbo/native
+        LoRA, latent refine/upscale). Still enforced only in the authoritative
+        check, because they need encoded conditioning or runtime model state:
+        audio-reference/guide tensors, latent-mask editing, control rows,
+        resolved latent continuations, the AdaLN sidecar, and cache_dit
+        quality. Rejection here happens after media preparation
+        (``prepare_encoder_inputs`` already decoded the references) but before
+        any Qwen/VAE model encode. Returns the validated integer, or ``None``
+        when ``keep_steps`` is absent or equals the step count (degenerate:
+        the historical full-video path).
 
         ``num_steps`` and ``base_schedule`` must come from
         ``_resolve_sigma_positions``; both call sites resolve them that way,
         so a pinned sigma schedule or a fused checkpoint cannot make the
         early and authoritative checks disagree. Switch-specific restrictions
-        (pinned schedules, task, audio, guides) only apply after the
-        degenerate ``== num_steps`` value is normalized away, preserving the
-        original semantics where such requests simply run full-video.
+        only apply after the degenerate ``== num_steps`` value is normalized
+        away, preserving the original semantics where such requests simply
+        run full-video.
         """
         keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
         if keep_steps is None:
@@ -3069,10 +3077,33 @@ class MiniMaxH3Pipeline(
             )
         if task is not None and task != "ref2va":
             raise OmniClientError("MiniMax H3 keep_steps requires task ref2va")
+        extra = getattr(sampling, "extra_args", None) or {}
         if condition_labels is not None and any(label[0] == "audio" for label in condition_labels):
             raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
         if timeline_guides:
             raise OmniClientError("MiniMax H3 keep_steps does not support timeline guides")
+        if extra.get("continue_from") is not None:
+            # A continue_from prefix rides the layout as a frame-0 guide,
+            # which changes the reference geometry the switch relies on.
+            raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
+        if extra.get("pad_seq_len") is not None:
+            raise OmniClientError("MiniMax H3 keep_steps does not support pad_seq_len")
+        if bool(getattr(self.od_config, "step_execution", False)):
+            raise OmniClientError("MiniMax H3 keep_steps does not support step execution")
+        if getattr(self.od_config, "kv_offload_config", None):
+            # The Tier-2 reference KV state is sized per branch at loop
+            # start; the mid-loop switch changes the reference row count.
+            raise OmniClientError("MiniMax H3 keep_steps does not support reference-KV offload")
+        if self._active_turbo_spec(sampling) is not None or self._has_active_native_lora(sampling):
+            raise OmniClientError("MiniMax H3 keep_steps does not support turbo or native LoRA sampling")
+        if self._resolve_latent_refine(extra) is not None or (
+            latent_hw is not None
+            and self._resolve_latent_upscale(extra, latent_h=latent_hw[0], latent_w=latent_hw[1]) is not None
+        ):
+            # The hi-res route re-runs diffuse() over a second layout with
+            # the same prepared kwargs; the base branch is built for the
+            # first full schedule only.
+            raise OmniClientError("MiniMax H3 keep_steps does not support latent refine/upscale passes")
         return keep_steps
 
     def _prepare_local_conditioning(
@@ -3150,6 +3181,7 @@ class MiniMaxH3Pipeline(
                         task=task,
                         condition_labels=prepared.condition_labels,
                         timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
+                        latent_hw=(int(prepared.media.height) // 16, int(prepared.media.width) // 16),
                     )
                 base_encode_needed = (
                     keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
@@ -3540,22 +3572,21 @@ class MiniMaxH3Pipeline(
         # reference conditions only the first ``keep_steps`` denoise steps;
         # the request then continues from an image-only presentation.
         # Normalization runs before the second encoder pass (see
-        # _normalize_keep_steps); the checks below need the encoded
-        # conditioning and stay authoritative for external presentations.
-        keep_steps = self._normalize_keep_steps(sampling, num_steps=num_steps, base_schedule=base_schedule, task=task)
+        # _normalize_keep_steps); every restriction decidable from the
+        # request config lives there. The checks below need the encoded
+        # conditioning or runtime model state and stay authoritative here.
+        keep_steps = self._normalize_keep_steps(
+            sampling,
+            num_steps=num_steps,
+            base_schedule=base_schedule,
+            task=task,
+            latent_hw=(conditioning.height // 16, conditioning.width // 16),
+        )
         if keep_steps is not None:
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support continuation")
-            if latent_continuation is not None:
-                # A continue_from prefix rides the layout as a frame-0 guide,
-                # which changes the reference geometry the switch relies on.
-                raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
             if control_rows is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support control conditioning")
-            if getattr(self.od_config, "kv_offload_config", None):
-                # The Tier-2 reference KV state is sized per branch at loop
-                # start; the mid-loop switch changes the reference row count.
-                raise OmniClientError("MiniMax H3 keep_steps does not support reference-KV offload")
             if (
                 conditioning.video_edit_clean_rows is not None
                 or conditioning.audio_edit_clean_rows is not None
@@ -3566,14 +3597,6 @@ class MiniMaxH3Pipeline(
                 or extra.get("audio_mode", "native") == "lock_source"
             ):
                 raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
-            if extra.get("pad_seq_len") is not None:
-                raise OmniClientError("MiniMax H3 keep_steps does not support pad_seq_len")
-            if bool(getattr(self.od_config, "step_execution", False)):
-                raise OmniClientError("MiniMax H3 keep_steps does not support step execution")
-            if turbo_spec is not None or has_native_lora:
-                raise OmniClientError("MiniMax H3 keep_steps does not support turbo or native LoRA sampling")
-            if self._fasth3 is not None:
-                raise OmniClientError("MiniMax H3 keep_steps does not support step-skipping features")
             if conditioning.guide_blocks:
                 # Guide rows pack ahead of the reference rows, so the
                 # image-row prefix slice that builds the base branch anchor
@@ -3626,11 +3649,6 @@ class MiniMaxH3Pipeline(
             extra, latent_h=conditioning.height // 16, latent_w=conditioning.width // 16
         )
         latent_refine = self._resolve_latent_refine(extra)
-        if keep_steps is not None and (upscale_target is not None or latent_refine is not None):
-            # The hi-res route re-runs diffuse() over a second layout with the
-            # same prepared kwargs; the image-only base branch is only built
-            # for the first pass's full schedule.
-            raise OmniClientError("MiniMax H3 keep_steps does not support latent refine/upscale passes")
         if latent_refine is not None:
             if (
                 control_rows is not None
