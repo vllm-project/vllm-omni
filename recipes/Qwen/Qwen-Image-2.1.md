@@ -490,13 +490,9 @@ QWEN_IMAGE21_TEST_MODEL=Qwen/Qwen-Image-2.1 python -m pytest \
 The test uses eight CUDA GPUs, HSDP8/Ulysses8, BF16 eager execution, and
 two denoise steps; it is a correctness test, not a serving benchmark.
 
-A separate vLLM 0.32.0 regression on eight RTX PRO 5000 48GB Blackwell GPUs
-found a limitation when replacing a short negative prompt with a repeated
-long Chinese negative prompt: RGB PSNR versus cache-off was 30.01 dB
-(`max_abs=118`) at 256x256 and two steps. Seven other cases in that run were
-bitwise equal. The 40 dB threshold above applies to the selected in-tree
-regression inputs, not arbitrary changed-length prompts. Disable cross-request
-prefix caching when strict reproduction of those requests is required.
+The 40 dB threshold applies to the selected in-tree regression inputs.
+Numerical agreement is configuration-specific and is reported separately
+for each tested workload.
 
 The cache deliberately isolates image-count/size layouts and CFG branches.
 Replacing a later reference image reuses earlier images only when the layout
@@ -547,7 +543,59 @@ partial/full trials share the unsalted namespace.
 These are sequential offline request latencies, not concurrent serving
 throughput. Keep each speedup comparison on one host and GPU configuration.
 
-#### Measured latency and output agreement
+#### Validation on vLLM 0.33
+
+After merging upstream `a2d3b4b2`, the prefix-cache path was revalidated at
+`8c463de7` with vLLM 0.33.0 (frozen wheel commit `4ba787ec9`),
+PyTorch 2.14.0+cu130, CUDA 13.0, cuDNN 9.25.1, Transformers 5.19.0 and
+diffusers 0.40.0. All comparisons below use the same host and allocation.
+
+Affected diffusion/KV/scheduler/runner CPU suites passed **910 tests**;
+image/chat API and profiler endpoints passed **122 tests**, with one existing
+expected failure. The eight-GPU partial-prefix/COW regression passed in
+317.39 seconds on eight RTX PRO 5000 72GB Blackwell cards,
+BF16, HSDP8/Ulysses8, 256² and two steps. All four cases matched cache-off
+bitwise in RGB and alpha, including the changed-text and changed-later-image
+hits with two tail-page copies each. A separate 480×608 control also matched
+bitwise for `mask_sp_padding=False` and `True`, cold and warm: 1,140 logical
+target tokens and four synthetic SP padding tokens.
+
+The representative performance follow-up uses one RTX PRO 5000 72GB card,
+Base at 1024², 50 steps, CFG scale 4, two references and seed 42.
+It uses the benchmark above: fresh processes per mode, two warmups and
+five measured trials per cold/partial/full case, with 14 GiB KV in paged modes.
+References are deterministic synthetic 128×128 RGB inputs processed normally.
+
+| Case | Dense s | Paged off s | Paged on s | Dense / on | Off / on |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cold | 48.983 | 50.248 | 50.488 | 0.970× | 0.995× |
+| partial | 49.006 | 50.313 | 49.554 | 0.989× | 1.015× |
+| full | 49.048 | 50.328 | 48.157 | 1.019× | 1.045× |
+
+All **15/15 measured cache-on/off full-image SHA256 pairs match**, including
+alpha. Each case's first saved on/off output array also matches bitwise.
+The following on/dense comparisons use those first saved matching inputs:
+
+| Case | On/off RGBA | On/dense RGB dB | On/dense RGB max | On/dense alpha max |
+| --- | --- | ---: | ---: | ---: |
+| cold | bitwise | 34.37 | 131 | 8 |
+| partial | bitwise | 36.71 | 159 | 5 |
+| full | bitwise | 34.91 | 161 | 4 |
+
+Actual decode-graph replay was observed in dense mode; paged modes did not
+replay decode graphs. Whole-run NVML sampled peaks were
+**57.76/52.16/52.15 GiB** for dense/off/on.
+These samples include startup, warmup, untimed preparation and retention
+probes, rather than per-request incremental memory. The paged-on pool has
+**1,792 physical blocks / 14 GiB**, retaining **1/32 full common CFG prefixes**
+after lookup-only probes. Capacity depends on image and text lengths.
+
+Full common-prefix hits give **1.045× versus paged-off** and **1.019× versus
+dense** in this Base single-GPU workload. Cold and changed-last-image partial
+requests remain slower than dense. This follow-up does not relabel the earlier
+Base/Turbo single-/multi-GPU matrix as vLLM 0.33 results.
+
+#### Earlier vLLM 0.32 measurements
 
 NVIDIA RTX PRO 5000 Blackwell, BF16, PyTorch 2.13.0+cu130, vLLM 0.32.0.
 Single-GPU cohorts use one 72GB card; HSDP8/Ulysses8 cohorts use eight
