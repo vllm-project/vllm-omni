@@ -21,8 +21,8 @@ def _assert_isolated_import_succeeds(script: str) -> None:
     # unrelated, inconsistent device-selection environment prevent the child
     # interpreter from reaching the boundary assertion.
     env = os.environ.copy()
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,
@@ -65,6 +65,7 @@ forbidden_prefixes = (
     "vllm_omni.entrypoints.duplex",
     "vllm_omni.entrypoints.duplex_omni",
     "vllm_omni.clients",
+    "vllm_omni.model_executor.common.duplex",
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
@@ -104,6 +105,7 @@ if missing:
 
 forbidden_prefixes = (
     "vllm_omni.clients",
+    "vllm_omni.model_executor.common.duplex",
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",

@@ -17,14 +17,16 @@ class QwenDuplexSessionState(DuplexModelSessionState):
     """Mutable model-owned state of one Qwen duplex session (owned by the session runner)."""
 
     audio_buffer: QwenPcmBuffer = field(default_factory=QwenPcmBuffer)
-    # Keep content objects alongside payloads so identity survives history copies.
-    audio_history: list[tuple[object, dict]] = field(default_factory=list)
+    # Each payload can combine several audio commits from one pending turn.
+    # Keep their content objects so associations survive shallow history copies.
+    audio_history: list[tuple[tuple[object, ...], dict]] = field(default_factory=list)
     input_since_commit: bool = False
     speech_since_commit: bool = False
     context_locked: bool = False
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0
+    committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
     continuation_owner_id: str | None = None
@@ -42,12 +44,14 @@ class QwenDuplexSessionState(DuplexModelSessionState):
         self.committed_audio_payload = payload
         self.committed_audio_operation_id = operation_id
         self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+        self.committed_audio_consume_started = False
 
     def clear_committed_audio(self) -> int:
         reserved_bytes = self.committed_audio_reserved_bytes
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         self.deferred_response_create = False
         self.deferred_precreate_response = False
         return reserved_bytes

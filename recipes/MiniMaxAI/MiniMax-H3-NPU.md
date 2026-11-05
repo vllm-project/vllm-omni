@@ -281,6 +281,185 @@ curl -sS -X POST "${API_URL}" \
   -o t2va.mp4
 ```
 
+This requires the FLASH_ATTN backend and MindIE-SD. H3 automatically applies
+exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
+kernel's fp16 workspace cannot overflow on outlier activations. Measured on
+the FastH3 four-step Dense configuration below, T2VA 15 s at 1344x768, this
+kernel reduced end-to-end latency from ~73 s to ~57 s (about 22%).
+
+## FastH3 four-step on A3
+
+[FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
+DMD2 student of H3-Base; see
+[MiniMax-H3.md § FastH3 adapter](MiniMax-H3.md#fasth3-adapter) for the adapter
+contract. On A3 the adapter cannot be fused the GPU way. The GPU recipe fuses
+it at load time from `--lora-path`, but that path replicates the full model per
+rank and does not fit in 64 GB HBM. A3 needs distributed layerwise offload, and
+offload is refused with `--lora-path` because it streams weights in without
+going through the fusion (see the GPU recipe's note on why
+`--enable-distributed-layerwise-offload` fails fast with a FastH3 adapter).
+
+The A3 path therefore fuses the adapter **offline**, once, into a native-layout
+checkpoint that distributed layerwise offload can memory-map directly. This
+also lets the offloaded server start without `--lora-path`, so the fusion
+contract check that rejects offload never fires.
+
+### Prepare the fused checkpoint (one-time, offline)
+
+The fusion runs in the vLLM-Omni native namespace
+(`blocks.N.attn.qkv_proj.weight`), matching the base H3 `FL2VA` transformer
+layout. It reads the base transformer and the Dense adapter, adds the adapter's
+low-rank and full-rank deltas per shard, symlinks the unchanged components
+(text encoder, VAEs, tokenizer, processor), and writes the four-step sigma
+ladder into `model_index.json` so the pipeline samples on the release's rungs
+rather than a uniform schedule.
+
+Download the base checkpoint's `FL2VA` partition (native layout) and the Dense
+adapter:
+
+```bash
+export BASE_DIR=/path/to/MiniMax-H3
+hf download MiniMaxAI/MiniMax-H3 --include "FL2VA/*" --local-dir "${BASE_DIR}"
+
+export FASTH3_DIR=/path/to/fasth3
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+```
+
+> The published full checkpoint
+> `FastVideo/FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree` is stored in the
+> diffusers layout (`transformer_blocks.N.attn.to_q/to_k/to_v`, split QKV,
+> value-first MLP). Distributed layerwise offload memory-maps by exact runtime
+> parameter name and has no diffusers-to-native remap for H3, so that artifact
+> cannot be served directly. Fuse from the base `FL2VA` partition instead — its
+> keys already match the runtime.
+
+Run the fusion:
+
+```python
+# prepare_fasth3_dense.py — fuse base H3 FL2VA + FastH3 Dense adapter (native layout)
+import json, os, shutil, sys, time
+import torch
+from safetensors.torch import load_file, save_file
+from vllm_omni.diffusion.models.minimax_h3.fasth3 import FastH3WeightFusion
+
+BASE = os.environ["BASE_DIR"] + "/FL2VA"          # base H3 FL2VA partition (native layout)
+ADAPTER = os.environ["FASTH3_DIR"] + "/dense-datafree/adapter_model.safetensors"
+OUT = os.environ.get("FUSED_DIR", "/path/to/FastH3-Dense-Fused/FL2VA")
+
+# MiniMax-H3 architecture
+HEAD_DIM, NUM_BLOCKS, NUM_REFINER_BLOCKS = 128, 50, 2
+# FastH3 four-step sigma positions; the pipeline adds per-modality shift on top.
+BASE_SCHEDULE = [0.999, 0.749, 0.5, 0.25, 0.0]
+COMPONENTS = ["audio_vae", "video_vae", "text_encoder", "tokenizer", "processor"]
+
+fusion = FastH3WeightFusion.from_path(
+    ADAPTER, head_dim=HEAD_DIM, num_blocks=NUM_BLOCKS,
+    num_refiner_blocks=NUM_REFINER_BLOCKS)
+assert fusion is not None, "adapter not recognized as FastH3"
+
+os.makedirs(OUT + "/transformer", exist_ok=True)
+src_t = BASE + "/transformer"
+for shard in sorted(f for f in os.listdir(src_t)
+                    if f.endswith(".safetensors") and "index" not in f):
+    data = load_file(os.path.join(src_t, shard), device="cpu")
+    fused = {}
+    for k, v in data.items():
+        fv = fusion.fuse(k, v)
+        fused[k] = fv.to("cpu").to(torch.bfloat16) if fv is not v else v
+    save_file(fused, os.path.join(OUT, "transformer", shard))
+fusion.validate_fully_applied()   # every delta must have met its parameter
+
+for j in os.listdir(src_t):       # copy transformer index/config
+    if j.endswith(".json"):
+        shutil.copy2(os.path.join(src_t, j), os.path.join(OUT, "transformer", j))
+
+for c in COMPONENTS:              # symlink unchanged components
+    s = os.path.join(BASE, c)
+    if os.path.exists(s):
+        os.symlink(os.path.realpath(s), os.path.join(OUT, c))
+
+idx = json.loads(open(BASE + "/model_index.json").read())   # inject sigma ladder
+idx.setdefault("_minimax_h3", {})["base_schedule"] = BASE_SCHEDULE
+open(OUT + "/model_index.json", "w").write(json.dumps(idx, indent=4) + "\n")
+print("fused ->", OUT)
+```
+
+```bash
+export FUSED_DIR=/path/to/FastH3-Dense-Fused/FL2VA
+python prepare_fasth3_dense.py
+```
+
+### Serve the fused checkpoint
+
+Serve the fused directory with the same multi-NPU flags as the base recipe, but
+**without** `--lora-path` — the adapter is already in the weights. Keep
+distributed layerwise offload and, optionally, LaserAttention:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PORT=9098
+export MODEL=/path/to/FastH3-Dense-Fused/FL2VA
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
+export MINDIE_SD_FA_TYPE="ascend_laser_attention"   # optional
+
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --task-type t2va \
+  --init-timeout 1800 \
+  --stage-init-timeout 1800 \
+  --num-gpus 8 \
+  --usp 8 \
+  --ring 1 \
+  --text-encoder-tp-size 8 \
+  --enable-distributed-layerwise-offload \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --vae-patch-parallel-size 8 \
+  --diffusion-attention-backend FLASH_ATTN
+```
+
+Requests must ask for `num_inference_steps=4` and `task=t2va`; FastH3 preview v1
+distills the T2VA path only. The first request includes regional compilation
+(~50 s warmup); exclude it from steady-state numbers.
+
+```bash
+curl -s -X POST "http://localhost:${PORT}/v1/videos/sync" \
+  -F 'prompt=A golden retriever running through a sunflower field at sunset' \
+  -F 'seconds=5' \
+  -F 'aspect_ratio=16:9' \
+  -F 'num_inference_steps=4' \
+  -o out.mp4
+```
+
+### Measured FastH3 four-step evidence
+
+Measured on an Atlas 800I A3 server (8x NPU) with CANN 9.0.1, PyTorch
+2.10.0+cpu, torch_npu 2.10.0.post2, the multi-NPU configuration above, T2VA at
+1344x768, one warmup excluded:
+
+| Duration | LaserAttention | End-to-end |
+| ---: | --- | ---: |
+| 4 s | on | ~12 s (768x768), ~15 s (1344x768) |
+| 8 s | on | ~26 s |
+| 15 s | on | ~57 s |
+| 5 s | off | ~19 s |
+| 10 s | off | ~41 s |
+| 15 s | off | ~73 s |
+
+These describe the validated shapes rather than a general throughput guarantee.
+
+> A native `--lora-path + --enable-distributed-layerwise-offload` path that
+> fuses during the offload memory-map (avoiding the offline step) is possible
+> through the offload backend's per-tensor transform hook, but is left as future
+> work pending upstream design discussion.
+
+## FastH3 HTTP API examples
+
 Switch tasks via `extra_params.task` (`t2va` / `fl2va` / `ref2va`); FL2VA and
 Ref2VA additionally pass `input_references` (first-frame image, reference
 video/audio). The full parameter table lives in the GPU recipe.
@@ -303,6 +482,62 @@ then on top of the recommended configuration above:
 T2VA only; FL2VA and Ref2VA are not supported, and neither
 `--enable-cpu-offload` nor `--enable-layerwise-offload` may be combined with
 it.
+
+## Optional LiteVAE video decoder
+
+Add the following to select the standard non-INT8 Lite decoder:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+See the [LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for
+checkpoint requirements and decoder selection rules.
+
+### LiteVAE measurements: 8 Ascend 910B4 NPUs
+
+The following exploratory measurements compare LiteVAE enabled against main
+on **8 Ascend 910B4 NPUs**. They cover T2VA with these fixed settings:
+
+- FlashGen online LoRA, PEFT backend, scale 1, four inference steps, seed 1101.
+- 124 frames at 24 FPS, five-second request duration, flow shift 12, audio shift 3.
+- USP8, ring1, text encoder TP8, VAE tile mode with tiling and patch parallel size 8.
+- Distributed layerwise offload, DiT INT8, RainFusion sparsity 0.8 starting at step 0.
+- `preencode_mp4=false`, `video_vae_decoder=null`; only the LiteVAE-enabled arm sets `lightvae_decoder_path`.
+
+This measured FlashGen/RainFusion combination differs from the dense FlashGen
+configuration above. To reproduce it, use the same LoRA and eight-card serving
+flags, replace the attention configuration with the following (do not also
+select the dense backend), and keep the pipeline profiler disabled:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"start_step":0}}}'
+```
+
+Five prompts cover cats playing brass instruments, a freckled portrait,
+floating balloons, embossed book titles, and piano hands.
+
+Each prompt/resolution/configuration combination includes one warmup and three
+measured requests. For each configuration, average the five per-prompt hot-run
+medians, then divide the main latency by the LiteVAE latency for speedup.
+
+| Case | Requested resolution | Output resolution | E2E speedup | E2E latency reduction | Video VAE decode speedup | VAE latency reduction |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 854 x 480 | 832 x 480 | 1.186x | 15.7% | 2.603x | 61.6% |
+| 2 | 864 x 480 | 864 x 480 | 1.175x | 14.9% | 2.694x | 62.9% |
+| 3 | 1280 x 720 | 1280 x 704 | 1.217x | 17.8% | 2.619x | 61.8% |
+| 4 | 1344 x 768 | 1344 x 768 | 1.182x | 15.4% | 2.640x | 62.1% |
+
+Video VAE timing uses current-stream NPU Events around `decode_latent()` and
+takes the maximum duration across eight ranks as a stage critical-path
+estimate. It excludes DiT denoising, audio decode, MP4 encoding, and HTTP
+delivery. Current-stream Events do not independently measure unrelated streams.
+
+The main, PR-off, and PR-on matrix completed 240 requests including warmups.
+PR-off MP4 hashes match main for all 20 prompt/resolution combinations.
+Manual visual review found some visually noticeable quality degradation with
+LiteVAE enabled compared with the original decoder. The speedup comes with a
+visual-quality trade-off.
 
 ## CPU MP4 response encoding (Atlas A2)
 
@@ -366,6 +601,38 @@ recommended lossy configuration. Memory figures are per device.
 
 These numbers describe the validated shapes rather than a general throughput
 guarantee.
+
+## Experimental reference-KV offload
+
+MiniMax-H3 can periodically reuse visual-reference K/V on intermediate denoise
+steps. This is opt-in and lossy because its bidirectional attention makes the
+reference K/V change as target tokens evolve. Omit `--kv-offload-config` for the
+existing full-compute path. For an experiment with the two-layer staging ring:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
+  --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"int8"}'
+```
+
+The JSON object accepts three keys:
+
+| Key | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | `on` | required | Cache reference K/V after Ulysses and prefetch layers into a fixed two-slot device ring. |
+| `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
+| `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization may fall back at runtime. |
+
+Reuse steps skip reference-token QKV projection and reference-query attention. This is lossy.
+The current implementation requires one request per forward and either no
+sequence parallelism or pure Ulysses; Ring and AllGather-KV are unsupported.
+
+The former MiniMax-H3 reference-KV and RainFusion hybrid environment variables
+are no longer used. The experimental RainFusion hybrid uses its validated BSA
+kernel and FP16 kernel input only on compact reference-KV reuse steps; the
+ordinary RainFusion path is unchanged when reference-KV offload is disabled.
+Warm up each configuration before comparing timings and inspect per-request
+reference row counts, refresh counts, and effective host quantization in worker
+logs. A successful HTTP response alone does not prove the cache was used.
 
 ## Known limitations
 

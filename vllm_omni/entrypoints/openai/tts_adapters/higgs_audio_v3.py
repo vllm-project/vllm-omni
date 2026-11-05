@@ -190,9 +190,6 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
             return err
         if not request.input or not request.input.strip():
             return "higgs_audio_v3: input text cannot be empty"
-        if request.ref_audio is not None and not request.ref_text:
-            # Voice clone ref_text is optional for v3 (improves fidelity but not required)
-            pass
         if request.max_new_tokens is not None:
             if request.max_new_tokens < self.max_new_tokens_min:
                 return f"max_new_tokens must be at least {self.max_new_tokens_min}"

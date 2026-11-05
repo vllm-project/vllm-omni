@@ -558,7 +558,7 @@ def test_shared_script_ar_path_reaches_generation(
         # safe against MODEL_NAME's base checkpoint missing the Instruct-only
         # <img_ratio_33>/<img_ratio_36> tokens. Wiring it here exercises the
         # real production path (get_ar_tokenizer_validator via the registry),
-        # not just the isolated fake-tokenizer coverage in test_prompt_utils.py
+        # not just the isolated fake-tokenizer coverage in test_hunyuan_image3_prompt_utils.py
         # / test_shared_script_ar_integration.py.
         validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
     )

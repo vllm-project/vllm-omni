@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from vllm_omni.diffusion.models.lance.lance_transformer import LanceBagel
 from vllm_omni.diffusion.models.lance.pipeline_lance import LancePipeline
@@ -23,6 +25,38 @@ class FramesWithMetadata(list[Image.Image]):
 
 class StopAfterVideoPreprocessError(Exception):
     pass
+
+
+def test_lance_load_weights_uses_canonical_name_for_shared_embedding():
+    pipeline = object.__new__(LancePipeline)
+    torch.nn.Module.__init__(pipeline)
+
+    language_model = torch.nn.Module()
+    language_model.model = torch.nn.Module()
+    language_model.model.embed_tokens = VocabParallelEmbedding(4, 2, padding_size=1, disable_tp=True)
+    pipeline.language_model = language_model
+    pipeline.transformer = language_model.model
+    pipeline.bagel = torch.nn.Module()
+    pipeline.bagel.language_model = language_model
+    pipeline.bagel.time_embedder = torch.nn.Linear(2, 2, bias=False)
+
+    embedding_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    time_weight = torch.full((2, 2), 7.0)
+    loaded = pipeline.load_weights(
+        iter(
+            [
+                ("bagel.language_model.model.embed_tokens.weight", embedding_weight),
+                ("bagel.time_embedder.weight", time_weight),
+            ]
+        )
+    )
+
+    assert loaded == {
+        "language_model.model.embed_tokens.weight",
+        "bagel.time_embedder.weight",
+    }
+    torch.testing.assert_close(language_model.model.embed_tokens.weight, embedding_weight)
+    torch.testing.assert_close(pipeline.bagel.time_embedder.weight, time_weight)
 
 
 def test_normalize_decoded_video_frames_preserves_rgb_pixels_and_fps():

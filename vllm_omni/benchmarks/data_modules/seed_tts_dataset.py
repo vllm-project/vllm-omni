@@ -33,16 +33,16 @@ from vllm.tokenizers.hf import get_cached_tokenizer
 
 logger = logging.getLogger(__name__)
 
-# Matches Qwen3-Omni serving examples (``openai_chat_completion_client_for_multimodal_generation`` /
-# ``qwen3_omni/gradio_demo``) plus explicit TTS / voice-clone instructions for chat completions.
+# Keep the Qwen3-Omni identity prefix, but distinguish reading from conversation:
+# Seed-TTS contains questions and instructions that must be spoken, not answered.
 SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
     "capable of perceiving auditory and visual inputs, as well as generating text and speech.\n"
-    "For this request you act as a text-to-speech engine with zero-shot voice cloning: "
-    "the API provides reference audio and its transcript (ref_audio, ref_text) and task_type Base. "
-    "The user message is the exact text you must speak. "
-    "Synthesize natural speech in the same language as that user text, "
-    "matching the timbre, prosody, and speaking style of the reference audio while reading the new content clearly."
+    "For this request, read the user message aloud verbatim. "
+    "Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. "
+    "Your text response must be exactly the user message. "
+    "Do not add introductions, explanations, answers, or any other words. "
+    "Do not paraphrase, translate, or continue the text."
 )
 
 
@@ -60,6 +60,8 @@ class SeedTTSSampleRequest(SampleRequest):
     seed_tts_ref_wav_path: str = ""
     #: Ordered text targets evaluated as turns in one Realtime session.
     seed_tts_turns: tuple[SeedTTSTurn, ...] = ()
+    #: Base64 WAV used as user input by matched HTTP / Realtime benchmarks.
+    seed_tts_input_audio: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,42 @@ def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None
     return Path(cache).resolve()
 
 
+#: Sample rate every ``--seed-tts-reference-as-input`` clip is normalized to.
+SEED_TTS_INPUT_SAMPLE_RATE_HZ = 24_000
+
+#: Silent tail appended after the reference speech. Server VAD needs more
+#: silence than its own ``silence_duration_ms`` threshold to find the endpoint,
+#: and Realtime benchmarks split content from tail on exactly this value — so
+#: it is one constant, not a literal repeated per call site.
+SEED_TTS_SILENT_TAIL_MS = 1000
+
+
+def _seed_tts_input_audio(path: Path) -> str:
+    """Normalize once so every backend sends identical 24 kHz PCM samples.
+
+    The silent tail is what lets server VAD decide the utterance ended; a
+    client that commits explicitly ends the turn itself and skips it.
+    """
+    import io
+    import math
+
+    import numpy as np
+    import soundfile as sf
+    from scipy.signal import resample_poly
+
+    rate_hz = SEED_TTS_INPUT_SAMPLE_RATE_HZ
+    audio, rate = sf.read(path, dtype="float32", always_2d=True)
+    audio = audio.mean(axis=1)
+    if rate != rate_hz:
+        divisor = math.gcd(rate, rate_hz)
+        audio = resample_poly(audio, rate_hz // divisor, rate // divisor)
+    tail_samples = rate_hz * SEED_TTS_SILENT_TAIL_MS // 1000
+    audio = np.concatenate((audio, np.zeros(tail_samples, dtype=np.float32)))
+    wav = io.BytesIO()
+    sf.write(wav, audio, rate_hz, format="WAV", subtype="PCM_16")
+    return base64.b64encode(wav.getvalue()).decode("ascii")
+
+
 def _ref_audio_payload(wav_path: Path, *, inline: bool) -> str:
     if inline:
         raw = wav_path.read_bytes()
@@ -209,7 +247,10 @@ class SeedTTSDataset(BenchmarkDataset):
         if not self.disable_shuffle:
             rng = random.Random(self.random_seed)
             rng.shuffle(self._rows)
-        self.data = self._rows
+        # ``BenchmarkDataset.data`` is ``Any | None`` upstream, but that base
+        # resolves to Any here, so mypy would otherwise pin the attribute to
+        # this subclass's row type and reject SeedTTSDesignDataset's own rows.
+        self.data: list[Any] = self._rows
         logger.info(
             "Loaded Seed-TTS: root=%s locale=%s rows=%d inline_ref_audio=%s",
             self._root,
@@ -229,7 +270,10 @@ class SeedTTSDataset(BenchmarkDataset):
     ) -> list[SampleRequest]:
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
+        reference_as_input = bool(kwargs.pop("reference_as_input", False))
         turns_per_session = int(kwargs.pop("turns_per_session", 1))
+        if reference_as_input and turns_per_session != 1:
+            raise ValueError("Seed-TTS reference-as-input requires one utterance per request")
         if turns_per_session < 1:
             raise ValueError("turns_per_session must be at least 1")
 
@@ -258,7 +302,9 @@ class SeedTTSDataset(BenchmarkDataset):
             )
             prompt_len = sum(len(tok.encode(f"{self._system_prompt}\n{turn.target_text}")) for turn in turns)
             lang = "English" if self.locale == "en" else "Chinese"
-            ref_uri = _ref_audio_payload(reference_wav_path, inline=self.inline_ref_audio)
+            ref_uri = (
+                None if reference_as_input else _ref_audio_payload(reference_wav_path, inline=self.inline_ref_audio)
+            )
             speech_extra: dict[str, Any] = {
                 "ref_audio": ref_uri,
                 "ref_text": reference_row.ref_text,
@@ -274,11 +320,12 @@ class SeedTTSDataset(BenchmarkDataset):
                     expected_output_len=output_len,
                     multi_modal_data=None,
                     request_id=f"{request_id_prefix}{session_index}",
-                    seed_tts_speech_extra=speech_extra,
+                    seed_tts_speech_extra=None if reference_as_input else speech_extra,
+                    seed_tts_input_audio=_seed_tts_input_audio(reference_wav_path) if reference_as_input else None,
                     seed_tts_utterance_id=turns[0].utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
-                    seed_tts_ref_wav_path=str(reference_wav_path),
+                    seed_tts_ref_wav_path="" if reference_as_input else str(reference_wav_path),
                     seed_tts_turns=turns,
                 )
             )

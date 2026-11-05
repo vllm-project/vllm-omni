@@ -1,0 +1,119 @@
+meta:
+  title: "MOSS-VoiceGenerator"
+  slug: "moss-voicegenerator"
+  provider: "OpenMOSS"
+  description: "OpenMOSS's 1.7B zero-shot voice-design model — generate diverse voices and styles directly from a text prompt with no reference speech — served via vLLM-Omni through the OpenAI /v1/audio/speech API (24 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - OpenMOSS-Team/MOSS-TTS
+    - OpenMOSS-Team/MOSS-TTS-Realtime
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-VoiceGenerator"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "1.7B"
+  active_parameters: "1.7B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--deploy-config"
+    - "vllm_omni/deploy/moss_voice_generator.yaml"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "MOSS-VoiceGenerator zero-shot voice design from a text prompt (no ref audio)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "OpenMOSS-Team/MOSS-VoiceGenerator",
+            "input": "Hello, this voice was designed entirely from a text prompt.",
+            "instructions": "A warm, friendly young female voice with a calm pace.",
+            "response_format": "wav"
+          }' --output designed.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "MOSS-VoiceGenerator 1.7B (MossTTSDelay, n_vq=16) — zero-shot voice design"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [MOSS-VoiceGenerator](https://huggingface.co/OpenMOSS-Team/MOSS-VoiceGenerator)
+  is the **voice-design** member of OpenMOSS's MOSS-TTS Family, served through
+  **vLLM-Omni** with the OpenAI-compatible `/v1/audio/speech` API. It generates
+  diverse voices and styles **directly from a text prompt, with no reference
+  speech**, unifying voice design, style control, and synthesis. It can run
+  standalone or as a design layer that produces a voice for the downstream TTS
+  members of the family. Output is **24 kHz mono**.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU. ~6 GB for the 1.7B talker + ~8 GB for the
+    codec decoder (comparable to MOSS-TTS-Realtime).
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  MOSS-VoiceGenerator shares `model_type=moss_tts_delay`, so pass its deploy
+  config explicitly:
+
+  ```bash
+  vllm serve OpenMOSS-Team/MOSS-VoiceGenerator --omni \
+    --deploy-config vllm_omni/deploy/moss_voice_generator.yaml --port 8000
+  ```
+
+  ## Client usage
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "OpenMOSS-Team/MOSS-VoiceGenerator",
+      "input": "Hello, this voice was designed entirely from a text prompt.",
+      "instructions": "A warm, friendly young female voice with a calm pace.",
+      "response_format": "wav"
+    }' --output designed.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **24 kHz mono**.
+  - No reference speech is used — voice identity comes from the text prompt /
+    `instructions`. The exact prompt schema follows the upstream model card.
+
+  ## References
+
+  - [Model card](https://huggingface.co/OpenMOSS-Team/MOSS-VoiceGenerator)
+  - [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) · [GitHub](https://github.com/OpenMOSS/MOSS-TTS)

@@ -11,7 +11,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A2"}, num_cards=2)]
 
 
 @pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")

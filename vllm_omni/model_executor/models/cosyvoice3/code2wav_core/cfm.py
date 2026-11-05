@@ -4,6 +4,7 @@
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
 from abc import ABC
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -94,6 +95,21 @@ class ConditionalCFM(BASECFM):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond):
+        runner = getattr(self, "_npu_euler_graphs", None)
+        if runner is None or spks is None or cond is None or not isinstance(self.estimator, nn.Module):
+            return self._solve_euler(x, t_span, mu, mask, spks, cond)
+        # Noise is drawn by forward() outside capture and copied on every replay.
+        # Shapes/dtypes are keyed by the runner; changing the CFG coefficient or
+        # autocast policy also requires a distinct graph.
+        autocast = torch.is_autocast_enabled("npu")
+        return runner.run(
+            "cfm_euler",
+            (x, t_span, mu, mask, spks, cond),
+            (self.inference_cfg_rate, autocast, torch.get_autocast_dtype("npu") if autocast else None),
+            lambda *values: (self._solve_euler(*values),),
+        )[0]
+
+    def _solve_euler(self, x, t_span, mu, mask, spks, cond):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -127,36 +143,89 @@ class ConditionalCFM(BASECFM):
             t_in = torch.zeros([estimator_batch], device=x.device, dtype=estimator_dtype)
             spks_in = torch.zeros([estimator_batch, 80], device=x.device, dtype=estimator_dtype)
             cond_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
-        for step in range(1, len(t_span)):
-            # Classifier-Free Guidance inference introduced in VoiceBox
-            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_prepare_2b"):
-                x_in[:batch_size] = x
-                x_in[batch_size:] = x
-                mask_in[:batch_size] = mask
-                mask_in[batch_size:] = mask
-                mu_in[:batch_size] = mu
-                t_in[:] = t
-                if spks is not None:
-                    spks_in[:batch_size] = spks
-                if cond is not None:
-                    cond_in[:batch_size] = cond
-            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_forward_estimator"):
-                dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
-                dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
-                dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_euler_update"):
-                x = x + dt * dphi_dt
-                t = t + dt
-            sol.append(x)
-            if step < len(t_span) - 1:
-                dt = t_span[step + 1] - t
+        # mask/mu/spks/cond do not change during one Euler solve. Stage
+        # them once; only x and t need refreshing on every estimator call.
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_prepare_static_2b"):
+            mask_in[:batch_size] = mask
+            mask_in[batch_size:] = mask
+            mu_in[:batch_size] = mu
+            if spks is not None:
+                spks_in[:batch_size] = spks
+            if cond is not None:
+                cond_in[:batch_size] = cond
+
+        blocked_attn_mask = None
+        if isinstance(self.estimator, torch.nn.Module) and getattr(self.estimator, "_use_npu_graph_attention", False):
+            from vllm_omni.platforms.npu.models.cosyvoice3_graph import cosyvoice3_fia_blocked_mask
+
+            keep_mask = mask_in[:, 0].bool()
+            blocked_attn_mask = cosyvoice3_fia_blocked_mask(
+                keep_mask,
+                query_len=x_in.shape[2],
+                key_len=x_in.shape[2],
+            )
+
+        estimator_session = nullcontext(None)
+        if not isinstance(self.estimator, torch.nn.Module):
+            session_factory = getattr(self.estimator, "estimation_session", None)
+            if session_factory is not None:
+                estimator_session = session_factory(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+
+        with estimator_session as trt_session:
+            for step in range(1, len(t_span)):
+                # Classifier-Free Guidance inference introduced in VoiceBox
+                with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_prepare_dynamic_2b"):
+                    x_in[:batch_size] = x
+                    x_in[batch_size:] = x
+                    t_in[:] = t
+                with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_forward_estimator"):
+                    dphi_dt = self.forward_estimator(
+                        x_in,
+                        mask_in,
+                        mu_in,
+                        t_in,
+                        spks_in,
+                        cond_in,
+                        estimator_session=trt_session,
+                        blocked_attn_mask=blocked_attn_mask,
+                    )
+                with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
+                    dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
+                    dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+                with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_euler_update"):
+                    x = x + dt * dphi_dt
+                    t = t + dt
+                sol.append(x)
+                if step < len(t_span) - 1:
+                    dt = t_span[step + 1] - t
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond):
+    def forward_estimator(
+        self,
+        x,
+        mask,
+        mu,
+        t,
+        spks,
+        cond,
+        estimator_session=None,
+        blocked_attn_mask=None,
+    ):
         if isinstance(self.estimator, torch.nn.Module):
+            if blocked_attn_mask is not None:
+                return self.estimator(
+                    x,
+                    mask,
+                    mu,
+                    t,
+                    spks,
+                    cond,
+                    blocked_attn_mask=blocked_attn_mask,
+                )
             return self.estimator(x, mask, mu, t, spks, cond)
+        elif estimator_session is not None:
+            return estimator_session.run(x, mask, mu, t, spks, cond)
         else:
             # TensorRT estimator: bind raw device pointers. The flow runs in
             # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),

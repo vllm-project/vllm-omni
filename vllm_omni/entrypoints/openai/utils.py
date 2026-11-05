@@ -38,6 +38,34 @@ def get_stage_type(stage_cfg: Any) -> str:
     return getattr(stage_cfg, "stage_type", "llm")
 
 
+def is_image_generation_stage(stage_cfg: Any) -> bool:
+    """Return whether a stage produces the pipeline's final image output.
+
+    Covers both classical diffusion stages (``stage_type == "diffusion"``) and
+    generation-LLM stages that emit images (``stage_type == "llm"`` with
+    ``final_output_type == "image"`` — the legacy topology MammothModa2 used
+    before #7134 migrated it to the shared diffusion runtime). Serving
+    endpoints use this so image routes accept either topology.
+    """
+    if get_stage_type(stage_cfg) == "diffusion":
+        return True
+    final_output_type = None
+    if isinstance(stage_cfg, dict):
+        final_output = stage_cfg.get("final_output", False)
+        final_output_type = stage_cfg.get("final_output_type")
+    elif hasattr(stage_cfg, "get"):
+        try:
+            final_output = stage_cfg.get("final_output", False)
+            final_output_type = stage_cfg.get("final_output_type")
+        except Exception:
+            final_output = getattr(stage_cfg, "final_output", False)
+            final_output_type = getattr(stage_cfg, "final_output_type", None)
+    else:
+        final_output = getattr(stage_cfg, "final_output", False)
+        final_output_type = getattr(stage_cfg, "final_output_type", None)
+    return bool(final_output) and final_output_type in {"image", "images"}
+
+
 def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
     """Return whether a pipeline declares a final video output stage."""
     for stage in stage_configs or ():
@@ -94,21 +122,6 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
     return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
 
 
-def get_supported_speakers_from_hf_config(hf_config: Any) -> set[str]:
-    """Extract supported speaker names from a model hf_config."""
-    config = (
-        hf_config.get("talker_config") if isinstance(hf_config, dict) else getattr(hf_config, "talker_config", None)
-    )
-    if config is None:
-        return set()
-
-    for spk_attr in ("speaker_id", "spk_id"):
-        speakers_dict = config.get(spk_attr) if isinstance(config, dict) else getattr(config, spk_attr, None)
-        if speakers_dict and isinstance(speakers_dict, dict):
-            return {speaker.lower() for speaker in speakers_dict}
-    return set()
-
-
 def resolve_diffusion_od_config(engine_client: Any, diffusion_engine: Any = None) -> Any:
     """Resolve the OmniDiffusionConfig from the engine or diffusion engine."""
     od_config = None
@@ -128,18 +141,3 @@ def is_single_stage_diffusion(engine_client: Any) -> bool:
     if len(stage_configs) != 1:
         return False
     return getattr(stage_configs[0], "stage_type", None) in ("diffusion", "DIFFUSION")
-
-
-def validate_requested_speaker(speaker: str | None, supported_speakers: set[str]) -> str | None:
-    """Normalize and validate an optional speaker value.
-
-    Returns the normalized speaker string when provided, otherwise ``None``.
-    Raises ``ValueError`` when the speaker is not in the supported list.
-    """
-    if not isinstance(speaker, str) or not speaker.strip():
-        return None
-
-    normalized = speaker.lower().strip()
-    if supported_speakers and normalized not in supported_speakers:
-        raise ValueError(f"Invalid speaker '{speaker}'. Supported: {', '.join(sorted(supported_speakers))}")
-    return normalized

@@ -90,3 +90,11 @@ platforms:
       - stage_id: 0
         # FlashInfer is not supported on ROCm.
         attention_backend: TRITON_ATTN
+  xpu:
+    stages:
+      - stage_id: 0
+        # FlashInfer is not supported on XPU. Both stages share one 32 GiB card.
+        attention_backend: FLASH_ATTN
+        gpu_memory_utilization: 0.4
+      - stage_id: 1
+        gpu_memory_utilization: 0.15
