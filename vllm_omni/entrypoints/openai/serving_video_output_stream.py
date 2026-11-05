@@ -911,7 +911,7 @@ class OmniStreamingVideoOutputHandler:
         request: VideoGenerationRequest,
     ) -> tuple[OmniTextPrompt, OmniDiffusionSamplingParams, VideoParams]:
         """Build text-only diffusion inputs for the streaming endpoint."""
-        prompt = cast(OmniTextPrompt, {"prompt": request.prompt})
+        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 

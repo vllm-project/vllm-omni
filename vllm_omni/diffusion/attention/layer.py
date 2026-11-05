@@ -233,7 +233,7 @@ class Attention(nn.Module):
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
             self.attn_backend = attn_backend_cls
-            self.attn_impl_cls: type[AttentionImpl] | type[nn.Module] = self.attn_backend.get_impl_cls()
+            self.attn_impl_cls = self.attn_backend.get_impl_cls()
             if impl_overrides is not None:
                 override = impl_overrides.get(attn_backend_cls.get_name())
                 if override is not None:
@@ -349,7 +349,6 @@ class Attention(nn.Module):
             return None
         assert self.attn_backend is not None  # Custom attention cannot opt into paged KV.
         dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
-        assert isinstance(dtype, torch.dtype), "Model dtype must be resolved before creating a KV cache spec"
         # Keep backend layout discovery under the same config context used by
         # upstream vLLM's attention-spec collector.  vLLM 0.29 moved the
         # block-stride decision off the spec and onto the single physical
@@ -399,7 +398,7 @@ class Attention(nn.Module):
                     "factors. Use Ulysses SP instead."
                 )
             platform_key = current_omni_platform.device_name
-            if not cast(AttentionImpl, self.attention).supports_kv_cache_dtype(dtype, platform_key):
+            if not self.attention.supports_kv_cache_dtype(dtype, platform_key):
                 raise ValueError(
                     f"Attention backend {self.attn_backend.get_name()} does not support "
                     f"kv_cache_dtype={dtype!r} on {platform_key}. Select a compatible "
@@ -507,7 +506,6 @@ class Attention(nn.Module):
             reason = self._cross_backend_limitation(attn_metadata)
             if reason is not None:
                 blocked = self._cross_fallback_blocker(attn_metadata)
-                assert self.sdpa_fallback is not None and self.attn_backend is not None
                 result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
                 return replace(
                     result,
@@ -659,7 +657,7 @@ class Attention(nn.Module):
                 value,
                 omni_attn_metadata=attn_metadata,
             )
-            out = cast(AttentionImpl, self.attention).forward_paged(paged_kv_context)
+            out = self.attention.forward_paged(paged_kv_context)
         else:
             attn_metadata = self._with_kv_cache_dtype(attn_metadata)
             if self.use_ring and strategy is not self._no_parallel_strategy:
@@ -761,7 +759,6 @@ class Attention(nn.Module):
 
     def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
         if self.backend_explicit:
-            assert self.attn_backend is not None
             return (
                 f"Explicit backend {self.attn_backend.get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata)}"
@@ -796,7 +793,6 @@ class Attention(nn.Module):
                 blocked = self._cross_fallback_blocker(attn_metadata)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
-                assert self.sdpa_fallback is not None
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the
