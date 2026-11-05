@@ -29,7 +29,7 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -49,6 +49,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.offloader.config import offload_enabled
@@ -425,14 +426,24 @@ class Flux2ParallelSelfAttention(nn.Module):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.to_out = ColumnParallelLinear(
-            self.inner_dim + self.mlp_hidden_dim,
-            self.out_dim,
-            bias=out_bias,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "to_out"),
-        )
+        if self.local_tp:
+            # Attention and SwiGLU outputs stay sharded; one GEMM + all-reduce
+            # contracts both instead of gathering them for a replicated to_out.
+            self.to_out = MergedRowParallelLinear(
+                [self.inner_dim, self.mlp_hidden_dim],
+                self.out_dim,
+                bias=out_bias,
+                prefix=_join_prefix(prefix, "to_out"),
+            )
+        else:
+            self.to_out = ColumnParallelLinear(
+                self.inner_dim + self.mlp_hidden_dim,
+                self.out_dim,
+                bias=out_bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "to_out"),
+            )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
             num_heads=self.query_num_heads,
@@ -521,9 +532,6 @@ class Flux2ParallelSelfAttention(nn.Module):
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
 
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
-        if self.local_tp:
-            attn_output = tensor_model_parallel_all_gather(attn_output.contiguous())
-            mlp_hidden_states = tensor_model_parallel_all_gather(mlp_hidden_states.contiguous())
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
         hidden_states, _ = self.to_out(hidden_states)
         return hidden_states
@@ -969,11 +977,11 @@ class Flux2Transformer2DModel(nn.Module):
             ]
         )
         if any(block.attn.local_tp for block in self.single_transformer_blocks):
-            # Rank-local shapes are unchanged, but packed weight rows belong
-            # to different ranks. Do not restore the old final-layout cache.
+            # Packed to_qkv_mlp_proj rows and merged to_out columns belong to
+            # different ranks. Do not restore an older final-layout cache.
             self.host_weight_restore_contract = FinalLayoutModelContract(
                 implementation_id="flux2-klein-dit",
-                version="2-local-single-stream-tp",
+                version="3-local-single-stream-tp-merged-row-out",
             )
 
         self.norm_out = AdaLayerNormContinuous(

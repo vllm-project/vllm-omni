@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from .base_linear import DiffusionBaseLinearLayerWithLoRA
 from .column_parallel_linear import (
@@ -9,7 +9,7 @@ from .column_parallel_linear import (
     DiffusionQKVParallelLinearWithLoRA,
 )
 from .replicated_linear import DiffusionReplicatedLinearWithLoRA
-from .row_parallel_linear import DiffusionRowParallelLinearWithLoRA
+from .row_parallel_linear import DiffusionMergedRowParallelLinearWithLoRA, DiffusionRowParallelLinearWithLoRA
 
 __all__ = [
     "DiffusionBaseLinearLayerWithLoRA",
@@ -17,6 +17,7 @@ __all__ = [
     "DiffusionColumnParallelLinearWithLoRA",
     "DiffusionMergedColumnParallelLinearWithLoRA",
     "DiffusionRowParallelLinearWithLoRA",
+    "DiffusionMergedRowParallelLinearWithLoRA",
     "DiffusionQKVParallelLinearWithLoRA",
     "DiffusionMergedQKVParallelLinearWithLoRA",
 ]
