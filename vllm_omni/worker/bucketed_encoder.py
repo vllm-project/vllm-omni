@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "LengthBucketingConfig",
-    "install_bucketed_processor_hook",
+    "install_bucketed_length_recording",
     "install_bucketed_encoders",
 ]
 
@@ -465,8 +465,8 @@ class _BucketedEncoder:
 
 _installed_hop: int | None = None
 
-# Registry of every class-level method patch applied by _install_processor_hook,
-# mapping (class, method_name) -> original, so _uninstall_processor_hook can roll
+# Registry of every class-level method patch applied by _patch_processor_length_recording,
+# mapping (class, method_name) -> original, so _unpatch_processor_length_recording can roll
 # them back for test isolation.
 _PATCHED_METHODS: dict[tuple[type, str], object] = {}
 
@@ -496,8 +496,8 @@ def _wrap_class_method_once(cls: type, name: str, factory) -> None:
         setattr(cls, name, wrapped)
 
 
-def _uninstall_processor_hook() -> None:
-    """Roll back every class-level patch installed by _install_processor_hook.
+def _unpatch_processor_length_recording() -> None:
+    """Roll back every class-level patch installed by _patch_processor_length_recording.
 
     Test-isolation helper: restores each wrapped method and clears the install
     flags so a later install starts from a clean slate.
@@ -516,11 +516,11 @@ def _uninstall_processor_hook() -> None:
             pass
 
 
-def _install_processor_hook(hop: int = _DEFAULT_HOP) -> bool:
-    """Install the length-publishing processor hook, returning True when the
-    hook is active for ``hop``. A mixed-hop second install returns False so the
-    caller can fail safe (leave the encoder unwrapped) instead of silently
-    publishing the wrong frame rate.
+def _patch_processor_length_recording(hop: int = _DEFAULT_HOP) -> bool:
+    """Patch the multimodal processor to record per-item lengths, returning
+    True when the patch is active for ``hop``. A mixed-hop second install
+    returns False so the caller can fail safe (leave the encoder unwrapped)
+    instead of silently recording the wrong frame rate.
 
     The two concrete orchestration methods are patched once at class level. On
     each call they lazily wrap the *defining* override of
@@ -541,7 +541,7 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> bool:
         if getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False):
             if _installed_hop is not None and _installed_hop != hop:
                 logger.warning(
-                    "Bucketed encoder processor hook already installed with hop %d; "
+                    "Bucketed encoder length recording already installed with hop %d; "
                     "refusing to install with hop %d (mixed-hop models in one process "
                     "are unsupported). The encoder is left unwrapped.",
                     _installed_hop,
@@ -602,7 +602,7 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> bool:
         OmniMultiModalProcessor._bucket_frames_installed = True
         _installed_hop = hop
 
-    logger.info("Bucketed encoder processor hook installed")
+    logger.info("Bucketed encoder length recording installed")
     return True
 
 
@@ -626,15 +626,15 @@ def _frames_from_mm_items(mm_items, hop: int = _DEFAULT_HOP) -> list[int] | None
     return frames
 
 
-def install_bucketed_processor_hook(vllm_config=None) -> bool:
-    """Install the length-publishing processor hook in the current process.
+def install_bucketed_length_recording(vllm_config=None) -> bool:
+    """Install per-item length recording in the current process.
 
     Request preprocessing (and therefore ``_apply_hf_processor_main``) runs in
     the frontend/orchestrator process, not in the worker that wraps the encoder,
-    so the hook must be registered where the frontend builds its multimodal
-    processor. Idempotent; returns True when the hook is active. A None or
+    so length recording must be registered where the frontend builds its
+    multimodal processor. Idempotent; returns True when it is active. A None or
     unverified ``vllm_config`` returns False (the model's encoder is not wrapped,
-    so the processor must not publish ``encoder_bucket_frames`` for it), and a
+    so the processor must not record ``encoder_bucket_frames`` for it), and a
     mixed-hop second install also returns False so the caller can fail safe.
     """
     if _rungs_from_env() is None:
@@ -642,11 +642,11 @@ def install_bucketed_processor_hook(vllm_config=None) -> bool:
     verified = _verified_knobs(vllm_config)
     if verified is None:
         # Unverified model (or no vllm_config): leave it fully untouched — the
-        # worker's wrapper is also skipped, so publishing lengths here would
+        # worker's wrapper is also skipped, so recording lengths here would
         # hand the model a field its encoder ignores.
         return False
     hop = verified.get("hop") or _DEFAULT_HOP
-    return _install_processor_hook(hop)
+    return _patch_processor_length_recording(hop)
 
 
 def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder]) -> None:
@@ -694,12 +694,12 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         return []
 
     hop = verified.get("hop") or _DEFAULT_HOP
-    # Fail safe before wrapping: if the processor hook is already publishing a
+    # Fail safe before wrapping: if length recording is already active for a
     # different frame rate (mixed-hop models in one process), wrapping this
     # encoder would bucket by the wrong lengths.
-    if not _install_processor_hook(hop):
+    if not _patch_processor_length_recording(hop):
         logger.warning(
-            "Bucketed encoder processor hook is unavailable for hop %d; "
+            "Bucketed encoder length recording is unavailable for hop %d; "
             "leaving encoders unwrapped so lengths are not bucketed at the wrong frame rate.",
             hop,
         )

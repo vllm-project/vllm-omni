@@ -1682,13 +1682,13 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     ``InputProcessor`` runs unmodified on top of it.
     """
 
-    # The bucketed-encoder processor hook must be registered in the frontend
+    # The bucketed-encoder length recording must be registered in the frontend
     # (this process builds the processor and runs request preprocessing), not
     # in the worker that wraps the encoder module. Idempotent and gated on the
     # bucketing env var.
-    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_length_recording
 
-    install_bucketed_processor_hook(stage_vllm_config)
+    install_bucketed_length_recording(stage_vllm_config)
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
     if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):

@@ -126,13 +126,13 @@ def bucket_env(monkeypatch):
 
 
 @pytest.fixture()
-def restore_processor_hook():
-    """Undo install_bucketed_processor_hook's class-level patches afterwards, so
+def restore_length_recording():
+    """Undo install_bucketed_length_recording's class-level patches afterwards, so
     later tests don't run against a patched processor."""
     yield
-    from vllm_omni.worker.bucketed_encoder import _uninstall_processor_hook
+    from vllm_omni.worker.bucketed_encoder import _unpatch_processor_length_recording
 
-    _uninstall_processor_hook()
+    _unpatch_processor_length_recording()
 
 
 def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
@@ -658,30 +658,30 @@ def test_qwen2audio_keyword_call_keeps_pooling_and_true_fallback(bucket_env):
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
-def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch, restore_processor_hook):
-    """The length-publishing processor hook must be installable from the
-    frontend (which builds the processor and runs request preprocessing), not
-    only from the worker that wraps the encoder module. ``install_bucketed_processor_hook``
-    is the env-gated, idempotent entry point the frontend calls."""
+def test_length_recording_is_frontend_installable_and_env_gated(monkeypatch, restore_length_recording):
+    """The length recording must be installable from the frontend (which builds
+    the processor and runs request preprocessing), not only from the worker that
+    wraps the encoder module. ``install_bucketed_length_recording`` is the
+    env-gated, idempotent entry point the frontend calls."""
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
-    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_length_recording
 
     whitelisted = _mock_vllm_config("step_audio_2")
 
     monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", raising=False)
-    assert install_bucketed_processor_hook(whitelisted) is False
+    assert install_bucketed_length_recording(whitelisted) is False
 
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-    # None means unverified: the hook must not install for a model whose encoder
-    # will not be wrapped.
-    assert install_bucketed_processor_hook() is False
-    # A whitelisted model installs the hook.
-    assert install_bucketed_processor_hook(whitelisted) is True
+    # None means unverified: length recording must not be installed for a model
+    # whose encoder will not be wrapped.
+    assert install_bucketed_length_recording() is False
+    # A whitelisted model installs length recording.
+    assert install_bucketed_length_recording(whitelisted) is True
     assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
 
 
-def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_processor_hook):
-    """The hook must (1) add encoder_bucket_frames from the raw audio sample
+def test_length_recording_adds_and_declares_bucket_frames(monkeypatch, restore_length_recording):
+    """The recording must (1) add encoder_bucket_frames from the raw audio sample
     counts and (2) declare its field config so from_hf_inputs carries it to the
     worker, even when the model's _get_mm_fields_config does not declare it."""
     from contextlib import nullcontext
@@ -693,10 +693,10 @@ def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_pro
     from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
-    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_length_recording
 
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-    install_bucketed_processor_hook(_mock_vllm_config("step_audio_2"))
+    install_bucketed_length_recording(_mock_vllm_config("step_audio_2"))
 
     class Processor(OmniMultiModalProcessor):
         def _get_mm_fields_config(self, *args):
@@ -732,7 +732,7 @@ def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_pro
     assert bucket_values == [300]
 
 
-def test_processor_hook_wraps_wholesale_apply_main_override(monkeypatch, restore_processor_hook):
+def test_length_recording_wraps_wholesale_apply_main_override(monkeypatch, restore_length_recording):
     """A subclass that overrides _apply_hf_processor_main wholesale (no super(),
     e.g. qwen2_5_omni) must still get the length field: the lazy per-class wrap
     targets the most-derived defining override instead of being shadowed."""
@@ -745,10 +745,10 @@ def test_processor_hook_wraps_wholesale_apply_main_override(monkeypatch, restore
     from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
-    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_length_recording
 
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-    install_bucketed_processor_hook(_mock_vllm_config("step_audio_2"))
+    install_bucketed_length_recording(_mock_vllm_config("step_audio_2"))
 
     class Processor(OmniMultiModalProcessor):
         def _apply_hf_processor_main(self, mm_items, hf_kwargs):
@@ -785,32 +785,32 @@ def test_processor_hook_wraps_wholesale_apply_main_override(monkeypatch, restore
     assert bucket_values == [300]
 
 
-def test_mixed_hop_install_fails_safe_and_leaves_encoder_unwrapped(monkeypatch, restore_processor_hook):
+def test_mixed_hop_install_fails_safe_and_leaves_encoder_unwrapped(monkeypatch, restore_length_recording):
     """A second model with a different hop must not wrap its encoder after the
-    first model already installed the processor hook: the published length uses
+    first model already installed the length recording: the published length uses
     the first hop, so bucketing the second encoder with its own hop would give
     silently wrong rung lengths. Both installers must fail safe instead."""
     from vllm_omni.worker import bucketed_encoder
-    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_length_recording
 
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "0.4,1,2")
 
-    # First model installs the hook with hop 160.
+    # First model installs the recording with hop 160.
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
         lambda vllm_config: {"hop": 160, "context_margin": 0, "time_axis": 1},
     )
-    assert install_bucketed_processor_hook(_mock_vllm_config("model_a")) is True
+    assert install_bucketed_length_recording(_mock_vllm_config("model_a")) is True
 
-    # Second model (hop 200): the processor hook refuses, and the worker wrapper
+    # Second model (hop 200): the length recording refuses, and the worker wrapper
     # is skipped so its encoder is never bucketed with the wrong frame rate.
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
         lambda vllm_config: {"hop": 200, "context_margin": 0, "time_axis": 1},
     )
-    assert install_bucketed_processor_hook(_mock_vllm_config("model_b")) is False
+    assert install_bucketed_length_recording(_mock_vllm_config("model_b")) is False
 
     model = ToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=_mock_vllm_config("model_b")) == []
@@ -922,7 +922,7 @@ def test_empty_batch_falls_back_to_original(bucket_env):
 
 def test_encoder_bucket_frames_d2h_sync(bucket_env):
     """The bucketed wrapper reads encoder_bucket_frames on the host without a
-    D2H sync. The keep_on_cpu field config is declared by the processor hook
+    D2H sync. The keep_on_cpu field config is declared by the length recording
     (not the model). CPU frames must not sync; CUDA frames do."""
 
     model = ToyModel().cuda()
