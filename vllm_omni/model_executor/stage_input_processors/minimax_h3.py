@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_PRESENTATION_TASK_KEY,
     MiniMaxH3EncoderConditioning,
 )
+from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
 from vllm_omni.model_executor.models.minimax_h3.timeline_guides import MINIMAX_H3_TIMELINE_GUIDES_KEY
 
@@ -63,13 +64,14 @@ def prepare_encoder_prompt(
     the combined deployment's contract. A pinned distilled schedule can make
     the effective step count smaller than ``num_inference_steps``; such a
     request passes intake and the diffusion stage's authoritative check
-    rejects it. The local-text-encoder path (tests/offline) already works end
-    to end via ``_prepare_local_conditioning``.
+    rejects it with the ``pinned distilled sigma schedules`` error. The
+    local-text-encoder path (tests/offline) already works end to end via
+    ``_prepare_local_conditioning``.
     """
     sampling = _diffusion_sampling_params(sampling_params_list)
     keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
     if keep_steps is not None:
-        num_steps = int(sampling.num_inference_steps or 50)
+        num_steps = int(sampling.num_inference_steps or MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS)
         if type(keep_steps) is not int or not 1 <= keep_steps <= num_steps:
             raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [1, {num_steps}]")
         if keep_steps != num_steps:

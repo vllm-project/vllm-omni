@@ -193,6 +193,7 @@ from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
 )
 from .time_request import (
+    MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS,
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
@@ -1527,7 +1528,9 @@ class MiniMaxH3Pipeline(
             return positions, len(positions) - 1
         sigma_schedule = self._sigma_schedule_for_request(sampling, task)
         if sigma_schedule is None:
-            return None, int(sampling.num_inference_steps or 50)
+            return None, int(
+                sampling.num_inference_steps or MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS
+            )
         # The schedule lists sigma boundaries; the denoise loop runs one step
         # per interval, and that count is what requests and Cache-DiT speak in.
         num_steps = sigma_schedule.num_inference_steps
@@ -3131,18 +3134,23 @@ class MiniMaxH3Pipeline(
                 )
                 # CodeVideoModel keep_steps: validate and normalize before any
                 # encoder work, then encode the image-only presentation only
-                # when the mid-loop switch will actually happen. Resolve the
-                # schedule with the same resolver the authoritative check
-                # uses, so pinned schedules cannot make the two disagree.
-                early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
-                keep_steps = self._normalize_keep_steps(
-                    sampling,
-                    num_steps=early_num_steps,
-                    base_schedule=early_base_schedule,
-                    task=task,
-                    condition_labels=prepared.condition_labels,
-                    timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
-                )
+                # when the mid-loop switch will actually happen. The resolver
+                # only runs for requests that carry keep_steps, so plain
+                # requests keep their original error ordering; when it runs,
+                # it is the same resolver the authoritative check uses, so
+                # pinned schedules cannot make the two disagree.
+                if (sampling.extra_args or {}).get("keep_steps") is None:
+                    keep_steps = None
+                else:
+                    early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
+                    keep_steps = self._normalize_keep_steps(
+                        sampling,
+                        num_steps=early_num_steps,
+                        base_schedule=early_base_schedule,
+                        task=task,
+                        condition_labels=prepared.condition_labels,
+                        timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
+                    )
                 base_encode_needed = (
                     keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
                 )

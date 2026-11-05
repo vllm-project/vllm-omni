@@ -485,6 +485,11 @@ def test_keep_steps_rejects_pinned_distilled_schedule():
         ({"task": "t2va"}, {"task": "t2va", "keep_steps": 2}, "requires task ref2va"),
         (
             {"audio_condition": torch.ones(4, 32), "audio_condition_lengths": (2,)},
+            {"keep_steps": 2},
+            "audio references",
+        ),
+        (
+            {"audio_condition": torch.ones(4, 32), "audio_condition_lengths": (2,)},
             {"keep_steps": 2, "audio_mode": "lock_source"},
             "audio references",
         ),
@@ -676,6 +681,17 @@ def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.Mo
     with pytest.raises(OmniClientError, match="must be an integer"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=9))
     assert encode_prompt.call_count == 0
+
+
+def test_plain_requests_never_touch_the_keep_steps_resolver(monkeypatch: pytest.MonkeyPatch):
+    """Requests without keep_steps keep their original code path untouched."""
+    pipeline, _, encode_prompt = _local_pipeline(monkeypatch)
+    resolver = Mock()
+    monkeypatch.setattr(pipeline, "_resolve_sigma_positions", resolver)
+    conditioning, _ = pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling())
+    resolver.assert_not_called()
+    assert encode_prompt.call_count == 1
+    assert conditioning.base_hidden_states is None
 
 
 # ---------------------------------------------------------------------------
