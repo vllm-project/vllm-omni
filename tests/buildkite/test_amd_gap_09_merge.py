@@ -20,7 +20,7 @@ GROUPS = (("prefill-tail", 1),)
 def test_gap_09_selects_bounded_advanced_rocm_cases() -> None:
     step = _find_step(LABEL, AMD_MERGE_PIPELINE)
     assert step["agent_pool"] == "mi300_1"
-    assert step["grade"] == "Blocking"
+    assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 60
     assert step["source_file_dependencies"]
     assert step["artifact_paths"] == ["artifacts/rocm-merge-customvoice-prefill-tail/**/*"]
