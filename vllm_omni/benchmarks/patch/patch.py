@@ -249,12 +249,12 @@ get_samples_old = datasets.get_samples
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
 
 
+def _env_flag(*names: str) -> bool:
+    return any(os.environ.get(v, "").lower() in ("1", "true", "yes") for v in names)
+
+
 def _seed_tts_capture_pcm_for_wer() -> bool:
-    return os.environ.get("SEED_TTS_WER_EVAL", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    return _env_flag("WER_EVAL", "SEED_TTS_WER_EVAL")
 
 
 #: A transport-level stall (no ``response.done``, socket left open) costs the
@@ -4265,11 +4265,7 @@ async def benchmark(
         print_daily_omni_accuracy_summary,
     )
 
-    _save_items = os.environ.get("DAILY_OMNI_SAVE_EVAL_ITEMS", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    _save_items = _env_flag("SAVE_EVAL_ITEMS", "DAILY_OMNI_SAVE_EVAL_ITEMS")
     _daily_acc = compute_daily_omni_accuracy_metrics(input_requests, outputs, include_per_item=_save_items)
     if _daily_acc is not None:
         result.update(_daily_acc)
@@ -4280,11 +4276,7 @@ async def benchmark(
         print_videomme_accuracy_summary,
     )
 
-    _save_vm = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    _save_vm = _env_flag("SAVE_EVAL_ITEMS", "VIDEOMME_SAVE_EVAL_ITEMS")
     _vm_acc = compute_videomme_accuracy_metrics(input_requests, outputs, include_per_item=_save_vm)
     if _vm_acc is not None:
         result.update(_vm_acc)
@@ -4296,11 +4288,7 @@ async def benchmark(
             print_seed_tts_wer_summary,
         )
 
-        _save_wer = os.environ.get("SEED_TTS_WER_SAVE_ITEMS", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        _save_wer = _env_flag("SAVE_EVAL_ITEMS", "SEED_TTS_WER_SAVE_ITEMS")
         _wer_m = compute_seed_tts_wer_metrics(input_requests, outputs, include_per_item=_save_wer)
         if _wer_m is not None:
             result.update(_wer_m)

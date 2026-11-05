@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -260,33 +261,114 @@ def test_compute_videomme_accuracy_metrics_saves_eval_items() -> None:
     assert metrics["videomme_eval_items"][0]["question_id"] == "q1"
 
 
-def test_videomme_save_eval_items_cli_sets_env(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "argv",
+    [["--save-eval-items"], ["--videomme-save-eval-items"]],
+    ids=["generic-flag", "videomme-deprecated-alias"],
+)
+def test_save_eval_items_cli_sets_env(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+) -> None:
+    from argparse import ArgumentParser
+
     from vllm_omni.benchmarks import serve
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import (
+        add_eval_output_cli_args,
+        add_videomme_cli_args,
+    )
 
     seen: dict[str, str | None] = {}
 
     async def fake_main_async(args: Namespace) -> dict[str, str]:
-        seen["env"] = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS")
+        seen["env"] = os.environ.get("SAVE_EVAL_ITEMS")
+        seen["save_eval_items"] = getattr(args, "save_eval_items", None)
         return {"ok": "1"}
 
-    monkeypatch.delenv("VIDEOMME_SAVE_EVAL_ITEMS", raising=False)
+    monkeypatch.delenv("SAVE_EVAL_ITEMS", raising=False)
     monkeypatch.setattr(serve, "main_async", fake_main_async)
 
-    args = Namespace(
-        videomme_save_eval_items=True,
-        seed_tts_wer_eval=False,
-        seed_tts_wer_save_items=False,
-        daily_omni_save_eval_items=False,
-        omni_request_timeout_s=None,
-        endpoint=None,
-        backend="openai-chat-omni",
-        explicit_keys=frozenset(),
-        extra_body=None,
-        print_stage=False,
-        dataset_name="videomme",
-    )
+    parser = ArgumentParser()
+    add_videomme_cli_args(parser)
+    add_eval_output_cli_args(parser)
+    if argv == ["--videomme-save-eval-items"]:
+        with pytest.warns(FutureWarning, match="videomme-save-eval-items is deprecated"):
+            args = parser.parse_args(argv)
+    else:
+        args = parser.parse_args(argv)
+    assert args.save_eval_items is True
+
+    args.wer_eval = False
+    args.omni_request_timeout_s = None
+    args.endpoint = None
+    args.backend = "openai-chat-omni"
+    args.explicit_keys = frozenset()
+    args.extra_body = None
+    args.print_stage = False
+    args.dataset_name = "videomme"
     assert serve.main(args) == {"ok": "1"}
     assert seen["env"] == "1"
+    assert seen["save_eval_items"] is True
+
+
+def test_eval_output_dataset_lists_are_valid_choices() -> None:
+    """The eval-output dataset lists must not drift from valid --dataset-name choices."""
+    from argparse import ArgumentParser
+
+    from vllm.benchmarks.serve import add_cli_args
+
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import (
+        _SAVE_EVAL_ITEMS_DATASETS,
+        _WER_EVAL_DATASETS,
+        add_omni_args,
+        extend_omni_choices,
+    )
+
+    parser = ArgumentParser()
+    add_cli_args(parser)
+    add_omni_args(parser)
+    extend_omni_choices(parser)
+
+    dataset_choices: set[str] = set()
+    # ``parser._actions`` is private argparse API — the standard way to reach
+    # a registered action's choices; revisit if argparse internals change.
+    for action in parser._actions:
+        if action.dest == "dataset_name" and action.choices is not None:
+            dataset_choices.update(action.choices)
+
+    assert dataset_choices, "dataset_name choices not found on the serve parser"
+    assert _SAVE_EVAL_ITEMS_DATASETS <= dataset_choices
+    assert _WER_EVAL_DATASETS <= dataset_choices
+
+
+@pytest.mark.parametrize("flag", ["save_eval_items", "wer_eval"], ids=["save-eval-items", "wer-eval"])
+def test_eval_output_flags_warn_on_unsupported_dataset(flag: str) -> None:
+    """Eval-output flags warn (not error) when paired with an unsupported dataset."""
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
+
+    args = Namespace(**{flag: True}, dataset_name="random")
+    with pytest.warns(UserWarning, match=f"{flag.replace('_', '-')} has no effect with dataset 'random'"):
+        preprocess_serve_args(args)
+
+
+@pytest.mark.parametrize("dataset", ["ttsd", "sound-effect"])
+def test_save_eval_items_warns_on_seed_tts_family_without_wer_eval(dataset: str) -> None:
+    """Seed-TTS-family per-item rows come from the --wer-eval pipeline; warn when it is missing."""
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
+
+    args = Namespace(save_eval_items=True, wer_eval=False, dataset_name=dataset)
+    with pytest.warns(UserWarning, match="pass --wer-eval as well"):
+        preprocess_serve_args(args)
+
+
+@pytest.mark.parametrize("dataset", ["ttsd", "sound-effect"])
+def test_save_eval_items_does_not_warn_with_wer_eval(dataset: str) -> None:
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
+
+    args = Namespace(save_eval_items=True, wer_eval=True, dataset_name=dataset)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        preprocess_serve_args(args)
 
 
 def _file_uri_path(url: str) -> Path:

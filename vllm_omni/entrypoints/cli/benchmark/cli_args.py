@@ -20,6 +20,7 @@ by ``add_omni_args``.
 
 import argparse
 import math
+import warnings
 from pathlib import Path
 
 _DEFAULT_OMNIINTERACT_NUM_PROMPTS = 3
@@ -44,6 +45,24 @@ def _existing_file(value: str) -> str:
     if not path.is_file():
         raise argparse.ArgumentTypeError(f"file does not exist: {value!r}")
     return str(path)
+
+
+class _DeprecatedStoreTrue(argparse.Action):
+    """``store_true`` that emits a FutureWarning on use.  Removed after v0.34."""
+
+    def __init__(self, option_strings, dest, replacement=None, **kwargs):
+        kwargs.setdefault("nargs", 0)
+        kwargs.setdefault("const", True)
+        kwargs.setdefault("default", False)
+        self.replacement = replacement
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        msg = f"{option_string} is deprecated and will be removed after v0.34."
+        if self.replacement:
+            msg += f" Use {self.replacement} instead."
+        warnings.warn(msg, FutureWarning, stacklevel=2)
+        setattr(namespace, self.dest, True)
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -343,11 +362,10 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--daily-omni-save-eval-items",
-        action="store_true",
-        default=False,
-        help="Include per-request Daily-Omni accuracy rows (gold/predicted/correct) "
-        "in the saved JSON under key daily_omni_eval_items. "
-        "Alternatively set env DAILY_OMNI_SAVE_EVAL_ITEMS=1.",
+        dest="save_eval_items",
+        action=_DeprecatedStoreTrue,
+        replacement="--save-eval-items",
+        help=argparse.SUPPRESS,
     )
 
 
@@ -416,10 +434,10 @@ def add_videomme_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--videomme-save-eval-items",
-        action="store_true",
-        default=False,
-        help="Include per-request Video-MME accuracy rows in the saved JSON under "
-        "videomme_eval_items. Or set env VIDEOMME_SAVE_EVAL_ITEMS=1.",
+        dest="save_eval_items",
+        action=_DeprecatedStoreTrue,
+        replacement="--save-eval-items",
+        help=argparse.SUPPRESS,
     )
 
 
@@ -477,22 +495,53 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Override chat system message for --backend openai-chat-omni (Qwen3-Omni TTS). "
         "Default follows official Qwen3-Omni identity + zero-shot voice-clone instructions.",
     )
+
+
+def add_eval_output_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared evaluation-output arguments.
+
+    These span datasets (Seed-TTS / Daily-Omni / Video-MME), so they get their
+    own group rather than living under any single dataset's options.
+    """
+    group = parser.add_argument_group("Eval Output Options")
     group.add_argument(
-        "--seed-tts-wer-eval",
+        "--wer-eval",
+        dest="wer_eval",
         action="store_true",
         default=False,
-        help="Keep synthesized audio as 24 kHz mono PCM for WER (works with "
+        help="Keep synthesized audio as 24 kHz mono PCM for WER evaluation (works with "
         "--backend openai-audio-speech or openai-chat-omni). Scoring follows "
         "zhaochenyang20/seed-tts-eval (Whisper-large-v3 / Paraformer-zh + jiwer). "
-        "Sets SEED_TTS_WER_EVAL=1. Install: pip install 'vllm-omni[dev]'. "
-        "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL.",
+        "Sets WER_EVAL=1. Install: pip install 'vllm-omni[dev]'. "
+        "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL. "
+        "Currently works only with Seed-TTS-family datasets "
+        "(seed-tts, seed-tts-text, seed-tts-design, ttsd, sound-effect).",
+    )
+    group.add_argument(
+        "--save-eval-items",
+        dest="save_eval_items",
+        action="store_true",
+        default=False,
+        help="Include per-item evaluation rows in the saved JSON (key depends on dataset: "
+        "seed_tts_wer_eval_items for WER, daily_omni_eval_items for Daily-Omni, "
+        "videomme_eval_items for Video-MME). Also controllable via env var SAVE_EVAL_ITEMS=1. "
+        "For Seed-TTS-family datasets, per-item rows are produced by the --wer-eval "
+        "pipeline, so pair this flag with --wer-eval.",
+    )
+    # Deprecated aliases — removed after v0.34
+    group.add_argument(
+        "--seed-tts-wer-eval",
+        dest="wer_eval",
+        action=_DeprecatedStoreTrue,
+        replacement="--wer-eval",
+        help=argparse.SUPPRESS,
     )
     group.add_argument(
         "--seed-tts-wer-save-items",
-        action="store_true",
-        default=False,
-        help="Include per-utterance ASR rows in the saved JSON under key seed_tts_wer_eval_items. "
-        "Or set SEED_TTS_WER_SAVE_ITEMS=1.",
+        dest="save_eval_items",
+        action=_DeprecatedStoreTrue,
+        replacement="--save-eval-items",
+        help=argparse.SUPPRESS,
     )
 
 
@@ -587,12 +636,64 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
     add_seed_tts_cli_args(parser)
+    add_eval_output_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
 
 
+_SAVE_EVAL_ITEMS_DATASETS = frozenset(
+    {
+        "daily-omni",
+        "seed-tts",
+        "seed-tts-text",
+        "seed-tts-design",
+        "sound-effect",
+        "ttsd",
+        "videomme",
+    }
+)
+
+_WER_EVAL_DATASETS = frozenset(
+    {
+        "seed-tts",
+        "seed-tts-text",
+        "seed-tts-design",
+        "sound-effect",
+        "ttsd",
+    }
+)
+
+
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    dataset = getattr(args, "dataset_name", None)
+    if getattr(args, "save_eval_items", False) and dataset and dataset not in _SAVE_EVAL_ITEMS_DATASETS:
+        warnings.warn(
+            f"--save-eval-items has no effect with dataset {dataset!r}; "
+            f"supported datasets: {', '.join(sorted(_SAVE_EVAL_ITEMS_DATASETS))}",
+            UserWarning,
+            stacklevel=2,
+        )
+    if getattr(args, "wer_eval", False) and dataset and dataset not in _WER_EVAL_DATASETS:
+        warnings.warn(
+            f"--wer-eval has no effect with dataset {dataset!r}; "
+            f"supported datasets: {', '.join(sorted(_WER_EVAL_DATASETS))}",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif (
+        getattr(args, "save_eval_items", False)
+        and dataset in _WER_EVAL_DATASETS
+        and not getattr(args, "wer_eval", False)
+    ):
+        # Per-item rows for Seed-TTS-family datasets are written by the WER
+        # eval pipeline, which only runs with --wer-eval.
+        warnings.warn(
+            f"--save-eval-items writes per-item rows for dataset {dataset!r} via the "
+            "--wer-eval pipeline; pass --wer-eval as well or no items will be saved",
+            UserWarning,
+            stacklevel=2,
+        )
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
         if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
             raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
