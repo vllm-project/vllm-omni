@@ -12,7 +12,6 @@ from __future__ import annotations
 import inspect
 import sys
 from collections.abc import Callable, Mapping
-from importlib.machinery import ModuleSpec
 from types import ModuleType
 from typing import Any
 
@@ -24,13 +23,14 @@ from vllm.logger import init_logger
 # ``get_quantization_config()`` (which unconditionally does
 # ``from .humming import HummingConfig``) does not crash when the real
 # ``humming`` wheel is not installed.  Only populate the bare-minimum
-# names that ``humming.py`` accesses at module level.
+# names that ``humming.py`` accesses at module level. The stubs are installed
+# only while resolving a vLLM quantization class, then removed from sys.modules.
 # ---------------------------------------------------------------------------
-def _register_humming_stubs() -> None:
+def _register_humming_stubs() -> dict[str, ModuleType]:
     """Register stub ``humming`` sub-modules so that the optional
     humming quantization backend can be imported without the real wheel."""
     if "humming" in sys.modules:
-        return  # already present (real or stub)
+        return {}  # already present (real or stub)
 
     # --- sub-modules ---
     submodules: dict[str, tuple[str, ...]] = {
@@ -49,16 +49,8 @@ def _register_humming_stubs() -> None:
     }
 
     registry: dict[str, ModuleType] = {}
-    packages = {"humming", "humming.utils"}
     for name, attrs in submodules.items():
         mod = ModuleType(name)
-        is_package = name in packages
-        # vLLM probes optional dependencies with importlib.util.find_spec().
-        # Modules already present in sys.modules need a non-None spec or that
-        # probe raises ValueError instead of reporting the module as present.
-        mod.__spec__ = ModuleSpec(name, loader=None, is_package=is_package)
-        if is_package:
-            setattr(mod, "__path__", [])
         for attr in attrs:
             setattr(mod, attr, type(attr, (), {}))
         registry[name] = mod
@@ -74,12 +66,14 @@ def _register_humming_stubs() -> None:
     for name, mod in registry.items():
         sys.modules[name] = mod
 
+    return registry
 
-_register_humming_stubs()
 
 from vllm.model_executor.layers.quantization import (  # noqa: E402
     QUANTIZATION_METHODS,
-    get_quantization_config,
+)
+from vllm.model_executor.layers.quantization import (  # noqa: E402
+    get_quantization_config as _get_vllm_quantization_config,
 )
 from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
     QuantizationConfig,
@@ -88,6 +82,17 @@ from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
 from .component_config import ComponentQuantizationConfig  # noqa: E402
 
 logger = init_logger(__name__)
+
+
+def _get_quantization_config(method: str) -> type[QuantizationConfig]:
+    """Resolve a vLLM quantization class without leaking placeholder modules."""
+    stubs = _register_humming_stubs()
+    try:
+        return _get_vllm_quantization_config(method)
+    finally:
+        for name, module in reversed(tuple(stubs.items())):
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
 
 
 def _build_fp8(**kw: Any) -> QuantizationConfig:
@@ -334,7 +339,7 @@ def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
 
 
 def _build_modelopt_from_config(method: str, config: Mapping[str, Any]) -> QuantizationConfig:
-    config_cls = get_quantization_config(method)
+    config_cls = _get_quantization_config(method)
     normalized_config = dict(config)
     normalized_config.setdefault("quant_method", method)
     return config_cls.from_config(normalized_config)
@@ -368,7 +373,7 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
     if method not in QUANTIZATION_METHODS:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
-    config_cls = get_quantization_config(method)
+    config_cls = _get_quantization_config(method)
 
     from vllm.config.quantization import resolve_quantization_config
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
