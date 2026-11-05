@@ -433,6 +433,69 @@ def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
     assert received["req_ids"] == ["request-a", "request-b"]
 
 
+def test_model_forward_passes_runtime_additional_information_to_decode_metadata(monkeypatch):
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a"])
+    runtime = [{"generated_len": 64, "omni_task": ["t2i"]}]
+    runner._build_model_kwargs_extra = lambda: {
+        "runtime_additional_information": runtime,
+        "model_intermediate_buffer": runtime,
+    }
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(1, dtype=torch.long))
+
+    assert received["runtime_additional_information"] is runtime
+    assert received["model_intermediate_buffer"] is runtime
+
+
+def test_model_forward_clears_decode_metadata_when_runtime_info_absent(monkeypatch):
+    """FULL-replay steps with no runtime payload must clear, not skip, the cache."""
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(1, dtype=torch.long))
+
+    assert "runtime_additional_information" in received
+    assert received["runtime_additional_information"] is None
+    assert "model_intermediate_buffer" in received
+    assert received["model_intermediate_buffer"] is None
+
+
+def test_prepare_mm_inputs_keeps_input_ids_when_requires_raw_input_tokens():
+    """MammothModa2's flag must keep input_ids on the mm graph path (dummy + live)."""
+    runner = object.__new__(GPUModelRunner)
+    ids_buf = torch.arange(8, dtype=torch.long)
+    emb_buf = torch.zeros(8, 4)
+    runner.input_ids = SimpleNamespace(gpu=ids_buf)
+    runner.inputs_embeds = SimpleNamespace(gpu=emb_buf)
+
+    runner.model = SimpleNamespace(requires_raw_input_tokens=True)
+    input_ids, inputs_embeds = GPUModelRunner._prepare_mm_inputs(runner, 5)
+    assert input_ids is not None
+    assert input_ids.data_ptr() == ids_buf.data_ptr()
+    assert tuple(input_ids.shape) == (5,)
+    assert tuple(inputs_embeds.shape) == (5, 4)
+
+    runner.model = SimpleNamespace(requires_raw_input_tokens=False)
+    input_ids, _ = GPUModelRunner._prepare_mm_inputs(runner, 5)
+    assert input_ids is None
+
+
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
     """Dummy model whose class name must exactly match the production check."""
 

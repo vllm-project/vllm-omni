@@ -71,6 +71,61 @@ def _make_runner():
     return runner
 
 
+@pytest.mark.parametrize("upstream_hook", [True, False])
+@pytest.mark.parametrize("hook_fails", [False, True])
+def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monkeypatch, hook_fails, upstream_hook):
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.worker.gpu import model_runner as upstream_model_runner
+
+    from vllm_omni.worker_v2 import omni_model_runner
+
+    runner = _make_runner()
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
+    runner.use_aux_hidden_state_outputs = False
+    runner.model = SimpleNamespace(has_preprocess=False)
+    runner.vllm_config = runner.encoder_cache = runner.device = None
+    state = object.__new__(OmniModelState)
+    state.model = runner.model
+    sampler_kernel = object()
+    outer_kernel = object()
+    outer_registry = JitWarmupRegistry(SimpleNamespace())
+
+    def custom_sampler(sampler):
+        JitWarmupRegistry.register(sampler_kernel)
+        if hook_fails:
+            raise RuntimeError("custom sampler initialization failed")
+        return sampler, None
+
+    runner.model.mrv2_custom_sampler = custom_sampler
+
+    def upstream_load(self):
+        # Match the target's ordering: model state and its sampler hook are
+        # initialized after the model-construction registry context ends.
+        if upstream_hook:
+            self.model_state = self._init_model_state()
+        else:
+            self.model_state = upstream_model_runner.init_model_state(None, self.model, None, None)
+        self.model_state.custom_sampler(object())
+
+    monkeypatch.setattr(omni_model_runner, "_UPSTREAM_HAS_MODEL_STATE_HOOK", upstream_hook)
+    monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load)
+    monkeypatch.setattr(omni_model_runner, "init_omni_model_state", lambda *args: state)
+    monkeypatch.setattr(runner, "_configure_cudagraph_output_contract", lambda: None)
+
+    original_init_model_state = upstream_model_runner.init_model_state
+    with outer_registry.activate():
+        if hook_fails:
+            with pytest.raises(RuntimeError, match="custom sampler initialization failed"):
+                runner.load_model()
+        else:
+            runner.load_model()
+        JitWarmupRegistry.register(outer_kernel)
+
+    assert set(runner.jit_warmup_registry._registrations) == {sampler_kernel}
+    assert set(outer_registry._registrations) == {outer_kernel}
+    assert upstream_model_runner.init_model_state is original_init_model_state
+
+
 @pytest.mark.parametrize("moss", [False, True])
 @pytest.mark.parametrize("sender_fails", [False, True])
 def test_shutdown_closes_model_owned_first_audio_and_other_resources(moss, sender_fails):
@@ -225,6 +280,8 @@ def test_duplex_kv_reanchor_runs_after_block_table_writes():
         apply_duplex_kv_reanchor=lambda r, scheduler_output: order.append(("reanchor", r, scheduler_output))
     )
     runner.aux_output_connector = None
+    # Encoder payload updates are disabled in this fixture.
+    runner.encoder_cache = None
     output = object()
     runner.kv_connector = SimpleNamespace(no_forward=lambda _s: output)
     runner._merge_ec_connector_no_forward = lambda _s, value: value
@@ -299,6 +356,7 @@ def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, 
     """With vLLM's runner hook the module factory stays untouched; older vLLM
     gets the Omni state through a swap of that factory, restored afterwards."""
     import vllm.v1.worker.gpu.model_runner as mr
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     import vllm_omni.worker_v2.omni_model_runner as omni_mr
 
@@ -331,6 +389,7 @@ def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, 
     runner.vllm_config, runner.encoder_cache, runner.device = vllm_config, encoder_cache, device
     runner.vocab_size = runner.req_states.vocab_size = 10
     runner.supports_mm_inputs = False
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
 
     runner.load_model()
 
@@ -344,6 +403,7 @@ def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, 
 def test_load_model_factory_swap_is_restored_when_loading_fails(monkeypatch):
     """On older vLLM a failing load still restores the module factory."""
     import vllm.v1.worker.gpu.model_runner as mr
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     import vllm_omni.worker_v2.omni_model_runner as omni_mr
 
@@ -355,6 +415,7 @@ def test_load_model_factory_swap_is_restored_when_loading_fails(monkeypatch):
     monkeypatch.setattr(omni_mr, "_UPSTREAM_HAS_MODEL_STATE_HOOK", False)
     monkeypatch.setattr(GPUModelRunner, "load_model", failing_load_model)
     runner = _make_runner()
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
 
     with pytest.raises(RuntimeError, match="load failed"):
         runner.load_model()
@@ -644,6 +705,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     runner.is_encoder_decoder = False
     runner.eplb = MagicMock()
     runner.kv_connector = MagicMock()
+    runner.pcp_manager = None
     runner.input_buffers = object()
     runner.kv_cache_config = object()
     runner.attn_groups = []
@@ -699,3 +761,61 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         assert not runner._prev_step_idle
     else:
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
+
+
+@pytest.mark.parametrize("cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
+    """Layers a drafter reads leave the forward tuple; the Omni aux slot stays empty."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    hidden, aux = torch.ones(1, 2), [torch.full((1, 2), 3.0)]
+    runner.model = MagicMock(return_value=(hidden, aux))
+    runner.cudagraph_manager = MagicMock()
+    runner.cudagraph_manager.run_fullgraph.return_value = (hidden, aux)
+    runner.use_aux_hidden_state_outputs = True
+    runner.pcp_manager = None
+    runner.model_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace()
+    runner.req_states = SimpleNamespace()
+    runner.model_state = MagicMock()
+    runner.model_state.prepare_inputs.return_value = {}
+    runner._omni_data_plane = object()
+    runner.supports_mm_inputs = False
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.eplb = MagicMock()
+    runner.kv_connector = MagicMock()
+    runner.input_buffers = object()
+    runner.kv_cache_config = object()
+    runner.attn_groups = []
+    input_batch = SimpleNamespace(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        is_padding=None,
+    )
+    monkeypatch.setattr(InputBatch, "make_dummy", MagicMock(return_value=input_batch))
+    runner.prepare_dummy_attn = MagicMock(return_value=((), torch.empty(0)))
+    runner.gather_batch_req_state = MagicMock(return_value=(None, 1))
+    batch_desc = SimpleNamespace(cg_mode=cg_mode, num_reqs=1, num_tokens=1, num_active_loras=0, max_query_len=1)
+    runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
+    monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
+    monkeypatch.setattr(
+        "vllm_omni.worker_v2.omni_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext()
+    )
+    scheduled = SchedulerOutput.make_empty()
+    scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
+    scheduled.total_num_scheduled_tokens = 1
+
+    runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
+
+    assert runner.execute_model_state.hidden_states is hidden
+    assert runner.execute_model_state.aux_hidden_states is aux
+    assert runner._last_aux_output is None
+    if cg_mode == CUDAGraphMode.FULL:
+        runner.model.assert_not_called()
+    else:
+        runner.cudagraph_manager.run_fullgraph.assert_not_called()
