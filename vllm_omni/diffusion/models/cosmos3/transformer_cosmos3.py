@@ -49,6 +49,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.rope import Cosmos3RotaryEmbedding
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
@@ -465,42 +466,6 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# RoPE application (Qwen3/Llama style)
-# ---------------------------------------------------------------------------
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen3-style RoPE: (x * cos) + (rotate_half(x) * sin).
-
-    Args:
-        q: [B, S, h, D]
-        k: [B, S, H_kv, D]
-        cos: [1, S, 1, D] or broadcastable
-        sin: [1, S, 1, D] or broadcastable
-    """
-    if q.device.type in ("npu", "privateuseone"):
-        import torch_npu
-
-        return (
-            torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half"),
-            torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half"),
-        )
-
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-# ---------------------------------------------------------------------------
 # Timestep Embedder
 # ---------------------------------------------------------------------------
 class TimestepEmbedder(nn.Module):
@@ -600,6 +565,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.rotary_embedding = Cosmos3RotaryEmbedding()
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_local = self.num_heads // tp_size
@@ -674,7 +640,7 @@ class Cosmos3CausalAttention(nn.Module):
         k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
-        q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        q, k = self.rotary_embedding(q, k, freqs_cos, freqs_sin)
 
         out = self.attn(q, k, v).reshape(B, S, -1)
         return self.to_out(out), k, v
@@ -709,6 +675,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.rotary_embedding = Cosmos3RotaryEmbedding()
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_local = self.num_heads // tp_size
@@ -927,7 +894,7 @@ class Cosmos3CrossAttention(nn.Module):
             k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
-        q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        q, k = self.rotary_embedding(q, k, freqs_cos, freqs_sin)
 
         if control_token_sizes is not None or control_weights is not None:
             if control_token_sizes is None or control_weights is None:
