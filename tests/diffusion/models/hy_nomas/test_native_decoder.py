@@ -71,6 +71,8 @@ def test_native_mrope_matches_axis_rotation(head_dim):
 
 
 class _SDPA(torch.nn.Module):
+    attn_backend = None
+
     def __init__(self, **kwargs):
         super().__init__()
 

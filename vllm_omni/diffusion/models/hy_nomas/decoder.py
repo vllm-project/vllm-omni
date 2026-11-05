@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.activation import SiluAndMul
+from vllm_omni.diffusion.models.hy_nomas.decoder_attention import packed_local_attention
 from vllm_omni.diffusion.models.hy_nomas.decoder_kernels import apply_mrope, split_norm_rope
 
 # Ported from jiaxiangc/diffusers at 12722ef11acf8e335f96cfd4faea17de78cd8909.
@@ -231,7 +232,7 @@ class PixelUMMAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def forward(self, hidden_states, cos, sin, neighborhoods=None) -> torch.Tensor:
+    def forward(self, hidden_states, cos, sin, neighborhoods=None, packed=None) -> torch.Tensor:
         batch, count, _ = hidden_states.shape
         dim = self.arch.head_dim
         qkv, _ = self.qkv_proj(hidden_states)
@@ -247,7 +248,10 @@ class PixelUMMAttention(nn.Module):
         key = prepare_qk(key, cos, sin, self.k_norm_t, self.k_norm_hw, sections, value.dtype)
         # Keep K/V compressed through neighborhood gathering. The shared backend
         # selects fused GQA where supported and owns the equal-head fallback.
-        if neighborhoods is None:
+        if packed is not None:
+            # One varlen call reads every tile's neighborhood (decoder_attention.py).
+            output = packed(self.attention, query, key, value)
+        elif neighborhoods is None:
             output = self.attention(query, key, value)
         else:
             outputs = []
@@ -287,8 +291,10 @@ class PixelUMMBlock(nn.Module):
         self.post_attn_norm = RMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
         self.mlp = PixelUMMMLP(arch, prefix=f"{prefix}.mlp")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, neighborhoods=None) -> torch.Tensor:
-        x = x + self.attn(self.input_norm(x), cos, sin, neighborhoods)
+    def forward(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, neighborhoods=None, packed=None
+    ) -> torch.Tensor:
+        x = x + self.attn(self.input_norm(x), cos, sin, neighborhoods, packed)
         return x + self.mlp(self.post_attn_norm(x))
 
 
@@ -351,13 +357,16 @@ class PixelUMMDecoderModel(nn.Module):
             if self.local_attention_tile:
                 layout = local_attention_layout(grid, self.local_attention_tile, tokens.device)
             neighborhoods = None
+            packed = None
             if layout is not None:
                 perm, inverse, neighborhoods = layout
                 tokens = tokens[:, perm]
                 cos = cos[:, perm]
                 sin = sin[:, perm]
+                # Every layer's attention shares one backend and one packed plan.
+                packed = packed_local_attention(self.layers[0].attn.attention, neighborhoods, tokens)
             for layer in self.layers:
-                tokens = layer(tokens, cos, sin, neighborhoods)
+                tokens = layer(tokens, cos, sin, neighborhoods, packed)
             tokens = self.final_norm(tokens)
             if layout is not None:
                 tokens = tokens[:, inverse.to(tokens.device)]

@@ -10,7 +10,12 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas import decoder as d
+from vllm_omni.diffusion.models.hy_nomas import decoder_attention as a
 from vllm_omni.diffusion.models.hy_nomas import decoder_kernels as k
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
@@ -110,3 +115,51 @@ def test_decoder_triton_offsets_past_int32(monkeypatch):
     use_eager(monkeypatch)
     expected = eager_qk(q[:, -128:], cos[:, -128:], sin[:, -128:], norm_t, norm_hw)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "grid,tile,batch",
+    [
+        # 704x1280 decoder window.
+        ((10, 44, 80), 8, 1),
+        # Partial 2x2 edge tiles, two batch elements.
+        ((1, 18, 34), 8, 2),
+    ],
+)
+@torch.inference_mode()
+def test_decoder_packed_local_attention_matches_fp32_tiles(grid, tile, batch):
+    torch.manual_seed(42)
+    cfg = OmniDiffusionConfig(model_class_name="HyNomasPipeline", dtype=torch.bfloat16)
+    with set_current_diffusion_config(cfg), set_forward_context(omni_diffusion_config=cfg):
+        attention = Attention(
+            num_heads=32,
+            num_kv_heads=8,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+            role="hy_nomas.decoder",
+            role_category="self",
+            skip_sequence_parallel=True,
+        )
+        _, _, neighborhoods = d.local_attention_layout(grid, tile, "cuda")
+        tokens = grid[0] * grid[1] * grid[2]
+        query = torch.randn(batch, tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
+        key = torch.randn(batch, tokens, 8, 128, device="cuda", dtype=torch.bfloat16)
+        value = torch.randn(batch, tokens, 8, 128, device="cuda", dtype=torch.bfloat16)
+        plan = a.packed_local_attention(attention, neighborhoods, query[..., 0, 0])
+        if plan is None:
+            pytest.skip("the selected attention backend has no multi-document packed varlen path")
+        actual = plan(attention, query, key, value).float()
+    expected = torch.empty_like(actual)
+    for (start, end), neighbors in neighborhoods:
+        local_key = torch.cat([key[:, first:last] for first, last in neighbors], dim=1).float()
+        local_value = torch.cat([value[:, first:last] for first, last in neighbors], dim=1).float()
+        expected[:, start:end] = torch.nn.functional.scaled_dot_product_attention(
+            query[:, start:end].float().transpose(1, 2),
+            local_key.transpose(1, 2),
+            local_value.transpose(1, 2),
+            enable_gqa=True,
+        ).transpose(1, 2)
+    # BF16 output rounding bounds the difference from FP32 attention.
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
