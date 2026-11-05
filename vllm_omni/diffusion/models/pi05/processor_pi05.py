@@ -85,6 +85,26 @@ def pil_image_to_tensor(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
 
 
+def _uint8_hwc_to_unit_range(image: np.ndarray) -> torch.Tensor:
+    """uint8 HWC image → float32 ``(1, 3, H, W)`` tensor in ``[-1, 1]``.
+
+    Bit-for-bit the Torch expression
+    ``from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(float32) / 255.0 * 2.0 - 1.0``
+    — same float32 operations in the same order, and the same HWC-backed
+    strides — but evaluated in NumPy. These are four element-wise passes over
+    150k values per camera; in Torch each pass opens an intra-op parallel
+    region, and a serving worker that has just spent a whole request launching
+    device kernels pays to wake that pool every time (about 1 ms per camera in
+    an ``mp`` diffusion worker with one thread per core, against about 0.1 ms
+    for the arithmetic itself).
+    """
+    scaled = np.ascontiguousarray(image).astype(np.float32)
+    scaled /= np.float32(255.0)
+    scaled *= np.float32(2.0)
+    scaled -= np.float32(1.0)
+    return torch.from_numpy(scaled).permute(2, 0, 1).unsqueeze(0)
+
+
 class Pi05ImageProcessor:
     """Minimal image preprocessor: image → normalized + padded ``[-1,1]`` tensor."""
 
@@ -110,6 +130,8 @@ class Pi05ImageProcessor:
         if isinstance(image, np.ndarray):
             if image.ndim != 3 or image.shape[-1] != 3:
                 raise ValueError(f"Expected an HWC ndarray with 3 channels, got shape {image.shape}.")
+            if image.dtype == np.uint8:
+                return _uint8_hwc_to_unit_range(image)
             t = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
         elif isinstance(image, torch.Tensor):
             t = image.unsqueeze(0) if image.ndim == 3 else image
@@ -131,7 +153,8 @@ class Pi05ImageProcessor:
 
     def make_empty_image(self) -> torch.Tensor:
         """Fill tensor for an unused camera slot — pure -1, matches OpenPI/LeRobot."""
-        return torch.full((1, 3, self.image_size, self.image_size), -1.0)
+        # NumPy fill for the same reason as ``_uint8_hwc_to_unit_range``.
+        return torch.from_numpy(np.full((1, 3, self.image_size, self.image_size), -1.0, dtype=np.float32))
 
 
 # ──────────────────────────────────────────────────────────────────────

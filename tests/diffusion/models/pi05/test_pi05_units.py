@@ -709,6 +709,37 @@ def test_float_image_rejects_values_outside_lerobot_domain(bad, container):
         Pi05ImageProcessor(image_size=4).preprocess_single(image)
 
 
+def test_uint8_image_matches_torch_reference_bit_for_bit():
+    """The NumPy uint8 path must reproduce the Torch arithmetic and layout exactly.
+
+    uint8 has 256 values, so placing each of them in every channel checks the
+    conversion exhaustively rather than on a sample.
+    """
+    values = np.arange(256, dtype=np.uint8)
+    image = np.stack(
+        [np.tile(values, (4, 1)), np.tile(values[::-1], (4, 1)), np.tile(np.roll(values, 7), (4, 1))],
+        axis=-1,
+    )
+    reference = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32) / 255.0 * 2.0 - 1.0
+
+    out = Pi05ImageProcessor(image_size=4)._to_tensor(image)
+
+    assert out.dtype == reference.dtype
+    assert out.shape == reference.shape
+    # The device copy keeps these strides, and they select the convolution layout.
+    assert out.stride() == reference.stride()
+    assert out.contiguous().numpy().tobytes() == reference.contiguous().numpy().tobytes()
+
+
+def test_empty_image_matches_torch_reference():
+    out = Pi05ImageProcessor(image_size=8).make_empty_image()
+    reference = torch.full((1, 3, 8, 8), -1.0)
+
+    assert out.dtype == reference.dtype
+    assert out.stride() == reference.stride()
+    assert torch.equal(out, reference)
+
+
 def test_resize_with_pad_pads_with_minus_one():
     out = resize_with_pad(torch.zeros(1, 3, 100, 200), 224, 224)
     assert out.shape == (1, 3, 224, 224)
