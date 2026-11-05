@@ -33,7 +33,7 @@ logger = init_logger(__name__)
 
 
 if is_310p():
-    from vllm_ascend._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
+    from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
 else:
     from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 
