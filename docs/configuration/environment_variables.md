@@ -156,9 +156,8 @@ values depend on the actual audio length distribution):
   independently reproduced results.
 
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
-| `VLLM_OMNI_AUDIO_BUCKET_MODULES` | Regex | Overrides the wrapped-module name pattern (default matches names ending in `encoder`, `audio_encoder`, `speech_encoder`, `audio_tower`, or `whisper_encoder`) | Use to opt in module names outside the default pattern, e.g. `reference_encoder`. | Experimental |
 
-> The per-model knobs (`hop`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the two knobs above are user-facing deployment settings; a model not in the whitelist cannot enable bucketing.
+> The per-model knobs (`hop`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the one knob above is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
 
 ### NIXL stage transfer
 

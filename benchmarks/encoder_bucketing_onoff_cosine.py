@@ -27,18 +27,15 @@ Bucketing env vars (set to turn the feature on)
 * ``VLLM_OMNI_AUDIO_BUCKET_SECONDS=2,4,8,16,30`` — the rung ladder in seconds
   (rung mel frames = seconds x 16000 / hop, where ``hop`` is the model's
   verified hop).
-* ``VLLM_OMNI_AUDIO_BUCKET_MODULES=encoder`` — which encoder modules to bucket.
 
 Usage (lossy case, unmasked Whisper):
     COVO_AUDIO_CHAT_CKPT=/path/to/Covo-Audio-Chat \
     VLLM_OMNI_AUDIO_BUCKET_SECONDS=2,4,8,16,30 \
-    VLLM_OMNI_AUDIO_BUCKET_MODULES=encoder \
     python benchmarks/encoder_bucketing_onoff_cosine.py --model-type covo
 
 Usage (lossless case, mask-aware):
     STEP_AUDIO2_CKPT=/path/to/Step-Audio-2-mini \
     VLLM_OMNI_AUDIO_BUCKET_SECONDS=2,4,8,16,30 \
-    VLLM_OMNI_AUDIO_BUCKET_MODULES=encoder \
     python benchmarks/encoder_bucketing_onoff_cosine.py --model-type stepaudio2
 """
 
@@ -56,7 +53,6 @@ from torch import nn
 # env vars. Default them so the script works without the caller setting them
 # (override via the environment if desired).
 os.environ.setdefault("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-os.environ.setdefault("VLLM_OMNI_AUDIO_BUCKET_MODULES", "encoder")
 
 RUNGS = (200, 400, 800, 1600, 3000)
 N_ITERS = 20

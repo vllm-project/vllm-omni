@@ -23,10 +23,6 @@ fixes.
     call sites that pass ``(features, mask)`` positionally (no lengths
     argument) must still bucket using the published lengths, and stay exact
     for a mask-consuming encoder.
-* test_module_pattern_env_override
-    ``VLLM_OMNI_AUDIO_BUCKET_MODULES`` selects which module names wrap, so
-    encoders outside the built-in name pattern can opt in without model
-    changes.
 
 All encoder calls run under ``torch.inference_mode()`` (the production
 context); the bucketed path is eager — no CUDA graphs.
@@ -564,23 +560,6 @@ def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
         solo, solo_len = wrapper._original(feats[row : row + 1, :, :length], lens[row : row + 1])
         torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
         assert out_lens[row].item() == solo_len.item()
-
-
-def test_module_pattern_env_override(bucket_env, monkeypatch):
-    """VLLM_OMNI_AUDIO_BUCKET_MODULES selects which module names wrap."""
-    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_MODULES", r"(?:^|\.)my_frontend$")
-
-    class CustomModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.my_frontend = RecordingEncoder()
-            self.encoder = RecordingEncoder()
-
-        def embed_multimodal(self, **kwargs):
-            return self.my_frontend(kwargs["audio_features"]).last_hidden_state
-
-    model = CustomModel().cuda()
-    assert install_bucketed_encoders(model) == ["my_frontend"]
 
 
 def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):

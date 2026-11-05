@@ -52,7 +52,6 @@ Bucketing env vars (applied automatically for the "on" pass)
 ------------------------------------------------------------
 * ``--bucket-seconds 2,4,8,16,30`` — the rung ladder in seconds (rung mel
   frames = seconds x 16000 / hop, where ``hop`` is the model's verified hop).
-* ``--bucket-modules encoder`` — which encoder modules to bucket.
 
 ``--max-seconds 29`` drops clips longer than 29 s: Step-Audio-2's positional
 embedding caps at 30 s (``n_audio_ctx=1500`` at 100 fps), so longer clips crash.
@@ -87,10 +86,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
-_BUCKET_ENV = (
-    "VLLM_OMNI_AUDIO_BUCKET_SECONDS",
-    "VLLM_OMNI_AUDIO_BUCKET_MODULES",
-)
+_BUCKET_ENV = ("VLLM_OMNI_AUDIO_BUCKET_SECONDS",)
 
 
 def build_query(model_type: str, audio_path: str, instruction: str) -> dict:
@@ -192,7 +188,6 @@ def transcribe(args, clips: list[str], on: bool) -> dict[str, str]:
     """Transcribe all clips with the feature off or on, returning ``{stem: text}``."""
     if on:
         os.environ["VLLM_OMNI_AUDIO_BUCKET_SECONDS"] = args.bucket_seconds
-        os.environ["VLLM_OMNI_AUDIO_BUCKET_MODULES"] = args.bucket_modules
     else:
         for k in _BUCKET_ENV:
             os.environ.pop(k, None)
@@ -350,7 +345,6 @@ def parse_args():
     parser.add_argument("--max-seconds", type=float, default=29.0, help="Skip clips longer than this (0 = no filter).")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N clips (0 = all).")
     parser.add_argument("--bucket-seconds", type=str, default="2,4,8,16,30")
-    parser.add_argument("--bucket-modules", type=str, default="encoder")
     parser.add_argument(
         "--max-extra",
         type=int,

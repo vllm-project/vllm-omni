@@ -44,7 +44,6 @@ __all__ = [
 ]
 
 _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
-_ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
 _DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
@@ -707,8 +706,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         return []
     rungs = _rungs_from_env(hop)
     ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
-    pattern_src = os.environ.get(_ENV_MODULES, "").strip() or _MODULE_PATTERN
-    pattern = re.compile(pattern_src)
+    pattern = re.compile(_MODULE_PATTERN)
     wrapped: list[str] = []
     encoders: list[_BucketedEncoder] = []
     for name, module in model.named_modules():
@@ -733,17 +731,15 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
                 logger.warning(
                     "Bucketed encoder %r is a fixed-window class: bucketed windows "
                     "use the built-in variable-length recipe, which is lossy "
-                    "(outputs may differ from the un-bucketed forward). Exclude it "
-                    "via %s for bit-identical output.",
+                    "(outputs may differ from the un-bucketed forward).",
                     name,
-                    _ENV_MODULES,
                 )
         module.forward = encoder
         wrapped.append(name)
         encoders.append(encoder)
 
     if not wrapped:
-        logger.warning("Bucketed encoder enabled but no encoder matched %r", pattern_src)
+        logger.warning("Bucketed encoder enabled but no encoder matched %r", _MODULE_PATTERN)
         return []
 
     _wrap_embed_multimodal(model, encoders)
