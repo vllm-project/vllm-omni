@@ -364,7 +364,7 @@ def _ras_mrv2_sample(
     row_temperature = temperature[rows]
     scores = torch.log_softmax(logits / row_temperature.clamp_min(eps).unsqueeze(1), dim=1)
     num_rows, vocab = scores.shape
-    top_k, top_p = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+    top_k, top_p, _ = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np, vocab)
     if top_p is None:
         top_p = scores.new_full((num_rows,), default_top_p)
     if top_k is None:

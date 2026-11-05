@@ -1425,6 +1425,17 @@ def test_ras_mrv2_sample_takes_the_positional_arguments_of_sampler_sample():
     assert positional(cosyvoice3._ras_mrv2_sample) == positional(Sampler.sample)
 
 
+def test_ras_mrv2_sample_matches_sampling_states_top_k_top_p():
+    """The RAS tensor path calls ``SamplingStates.get_top_k_top_p``; the test
+    stubs mirror this signature, so they must track vLLM's."""
+    import inspect
+
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
+
+    params = list(inspect.signature(SamplingStates.get_top_k_top_p).parameters)
+    assert params == ["self", "expanded_idx_mapping", "idx_mapping_np", "vocab_size"]
+
+
 def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkeypatch):
     from vllm.v1.worker.gpu.sample import gumbel
     from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -1455,7 +1466,7 @@ def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkey
         seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
         top_k=SimpleNamespace(gpu=top_k, np=top_k.numpy()),
         top_p=SimpleNamespace(gpu=top_p, np=top_p.numpy()),
-        get_top_k_top_p=lambda rows, rows_np: (top_k[rows.long()], top_p[rows.long()]),
+        get_top_k_top_p=lambda rows, rows_np, vocab_size: (top_k[rows.long()], top_p[rows.long()], False),
     )
     sampler = SimpleNamespace(
         logits_processors=[Bias(), Penalty()],
