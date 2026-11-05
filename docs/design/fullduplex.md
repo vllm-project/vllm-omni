@@ -690,10 +690,11 @@ Qwen3-Omni supports resident Thinker requests in the V1 and CUDA MRv2 duplex
 profiles, using the upstream resumable streaming-input
 request path. A continued request drains its previous turn's in-flight outputs
 before worker delivery state is reset; other sessions remain schedulable. The
-`supports_turn_kv_continuation` capability is resolved from engine settings;
+`supports_core_resumable_request` capability is resolved from engine settings;
 unsupported configurations log a reason and use per-turn requests with ordinary
 prefix caching where available. No separate deployment or session switch is
-required. Commit, playback and VAD policy remain turn-based. A request-owned
+required. Qwen also advertises `supports_turn_commit_only: true`, so only
+the entry request stays resident; commit, playback and VAD policy remain turn-based. A request-owned
 Qwen input ledger records accepted output tokens. A session-owned append cursor
 is invalidated by edits to previously submitted history. After checking the
 last heard reply against completed output, the normal path renders only new

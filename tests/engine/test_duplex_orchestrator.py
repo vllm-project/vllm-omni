@@ -122,19 +122,18 @@ async def test_qwen_continuation_defaults_follow_engine_configuration(unsupporte
     entry.speculative_config = object() if unsupported == "speculative" else None
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
-    assert plugin.capabilities(max_sessions=1).supports_turn_kv_continuation
+    assert plugin.capabilities(max_sessions=1).supports_core_resumable_request
     orchestrator, _, rpc_q, _ = _build(
         plugin=plugin,
         async_chunk=unsupported != "no_chunks",
         stage_configs=configs,
     )
     try:
-        assert plugin.capabilities(max_sessions=1).supports_turn_kv_continuation is (unsupported in (None, "v2"))
-        assert not plugin.capabilities(max_sessions=1).supports_core_resumable_request
+        assert plugin.capabilities(max_sessions=1).supports_core_resumable_request is (unsupported in (None, "v2"))
         assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
         session = orchestrator.session_manager.get(SESSION_ID)
         assert session is not None
-        assert session.capabilities.supports_turn_kv_continuation is (unsupported in (None, "v2"))
+        assert session.capabilities.supports_core_resumable_request is (unsupported in (None, "v2"))
     finally:
         await orchestrator.session_manager.shutdown()
 

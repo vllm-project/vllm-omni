@@ -19,8 +19,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Plugin:
+    def __init__(self, *, turn_commit_only=False):
+        self.turn_commit_only = turn_commit_only
+
     def capabilities(self, *, max_sessions):
-        return SimpleNamespace(required_input_modalities={"audio"}, supports_core_resumable_request=True)
+        return SimpleNamespace(
+            required_input_modalities={"audio"},
+            supports_core_resumable_request=True,
+            supports_turn_commit_only=self.turn_commit_only,
+        )
 
     def silence_unit_payload(self):
         return {"audio": "AAAAAA==", "format": "pcm_f32le", "sample_rate_hz": 24000}
@@ -32,6 +39,7 @@ class _Handle:
         self.session_id = session_id
         self.events_queue: asyncio.Queue[SimpleNamespace | None] = asyncio.Queue()
         self.appends = []
+        self.commits = []
         self.closed = False
 
     async def append_audio(self, audio, **kwargs):
@@ -44,6 +52,9 @@ class _Handle:
             return
         event_type = "error" if self.owner.failure == "event" else "response.output_audio.delta"
         self.events_queue.put_nowait(SimpleNamespace(type=event_type))
+
+    async def commit(self, **kwargs):
+        self.commits.append(kwargs)
 
     async def events(self):
         while (event := await self.events_queue.get()) is not None:
@@ -216,3 +227,15 @@ async def test_warmup_timeout_admits_single_and_multiple_frontend_clients(monkey
     await asyncio.wait_for(warmup.wait_for_duplex_warmup(websocket), timeout=2)
 
     assert not app.state.duplex_warmup_done.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_commit_only", [False, True])
+async def test_resumable_warmup_uses_turn_policy_for_commit(turn_commit_only):
+    omni = _Omni(2, 2, 0)
+    omni.engine.plugin = _Plugin(turn_commit_only=turn_commit_only)
+    await warmup._warmup_duplex_realtime(_app(omni, 2), SimpleNamespace(), 1)
+
+    assert omni.configs[0]["extra_body"]["auto_response"] is not turn_commit_only
+    assert omni.handles[0].commits == ([{"final": True, "create_response": None}] if turn_commit_only else [])
+    assert omni.handles[0].closed

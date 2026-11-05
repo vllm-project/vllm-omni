@@ -18,7 +18,9 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _channel(*, projects_intermediate: bool = False, turn_kv_continuation: bool = False) -> ModelChannel:
+def _channel(
+    *, projects_intermediate: bool = False, resumable: bool = False, turn_commit_only: bool = True
+) -> ModelChannel:
     async def _unused(*args, **kwargs):
         del args, kwargs
 
@@ -26,7 +28,9 @@ def _channel(*, projects_intermediate: bool = False, turn_kv_continuation: bool 
         SimpleNamespace(
             plugin=SimpleNamespace(projects_intermediate_outputs=projects_intermediate),
             session=SimpleNamespace(
-                capabilities=DuplexCapabilities(supports_turn_kv_continuation=turn_kv_continuation)
+                capabilities=DuplexCapabilities(
+                    supports_core_resumable_request=resumable, supports_turn_commit_only=turn_commit_only
+                )
             ),
         ),
         SimpleNamespace(),
@@ -71,7 +75,7 @@ def test_real_stop_stays_finished() -> None:
 
 def test_resident_turn_thinker_segment_finishes_a_text_only_response() -> None:
     output = SimpleNamespace(request_id="resident", finished=False, outputs=[])
-    built = _channel(turn_kv_continuation=True)._build_stage_output(
+    built = _channel(resumable=True)._build_stage_output(
         _item(output, segment_finished=True, stage_id=0, final_stage_id=0)
     )
     assert built.finished is True
@@ -84,3 +88,12 @@ def test_intermediate_stage_stays_unfinished() -> None:
         _item(output, segment_finished=False, stage_id=1, final_stage_id=3)
     )
     assert built.finished is False
+
+
+def test_native_resumable_segment_does_not_finish_turn() -> None:
+    output = SimpleNamespace(request_id="duplex-s.seg.e.0.r.stage0", finished=False, outputs=[])
+    built = _channel(resumable=True, turn_commit_only=False)._build_stage_output(
+        _item(output, segment_finished=True, stage_id=0, final_stage_id=0)
+    )
+    assert built.finished is False
+    assert output.finished is False

@@ -459,7 +459,7 @@ class DuplexModelPlugin(ABC):
 
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
-    supports_turn_kv_continuation: bool = False
+    supports_core_resumable_request: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
