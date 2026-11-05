@@ -556,7 +556,7 @@ def test_replace_layers_binds_every_native_target(monkeypatch):
     from vllm.lora.layers import BaseLayerWithLoRA
     from vllm.lora.peft_helper import PEFTHelper
 
-    from vllm_omni.diffusion.lora import manager as manager_module
+    from vllm_omni.lora import manager as manager_module
 
     class _StubLoRALayer(BaseLayerWithLoRA):
         def __init__(self, base_layer):
@@ -589,7 +589,7 @@ def test_replace_layers_binds_every_native_target(monkeypatch):
     pipeline = torch.nn.Module()
     pipeline.transformer = transformer
 
-    monkeypatch.setattr(manager_module, "from_layer_diffusion", lambda *, layer, **_: _StubLoRALayer(layer))
+    monkeypatch.setattr(manager_module, "from_layer", lambda *, layer, **_: _StubLoRALayer(layer))
 
     manager = object.__new__(DiffusionLoRAManager)
     manager.pipeline = pipeline

@@ -106,7 +106,7 @@ class TestStage1DiTLoRA:
 
     def test_diffusion_lora_manager_replaces_bagel_packed_layer_via_sublayer_target(self, monkeypatch):
         """Targeting sublayer 'q_proj' should replace the fused 'qkv_proj' under bagel."""
-        import vllm_omni.diffusion.lora.manager as manager_mod
+        import vllm_omni.lora.manager as manager_mod
 
         monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", DummyBaseLayerWithLoRA)
 
@@ -115,7 +115,7 @@ class TestStage1DiTLoRA:
 
         replace_calls: list[str] = []
 
-        monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+        monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer_diffusion)
         monkeypatch.setattr(
             manager_mod,
             "replace_submodule",
@@ -192,7 +192,7 @@ class TestBagelLoRARoundTrip:
 
     def test_set_active_adapter_loads_and_activates_bagel_lora(self, tmp_path, monkeypatch):
         """Full round-trip through set_active_adapter for a bagel component module."""
-        import vllm_omni.diffusion.lora.manager as manager_mod
+        import vllm_omni.lora.manager as manager_mod
 
         monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", DummyBaseLayerWithLoRA)
 
@@ -211,7 +211,7 @@ class TestBagelLoRARoundTrip:
                 return DummyBaseLayerWithLoRA(layer)
             return layer
 
-        monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer)
+        monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer)
         monkeypatch.setattr(
             manager_mod,
             "replace_submodule",

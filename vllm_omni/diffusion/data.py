@@ -934,6 +934,7 @@ class OmniDiffusionConfig:
     lora_path: str | list[str] | None = None
     lora_scale: float | list[float] = 1.0
     lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
+    lora_application: str = "runtime"
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
@@ -1460,6 +1461,24 @@ class OmniDiffusionConfig:
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
+        if self.lora_application not in ("runtime", "merged"):
+            raise ValueError("lora_application must be 'runtime' or 'merged'")
+        if self.lora_application == "merged":
+            if self.lora_backend != LoRABackend.PEFT:
+                raise ValueError("Merged LoRA requires lora_backend='peft'")
+            if self.quantization_config is not None or self.parallel_config.use_hsdp:
+                raise ValueError("Merged LoRA requires unquantized weights without HSDP")
+            if offload_strategy is not OffloadStrategy.NONE:
+                raise ValueError("Merged LoRA does not support inference weight offloading")
+            if self.is_moe:
+                raise ValueError("Merged LoRA does not support MoE adapters")
+            if (
+                self.weight_transfer_config is not None
+                and self.weight_transfer_config.get("backend") != "omni_lora_ipc"
+            ):
+                raise ValueError("Merged LoRA weight updates require backend='omni_lora_ipc'")
+        elif self.weight_transfer_config is not None and self.weight_transfer_config.get("backend") == "omni_lora_ipc":
+            raise ValueError("omni_lora_ipc requires lora_application='merged'")
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:

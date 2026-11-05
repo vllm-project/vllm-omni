@@ -361,6 +361,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_load_format: str | None = None
     lora_path: list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: str | None = None
     diffusers_call_kwargs: str | None = None
@@ -774,6 +775,7 @@ class OrchestratorArgs:
     """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
@@ -862,6 +864,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_load_format",
         "lora_path",
         "lora_backend",
+        "lora_application",
         "lora_scale",
         "diffusers_load_kwargs",
         "diffusers_call_kwargs",
