@@ -126,15 +126,13 @@ def talker_kstep_decode(
     accumulated_latents: list[torch.Tensor] = []
     finished = False
 
-    # Pre-allocate device-resident buffer to avoid per-step torch.cat and DtoD copy
-    static_tokens_buf = torch.empty(max_decode_tokens, dtype=torch.long, device=device)
-    curr_len = 0
-    write_pos = 0
+    # Pre-allocate device-resident buffer with k_steps headroom so in-loop writes
+    # never overwrite past history before stop-token truncation is resolved.
+    static_tokens_buf = torch.empty(max_decode_tokens + max(1, k_steps), dtype=torch.long, device=device)
+    past_num = 0
     if past_tokens_tensor is not None and past_tokens_tensor.numel() > 0:
         past_num = min(past_tokens_tensor.numel(), max_decode_tokens)
         static_tokens_buf[:past_num].copy_(past_tokens_tensor.view(-1)[-past_num:])
-        curr_len = past_num
-        write_pos = past_num
 
     current_hidden = initial_hidden_states
     step_tokens_buf = torch.empty(max(1, k_steps), dtype=torch.long, device=device)
@@ -147,11 +145,9 @@ def talker_kstep_decode(
             break
         logits = logits.squeeze(0).squeeze(0)  # (vocab_size,)
 
-        if curr_len > 0:
-            if write_pos > max_decode_tokens:
-                active_past = static_tokens_buf.roll(-(write_pos % max_decode_tokens), dims=0)
-            else:
-                active_past = static_tokens_buf[:curr_len]
+        total_before = past_num + step_idx
+        if total_before > 0:
+            active_past = static_tokens_buf[max(0, total_before - max_decode_tokens) : total_before]
         else:
             active_past = None
 
@@ -163,16 +159,12 @@ def talker_kstep_decode(
             repetition_penalty=repetition_penalty,
             past_tokens=active_past,
             stop_token_ids=stop_token_ids,
-            current_step=curr_len,
+            current_step=min(total_before, max_decode_tokens),
         )
 
         # In-place write to static buffers on device (deferring host materialization until after loop)
-        slot = write_pos % max_decode_tokens
-        static_tokens_buf[slot : slot + 1].copy_(token_t)
+        static_tokens_buf[total_before : total_before + 1].copy_(token_t)
         step_tokens_buf[step_idx : step_idx + 1].copy_(token_t)
-        write_pos += 1
-        if curr_len < max_decode_tokens:
-            curr_len += 1
         steps_run += 1
 
         if use_latent:
@@ -182,6 +174,8 @@ def talker_kstep_decode(
             mel_pos = torch.tensor([start_pos + step_idx + 1], dtype=torch.long, device=device)
             embeds = talker.mel_embedding(token_t) + talker.mel_pos_embedding.emb(mel_pos)
             hidden = embeds
+            # Stateless feed-forward/layer pass over hidden only (does not write into
+            # scheduler-allocated paged KV cache slots).
             for layer in talker.h[talker.start_layer : talker.end_layer]:
                 hidden = layer(hidden)
             current_hidden = talker.final_norm(talker.ln_f(hidden))
@@ -200,22 +194,8 @@ def talker_kstep_decode(
             finished = True
             break
 
-    # Adjust ring cursor if a stop token terminated before steps_run
-    extra_steps = steps_run - kept_steps
-    if extra_steps > 0:
-        write_pos -= extra_steps
-        past_init = (
-            min(past_tokens_tensor.numel(), max_decode_tokens)
-            if (past_tokens_tensor is not None and past_tokens_tensor.numel() > 0)
-            else 0
-        )
-        curr_len = min(max_decode_tokens, past_init + kept_steps)
-
-    # If buffer wrapped around, roll so earliest token is at index 0 and latest at the end
-    if write_pos > max_decode_tokens:
-        sampled_tensor = static_tokens_buf.roll(-(write_pos % max_decode_tokens), dims=0)
-    else:
-        sampled_tensor = static_tokens_buf[:curr_len]
+    total_kept = past_num + kept_steps
+    sampled_tensor = static_tokens_buf[max(0, total_kept - max_decode_tokens) : total_kept]
 
     return IndexTTSKStepResult(
         sampled_tokens=sampled_tokens,
