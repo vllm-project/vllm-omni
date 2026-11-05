@@ -29,12 +29,12 @@ def _voice_prompt(path):
     )
 
 
-def _candidate(enabled=True, *, mixed_history=False):
+def _candidate(enabled=True):
+    mixed_history = enabled
     model, core = _model(setup_cache_size=16)
     core._prepare_prompt = _voice_prompt
     core.flow.decoder.rand_noise = torch.zeros(1, 1, 1024)
     model._npu_cross_reference_batching = enabled
-    model._npu_mixed_history_batching = mixed_history
     backend = model.backend
     backend._ragged_fused_body = True
     if mixed_history:
@@ -158,40 +158,17 @@ def test_single_request_keeps_original_dispatch_without_npu_metadata(enabled, mo
     assert not model._states
 
 
-def test_singleton_buckets_skip_prepared_shape_partition(monkeypatch):
+def test_different_lengths_merge_after_reference_setup():
     model, _, calls = _candidate()
     independent = [_candidate(False)[0] for _ in range(2)]
-    grouping = Mock(side_effect=AssertionError("a one-row bucket needs no additional shape partition"))
-    monkeypatch.setattr(model, "_npu_same_shape_groups", grouping)
     infos = [_request(0, 0, count=20), _request(1, 0, count=12)]
     actual = _forward(model, infos)
-    assert calls == [1, 1]
-    grouping.assert_not_called()
+    assert calls == [2]
     for row, single in enumerate(independent):
         expected = _forward(single, [infos[row]])
         torch.testing.assert_close(
             actual.multimodal_outputs["model_outputs"][row], expected.multimodal_outputs["model_outputs"][0]
         )
-
-
-def test_singletons_after_reference_setup_skip_revalidation(monkeypatch):
-    model, core, calls = _candidate()
-
-    def different_prompt_lengths(path):
-        values = list(_voice_prompt(path))
-        if "voice-1.wav" in path:
-            values[0] = torch.tensor([[5, 6, 7]])
-            values[3] = torch.ones(1, 5, 1)
-        return tuple(values)
-
-    core._prepare_prompt = different_prompt_lengths
-    grouping = Mock(wraps=model._npu_same_shape_groups)
-    monkeypatch.setattr(model, "_npu_same_shape_groups", grouping)
-    _forward(model, [_request(0, 0), _request(1, 0)])
-    assert calls == [1, 1]
-    # Fresh rows need one authoritative partition after setup, but the
-    # singleton groups it produces must not perform the same validation again.
-    grouping.assert_called_once()
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -282,12 +259,12 @@ def test_step_graph_is_preserved_when_npu_opt_in_is_ineligible():
     assert calls == [2] * (2 * model.backend.n_timesteps)
 
 
-def test_different_token_lengths_are_split_without_reordering():
+def test_different_token_lengths_share_cfm_without_reordering():
     model, _, calls = _candidate()
     singles = [_candidate(False)[0] for _ in range(3)]
     infos = [_request(row, 0, count=count) for row, count in enumerate([20, 12, 20])]
     actual = _forward(model, infos)
-    assert calls == [2, 1]
+    assert calls == [3]
     for row, single in enumerate(singles):
         expected = _forward(single, [infos[row]])
         torch.testing.assert_close(
@@ -313,7 +290,7 @@ def test_fresh_references_are_regrouped_after_actual_prompt_setup(onset_merge):
         single.backend._token2wav._prepare_prompt = varied_prompt
     infos = [_request(row, 0) for row in range(3)]
     actual = _forward(model, infos)
-    assert calls == [2, 1]
+    assert calls == [3]
     for row, single in enumerate(singles):
         expected = _forward(single, [infos[row]])
         torch.testing.assert_close(
@@ -321,18 +298,18 @@ def test_fresh_references_are_regrouped_after_actual_prompt_setup(onset_merge):
         )
 
 
-def test_mixed_history_and_final_flags_remain_separate():
+def test_mixed_history_and_final_flags_share_cfm():
     model, _, calls = _candidate()
     _forward(model, [_request(0, 0), _request(1, 0)])
     _forward(model, [_request(0, 1)])
     calls.clear()
     _forward(model, [_request(0, 2), _request(1, 1)])
-    assert calls == [1, 1]
+    assert calls == [2]
     other, _, other_calls = _candidate()
     _forward(other, [_request(0, 0), _request(1, 0)])
     other_calls.clear()
     _forward(other, [_request(0, 1, last=True), _request(1, 1)])
-    assert other_calls == [1, 1]
+    assert other_calls == [2]
     assert "voice-0" not in other._states and "voice-1" in other._states
     other.on_requests_finished(["voice-1"])
     assert not other._states
@@ -475,7 +452,7 @@ def test_authoritative_shape_group_rejects_incompatible_rows(change):
 
 
 @pytest.mark.parametrize("mismatch", ["tokens", "last_chunk"])
-def test_direct_uniform_dispatch_rejects_mismatch_before_backend_call(mismatch):
+def test_direct_dispatch_routes_variable_shapes_to_ragged_backend(mismatch):
     model, _, _ = _candidate()
     items, states, features = _prepared_rows()
     if mismatch == "tokens":
@@ -483,8 +460,10 @@ def test_direct_uniform_dispatch_rejects_mismatch_before_backend_call(mismatch):
     else:
         items[1] = replace(items[1], last_chunk=not items[0].last_chunk)
     model.backend.decode_batch = Mock(side_effect=AssertionError("must not run"))
-    with pytest.raises(RuntimeError, match="npu_cross_reference_shape_mismatch"):
-        model._decode_rows(items, states, features, ragged=False)
+    expected: tuple[list[torch.Tensor], list[BatchedToken2WavState]] = ([], [])
+    model.backend.decode_ragged_batch = Mock(return_value=expected)
+    assert model._decode_rows(items, states, features, ragged=False) is expected
+    model.backend.decode_ragged_batch.assert_called_once()
     model.backend.decode_batch.assert_not_called()
 
 
@@ -498,7 +477,7 @@ def test_existing_npu_mixed_history_guard_is_preserved(monkeypatch):
 
 @pytest.mark.parametrize("batch", [2, 3, 4])
 def test_ragged_npu_inputs_match_independent_streams(batch):
-    model, core, calls = _candidate(mixed_history=True)
+    model, core, calls = _candidate()
     independent_pairs = [_candidate(False) for _ in range(batch)]
     independent = [value[0] for value in independent_pairs]
 
@@ -552,19 +531,8 @@ def test_ragged_npu_groups_allow_lengths_but_keep_hift_boundary():
     assert group(items, states, features, cross_turn=False, mixed_history=True) == [[0], [1]]
 
 
-def test_mixed_history_requires_cross_reference_warning(monkeypatch):
-    warning = Mock()
-    monkeypatch.setattr("vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav.logger.warning", warning)
-    config = _config()
-    config.model_config.stage_connector_config["extra"].update(
-        cfm_npu_cross_reference_batching=False, cfm_npu_mixed_history_batching=True
-    )
-    MiniCPMO45Code2Wav(vllm_config=config)
-    assert any("requires cfm_npu_cross_reference_batching=true" in str(call) for call in warning.call_args_list)
-
-
 def test_ragged_npu_staggered_final_and_fresh_request():
-    model, _, calls = _candidate(mixed_history=True)
+    model, _, calls = _candidate()
     singles = {row: _candidate(False)[0] for row in range(3)}
     for chunk in range(10):
         # Row 0 finishes while row 1 continues; row 2 then joins as a fresh row.

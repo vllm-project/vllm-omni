@@ -43,27 +43,16 @@ connectors:
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
       cfm_fused_body: true
-      # Enabled in this profile for NPU; set false to disable.
-      # Has no effect on non-NPU backends. Different references share CFM
-      # decode when their prepared states are compatible. Without the mixed-
-      # history option below, prompt/cache/token shapes and final flags must match.
-      # Requires a FP32 fused Whole-Euler arena, FP32 attention caches and
-      # code2wav_min_batch_size: 1. References still initialize separately.
-      # References initialize separately; unsupported configurations retain
-      # their existing dispatch. This does not enable slot-pool batching.
+      # Enable NPU cross-reference CFM batching for same-shape and ragged
+      # requests, including different token/query, reference prompt and
+      # conformer/CFM attention-history lengths and mixed final-chunk flags.
+      # Requires FP32 fused Whole-Euler, FP32 attention caches, no slot pool
+      # and code2wav_min_batch_size=1; otherwise warn and retain existing dispatch.
+      # Encoder/HiFT run in compatible subgroups; CFM uses per-request masks,
+      # noise offsets and cache trimming. CNN/HiFT cache shapes, dtypes,
+      # devices and the cache-epoch policy still constrain batching.
+      # Enabled in this profile; set false to disable. No effect off NPU.
       cfm_npu_cross_reference_batching: true
-      # Extend NPU cross-reference CFM batching to different token/query,
-      # conformer/CFM attention-history and reference prompt lengths, including
-      # mixed final-chunk flags. Requires cfm_npu_cross_reference_batching above
-      # and its FP32 fused Whole-Euler prerequisites. Encoder subgroups feed
-      # one padded CFM solve with per-request masks, noise offsets and cache
-      # trimming; HiFT runs in compatible subgroups. CNN/HiFT cache shapes,
-      # dtypes, devices and the configured cache-epoch policy still constrain
-      # batching. No effect off NPU.
-      # Opt in by setting this to true in a deployment copy or overlay.
-      # Keep same-shape batching as the shipped default while broader
-      # production mixed-history occupancy is evaluated.
-      cfm_npu_mixed_history_batching: false
       # Small exact encoder batches share one startup arena; larger batches
       # replay in groups, preserving cache lengths without batch padding.
       enable_code2wav_encoder_graph: true
