@@ -244,122 +244,33 @@ latents, and exact metadata/request identity.
 
 ## Experimental WorldKV memory for LingBot World
 
-LingBot accepts an opt-in `model_config.worldkv` mapping for pose-ranked
-history retrieval and CPU-bank KV compression. Omitting this mapping preserves
-the native LingBot sink and paged/direct cache paths. All units below are latent
-frames, and `window_frames` includes the current chunk.
-
-The two mechanism controls are:
-
-| Mechanism | Disabled by default | Enable explicitly |
-| --- | --- | --- |
-| Pose retrieval | `retrieval_frames: 0` | Set a positive frame budget and `bank_bytes` |
-| Bank KV compression | `world_keep_ratio: 1.0` | Set a ratio in `[0,1)` with retrieval enabled |
-
-Compression only reduces rows stored in the retrieval bank. It does not
-compress the current chunk, native sink, or recent canonical history. Compression
-requires retrieval; enabling compression alone is rejected rather than silently
-activating retrieval. `world_score: centroid` uses the released WorldKV code's
-normalized raw-anchor centroid; `pairwise_mean` (the default) uses mean cosine
-similarity to the anchor tokens. These scores can select different tokens.
-The anchor frame is always retained in full. For a three-frame chunk,
-`world_keep_ratio: 0.5` therefore retains about two thirds of all chunk tokens.
-
-The configuration below matches the paper's LingBot layout: an 18-frame window
-holding 3 sink frames, 9 frames of retrieved memory, 3 recent frames and the
-3-frame current chunk, with 25% of the non-anchor tokens kept per stored chunk.
-Each stored chunk then costs 1.5 frames of tokens, so the 9-frame budget holds
-six retrieved chunks.
+`model_config.worldkv` opts LingBot into training-free, pose-indexed KV memory.
+Without it, the native sink and window paths are unchanged. Units are latent
+frames; `window_frames` includes the 3-frame current chunk.
 
 ```yaml
 model_config:
   worldkv:
     window_frames: 18
-    sink_frames: 3
-    retrieval_frames: 9
-    bank_bytes: 51539607552  # 48 GiB CPU bank; see bank sizing below
-    world_keep_ratio: 0.25  # use 1.0 for the uncompressed retrieval control
-    world_score: pairwise_mean  # paper Eq. 5; centroid follows the released code
+    sink_frames: 3            # multiple of the chunk size when retrieving
+    retrieval_frames: 9       # budget after compression; 0 disables retrieval
+    bank_bytes: 51539607552   # per-memory CPU bank, FIFO eviction
+    world_keep_ratio: 0.25    # 1.0 disables compression; needs retrieval
+    world_score: pairwise_mean  # or centroid, as in the released code
+    # host_bank_limit_bytes: process-wide cap, defaults to physical memory
 ```
 
-`retrieval_frames` is a token budget measured in frames *after* compression.
-The released code's `--retrieval_frames R` instead counts uncompressed frames
-(`R / 3` chunks); the equivalent budget here is `R / 3 * (1 + 2 * ratio)`. For
-example, its script default (`R = 18`, ratio 0.5) corresponds to
-`retrieval_frames: 12`. Chunks are fitted whole, so a budget that is not a
-multiple of one compressed chunk leaves the remainder of the region unused.
+- **Retrieval:** evicted chunks go to the bank, keyed by their middle-frame
+  C2W pose. Each chunk ranks bank chunks by translation plus rotation distance
+  and fits whole chunks into the budget, in time order with original RoPE.
+- **Compression:** only bank rows; the anchor frame is kept in full.
+- **Bank size:** about 1.79 GiB per chunk at 480x832, bf16, ratio 0.25. A
+  revisit is recalled only while its chunk is still in the bank; the first
+  eviction logs a warning.
+- **Limits:** single rank, single sequence, eager, clean-x0 commits. Deep
+  Sink, Participative Compression, RoPE rebasing and CausVid keys are rejected.
+- **State:** history and bank publish only after an all-layer clean forward;
+  failures, reset and close leave canonical state unchanged.
 
-Omitted `window_frames` and `sink_frames` inherit the model's native window
-(18 frames) and sink (9 frames), so an empty mapping attends to the same
-sink and recent frames as native LingBot, without retrieval or compression,
-through the transactional WorldKV cache instead of the native cache paths. The paper
-layout above therefore sets `sink_frames: 3` explicitly. Configuration is
-validated against the 3-frame chunk at model load: the window must fit sink,
-retrieval and one complete chunk; with retrieval enabled, `sink_frames` must be
-a multiple of the chunk size (otherwise the non-sink frames of a chunk
-straddling the sink could never be retrieved) and `retrieval_frames` must fit
-at least one compressed chunk.
-
-Only single-rank, single-sequence eager attention with clean-x0 KV commits is
-supported. First-block sharing and last-denoise-step KV reuse are rejected.
-The model's session reservation includes policy history, pending commits,
-retrieved device rows and layer-local scratch; a minimum legacy pool remains
-allocated for runtime geometry.
-
-### Bank sizing
-
-The CPU bank is byte-bounded with FIFO eviction, and every chunk after the
-sink is stored when it is committed. One stored chunk costs
-
-```text
-128 + layers * (T + ceil((chunk - 1) * T * ratio)) * (2 * heads * head_dim * itemsize + 16)
-```
-
-bytes, where `T` is the number of tokens per latent frame. For the 40-layer,
-40-head LingBot geometry at 480x832 in bf16 (`T = 1560`), this is about
-1.79 GiB at ratio 0.25, 2.38 GiB at 0.5 and 3.57 GiB at 1.0. A 48 GiB bank
-therefore keeps about 26 chunks (78 latent frames, roughly 20 seconds of video)
-at ratio 0.25. A revisit can only be recalled while its chunk is still in the
-bank, so size `bank_bytes` for the longest revisit distance: holding the whole
-trajectory needs `(latent_frames - sink_frames) / 3` chunks. The first
-eviction in each memory logs a warning, and `WorldKV.evicted_chunks` counts
-evicted chunks.
-
-`bank_bytes` is a per-memory limit: every session branch and every direct
-request owns a separate bank. A memory reserves its full `bank_bytes` when it
-is created and releases it on reset, close or when a request-local cache is
-dropped. A new memory is rejected when the reservations of all live memories
-in the process would exceed `host_bank_limit_bytes`, which defaults to the
-host's physical memory; set it lower to leave room for weights and other host
-state.
-
-### Retrieval
-
-Retrieval ranks absolute C2W poses by normalized translation and rotation
-distance. It excludes sink and still-visible recent chunks, fits complete
-bank chunks into the retrieval token budget, and preserves chronological order
-for attention. Retrieved rows
-are transferred once per chunk/layer and reused during denoising. A new pose,
-clean commit, failed forward, reset or close invalidates device staging.
-Only a successful all-layer clean forward publishes history and bank together;
-failed publication leaves canonical state unchanged. Session branches and
-requests own separate memories and release them on reset or close.
-
-This branch contains only the WorldKV-inspired retrieval/compression path.
-Deep Sink, Participative Compression, RoPE rebasing and CausVid policy integration
-are not included; their configuration keys are rejected. Stored and retrieved
-keys retain their original temporal RoPE phase, matching the released code's
-default (`--retrieval_rope_correction` off). Two further differences from the
-released code are intentional. Each chunk is represented by the pose of its
-middle latent frame rather than by the element-wise mean of its poses, which is
-not a rotation. The released code also excludes the chunk immediately before the
-visible recent frames from retrieval even though it is no longer attended; here
-every chunk that has left the recent window is a candidate. This is a method transfer to
-LingBot v2, not a claim to reproduce the original paper's full benchmark or
-improve long-video quality. Prior three-minute results belong to the combined
-branch and do not replace validation of this extraction.
-
-CPU tests cover dense numerical compression oracles, raw/retrieved attention,
-feature isolation, bank capacity and eviction, transaction rollback, and real
-LingBot attention/transformer integration. GPU output and performance claims
-require E2E results for the exact branch revision, backend and workload.
+This is a method transfer, not a reproduction of the paper's benchmark.
+Quality and performance claims need E2E results for the exact revision.
