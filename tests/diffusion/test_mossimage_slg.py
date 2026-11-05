@@ -106,7 +106,6 @@ def step_state(request_id, params, prompt="positive"):
     emulation).
     """
     req = request(params, request_id=request_id)
-    req.prompt = prompt
     return StepRequestState(request_id=request_id, sampling=req.sampling_params, prompt=prompt)
 
 
