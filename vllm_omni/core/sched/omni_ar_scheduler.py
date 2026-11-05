@@ -26,6 +26,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.seeded_isolation import isolation_plan, request_is_seeded
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
@@ -835,6 +836,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _seeded_isolation_plan(self) -> tuple[bool, bool]:
+        """Whether to defer admission and/or admit only a waiting seeded request."""
+        return isolation_plan(
+            has_running=bool(self.running),
+            seeded_running=any(request_is_seeded(getattr(r, "sampling_params", None)) for r in self.running),
+            seeded_waiting=any(request_is_seeded(getattr(r, "sampling_params", None)) for r in self.waiting),
+        )
+
+    def _promote_seeded_request(self) -> None:
+        """Move the oldest waiting seeded request to the front of the queue."""
+        target = next(
+            (r for r in self.waiting if request_is_seeded(getattr(r, "sampling_params", None))),
+            None,
+        )
+        if target is None:
+            return
+        if self.waiting.peek_request() is not target:
+            self.waiting.remove_request(target)
+            self.waiting.prepend_request(target)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -851,13 +872,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
 
+        seeded_defer, seeded_solo = self._seeded_isolation_plan()
+        if seeded_solo:
+            self._promote_seeded_request()
+
         original_wait_queues = None
-        if self._should_defer_waiting_admission():
+        if seeded_defer or self._should_defer_waiting_admission():
             original_wait_queues = self.waiting, self.kv_holding_waiting
             self.waiting = create_request_queue(self.policy)
             self.kv_holding_waiting = create_request_queue(self.policy)
 
         original_max_num_active_reqs = self.max_num_active_reqs
+        if seeded_solo:
+            # Admit exactly the promoted seeded request, nothing else.
+            self.max_num_active_reqs = 1
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
