@@ -203,8 +203,83 @@ omni = Omni(model="<autoround-mxfp8-model>")
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
+| `prefix_bf16_steps` | int | `0` | Online NPU only; compute denoising indices `0 <= step < K` with the retained BF16 master, then resume MXFP8; `0` disables the fallback |
+| `prefix_bf16_master_mode` | `cpu`, `resident`, or `dlo` | `cpu` | Storage policy for the retained BF16 master; `dlo` reuses distributed layerwise offload buffers |
 
 ## Validation and Notes
+
+### NPU MXFP8 Block-Scale Selection
+
+`VLLM_OMNI_MXFP8_SCALE_METHOD` selects the shared scale for NPU activation
+and online weight quantization. Set it before starting the process:
+
+```bash
+export VLLM_OMNI_MXFP8_SCALE_METHOD=amax_pow2_ceil
+```
+
+| Value | Scale selection for an E4M3FN block | CANN argument |
+| --- | --- | --- |
+| `ocp` (default) | OCP shared exponent: `s = 2 ** (floor(log2(amax)) - 8)` | `scale_alg=0` |
+| `amax_pow2_ceil` | Cover the block maximum: `s = 2 ** ceil(log2(amax / 448))` | `scale_alg=1` |
+
+Here `amax = max(abs(x))` over 32 elements along the last dimension; 448 is the
+largest finite E4M3FN value. These formulas describe nonzero finite blocks away
+from the shared-scale range limits; the operator handles zeros and UE8M0 limits.
+See the [CANN operator definition](https://gitcode.com/cann/ops-nn/blob/master/quant/dynamic_mx_quant/docs/aclnnDynamicMxQuant.md).
+Scale selection is independent of element `round_mode`. The installed
+torch_npu/CANN version must support the method and the `scale_alg` keyword.
+Offline checkpoint weights are not requantized. Unknown names, including numeric
+strings, raise `ValueError` when quantization runs. The environment is read on
+each quantizer call; keep it fixed for the process lifetime so online weights and
+activations use the same method.
+
+#### When to change the method
+
+Start with `ocp`. Diagnose weights and activations separately, by layer and
+denoising step, on representative inputs:
+
+- **Pre-cast clipping ratio:** finite input elements with `abs(x) > 448 * s`,
+  divided by all finite real input elements. Exclude padding from the denominator.
+- **Clipped-block ratio:** blocks containing any such element, divided by all
+  real blocks. Also record nonfinite inputs separately.
+- **Endpoint occupancy:** the proportion of quantized values with `abs(q) == 448`.
+  This includes rounding to the endpoint and is not itself a clipping ratio.
+
+If `ocp` clips values in sensitive layers/steps and reconstruction error or output
+quality is unacceptable, compare `amax_pow2_ceil` using the same inputs, seed and
+steps. Its scale can be twice as large: it reduces over-range clipping but may
+increase rounding error for smaller values. Compare reconstruction MSE/NRMSE and
+generated quality, not clipping alone. There is no universal ratio threshold and
+no automatic switching. Zero clipping does not establish accuracy; weight-only
+measurements cannot establish activation clipping. Retain OCP when the alternative
+does not help; use layer/timestep BF16 fallback where needed.
+
+### NPU Online BF16 Prefix Fallback
+
+Use the prefix fallback when quantization error on early denoising steps is
+unacceptable. The policy is executed by MindIE-SD's `MXFP8BF16Fallback`; this
+repository owns the denoising-step context and optional DLO lifecycle.
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-quantization-config '{"method":"mxfp8","prefix_bf16_steps":5,"prefix_bf16_master_mode":"cpu"}'
+```
+
+`prefix_bf16_steps` counts zero-based `ForwardContext.denoise_step_idx`
+indices, so every CFG pass at the same denoising step uses the same policy.
+If no denoising step is published, inference stays on MXFP8. A positive value
+requires online MXFP8 weights because serialized checkpoints do not contain
+the BF16 master.
+
+`cpu` keeps the master in host memory and transfers the current layer during
+fallback steps. `resident` keeps all local masters on the loading NPU and can
+significantly increase accelerator memory. `dlo` requires distributed
+layerwise offload and streams the BF16 master through its existing bounded
+double buffers; it retains separate host backing for the standard and BF16
+representations but keeps device residency bounded by the offload block size.
+The BF16 master is excluded from `state_dict` and is not moved by
+`module.to()`. Model migration, mixed-step batches, reload, and sleep/wake are
+not supported for `dlo`.
 
 1. Online mode quantizes BF16 weights at load time using
    `npu_dynamic_mx_quant`. This adds a one-time overhead on the first load

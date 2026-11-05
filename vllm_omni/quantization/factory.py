@@ -574,6 +574,9 @@ def resolve_quant_config_from_disk(
     for policy in ("w4a8_fallback_steps", "w4a8_fallback_layers"):
         if hasattr(quant_config, policy):
             qc_kwargs[policy] = list(getattr(quant_config, policy))
+    for policy in ("prefix_bf16_steps", "prefix_bf16_master_mode"):
+        if hasattr(quant_config, policy):
+            qc_kwargs[policy] = getattr(quant_config, policy)
     if hasattr(quant_config, "mxfp4_scale_alg"):
         # Runtime activation policy is independent of how offline W4 was made.
         qc_kwargs["mxfp4_scale_alg"] = quant_config.mxfp4_scale_alg
