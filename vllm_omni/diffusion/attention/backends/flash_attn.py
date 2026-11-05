@@ -1064,7 +1064,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             output = try_npu_flex_attention(query, key, value, attn_metadata, self.softmax_scale)
             if output is None:
                 raise ValueError(
-                    "NPU FlexAttention requires single-sample, unpadded BF16 prefill without SP or quantization. "
+                    "NPU FlexAttention requires compatible single-sample BF16 block-causal prefill "
+                    "without attention quantization. "
                     "Use attn_path='piecewise' or attn_path='mask' for other inputs."
                 )
             logger.info_once("NPU prefill is using FlexAttention (BF16, BlockMask=128).")

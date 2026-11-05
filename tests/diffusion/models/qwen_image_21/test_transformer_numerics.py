@@ -22,6 +22,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 )
 @pytest.mark.parametrize("attn_path", [None, "auto", "piecewise", "mask", "flex"])
 def test_prefill_attention_metadata(monkeypatch, device, attention_device, attn_path):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    monkeypatch.setattr(npu_flex_attention, "load_mindie_flex_runtime", lambda: None)
     seen = []
 
     class CaptureBlock(torch.nn.Module):
@@ -80,7 +83,7 @@ def test_prefill_attention_metadata(monkeypatch, device, attention_device, attn_
         return_dict=False,
     )
     if attn_path == "flex" and attention_device != "npu":
-        with pytest.raises(ValueError, match="unpadded NPU prefill"):
+        with pytest.raises(ValueError, match="NPU prefill"):
             model(**inputs)
         return
     output = model(**inputs)[0]
@@ -103,7 +106,11 @@ def test_prefill_attention_metadata(monkeypatch, device, attention_device, attn_
             assert metadata.full_attn_spans == [[(2, 4)]]
             assert metadata.attn_mask is None
         if attn_path == "flex":
-            assert metadata.extra == {"npu_flex_attention": True, "_qwen_image21_flex_cache": {}}
+            assert metadata.extra == {
+                "npu_flex_attention": True,
+                "npu_flex_seq_len": 4,
+                "_qwen_image21_flex_cache": {},
+            }
         else:
             assert metadata.extra == {}
     torch.testing.assert_close(output, torch.cat([text, hidden], dim=1), rtol=0, atol=0)
@@ -119,13 +126,16 @@ def test_prefill_attention_metadata(monkeypatch, device, attention_device, attn_
         ("auto", False, False, False, "SDPA", "mask"),
         ("mask", False, False, True, "FLASH_ATTN", "mask"),
         ("flex", False, False, True, "FLASH_ATTN", "flex"),
-        ("flex", True, False, True, "FLASH_ATTN", None),
-        ("flex", False, True, True, "FLASH_ATTN", None),
+        ("flex", True, False, True, "FLASH_ATTN", "flex"),
+        ("flex", False, True, True, "FLASH_ATTN", "flex"),
         ("flex", False, False, True, "SDPA", None),
         ("invalid", False, False, True, "FLASH_ATTN", None),
     ],
 )
-def test_npu_prefill_path_contract(hint, padding, sp_padding, supports_spans, backend_name, expected):
+def test_npu_prefill_path_contract(monkeypatch, hint, padding, sp_padding, supports_spans, backend_name, expected):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    monkeypatch.setattr(npu_flex_attention, "load_mindie_flex_runtime", lambda: None)
     model = object.__new__(transformer.QwenImage21Transformer2DModel)
     torch.nn.Module.__init__(model)
     model.causal_block = True
@@ -136,6 +146,63 @@ def test_npu_prefill_path_contract(hint, padding, sp_padding, supports_spans, ba
             model._resolve_attn_path(hint, padding, sp_padding, "npu")
     else:
         assert model._resolve_attn_path(hint, padding, sp_padding, "npu") == expected
+
+
+@pytest.mark.cpu
+def test_flex_dependency_error_precedes_automatic_sdpa_selection(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_block = True
+
+    def unavailable():
+        raise ImportError("MindIE-SD with FlexAttention is required")
+
+    monkeypatch.setattr(npu_flex_attention, "load_mindie_flex_runtime", unavailable)
+    with pytest.raises(ImportError, match="MindIE-SD"):
+        model._resolve_attn_path("flex", False, False, "npu")
+
+
+@pytest.mark.cpu
+def test_flex_is_rejected_when_block_causal_attention_is_disabled():
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_block = False
+    with pytest.raises(ValueError, match="causal_block"):
+        model._resolve_attn_path("flex", False, False, "npu")
+    assert model._resolve_attn_path("auto", False, False, "npu") == "key_padding"
+
+
+@pytest.mark.cpu
+def test_flex_transport_padding_matches_existing_sp_output_crop():
+    prepare = transformer.QwenImage21SequencePrepare.__new__(transformer.QwenImage21SequencePrepare)
+    torch.nn.Module.__init__(prepare)
+    hidden = torch.randn(1, 5, 4)
+    frequencies = torch.randn(5, 2, dtype=torch.complex64)
+    prepare._flex_sp_padding = 3
+    padded, padded_freqs = prepare._pad_flex_target(hidden, frequencies)
+    assert padded.shape == (1, 8, 4)
+    assert padded_freqs.shape == (8, 2)
+    torch.testing.assert_close(padded[:, :5], hidden)
+    torch.testing.assert_close(padded_freqs[:5], frequencies)
+    assert not padded[:, 5:].count_nonzero()
+    assert not padded_freqs[5:].count_nonzero()
+    prepare._flex_sp_padding = 0
+    restored, restored_freqs = prepare._pad_flex_target(hidden, frequencies)
+    assert restored is hidden and restored_freqs is frequencies
+
+
+@pytest.mark.cpu
+def test_flex_decode_metadata_keeps_full_visibility_and_request_isolation():
+    validity = torch.tensor([[True, True, True, True, False]])
+    first = transformer.QwenImage21Transformer2DModel._build_flex_metadata([(0, 5)], 5, validity)
+    second = transformer.QwenImage21Transformer2DModel._build_flex_metadata([(0, 5)], 5, validity)
+    assert first.full_attn_spans == [[(0, 5)]]
+    assert first.attn_mask is None
+    assert first.extra["npu_flex_valid_tokens"] is validity
+    assert first.extra["npu_flex_seq_len"] == 5
+    assert first.extra["_qwen_image21_flex_cache"] is not second.extra["_qwen_image21_flex_cache"]
 
 
 @pytest.mark.parametrize(

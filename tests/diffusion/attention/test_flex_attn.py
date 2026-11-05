@@ -16,8 +16,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 @hardware_test(res={"npu": "A5"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires an Ascend NPU")
 @torch.inference_mode()
-def test_compiled_npu_flex_matches_dense_across_requests(monkeypatch):
-    monkeypatch.setattr(npu_flex_attention, "_compiled_flex", None)
+def test_compiled_npu_flex_matches_dense_across_requests():
+    mindiesd = pytest.importorskip("mindiesd")
+    if not hasattr(mindiesd, "parallel_flex_attention"):
+        pytest.skip("requires a MindIE-SD build with the FlexAttention API")
     torch.manual_seed(42)
     scale = 128**-0.5
     # Exercise changing lengths, image counts and partially filled mask blocks
