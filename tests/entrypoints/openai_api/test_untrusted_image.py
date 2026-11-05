@@ -7,11 +7,14 @@ import asyncio
 import base64
 from io import BytesIO
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from PIL import EpsImagePlugin, Image, UnidentifiedImageError
 
+from vllm_omni.entrypoints.openai import media_input
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.images import helpers as image_helpers
 from vllm_omni.entrypoints.openai.images.helpers import _load_input_images
 from vllm_omni.entrypoints.openai.video.generation.helpers import _validate_minimax_h3_image_payload
 from vllm_omni.entrypoints.openai.video_api_utils import _decode_image_bytes
@@ -45,6 +48,37 @@ def test_load_input_images_rejects_disallowed_eps_data_url(monkeypatch):
         asyncio.run(_load_input_images([data_url]))
 
     assert isinstance(exc_info.value.__context__, UnidentifiedImageError)
+
+
+def test_load_input_images_rejects_oversized_data_url_before_decode(monkeypatch):
+    monkeypatch.setattr(image_helpers, "MAX_IMAGE_INPUT_BYTES", 4)
+    data_url = f"data:image/png;base64,{base64.b64encode(b'12345').decode('ascii')}"
+
+    with pytest.raises(ValueError, match="exceeds"):
+        asyncio.run(_load_input_images([data_url]))
+
+
+def test_load_input_images_rejects_oversized_http_response_before_decode(monkeypatch):
+    async_client = media_input.httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        return async_client(
+            *args,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-length": "5"},
+                    content=b"12345",
+                )
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(image_helpers, "MAX_IMAGE_INPUT_BYTES", 4)
+    monkeypatch.setattr(media_input.httpx, "AsyncClient", _client_factory)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        asyncio.run(_load_input_images(["https://example.com/large.png"]))
 
 
 def test_minimax_h3_upload_validator_rejects_disallowed_eps(monkeypatch):
