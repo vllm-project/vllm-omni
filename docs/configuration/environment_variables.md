@@ -137,8 +137,8 @@ values depend on the actual audio length distribution):
   104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%).
 * Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
   bfloat16), and 1.62-3.7x encoder speedup depending on the batch length mix.
-  End-to-end WER is contributor-reported from one `benchmarks/encoder_bucketing_wer.py`
-  run (single RTX 5090 32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
+  End-to-end WER is contributor-reported from a local WER run (single RTX 5090
+  32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
   temperature 0, repetition penalty 1.05, seed 42; buckets 2,4,8,16,30 s; same
   checkout with the feature off -> on) on LibriSpeech test-clean clips of <= 29 s
   (199 clips measured): WER(off) 1.58%, WER(on) 1.54%, WER(on vs off) 0.22% on
