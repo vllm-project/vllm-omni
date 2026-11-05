@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import builtins
 import importlib.util
 import sys
 import types
@@ -17,7 +18,6 @@ assert _SPEC is not None and _SPEC.loader is not None
 patch_groupnorm = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = patch_groupnorm
 _SPEC.loader.exec_module(patch_groupnorm)
-patch_groupnorm._registry_mod.initialize_model = patch_groupnorm._original_initialize_model
 
 
 @pytest.fixture(autouse=True)
@@ -28,9 +28,20 @@ def aiter_available(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_ops)
 
 
+def test_patch_import_does_not_load_runtime_registry(monkeypatch):
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "vllm_omni.diffusion.registry":
+            pytest.fail("Importing the ROCm patch must not load the runtime registry")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    _SPEC.loader.exec_module(importlib.util.module_from_spec(_SPEC))
+
+
 def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
     model = types.SimpleNamespace(vae=nn.Sequential(nn.GroupNorm(4, 8)))
-    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _, **kwargs: model)
     monkeypatch.setattr(
         patch_groupnorm,
         "_replace_groupnorm_with_aiter",
@@ -38,13 +49,12 @@ def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
     )
 
     od_config = types.SimpleNamespace(model_class_name="HunyuanImage3ForCausalMM")
-    assert patch_groupnorm._patched_initialize_model(od_config) is model
+    patch_groupnorm.patch_model_groupnorm(model, od_config)
     assert type(model.vae[0]) is nn.GroupNorm
 
 
 def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
     model = types.SimpleNamespace(vae=nn.Sequential(nn.GroupNorm(4, 8)))
-    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _, **kwargs: model)
 
     replaced = False
 
@@ -55,19 +65,16 @@ def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
 
     monkeypatch.setattr(patch_groupnorm, "_replace_groupnorm_with_aiter", replace_groupnorm)
     od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
-    assert patch_groupnorm._patched_initialize_model(od_config) is model
+    patch_groupnorm.patch_model_groupnorm(model, od_config)
     assert replaced
 
 
-@pytest.mark.parametrize("model_init_kwargs", [None, {"backbone_meta": True}])
-def test_initialize_model_forwards_kwargs(monkeypatch, model_init_kwargs):
+def test_model_without_vae_needs_no_groupnorm_patch(monkeypatch):
     model = types.SimpleNamespace()
     od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
-
-    def initialize_model(config, **kwargs):
-        assert config is od_config
-        assert kwargs == {"model_init_kwargs": model_init_kwargs}
-        return model
-
-    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", initialize_model)
-    assert patch_groupnorm._patched_initialize_model(od_config, model_init_kwargs=model_init_kwargs) is model
+    monkeypatch.setattr(
+        patch_groupnorm,
+        "_replace_groupnorm_with_aiter",
+        lambda _: pytest.fail("Models without a VAE need no GroupNorm replacement"),
+    )
+    patch_groupnorm.patch_model_groupnorm(model, od_config)

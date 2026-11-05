@@ -598,6 +598,12 @@ def initialize_model(
         # re-layout it performs stays offloadable by sleep mode.
         _apply_wan_vae_fastpath_if_enabled(model, od_config)
 
+        if current_omni_platform.is_rocm():
+            # Keep platform discovery independent of the runtime registry.
+            from vllm_omni.platforms.rocm.patch.worker.patch_groupnorm import patch_model_groupnorm
+
+            patch_model_groupnorm(model, od_config)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
