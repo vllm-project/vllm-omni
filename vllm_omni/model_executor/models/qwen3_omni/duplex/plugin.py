@@ -877,11 +877,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         *,
         history_len: int,
     ) -> dict[str, object] | None:
-        """Show the model that a call ended, on the next prompt only.
+        """Show the model that a call ended, until one response stores its text.
 
         The notice is shaped like an accepted pair, so it shares that pair's
         window and response bookkeeping. A suppressed repeat has no anchor, and
-        the call it repeats already produced a notice.
+        every abandoned call already produced a notice here.
         """
         del config
         origin = abandonment.origin

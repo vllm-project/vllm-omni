@@ -97,6 +97,22 @@ def test_qwen_notice_survives_the_prompt_splice_bookkeeping():
     assert collected[0]["notice"] is True
 
 
+def test_qwen_notice_is_dropped_once_a_response_stores_its_text():
+    plugin = qwen()
+    updated = plugin.runtime_config_for_abandoned_tool_call(
+        CONFIG, {}, abandonment(ToolCallAbandonReason.TIMEOUT), history_len=2
+    )
+    turn = {**updated["qwen_tool_turns"][0], "response_id": "resp_a"}
+    inflight = {"qwen_tool_turns_inflight": [turn]}
+
+    cancelled = plugin.runtime_config_after_response(inflight, committed=False, response_id="resp_a")
+    assert [item.get("notice") for item in cancelled["qwen_tool_turns"]] == [True]
+
+    stored = plugin.runtime_config_after_response(inflight, committed=True, response_id="resp_a")
+    assert "qwen_tool_turns_inflight" not in stored
+    assert not stored.get("qwen_tool_turns")
+
+
 def test_qwen_skips_a_suppressed_repeat_and_a_call_outside_the_window():
     plugin = qwen()
     suppressed = abandonment(ToolCallAbandonReason.SUPPRESSED)
@@ -169,7 +185,7 @@ def joyai() -> JoyAIDuplexPlugin:
 QUESTION = json.dumps({"question": "Is the pot overheated?"})
 
 
-@pytest.mark.parametrize("reason", REASONS_WITH_NOTICE)
+@pytest.mark.parametrize("reason", [*REASONS_WITH_NOTICE, ToolCallAbandonReason.SUPPRESSED])
 def test_joyai_carries_a_notice_to_the_next_observation(reason):
     item = abandonment(reason, name=DELEGATION_TOOL_NAME, arguments=QUESTION)
     updated = joyai().runtime_config_for_abandoned_tool_call(CONFIG, {}, item, history_len=4)
@@ -178,12 +194,8 @@ def test_joyai_carries_a_notice_to_the_next_observation(reason):
     assert json.loads(record["output"])["reason"] == reason.value
 
 
-@pytest.mark.parametrize(
-    "reason",
-    [ToolCallAbandonReason.EPOCH_CANCELLED, ToolCallAbandonReason.SUPPRESSED],
-)
-def test_joyai_does_not_resurface_a_cancelled_or_repeated_question(reason):
-    item = abandonment(reason, name=DELEGATION_TOOL_NAME, arguments=QUESTION)
+def test_joyai_does_not_resurface_a_cancelled_question():
+    item = abandonment(ToolCallAbandonReason.EPOCH_CANCELLED, name=DELEGATION_TOOL_NAME, arguments=QUESTION)
     assert joyai().runtime_config_for_abandoned_tool_call(CONFIG, {}, item, history_len=4) is None
 
 

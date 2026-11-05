@@ -42,6 +42,8 @@ class DuplexToolRunner:
         self._client = client
         self._handlers = dict(handlers)
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        #: Calls the server ended. A result for one would only be refused.
+        self._settled: set[str] = set()
 
     async def run(self) -> None:
         """Handle calls until the session ends; running tools are then cancelled."""
@@ -64,7 +66,10 @@ class DuplexToolRunner:
         elif event.type == "duplex.tool_call.settled":
             details = event.raw.get("event")
             call_id = details.get("call_id") if isinstance(details, dict) else None
-            task = self._tasks.pop(call_id, None) if isinstance(call_id, str) else None
+            if not isinstance(call_id, str):
+                return
+            self._settled.add(call_id)
+            task = self._tasks.pop(call_id, None)
             if task is not None:
                 task.cancel()
 
@@ -89,6 +94,8 @@ class DuplexToolRunner:
             if not isinstance(decoded, dict):
                 raise TypeError("tool arguments must be a JSON object")
             output = await handler(decoded)
+            if not isinstance(output, str):
+                raise TypeError(f"tool {name!r} must return a string, got {type(output).__name__}")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -97,7 +104,11 @@ class DuplexToolRunner:
             logger.exception("Tool call %s failed", call_id)
             await self._finish(self._client.cancel_tool_call(call_id, reason="failed"))
             return
+        if call_id in self._settled:
+            return
         await self._finish(self._client.send_tool_result(call_id, output))
+        if call_id in self._settled:
+            return
         capabilities = self._client.session_info.get("capabilities")
         if isinstance(capabilities, dict) and capabilities.get("tool_result_continuation") == "client_response_create":
             await self._finish(self._client.send({"type": "response.create"}))

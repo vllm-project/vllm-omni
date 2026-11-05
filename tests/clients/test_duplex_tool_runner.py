@@ -161,6 +161,46 @@ async def test_a_settled_call_stops_its_tool_and_drops_the_result():
 
 
 @pytest.mark.asyncio
+async def test_a_call_that_settles_during_a_tool_gets_no_result_or_follow_up():
+    sock = FakeSocket()
+    sock.feed(session_with("client_response_create"))
+    started = asyncio.Event()
+
+    async def ignores_cancellation(arguments):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        return "late"
+
+    async def body():
+        sock.feed(call_event())
+        await started.wait()
+        sock.feed(settled_event())
+
+    await run_with(sock, {"get_weather": ignores_cancellation}, body)
+    assert sent(sock, "conversation.item.create") == []
+    assert sent(sock, "response.create") == []
+
+
+@pytest.mark.asyncio
+async def test_a_non_string_output_is_reported_as_a_failed_tool():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+
+    async def returns_a_dict(arguments):
+        return {"temperature_c": 17}
+
+    async def body():
+        sock.feed(call_event())
+
+    await run_with(sock, {"get_weather": returns_a_dict}, body)
+    assert sent(sock, "conversation.item.create") == []
+    assert sent(sock, "tool_call.cancel")[0]["reason"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_a_slow_tool_does_not_block_the_next_one():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)

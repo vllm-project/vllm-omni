@@ -52,10 +52,17 @@ def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping
     It is not part of ``validate_client_extra_body``, which plugins override
     and which does not see the top-level ``tools`` of a ``session.update``.
     """
-    if not extra_body.get("realtime_tools"):
+    tools = extra_body.get("realtime_tools")
+    if not tools:
         return
     if capabilities.tool_call_mode == "none":
         raise DuplexRuntimeConfigError("This duplex model does not support tools", code="tools_unsupported")
+    max_tools = capabilities.max_tools
+    if max_tools is not None and isinstance(tools, list) and len(tools) > max_tools:
+        raise DuplexRuntimeConfigError(
+            f"This duplex model supports at most {max_tools} tools per session",
+            code="too_many_tools",
+        )
     tool_choice = extra_body.get("realtime_tool_choice")
     if tool_choice not in (None, "auto"):
         raise DuplexRuntimeConfigError(
@@ -894,7 +901,9 @@ class DuplexModelPlugin(ABC):
         Called for a timed-out or cancelled call still in the current epoch,
         and for a repeat the session refused to expose (``suppressed``, which
         has no ledger record). Show ``abandoned_tool_call_notice``, never client
-        text. Cached metadata cleanup belongs in ``on_tool_call_settled`` and
+        text. A plugin may skip a reason it cannot deliver, so a suppressed
+        repeat can be the first notice the model gets for an epoch-cancelled
+        call. Cached metadata cleanup belongs in ``on_tool_call_settled`` and
         runs even if an epoch changed. Returning ``None`` requests no change; it
         is not an acknowledgement that the worker consumed anything. The notice
         must not reset the session or retire another call's queued result.

@@ -323,6 +323,13 @@ class SessionControl:
             self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
             return
         try:
+            # Top-level tools reach the config here, past the extra_body check above.
+            tool_settings = {
+                key: candidate_config.extra_body[key]
+                for key in ("realtime_tools", "realtime_tool_choice")
+                if key in candidate_config.extra_body
+            }
+            self._ctx.plugin.validate_client_extra_body(tool_settings)
             validate_session_tools(session.capabilities, candidate_config.extra_body)
         except DuplexRuntimeConfigError as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)

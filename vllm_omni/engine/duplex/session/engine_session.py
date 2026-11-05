@@ -35,6 +35,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexTurnEventType,
     DuplexTurnState,
     ResponseCreateOptions,
+    effective_tool_retry_policy,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
@@ -2034,6 +2035,7 @@ class DuplexEngineSession:
             "watermarking": self.config.watermarking,
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
+            "tool_retry_policy": effective_tool_retry_policy(self.capabilities, self.config.extra_body),
         }
         extra_body = self.config.extra_body
         realtime_tools = _copy_list(extra_body.get("realtime_tools"))

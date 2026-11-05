@@ -73,6 +73,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "invalid_tool_call_cancel": "invalid_request_error",
     "invalid_tool_policy": "invalid_request_error",
     "invalid_tool_result_timeout": "invalid_request_error",
+    "too_many_tools": "invalid_request_error",
     "tool_policy_update_unsupported": "invalid_request_error",
     "tools_unsupported": "invalid_request_error",
     "unsupported_tool_choice": "invalid_request_error",

@@ -56,12 +56,12 @@ from vllm_omni.engine.duplex.commands import (
 )
 from vllm_omni.engine.duplex.config import (
     TOOL_INTERRUPT_POLICY_KEY,
-    TOOL_RETRY_POLICY_KEY,
     DuplexConfigError,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
     ResponseCreateOptions,
+    effective_tool_retry_policy,
     resolve_tool_policy,
     resolve_tool_result_timeout_s,
 )
@@ -260,8 +260,7 @@ class DuplexSessionRunner:
             keep_on_epoch_advance=(resolve_tool_policy(session.config.extra_body, TOOL_INTERRUPT_POLICY_KEY) == "keep"),
             user_turn_seq=(
                 session.user_turn_seq
-                if session.capabilities.clears_tool_block_on_user_commit
-                and resolve_tool_policy(session.config.extra_body, TOOL_RETRY_POLICY_KEY) == "user_turn"
+                if effective_tool_retry_policy(session.capabilities, session.config.extra_body) == "user_turn"
                 else None
             ),
         )

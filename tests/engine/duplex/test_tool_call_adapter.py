@@ -21,6 +21,7 @@ from tests.engine.duplex.test_session_runner_nemotron_voicechat import (
     TIMEOUT_S,
     answer,
     batches,
+    decode_a_different_call,
     deliver,
     error_codes,
     open_nemotron_harness,
@@ -33,6 +34,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexCapabilities,
     DuplexConfigError,
     DuplexSessionConfig,
+    effective_tool_retry_policy,
     resolve_tool_policy,
 )
 from vllm_omni.engine.duplex.contracts import ToolCallAbandonReason, abandoned_tool_call_notice
@@ -277,6 +279,20 @@ def test_policies_default_and_validate():
     assert refused.value.code == "invalid_tool_policy"
 
 
+def test_an_invalid_policy_in_an_update_is_refused_as_invalid():
+    config = DuplexSessionConfig(model="m")
+    with pytest.raises(DuplexConfigError) as refused:
+        config.apply_realtime_update({"extra_body": {"tool_retry_policy": "sometimes"}}, session_id="s")
+    assert refused.value.code == "invalid_tool_policy"
+
+
+def test_the_effective_retry_policy_needs_a_user_turn_boundary():
+    with_boundary = DuplexCapabilities(clears_tool_block_on_user_commit=True)
+    assert effective_tool_retry_policy(with_boundary, {}) == "user_turn"
+    assert effective_tool_retry_policy(with_boundary, {"tool_retry_policy": "never"}) == "never"
+    assert effective_tool_retry_policy(DuplexCapabilities(), {}) == "never"
+
+
 def test_a_policy_cannot_change_after_the_session_opens():
     config = DuplexSessionConfig(model="m", extra_body={"tool_interrupt_policy": "keep"})
     with pytest.raises(DuplexConfigError) as refused:
@@ -298,15 +314,26 @@ def test_tools_are_refused_where_a_model_would_ignore_them():
 
 @pytest.mark.parametrize("tool_choice", ["none", "required", {"type": "function", "name": "f"}])
 def test_tool_choice_other_than_auto_is_refused(tool_choice):
-    capabilities = DuplexCapabilities(tool_call_mode="declared")
+    capabilities = DuplexCapabilities(tool_call_mode="declared", max_tools=None)
     extra_body = {"realtime_tools": [{"name": "f"}], "realtime_tool_choice": tool_choice}
     with pytest.raises(DuplexRuntimeConfigError) as refused:
         validate_session_tools(capabilities, extra_body)
     assert refused.value.code == "unsupported_tool_choice"
 
 
+def test_more_tools_than_a_model_supports_are_refused():
+    capabilities = DuplexCapabilities(tool_call_mode="declared", max_tools=1)
+    tools = [{"name": "f"}, {"name": "g"}]
+    with pytest.raises(DuplexRuntimeConfigError) as refused:
+        validate_session_tools(capabilities, {"realtime_tools": tools})
+    assert refused.value.code == "too_many_tools"
+    validate_session_tools(capabilities, {"realtime_tools": tools[:1]})
+    unlimited = DuplexCapabilities(tool_call_mode="declared", max_tools=None)
+    validate_session_tools(unlimited, {"realtime_tools": tools})
+
+
 def test_tool_choice_auto_is_accepted():
-    capabilities = DuplexCapabilities(tool_call_mode="declared")
+    capabilities = DuplexCapabilities(tool_call_mode="declared", max_tools=None)
     validate_session_tools(capabilities, {"realtime_tools": [{"name": "f"}], "realtime_tool_choice": "auto"})
 
 
@@ -405,6 +432,31 @@ async def test_a_repeat_of_a_pending_call_is_suppressed_without_a_notice(monkeyp
         assert batches(h) == []
         assert error_codes(await answer(h, call_id)) == []
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_is_not_a_user_turn_and_lifts_no_block(monkeypatch):
+    async with open_nemotron_harness(monkeypatch) as h:
+        h.runner.tool_calls._user_turn_seq = h.session.user_turn_seq
+        call_a = await prepare(h)
+        await h.run(commands.CancelToolCall(call_id=call_a))
+        original_decode = h.tokenizer.decode
+        decode_a_different_call(h)
+        call_b = await prepare(h)
+        turns = h.session.user_turn_seq()
+
+        assert error_codes(await answer(h, call_b)) == []
+
+        assert h.session.user_turn_seq() == turns
+        h.tokenizer.decode = original_decode
+        suppressed = wire(await repeat_call(h), "duplex.tool_call.suppressed")
+        assert [item["blocked_by_call_id"] for item in suppressed] == [call_a]
+
+
+@pytest.mark.asyncio
+async def test_the_session_reports_the_policy_it_applies(monkeypatch):
+    async with open_nemotron_harness(monkeypatch, extra_body={"tool_retry_policy": "user_turn"}) as h:
+        assert h.session.as_public_dict()["tool_retry_policy"] == "never"
 
 
 @pytest.mark.asyncio

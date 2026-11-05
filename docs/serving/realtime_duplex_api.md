@@ -876,6 +876,8 @@ open.
 | `user_turn` (default) | The next user turn lifts the block, on models with `capabilities.clears_tool_block_on_user_commit`. On other models it lasts for the session, because they have no reliable user-turn boundary. |
 | `never` | The block lasts for the session. |
 
+The session object reports the effective value as `tool_retry_policy`, so a client can see when `user_turn` behaves as `never`.
+
 **Notices.** The session also shows the model a fixed status saying the call did
 not complete, through the plugin hook `runtime_config_for_abandoned_tool_call`.
 It never contains client text.
@@ -883,8 +885,8 @@ It never contains client text.
 | Model | How the model sees it |
 | --- | --- |
 | Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
-| Nemotron VoiceChat | On the function channel of the open request, except after an epoch cancellation. |
-| JoyAI-VL-Interaction | As a delegated result on the next observation, except after an epoch cancellation or a suppressed repeat. |
+| Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
+| JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
 
 **Interruptions.** `extra_body.tool_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
@@ -898,7 +900,7 @@ already accepted follows the model's existing retirement rules either way.
 | --- | --- |
 | `tool_call_mode` | `none`, `declared` (client-defined tools) or `delegate_only` (only the model's `delegate` function) |
 | `tool_result_continuation` | What turns an accepted result into output: `client_response_create`, `automatic`, `next_observation`, or `none` |
-| `max_tools` | Most tools one session may declare, or `null` for no model limit |
+| `max_tools` | Most tools one session may declare, or `null` for no model limit. More is refused with `too_many_tools`. |
 | `clears_tool_block_on_user_commit` | Whether `tool_retry_policy: user_turn` can lift a block |
 
 Non-empty `tools` on a `none` model is refused with `tools_unsupported`.
@@ -1307,7 +1309,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.function_call_arguments.done` | 1 | Tool-call arguments complete. |
 | `duplex.function_call.done` | 3 | Raw fallback when a model tool call is malformed. |
 | `duplex.tool_call.settled` | 3 | A function call ended without a result; details under `event`. |
-| `duplex.tool_call.suppressed` | 3 | The session refused to publish a repeat of an abandoned call; details under `event`. |
+| `duplex.tool_call.suppressed` | 3 | The session refused to publish a repeat of a pending or abandoned call; `blocked_by_state` says which. Details under `event`. |
 | `output_audio_buffer.cleared` | 1 | Reply to `output_audio_buffer.clear`. |
 | `playback.acknowledged` | 3 | Reply to `playback.ack`; returns the playback ledger and `history_committed`. |
 | `overlap.decision` | 3 | How an append that overlapped an active response was handled (`drop` \| `listen` \| `barge_in`); details under `metadata`. |

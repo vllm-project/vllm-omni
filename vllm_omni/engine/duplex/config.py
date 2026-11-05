@@ -355,6 +355,16 @@ def resolve_tool_policy(extra_body: Mapping[str, object] | None, key: str) -> st
     return str(value)
 
 
+def effective_tool_retry_policy(capabilities: DuplexCapabilities, extra_body: Mapping[str, object] | None) -> str:
+    """The retry policy this session actually applies.
+
+    ``user_turn`` needs a user-turn boundary. A model without one keeps a block
+    for the session, whatever was requested.
+    """
+    policy = resolve_tool_policy(extra_body, TOOL_RETRY_POLICY_KEY)
+    return policy if capabilities.clears_tool_block_on_user_commit else "never"
+
+
 def validate_tool_policies(extra_body: Mapping[str, object] | None) -> None:
     for key in _TOOL_POLICIES:
         resolve_tool_policy(extra_body, key)

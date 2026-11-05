@@ -1560,12 +1560,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object] | None:
         """Carry a fixed notice to the next observation, like a delegated result.
 
-        A cancelled turn's question must not resurface, and a suppressed repeat
-        follows a call that already produced a notice.
+        A cancelled turn's question must not resurface on its own. If the model
+        asks it again, that repeat is current, and the refusal is the notice.
         """
         del config
         reason = abandonment.reason
-        if reason in (ToolCallAbandonReason.EPOCH_CANCELLED, ToolCallAbandonReason.SUPPRESSED):
+        if reason is ToolCallAbandonReason.EPOCH_CANCELLED:
             return None
         origin = abandonment.origin
         item = {
