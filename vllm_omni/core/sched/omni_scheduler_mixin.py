@@ -1339,28 +1339,17 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         return finished
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        if not self.log_stats:
+            return None
         now = time.monotonic()
-        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S and not self._stats_entering_idle():
+        # EngineCore steps again only while has_requests() is True. Once it is
+        # False this may be the stage's last report until new work arrives, so it
+        # must not be throttled, or the running / waiting / KV-usage gauges keep
+        # their last busy values. Callers must invoke this after the step's frees.
+        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S and self.has_requests():
             return None
         self._last_stats_time = now
-        stats = super().make_stats(*args, **kwargs)
-        self._last_stats_busy = stats is not None and bool(
-            stats.num_running_reqs or stats.num_waiting_reqs or getattr(stats, "num_skipped_waiting_reqs", 0)
-        )
-        return stats
-
-    def _stats_entering_idle(self) -> bool:
-        """Whether this tick is the busy -> idle transition.
-
-        EngineCore stops stepping once the scheduler has no requests left, so a
-        throttled idle tick is never followed by another ``make_stats`` call and
-        the running / waiting / KV-usage gauges would stay frozen at their last
-        busy value until the next request arrives. Let that one tick through.
-        """
-        if not getattr(self, "_last_stats_busy", False):
-            return False
-        num_running, num_waiting = self.get_request_counts()
-        return num_running == 0 and num_waiting == 0
+        return super().make_stats(*args, **kwargs)
 
     def _realign_request_status_to_queues(
         self,
