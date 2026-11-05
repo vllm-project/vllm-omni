@@ -9,17 +9,21 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 # ── Import tests ──
 
 
+@pytest.mark.cpu
 def test_layernorm_import():
     """Verify LayerNorm can be imported from the norm module."""
     from vllm_omni.diffusion.layers.norm import LayerNorm  # noqa: F401
 
 
+@pytest.mark.cpu
 def test_rmsnorm_import():
     """Verify RMSNorm can be imported from the norm module."""
     from vllm_omni.diffusion.layers.norm import RMSNorm  # noqa: F401
@@ -28,6 +32,7 @@ def test_rmsnorm_import():
 # ── LayerNorm tests ──
 
 
+@pytest.mark.cpu
 def test_layernorm_forward_shape():
     """LayerNorm produces correct output shapes."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -43,6 +48,7 @@ def test_layernorm_forward_shape():
     assert out.shape == (batch, seq_len, dim)
 
 
+@pytest.mark.cpu
 def test_layernorm_forward_shape_2d():
     """LayerNorm works with 2D input tensors."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -57,6 +63,7 @@ def test_layernorm_forward_shape_2d():
     assert out.shape == (batch, dim)
 
 
+@pytest.mark.cpu
 def test_layernorm_preserves_dtype_fp32():
     """LayerNorm preserves float32 dtype."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -70,6 +77,7 @@ def test_layernorm_preserves_dtype_fp32():
     assert out.dtype == torch.float32
 
 
+@pytest.mark.cpu
 def test_layernorm_preserves_dtype_fp16():
     """LayerNorm preserves float16 dtype."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -83,6 +91,7 @@ def test_layernorm_preserves_dtype_fp16():
     assert out.dtype == torch.float16
 
 
+@pytest.mark.cpu
 def test_layernorm_preserves_dtype_bf16():
     """LayerNorm preserves bfloat16 dtype."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -96,6 +105,7 @@ def test_layernorm_preserves_dtype_bf16():
     assert out.dtype == torch.bfloat16
 
 
+@pytest.mark.cpu
 def test_layernorm_without_elementwise_affine():
     """LayerNorm works without elementwise_affine (no learned parameters)."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -112,6 +122,7 @@ def test_layernorm_without_elementwise_affine():
     assert out.shape == (2, 4, dim)
 
 
+@pytest.mark.cpu
 def test_layernorm_custom_eps():
     """LayerNorm accepts custom epsilon value."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -123,6 +134,7 @@ def test_layernorm_custom_eps():
     assert norm.eps == eps
 
 
+@pytest.mark.cpu
 def test_layernorm_has_learnable_parameters():
     """LayerNorm has learnable weight and bias by default."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -136,6 +148,7 @@ def test_layernorm_has_learnable_parameters():
     assert norm.bias.shape == (dim,)
 
 
+@pytest.mark.cpu
 def test_layernorm_matches_fp32_reference():
     """Verify LayerNorm produces identical output to FP32 nn.LayerNorm."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -159,6 +172,7 @@ def test_layernorm_matches_fp32_reference():
     torch.testing.assert_close(out_ours, out_ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.cpu
 def test_layernorm_matches_diffusers_fp32layernorm():
     """Verify LayerNorm produces identical output to diffusers FP32LayerNorm."""
     from diffusers.models.normalization import FP32LayerNorm
@@ -188,6 +202,7 @@ def test_layernorm_matches_diffusers_fp32layernorm():
 # ── RMSNorm tests ──
 
 
+@pytest.mark.cpu
 def test_rmsnorm_forward_shape():
     """RMSNorm produces correct output shapes."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -203,6 +218,7 @@ def test_rmsnorm_forward_shape():
     assert out.shape == (batch, seq_len, hidden_size)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_forward_shape_2d():
     """RMSNorm works with 2D input tensors."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -217,6 +233,7 @@ def test_rmsnorm_forward_shape_2d():
     assert out.shape == (batch, hidden_size)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_preserves_dtype_fp32():
     """RMSNorm preserves float32 dtype."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -230,6 +247,7 @@ def test_rmsnorm_preserves_dtype_fp32():
     assert out.dtype == torch.float32
 
 
+@pytest.mark.cpu
 def test_rmsnorm_preserves_dtype_fp16():
     """RMSNorm preserves float16 dtype."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -243,6 +261,7 @@ def test_rmsnorm_preserves_dtype_fp16():
     assert out.dtype == torch.float16
 
 
+@pytest.mark.cpu
 def test_rmsnorm_preserves_dtype_bf16():
     """RMSNorm preserves bfloat16 dtype."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -256,6 +275,7 @@ def test_rmsnorm_preserves_dtype_bf16():
     assert out.dtype == torch.bfloat16
 
 
+@pytest.mark.cpu
 def test_rmsnorm_custom_eps():
     """RMSNorm accepts custom epsilon value."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -267,6 +287,7 @@ def test_rmsnorm_custom_eps():
     assert norm.variance_epsilon == eps
 
 
+@pytest.mark.cpu
 def test_rmsnorm_has_weight_parameter():
     """RMSNorm has learnable weight parameter initialized to ones."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -279,6 +300,7 @@ def test_rmsnorm_has_weight_parameter():
     torch.testing.assert_close(norm.weight, torch.ones(hidden_size))
 
 
+@pytest.mark.cpu
 def test_rmsnorm_numerical_correctness():
     """Verify RMSNorm produces numerically correct output."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -302,6 +324,7 @@ def test_rmsnorm_numerical_correctness():
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_dtype_matches_parameter_and_fp32_accumulation_contract():
     """dtype controls gamma storage; reduced-precision inputs still use fp32 accumulation."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -319,6 +342,7 @@ def test_rmsnorm_dtype_matches_parameter_and_fp32_accumulation_contract():
     torch.testing.assert_close(norm.forward_native(x), expected, atol=0, rtol=0)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.MonkeyPatch):
     """The NPU fused op receives the bf16 checkpoint gamma used by H3."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -342,6 +366,7 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.cpu
 def test_rmsnorm_npu_dispatch_falls_back_for_cpu_tensor(with_residual: bool):
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
@@ -364,6 +389,7 @@ def test_rmsnorm_npu_dispatch_falls_back_for_cpu_tensor(with_residual: bool):
 # ── RMSNorm residual tests ──
 
 
+@pytest.mark.cpu
 def test_rmsnorm_matches_native_residual_contract():
     """The non-NPU path preserves separate residual-add and RMSNorm math."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -388,6 +414,7 @@ def test_rmsnorm_matches_native_residual_contract():
     "forward_name",
     ["forward_cuda", "forward_hip", "forward_musa", "forward_xpu"],
 )
+@pytest.mark.cpu
 def test_rmsnorm_non_npu_residual_delegates_to_native(
     monkeypatch: pytest.MonkeyPatch,
     forward_name: str,
@@ -416,6 +443,7 @@ def test_rmsnorm_non_npu_residual_delegates_to_native(
     assert captured["residual"] is residual
 
 
+@pytest.mark.cpu
 def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.MonkeyPatch):
     """NPU keeps the direct fused AddRMSNorm path instead of IR fallback."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -456,6 +484,7 @@ def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.Monkey
 # ── RMSNorm compile-path regression tests ──
 
 
+@pytest.mark.cpu
 def test_rmsnorm_forward_cuda_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
     """Regression: _forward_fused must not be called during torch.compile tracing.
 
@@ -482,6 +511,7 @@ def test_rmsnorm_forward_cuda_does_not_call_fused_during_compile(mocker: MockerF
     assert out.shape == x.shape
 
 
+@pytest.mark.cpu
 def test_rmsnorm_forward_hip_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
     """Regression: same guard must be present in forward_hip.
 
@@ -502,6 +532,7 @@ def test_rmsnorm_forward_hip_does_not_call_fused_during_compile(mocker: MockerFi
     assert out.shape == x.shape
 
 
+@pytest.mark.cpu
 def test_rmsnorm_skips_fused_kernel_for_empty_input(mocker: MockerFixture) -> None:
     """Regression: the fused kernel fails to launch on a zero-token tensor and leaves a sticky CUDA error."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -515,6 +546,7 @@ def test_rmsnorm_skips_fused_kernel_for_empty_input(mocker: MockerFixture) -> No
     mock_fused.assert_not_called()
 
 
+@pytest.mark.cpu
 def test_rmsnorm_matches_reference_implementation():
     """Verify RMSNorm matches a reference implementation."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -545,6 +577,7 @@ def test_rmsnorm_matches_reference_implementation():
 # ── CustomOp dispatch tests ──
 
 
+@pytest.mark.cpu
 def test_layernorm_inherits_from_customop():
     """LayerNorm inherits from CustomOp for platform dispatch."""
     from vllm_omni.diffusion.layers.custom_op import CustomOp
@@ -554,6 +587,7 @@ def test_layernorm_inherits_from_customop():
     assert isinstance(norm, CustomOp)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_inherits_from_customop():
     """RMSNorm inherits from CustomOp for platform dispatch."""
     from vllm_omni.diffusion.layers.custom_op import CustomOp
@@ -563,6 +597,7 @@ def test_rmsnorm_inherits_from_customop():
     assert isinstance(norm, CustomOp)
 
 
+@pytest.mark.cpu
 def test_layernorm_has_platform_methods():
     """LayerNorm has forward methods for each platform."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -576,6 +611,7 @@ def test_layernorm_has_platform_methods():
     assert hasattr(norm, "forward_native")
 
 
+@pytest.mark.cpu
 def test_rmsnorm_has_platform_methods():
     """RMSNorm has forward methods for each platform."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -589,6 +625,7 @@ def test_rmsnorm_has_platform_methods():
     assert hasattr(norm, "forward_native")
 
 
+@pytest.mark.cpu
 def test_layernorm_forward_native_directly():
     """LayerNorm.forward_native can be called directly."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -602,6 +639,7 @@ def test_layernorm_forward_native_directly():
     assert out.shape == (2, 4, dim)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_forward_native_directly():
     """RMSNorm.forward_native can be called directly."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -618,6 +656,7 @@ def test_rmsnorm_forward_native_directly():
 # ── Edge case tests ──
 
 
+@pytest.mark.cpu
 def test_layernorm_with_large_dim():
     """LayerNorm works with large hidden dimensions."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -631,6 +670,7 @@ def test_layernorm_with_large_dim():
     assert out.shape == (1, 16, dim)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_with_large_dim():
     """RMSNorm works with large hidden dimensions."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -644,6 +684,7 @@ def test_rmsnorm_with_large_dim():
     assert out.shape == (1, 16, hidden_size)
 
 
+@pytest.mark.cpu
 def test_layernorm_with_single_element_batch():
     """LayerNorm works with batch size of 1."""
     from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -657,6 +698,7 @@ def test_layernorm_with_single_element_batch():
     assert out.shape == (1, 1, dim)
 
 
+@pytest.mark.cpu
 def test_rmsnorm_with_single_element_batch():
     """RMSNorm works with batch size of 1."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -673,6 +715,7 @@ def test_rmsnorm_with_single_element_batch():
 # ── Fused vs Native correctness tests ──
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_rmsnorm_fused_native_parity_cuda():
     """Verify fused and native RMSNorm produce identical results on CUDA.
 
@@ -698,6 +741,7 @@ def test_rmsnorm_fused_native_parity_cuda():
         torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_rmsnorm_fused_native_parity_large_tensor():
     """Verify fused and native RMSNorm parity with large tensors.
 
@@ -723,6 +767,7 @@ def test_rmsnorm_fused_native_parity_large_tensor():
         torch.testing.assert_close(out_fused, out_native, atol=1e-2, rtol=1e-2)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_rmsnorm_fused_native_parity_2d_input():
     """Verify fused and native RMSNorm parity with 2D input tensors."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -744,6 +789,7 @@ def test_rmsnorm_fused_native_parity_2d_input():
         torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_rmsnorm_fused_native_parity_custom_weight():
     """Verify fused and native RMSNorm parity with non-default weights.
 

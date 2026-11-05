@@ -13,8 +13,9 @@ loaded once by ``DuplexOmniEngine`` and handed to ``DuplexOrchestrator`` /
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
@@ -41,6 +42,19 @@ class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
 
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class DuplexInputCapacityError(ValueError):
+    """Reject an append before submission without ending its Session.
+
+    Plugins raise this only for recoverable admission limits. The append owner
+    compensates reservations and its response; ordinary runtime failures keep
+    their existing fatal behavior.
+    """
+
+    def __init__(self, message: str, *, code: str = "input_capacity_exceeded") -> None:
         super().__init__(message)
         self.code = code
 
@@ -341,6 +355,70 @@ class PartialStageForward:
     queue_close_after: bool = False
 
 
+def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:
+    """Snapshot committed text without retaining images or audio payloads."""
+    entries = []
+    for message in conversation:
+        content = message.get("content")
+        if isinstance(content, list):
+            texts = []
+            has_audio_transcript = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    texts.append(str(part.get("text", "")))
+                elif part.get("type") == "audio_url" and isinstance(part.get("transcript"), str):
+                    texts.append(part["transcript"])
+                    has_audio_transcript = True
+            transcript = message.get("transcript")
+            if not has_audio_transcript and isinstance(transcript, str):
+                texts.append(transcript)
+            text = "\n".join(texts)
+        else:
+            text = content if isinstance(content, str) else ""
+        entries.append((str(message.get("role", "")), text))
+    return tuple(entries)
+
+
+def duplex_history_digest(history: tuple[tuple[str, str], ...]) -> str:
+    return hashlib.sha256(repr(history).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class DuplexAuxiliaryPolicy:
+    """Model-owned work identity and eligibility for the single auxiliary slot.
+
+    ``source_key`` must remain unchanged when unrelated input is appended so
+    that observation traffic cannot reset retries for the same failed work.
+    ``allow_during_response`` permits queueing alongside ordinary responses;
+    pending or active user interactions still take priority.
+    """
+
+    source_key: Hashable
+    allow_during_response: bool = False
+
+
+@dataclass(frozen=True)
+class DuplexAuxiliaryRequest:
+    """One private, non-resumable request ending at its selected stage.
+
+    The committed prefix identifies the evidence used by the model policy.
+    Later conversation can append while that prefix remains unchanged.
+    """
+
+    stage_id: int
+    prompt: dict[str, object]
+    sampling_params: object
+    history_length: int
+    history_digest: str
+    timeout_s: float = 30.0
+    model_source: object | None = None
+    retry_delays_s: tuple[float, ...] = ()
+    # Continue at this interval after the short retry budget is exhausted.
+    retry_cooldown_s: float | None = None
+
+
 class DuplexModelPlugin(ABC):
     """Everything vLLM-Omni needs to know about one full-duplex model.
 
@@ -359,6 +437,7 @@ class DuplexModelPlugin(ABC):
         return None
 
     projects_intermediate_outputs: bool = False
+    supports_auxiliary_requests: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -417,6 +496,64 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    async def prepare_auxiliary_request(
+        self,
+        *,
+        history: tuple[tuple[str, str], ...],
+        runtime_config: Mapping[str, object],
+        state: DuplexModelSessionState,
+    ) -> DuplexAuxiliaryRequest | None:
+        """Plan bounded background work from committed text; default opt-out."""
+        return None
+
+    def auxiliary_policy(
+        self,
+        *,
+        state: DuplexModelSessionState,
+        history_revision: int,
+        history: tuple[dict[str, object], ...],
+    ) -> DuplexAuxiliaryPolicy | None:
+        """Reconcile model sources and select work without preparing its prompt.
+
+        The runner caches the current conversation view by revision. Plugins
+        can invalidate derived state here even when no append follows an edit.
+        The default preserves idle-only text consolidation.
+        """
+        return DuplexAuxiliaryPolicy(source_key=history_revision)
+
+    def auxiliary_source_matches(
+        self,
+        *,
+        request: DuplexAuxiliaryRequest,
+        state: DuplexModelSessionState,
+        history: tuple[dict[str, object], ...],
+    ) -> bool:
+        """Validate model evidence before submission and result application."""
+        text = duplex_text_history(history)
+        return len(text) >= request.history_length and (
+            duplex_history_digest(text[: request.history_length]) == request.history_digest
+        )
+
+    def auxiliary_preempted_by_input(
+        self,
+        *,
+        payload: Mapping[str, object],
+        state: DuplexModelSessionState,
+        has_new_user_input: bool,
+    ) -> bool:
+        """Classify an input as interactive; models may exempt observations.
+
+        ``has_new_user_input`` carries successfully accepted user-item intent
+        until its next append, independently of the conversation item counter.
+        """
+        return True
+
+    def apply_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState
+    ) -> bool:
+        """Apply a private result after the runner validates its committed prefix."""
+        return False
 
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
