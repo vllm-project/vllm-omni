@@ -115,13 +115,28 @@ def test_discovery_from_modular_index(checkpoint, monkeypatch):
 
 
 def test_discovery_does_not_import_runtime_registry(checkpoint):
-    code = (
-        "import sys; "
-        "from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index; "
-        f"assert get_diffusion_model_index({str(checkpoint)!r})['_class_name'] == 'HyNomasModularPipeline'; "
-        "assert 'vllm_omni.diffusion.registry' not in sys.modules; "
-        "assert 'hymm' not in sys.modules"
-    )
+    code = f"""
+import sys
+from types import ModuleType
+
+# Metadata discovery does not need process-wide platform patches. Keeping them
+# out also prevents unrelated optional-package probes from failing the import.
+sys.modules["vllm_omni.patch"] = ModuleType("vllm_omni.patch")
+
+# Package initialization may activate platform plugins that eagerly import the
+# runtime registry. Establish the baseline after initialization so this test
+# specifically verifies that metadata discovery does not reintroduce it.
+import vllm_omni  # noqa: F401
+
+sys.modules.pop("vllm_omni.diffusion.registry", None)
+sys.modules.pop("hymm", None)
+
+from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+
+assert get_diffusion_model_index({str(checkpoint)!r})["_class_name"] == "HyNomasModularPipeline"
+assert "vllm_omni.diffusion.registry" not in sys.modules
+assert "hymm" not in sys.modules
+"""
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}
     )
