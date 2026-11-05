@@ -95,6 +95,7 @@ MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 
 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
+MINIMAX_H3_REFERENCE_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 
 CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
@@ -103,7 +104,7 @@ CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 TIMELINE_GUIDE_MAX_ENTRIES = 8
 TIMELINE_GUIDE_MAX_FILES = 16
 TIMELINE_GUIDE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3", ".flac"})
-_TIMELINE_GUIDES_ADAPTER = TypeAdapter(list[TimelineGuide])
+_TIMELINE_GUIDES_ADAPTER: TypeAdapter[list[TimelineGuide]] = TypeAdapter(list[TimelineGuide])
 
 LATENT_EDIT_SOURCE_MAX_BYTES = 512 * 1024 * 1024
 LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
@@ -537,13 +538,18 @@ async def _persist_uploaded_reference(
     field_name: str,
     suffix: str,
     max_bytes: int,
+    chunk_size: int = 1024 * 1024,
+    allow_empty: bool = False,
+    size_limit_detail: str | None = None,
 ) -> str:
     """Stream one bounded upload to request-scoped local storage."""
+    if size_limit_detail is None:
+        size_limit_detail = f"{field_name} exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
     declared_size = upload.size
     if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=f"{field_name} exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+            detail=size_limit_detail,
         )
 
     fd, path = tempfile.mkstemp(prefix=f"vllm_omni_{field_name}_", suffix=suffix)
@@ -551,15 +557,15 @@ async def _persist_uploaded_reference(
     persisted = False
     try:
         with os.fdopen(fd, "wb") as output:
-            while chunk := await upload.read(min(1024 * 1024, max_bytes - size + 1)):
+            while chunk := await upload.read(min(chunk_size, max_bytes - size + 1)):
                 size += len(chunk)
                 if size > max_bytes:
                     raise HTTPException(
                         status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"{field_name} exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+                        detail=size_limit_detail,
                     )
                 output.write(chunk)
-        if size == 0:
+        if size == 0 and not allow_empty:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"{field_name} must not be empty.",
@@ -842,13 +848,13 @@ def _minimax_h3_upload_limit(upload: UploadFile) -> int:
     return MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES
 
 
-async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None) -> bytes:
-    """Read an upload with an optional hard byte limit."""
-    if max_bytes is None:
+async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None, discard: bool = False) -> bytes:
+    """Read with an optional byte limit; discard=True returns b"" without buffering."""
+    if max_bytes is None and not discard:
         return await upload.read()
 
     declared_size = getattr(upload, "size", None)
-    if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
+    if max_bytes is not None and isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
@@ -857,16 +863,18 @@ async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = No
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = await upload.read(min(1024 * 1024, max_bytes - total + 1))
+        read_size = 1024 * 1024 if max_bytes is None else min(1024 * 1024, max_bytes - total + 1)
+        chunk = await upload.read(read_size)
         if not chunk:
             break
         total += len(chunk)
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
             )
-        chunks.append(chunk)
+        if not discard:
+            chunks.append(chunk)
     return b"".join(chunks)
 
 
@@ -911,7 +919,8 @@ async def _persist_uploaded_media_references(
 
     Images are decoded in memory; videos and audio remain files because H3's
     reference encoders need the original container streams (including video
-    soundtracks).
+    soundtracks). Empty video/audio files are persisted unchanged; H3 input
+    preparation owns media-content validation, including empty-file rejection.
     """
     images: list[Image.Image] = []
     videos: list[str] = []
@@ -925,8 +934,8 @@ async def _persist_uploaded_media_references(
     try:
         for upload in uploads:
             kind = _uploaded_media_kind(upload)
-            payload = await _read_upload_limited(upload, max_bytes=_minimax_h3_upload_limit(upload))
             if kind == "image":
+                payload = await _read_upload_limited(upload, max_bytes=_minimax_h3_upload_limit(upload))
                 try:
                     _validate_minimax_h3_image_payload(payload, filename=upload.filename)
                     images.append(
@@ -937,8 +946,16 @@ async def _persist_uploaded_media_references(
                     )
                 except InvalidInputReferenceError as exc:
                     raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+                del payload
                 continue
             suffix = Path(upload.filename or "").suffix.lower()
+            max_bytes = _minimax_h3_upload_limit(upload)
+            allowed_suffixes = (
+                MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES if kind == "audio" else MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES
+            )
+            if suffix and suffix not in allowed_suffixes:
+                # Preserve read/size error priority without writing a rejected upload.
+                await _read_upload_limited(upload, max_bytes=max_bytes, discard=True)
             if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
@@ -949,19 +966,23 @@ async def _persist_uploaded_media_references(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="MiniMax H3 reference audio must use a WAV or MP3 file.",
                 )
-            if not suffix or len(suffix) > 8:
-                suffix = ".mp3" if kind == "audio" else ".mp4"
-            fd, path = tempfile.mkstemp(prefix="vllm_omni_reference_", suffix=suffix)
+            path = await _persist_uploaded_reference(
+                upload,
+                field_name="reference",
+                suffix=suffix or (".mp3" if kind == "audio" else ".mp4"),
+                max_bytes=max_bytes,
+                chunk_size=MINIMAX_H3_REFERENCE_UPLOAD_CHUNK_BYTES,
+                allow_empty=True,
+                size_limit_detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+            )
             paths.append(path)
-            with os.fdopen(fd, "wb") as output:
-                output.write(payload)
             if kind == "audio":
                 audios.append(path)
             else:
                 videos.append(path)
-    except Exception:
+    except (asyncio.CancelledError, Exception):
         for path in paths:
-            if os.path.exists(path):
+            with suppress(OSError):
                 os.unlink(path)
         raise
     return images, videos, audios
@@ -1325,7 +1346,8 @@ async def _parse_video_form(
         if not supports_mixed_reference_inputs:
             video_paths = await _persist_uploaded_video_references(input_references)
             reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
-            images, audio_paths = [], []
+            images: list[Image.Image] = []
+            audio_paths: list[str] = []
         else:
             images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
         if images:
@@ -1335,7 +1357,7 @@ async def _parse_video_form(
         if audio_paths:
             reference_audio = ReferenceAudio(path=audio_paths, cleanup_paths=tuple(audio_paths))
     else:
-        video_paths: list[str] = []
+        video_paths = []
         try:
             image_items = _reference_list(request.image_reference)
             video_items = _reference_list(request.video_reference)
@@ -1397,13 +1419,13 @@ async def _parse_video_form(
     audio_paths = [] if reference_audio is None else list(_reference_list(reference_audio.path))
     if request.audio_reference is not None:
         try:
-            for audio_reference in _reference_list(request.audio_reference):
-                audio_paths.append(await decode_audio_url(audio_reference.audio_url))
+            for audio_item in _reference_list(request.audio_reference):
+                audio_paths.append(await decode_audio_url(audio_item.audio_url))
         except InvalidInputReferenceError as exc:
             _cleanup_video_references(reference_video, reference_audio, request)
-            cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
+            existing_audio_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
             for path in audio_paths:
-                if path not in cleanup_paths and os.path.exists(path):
+                if path not in existing_audio_paths and os.path.exists(path):
                     os.unlink(path)
             raise HTTPException(400, detail=str(exc)) from exc
     if audio_paths:
