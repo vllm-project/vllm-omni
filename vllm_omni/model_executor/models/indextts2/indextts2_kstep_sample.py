@@ -49,16 +49,17 @@ def sample_token_tensor(
     if filtered_logits.shape[0] != 1:
         raise ValueError(f"sample_token_tensor expects a single-row logit tensor, got batch={filtered_logits.shape[0]}")
 
-    # Repetition penalty
+    # Repetition penalty (without torch.unique host sync: duplicate indices in
+    # past_tokens gather identical logits and scatter identical penalized values).
     if repetition_penalty != 1.0 and past_tokens is not None and past_tokens.numel() > 0:
-        unique_tokens = torch.unique(past_tokens).view(1, -1)
-        token_logits = filtered_logits.gather(-1, unique_tokens)
+        history_indices = past_tokens.view(1, -1)
+        token_logits = filtered_logits.gather(-1, history_indices)
         penalized = torch.where(
             token_logits > 0,
             token_logits / repetition_penalty,
             token_logits * repetition_penalty,
         )
-        filtered_logits.scatter_(-1, unique_tokens, penalized)
+        filtered_logits.scatter_(-1, history_indices, penalized)
 
     # Stop-token masking before min_tokens
     if current_step < min_tokens and stop_token_ids:
@@ -86,7 +87,7 @@ def sample_token_tensor(
         sorted_probs, sorted_sub_indices = torch.sort(probs, descending=True, dim=-1)
         cum_probs = torch.cumsum(sorted_probs, dim=-1)
         mask = (cum_probs - sorted_probs) > top_p
-        sorted_probs[mask] = 0.0
+        sorted_probs = sorted_probs.masked_fill(mask, 0.0)
         sorted_logits = (sorted_probs + 1e-10).log()
         sub_sample_idx = gumbel_max_sample(sorted_logits)
         orig_topk_idx = sorted_sub_indices.gather(-1, sub_sample_idx)
@@ -120,7 +121,7 @@ def talker_kstep_decode(
     past_tokens_tensor: torch.Tensor | None = None,
     max_decode_tokens: int = 2048,
 ) -> IndexTTSKStepResult:
-    """Run K steps of decode loop on GPU using a static ring buffer for past tokens."""
+    """Run K steps of decode loop on GPU using a pre-allocated linear buffer for past tokens."""
     device = initial_hidden_states.device
     sampled_tokens: list[int] = []
     accumulated_latents: list[torch.Tensor] = []
@@ -136,6 +137,7 @@ def talker_kstep_decode(
 
     current_hidden = initial_hidden_states
     step_tokens_buf = torch.empty(max(1, k_steps), dtype=torch.long, device=device)
+    mel_positions = torch.arange(start_pos + 1, start_pos + max(1, k_steps) + 1, dtype=torch.long, device=device)
     raw_latents: list[torch.Tensor] = []
     steps_run = 0
 
@@ -171,7 +173,7 @@ def talker_kstep_decode(
             raw_latents.append(current_hidden.detach())
 
         if step_idx < k_steps - 1:
-            mel_pos = torch.tensor([start_pos + step_idx + 1], dtype=torch.long, device=device)
+            mel_pos = mel_positions[step_idx : step_idx + 1]
             embeds = talker.mel_embedding(token_t) + talker.mel_pos_embedding.emb(mel_pos)
             hidden = embeds
             # Stateless feed-forward/layer pass over hidden only (does not write into

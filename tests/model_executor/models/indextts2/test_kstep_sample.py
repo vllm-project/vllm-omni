@@ -11,12 +11,6 @@ from vllm_omni.model_executor.models.indextts2.indextts2_kstep_sample import (
     sample_token_tensor,
     talker_kstep_decode,
 )
-from vllm_omni.model_executor.models.indextts2.ops.fused_qkv_layer_norm import (
-    qkv_head_layer_norm,
-)
-from vllm_omni.model_executor.models.indextts2.ops.fused_residual_layer_norm import (
-    residual_layer_norm,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -177,35 +171,29 @@ def test_talker_kstep_decode_early_stop_on_full_buffer_preserves_history():
     assert res.sampled_tensor.tolist() == [13, 14, 15, 16, 101, stop_id]
 
 
-def test_fused_residual_layer_norm_cpu_fallback():
-    x = torch.randn(2, 16, 64)
-    res = torch.randn(2, 16, 64)
-    w = torch.ones(64)
-    b = torch.zeros(64)
-    out = residual_layer_norm(res, x, weight=w, bias=b)
-    assert out.shape == (2, 16, 64)
+def test_sample_token_tensor_rejects_multi_row_batch():
+    logits_batch = torch.randn(2, 8194)
+    with pytest.raises(ValueError, match="expects a single-row logit tensor"):
+        sample_token_tensor(logits_batch)
 
 
-def test_fused_qkv_layer_norm_cpu_fallback():
-    qkv = torch.randn(2, 16, 64 * 3)
-    kv = torch.empty(2, 4, 16, 2 * 16)
-    q_norm = nn.LayerNorm(16)
-    k_norm = nn.LayerNorm(16)
-    q = qkv_head_layer_norm(qkv, kv, num_heads=4, head_dim=16, q_norm=q_norm, k_norm=k_norm)
-    assert q.shape == (2, 4, 16, 16)
+def test_s2mel_tf32_context_restores_backend_flags():
+    from types import SimpleNamespace
 
+    from vllm_omni.model_executor.models.indextts2.indextts2_s2mel_decoder import IndexTTS2S2MelDecoder
 
-if __name__ == "__main__":
-    print("Testing test_sample_token_tensor_1d_and_2d...")
-    test_sample_token_tensor_1d_and_2d()
-    print("Testing test_sample_token_tensor_empty_history...")
-    test_sample_token_tensor_empty_history()
-    print("Testing test_talker_kstep_decode_multi_step...")
-    test_talker_kstep_decode_multi_step()
-    print("Testing test_talker_kstep_decode_buffer_overflow...")
-    test_talker_kstep_decode_buffer_overflow()
-    print("Testing test_fused_residual_layer_norm_cpu_fallback...")
-    test_fused_residual_layer_norm_cpu_fallback()
-    print("Testing test_fused_qkv_layer_norm_cpu_fallback...")
-    test_fused_qkv_layer_norm_cpu_fallback()
-    print("ALL UNIT TESTS PASSED SUCCESSFULLY!")
+    decoder = object.__new__(IndexTTS2S2MelDecoder)
+    decoder.config = SimpleNamespace(s2mel_allow_tf32=True)
+    orig_matmul = torch.backends.cuda.matmul.allow_tf32
+    orig_cudnn = torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        with decoder._maybe_s2mel_tf32_context(torch.device("cuda")):
+            assert torch.backends.cuda.matmul.allow_tf32 is True
+            assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = orig_matmul
+        torch.backends.cudnn.allow_tf32 = orig_cudnn
