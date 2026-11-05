@@ -1483,7 +1483,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 else:
                     if result.status != "CLOSED":
                         backend.mark_failed(imported)
-            model._weight_share_failed = True
             raise
 
         model = model.eval()

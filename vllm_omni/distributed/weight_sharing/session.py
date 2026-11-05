@@ -25,6 +25,8 @@ DEFAULT_PROTOCOL_VERSION = 1
 class SharedWeightGroupConfig:
     """Static agreement for one rank of a sharing group.
 
+    Models select their adapter through ``get_weight_sharing_adapter()``.
+
     ``device_index`` is intentionally absent: it is a per-process, torch-visible
     ordinal supplied by the worker when it assembles the :class:`SessionContext`.
 
@@ -45,7 +47,6 @@ class SharedWeightGroupConfig:
     device_uuid: str
     model_id: str
     checkpoint_revision: str
-    adapter: str = "hunyuan_image3"
     layout: str = "hunyuan_image3_backbone_v1"
     payload: bytes | None = None
 
