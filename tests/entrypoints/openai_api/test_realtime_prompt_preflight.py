@@ -842,7 +842,7 @@ async def test_generated_audio_stretches_each_delta() -> None:
 def test_stretch_audio_delta_is_noop_at_default_speed() -> None:
     chunk = np.zeros(128, dtype=np.float32)
 
-    assert OpenAIFullDuplexConnection._stretch_audio_delta(chunk, SAMPLE_RATE_HZ, 1.0) is chunk
+    assert OpenAIFullDuplexConnection._stretch_audio_delta(chunk, 1.0) is chunk
 
 
 @pytest.mark.asyncio

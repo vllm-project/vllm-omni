@@ -57,7 +57,6 @@ from vllm_omni.engine.duplex.turn_detection import (
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
 from vllm_omni.entrypoints.openai.realtime.session import (
     ActiveResponse,
     AudioFullDuplexSessionState,
@@ -1342,7 +1341,7 @@ class OpenAIFullDuplexConnection:
                                 SAMPLE_RATE_HZ,
                             )
                         for chunk in audio_chunks:
-                            stretched = self._stretch_audio_delta(chunk, sample_rate, output_speed)
+                            stretched = self._stretch_audio_delta(chunk, output_speed)
                             await emit_audio_delta(audio_resampler.process(stretched))
                     continue
 
@@ -2152,8 +2151,8 @@ class OpenAIFullDuplexConnection:
         return base64.b64encode(pcm16.tobytes()).decode()
 
     @staticmethod
-    def _stretch_audio_delta(chunk: np.ndarray, sample_rate: int, speed: float) -> np.ndarray:
-        """Time-stretch one audio delta through the shared encoder's speed control.
+    def _stretch_audio_delta(chunk: np.ndarray, speed: float) -> np.ndarray:
+        """Time-stretch one audio delta with the shared speed helper.
 
         Each delta is stretched independently, so chunk boundaries are not
         phase-continuous. A stateful streaming stretcher is the proper fix.
@@ -2161,19 +2160,7 @@ class OpenAIFullDuplexConnection:
         if speed == 1.0:
             return chunk
 
-        response = AudioMixin().create_audio(
-            CreateAudio(
-                audio_tensor=np.asarray(chunk, dtype=np.float32),
-                sample_rate=sample_rate,
-                response_format="pcm",
-                speed=speed,
-                base64_encode=False,
-            )
-        )
-        audio_data = response.audio_data
-        assert isinstance(audio_data, bytes)
-        pcm16 = np.frombuffer(audio_data, dtype=np.int16)
-        return pcm16.astype(np.float32) / 32768.0
+        return AudioMixin.apply_speed_adjustment(np.asarray(chunk, dtype=np.float32), speed)
 
     # ------------------------------------------------------------------ #
     #  Server event emission                                              #
