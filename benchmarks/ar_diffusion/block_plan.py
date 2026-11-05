@@ -26,7 +26,10 @@ class BlockPlan:
         schedule = native.schedule
         groups = schedule.layer_groups
         blocks = schedule.num_blocks
-        if blocks % groups or schedule.step_replicas != schedule.num_denoise_steps + 1:
+        # step_replicas == num_denoise_steps + 1 for Latest-KV schedules is
+        # already enforced by CellSchedule.__post_init__, so only partitioning
+        # is checked here.
+        if blocks % groups:
             raise ValueError("block transport requires equal partitions and one rank per stage/group")
         if schedule.ordering is not Ordering.LATEST_KV or schedule.kv_history_chunks < 1:
             raise ValueError("block transport requires Latest-KV execution with positive history")

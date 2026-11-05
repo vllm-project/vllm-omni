@@ -18,6 +18,28 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyK
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_hybrid_kv_surface_tracks_upstream_schedule_and_cache_kwargs():
+    """CPU guard for the GPU-only rename blind spot in the hybrid harness.
+
+    ``HybridNoisyKVState.begin_request`` reads ``plan.schedule.step_replicas``
+    and ``benchmark_noisy_pp`` passes ``step_replicas=`` into main's
+    ``NoisyKVCache``; both run only inside GPU benchmark jobs, so a rename of
+    either kwarg on main previously surfaced only there. Pin the signatures
+    and the read on CPU so the next upstream rename fails here first.
+    """
+    import inspect
+
+    from benchmarks.ar_diffusion import benchmark_noisy_pp
+    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache
+
+    # The import itself is part of the contract: the harness module must stay
+    # importable on CPU after upstream refactors.
+    assert benchmark_noisy_pp is not None
+    assert "step_replicas" in inspect.signature(CellSchedule).parameters
+    assert "step_replicas" in inspect.signature(NoisyKVCache.__init__).parameters
+    assert "step_replicas" in inspect.getsource(HybridNoisyKVState.begin_request)
+
+
 @pytest.mark.parametrize("groups", [1, 2])
 @pytest.mark.parametrize("steps", [3, 4])
 @pytest.mark.parametrize("chunks", [1, 7, 128])
