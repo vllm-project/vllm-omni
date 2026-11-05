@@ -185,6 +185,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionClosedError,
     RolloutSessionNotFoundError,
 )
+from vllm_omni.entrypoints.openai.safety_checker import SafetyChecker, check_images_safe
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
@@ -999,6 +1000,12 @@ async def omni_init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.args = args
+    state.safety_checker = None
+    if getattr(args, "safety_checker", False):
+        # Fail at startup rather than serving unfiltered images without a working checker.
+        state.safety_checker = SafetyChecker()
+        state.safety_checker.ensure_loaded()
+        logger.info("NSFW safety checker enabled")
     state.sleeping_stages = set()
 
     # For omni models
@@ -2359,6 +2366,7 @@ async def generate_images(
                     content=generation_result.model_dump(),
                 )
             flat_images, stage_durations, peak_memory_mb, _, response_metrics = generation_result
+            await check_images_safe(flat_images, raw_request)
             return _build_image_generation_response(
                 images=flat_images,
                 request=request,
@@ -2452,6 +2460,8 @@ async def generate_images(
         images = _extract_images_from_result(result)
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
+
+        await check_images_safe(images, raw_request)
 
         stage_durations = getattr(result, "stage_durations", None)
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
@@ -2819,6 +2829,8 @@ async def edit_images(
         if images is None:
             images = []
         logger.debug(f"Successfully generated {len(images)} image(s)")
+
+        await check_images_safe(images, raw_request)
 
         # Encode images to base64
         image_data = [

@@ -1217,6 +1217,14 @@ class OmniServeCommand(CLISubcommand):
             help="Enable orchestrator window monitor and write a JSON log at shutdown.",
         )
 
+        omni_config_group.add_argument(
+            "--safety-checker",
+            action="store_true",
+            help="Reject generated images that an NSFW classifier (Falconsai/nsfw_image_detection, run on CPU) "
+            "flags as unsafe. Applies to /v1/images/generations and non-streaming /v1/images/edits. "
+            "Streaming edits and chat completions are not checked. Independent of --no-guardrails.",
+        )
+
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
