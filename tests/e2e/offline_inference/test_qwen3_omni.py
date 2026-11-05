@@ -52,9 +52,9 @@ else:
     stage_configs = [get_cuda_graph_config()]
 
 # Create parameter combinations for model and stage config.
-# The third item is OmniRunner kwargs. Cold NFS loads of this 30B checkpoint
-# miss the 600s stage READY deadline (AMD build 15260).
-_STAGE_INIT = {"stage_init_timeout": QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S}
+# The third item is OmniRunner kwargs. Only ROCm receives the bounded per-stage
+# cold-NFS allowance; the runner's existing 1800s overall deadline is retained.
+_STAGE_INIT = {"stage_init_timeout": QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S} if current_omni_platform.is_rocm() else {}
 test_params = [(model, stage_config, _STAGE_INIT) for model in models for stage_config in stage_configs]
 production_test_params = [(model, _PRODUCTION_DEPLOY, _STAGE_INIT) for model in models]
 # we can use the same config for a model that only has thinker (i.e., does not
