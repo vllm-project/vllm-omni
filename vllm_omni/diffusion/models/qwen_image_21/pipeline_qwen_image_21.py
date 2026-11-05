@@ -1512,6 +1512,16 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        # ForwardContext carries one index for this entire transformer forward.
+        # Before allowing mixed steps, check every step-dependent consumer:
+        # Attention treats an unknown index as a skip with an active skip selector,
+        # and W4A8 Linear fallback requires a known index. A representative row's
+        # index could select the wrong precision for the other rows.
+        step_indices = {state.step_index for state in states}
+        if len(step_indices) != 1:
+            raise ValueError(f"Qwen-Image-2.1 requires a common denoise step per forward, got {sorted(step_indices)}.")
+        step_idx = states[0].step_index
+
         if self._kv_cache_phase(states[0].extra.get("kv_cache")) == "prefill":
             self._release_idle_decode_graphs()
 
@@ -1600,13 +1610,10 @@ class QwenImage21Pipeline(
         else:
             negative_kwargs = None
 
-        # Qwen admits new requests at step zero and advances the batch together.
-        # Only publish an index shared by every row of this forward.
-        step_indices = {state.step_index for state in states}
         forward_context = get_forward_context() if is_forward_context_available() else None
         previous_step = forward_context.denoise_step_idx if forward_context is not None else None
         try:
-            set_forward_context_denoise_step_idx(next(iter(step_indices)) if len(step_indices) == 1 else None)
+            set_forward_context_denoise_step_idx(step_idx)
             noise_pred = self.predict_noise_maybe_with_cfg(
                 input_batch.do_true_cfg,
                 input_batch.true_cfg_scale,

@@ -118,8 +118,9 @@ Qwen-Image-2.1 publishes a zero-based denoising index in
 branches see the same index. In step execution, Qwen defers new first-step
 requests while a batch is decoding. The runner advances each scheduled request
 once per iteration, so requests admitted together share an index even if their
-total step counts differ. Each transformer forward publishes its common index,
-or `None` if its input states disagree. On exit the pipeline restores the
+total step counts differ. After prefix-length grouping, each transformer forward
+requires a common index. Mixed indices within a group raise a `ValueError`
+before step publication, including in native precision. On exit the pipeline restores the
 previous index directly, preserving the worker's paged-KV activation scope.
 
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.

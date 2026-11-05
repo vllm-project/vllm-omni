@@ -241,12 +241,11 @@ def test_scheduled_requests_publish_the_common_step(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("different_prefix_lengths", [False, True])
-def test_decode_publishes_only_a_common_index_per_prefix_group(monkeypatch, different_prefix_lengths):
+def test_decode_checks_the_common_index_after_prefix_grouping(monkeypatch, different_prefix_lengths):
     config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
     pipe = _step_pipeline(config)
-    # Direct input exercises the scalar context boundary for mixed indices.
-    # Normal Qwen admission is covered by the scheduler test above.
-    states = [_state("a", 1, 1.0), _state("b", 2, 2.0, rows=2), _state("c", 3, 3.0)]
+    second_step = 2 if different_prefix_lengths else 3
+    states = [_state("a", 3, 1.0), _state("b", second_step, 2.0, rows=2), _state("c", 3, 3.0)]
     for state in states:
         prefix = 2 if different_prefix_lengths and state.request_id == "b" else 1
         state.extra["prefill_prompt_seq_len"] = prefix
@@ -264,10 +263,23 @@ def test_decode_publishes_only_a_common_index_per_prefix_group(monkeypatch, diff
     with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9):
         result = pipe.denoise_step(InputBatch.make_batch(states))
         assert get_forward_context().denoise_step_idx == 9
-    assert calls == (
-        [(None, [1.0, 3.0]), (2, [2.0, 2.0])] if different_prefix_lengths else [(None, [1.0, 2.0, 2.0, 3.0])]
-    )
+    assert calls == ([(3, [1.0, 3.0]), (2, [2.0, 2.0])] if different_prefix_lengths else [(3, [1.0, 2.0, 2.0, 3.0])])
     torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0]))
+
+
+@pytest.mark.parametrize("dtype", ["float", "mxfp8"])
+def test_mixed_steps_raise_before_publication_or_forward(mocker, dtype):
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype=dtype, diffusion_kv_cache_skip_steps="0")
+    pipe = _step_pipeline(config)
+    predict = mocker.patch.object(pipe, "predict_noise_maybe_with_cfg")
+    runtime = mocker.Mock()
+    batch = InputBatch.make_batch([_state("a", 3, 1.0), _state("b", 1, 2.0)])
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9, paged_kv_runtime=runtime):
+        with pytest.raises(ValueError, match=r"common denoise step per forward, got \[1, 3\]"):
+            pipe.denoise_step(batch)
+        assert get_forward_context().denoise_step_idx == 9
+    predict.assert_not_called()
+    runtime.ensure_active.assert_not_called()
 
 
 @pytest.mark.parametrize("previous_step", [None, 0, 9])
