@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Apply the ROCm VAE GroupNorm optimization after model initialization."""
+"""Replace VAE GroupNorm with AITER GroupNorm after model initialization."""
 
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -35,14 +35,14 @@ def _replace_groupnorm_with_aiter(vae: nn.Module) -> bool:
     return len(targets) > 0
 
 
-def apply_vae_groupnorm(model: nn.Module, od_config) -> nn.Module:
+def apply_aiter_groupnorm(model: nn.Module, model_class_name: str | None) -> None:
     if hasattr(model, "vae"):
         # AITER GroupNorm does not preserve the PyTorch autocast behavior required
         # by Hunyuan Image 3.0. Keep PyTorch GroupNorm until the fix is released:
         # https://github.com/ROCm/aiter/issues/4780
         # https://github.com/ROCm/aiter/pull/4779
-        if od_config.model_class_name == "HunyuanImage3ForCausalMM":
-            return model
+        if model_class_name == "HunyuanImage3ForCausalMM":
+            return
 
         try:
             from vllm._aiter_ops import is_aiter_found_and_supported
@@ -51,5 +51,3 @@ def apply_vae_groupnorm(model: nn.Module, od_config) -> nn.Module:
                 logger.info("AITER GroupNorm is enabled for VAE.")
         except Exception:
             logger.warning("Failed to apply AITER GroupNorm to VAE.")
-
-    return model

@@ -13,6 +13,7 @@ import pytest
 import torch.nn as nn
 
 from vllm_omni.diffusion import registry
+from vllm_omni.platforms.interface import OmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -22,6 +23,19 @@ assert _SPEC is not None and _SPEC.loader is not None
 patch_groupnorm = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = patch_groupnorm
 _SPEC.loader.exec_module(patch_groupnorm)
+
+
+def test_import_does_not_load_diffusion_registry():
+    code = (
+        "import importlib.util, sys; "
+        f"spec = importlib.util.spec_from_file_location('groupnorm_patch', {str(_PATCH_PATH)!r}); "
+        "assert spec is not None and spec.loader is not None; "
+        "module = importlib.util.module_from_spec(spec); "
+        "spec.loader.exec_module(module); "
+        "assert 'vllm_omni.diffusion.registry' not in sys.modules"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -40,8 +54,7 @@ def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
         lambda _: pytest.fail("Hunyuan Image 3.0 must keep PyTorch GroupNorm"),
     )
 
-    od_config = types.SimpleNamespace(model_class_name="HunyuanImage3ForCausalMM")
-    assert patch_groupnorm.apply_vae_groupnorm(model, od_config) is model
+    assert patch_groupnorm.apply_aiter_groupnorm(model, "HunyuanImage3ForCausalMM") is None
     assert type(model.vae[0]) is nn.GroupNorm
 
 
@@ -56,8 +69,7 @@ def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
         return True
 
     monkeypatch.setattr(patch_groupnorm, "_replace_groupnorm_with_aiter", replace_groupnorm)
-    od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
-    assert patch_groupnorm.apply_vae_groupnorm(model, od_config) is model
+    assert patch_groupnorm.apply_aiter_groupnorm(model, "OtherDiffusionModel") is None
     assert replaced
 
 
@@ -94,6 +106,20 @@ def test_rocm_platform_initialization_keeps_model_discovery_lightweight(tmp_path
 @pytest.mark.parametrize("is_rocm", [False, True])
 @pytest.mark.parametrize("has_vae", [False, True])
 def test_registry_applies_groupnorm_only_after_rocm_model_initialization(monkeypatch, is_rocm, has_vae):
+    # Exercise upstream's real platform hook. Only the hardware-querying vLLM
+    # base is substituted when this CPU regression runs without ROCm.
+    import torch
+
+    if torch.version.hip is None:
+        rocm_base = types.ModuleType("vllm.platforms.rocm")
+        setattr(rocm_base, "RocmPlatform", type("RocmPlatform", (), {}))
+        monkeypatch.setitem(sys.modules, "vllm.platforms.rocm", rocm_base)
+    platform_path = Path(__file__).parents[2] / "vllm_omni/platforms/rocm/platform.py"
+    spec = importlib.util.spec_from_file_location("groupnorm_test_rocm_platform", platform_path)
+    assert spec is not None and spec.loader is not None
+    rocm_platform = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rocm_platform)
+
     model = nn.Module()
     if has_vae:
         model.vae = nn.Sequential(nn.GroupNorm(4, 8))
@@ -112,7 +138,11 @@ def test_registry_applies_groupnorm_only_after_rocm_model_initialization(monkeyp
         return model
 
     monkeypatch.setattr(registry.DiffusionModelRegistry, "_try_load_model_cls", lambda _: construct_model)
-    monkeypatch.setattr(registry, "current_omni_platform", types.SimpleNamespace(is_rocm=lambda: is_rocm))
+    monkeypatch.setattr(
+        registry,
+        "current_omni_platform",
+        rocm_platform.RocmOmniPlatform if is_rocm else OmniPlatform,
+    )
     monkeypatch.setattr(registry, "_apply_sequence_parallel_if_enabled", lambda *_: events.append("parallel"))
     monkeypatch.setattr(registry, "_apply_wan_vae_fastpath_if_enabled", lambda *_: events.append("fastpath"))
     monkeypatch.setitem(sys.modules, "vllm_omni.platforms.rocm.patch.worker.patch_groupnorm", patch_groupnorm)
@@ -148,7 +178,7 @@ def test_unavailable_aiter_keeps_pytorch_groupnorm(monkeypatch):
     monkeypatch.setattr(patch_groupnorm, "_replace_groupnorm_with_aiter", lambda _: pytest.fail("AITER unavailable"))
     model = nn.Module()
     model.vae = nn.Sequential(nn.GroupNorm(4, 8))
-    assert patch_groupnorm.apply_vae_groupnorm(model, types.SimpleNamespace(model_class_name="Other")) is model
+    assert patch_groupnorm.apply_aiter_groupnorm(model, "Other") is None
     assert type(model.vae[0]) is nn.GroupNorm
 
 
@@ -159,5 +189,5 @@ def test_aiter_failure_keeps_model_initialization_successful(monkeypatch):
     monkeypatch.setattr(patch_groupnorm, "_replace_groupnorm_with_aiter", unavailable)
     model = nn.Module()
     model.vae = nn.Sequential(nn.GroupNorm(4, 8))
-    assert patch_groupnorm.apply_vae_groupnorm(model, types.SimpleNamespace(model_class_name="Other")) is model
+    assert patch_groupnorm.apply_aiter_groupnorm(model, "Other") is None
     assert type(model.vae[0]) is nn.GroupNorm

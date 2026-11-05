@@ -597,13 +597,7 @@ def initialize_model(
         # re-layout it performs stays offloadable by sleep mode.
         _apply_wan_vae_fastpath_if_enabled(model, od_config)
 
-        # Defer ROCm's VAE optimization until the model exists. Installing a
-        # registry monkeypatch during platform discovery eagerly imports this
-        # runtime module into otherwise lightweight checkpoint inspection.
-        if current_omni_platform.is_rocm():
-            from vllm_omni.platforms.rocm.patch.worker.patch_groupnorm import apply_vae_groupnorm
-
-            model = apply_vae_groupnorm(model, od_config)
+        current_omni_platform.apply_diffusion_model_patches(model, od_config)
 
         return model
     else:
