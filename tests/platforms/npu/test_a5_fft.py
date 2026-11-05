@@ -182,6 +182,19 @@ def test_stft_fft_rejects_short_input() -> None:
         module._stft_fft(torch.randn(8), 16, 4, 16, window, False, "reflect", False, None, True)
 
 
+def test_stft_fft_falls_back_for_complex_window() -> None:
+    module = _load_module()
+    torch.manual_seed(8)
+    audio = torch.randn(1, 64)
+    window = torch.ones(16, dtype=torch.complex64) * 1j
+    with pytest.raises(module._FallbackError):
+        module._stft_fft(audio, 16, 4, 16, window, True, "reflect", False, False, True)
+
+    expected = torch.stft(audio, 16, 4, 16, window=window, center=True, onesided=False, return_complex=True)
+    actual = module._stft_on_cpu(audio, 16, 4, 16, window, True, "reflect", False, False, True)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_stft_fft_accepts_low_precision_input(dtype: torch.dtype) -> None:
     module = _load_module()
@@ -289,6 +302,16 @@ def test_istft_fft_matches_torch_length_beyond_reconstruction() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_istft_fft_full_spectrum_real_output_matches_torch() -> None:
+    module = _load_module()
+    spec = torch.zeros(1, 4, 1, dtype=torch.complex64)
+    spec[0, 1, 0] = 1
+    window = torch.ones(4)
+    expected = torch.istft(spec, 4, 4, 4, window=window, center=False, onesided=False)
+    actual = module._istft_fft(spec, 4, 4, 4, window, False, False, False, None, False)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_istft_envelope_cache_recomputes_after_window_mutation() -> None:
     module = _load_module()
     torch.manual_seed(7)
@@ -302,6 +325,18 @@ def test_istft_envelope_cache_recomputes_after_window_mutation() -> None:
     window.mul_(0.5)
     expected = torch.istft(spec, 16, 4, 16, window=window)
     actual = module._istft_fft(spec, 16, 4, 16, window, True, False, None, None, False)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_istft_fft_handles_inference_window() -> None:
+    module = _load_module()
+    with torch.inference_mode():
+        torch.manual_seed(9)
+        audio = torch.randn(1, 64)
+        window = torch.hann_window(16)
+        spec = torch.stft(audio, 16, 4, 16, window=window, return_complex=True)
+        expected = torch.istft(spec, 16, 4, 16, window=window)
+        actual = module._istft_fft(spec, 16, 4, 16, window, True, False, None, None, False)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
@@ -342,6 +377,16 @@ def test_stft_propagates_oom(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "_stft_fft", fail)
     with pytest.raises(torch.OutOfMemoryError):
         module.stft(torch.empty(0, device="meta"), 16, 4, 16)
+
+
+def test_fallback_counter_tracks_repeated_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_WARNED", set())
+    monkeypatch.setattr(module, "_FALLBACK_COUNTS", {})
+    with pytest.warns(RuntimeWarning, match="A5 FFT STFT failed"):
+        module._warn_fallback("STFT", RuntimeError("first"))
+        module._warn_fallback("STFT", RuntimeError("second"))
+    assert module._FALLBACK_COUNTS == {"STFT": 2}
 
 
 def test_istft_propagates_oom(monkeypatch: pytest.MonkeyPatch) -> None:

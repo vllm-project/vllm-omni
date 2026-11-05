@@ -8,12 +8,15 @@ References bound before platform initialization are not replaced.
 
 from __future__ import annotations
 
+import logging
 import warnings
 from functools import lru_cache
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 _TORCH_STFT = torch.stft
 _TORCH_ISTFT = torch.istft
@@ -22,6 +25,7 @@ _PATCHED = False
 _ENVELOPE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, bool]] = {}
 _ENVELOPE_CACHE_MAX = 16
 _WARNED: set[str] = set()
+_FALLBACK_COUNTS: dict[str, int] = {}
 
 
 class _FallbackError(Exception):
@@ -29,6 +33,9 @@ class _FallbackError(Exception):
 
 
 def _warn_fallback(op: str, error: Exception) -> None:
+    count = _FALLBACK_COUNTS.get(op, 0) + 1
+    _FALLBACK_COUNTS[op] = count
+    logger.debug("A5 FFT %s fallback #%d: %s", op, count, error)
     if op in _WARNED:
         return
     _WARNED.add(op)
@@ -128,7 +135,7 @@ def _stft_fft(
     work_dtype = torch.float32 if input.dtype in (torch.float16, torch.bfloat16) else input.dtype
     if window is None:
         window = torch.ones(win_length, device=input.device, dtype=work_dtype)
-    elif window.ndim != 1 or window.numel() != win_length:
+    elif window.ndim != 1 or window.numel() != win_length or torch.is_complex(window):
         raise _FallbackError
     else:
         window = window.to(device=input.device, dtype=work_dtype)
@@ -266,18 +273,20 @@ def _istft_envelope(
     expected_len = n_fft + hop_length * (n_frames - 1)
     offset = n_fft // 2 if center else 0
     available = min(target_len, expected_len - offset)
-    key = (
-        id(window),
-        window._version,
-        n_frames,
-        n_fft,
-        hop_length,
-        center,
-        target_len,
-    )
-    cached = _ENVELOPE_CACHE.get(key)
-    if cached is not None and cached[0] is window:
-        return cached[1], cached[2], cached[3]
+    cache_key = None
+    if not window.is_inference():
+        cache_key = (
+            id(window),
+            window._version,
+            n_frames,
+            n_fft,
+            hop_length,
+            center,
+            target_len,
+        )
+        cached = _ENVELOPE_CACHE.get(cache_key)
+        if cached is not None and cached[0] is window:
+            return cached[1], cached[2], cached[3]
     envelope = torch.ops.aten.unfold_backward(
         window.square().expand(n_frames, n_fft),
         [expected_len],
@@ -287,10 +296,10 @@ def _istft_envelope(
     )
     envelope = envelope[offset : offset + available]
     valid = envelope.numel() > 0 and bool(envelope.abs().min() > 1e-11)
-    if len(_ENVELOPE_CACHE) >= _ENVELOPE_CACHE_MAX:
-        _ENVELOPE_CACHE.pop(next(iter(_ENVELOPE_CACHE)))
-    result = (window, envelope, available, valid)
-    _ENVELOPE_CACHE[key] = result
+    if cache_key is not None:
+        if len(_ENVELOPE_CACHE) >= _ENVELOPE_CACHE_MAX:
+            _ENVELOPE_CACHE.pop(next(iter(_ENVELOPE_CACHE)))
+        _ENVELOPE_CACHE[cache_key] = (window, envelope, available, valid)
     return envelope, available, valid
 
 
@@ -328,7 +337,7 @@ def _istft_fft(
     real_dtype = torch.float64 if input.dtype == torch.complex128 else torch.float32
     if window is None:
         window = torch.ones(win_length, device=input.device, dtype=real_dtype)
-    elif window.ndim != 1 or window.numel() != win_length:
+    elif window.ndim != 1 or window.numel() != win_length or torch.is_complex(window):
         raise _FallbackError
     else:
         window = window.to(device=input.device, dtype=real_dtype)
@@ -353,10 +362,9 @@ def _istft_fft(
     if normalized:
         input = input * (n_fft**0.5)
     spectrum = input.transpose(-2, -1).contiguous()
-    if onesided:
-        frames = torch.fft.irfft(spectrum, n=n_fft, dim=-1)
-    else:
-        frames = torch.fft.ifft(spectrum, dim=-1).real
+    if not onesided:
+        spectrum = spectrum[..., : n_fft // 2 + 1]
+    frames = torch.fft.irfft(spectrum, n=n_fft, dim=-1)
     frames = frames * window
 
     batch_shape = frames.shape[:-2]
