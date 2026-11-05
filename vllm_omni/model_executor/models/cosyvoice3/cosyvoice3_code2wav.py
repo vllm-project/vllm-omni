@@ -936,6 +936,7 @@ class CosyVoice3Code2Wav(nn.Module):
             start = min(state.committed, emit // cache.chunk * cache.chunk)
             if end <= start:
                 # An empty non-final hop does not abandon the request's prefix.
+                # FP32 matches FlowPrefixCache.solve, which returns float() mels.
                 results[index] = (weight.new_empty((1, self.output_size, 0), dtype=torch.float32), state)
                 continue
             if not cache.reserve(state, end):

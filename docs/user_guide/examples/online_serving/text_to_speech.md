@@ -185,56 +185,6 @@ recomputation and can reduce throughput. Startup logs distinguish the actual
 pool tensor allocation from the configured budget; neither is total GPU memory.
 Weights, solver temporaries and CUDA graphs require additional headroom.
 
-To compare pool policies, use the following experiment. The on-demand arms
-are experimental implementations, not configuration options shipped here.
-
-| Arm | Allocation policy | Request completion |
-| --- | --- | --- |
-| Preallocated | Allocate the entire budget at startup (current implementation). | Return pages to the pool. |
-| On-demand, retained | Allocate stable-address page slabs as demand grows, up to the same budget. | Keep slabs for reuse. |
-| On-demand, released | Allocate the same slabs as needed. | Drop only completely idle slabs after all GPU users finish. |
-
-Use the same page shape, scratch-page reservation, precision and capacity in
-all arms. Never resize or relocate live pages: graph replay requires stable
-addresses. On-demand storage needs a compatible page-table/kernel design;
-merely moving allocation outside the timing window is not an on-demand arm.
-
-1. **Allocator-only replay:** record per-request reserve/release events from
-   the current implementation, including requested frame counts and final or
-   cancelled requests. Replay the identical trace into all three allocators
-   in fresh processes. Include C1, C8 and C32, plus a C1 → C32 → idle → C1
-   sequence and a deliberately over-budget trace. Repeat each arm three times
-   in rotated order. This isolates memory policy; it does not establish audio
-   correctness, serving throughput or CUDA-graph compatibility.
-2. **Serving validation:** after integrating an on-demand allocator with the
-   real solver, compare the same head, checkpoint, GPU, dtype, runner, sampling
-   policy, Euler steps, prompts and warmup. Sweep 4/8/16 GiB at C1/C8/C32,
-   with both short and long utterances. Add cache-disabled serving as a
-   separate reference, not as an on-demand implementation. Keep all other
-   optimizations fixed and report cold startup separately from warmed runs.
-3. **Measurements:** record pool tensor bytes, live/free pages, allocation
-   count and time, reserve failures/full-recompute fallbacks, and per-worker
-   PyTorch allocated/reserved memory and their peaks. Sample device/process
-   memory at a stated interval (for example 100 ms). Capture startup, post
-   warmup, peak load and post-idle values; reset peak counters at phase
-   boundaries after synchronization, outside the timed serving hot path.
-   Device-level sampling can miss short peaks and includes unrelated processes,
-   so isolate the GPU. With MPS, report total device memory as well as worker
-   allocator counters instead of summing ambiguous process accounting.
-4. **Acceptance:** report throughput, TTFA P50/P95/P99, audio underruns and
-   output-quality/completeness alongside memory. Report OOM arms as failures.
-   A lower tensor allocation alone is not a lower device footprint: retained
-   PyTorch allocator blocks can keep reserved memory high after slab release.
-   Do not call `empty_cache()` in one arm's timed path; an optional synchronized
-   post-idle measurement after allocator-cache release must be labelled
-   separately and applied consistently to every arm.
-
-Record revision, environment, exact configuration and workload for every run.
-Report both absolute memory and the delta from the post-model-load baseline;
-the pool excludes weights, CUDA graphs, solver temporaries and allocator
-fragmentation. No C32 peak-memory or on-demand performance result is implied
-by this protocol.
-
 For an experimental CUDA deployment with both Talker and Code2Wav on Model
 Runner V2, select the explicit streaming profile:
 
@@ -257,7 +207,6 @@ request** (`stream=true`). CosyVoice3 has no native duplex model plugin;
 resumable text input and `session_mode: duplex` are not supported on this
 MRv2 path. A duplex application can submit and cancel independent TTS
 requests, with a new request for the next utterance.
-
 
 ### Ascend Stage-1 graph regions
 
