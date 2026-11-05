@@ -11,7 +11,12 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.ops import qkv_head_layer_norm
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    # The bug lives on the CPU fallback, so the CPU job must collect this file too.
+    pytest.mark.cpu,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
+]
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
@@ -78,7 +83,7 @@ def test_slot_positions_scatter_kv(device: str, affine: bool) -> None:
     if not affine:
         q_norm = torch.nn.LayerNorm(head_dim, eps=1e-6, elementwise_affine=False, device=device)
         k_norm = torch.nn.LayerNorm(head_dim, eps=1e-6, elementwise_affine=False, device=device)
-    # Row 0 writes frames 0/1 onto slots 2/(-1)/0; row 1 onto slots 4/1/(-1) of another pool row.
+    # Row 0 writes frames 0/1/2 onto slots 2/-1/0; row 1 onto slots 4/1/-1 of another pool row.
     rows = torch.tensor([3, 0], device=device)
     positions = torch.tensor([[2, -1, 0], [4, 1, -1]], device=device)
 
