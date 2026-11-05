@@ -41,6 +41,9 @@ EXCLUDED_MODELS = [
     # Requires upstream AR hidden states and token boundaries; covered by
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
+    # Action expert that needs the reasoning stage's KV prefix; covered by
+    # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
+    "Alpamayo2SuperPipeline",
     "WanPipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",
@@ -52,6 +55,10 @@ EXCLUDED_MODELS = [
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
+    # Physis uses full video model checkpoints and has dedicated contract tests.
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
+    "PhysisWanPipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
     # Decoder-only stage consumes upstream latents; covered by H3 decoder
@@ -89,6 +96,10 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # No common tiny builder for the native Qwen/PixelUMM layout yet; covered by
+    # tests/diffusion/models/hy_nomas and real-checkpoint offline/accuracy/serving E2E.
+    "HyNomasPipeline",
+    "HyNomasModularPipeline",
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated CPU contract tests and manual real-checkpoint smoke tests instead.
     "ABotWorldCausalPipeline",
