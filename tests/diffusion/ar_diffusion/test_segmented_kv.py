@@ -98,6 +98,25 @@ def test_ragged_pages_match_dense_attention_without_padding(lengths):
     assert cache.manager.block_pool.get_num_free_blocks() == free
 
 
+def test_commit_validation_does_not_publish_or_evict_before_peer_agreement():
+    cache = make_cache()
+    owner = make_state(cache)
+    state = owner.segmented("main")
+    old = append(state, (3, 5), offset=7)
+    free = cache.manager.block_pool.get_num_free_blocks()
+    state.prepare_layer_views(6, 2)
+    pending = state.begin_commit((2, 4))
+    for layer in range(cache.num_layers):
+        state.assemble(layer, rows(2), rows(2), rows(6, 99), rows(6, 99))
+        state.stage(layer)
+    assert state.validate_commit(retain=pending) == pending
+    assert state.handles == old and state.history_tokens == 8 and state.commit_active
+    state.rollback()
+    assert state.handles == old
+    assert cache.manager.block_pool.get_num_free_blocks() == free
+    owner.close()
+
+
 def test_noisy_steps_reuse_history_and_never_mutate_committed_pages():
     cache = make_cache()
     state = make_state(cache).segmented("main")
