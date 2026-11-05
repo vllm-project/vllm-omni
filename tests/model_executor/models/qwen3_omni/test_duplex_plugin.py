@@ -2539,9 +2539,11 @@ async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker)
             if 0 < i < 4:
                 assert snapshot.call_count == 0
                 assert h.port.submissions[-1].prompt["_qwen_turn_delta"] is True
+                assert h.port.submissions[-1].history_revision == h.session.history_revision
             else:
                 assert snapshot.call_count == 1
                 assert "_qwen_turn_delta" not in h.port.submissions[-1].prompt
+                assert h.port.submissions[-1].history_revision is None
             text = OmniRequestOutput.from_stage_output(
                 tts_output(request_id, samples=0, text="hello", finished=True),
                 request_id=request_id,
