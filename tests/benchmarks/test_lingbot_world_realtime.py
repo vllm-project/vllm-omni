@@ -14,6 +14,8 @@ from __future__ import annotations
 # ruff: noqa: E402, I001
 import asyncio
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1025,13 +1027,66 @@ def test_source_compatibility_imports_share_packaged_implementation() -> None:
 
     assert legacy is realtime
     assert legacy_workload is workload
-    assert realtime._git_revision() is not None
+    assert realtime.__name__ == "vllm_omni.benchmarks.lingbot_world.realtime"
+    assert realtime.REPO_ROOT == Path(realtime.__file__).resolve().parents[3]
 
 
-def test_installed_benchmark_does_not_claim_unrelated_source_revision(tmp_path, monkeypatch) -> None:
+@pytest.fixture
+def benchmark_git_checkout(tmp_path) -> tuple[Path, str]:
+    root = tmp_path / "benchmark-source"
+    environment = {
+        "PATH": os.environ["PATH"],
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "Benchmark fixture",
+        "GIT_AUTHOR_EMAIL": "benchmark@example.invalid",
+        "GIT_COMMITTER_NAME": "Benchmark fixture",
+        "GIT_COMMITTER_EMAIL": "benchmark@example.invalid",
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+    }
+    subprocess.run(["git", "init", "--quiet", "--initial-branch=main", str(root)], env=environment, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "core.hooksPath=" + os.devnull,
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Benchmark source fixture",
+        ],
+        env=environment,
+        check=True,
+    )
+    revision = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], env=environment, text=True
+    ).strip()
+    return root, revision
+
+
+def test_source_benchmark_records_its_own_git_revision(benchmark_git_checkout, tmp_path, monkeypatch) -> None:
     from vllm_omni.benchmarks.lingbot_world import realtime
 
-    monkeypatch.setattr(realtime, "REPO_ROOT", tmp_path)
+    root, revision = benchmark_git_checkout
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(realtime, "REPO_ROOT", root)
+    assert realtime._git_revision() == revision
+
+
+def test_installed_benchmark_does_not_claim_unrelated_source_revision(benchmark_git_checkout, monkeypatch) -> None:
+    from vllm_omni.benchmarks.lingbot_world import realtime
+
+    unrelated_checkout, _ = benchmark_git_checkout
+    installed_root = unrelated_checkout / "installed-wheel"
+    installed_root.mkdir()
+    monkeypatch.chdir(unrelated_checkout)
+    monkeypatch.setattr(realtime, "REPO_ROOT", installed_root)
     assert realtime._git_revision() is None
 
 
