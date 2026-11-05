@@ -64,6 +64,10 @@ class QwenImageMixFusionAdapter:
             # The editing path passes per-token modulate indices that the
             # packed layout does not build yet.
             return False, "zero_cond_t/editing path is not supported"
+        if input_batch.image_latents is not None:
+            # Reference-image tokens need their own RoPE and per-token
+            # conditioning in the packed layout, which is not built yet.
+            return False, "image_latents (reference images) are not supported"
         if input_batch.img_shapes is None or input_batch.txt_seq_lens is None:
             return False, "img_shapes and txt_seq_lens are required"
         return True, ""

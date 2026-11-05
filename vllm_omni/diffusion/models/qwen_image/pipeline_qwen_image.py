@@ -856,7 +856,7 @@ class QwenImagePipeline(
 
         ``latents`` may be one tensor per request (a packed MixFusion step);
         the list is forwarded unchanged and the transformer's root hook packs
-        it. The driver never packs image-conditioned batches.
+        it. The adapter declines image-conditioned batches.
 
         Returns:
             (positive_kwargs, negative_kwargs, output_slice)

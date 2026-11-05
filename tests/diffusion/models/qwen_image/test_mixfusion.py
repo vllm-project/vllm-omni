@@ -10,6 +10,8 @@ what is Qwen-specific:
   exposes the block boundaries to the foreign-hook guard;
 * the pipeline's dense keyword builder feeding a packed list through an armed
   step, with and without sequential true-CFG;
+* the serial-ragged fallback keeping each request's spatial RoPE when
+  equal-area images differ in aspect ratio;
 * ``prepare_inputs``: row expansion, chunk split, RoPE tables, plan and the
   step-invariant cache;
 * the packed cross-attention: one ``forward_packed`` call over mixed requests
@@ -46,9 +48,13 @@ from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import (
 )
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    ImageRopePrepare,
+    QwenEmbedRope,
     QwenImageCrossAttention,
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -91,11 +97,16 @@ def _transformer(blocks: list[nn.Module] | None = None) -> tuple[QwenImageTransf
 def test_can_pack_rejects_zero_cond_t_and_missing_shapes():
     adapter = QwenImageMixFusionAdapter()
     transformer, _ = _transformer()
-    batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4])
+    batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=None)
     assert adapter.can_pack(transformer, batch) == (True, "")
-    assert adapter.can_pack(transformer, SimpleNamespace(img_shapes=None, txt_seq_lens=[4])) == (
+    assert adapter.can_pack(transformer, SimpleNamespace(img_shapes=None, txt_seq_lens=[4], image_latents=None)) == (
         False,
         "img_shapes and txt_seq_lens are required",
+    )
+    edit_batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=torch.zeros(1, 4, 8))
+    assert adapter.can_pack(transformer, edit_batch) == (
+        False,
+        "image_latents (reference images) are not supported",
     )
     object.__setattr__(transformer, "zero_cond_t", True)
     assert adapter.can_pack(transformer, batch) == (False, "zero_cond_t/editing path is not supported")
@@ -221,6 +232,52 @@ def test_driver_runs_the_pipeline_denoise_step_packed(do_true_cfg):
     expected = 2.0 + batch.true_cfg_scale * (1.0 - 2.0) if do_true_cfg else 1.0
     for out, latent in zip(result, batch.latents):
         assert torch.equal(out, torch.full_like(latent, expected))
+
+
+# ---------------------------------------------------------------------------
+# Serial-ragged fallback keeps each request's spatial RoPE.
+# ---------------------------------------------------------------------------
+
+
+def test_serial_fallback_keeps_each_requests_rope_for_equal_area_aspect_ratios():
+    """A rejected batch's dense groups must not share one image geometry.
+
+    2x4 and 4x2 token grids have the same sequence length, but the real
+    ``ImageRopePrepare`` / ``QwenEmbedRope`` builds one table from
+    ``img_shapes[0]`` per dense call, so grouping them would hand the second
+    request the first request's spatial RoPE.
+    """
+    prepare = ImageRopePrepare(nn.Identity(), QwenEmbedRope(theta=10000, axes_dim=[4, 6, 6], scale_rope=True))
+    grids = [(1, 2, 4), (1, 4, 2), (1, 3, 4)]
+    states = [
+        StepRequestState(
+            request_id=f"req-{idx}",
+            sampling=SimpleNamespace(true_cfg_scale=None, cfg_normalize=False),
+            latents=torch.zeros(1, frame * height * width, 4),
+            timesteps=torch.tensor([500.0]),
+            img_shapes=[[(frame, height, width)]],
+            txt_seq_lens=[3],
+            extra={"use_ragged_latents": True},
+        )
+        for idx, (frame, height, width) in enumerate(grids)
+    ]
+
+    def dense_step(batch, **kwargs):
+        # Same call the transformer makes: one RoPE table per dense batch.
+        _, vid_freqs, _ = prepare(batch.latents, batch.img_shapes, batch.txt_seq_lens)
+        return [vid_freqs for _ in range(batch.num_reqs)]
+
+    # A chunk policy no batch can meet forces the serial fallback.
+    batch = InputBatch.make_batch(states)
+    for extra in batch.request_extras:
+        extra["mixfusion_min_chunk_tokens"] = 1024
+    driver = MixFusionDriver(_StubPipeline(_StubTransformer()), _StubTransformer(), QwenImageMixFusionAdapter())
+    with override_forward_context(ForwardContext()):
+        outputs = driver.run(batch, states, dense_step)
+
+    for output, state in zip(outputs, states):
+        expected, _ = prepare.pos_embed(state.img_shapes[0], state.txt_seq_lens, device=torch.device("cpu"))
+        assert torch.equal(output, expected), state.request_id
 
 
 # ---------------------------------------------------------------------------

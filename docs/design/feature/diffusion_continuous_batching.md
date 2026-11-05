@@ -220,9 +220,13 @@ With the capability present, the model runner hands every denoise step to
 dispatches on the batch: dense (tensor) latents go straight to
 `pipeline.denoise_step`; list latents return `None` when the pipeline is
 interrupted and otherwise take one packed forward only when
-`MixFusionDriver.admit` accepts them. Rejected batches fall back to `serial_ragged`, which rebuilds one
-single-request dense batch per request and calls the same `denoise_step`
-with flattened latents, so per-image conditioning stays aligned.
+`MixFusionDriver.admit` accepts them. Rejected batches fall back to
+`serial_ragged`, which rebuilds one dense batch per compatible group and calls
+the same `denoise_step` with flattened latents, so per-image conditioning
+stays aligned. A group shares the latent shape, CFG/guidance settings,
+`img_shapes` and the step-key fields MixFusion relaxed (height, width,
+resolution): equal-area images with different aspect ratios share a sequence
+length but not their positional embedding.
 
 Admission rejects, in order:
 
@@ -234,7 +238,7 @@ Admission rejects, in order:
   block instead);
 - `sequence_parallel_size > 1` (packing already splits and stacks the image
   stream; SP would shard rows a second time);
-- `do_true_cfg` and image latents (edit path);
+- `cfg_parallel_size > 1` (CFG parallel all-gathers tensor predictions);
 - foreign forward hooks on any module the plan touches, reported by
   `plan_foreign_hooks` as `<plan name>:torch-native` (layerwise offload,
   FSDP2 or cache hooks would see a layout they were not written for);
@@ -341,8 +345,9 @@ _mixfusion_plan = {
   step instead of a forward argument.
 - Paths the packed layout cannot express are refused by the driver's
   admission guards (above); model-specific refusals live in the adapter.
-  For Qwen-Image, `can_pack` refuses `zero_cond_t` (editing) and batches
-  without `img_shapes` / `txt_seq_lens`. The fused joint
+  For Qwen-Image, `can_pack` refuses `zero_cond_t` (editing), image
+  latents (reference images) and batches without `img_shapes` /
+  `txt_seq_lens`. The fused joint
   QK-norm-RoPE table is disabled while a step is armed, because text
   (per-request) and image rows (per-chunk) cannot share one table.
 
@@ -382,8 +387,8 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
 - MixFusion shape relaxation requires the pipeline `supports_mixfusion`
-  capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, active
-  forward hooks, and `do_true_cfg` fall back to serial ragged execution.
+  capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, CFG
+  parallel and active forward hooks fall back to serial ragged execution.
 
 ## Related Implementation
 

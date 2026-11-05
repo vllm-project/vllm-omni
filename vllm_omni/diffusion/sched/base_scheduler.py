@@ -26,6 +26,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.mixfusion.request import RELAXED_STEP_KEY_FIELDS
 from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -86,9 +87,8 @@ def _apply_mixfusion_shape_relaxation(
         return values
     if _has_per_prompt_inputs(request):
         return None
-    values["height"] = None
-    values["width"] = None
-    values["resolution"] = None
+    for name in RELAXED_STEP_KEY_FIELDS:
+        values[name] = None
     return values
 
 

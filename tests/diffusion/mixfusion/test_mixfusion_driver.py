@@ -149,15 +149,18 @@ def _state(
     true_cfg_scale: float | None = None,
     cfg_normalize: bool = False,
     guidance: torch.Tensor | None = None,
+    img_shapes: list | None = None,
+    height: int | None = None,
 ) -> StepRequestState:
     """One ragged request state accepted by ``InputBatch.make_batch``."""
     return StepRequestState(
         request_id=request_id,
-        sampling=SimpleNamespace(true_cfg_scale=true_cfg_scale, cfg_normalize=cfg_normalize),
+        sampling=SimpleNamespace(true_cfg_scale=true_cfg_scale, cfg_normalize=cfg_normalize, height=height),
         latents=latents,
         timesteps=torch.tensor([500.0]),
         do_true_cfg=do_true_cfg,
         guidance=guidance,
+        img_shapes=img_shapes,
         extra={"use_ragged_latents": True},
     )
 
@@ -247,7 +250,6 @@ def _hooked_root() -> _FakeTransformer:
         ({"pipeline": _pipeline(attention_kwargs={"scale": 0.5})}, {}, {}, "attention_kwargs is set"),
         ({"pipeline": _pipeline(sp_size=2)}, {}, {}, "sequence parallelism is enabled"),
         ({"pipeline": _pipeline(cfg_size=2)}, {"do_true_cfg": True}, {}, "CFG parallel is enabled"),
-        ({}, {"image_latents": torch.zeros(1, 4, 4)}, {}, "image_latents is set"),
         (
             {"transformer": _hooked_blocks},
             {},
@@ -360,6 +362,32 @@ def test_serial_ragged_splits_groups_by_latent_shape():
     outputs = driver.serial_ragged(SimpleNamespace(latents=latents), states, dense_step)
 
     assert [batch.request_ids for batch in seen] == [["req-0", "req-2"], ["req-1", "req-3"]]
+    for output, lat in zip(outputs, latents):
+        assert torch.equal(output, lat + 1)
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        # Equal area, different aspect ratio: same S, different RoPE grid.
+        [{"img_shapes": [[(1, 2, 4)]]}, {"img_shapes": [[(1, 4, 2)]]}, {"img_shapes": [[(1, 2, 4)]]}],
+        # A relaxed step-key field alone also separates requests.
+        [{"height": 512}, {"height": 1024}, {"height": 512}],
+    ],
+)
+def test_serial_ragged_splits_groups_by_image_geometry(geometry):
+    driver, _ = _driver()
+    latents = [torch.full((1, 8, 4), float(idx)) for idx in range(3)]
+    states = [_state(f"req-{idx}", lat, **geometry[idx]) for idx, lat in enumerate(latents)]
+    seen: list[InputBatch] = []
+
+    def dense_step(batch, **kwargs):
+        seen.append(batch)
+        return batch.latents + 1
+
+    outputs = driver.serial_ragged(SimpleNamespace(latents=latents), states, dense_step)
+
+    assert [batch.request_ids for batch in seen] == [["req-0", "req-2"], ["req-1"]]
     for output, lat in zip(outputs, latents):
         assert torch.equal(output, lat + 1)
 

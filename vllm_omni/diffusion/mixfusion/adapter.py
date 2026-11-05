@@ -84,7 +84,7 @@ class MixFusionAdapter(Protocol):
 
         Only model-specific limits belong here; the driver already checks the
         model-agnostic ones (adapter/hooks present, attention kwargs, SP, CFG
-        parallel, image latents, foreign hooks, chunk policy).
+        parallel, foreign hooks, chunk policy).
         """
         ...
 

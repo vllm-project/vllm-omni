@@ -17,6 +17,11 @@ from typing import Any
 DEFAULT_MIN_CHUNK_TOKENS = 256
 DEFAULT_MAX_CHUNKS = 128
 
+#: Step-batch key fields MixFusion relaxes so mixed resolutions share a step.
+#: A dense fallback must restore them: requests that differ here may share a
+#: latent sequence length (equal area, different aspect ratio) but not RoPE.
+RELAXED_STEP_KEY_FIELDS = ("height", "width", "resolution")
+
 
 def mixfusion_request_extras(sampling: Any, od_config: Any, *, supported: bool) -> dict[str, object]:
     """Build the ``state.extra`` entries that opt a request into MixFusion.

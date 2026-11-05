@@ -23,7 +23,11 @@ from vllm_omni.diffusion.forward_context import MixFusionStep, get_forward_conte
 from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter
 from vllm_omni.diffusion.mixfusion.execution_plan import plan_chunk_size
-from vllm_omni.diffusion.mixfusion.request import DEFAULT_MAX_CHUNKS, DEFAULT_MIN_CHUNK_TOKENS
+from vllm_omni.diffusion.mixfusion.request import (
+    DEFAULT_MAX_CHUNKS,
+    DEFAULT_MIN_CHUNK_TOKENS,
+    RELAXED_STEP_KEY_FIELDS,
+)
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 
 logger = init_logger(__name__)
@@ -105,8 +109,6 @@ class MixFusionDriver:
         # per-request list semantics. Sequential true-CFG is fine.
         if parallel_config is not None and parallel_config.cfg_parallel_size > 1:
             return False, "CFG parallel is enabled"
-        if input_batch.image_latents is not None:
-            return False, "image_latents is set"
         # Hooks on modules the packed path drives would see a layout they were
         # not written for (layerwise offload, FSDP2, cache hooks).
         foreign = plan_foreign_hooks(self.transformer, getattr(self.transformer, "_mixfusion_plan", None))
@@ -131,18 +133,23 @@ class MixFusionDriver:
     ) -> list[Any]:
         """Denoise the ragged batch through the dense path, one call per group.
 
-        Requests with the same latent token shape and CFG/guidance settings
-        share one dense batch; the batch dimension is per-image, so different
-        ``num_images`` can share a call as long as ``S`` and ``C`` match.
-        Rebuilding the batch per group keeps per-image conditioning rows
-        aligned with its latents. Outputs are returned per request, in caller
-        order, whether ``dense_step`` returns a tensor or a list.
+        A dense call takes one image geometry, so requests share a group only
+        if they also matched on the step-batch key fields MixFusion relaxed
+        (and on ``img_shapes``): equal-area images with different aspect
+        ratios share ``S`` but not their positional embedding. CFG/guidance
+        settings must match too. The batch dimension is per-image, so
+        different ``num_images`` can share a call. Rebuilding the batch per
+        group keeps per-image conditioning rows aligned with its latents.
+        Outputs are returned per request, in caller order, whether
+        ``dense_step`` returns a tensor or a list.
         """
         groups: dict[tuple, list[int]] = {}
         for req_idx, latents in enumerate(input_batch.latents):
             state = states[req_idx]
             group_key = (
                 tuple(latents.shape[1:]),
+                _freeze(getattr(state, "img_shapes", None)),
+                *(getattr(state.sampling, name, None) for name in RELAXED_STEP_KEY_FIELDS),
                 state.do_true_cfg,
                 getattr(state.sampling, "true_cfg_scale", None) or 4.0,
                 bool(getattr(state.sampling, "cfg_normalize", False)),
@@ -199,3 +206,10 @@ class MixFusionDriver:
         )
         max_chunks = min(int(extra.get("mixfusion_max_chunks", DEFAULT_MAX_CHUNKS)) for extra in request_extras)
         return min_chunk_tokens, max_chunks
+
+
+def _freeze(value: Any) -> Any:
+    """Hashable form of nested ``list``/``tuple`` metadata such as ``img_shapes``."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
