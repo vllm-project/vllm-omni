@@ -3,12 +3,13 @@
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @pytest.fixture(autouse=True)
-def _init_distributed(monkeypatch, tmp_path):
+def _init_distributed(monkeypatch):
     """The native transformer uses vLLM parallel linear layers, which require a
     tensor-parallel group; initialize a single-process group for CPU tests."""
     from vllm.distributed.parallel_state import (
@@ -26,7 +27,7 @@ def _init_distributed(monkeypatch, tmp_path):
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method=f"file://{tmp_path / 'sana-video-distributed'}",
+        distributed_init_method=get_file_store_init_method(),
     )
     try:
         initialize_model_parallel()
