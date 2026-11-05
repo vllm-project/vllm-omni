@@ -144,3 +144,20 @@ def test_active_linear_uses_svdquant_method(
     method = config.get_quant_method(linear, "blocks.0.attn.out_proj")
 
     assert isinstance(method, DiffusionSVDQuantLinearMethod)
+
+
+@pytest.mark.parametrize(
+    ("major", "minor", "supported"),
+    [(10, 3, True), (12, 0, True), (9, 0, False), (10, 0, False)],
+)
+def test_sm103_and_sm120_capabilities_are_supported(
+    major: int,
+    minor: int,
+    supported: bool,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+
+    capability = DeviceCapability(major=major, minor=minor)
+
+    assert svdquant_config._supports_capability(capability) is supported
+    assert svdquant_config._supports_capability(None) is False

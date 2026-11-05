@@ -45,6 +45,7 @@ ones when no per-output correction is needed. Modules listed in
 The compatibility path accepts BF16 inputs and executes an NVFP4 GEMM followed
 by the BF16 rank correction. It supports vLLM's FlashInfer, CUTLASS, and FBGEMM
 NVFP4 tensor layouts; incompatible forced backends fail during model loading.
-SM103 is the currently validated and enabled hardware target. Native fusion of
+SM103 and SM120 (e.g. RTX PRO 6000 Blackwell) are the validated and enabled
+hardware targets. Native fusion of
 the NVFP4 GEMM and rank correction is separate from this checkpoint-loading
 contract.
