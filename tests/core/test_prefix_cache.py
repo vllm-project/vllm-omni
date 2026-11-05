@@ -2170,7 +2170,7 @@ def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
 
 
 # ------------------------------------------------------- session-level
-# Phase 1: session-keyed namespace, session-scoped retention, coarse
+# Session-keyed namespace, session-scoped retention, coarse
 # invalidation, live-session resume. Single-request steps; hidden values
 # are slot ids (plus value_offset), so a slot reused by another request
 # with a different offset is distinguishable from the session's rows.

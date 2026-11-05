@@ -507,11 +507,11 @@ Threads, locks, and what each may block on:
 | controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
 | `WriteTask.lock` | `state`, `reassigned`, `append_chunk` | waiting on `host_ready` / `done` (those are events) |
 
-### Session-level prefix caching (phase 1)
+### Session-level prefix caching
 
 The slot pool is keyed by KV block id, so any request's traffic can hand
 a block to a new tenant: a live duplex session's prefix rows can be
-evicted by unrelated load. Phase 1 adds a session-level counterpart,
+evicted by unrelated load. This adds a session-level counterpart,
 `SessionPrefixStore`, holding per-session, token-ordered copies of
 immediate-key rows (hidden + non-deferred mm), independent of block-pool
 eviction. A session's rows survive until the session itself mutates its
@@ -558,7 +558,7 @@ history or ends.
   caps host bytes; over-budget appends are refused and fall back to the
   slot pool. Deferred mm is not stored (not on CPU at materialize time).
 
-Explicitly out of phase 1: fine-grained invalidation (phase 2, builds on
+Explicitly out of scope: fine-grained invalidation (builds on
 the snapshot/ledger work), and any change to vLLM block eviction —
 the manager cannot pin blocks, which is why the session store holds
 copies rather than namespacing the pool.
