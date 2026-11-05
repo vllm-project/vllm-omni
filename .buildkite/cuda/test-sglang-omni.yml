@@ -17,8 +17,11 @@ steps:
     agents:
       queue: medium_cpu_queue_premerge
 
-  - label: ":speaker: SGLang-Omni · Qwen3-Omni · 2-GPU Audio (10 prompts, 0.1 req/s)"
+  - &audio_benchmark
+    label: ":speaker: SGLang-Omni · Qwen3-Omni · 2-GPU Audio (10 prompts, 0.1 req/s)"
     key: nightly-sglang-omni-qwen3-omni
+    env:
+      COMPARISON_CONFIG: tests/dfx/perf/tests/test_qwen3_omni_sglang.json
     depends_on: image-build-sglang-omni
     timeout_in_minutes: 90
     artifact_paths:
@@ -30,7 +33,7 @@ steps:
       - python3 .buildkite/cuda/scripts/check_vllm_runtime.py
       - >-
         pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
-        --test-config-file tests/dfx/perf/tests/test_qwen3_omni_sglang.json
+        --test-config-file "$${COMPARISON_CONFIG}"
         --run-level full_model
     agents:
       queue: mithril-h100-pool
@@ -64,3 +67,10 @@ steps:
               - name: hf-cache
                 hostPath:
                   path: /mnt/hf-cache
+
+  - <<: *audio_benchmark
+    label: ":speaker: SGLang-Omni · Qwen3-TTS Base · 2-GPU voice clone (20 prompts, concurrency 1)"
+    key: nightly-sglang-omni-qwen3-tts
+    if: build.source == "schedule"
+    env:
+      COMPARISON_CONFIG: tests/dfx/perf/tests/test_qwen3_tts_sglang.json

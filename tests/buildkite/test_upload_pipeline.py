@@ -120,16 +120,22 @@ def test_regular_cuda_uploads_do_not_include_backend_comparison(changed_file: st
 
 def test_backend_comparison_pipeline_has_only_required_jobs() -> None:
     comparison = yaml.safe_load(Path(".buildkite/cuda/test-sglang-omni.yml").read_text())
-    assert len(comparison["steps"]) == 2
-    build, benchmark = comparison["steps"]
+    build, omni, tts = comparison["steps"]
     assert "depends_on" not in build
-    assert benchmark["depends_on"] == build["key"] == "image-build-sglang-omni"
-    assert benchmark["key"] == "nightly-sglang-omni-qwen3-omni"
-    assert "--test-config-file tests/dfx/perf/tests/test_qwen3_omni_sglang.json" in benchmark["commands"][-1]
-    assert benchmark["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
-    container = benchmark["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
-    assert container["image"].endswith("${BUILDKITE_COMMIT}-sglang-omni")
-    assert container["resources"]["limits"]["nvidia.com/gpu"] == 2
+    assert "if" not in omni
+    assert tts["if"] == 'build.source == "schedule"'
+    for step, name, config in [(omni, "qwen3-omni", "qwen3_omni"), (tts, "qwen3-tts", "qwen3_tts")]:
+        assert step["key"] == f"nightly-sglang-omni-{name}"
+        assert step["depends_on"] == build["key"] == "image-build-sglang-omni"
+        assert step["env"]["COMPARISON_CONFIG"] == f"tests/dfx/perf/tests/test_{config}_sglang.json"
+        assert '--test-config-file "$${COMPARISON_CONFIG}"' in step["commands"][-1]
+        assert step["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
+        assert step["agents"]["queue"] == "mithril-h100-pool"
+        pod = step["plugins"][0]["kubernetes"]["podSpec"]
+        assert pod["nodeSelector"]["node.kubernetes.io/instance-type"] == "gpu-h100-sxm"
+        container = pod["containers"][0]
+        assert container["image"].endswith("${BUILDKITE_COMMIT}-sglang-omni")
+        assert container["resources"]["limits"]["nvidia.com/gpu"] == 2
 
 
 def test_backend_comparison_client_matches_cuda_runtime_pin() -> None:
@@ -151,6 +157,10 @@ def test_backend_comparison_deploy_uses_both_requested_gpus() -> None:
     hardware = next(mark["hardware_marks"] for mark in config["mark"] if isinstance(mark, dict))
     assert hardware == {"res": {"cuda": "H100"}, "num_cards": 2}
     deploy = yaml.safe_load(Path(config["server_params"]["serve_args"]["config"]).read_text())
+    (workload,) = config["benchmark_params"]
+    assert (workload["num_prompts"], workload["max_concurrency"]) == ([20], [1])
+    assert "request_rate" not in workload
+    assert (workload["seed_tts_locale"], workload["seed"], workload["num_warmups"]) == ("en", 0, 2)
     assert deploy["config_cls"] == "Qwen3TTSPipelineConfig"
     assert deploy["model_path"] == config["server_params"]["model"]
     assert deploy["stages"]["tts_engine"] == {"process": "pipeline", "gpu": 0}

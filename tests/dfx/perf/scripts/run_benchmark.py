@@ -709,7 +709,20 @@ def test_performance_benchmark(omni_server, benchmark_params):
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
+    if revision := params.get("seed_tts_revision"):
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        # Pass the pinned snapshot to the client while retaining its dataset ID in provenance.
+        root = hf_api().snapshot_download(
+            repo_id=params["dataset_path"],
+            repo_type="dataset",
+            revision=revision,
+            allow_patterns=[f"{params['seed_tts_locale']}/**"],
+        )
+        args.extend(["--seed-tts-root", str(root)])
+
     exclude_keys = {
+        "seed_tts_revision",
         "request_rate",
         "baseline",
         "num_prompts",
