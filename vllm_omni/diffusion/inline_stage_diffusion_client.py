@@ -73,6 +73,10 @@ class InlineStageDiffusionClient(StageClientBase):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inline-diffusion")
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        # Set whenever an output is queued (or the engine dies), so the
+        # orchestrator can await the next output instead of polling for it.
+        self._output_ready = asyncio.Event()
+        self._output_loop: asyncio.AbstractEventLoop | None = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._engine_dead = False
         self._shutting_down = False
@@ -101,6 +105,34 @@ class InlineStageDiffusionClient(StageClientBase):
             self.stage_id,
             self.replica_id,
         )
+        # May run on the executor's monitor thread: wake a waiting poller on
+        # its own loop so it observes the death without waiting for a timeout.
+        loop = self._output_loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._output_ready.set)
+            except RuntimeError:
+                pass
+
+    def _publish_output(self, output: OmniRequestOutput) -> None:
+        self._output_queue.put_nowait(output)
+        self._output_ready.set()
+
+    async def wait_diffusion_output(self, timeout: float) -> None:
+        """Return once an output is queued, the engine died, or ``timeout`` elapsed.
+
+        Outputs are queued on the orchestrator loop, which is also the only
+        caller of this method, so the check-clear-wait sequence cannot miss one.
+        """
+        if self._output_loop is None:
+            self._output_loop = asyncio.get_running_loop()
+        if not self._output_queue.empty() or self._engine_dead:
+            return
+        self._output_ready.clear()
+        try:
+            await asyncio.wait_for(self._output_ready.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
 
     # ------------------------------------------------------------------
     # Request processing
@@ -162,7 +194,7 @@ class InlineStageDiffusionClient(StageClientBase):
                     result = results[0]
                     if not result.request_id:
                         result.request_id = request_id
-                    self._output_queue.put_nowait(result)
+                    self._publish_output(result)
             else:
                 # Non-streaming callers share the streaming engine path but
                 # only publish the final output.
@@ -172,20 +204,20 @@ class InlineStageDiffusionClient(StageClientBase):
                     if is_diffusion_request_started_output(output):
                         if not output.request_id:
                             output.request_id = request_id
-                        self._output_queue.put_nowait(output)
+                        self._publish_output(output)
                         continue
                     result = output
                 if result is None:
                     raise RuntimeError("Diffusion execution finished without output.")
                 if not result.request_id:
                     result.request_id = request_id
-                self._output_queue.put_nowait(result)
+                self._publish_output(result)
                 latency_trace.mark(request_id, "client_output_queued")
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
             metrics = diffusion_exception_metrics(e)
             if metrics:
-                self._output_queue.put_nowait(
+                self._publish_output(
                     OmniRequestOutput(
                         request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
                         finished=True,
@@ -202,7 +234,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 error_type=error_type,
             )
             error_output.metrics.update(diffusion_exception_metrics(e))
-            self._output_queue.put_nowait(error_output)
+            self._publish_output(error_output)
         finally:
             self._tasks.pop(request_id, None)
 

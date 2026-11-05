@@ -119,6 +119,19 @@ _PREWARM_UNCOPIED_PROMPT_KEYS = frozenset(
 )
 
 
+# The event-driven loop waits for an inline diffusion stage's next output
+# instead of polling it every millisecond. VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP=0
+# restores the 1 ms nowait poll for every diffusion pool.
+_DIFFUSION_OUTPUT_WAKEUP_ENV = "VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP"
+
+
+def _diffusion_output_wakeup_enabled() -> bool:
+    value = os.environ.get(_DIFFUSION_OUTPUT_WAKEUP_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _event_driven_orch_enabled() -> bool:
     value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
     if value is None:
@@ -469,6 +482,7 @@ class OrchestratorBase:
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
         self._event_driven_orch = _event_driven_orch_enabled()
+        self._diffusion_output_wakeup = _diffusion_output_wakeup_enabled()
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -1354,7 +1368,15 @@ class OrchestratorBase:
                         await ready_q.put(("diffusion", stage_id, replica_id, output))
                         self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
                         got = True
-                    await asyncio.sleep(0 if got else 0.001)
+                    if got:
+                        await asyncio.sleep(0)
+                        continue
+                    wait_for_output = pool.diffusion_output_waiter() if self._diffusion_output_wakeup else None
+                    if wait_for_output is None:
+                        await asyncio.sleep(0.001)
+                    else:
+                        # Bounded so replica membership is still re-read while idle.
+                        await wait_for_output(_ORCH_READER_RECONCILE_INTERVAL_S)
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
