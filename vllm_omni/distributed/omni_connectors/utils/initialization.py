@@ -555,8 +555,20 @@ def validate_stage_payload_connectors(transfer_cfg: OmniTransferConfig | None, s
     """
     if transfer_cfg is None:
         return
-    connector, resolved_from, resolved_to = resolve_omni_kv_config_for_stage(transfer_cfg, stage_id)
     stage_id_str = str(stage_id)
+    # The runtime merges extras into the connector dict. Keep the backend name
+    # unambiguous on both sides of a payload receiver before resolving its edge.
+    for (source, target), spec in transfer_cfg.connectors.items():
+        if stage_id_str not in (source, target):
+            continue
+        extra_type = (spec.extra or {}).get("type", spec.name)
+        if extra_type != spec.name:
+            direction = "input" if target == stage_id_str else "output"
+            raise ValueError(
+                f"Stage {stage_id}: {direction} edge {source}→{target}: connector extra.type={extra_type!r} "
+                f"conflicts with name={spec.name!r}. Select the backend with name; extra.type must not override it."
+            )
+    connector, resolved_from, resolved_to = resolve_omni_kv_config_for_stage(transfer_cfg, stage_id)
     for (source, target), spec in transfer_cfg.connectors.items():
         if target != stage_id_str:
             continue

@@ -5,6 +5,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 from omegaconf import OmegaConf
 
 from vllm_omni.config.omni_config import VllmOmniConfig
@@ -34,6 +35,36 @@ def _mixed_egd(incoming, outgoing):
     return stages, transfer
 
 
+def _assert_rejected_before_launch(startup, stages, config_path, mocker, match):
+    if startup == "regular":
+        mocker.patch.object(stage_runtime, "prepare_engine_environment")
+        runtime = stage_runtime.StageRuntime(stages, "unused", config_path, stage_init_timeout=1, async_chunk=False)
+        next_step = mocker.patch.object(
+            runtime, "_build_logical_stage_init_plans", side_effect=AssertionError("must reject before building plans")
+        )
+        with pytest.raises(ValueError, match=match):
+            runtime._prepare_stage_plans()
+    else:
+        next_step = mocker.patch.object(
+            stage_init_utils,
+            "build_diffusion_config",
+            side_effect=AssertionError("must reject before device discovery"),
+        )
+        with pytest.raises(ValueError, match=match):
+            stage_engine_startup.launch_headless_diffusion_replicas(
+                model="unused",
+                stage_cfg=stages[1],
+                stage_configs=stages,
+                stage_id=1,
+                omni_master_address="127.0.0.1",
+                omni_master_port=1,
+                omni_dp_size_local=1,
+                per_replica_devices=["1"],
+                config_path=config_path,
+            )
+    next_step.assert_not_called()
+
+
 @pytest.mark.parametrize("startup", ("regular", "headless"))
 @pytest.mark.parametrize(
     ("incoming", "outgoing"),
@@ -46,35 +77,45 @@ def _mixed_egd(incoming, outgoing):
 )
 def test_mixed_egd_rejected_before_startup(startup, incoming, outgoing, mocker):
     stages, transfer = _mixed_egd(incoming, outgoing)
-    if startup == "regular":
-        mocker.patch.object(stage_runtime, "load_omni_transfer_config_for_model", return_value=transfer)
-        mocker.patch.object(stage_runtime, "prepare_engine_environment")
-        runtime = stage_runtime.StageRuntime(stages, "unused", None, stage_init_timeout=1, async_chunk=False)
-        next_step = mocker.patch.object(
-            runtime, "_build_logical_stage_init_plans", side_effect=AssertionError("must reject before building plans")
-        )
-        with pytest.raises(ValueError, match="Stage 1.*edge 0.*1"):
-            runtime._prepare_stage_plans()
-    else:
-        mocker.patch.object(stage_init_utils, "load_omni_transfer_config_for_model", return_value=transfer)
-        next_step = mocker.patch.object(
-            stage_init_utils,
-            "build_diffusion_config",
-            side_effect=AssertionError("must reject before device discovery"),
-        )
-        with pytest.raises(ValueError, match="Stage 1.*edge 0.*1"):
-            stage_engine_startup.launch_headless_diffusion_replicas(
-                model="unused",
-                stage_cfg=stages[1],
-                stage_configs=stages,
-                stage_id=1,
-                omni_master_address="127.0.0.1",
-                omni_master_port=1,
-                omni_dp_size_local=1,
-                per_replica_devices=["1"],
-                config_path="unused",
-            )
-    next_step.assert_not_called()
+    loader_module = stage_runtime if startup == "regular" else stage_init_utils
+    mocker.patch.object(loader_module, "load_omni_transfer_config_for_model", return_value=transfer)
+    _assert_rejected_before_launch(startup, stages, "unused", mocker, "Stage 1.*edge 0.*1")
+
+
+@pytest.mark.parametrize("startup", ("regular", "headless"))
+@pytest.mark.parametrize("actual_type", ("MooncakeTransferEngineConnector", "NixlConnector"))
+@pytest.mark.parametrize("direction", ("input", "output"))
+def test_extra_type_override_rejected_before_startup(startup, actual_type, direction, tmp_path, mocker):
+    raw = yaml.safe_load((DEPLOY_DIR / "wan2_2_egd.yaml").read_text())
+    connector_key = "wan_encode_connector" if direction == "input" else "wan_latent_connector"
+    edge = "0→1" if direction == "input" else "1→2"
+    raw["connectors"][connector_key]["extra"] = {"type": actual_type}
+    path = tmp_path / "wan_mixed.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    stages = list(VllmOmniConfig.from_pipeline_config(WAN2_2_EGD_PIPELINE, deploy_config_path=str(path)).stage_configs)
+    # Keep YAML loading/resolution real; only the next startup step is replaced.
+    _assert_rejected_before_launch(
+        startup, stages, str(path), mocker, rf"Stage 1: {direction} edge {edge}:.*extra\.type.*SharedMemoryConnector"
+    )
+
+
+@pytest.mark.parametrize("extra_type", ("MooncakeTransferEngineConnector", "NixlConnector", None, "", 42, {}, []))
+@pytest.mark.parametrize("edge", (("0", "1"), ("1", "2")), ids=("incoming", "outgoing"))
+def test_programmatic_connector_cannot_override_type(extra_type, edge):
+    _, transfer = _mixed_egd("SharedMemoryConnector", "SharedMemoryConnector")
+    transfer.connectors[edge].extra["type"] = extra_type
+    with pytest.raises(ValueError, match=rf"Stage 1: .*edge {edge[0]}→{edge[1]}:.*extra\.type.*SharedMemoryConnector"):
+        validate_stage_payload_connectors(transfer, 1)
+
+
+@pytest.mark.parametrize("connector", ("SharedMemoryConnector", "NixlConnector"))
+def test_matching_extra_type_remains_allowed(connector):
+    stages, transfer = _mixed_egd(connector, connector)
+    for spec in transfer.connectors.values():
+        spec.extra.update(type=connector, host="127.0.0.1")
+    before = resolve_omni_kv_config_for_stage(transfer, 1)
+    stage_init_utils.validate_diffusion_stage_payload_topology(stages, transfer)
+    assert resolve_omni_kv_config_for_stage(transfer, 1) == before
 
 
 @pytest.mark.parametrize(

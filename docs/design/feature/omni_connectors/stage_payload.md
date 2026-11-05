@@ -106,6 +106,12 @@ Headless startup uses the same check before launching its local replicas. Every
 configured incoming edge must declare deadline-aware receive support. Errors
 identify the stage, edge (for example, `0→1`), and connector.
 
+On edges attached to a payload-receiving stage, `ConnectorSpec.name` selects the
+backend. `extra.type` may be omitted or repeat that name, but conflicting values
+are rejected before edge resolution. This prevents extras from silently changing
+the backend checked by preflight, and applies to both deploy YAMLs and
+programmatically supplied connector specs.
+
 A middle stage currently resolves one connector, preferring its outgoing edge.
 The preflight therefore also rejects incoming connector types that differ from
 the resolved connector type, even when both types support deadline receive.
