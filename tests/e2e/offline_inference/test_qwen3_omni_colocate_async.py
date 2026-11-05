@@ -34,6 +34,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.platforms import current_omni_platform
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+# Same order of magnitude as the #8678 sleep and parked-generate waits.
+_ENGINE_CONTROL_TIMEOUT_S = 180
 
 
 def _output_token_ids(output) -> list[int]:
@@ -109,6 +111,14 @@ async def async_omni_runner(_gpu_idle_before_colocate_engine, request, run_level
         runners.close()
 
 
+async def _reopen_colocate_engine(engine) -> None:
+    """Wake and resume with a bound so a wedge fails this case, not the job."""
+    if await engine.is_sleeping():
+        await asyncio.wait_for(engine.wake_up(), timeout=_ENGINE_CONTROL_TIMEOUT_S)
+    if await engine.is_paused():
+        await asyncio.wait_for(engine.resume_generation(), timeout=_ENGINE_CONTROL_TIMEOUT_S)
+
+
 @asynccontextmanager
 async def _release_colocate_engine(engine, request_ids: tuple[str, ...]):
     """Abort this case's requests and leave the shared engine awake."""
@@ -117,11 +127,13 @@ async def _release_colocate_engine(engine, request_ids: tuple[str, ...]):
     finally:
         # Wake before abort. Abort against a sleeping engine can sit in the
         # admission gate; the next test needs the same process-wide engine.
-        with suppress(Exception):  # noqa: BLE001 - best-effort wake so the next test can reuse the engine
-            if await engine.is_sleeping():
-                await engine.wake_up()
-            if await engine.is_paused():
-                await engine.resume_generation()
+        # TimeoutError must surface; other wake failures stay best-effort.
+        try:
+            await _reopen_colocate_engine(engine)
+        except TimeoutError:
+            raise
+        except Exception:  # noqa: BLE001 - best-effort wake so the next test can reuse the engine
+            pass
         for request_id in request_ids:
             with suppress(Exception):  # noqa: BLE001 - in-flight generate may already be gone
                 await engine.abort(request_id)
@@ -131,10 +143,7 @@ async def _release_colocate_engine(engine, request_ids: tuple[str, ...]):
 async def colocate_engine(async_omni_runner):
     """One AsyncOmni for both tests; reopen admission if the previous case slept."""
     engine = async_omni_runner.engine
-    if await engine.is_sleeping():
-        await engine.wake_up()
-    if await engine.is_paused():
-        await engine.resume_generation()
+    await _reopen_colocate_engine(engine)
     yield engine
 
 
