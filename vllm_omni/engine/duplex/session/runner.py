@@ -1302,7 +1302,8 @@ class DuplexSessionRunner:
                 value = event.get(key)
                 if isinstance(value, str) and value.strip().lower() in {"barge_in", "interrupt", "cancel"}:
                     event.pop(key, None)
-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
+        format_value = event.get("format")
+        fmt = format_value if isinstance(format_value, str) else "pcm16"
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
@@ -1320,23 +1321,28 @@ class DuplexSessionRunner:
             detected = [(event, None)]
         else:
             try:
-                converted: tuple[object, object, int | float | None] = await self.offload(
-                    convert_input_audio_with_rate,
-                    audio,
-                    fmt,
-                    sample_rate_hz=sample_rate_hz,
-                )
+                converted: tuple[object, object, int | float | None]
+                if fmt.lower() == "pcm_f32le":
+                    # Already native PCM: avoid an executor round trip for a no-op.
+                    converted = audio, fmt, sample_rate_hz
+                else:
+                    converted = await self.offload(
+                        convert_input_audio_with_rate,
+                        audio,
+                        fmt,
+                        sample_rate_hz=sample_rate_hz,
+                    )
             except ValueError as exc:
                 self._emit_error("bad_event", str(exc))
                 return
-            audio, fmt, converted_rate = converted
+            audio, converted_format, converted_rate = converted
             if converted_rate is not None:
                 sample_rate_hz = converted_rate
-            if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+            if isinstance(converted_format, str) and converted_format.lower() in {"pcm16", "pcm_s16le", "s16le"}:
                 self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
                 return
             event["audio"] = audio
-            event["format"] = fmt
+            event["format"] = converted_format
             event["sample_rate_hz"] = sample_rate_hz
             detected = await self.control.run_turn_detection(event)
         with ExitStack() as unprocessed:

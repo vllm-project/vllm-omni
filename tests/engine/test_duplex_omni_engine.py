@@ -9,6 +9,7 @@ import asyncio
 import queue
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -51,7 +52,7 @@ class _FakeSyncQueue:
         self.items: list[Any] = []
         self.full = full
 
-    def put(self, item: Any, timeout: float | None = None) -> None:
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
         if self.full:
             raise queue.Full
         self.items.append(item)
@@ -168,9 +169,11 @@ async def test_engine_error_and_timeout_map_to_session_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_command_is_one_way_on_the_request_queue() -> None:
+async def test_submit_command_is_one_way_on_the_request_queue(monkeypatch) -> None:
     engine = _engine(None)
     command = Heartbeat(event_id="evt-1")
+    executor = Mock(side_effect=AssertionError("uncontended enqueue must not use the executor"))
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", executor)
 
     await engine.submit_command_async("sid", command)
 
@@ -178,6 +181,61 @@ async def test_submit_command_is_one_way_on_the_request_queue() -> None:
     assert isinstance(message, DuplexSessionCommandMessage)
     assert message.session_id == "sid" and message.command is command
     assert engine.rpc_client.calls == []
+    executor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_full_command_queue_offloads_wait_and_preserves_sequential_order(monkeypatch) -> None:
+    engine = _engine(None)
+    sync_q: queue.Queue[object] = queue.Queue(maxsize=1)
+    occupied = object()
+    sync_q.put_nowait(occupied)
+    engine.request_queue.sync_q = sync_q
+    loop = asyncio.get_running_loop()
+    waiting = asyncio.Event()
+    original_submit = engine._submit_command
+    attempts: list[tuple[DuplexSessionCommandMessage, bool]] = []
+
+    def submit_after_full(message: DuplexSessionCommandMessage, *, block: bool = True) -> None:
+        attempts.append((message, block))
+        if block:
+            loop.call_soon_threadsafe(waiting.set)
+        original_submit(message, block=block)
+
+    monkeypatch.setattr(engine, "_submit_command", submit_after_full)
+    first, second = Heartbeat(event_id="first"), Heartbeat(event_id="second")
+
+    async def publish():
+        await engine.submit_command_async("sid", first)
+        await engine.submit_command_async("sid", second)
+
+    async def receive():
+        while True:
+            try:
+                return sync_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.001)
+
+    task = asyncio.create_task(publish())
+    received = []
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=2)
+        assert not task.done()
+        assert len(attempts) == 2
+        assert attempts[0][1] is False and attempts[1][1] is True
+        assert attempts[0][0] is attempts[1][0]
+        assert sync_q.get_nowait() is occupied
+        for _ in range(2):
+            message = await asyncio.wait_for(receive(), timeout=2)
+            received.append(message.command)
+        await asyncio.wait_for(task, timeout=2)
+        assert received == [first, second]
+    finally:
+        # Release any blocked publisher if an assertion above fails.
+        while not sync_q.empty():
+            sync_q.get_nowait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
