@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage input processor for IndexTTS2: Talker (GPT AR) → S2Mel decoder."""
 
 from typing import Any
@@ -10,6 +10,19 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 STOP_MEL_TOKEN = 8193
+
+# Reference conditioning tensors and per-request scalar policy are request-
+# level state rather than appendable per-step deltas, so declare REPLACE
+# semantics in the full-payload accumulator.
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
+    {
+        "meta.use_gpt_latent",
+        "meta.duration_factor",
+        "meta.S_ref",
+        "meta.ref_mel",
+        "meta.style",
+    }
+)
 
 
 def _cpu_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -40,13 +53,10 @@ def _strip_stop_token(
 
     if codes.device.type != "cpu":
         codes = codes.detach().cpu()
-    if latent is not None and latent.device.type != "cpu":
-        latent = latent.detach().cpu()
 
     device = codes.device
     code_lens = []
     codes_out = []
-    latent_out = []
 
     for i in range(codes.shape[0]):
         code = codes[i]
@@ -57,10 +67,15 @@ def _strip_stop_token(
             valid_len = int(code.shape[0])
         code_lens.append(valid_len)
         codes_out.append(code[:valid_len])
-        if latent is not None:
-            latent_out.append(latent[i, :valid_len])
 
     max_len = max(code_lens) if code_lens else 0
+    if latent is not None:
+        # Trim to max_len on the source device before moving to CPU so trailing
+        # stop/padding rows never cross the PCIe bus.
+        latent = latent[:, :max_len].detach()
+        if latent.device.type != "cpu":
+            latent = latent.cpu()
+
     if max_len == 0:
         empty_codes = torch.zeros(codes.shape[0], 0, dtype=torch.long, device=device)
         empty_latent = (
@@ -84,23 +99,28 @@ def _strip_stop_token(
             ),
         )
 
+    if len(codes_out) == 1:
+        single_codes = codes_out[0].unsqueeze(0).clone().contiguous()
+        single_latent = latent[:, : code_lens[0]].clone().contiguous() if latent is not None else None
+        return single_codes, single_latent, torch.tensor(code_lens, dtype=torch.long, device=device)
+
     padded_codes = torch.zeros((len(codes_out), max_len), dtype=torch.long, device=device)
     padded_latent = (
         torch.zeros(
-            len(latent_out),
+            len(codes_out),
             max_len,
-            latent_out[0].shape[-1],
+            latent.shape[-1],
             device=device,
-            dtype=latent_out[0].dtype,
+            dtype=latent.dtype,
         )
-        if latent_out
+        if latent is not None
         else None
     )
     for i, c in enumerate(codes_out):
         padded_codes[i, : c.shape[0]] = c
-        if padded_latent is not None:
-            lat = latent_out[i]
-            padded_latent[i, : lat.shape[0]] = lat
+        if padded_latent is not None and latent is not None:
+            valid_len = code_lens[i]
+            padded_latent[i, :valid_len] = latent[i, :valid_len]
 
     return padded_codes, padded_latent, torch.tensor(code_lens, dtype=torch.long, device=device)
 
@@ -136,14 +156,14 @@ def _build_s2mel_additional_information(
     mel_codes_clean, latent_clean, code_lens = _strip_stop_token(mel_codes, latent)
 
     additional_information = {
-        "mel_codes": _cpu_view(mel_codes_clean),
-        "code_lens": _cpu_view(code_lens),
+        "mel_codes": mel_codes_clean,
+        "code_lens": code_lens,
         "use_gpt_latent": use_gpt_latent,
     }
     if use_gpt_latent:
         if latent_clean is None:
             raise ValueError(f"{context} requires GPT latent but none was provided")
-        additional_information["latent"] = _cpu_view(latent_clean)
+        additional_information["latent"] = latent_clean
 
     duration_factor = meta.get("duration_factor", 1.0)
     additional_information["duration_factor"] = 1.0 if duration_factor is None else float(duration_factor)
@@ -177,6 +197,15 @@ def _request_seed(request: Any) -> int | None:
     return int(seed) if seed is not None else None
 
 
+def _is_aborted(request: Any) -> bool:
+    # Intentionally treat ERROR statuses like ABORT/CANCEL so Stage 1 never
+    # attempts partial audio synthesis from a failed Stage-0 request.
+    if getattr(request, "aborted", False) is True:
+        return True
+    status_name = getattr(getattr(request, "status", None), "name", "")
+    return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
+
+
 def talker2s2mel_token_only(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -188,7 +217,7 @@ def talker2s2mel_token_only(
     del prompt
     s2mel_inputs: list[OmniTokensPrompt] = []
     for talker_output in source_outputs:
-        if not talker_output.finished:
+        if not talker_output.finished or _is_aborted(talker_output):
             continue
         s2mel_inputs.append(
             OmniTokensPrompt(
@@ -203,12 +232,14 @@ def talker2s2mel_token_only(
 
 def talker2s2mel_full_payload(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: dict[str, Any] | None,
     request: Any,
     **_: Any,
 ) -> dict[str, Any] | None:
     """Build the complete S2Mel input from accumulated per-step talker deltas."""
     del transfer_manager
+    if _is_aborted(request):
+        return None
     rid = _request_id(request)
     if not isinstance(pooling_output, dict):
         raise ValueError(f"IndexTTS Stage 0 payload must be a dict for req={rid}")
@@ -286,3 +317,6 @@ def talker2s2mel_full_payload(
     if seed is not None:
         additional_information["seed"] = seed
     return additional_information
+
+
+setattr(talker2s2mel_full_payload, "_suppress_client_multimodal_outputs", True)
