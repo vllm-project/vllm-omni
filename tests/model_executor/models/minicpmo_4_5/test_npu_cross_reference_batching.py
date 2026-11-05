@@ -565,3 +565,75 @@ def test_ragged_npu_staggered_final_and_fresh_request():
         if chunk >= 4:
             assert "voice-0" not in model._states
     assert not model._states
+
+
+@pytest.mark.parametrize(
+    "policy,expected",
+    [
+        ("eligible", True),
+        ("disabled", False),
+        ("fp16", False),
+        ("slots", False),
+        ("bf16_cache", False),
+        ("unfused", False),
+        ("no_ragged", False),
+        ("disabled_graph", False),
+        ("minimum", False),
+        ("cpu", False),
+        ("no_wrapper", False),
+    ],
+)
+def test_backend_initialization_gates_actual_wrapper_flag(policy, expected, monkeypatch, tmp_path):
+    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav as stage_module
+    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav as core_module
+
+    model, core, _ = _candidate()
+    backend = model.backend
+    wrapper = backend._whole_euler_graph_wrapper
+    # A stale True must be overwritten when configuration/admission rejects it.
+    wrapper.npu_mixed_history = True
+    if policy == "disabled":
+        model._npu_cross_reference_batching = False
+    elif policy == "fp16":
+        wrapper.dtype = torch.float16
+    elif policy == "slots":
+        wrapper.att_slots = 4
+    elif policy == "bf16_cache":
+        backend._estimator_att_cache_dtype = torch.bfloat16
+    elif policy == "unfused":
+        backend._ragged_fused_body = False
+    elif policy == "no_ragged":
+        wrapper.ragged_body = None
+    elif policy == "disabled_graph":
+        wrapper.enabled = False
+    elif policy == "minimum":
+        model._min_batch_size = 2
+    elif policy == "cpu":
+        wrapper.device = SimpleNamespace(type="cpu")
+    elif policy == "no_wrapper":
+        backend._whole_euler_graph_wrapper = None
+
+    (tmp_path / "assets" / "token2wav").mkdir(parents=True)
+    prompt = tmp_path / "prompt.wav"
+    prompt.touch()
+    extra = model.vllm_config.model_config.stage_connector_config["extra"]
+    extra.update(
+        prompt_wav=str(prompt), token2wav_device_spk=False, token2wav_trt=False, token2wav_spk_cpu_reference=False
+    )
+    model._prompt_wav_override = str(prompt)
+    monkeypatch.delenv("MINICPMO_TOKEN2WAV_TRT", raising=False)
+    monkeypatch.setattr(stage_module, "_resolve_model_dir", lambda *args: str(tmp_path))
+    monkeypatch.setattr(core_module, "MiniCPMO45Token2wav", lambda *args, **kwargs: core)
+    monkeypatch.setattr(stage_module, "BatchedToken2Wav", lambda *args, **kwargs: backend)
+    warning = Mock()
+    monkeypatch.setattr(stage_module.logger, "warning", warning)
+    model.backend = None
+    model._build_backend()
+
+    assert model.backend is backend
+    if policy != "no_wrapper":
+        assert wrapper.npu_mixed_history is expected
+    inactive_warnings = [
+        call for call in warning.call_args_list if "NPU cross-reference CFM batching is inactive" in str(call)
+    ]
+    assert bool(inactive_warnings) is (policy not in ("eligible", "disabled"))
