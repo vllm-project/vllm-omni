@@ -13,7 +13,16 @@ the same six reference videos. This archive remains unchanged for boundary and d
 checks; archiving it does not change original hardware pass/fail results.
 
 Archived records are not loaded by the CI runner.
-The active nightly records use vLLM 0.32.0 reference cohorts from builds 17633
+`v033_reference_protocol_before_single_block_streaming.json` preserves the first
+vLLM 0.33 protocol byte for byte (SHA256
+`c1f7ceb8929d529633d565053b73e99e75b66580b54145ab908d4d3c47d4eb2f`).
+Before any training cohorts were collected, real single-block diagnostics found
+that the common formatter omitted the genuine generation index from a terminal
+stream. Its identical reference/candidate compatibility repair requires a new
+immutable source pin; the active protocol retains all original fitting rules
+and numerical allowances. Diagnostic media are not training cohorts.
+
+The retained vLLM 0.32 nightly records use reference cohorts from builds 17633
 and 17640. Their frozen training records require a subsequent independent
 campaign; historical method controls do not qualify this new reference epoch.
 
