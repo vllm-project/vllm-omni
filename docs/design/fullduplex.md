@@ -394,6 +394,12 @@ L1 nodes for the same source revision are rejected through either admission
 API. Callers refresh against a current authoritative snapshot before reading
 valid nodes.
 
+Admission detaches message dictionaries, lists and tuples from the caller while
+sharing opaque payloads. Batch admission prepares every message before writing
+nodes, so a preparation failure leaves the graph and next node ID unchanged.
+The ledger owns admitted message containers; node readers must treat them and
+opaque payloads as read-only. Rendered views are detached from ledger messages.
+
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
 the prompt config is built exactly as before and no L1 view is rendered. With a

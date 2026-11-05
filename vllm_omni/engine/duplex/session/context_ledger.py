@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
 
-from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
+from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot, copy_history_message
 
 
 class DuplexContextLevel(IntEnum):
@@ -26,7 +26,8 @@ class DuplexContextNode:
     """A rendered message derived from history sources and earlier nodes.
 
     Parents always have smaller node IDs, so ascending node ID order is a
-    topological order of the dependency graph.
+    topological order of the dependency graph. Message containers are owned
+    by the ledger; readers must treat them and opaque payloads as read-only.
     """
 
     node_id: int
@@ -82,7 +83,11 @@ class DuplexContextLedger:
         At most one L1 node is admitted per source revision between refreshes.
         """
         return self._add_node(
-            _current_revisions(snapshot), level=level, sources=sources, parents=parents, message=message
+            _current_revisions(snapshot),
+            level=level,
+            sources=sources,
+            parents=parents,
+            message=copy_history_message(dict(message)),
         )
 
     def add_l1_nodes(
@@ -103,6 +108,8 @@ class DuplexContextLedger:
         for source_id in messages:
             if self._has_l1_revision(source_id, current[source_id]):
                 raise DuplexContextNodeRejectedError("source_already_has_media_dropped_node")
+        # Copy the whole batch before writing any node or consuming an ID.
+        prepared = tuple((source_id, copy_history_message(dict(message))) for source_id, message in messages.items())
         return tuple(
             self._add_node(
                 current,
@@ -110,7 +117,7 @@ class DuplexContextLedger:
                 sources=(DuplexSourceRef(source_id, current[source_id]),),
                 message=message,
             )
-            for source_id, message in messages.items()
+            for source_id, message in prepared
         )
 
     def _add_node(
@@ -122,6 +129,7 @@ class DuplexContextLedger:
         parents: tuple[int, ...] = (),
         message: Mapping[str, object],
     ) -> DuplexContextNode:
+        """Validate and store a message already detached by a public admission API."""
         if not sources and not parents:
             raise DuplexContextNodeRejectedError("node_has_no_dependencies")
         if not _sources_current(sources, current):
