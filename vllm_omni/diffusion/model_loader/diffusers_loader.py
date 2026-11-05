@@ -1388,9 +1388,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         from vllm_omni.platforms import current_omni_platform
 
         device_index = current_omni_platform.current_device()
-        if target_device.type not in ("cpu", "meta") and target_device.index not in (None, device_index):
+        expected_device = current_omni_platform.get_torch_device(device_index)
+        if target_device.type not in ("cpu", "meta") and (
+            target_device.type != expected_device.type or target_device.index not in (None, device_index)
+        ):
             raise ValueError(
-                f"Weight-sharing target device {target_device} does not match current device index {device_index}"
+                f"Weight-sharing target device {target_device} does not match current device {expected_device}"
             )
 
         with set_default_torch_dtype(self.od_config.dtype):

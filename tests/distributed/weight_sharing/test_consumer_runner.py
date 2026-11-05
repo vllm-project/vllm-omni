@@ -38,7 +38,10 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
     factory = Mock(return_value=backend)
     monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing", weight_sharing)
     monkeypatch.setattr(weight_sharing, "TorchIpcBackend", factory)
-    platform = Mock(current_device=Mock(return_value=3))
+    platform = Mock(
+        current_device=Mock(return_value=3),
+        get_torch_device=Mock(side_effect=lambda index: torch.device("cuda", index)),
+    )
     monkeypatch.setitem(sys.modules, "vllm_omni.platforms", SimpleNamespace(current_omni_platform=platform))
     # Model binding is outside this test; imported views still have real backend lifetimes.
     adapter = SimpleNamespace(
@@ -146,8 +149,10 @@ def test_load_failure_retains_backend_and_blocks_retry(consumer_load, contracts,
 
 
 @pytest.mark.parametrize("load_format", ["default", None])
-def test_pipeline_return_keeps_same_backend_on_runner(consumer_load, load_format):
+@pytest.mark.parametrize("device", ["cuda:3", "cuda"])
+def test_pipeline_return_keeps_same_backend_on_runner(consumer_load, load_format, device):
     r = consumer_load
+    r.runner.device = device
     r.model.requires_early_lora_init = True
     # Stop after pipeline assignment, before unrelated compilation/cache setup.
     with pytest.raises(LoadError, match="after load"):
@@ -271,11 +276,11 @@ def test_shared_backbone_allows_private_encoder_offload(consumer_load, mode):
     r.adapter.open_backbone_import.assert_called_once()
 
 
-@pytest.mark.parametrize("device", ["cuda:0", "xpu:0"])
+@pytest.mark.parametrize("device", ["cuda:0", "xpu:3", "xpu"])
 def test_device_mismatch_is_rejected_before_construction(consumer_load, device):
     r = consumer_load
     r.runner.device = device
-    with pytest.raises(ValueError, match="does not match current device index 3"):
+    with pytest.raises(ValueError, match="does not match current device cuda:3"):
         r.runner.load_model()
     r.loader._init_from_load_format.assert_not_called()
     r.adapter.open_backbone_import.assert_not_called()

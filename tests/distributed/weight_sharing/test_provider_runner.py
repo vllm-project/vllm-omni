@@ -43,7 +43,11 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "vllm_omni.platforms",
-        SimpleNamespace(current_omni_platform=SimpleNamespace(current_device=lambda: 3)),
+        SimpleNamespace(
+            current_omni_platform=SimpleNamespace(
+                current_device=lambda: 3, get_torch_device=lambda index: torch.device("cuda", index)
+            )
+        ),
     )
     context = make_context(contracts)
 
@@ -122,8 +126,11 @@ def test_failed_publish_retains_owner_and_rejects_retry(provider_runner, contrac
     assert not codec.cancellations
 
 
-def test_successful_publish_retains_owner_before_export_and_is_idempotent(provider_runner, contracts):
+@pytest.mark.parametrize("device", ["cuda:3", "cuda"])
+def test_successful_publish_retains_owner_before_export_and_is_idempotent(provider_runner, contracts, device):
     runner, backend, codec, factory = provider_runner
+
+    runner.device = torch.device(device)
 
     def check_owner():
         assert runner._weight_share_backend is backend
@@ -150,11 +157,11 @@ def test_missing_adapter_is_rejected_before_export(provider_runner):
     assert not codec.exports
 
 
-@pytest.mark.parametrize("device", ["cuda:0", "xpu:0"])
+@pytest.mark.parametrize("device", ["cuda:0", "xpu:3", "xpu"])
 def test_device_mismatch_is_rejected_before_export(provider_runner, device):
     runner, backend, codec, factory = provider_runner
     runner.device = torch.device(device)
-    with pytest.raises(ValueError, match="does not match current device index 3"):
+    with pytest.raises(ValueError, match="does not match current device cuda:3"):
         runner.publish()
     factory.assert_not_called()
     runner.adapter.publish_backbone.assert_not_called()

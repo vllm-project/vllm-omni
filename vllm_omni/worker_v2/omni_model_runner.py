@@ -456,9 +456,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         from vllm_omni.platforms import current_omni_platform
 
         device_index = current_omni_platform.current_device()
-        if self.device.type not in ("cpu", "meta") and self.device.index not in (None, device_index):
+        expected_device = current_omni_platform.get_torch_device(device_index)
+        if self.device.type not in ("cpu", "meta") and (
+            self.device.type != expected_device.type or self.device.index not in (None, device_index)
+        ):
             raise ValueError(
-                f"Weight-sharing target device {self.device} does not match current device index {device_index}"
+                f"Weight-sharing target device {self.device} does not match current device {expected_device}"
             )
         backend = TorchIpcBackend()
         # Retain partial exports and their diagnostics if publish raises. The
