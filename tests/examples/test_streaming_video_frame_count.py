@@ -380,7 +380,11 @@ def test_cancel_during_final_drain_marks_count_unknown(client, fragments, monkey
     asyncio.run(run())
 
 
-def test_cancel_during_drain_waits_for_scheduler_cleanup(client, fragments, monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("background", ["camera", "heartbeat"])
+@pytest.mark.parametrize("cancel_during_drain", [False, True], ids=["normal", "cancelled"])
+def test_decoder_drain_waits_for_background_cleanup(
+    client, fragments, monkeypatch, tmp_path, capsys, background, cancel_during_drain
+):
     release_decoder = threading.Event()
     real_open = av.open
     real_finish = client._StreamingFrameCounter.finish
@@ -396,8 +400,12 @@ def test_cancel_during_drain_waits_for_scheduler_cleanup(client, fragments, monk
         scheduler_settled = asyncio.Event()
         drain_started = asyncio.Event()
         drain_settled = asyncio.Event()
+        background_tasks = []
 
         async def scheduler(*args, **kwargs):
+            task = asyncio.current_task()
+            assert task is not None
+            background_tasks.append(task)
             scheduler_started.set()
             try:
                 await asyncio.Future()
@@ -431,30 +439,46 @@ def test_cancel_during_drain_waits_for_scheduler_cleanup(client, fragments, monk
             yield Connection()
 
         monkeypatch.setattr(client, "connect", connect)
-        monkeypatch.setattr(client, "_run_camera_update_scheduler", scheduler)
+        monkeypatch.setattr(
+            client, "_run_camera_update_scheduler" if background == "camera" else "_send_heartbeats", scheduler
+        )
         monkeypatch.setattr(client._StreamingFrameCounter, "finish", finish)
         args = client.parse_args()
-        args.camera_updates = [client.ScheduledCameraUpdate(at=0, camera={"mode": "velocity"}, transition_chunks=None)]
+        args.camera_updates = (
+            [client.ScheduledCameraUpdate(at=0, camera={"mode": "velocity"}, transition_chunks=None)]
+            if background == "camera"
+            else []
+        )
         session = asyncio.create_task(client.stream_video(args))
         try:
             await asyncio.wait_for(drain_started.wait(), 3)
-            session.cancel()
+            if cancel_during_drain:
+                session.cancel()
             release_decoder.set()
             await asyncio.wait_for(drain_settled.wait(), 3)
             assert not session.done(), "session returned before its scheduler cleanup completed"
         finally:
             release_decoder.set()
             allow_scheduler_cleanup.set()
-            with pytest.raises(asyncio.CancelledError):
-                await session
-            await asyncio.wait_for(scheduler_settled.wait(), 3)
+            try:
+                if cancel_during_drain:
+                    with pytest.raises(asyncio.CancelledError):
+                        await session
+                else:
+                    await session
+            finally:
+                for task in background_tasks:
+                    task.cancel()
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+                await asyncio.wait_for(scheduler_settled.wait(), 3)
 
     monkeypatch.setattr(client.av, "open", blocked_open)
     monkeypatch.setattr(client, "save_video", lambda chunks, *args, **kwargs: saved.append(b"".join(chunks)))
     monkeypatch.setattr("sys.argv", ["client", "--output", str(tmp_path / "out.mp4")])
     asyncio.run(run())
     assert saved == [b"".join(fragments)]
-    assert "[decode] total_frames=unknown status=shutdown_cancelled" in capsys.readouterr().out
+    expected = "unknown status=shutdown_cancelled" if cancel_during_drain else "33 status=complete"
+    assert f"[decode] total_frames={expected}" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("overflow", [False, True])
