@@ -434,10 +434,12 @@ class DiT(nn.Module):
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
     def _reads_unpublished_masks(self, device_type: str) -> bool:
-        # Only FLASH_ATTN's forward_cuda (also used on ROCm) honors a published
-        # mode; elsewhere the read would only add a sync, and NPU graph capture
-        # must not read the host.
-        if device_type != "cuda" or getattr(self, "_use_npu_graph_attention", False):
+        # Only FLASH_ATTN's forward_cuda honors a published mode. ROCm reports
+        # device type "cuda" and dispatches to forward_cuda directly; MUSA
+        # reports "musa" and forward_musa defaults to forward_cuda too, so
+        # both land on the same honoring path. Elsewhere the read would only
+        # add a sync, and NPU graph capture must not read the host.
+        if device_type not in ("cuda", "musa") or getattr(self, "_use_npu_graph_attention", False):
             return False
         backend = getattr(self.transformer_blocks[0].attn.attn, "attn_backend", None)
         return backend is not None and backend.get_name() == "FLASH_ATTN"

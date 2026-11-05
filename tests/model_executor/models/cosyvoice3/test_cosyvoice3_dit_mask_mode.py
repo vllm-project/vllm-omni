@@ -104,17 +104,23 @@ def test_dit_reads_a_padded_mask_once_per_forward_for_flash_attn(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("backend", "npu_graph", "expected"),
-    [("FLASH_ATTN", False, True), ("TORCH_SDPA", False, False), ("FLASH_ATTN", True, False)],
+    ("backend", "device_type", "npu_graph", "expected"),
+    [
+        ("FLASH_ATTN", "cuda", False, True),
+        ("FLASH_ATTN", "musa", False, True),
+        ("TORCH_SDPA", "cuda", False, False),
+        ("FLASH_ATTN", "cuda", True, False),
+        ("FLASH_ATTN", "xpu", False, False),
+    ],
 )
-def test_mask_mode_is_published_only_where_flash_attn_honors_it(backend, npu_graph, expected):
+def test_mask_mode_is_published_only_where_flash_attn_honors_it(backend, device_type, npu_graph, expected):
     dit, _ = _dit()
     layer = cosyvoice3_dit.DiTAttention(dim=32, heads=2, dim_head=16, dropout=0.0)
     layer.attn.attn_backend = DiffusionAttentionBackendEnum[backend].get_class()
     dit.transformer_blocks[0].attn = layer
     if npu_graph:
         dit._use_npu_graph_attention = True
-    assert dit._reads_unpublished_masks("cuda") is expected
+    assert dit._reads_unpublished_masks(device_type) is expected
 
 
 def test_dit_attention_layer_exposes_its_backend():
