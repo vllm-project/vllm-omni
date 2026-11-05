@@ -195,15 +195,17 @@ def test_serial_safetensors_loading_preserves_every_sharded_weight(tmp_path):
     assert all(torch.equal(populations[0][name], populations[1][name]) for name in expected)
 
 
-def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
-    torchao_config = SimpleNamespace(
-        get_name=lambda: "torchao",
-        is_checkpoint_torchao_serialized=True,
-    )
+@pytest.mark.parametrize(
+    ("torchao_serialized", "suffix"),
+    [(True, ".bin"), (False, ".pth")],  # torchao checkpoints, and plain state dicts such as Video Depth Anything's
+)
+def test_pytorch_checkpoints_use_pytorch_iterator(mocker, torchao_serialized, suffix):
     loader = _make_loader_with_weights([])
-    loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
+    if torchao_serialized:
+        torchao_config = SimpleNamespace(get_name=lambda: "torchao", is_checkpoint_torchao_serialized=True)
+        loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
     loader.load_config.pt_load_map_location = "cpu"
-    files = ["/weights/model-10.bin", "/weights/model-2.bin"]
+    files = [f"/weights/model-10{suffix}", f"/weights/model-2{suffix}"]
     mocker.patch.object(loader, "_prepare_weights", return_value=("/weights", files, False))
     pt_iterator = mocker.patch.object(
         loader_module,
@@ -222,7 +224,7 @@ def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
     weights = list(loader._get_weights_iterator(source))
 
     pt_iterator.assert_called_once_with(
-        ["/weights/model-2.bin", "/weights/model-10.bin"],
+        [f"/weights/model-2{suffix}", f"/weights/model-10{suffix}"],
         loader.load_config.use_tqdm_on_load,
         "cpu",
     )
@@ -737,6 +739,82 @@ def test_stream_online_quant_weights_offloads_layers_after_processing():
     with pytest.raises(StopIteration):
         next(streamed)
     assert events == ["first", "second"]
+
+
+def test_online_quant_finalizes_padded_layers_without_accumulating(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    resident: set[nn.Module] = set()
+    finalized: set[nn.Module] = set()
+
+    class _OnlineQuantMethod:
+        uses_meta_device = True
+
+    class _PaddedLayer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 3, bias=False)
+            self.quant_method = _OnlineQuantMethod()
+            info = layerwise.get_layerwise_info(self)
+            info.load_numel_total = self.weight.numel()
+            info.load_numel = 4  # The checkpoint omits two padding elements.
+
+        def to(self, device):
+            assert device == "cpu"
+            assert self in finalized
+            resident.remove(self)
+            return super().to(device)
+
+    model = nn.Sequential(_PaddedLayer(), _PaddedLayer(), _PaddedLayer())
+
+    def finalize(module, model_config):
+        assert model_config is None
+        assert not resident, "previous deferred layer must be offloaded before the next"
+        resident.add(module)
+        finalized.add(module)
+        layerwise.get_layerwise_info(module).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    DiffusersPipelineLoader._finalize_online_quant_weights_to_cpu(model)
+    assert finalized == set(model)
+    assert not resident
+
+
+def test_online_quant_finalization_waits_for_buffered_weight_consumer(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    class _BufferedModel(nn.Module):
+        consumed = False
+
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2, bias=False)
+            self.layer.quant_method = SimpleNamespace(uses_meta_device=True)
+            layerwise.get_layerwise_info(self.layer).load_numel_total = 6
+
+        def load_weights(self, weights):
+            buffered = list(weights)
+            assert not self.consumed
+            assert len(buffered) == 1
+            self.layer.weight.data.copy_(buffered[0][1])
+            layerwise.get_layerwise_info(self.layer).load_numel = 4
+            self.consumed = True
+            return None
+
+    model = _BufferedModel()
+    loader = _make_loader_with_weights(["weight"])
+    finalized = []
+
+    def finalize(layer, model_config):
+        assert layer is model.layer and model_config is None
+        assert model.consumed, "iterator exhaustion does not mean the consumer finished"
+        finalized.append(layer)
+        layerwise.get_layerwise_info(layer).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    loader.load_weights(model, stream_online_quant_to_cpu=True)
+    assert finalized == [model.layer]
 
 
 def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
@@ -2128,6 +2206,8 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
         if model.load_called:
             with open(os.path.join(temp_dir, f"rank_{rank}_success.flag"), "w") as f:
                 f.write("ok")
+        # Keep successful ranks alive until every peer has finished initialization/loading.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 

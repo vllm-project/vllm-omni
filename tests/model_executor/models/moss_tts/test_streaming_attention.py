@@ -13,7 +13,7 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
 )
 from vllm_omni.model_executor.models.moss_tts.streaming_attention import masked_attention
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 
 @pytest.mark.parametrize(

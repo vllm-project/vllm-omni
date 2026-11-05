@@ -173,15 +173,13 @@ def test_smoke_propagates_device_cleanup_failure_after_valid_inference(smoke_ent
     assert (settings["output"] / "metrics.json").exists(), "retain successful inference evidence when cleanup fails"
 
 
-@pytest.mark.parametrize(
-    "platform,shell",
-    [("cuda", "/bin/sh"), ("cuda", "/bin/bash"), ("amd-other", "/bin/bash"), ("amd-executor", "/bin/bash")],
-)
+# AMD coverage lives in test_amd_cpu_timing.py with main's shared CPU runner.
+@pytest.mark.parametrize("shell", ["/bin/sh", "/bin/bash"])
 @pytest.mark.parametrize("status", [0, 1, 2, 134])
-def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, platform: str, shell: str, status: int):
-    source = ".buildkite/cuda/test-ready.yml" if platform == "cuda" else ".buildkite/amd/test-amd-ready.yml"
+def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, shell: str, status: int):
+    source = ".buildkite/cuda/test-ready.yml"
     pipeline = yaml.safe_load((ROOT / source).read_text())
-    label = "Simple · Model Executor Test · Shard %N/%t" if platform == "amd-executor" else "Simple · Other Test"
+    label = "Simple · Other Test"
     step = next(step for group in pipeline["steps"] for step in group.get("steps", []) if step.get("label") == label)
     application = tmp_path / "application"
     checkout = tmp_path / "agent-checkout"
@@ -216,9 +214,8 @@ def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, p
         timeout=30,
     )
     assert result.returncode == status, result.stdout + result.stderr
-    directory = {"cuda": "cuda-other", "amd-other": "amd-other", "amd-executor": "amd-model-executor-cpu"}[platform]
-    output = checkout / "artifacts" / directory
-    stem = "pytest-2" if platform == "amd-executor" else "pytest"
+    output = checkout / "artifacts/cuda-other"
+    stem = "pytest"
     log = (output / (stem + ".log")).read_text()
     assert "pytest stdout" in log and "pytest stderr" in log
     assert ET.parse(output / (stem + ".xml")).getroot().tag == "testsuite"

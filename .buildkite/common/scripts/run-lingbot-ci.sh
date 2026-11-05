@@ -76,6 +76,7 @@ UNIT_ENV
     python -m pytest -sv -p tests.dfx.lingbot_world.conftest \
         tests/benchmarks/test_lingbot_world_*.py \
         tests/buildkite/test_upload_pipeline.py tests/buildkite/test_amd_pipeline.py \
+        tests/buildkite/test_amd_cpu_timing.py \
         tests/helpers/tests/test_runtime_startup_timeout.py \
         tests/helpers/tests/test_runtime_server_ports.py tests/helpers/tests/test_runtime_stage_cli.py \
         tests/helpers/tests/test_clean.py \

@@ -44,6 +44,7 @@ from vllm_omni.engine.duplex.commands import (
     DeleteItem,
     DuplexCommand,
     DuplexCommandError,
+    GetSessionStats,
     Heartbeat,
     SignalTurn,
     TruncateItem,
@@ -271,6 +272,9 @@ def translate_realtime_command(
 
     if event_type == "session.heartbeat":
         return Heartbeat(event_id=event_id)
+
+    if event_type == "session.stats.get":
+        return GetSessionStats(event_id=event_id)
 
     if event_type == "conversation.item.retrieve":
         # The projected conversation items live engine-side; the runner answers.
