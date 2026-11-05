@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -160,6 +161,8 @@ _VERIFIED_MODELS: dict[str, dict[str, int]] = {
 
 def _verified_knobs(vllm_config) -> dict[str, int] | None:
     """Return the verified bucketing knobs, or None if the model is unverified."""
+    if vllm_config is None:
+        return None
     return _VERIFIED_MODELS.get(vllm_config.model_config.hf_config.model_type)
 
 
@@ -266,6 +269,11 @@ class _BucketedEncoder:
 
         lengths, mask, length_arg = self._host_lengths(features, args[1:])
         if lengths is None or len(lengths) != features.size(0):
+            logger.debug(
+                "Bucketed encoder %r: no per-item lengths (got %r); falling back to the original forward",
+                self.name,
+                None if lengths is None else len(lengths),
+            )
             return self._original(*args, **kwargs)
 
         # Route empty batches and batches containing an item longer than the
@@ -453,6 +461,10 @@ class _BucketedEncoder:
 # --------------------------------------------------------------- auto install
 
 
+_processor_hook_lock = threading.RLock()
+_installed_hop: int | None = None
+
+
 def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
     try:
         from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -461,7 +473,16 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
         from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
     except Exception:
         return
+    global _installed_hop
     if getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False):
+        if _installed_hop is not None and _installed_hop != hop:
+            logger.warning(
+                "Bucketed encoder processor hook already installed with hop %d; "
+                "a second install with hop %d is ignored (mixed-hop models in one "
+                "process are unsupported).",
+                _installed_hop,
+                hop,
+            )
         return
 
     # Wrap the two concrete orchestration methods so that, for every multimodal
@@ -474,35 +495,41 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
 
     def _wrap(orig):
         def wrapped(self, *args, **kwargs):
-            # Both callbacks are assigned as plain functions on the instance, so
-            # they are invoked WITHOUT binding self; the captured originals are
-            # already bound methods.
-            main = self._apply_hf_processor_main
-            get = self._get_mm_fields_config
+            # The per-call instance-attribute swap is guarded by a reentrant
+            # lock: _cached_apply_hf_processor calls back into _apply_hf_processor,
+            # so the outer and inner wraps nest on the same thread. The lock keeps
+            # concurrent callers on different threads from observing each other's
+            # temporary _main / _get.
+            with _processor_hook_lock:
+                # Both callbacks are assigned as plain functions on the instance,
+                # so they are invoked WITHOUT binding self; the captured originals
+                # are already bound methods.
+                main = self._apply_hf_processor_main
+                get = self._get_mm_fields_config
 
-            def _main(mm_items, hf_kwargs):
-                result = main(mm_items, hf_kwargs)
+                def _main(mm_items, hf_kwargs):
+                    result = main(mm_items, hf_kwargs)
+                    try:
+                        frames = _frames_from_mm_items(mm_items, hop)
+                        if frames is not None:
+                            result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
+                    except Exception:
+                        logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
+                    return result
+
+                def _get(hf_inputs, hf_processor_mm_kwargs):
+                    fields = dict(get(hf_inputs, hf_processor_mm_kwargs))
+                    if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
+                        fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
+                    return fields
+
+                self._apply_hf_processor_main = _main
+                self._get_mm_fields_config = _get
                 try:
-                    frames = _frames_from_mm_items(mm_items, hop)
-                    if frames is not None:
-                        result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
-                except Exception:
-                    logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
-                return result
-
-            def _get(hf_inputs, hf_processor_mm_kwargs):
-                fields = dict(get(hf_inputs, hf_processor_mm_kwargs))
-                if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
-                    fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
-                return fields
-
-            self._apply_hf_processor_main = _main
-            self._get_mm_fields_config = _get
-            try:
-                return orig(self, *args, **kwargs)
-            finally:
-                self._apply_hf_processor_main = main
-                self._get_mm_fields_config = get
+                    return orig(self, *args, **kwargs)
+                finally:
+                    self._apply_hf_processor_main = main
+                    self._get_mm_fields_config = get
 
         return wrapped
 
@@ -510,6 +537,7 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
     BaseMultiModalProcessor._cached_apply_hf_processor = _wrap(_orig_cached)
 
     OmniMultiModalProcessor._bucket_frames_installed = True
+    _installed_hop = hop
     logger.info("Bucketed encoder processor hook installed")
 
 
@@ -545,8 +573,12 @@ def install_bucketed_processor_hook(vllm_config=None) -> bool:
     """
     if _rungs_from_env() is None:
         return False
+    verified = _verified_knobs(vllm_config)
+    if vllm_config is not None and verified is None:
+        # Unverified model: leave it fully untouched (the worker's wrapper is
+        # also skipped), matching the warning in install_bucketed_encoders.
+        return False
     hop = _DEFAULT_HOP
-    verified = _verified_knobs(vllm_config) if vllm_config is not None else None
     if verified is not None and verified.get("hop"):
         hop = verified["hop"]
     _install_processor_hook(hop)
@@ -586,11 +618,12 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
 
     verified = _verified_knobs(vllm_config)
     if verified is None:
+        model_type = vllm_config.model_config.hf_config.model_type if vllm_config is not None else "<unknown>"
         logger.warning(
             "Bucketed encoder is not verified for model_type %r; disabling the "
             "feature and serving the untouched forward. Verified model_type values: "
             "%s. Remove %s to silence this warning.",
-            vllm_config.model_config.hf_config.model_type,
+            model_type,
             sorted(_VERIFIED_MODELS),
             _ENV_SECONDS,
         )
