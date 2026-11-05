@@ -535,7 +535,7 @@ steps:
           - export AITER_JIT_DIR="/tmp/vllm-omni-cosmos3-aiter-$$BUILDKITE_JOB_ID"
           - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-cosmos3-torch-extensions-$$BUILDKITE_JOB_ID"
           - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
-          - pytest --collect-only -q tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001 -m "core_model and rocm and MI325 and cards_1" --run-level full_model
+          - pytest --collect-only -q tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001 -m "slow and rocm and MI325 and cards_1" --run-level full_model
           - >-
             timeout --signal=TERM --kill-after=2m 55m
             python .buildkite/amd/scripts/prewarm_cosmos3_aiter.py
@@ -543,7 +543,7 @@ steps:
             timeout --signal=TERM --kill-after=2m 25m
             pytest -s -v
             tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001
-            -m "core_model and rocm and MI325 and cards_1"
+            -m "slow and rocm and MI325 and cards_1"
             --run-level full_model
             --junitxml=/tmp/cosmos3-pytest.xml
           - |
@@ -621,6 +621,86 @@ steps:
             tail -n 100 "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log" >
             "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
 
+
+  # CUDA nightly "Diffusion · Offloader Test" selects this full_model node.
+  # The ROCm mark is cards_1. The existing 512 MB savings check stays in the
+  # test. The former quarantined MERGE leaf is removed, making this the sole
+  # Stable Audio layerwise-offload owner on ROCm.
+  - group: ":full_moon: Layerwise Offload MI300 Nightly"
+    steps:
+      - label: "Stable Audio Layerwise Offload"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies:
+          - diffusion_offloader
+          - diffusion_stable_audio_function
+        artifact_paths:
+          - artifacts/rocm-stable-audio-layerwise-offload/**/*
+        commands:
+          - export LAYERWISE_OFFLOAD_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-stable-audio-layerwise-offload"
+          - mkdir -p "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR"
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - |
+            node='tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
+            if pytest --collect-only -q \
+              tests/diffusion/offloader/test_diffusion_layerwise_offload.py \
+              -m 'full_model and diffusion and rocm and MI325 and cards_1' \
+              --run-level full_model \
+              > "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt"; then
+              count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+                "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt")
+              if [[ "$$count" != 1 ]]; then
+                echo "Expected exactly one Stable Audio layerwise-offload node, found $$count." >&2
+                cat "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            else
+              exit $$?
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 45m \
+                pytest -s -v -ra \
+                tests/diffusion/offloader/test_diffusion_layerwise_offload.py \
+                -m 'full_model and diffusion and rocm and MI325 and cards_1' \
+                --run-level full_model \
+                --durations=0 \
+                --junitxml="$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/pytest.log" > \
+              "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed Stable Audio layerwise-offload test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$LAYERWISE_OFFLOAD_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
   - group: ":full_moon: Qwen-Image Accuracy MI300 Nightly"
     steps:

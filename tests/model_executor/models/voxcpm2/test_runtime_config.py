@@ -9,6 +9,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 
 from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig, reject_outer_full_cudagraph
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -18,9 +19,11 @@ def test_runner_specific_audio_defaults(uses_v2):
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
-    assert config.enable_incremental_vae is uses_v2
-    assert config.vae_decode_every == (1 if uses_v2 else 3)
-    assert config.audio_emit_every == (3 if uses_v2 else 1)
+    # Incremental VAE is the CUDA v2 default only. ROCm keeps the v1 profile.
+    incremental = uses_v2 and current_omni_platform.is_cuda()
+    assert config.enable_incremental_vae is incremental
+    assert config.vae_decode_every == (1 if incremental else 3)
+    assert config.audio_emit_every == (3 if incremental else 1)
 
 
 def test_mrv2_explicit_legacy_audio_override():
