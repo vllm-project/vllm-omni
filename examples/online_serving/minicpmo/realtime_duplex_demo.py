@@ -474,25 +474,25 @@ async def _drain_forced_post_commit_response(
     ``response.done`` -- even a cancelled one, or the settle of a pre-commit
     response -- means the promotion may still be in flight and the drain keeps
     waiting instead of re-asking into ``response_already_active``. A native
-    auto-response session never defers an audio-driven commit: it submits the
-    retained input at once or acknowledges with nothing scheduled, so a
-    post-commit settle is final -- the server is idle, and suppressing the
-    re-ask there would strand an already-answered session in ``TimeoutError``;
-    the re-ask stays armed and settles it on the forced answer or on the
-    definitive refusal.     (The deferrals a native session still has: a video-only commit -- no
-    audio in the buffer while a response runs, on a model that accepts video
-    without audio and has no concurrent-turn capability, and only when the
-    session ever appended video frames; and a commit that landed while a
-    response was already running -- there the runner rides the in-flight
-    answer instead of precreating, so that settle belongs to the old
-    response and the answer's own ``response.created`` follows. The caller
-    keys ``commit_may_defer_create`` on both conditions plus its
-    non-auto-response sessions, so a settle is treated as final only when
-    none of them applies.) Errors reported after the commit suppress the
-    re-ask either way, since the server is refusing rather than slow. The flip side for CI
-    triage on a deferring session: if the server drops the deferred create
-    after such activity, the drain can only end in ``TimeoutError`` -- no
-    re-ask will have fired -- so a client timeout in that situation points
+    auto-response session does not defer an audio commit taken while it is
+    idle: it submits the retained input at once or acknowledges with nothing
+    scheduled, so a post-commit settle is final -- the server is idle, and
+    suppressing the re-ask there would strand an already-answered session in
+    ``TimeoutError``; the re-ask stays armed and settles it on the forced
+    answer or on the definitive refusal. (The deferrals such a session still
+    has, and the caller keys ``commit_may_defer_create`` on all of them: a
+    video-only commit -- no audio in the buffer while a response runs, on a
+    model that accepts video without audio and has no concurrent-turn
+    capability, and only when the session ever appended video frames; and a
+    commit that landed while a response was already running -- there the
+    runner rides the in-flight answer instead of precreating, so that settle
+    belongs to the old response and the answer's own ``response.created``
+    follows. A settle is treated as final only when none of the conditions
+    above applies.) Errors reported after the commit suppress the re-ask
+    either way, since the server is refusing rather than slow. The flip side
+    for CI triage on a deferring session: if the server drops the deferred
+    create after such activity, the drain can only end in ``TimeoutError`` --
+    no re-ask will have fired -- so a client timeout in that situation points
     at a lost promotion on the server side, not at a missing fallback.
 
     A re-ask can itself fail client-side: a send landing inside a transport
