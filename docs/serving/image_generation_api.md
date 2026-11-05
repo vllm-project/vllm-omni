@@ -214,11 +214,28 @@ The API passes parameters directly to the diffusion pipeline without model-speci
 
 **Best Practice:** Start with the model's recommended parameters, then adjust based on your needs.
 
+## NSFW Safety Checker
+
+Start the server with `--safety-checker` to reject generated images that an NSFW classifier
+(`Falconsai/nsfw_image_detection`, run on CPU) flags as unsafe:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --safety-checker
+```
+
+The classifier is loaded at startup, so the server fails to start if it cannot be loaded. It adds roughly
+100 ms of CPU time per image. If any image in a request is flagged, the whole request fails with a
+`400` response; if the checker itself fails, the request fails with a `503`.
+
+The check applies to `/v1/images/generations` and non-streaming `/v1/images/edits`. Streaming image edits,
+chat completions with image output, and video generation are not checked. The flag is independent of
+`--no-guardrails`, which only controls the Cosmos3 guardrails.
+
 ## Error Responses
 
 ### 400 Bad Request
 
-Invalid parameters (e.g., model mismatch):
+Invalid parameters (e.g., model mismatch), or a generated image flagged by `--safety-checker`:
 
 ```json
 {
