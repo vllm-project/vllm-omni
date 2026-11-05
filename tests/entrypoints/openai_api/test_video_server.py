@@ -2736,7 +2736,7 @@ async def test_h3_mixed_reference_size_error_precedes_suffix_error_and_cleans_up
         assert error.value.status_code == 400
         assert error.value.detail == "Uploaded reference exceeds the 5 MiB size limit."
         assert uploads[1].file.tell() == limit + 1
-        assert len(reference_upload_paths) == 2
+        assert len(reference_upload_paths) == 1  # Only the preceding valid reference was persisted.
         assert not any(path.exists() for path in reference_upload_paths)
     finally:
         for upload in uploads:
@@ -2776,7 +2776,7 @@ def test_h3_multipart_null_suffix_returns_format_error(test_client, reference_up
     )
     assert response.status_code == 400
     assert response.json()["detail"] == "MiniMax H3 reference videos must use an MP4 or MOV file."
-    assert reference_upload_paths and not any(path.exists() for path in reference_upload_paths)
+    assert not reference_upload_paths
 
 
 @pytest.mark.asyncio

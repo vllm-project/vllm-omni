@@ -848,13 +848,13 @@ def _minimax_h3_upload_limit(upload: UploadFile) -> int:
     return MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES
 
 
-async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None) -> bytes:
-    """Read an upload with an optional hard byte limit."""
-    if max_bytes is None:
+async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None, discard: bool = False) -> bytes:
+    """Read with an optional byte limit; discard=True returns b"" without buffering."""
+    if max_bytes is None and not discard:
         return await upload.read()
 
     declared_size = getattr(upload, "size", None)
-    if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
+    if max_bytes is not None and isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
@@ -863,16 +863,18 @@ async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = No
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = await upload.read(min(1024 * 1024, max_bytes - total + 1))
+        read_size = 1024 * 1024 if max_bytes is None else min(1024 * 1024, max_bytes - total + 1)
+        chunk = await upload.read(read_size)
         if not chunk:
             break
         total += len(chunk)
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
             )
-        chunks.append(chunk)
+        if not discard:
+            chunks.append(chunk)
     return b"".join(chunks)
 
 
@@ -917,7 +919,8 @@ async def _persist_uploaded_media_references(
 
     Images are decoded in memory; videos and audio remain files because H3's
     reference encoders need the original container streams (including video
-    soundtracks).
+    soundtracks). Empty video/audio files are persisted unchanged; H3 input
+    preparation owns media-content validation, including empty-file rejection.
     """
     images: list[Image.Image] = []
     videos: list[str] = []
@@ -950,18 +953,9 @@ async def _persist_uploaded_media_references(
             allowed_suffixes = (
                 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES if kind == "audio" else MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES
             )
-            temporary_suffix = suffix if suffix in allowed_suffixes else (".mp3" if kind == "audio" else ".mp4")
-            # Keep read/size errors ahead of format errors, as in the buffered path.
-            path = await _persist_uploaded_reference(
-                upload,
-                field_name="reference",
-                suffix=temporary_suffix,
-                max_bytes=max_bytes,
-                chunk_size=MINIMAX_H3_REFERENCE_UPLOAD_CHUNK_BYTES,
-                allow_empty=True,  # Preserve downstream validation of empty references.
-                size_limit_detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
-            )
-            paths.append(path)
+            if suffix and suffix not in allowed_suffixes:
+                # Preserve read/size error priority without writing a rejected upload.
+                await _read_upload_limited(upload, max_bytes=max_bytes, discard=True)
             if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
@@ -972,6 +966,16 @@ async def _persist_uploaded_media_references(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="MiniMax H3 reference audio must use a WAV or MP3 file.",
                 )
+            path = await _persist_uploaded_reference(
+                upload,
+                field_name="reference",
+                suffix=suffix or (".mp3" if kind == "audio" else ".mp4"),
+                max_bytes=max_bytes,
+                chunk_size=MINIMAX_H3_REFERENCE_UPLOAD_CHUNK_BYTES,
+                allow_empty=True,
+                size_limit_detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+            )
+            paths.append(path)
             if kind == "audio":
                 audios.append(path)
             else:
