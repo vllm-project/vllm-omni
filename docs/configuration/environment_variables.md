@@ -121,9 +121,12 @@ extractor padding while the bucketed path attends over the smaller rung window, 
 two outputs differ. **Mask-aware encoders keep the encoder output numerically
 unchanged** (e.g. Step-Audio-2-mini, whose `AudioEncoder` masks padding via
 `make_non_pad_mask`): the on/off encoder outputs are identical in fp32 and nearly
-identical in bfloat16. This is a numerical comparison at the encoder boundary; it
-does not establish end-to-end transcript equivalence (see the Step-Audio-2-mini
-measurement below).
+identical in bfloat16. The bucketed copy never drops real frames: the rung is the
+published length (`samples // hop`) plus a per-model `context_margin` set one past
+the worst-case offset to the real frame count, so it overshoots by at most one
+frame of zero padding (property-swept in `tests/worker/test_bucketed_encoder.py`).
+These are mel-window and encoder-boundary guarantees only; neither establishes
+end-to-end transcript equivalence (see the Step-Audio-2-mini measurement below).
 
 Measured on the real checkpoints, the main numbers are (reference data; the exact
 values depend on the actual audio length distribution):
