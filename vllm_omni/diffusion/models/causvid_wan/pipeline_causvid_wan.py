@@ -246,13 +246,21 @@ class CausVidWanPipeline(nn.Module):
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
         local_layers = max(1, self.transformer.local_num_layers)
+        history = max(1, self.max_history_chunks)
+        history_versions = history
+        if self.step_replicas > 1 and self.step_replicas == self._default_denoise:
+            # Same-Step: each rank owns one denoise step, so a parked session keeps
+            # H own-step versions plus the chunk-0 sink on every rank, and another
+            # request's live window (H) sits next to it in the same pool.
+            history_versions = 2 * history + 1
         return ARDiffusionNoisyKVSpec(
             num_layers=local_layers,
             num_kv_heads=self.transformer.num_heads,
             head_size=self.transformer.head_dim,
             block_size=self.block_size,
             max_chunk_tokens=self.max_chunk_tokens,
-            max_history_chunks=max(1, self.max_history_chunks),
+            max_history_chunks=history,
+            max_history_versions=history_versions,
         )
 
     @contextmanager
@@ -350,8 +358,12 @@ class CausVidWanPipeline(nn.Module):
             ordering = Ordering.SELF_FORCING
         elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
+        elif schedule_name == "same_step":
+            ordering = Ordering.SAME_STEP
         else:
-            raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
+            raise ValueError(
+                f"CausVidWan cell_schedule must be 'self_forcing', 'latest_kv' or 'same_step', got {schedule_name!r}"
+            )
         step_replicas = self.step_replicas
         if ordering is Ordering.SELF_FORCING and step_replicas > 1:
             # Self-Forcing is single-replica (paper semantics, layer PP);
@@ -367,8 +379,15 @@ class CausVidWanPipeline(nn.Module):
                 f"latest_kv requires step_replicas=D+1 ({denoise + 1}) for clean history, "
                 "got 1; step_replicas=1 layer PP uses cell_schedule: self_forcing"
             )
-        # CausVid rejects same_step; vertical is S=D+1 only (S=D stays schedule-level).
-        if step_replicas not in (1, denoise + 1):
+        # Same-Step is the S=D vertical placement (one replica per denoise step);
+        # Latest-KV is S=D+1 (one extra clean replica).
+        if ordering is Ordering.SAME_STEP:
+            if step_replicas != denoise:
+                raise ValueError(
+                    f"same_step requires step_replicas=D ({denoise}) so every denoise step owns a "
+                    f"replica, got {step_replicas}"
+                )
+        elif step_replicas not in (1, denoise + 1):
             if explicit_denoise is not None:
                 raise ValueError(f"step_replicas must be 1 or D+1 ({denoise + 1}), got {step_replicas}")
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
@@ -545,6 +564,15 @@ class CausVidWanPipeline(nn.Module):
             plan, extra, denoise = self._plan_for(item, chunk_base=chunk_base)
             schedule = plan.schedule
             if persist:
+                if schedule.ordering is Ordering.SAME_STEP and chunk_base == 0 and schedule.chunks == 1:
+                    # Only a multi-chunk cold request runs chunk 0's clean forward, and
+                    # every continuation reads that sink. Refuse on every rank here:
+                    # the residency check below runs on the sink owner only, so a
+                    # later continuation would fail on one rank while its peers wait.
+                    raise ValueError(
+                        f"same_step session {kv_id!r} must start with num_chunks >= 2 so chunk 0's "
+                        "clean sink exists for continuations"
+                    )
                 ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
                 # Fail-closed only for cells this rank owns; remotes arrive via prep handoff.
                 logical = expected_prior_cells(schedule)
