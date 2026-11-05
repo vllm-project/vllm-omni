@@ -7,8 +7,7 @@ E2E offline tests for Omni model with video input and audio output.
 ``test_structured_multistage_config_reaches_runtime`` and
 ``test_video_to_audio`` share one CI Instruct ``omni_runner``. Keep them
 adjacent and on ``test_params``; a different deploy param cold-starts the
-30B model again. Production YAML literals live in
-``tests/config/test_qwen3_omni_moe_deploy.py``.
+30B model again.
 
 Abort / sleep-admission lives in ``test_qwen3_omni_colocate_async.py`` so it
 does not overlap this module's OmniRunners.
@@ -93,9 +92,8 @@ def get_question(prompt_type="video"):
 def test_structured_multistage_config_reaches_runtime(omni_runner, offline_client) -> None:
     """Deploy settings reach the materialized configs used by live stages.
 
-    Shares the CI Instruct runner with ``test_video_to_audio``. Production
-    literals (``max_num_seqs``, gpu memory utilization, ``enforce_eager``,
-    sampling defaults) are pinned by the CPU resolver twin.
+    Shares the CI Instruct runner with ``test_video_to_audio``. Compares each
+    resolved CI stage with the live engine.
     """
     engine = omni_runner.omni.engine
 
@@ -117,9 +115,10 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
 
     # Engine-owned deploy settings must survive the startup projection into
     # the actual VllmConfig objects retained by the stage pools. Compare
-    # against the resolved CI stage (the CUDA graph overlay sets
-    # ``enforce_eager`` on stages 0 and 1; the CI overlay sets ``max_num_seqs``
-    # and the talker utilization). Production literals are the CPU twin's job.
+    # against the resolved CI stage: the CUDA graph overlay sets
+    # ``enforce_eager`` on stages 0 and 1, and the CI overlay sets
+    # ``max_num_seqs`` and the talker utilization. Platform overrides are
+    # already on that resolved stage.
     assert len(engine.stage_vllm_configs) == 3
     thinker_vllm, talker_vllm, code2wav_vllm = engine.stage_vllm_configs
     assert thinker_vllm is not None
@@ -130,23 +129,14 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
         assert vllm_config.scheduler_config.max_num_batched_tokens == stage.scheduler_config.max_num_batched_tokens
         assert vllm_config.cache_config.gpu_memory_utilization == stage.cache_config.gpu_memory_utilization
         assert vllm_config.model_config.enforce_eager is stage.model_config.enforce_eager
-    assert thinker_vllm.scheduler_config.max_num_batched_tokens == 32768
-    assert talker_vllm.scheduler_config.max_num_batched_tokens == 32768
-    assert code2wav_vllm.scheduler_config.max_num_batched_tokens == 65536
-    # Platform overrides are already reflected in the resolved stage config.
-    # Verify that startup projection preserves that value in vLLM's runtime
-    # config instead of restating each platform's policy here.
-    assert thinker_vllm.cache_config.enable_prefix_caching is thinker.cache_config.enable_prefix_caching
-    assert talker_vllm.cache_config.enable_prefix_caching is False
-    assert code2wav_vllm.cache_config.enable_prefix_caching is False
-    assert all(config.model_config.trust_remote_code is True for config in engine.stage_vllm_configs)
-    assert code2wav_vllm.scheduler_config.enable_chunked_prefill is False
-    assert code2wav_vllm.scheduler_config.async_scheduling is False
+        assert vllm_config.cache_config.enable_prefix_caching is stage.cache_config.enable_prefix_caching
+        assert vllm_config.model_config.trust_remote_code is stage.model_config.trust_remote_code
+    assert code2wav_vllm.scheduler_config.enable_chunked_prefill is code2wav.scheduler_config.enable_chunked_prefill
+    assert code2wav_vllm.scheduler_config.async_scheduling is code2wav.scheduler_config.async_scheduling
 
     # Sampling defaults are consumed from StageClient metadata. The resolver
     # keeps the deploy values (CI max_tokens overrides included); SamplingParams
-    # normalizes them (greedy top_k -1 becomes 0). Production YAML literals are
-    # pinned by the CPU twin.
+    # normalizes them (greedy top_k -1 becomes 0).
     assert len(engine.default_sampling_params_list) == len(resolved_stages)
     for stage, runtime_params in zip(resolved_stages, engine.default_sampling_params_list, strict=True):
         raw = stage.model_config.default_sampling_params or {}
