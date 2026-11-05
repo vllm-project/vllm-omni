@@ -1502,3 +1502,17 @@ def test_model_kv_requires_current_matching_ar_binding(prepare_encode_pipeline):
     pipe._ar_diffusion_kv_state = None
     with pytest.raises(RuntimeError, match="requires the AR-Diffusion engine"):
         _ = session.cache
+
+
+def test_streaming_attention_preserves_minimax_forward_contract() -> None:
+    from inspect import Parameter, signature
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention
+    from vllm_omni.diffusion.models.taomate_h3.attention import TaoMateH3StreamingAttention
+
+    base = signature(MiniMaxH3Attention.forward).parameters
+    streaming = signature(TaoMateH3StreamingAttention.forward).parameters
+    for name, param in base.items():
+        assert name in streaming, name
+        if param.kind is Parameter.KEYWORD_ONLY:
+            assert streaming[name].kind is Parameter.KEYWORD_ONLY, name
