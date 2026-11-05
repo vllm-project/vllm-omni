@@ -6,7 +6,7 @@ gate logic separately and are not model performance evidence.
 ## vLLM 0.33 reference and qualification status
 
 The inference source is frozen at
-`16cd96494784192ca4cfdad23e409d2ffab171dc` in
+`3094f0ea747cb2563d99d049da25725cc45f0d2e` in
 `https://github.com/tzhouam/vllm-omni.git`. Every profile records both the
 repository and full revision, so provisioning can fetch the immutable source
 without relying on an upstream branch containing the reference commit.
@@ -21,9 +21,19 @@ that the preceding `61d19b6094189136ad047bf8b060d4180c3c60bf` emitted the correc
 nine frames but omitted that index; the unchanged strict benchmark therefore
 rejected single-block requests and single-block prewarming diagnostics. The fix preserves
 ordinary nonstreaming output and changes no generation or numerical behavior.
-The reference and candidate formatter file bytes are identical. It contains no
-candidate harness or new performance optimization. Updating a candidate must
-not advance this pin.
+The reference and candidate formatter file bytes are identical.
+
+The final reference also applies the identical `core/sched/output.py` and
+`core/sched/omni_generation_scheduler.py` compatibility fixes used by the
+candidate. Ascend dynamically adds a default `replay_start` field to the base
+cached-request dataclass. Both preceding references fail when Omni declares
+required positional fields after that inherited default. Required keyword-only
+Omni fields fix declaration order, and conversion preserves all actual base
+field values and object references. This changes no model generation or
+numerical settings. No replay corruption was observed; forwarding populated
+upstream fields is a compatibility contract covered by regression tests.
+The reference contains no candidate harness or new performance optimization.
+Updating a candidate must not advance this pin.
 
 No training cohorts had been collected when this reference was replaced. The
 preceding frozen protocol is preserved byte for byte in
@@ -32,6 +42,13 @@ The active protocol records the source fix and former protocol hash; all fitting
 rules, workload settings and candidate allowances remain unchanged. Minimal
 local functionality diagnostics are excluded from calibration and hardware
 qualification.
+
+The intermediate streaming-compatible protocol is likewise preserved byte for
+byte in
+[calibration/history/v033_reference_protocol_before_ascend_cached_requests.json](calibration/history/v033_reference_protocol_before_ascend_cached_requests.json)
+(SHA256 `37c63fc54e1d47358e703481e0d246aaa612b54cfd3d8e7600a3939a134f091c`).
+The final protocol records both compatibility updates; no training cohort was
+collected before either update, and their statistical rules are identical.
 
 The runtime migration is necessary: the previous reference `48cebe5a` fails
 actual serving startup on vLLM 0.33 because

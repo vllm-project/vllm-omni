@@ -1,9 +1,20 @@
 {
   "schema_version": 1,
   "reference_repository": "https://github.com/tzhouam/vllm-omni.git",
-  "reference_revision": "16cd96494784192ca4cfdad23e409d2ffab171dc",
+  "reference_revision": "3094f0ea747cb2563d99d049da25725cc45f0d2e",
   "accepted_main_revision": "02286829737a54167e890185bcbb6948ed9afbcf",
   "established_fix_source_revision": "48cebe5a248d4b0160f20c7fc18b5d1c46883872",
+  "npu_scheduler_compatibility": {
+    "parent_revision": "16cd96494784192ca4cfdad23e409d2ffab171dc",
+    "shared_sources_sha256": {
+      "vllm_omni/core/sched/output.py": "d7c560165fd60d725bec9b8006fe869290dfca53d386f138d94f1379813d8d22",
+      "vllm_omni/core/sched/omni_generation_scheduler.py": "80a7c5f88d15a67a974c3b4ebb85a2bcd0f0e75fdc834c3a0b3aca58d20bb46f"
+    },
+    "scope": "Required keyword-only Omni fields support Ascend's runtime-added cached-request default; conversion preserves all actual upstream field values by reference, without model or numerical changes",
+    "superseded_protocol_sha256": "37c63fc54e1d47358e703481e0d246aaa612b54cfd3d8e7600a3939a134f091c",
+    "superseded_protocol_archive": "history/v033_reference_protocol_before_ascend_cached_requests.json",
+    "training_cohorts_collected_before_update": false
+  },
   "streaming_metadata_compatibility": {
     "parent_revision": "61d19b6094189136ad047bf8b060d4180c3c60bf",
     "shared_source": "vllm_omni/diffusion/output_formatter.py",

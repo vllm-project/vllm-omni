@@ -13,6 +13,15 @@ the same six reference videos. This archive remains unchanged for boundary and d
 checks; archiving it does not change original hardware pass/fail results.
 
 Archived records are not loaded by the CI runner.
+`v033_reference_protocol_before_ascend_cached_requests.json` retains the
+streaming-compatible protocol byte for byte (SHA256
+`37c63fc54e1d47358e703481e0d246aaa612b54cfd3d8e7600a3939a134f091c`).
+Before training collection, controlled checks found that Ascend dynamically
+adds a default cached-request field, making Omni's required positional
+extension fail during import. Identical reference/candidate compatibility
+repairs retain required Omni fields and all inherited values. Only source pins
+and compatibility provenance advance; fitting rules and allowances are retained.
+
 `v033_reference_protocol_before_single_block_streaming.json` preserves the first
 vLLM 0.33 protocol byte for byte (SHA256
 `c1f7ceb8929d529633d565053b73e99e75b66580b54145ab908d4d3c47d4eb2f`).
