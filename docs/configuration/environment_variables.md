@@ -138,13 +138,6 @@ values depend on the actual audio length distribution):
 
 > The per-model knobs (`hop`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the two knobs above are user-facing deployment settings; a model not in the whitelist cannot enable bucketing.
 
-> While bucketing is enabled, the processor hook holds a per-processor reentrant
-> lock across each full preprocessing call (the length-publishing callbacks are
-> injected via a per-call instance-attribute swap). Distinct processor instances
-> stay concurrent, but concurrent requests that share one processor instance
-> (typically one per model) serialize during preprocessing. This is acceptable
-> for the experimental flag; it does not affect the worker-side encoder bucketing.
-
 ### NIXL stage transfer
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |

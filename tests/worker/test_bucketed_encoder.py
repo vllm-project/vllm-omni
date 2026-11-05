@@ -131,24 +131,12 @@ def bucket_env(monkeypatch):
 
 @pytest.fixture()
 def restore_processor_hook():
-    """Undo install_bucketed_processor_hook's global class patch afterwards, so
-    later tests don't run against a patched OmniMultiModalProcessor."""
-    from vllm.multimodal.processing import BaseMultiModalProcessor
-
-    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
-    from vllm_omni.worker import bucketed_encoder
-
-    saved_main = OmniMultiModalProcessor._apply_hf_processor_main
-    saved_apply = BaseMultiModalProcessor._apply_hf_processor
-    saved_cached = BaseMultiModalProcessor._cached_apply_hf_processor
-    saved_flag = getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
-    saved_hop = bucketed_encoder._installed_hop
+    """Undo install_bucketed_processor_hook's class-level patches afterwards, so
+    later tests don't run against a patched processor."""
     yield
-    OmniMultiModalProcessor._apply_hf_processor_main = saved_main
-    BaseMultiModalProcessor._apply_hf_processor = saved_apply
-    BaseMultiModalProcessor._cached_apply_hf_processor = saved_cached
-    OmniMultiModalProcessor._bucket_frames_installed = saved_flag
-    bucketed_encoder._installed_hop = saved_hop
+    from vllm_omni.worker.bucketed_encoder import _uninstall_processor_hook
+
+    _uninstall_processor_hook()
 
 
 def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
@@ -748,6 +736,59 @@ def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_pro
     processor._get_mm_prompt_updates = Mock(return_value=[])
 
     audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 s -> 300 mel frames at 100 fps
+    items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
+    inputs = SimpleNamespace(mm_data_items=items, hf_processor_mm_kwargs={}, prompt="hi")
+    timing_ctx = SimpleNamespace(record=Mock(return_value=nullcontext()))
+
+    result = processor._apply_hf_processor(inputs, timing_ctx)
+
+    bucket_values = []
+    for items_list in result.kwargs.values():
+        for item in items_list:
+            if "encoder_bucket_frames" in item:
+                elems = item["encoder_bucket_frames"]
+                if not isinstance(elems, (list, tuple)):
+                    elems = [elems]
+                bucket_values.extend(int(e.data) for e in elems)
+    assert bucket_values == [300]
+
+
+def test_processor_hook_wraps_wholesale_apply_main_override(monkeypatch, restore_processor_hook):
+    """A subclass that overrides _apply_hf_processor_main wholesale (no super(),
+    e.g. qwen2_5_omni) must still get the length field: the lazy per-class wrap
+    targets the most-derived defining override instead of being shadowed."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import numpy as np
+    from transformers import BatchFeature
+    from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+
+    from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
+    install_bucketed_processor_hook(_mock_vllm_config("step_audio_2"))
+
+    class Processor(OmniMultiModalProcessor):
+        def _apply_hf_processor_main(self, mm_items, hf_kwargs):
+            # Wholesale override: does not call super().
+            return BatchFeature({"audio_features": torch.zeros(1, 128, 3000)})
+
+        def _get_mm_fields_config(self, *args):
+            return {}
+
+        def _get_prompt_updates(self, *args):
+            return []
+
+    processor = object.__new__(Processor)
+    processor.dummy_inputs = SimpleNamespace(get_dummy_text=Mock(return_value="dummy"))
+    processor._postprocess_prompt = lambda x: x
+    processor._get_mm_hashes = Mock(return_value=[])
+    processor._get_mm_prompt_updates = Mock(return_value=[])
+
+    audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 s -> 300 frames at hop 160
     items = MultiModalDataItems({"audio": AudioProcessorItems([(audio, 16000)])})
     inputs = SimpleNamespace(mm_data_items=items, hf_processor_mm_kwargs={}, prompt="hi")
     timing_ctx = SimpleNamespace(record=Mock(return_value=nullcontext()))

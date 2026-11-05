@@ -464,12 +464,63 @@ class _BucketedEncoder:
 
 _installed_hop: int | None = None
 
+# Registry of every class-level method patch applied by _install_processor_hook,
+# mapping (class, method_name) -> original, so _uninstall_processor_hook can roll
+# them back for test isolation.
+_PATCHED_METHODS: dict[tuple[type, str], object] = {}
+
+# Guards only the one-time class-attribute wrap (held for the wrap, never across
+# a processor call), so the first concurrent use of a class wraps exactly once.
+_wrap_lock = threading.Lock()
+
+
+def _wrap_class_method_once(cls: type, name: str, factory) -> None:
+    """Permanently wrap ``name`` on ``cls`` once; idempotent via a marker."""
+    original = cls.__dict__.get(name)
+    if original is None or getattr(original, "_bucket_frames_wrapped", False):
+        return
+    with _wrap_lock:
+        original = cls.__dict__.get(name)
+        if original is None or getattr(original, "_bucket_frames_wrapped", False):
+            return
+        wrapped = factory(original)
+        wrapped._bucket_frames_wrapped = True
+        _PATCHED_METHODS.setdefault((cls, name), original)
+        setattr(cls, name, wrapped)
+
+
+def _uninstall_processor_hook() -> None:
+    """Roll back every class-level patch installed by _install_processor_hook.
+
+    Test-isolation helper: restores each wrapped method and clears the install
+    flags so a later install starts from a clean slate.
+    """
+    global _installed_hop
+    for (cls, name), original in _PATCHED_METHODS.items():
+        setattr(cls, name, original)
+    _PATCHED_METHODS.clear()
+    _installed_hop = None
+    try:
+        from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+
+        OmniMultiModalProcessor._bucket_frames_installed = False
+    except Exception:
+        pass
+
 
 def _install_processor_hook(hop: int = _DEFAULT_HOP) -> bool:
     """Install the length-publishing processor hook, returning True when the
     hook is active for ``hop``. A mixed-hop second install returns False so the
     caller can fail safe (leave the encoder unwrapped) instead of silently
-    publishing the wrong frame rate."""
+    publishing the wrong frame rate.
+
+    The two concrete orchestration methods are patched once at class level. On
+    each call they lazily wrap the *defining* override of
+    ``_apply_hf_processor_main`` / ``_get_mm_fields_config`` on ``type(self)``
+    (walking its MRO), so whole-override subclasses and classes defined after
+    this install are all covered with no per-call mutable state, no lock held
+    across a processor run, and no race or stale-closure risk.
+    """
     try:
         from vllm.multimodal.inputs import MultiModalFieldConfig
         from vllm.multimodal.processing import BaseMultiModalProcessor
@@ -490,62 +541,53 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> bool:
             return False
         return True
 
-    # Wrap the two concrete orchestration methods so that, for every multimodal
-    # processor (both OmniMultiModalProcessor and plain BaseMultiModalProcessor
-    # subclasses), the per-item audio length is (1) added to the mm inputs from
-    # the raw audio and (2) declared as a batched keep_on_cpu field, so
-    # from_hf_inputs carries it to the worker's embed_multimodal.
-    _orig_apply = BaseMultiModalProcessor._apply_hf_processor
-    _orig_cached = BaseMultiModalProcessor._cached_apply_hf_processor
-
-    def _wrap(orig):
-        def wrapped(self, *args, **kwargs):
-            # The per-call instance-attribute swap is guarded by a per-instance
-            # reentrant lock: _cached_apply_hf_processor calls back into
-            # _apply_hf_processor, so the outer and inner wraps nest on the same
-            # thread, while distinct processor instances stay concurrent. Only the
-            # same instance must serialize (its _main/_get can hold one closure at
-            # a time); different instances never touch each other's attributes.
-            lock = self.__dict__.get("_bucket_processor_lock")
-            if lock is None:
-                # setdefault resolves the first-use race atomically; both threads
-                # reuse whichever lock wins rather than two disjoint locks.
-                lock = self.__dict__.setdefault("_bucket_processor_lock", threading.RLock())
-            with lock:
-                # Both callbacks are assigned as plain functions on the instance,
-                # so they are invoked WITHOUT binding self; the captured originals
-                # are already bound methods.
-                main = self._apply_hf_processor_main
-                get = self._get_mm_fields_config
-
-                def _main(mm_items, hf_kwargs):
-                    result = main(mm_items, hf_kwargs)
-                    try:
-                        frames = _frames_from_mm_items(mm_items, hop)
-                        if frames is not None:
-                            result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
-                    except Exception:
-                        logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
-                    return result
-
-                def _get(hf_inputs, hf_processor_mm_kwargs):
-                    fields = dict(get(hf_inputs, hf_processor_mm_kwargs))
-                    if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
-                        fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
-                    return fields
-
-                self._apply_hf_processor_main = _main
-                self._get_mm_fields_config = _get
-                try:
-                    return orig(self, *args, **kwargs)
-                finally:
-                    self._apply_hf_processor_main = main
-                    self._get_mm_fields_config = get
+    # 1. Publish the per-item length on the mm inputs.
+    def _main_factory(original):
+        def wrapped(self, mm_items, hf_kwargs):
+            result = original(self, mm_items, hf_kwargs)
+            try:
+                # Idempotent guard: a nested/cached path that reaches us twice
+                # only writes the same value.
+                if _BUCKET_FRAMES_KEY not in result:
+                    frames = _frames_from_mm_items(mm_items, hop)
+                    if frames is not None:
+                        result[_BUCKET_FRAMES_KEY] = torch.tensor(frames, dtype=torch.int64)
+            except Exception:
+                logger.warning("Bucketed encoder could not record per-item lengths", exc_info=True)
+            return result
 
         return wrapped
 
-    BaseMultiModalProcessor._apply_hf_processor = _wrap(_orig_apply)
-    BaseMultiModalProcessor._cached_apply_hf_processor = _wrap(_orig_cached)
+    # 2. Declare the field config so ``from_hf_inputs`` keeps the published key,
+    #    even when the model's own ``_get_mm_fields_config`` does not declare it.
+    def _get_factory(original):
+        def wrapped(self, hf_inputs, hf_processor_mm_kwargs):
+            fields = dict(original(self, hf_inputs, hf_processor_mm_kwargs))
+            if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
+                fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
+            return fields
+
+        return wrapped
+
+    def _ensure_wrapped(processor_type: type) -> None:
+        for name, factory in (
+            ("_apply_hf_processor_main", _main_factory),
+            ("_get_mm_fields_config", _get_factory),
+        ):
+            for cls in processor_type.__mro__:
+                if name in cls.__dict__:
+                    _wrap_class_method_once(cls, name, factory)
+                    break
+
+    def _entry(orig):
+        def wrapped(self, *args, **kwargs):
+            _ensure_wrapped(type(self))
+            return orig(self, *args, **kwargs)
+
+        return wrapped
+
+    _wrap_class_method_once(BaseMultiModalProcessor, "_apply_hf_processor", _entry)
+    _wrap_class_method_once(BaseMultiModalProcessor, "_cached_apply_hf_processor", _entry)
 
     OmniMultiModalProcessor._bucket_frames_installed = True
     _installed_hop = hop
