@@ -9,7 +9,7 @@ on CUDA and NPU platforms.
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Module
@@ -68,7 +68,7 @@ logger = init_logger(__name__)
 # offloaded back to host memory after online quantization (DLO). Over-wide
 # layers that npu_quant_matmul cannot run then load straight into host memory
 # instead of being built on the accelerator and moved off at the end of
-# loading — on MiniMax H3 the 50 fallback adaln layers are ~24 GiB of bf16,
+# loading; on MiniMax H3 the 50 fallback adaln layers are ~24 GiB of bf16,
 # which is the dominant startup memory peak.
 _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU: ContextVar[bool] = ContextVar(
     "int8_load_unquantizable_fallback_on_cpu", default=False
@@ -224,7 +224,7 @@ class DiffusionInt8Config(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix=prefix,
@@ -433,7 +433,7 @@ class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
     so under the ordinary path their bf16 weights materialize on the accelerator
     at construction time and stay there until the whole model is moved off after
     loading. When the loader has entered ``load_unquantizable_fallback_on_cpu()``
-    (offload-after-quant, i.e. DLO), that round trip is pure startup peak — the
+    (offload-after-quant, i.e. DLO), that round trip is pure startup peak; the
     weights end up pinned on the host either way and only visit the accelerator
     through the offload backend's runtime prefetch.
 
@@ -457,7 +457,7 @@ class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
         """Unquantized weights need no post-load transform.
 
         The mixin calls this when the weight is fully loaded, right before it
-        flags the layer — and the flag is what keeps the loader's post-load
+        flags the layer, and the flag is what keeps the loader's post-load
         sweep from bouncing the host tensor to the accelerator and back.
         """
 

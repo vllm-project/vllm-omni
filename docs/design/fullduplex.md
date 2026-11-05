@@ -245,7 +245,7 @@ vllm_omni/
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
 │   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
-│   │   ├── warmup.py                startup warmup probe; wait_for_duplex_warmup holds clients until it finishes
+│   │   ├── warmup.py                startup warmup probe; holds native session admission after WebSocket acceptance
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
@@ -717,6 +717,13 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
+MiniCPM-o native duplex treats `max_speak_chars_per_chunk` (default 28) as a
+soft target. It keeps the complete sampled token that reaches or crosses the
+target, then closes the chunk before another draw once the accepted prefix
+reaches the target. A decoded prefix ending in U+FFFD may continue to complete
+its UTF-8 bytes. Hard token and request caps retain priority; explicit
+`force_listen` bypasses only the soft character target.
+
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change
 scene descriptions during long video sessions. Turn-mode and non-CUDA vision
@@ -742,6 +749,13 @@ standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
 profiles. Talker and NPU attention settings are unchanged. This aligns the
 Thinker backend selection; it does not establish accuracy or performance parity
 across GPU types and layouts.
+
+The inherited CUDA duplex profile uses upstream `vllm_c` RMSNorm and fused
+add-RMSNorm, `silu_and_mul`, and QK-normalization/RoPE fusion for Thinker stage 0.
+The checkpoint's model and head dtypes are retained. The turn profile resets
+`kernel_config` and `compilation_config` to upstream defaults, including its
+MRv2 derivatives. Other platforms and Talker keep their existing settings;
+explicit engine overrides retain precedence.
 
 Tool result conversion is preparation until the session's final deadline/epoch
 check and admission. `runtime_config_for_function_output` receives an isolated
