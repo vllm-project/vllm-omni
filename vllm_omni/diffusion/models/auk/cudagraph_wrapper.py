@@ -122,7 +122,6 @@ class AuKCUDAGraphWrapper:
         if len(self._cache) + len(self._loop_cache) >= self.max_graphs:
             self._cache.clear()
             self._loop_cache.clear()
-            self._uncapturable_loop_keys.clear()
             self._active_key = None
             self._pool_handle = None
 
@@ -368,13 +367,10 @@ class AuKCUDAGraphWrapper:
         if entry is None:
             self._retire_graph_generation_if_full()
             if batch_bucket > x_buck.shape[0]:
-                orig_b = x_buck.shape[0]
                 x_buck = self._pad_batch_time(x_buck, batch_bucket, x_buck.shape[1])
                 x_mask = self._pad_batch_time(x_mask, batch_bucket, x_mask.shape[1], mask=True)
                 text_buck = self._pad_batch_time(text_buck, batch_bucket, text_buck.shape[1])
-                c_mask_buck = self._pad_batch_time(c_mask_buck, batch_bucket, c_mask_buck.shape[1], mask=True)
-                if c_mask_buck.shape[1] > 0:
-                    c_mask_buck[orig_b:, 0] = True
+                c_mask_buck = self._pad_c_mask(c_mask_buck, batch_bucket, c_mask_buck.shape[1])
                 ref_buck = self._pad_batch_time(ref_buck, batch_bucket, ref_buck.shape[1])
                 ref_mask_buck = self._pad_batch_time(ref_mask_buck, batch_bucket, ref_mask_buck.shape[1], mask=True)
             ctx = self._prepare(
@@ -465,6 +461,16 @@ class AuKCUDAGraphWrapper:
             return F.pad(tensor, (0, 0, 0, pad_t, 0, pad_b))
         return F.pad(tensor, (0, pad_t, 0, pad_b), value=False if mask else 0)
 
+    @staticmethod
+    def _pad_c_mask(c_mask: torch.Tensor, batch: int, seq: int) -> torch.Tensor:
+        """Pad ``c_mask`` to ``(batch, seq)`` while keeping at least one valid token on padded rows."""
+        orig_b = c_mask.shape[0]
+        padded = AuKCUDAGraphWrapper._pad_batch_time(c_mask, batch, seq, mask=True)
+        if batch > orig_b and padded.shape[1] > 0:
+            padded = padded.clone()
+            padded[orig_b:, 0] = True
+        return padded
+
     def _fit_loop_inputs(
         self,
         entry: _LoopGraphEntry,
@@ -483,7 +489,7 @@ class AuKCUDAGraphWrapper:
             self._pad_batch_time(x, graph_b, graph_frames),
             self._pad_batch_time(x_mask, graph_b, graph_frames, mask=True),
             self._pad_batch_time(text, graph_b, graph_text),
-            self._pad_batch_time(c_mask, graph_b, graph_text, mask=True),
+            self._pad_c_mask(c_mask, graph_b, graph_text),
             self._pad_batch_time(ref, graph_b, graph_ref),
             self._pad_batch_time(ref_mask, graph_b, graph_ref, mask=True),
         )

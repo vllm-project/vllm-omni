@@ -262,6 +262,11 @@ def test_pad_batch_time_pads_batch_and_time() -> None:
     assert padded_mask.shape == (4, 5)
     assert padded_mask.dtype == torch.bool
     assert not padded_mask[2:].any() and not padded_mask[:, 3:].any()
+    padded_c_mask = AuKCUDAGraphWrapper._pad_c_mask(mask, 4, 5)
+    assert padded_c_mask.shape == (4, 5)
+    assert torch.equal(padded_c_mask[:2, :3], mask)
+    assert padded_c_mask[2:, 0].all()
+    assert not padded_c_mask[2:, 1:].any()
 
 
 @pytest.mark.cpu
