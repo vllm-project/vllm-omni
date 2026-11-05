@@ -48,7 +48,11 @@ async def _publish_adapter(engine: AsyncOmni, factors: list[tuple[str, torch.Ten
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.asyncio
-async def test_qwen3_omni_merged_lora_ipc_preserves_graph_storage_and_restores_output():
+async def test_qwen3_omni_merged_lora_ipc_preserves_graph_storage_and_restores_output(monkeypatch):
+    # Raw CUDA IPC handles contain Python classes. The AR engine-core RPC
+    # crosses a msgpack boundary, unlike the in-process diffusion worker.
+    # Opt in only for this test's trusted, locally spawned IPC exporter.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     deploy = modify_stage_config(
         get_deploy_config_path("ci/qwen3_omni_moe.yaml"),
         updates={"async_chunk": False, "stages": {0: {"weight_transfer_config": {"backend": "omni_lora_ipc"}}}},

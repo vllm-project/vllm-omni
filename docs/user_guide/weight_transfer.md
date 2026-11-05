@@ -34,6 +34,14 @@ upstream backend support (`ipc`, `nccl`, and `sparse_nccl`). The diffusion path
 validated here is unquantized Qwen-Image using `ipc` and upstream layerwise reload.
 No separate apply-strategy setting is required.
 
+CUDA IPC handles contain serialized Python objects. For HTTP IPC updates and
+Python IPC updates to AR stages (including `omni_lora_ipc`), set
+`VLLM_ALLOW_INSECURE_SERIALIZATION=1` before creating the client and engine so
+the engine-core RPC can carry these handles. Use this opt-in only with trusted
+trainers and restrict access to weight-transfer endpoints; it permits
+pickle-based deserialization. The in-process diffusion path does not cross this
+AR RPC boundary.
+
 Other diffusion pipelines must explicitly enable `supports_weight_reload` after
 validating their loading contract. See the [design document](../design/feature/weight_transfer.md#diffusion-loading-contract).
 
