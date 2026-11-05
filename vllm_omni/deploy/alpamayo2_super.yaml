@@ -1,0 +1,63 @@
+# Alpamayo 2 Super on one H200 (BF16): Qwen3-VL reasoning (stage 0) hands each
+# request's KV prefix to the trajectory expert (stage 1), which runs the
+# requests that reach it together as one batch. NIXL moves each KV prefix
+# GPU to GPU over UCX's CUDA IPC transport.
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    env:
+      # UCX turns off CUDA IPC reads without NVLink; both stages share one GPU here.
+      UCX_CUDA_IPC_ENABLE_GET_ZCOPY: "y"
+    max_num_seqs: 6
+    max_num_batched_tokens: 8192
+    # Seven cameras x four frames plus reasoning fit in 6k tokens.
+    max_model_len: 6144
+    limit_mm_per_prompt:
+      image: 28
+      video: 0
+    # About 67 GiB of weights plus the KV cache; the expert stage uses the rest.
+    gpu_memory_utilization: 0.6
+    enforce_eager: true
+    output_connectors:
+      to_stage_1: nixl_connector
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.98
+      max_tokens: 256
+      # <|traj_future_end|>; trajectory tokens are outside the stage tokenizer.
+      stop_token_ids: [155683]
+      detokenize: false
+
+  - stage_id: 1
+    devices: "0"
+    env:
+      # UCX turns off CUDA IPC reads without NVLink; both stages share one GPU here.
+      UCX_CUDA_IPC_ENABLE_GET_ZCOPY: "y"
+    max_num_seqs: 6
+    # Collect requests that finish reasoning close together into one batch.
+    request_batch_max_wait_ms: 20
+    enforce_eager: true
+    model_config:
+      # OpenPI (/v1/realtime/robot/openpi) handshake, sent verbatim to clients.
+      policy_server_config:
+        needs_session_id: false
+        frames_per_camera: 4
+        history_steps: 16
+        action_horizon: 64
+        action_dt: 0.1
+        action_space: ego_trajectory_xyz
+      # Builds the reasoning stage's prompt from each OpenPI observation.
+      openpi_prompt_builder: vllm_omni.model_executor.models.alpamayo2_super.openpi.Alpamayo2SuperOpenPIPrompt
+    input_connectors:
+      from_stage_0: nixl_connector
+
+connectors:
+  nixl_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50071
+      backends: ["UCX"]
