@@ -16,6 +16,7 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pybase64 as base64
@@ -35,6 +36,9 @@ from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
     validate_requested_speaker,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 
 logger = init_logger(__name__)
 
@@ -373,7 +377,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 self.data_plane.retain_history_audio = True
         return self._history_calibrator
 
-    def context_view_policy(self, *, stage_id, runtime_config):
+    def context_view_policy(
+        self, *, stage_id: int, runtime_config: DuplexSessionRuntimeConfig
+    ) -> DuplexContextViewPolicy | None:
         # Only the Thinker (stage 0) formats conversation history.
         if stage_id != 0 or runtime_config.context_keep_media_turns is None:
             return None

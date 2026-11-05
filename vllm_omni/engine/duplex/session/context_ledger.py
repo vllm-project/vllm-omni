@@ -11,12 +11,16 @@ from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapsh
 
 
 class DuplexContextLevel(IntEnum):
+    """Derived node kinds: MEDIA_DROPPED is the L1 view; SUMMARY stores summaries."""
+
     MEDIA_DROPPED = 1
     SUMMARY = 2
 
 
 @dataclass(frozen=True)
 class DuplexSourceRef:
+    """A source ID and revision scoped to one live session."""
+
     source_id: int
     revision: int
 
