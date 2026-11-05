@@ -71,3 +71,47 @@ def test_video_job(
     assert_video_valid(
         responses[0].videos[0], num_frames=25 if num_frames is None else num_frames, width=256, height=256, fps=24
     )
+
+
+@pytest.mark.parametrize(
+    ("omni_server", "num_frames"),
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--enforce-eager",
+                    "--ulysses-degree",
+                    str(sp_size),
+                    "--stage-overrides",
+                    json.dumps({"0": {"devices": ",".join(str(rank) for rank in range(sp_size))}}),
+                    "--custom-pipeline-args",
+                    '{"decoder_parallel_mode":"window"}',
+                ],
+            ),
+            (10 + (sp_size - 1) * 5 - 1) * 4 + 1,
+            id=f"window-sp{sp_size}",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=sp_size),
+        )
+        for sp_size in (2, 4, 8)
+    ],
+    indirect=["omni_server"],
+)
+def test_window_parallel_video_job(omni_server: OmniServer, online_client: OnlineOmniClient, num_frames: int):
+    responses = online_client.send_video_diffusion_request(
+        {
+            "model": omni_server.model,
+            "form_data": {
+                "prompt": "A forest beside a river.",
+                "size": "256x256",
+                "num_frames": num_frames,
+                "generate_sound": False,
+                "fps": 24,
+                "num_inference_steps": 4,
+                "guidance_scale": 1.0,
+                "seed": 42,
+            },
+        }
+    )
+    assert responses[0].videos
+    assert_video_valid(responses[0].videos[0], num_frames=num_frames, width=256, height=256, fps=24)
