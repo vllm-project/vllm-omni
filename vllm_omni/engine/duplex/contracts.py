@@ -84,6 +84,8 @@ class DuplexStageSubmission:
     # Distinct from DuplexCapabilities.supports_core_resumable_request.
     resumable: bool = True
     resume_from_full_prompt: bool = False
+    # Delta eligibility must remain valid through asynchronous input processing.
+    history_revision: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))

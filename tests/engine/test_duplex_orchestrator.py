@@ -996,7 +996,7 @@ async def test_terminal_stage_error_preserves_plugin_cleanup_policy(mocker, plug
     )
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
     try:
-        await orchestrator._report_duplex_session_request_error(0, 0, output, request_state)
+        assert await orchestrator._report_duplex_session_request_error(0, 0, output, request_state)
         cleanup.assert_awaited_once_with(
             [request_state.request_id], abort=True, release_owners=close_session, trace_error="RuntimeError"
         )
@@ -1444,6 +1444,121 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         assert submitted.resume_from_full_prompt is True
         assert orchestrator.request_states[submitted.request_id].streaming.enabled
     finally:
+        await _close(orchestrator, rpc_q)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["tokenization", "multimodal"])
+@pytest.mark.parametrize("delete_history", [False, True])
+async def test_turn_delta_history_fence_covers_input_processing(mocker, phase, delete_history):
+    from dataclasses import replace
+
+    from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import (
+        DELTA_KEY,
+        QwenIncrementalPrompt,
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+    blocking = False
+
+    def pause_worker(at):
+        if blocking and at == phase:
+            entered.set()
+            assert release.wait(10), "test did not release input preprocessing"
+
+    def encode(text, **kwargs):
+        pause_worker("tokenization")
+        return [11, 12]
+
+    ledger = QwenIncrementalPrompt(SimpleNamespace(all_special_tokens=[], encode=encode))
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace()
+    mocker.patch.object(plugin, "create_turn_prompt_tokenizer", return_value=ledger)
+    orchestrator, clients, rpc_q, _ = _build(plugin=plugin, async_chunk=True)
+
+    def process_inputs(**kwargs):
+        pause_worker("multimodal")
+        return build_engine_core_request_from_tokens(
+            kwargs["request_id"], kwargs["prompt"], kwargs["params"], resumable=kwargs["resumable"]
+        )
+
+    mocker.patch.object(
+        orchestrator,
+        "_get_stage_input_processor",
+        return_value=SimpleNamespace(tokenizer=object(), process_inputs=process_inputs),
+    )
+    mocker.patch.object(orchestrator.stage_pools[0].output_processor, "remove_request", create=True)
+    assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+    session = orchestrator.session_manager.get(SESSION_ID)
+    assert session is not None
+    await _submit(
+        orchestrator,
+        commands.CreateItem(
+            item={
+                "id": "old-user",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "old context"}],
+            }
+        ),
+    )
+    assert session.history
+    context = DuplexStageRequestContext(
+        request_id=_stage0_request_id(),
+        session_id=SESSION_ID,
+        fence=session.fence,
+        stage_id=0,
+        final_stage_id=0,
+        config_generation=0,
+        sampling_params=orchestrator.sampling_defaults(),
+    )
+    orchestrator.ensure_request(context)
+    first = DuplexStageSubmission(
+        context=context, prompt={"prompt": "first"}, already_submitted=False, resume_from_full_prompt=True
+    )
+    task = None
+    try:
+        await orchestrator.submit(first)
+        ledger.record_output([31, 99], True)
+        await orchestrator.finish_turn(context.request_id)
+        state = orchestrator.request_states[context.request_id]
+        state.turn_entry_finished = True
+        old_prompt = list(ledger._prompt_ids)
+        old_output = list(ledger._output_ids)
+        delta = replace(
+            first,
+            prompt={"prompt": "delta", DELTA_KEY: True},
+            already_submitted=True,
+            history_revision=session.history_revision,
+        )
+        blocking = True
+        task = asyncio.create_task(orchestrator.submit(delta))
+        assert await asyncio.to_thread(entered.wait, 5)
+        if delete_history:
+            await _submit(orchestrator, commands.DeleteItem(item_id="old-user"))
+            assert session.history_revision != delta.history_revision
+        release.set()
+        if delete_history:
+            with pytest.raises(DuplexInputCapacityError, match="Conversation changed"):
+                await task
+            assert len(clients[0].add_request_calls) == 1
+            assert ledger._prompt_ids == old_prompt and ledger._output_ids == old_output
+            assert ledger._finished
+            assert state.turn_entry_finished and state.turn_resources_released
+            # Rejected preprocessing must not poison the resident's next attempt.
+            await orchestrator.submit(replace(first, prompt={"prompt": "rebuilt"}, already_submitted=True))
+            assert len(clients[0].add_request_calls) == 2
+            assert clients[0].add_request_calls[-1][0].append_prefix_length is None
+        else:
+            await task
+            assert len(clients[0].add_request_calls) == 2
+            assert clients[0].add_request_calls[-1][0].append_prefix_length == len(old_prompt) + len(old_output) - 1
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
         await _close(orchestrator, rpc_q)
 
 

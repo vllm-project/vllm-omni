@@ -75,6 +75,8 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
     turn_prompt_tokenizer: DuplexPromptTokenizer | None = None
+    # Set only while a submission owns the stage's input-processing guard.
+    input_history_revision: int | None = None
     turn_entry_finished: bool = False
     turn_resources_released: bool = False
     pending_turn_terminal: tuple[int, int, RequestOutput, StageRequestStats | None, float | None] | None = None
@@ -407,19 +409,20 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         replica_id: int | None,
         eco: OmniEngineCoreOutput,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
+        """Report a terminal session error and tell the base loop it was consumed."""
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
-            return
+            return False
         # Segment boundaries do not terminate a resumable request. Context
         # overflow emits a separate terminal ERROR with is_segment_finished=False.
         if getattr(eco, "is_segment_finished", False):
-            return
+            return False
         reason = getattr(eco, "stop_reason", None)
         error = reason if isinstance(reason, str) and reason else "duplex session request failed"
         # Duplex sessions receive session events, not the ordinary request queue's
         # ErrorMessage. Close a resident session before another append can recreate
         # its finished stage request without the model's voice/persona prefill.
-        await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+        return await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
 
     async def _handle_forward_failure(
         self,
@@ -639,6 +642,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request = OmniEngineCoreRequest.from_request(request)
         return request
 
+    def _validate_turn_history(self, state: DuplexOrchestratorRequestState, revision: int | None) -> None:
+        """Reject a stale delta before committing its ledger or sending input."""
+        if revision is None:
+            return
+        session = self.session_manager.get(state.session_id) if state.session_id is not None else None
+        if session is None or session.history_revision != revision:
+            raise DuplexInputCapacityError("Conversation changed during turn preparation; retry the response")
+
     async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
         request_id = kwargs.get("request_id")
         state = self.request_states.get(request_id) if isinstance(request_id, str) else None
@@ -704,6 +715,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     raise
                 kwargs["prompt"] = prepared
         request = await super()._process_stage_inputs(stage_id, **kwargs)
+        if stage_id == 0 and isinstance(state, DuplexOrchestratorRequestState):
+            self._validate_turn_history(state, state.input_history_revision)
         if complete_turn is not None:
             assert isinstance(prompt, dict)
             request = OmniEngineCoreRequest.from_request(request)
@@ -741,8 +754,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             if submission.resume_from_full_prompt:
                 if submission.already_submitted and not request_state.turn_resources_released:
                     raise DuplexInputCapacityError("Previous Thinker turn has not finished retiring its transport")
-                request_state.turn_entry_finished = False
-                request_state.turn_resources_released = False
+            self._validate_turn_history(request_state, submission.history_revision)
             pinned_replica_id = self._session_route(context.stage_id, request_state)
             if pinned_replica_id is not None:
                 self.stage_pools[context.stage_id].bind_request_to_replica(context.request_id, pinned_replica_id)
@@ -766,15 +778,24 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 request_state.prompt = dict(submission.prompt)
                 # Use the ordinary multimodal input processor for turn-model plugins.
                 # Its CPU preprocessing runs off the session/orchestrator event loop.
-                request = await self._build_next_stage_request(
-                    context.request_id,
-                    context.stage_id,
-                    dict(submission.prompt),
-                    context.stage_sampling_params,
-                    resumable=submission.resumable,
-                )
+                request_state.input_history_revision = submission.history_revision
+                try:
+                    request = await self._build_next_stage_request(
+                        context.request_id,
+                        context.stage_id,
+                        dict(submission.prompt),
+                        context.stage_sampling_params,
+                        resumable=submission.resumable,
+                    )
+                finally:
+                    request_state.input_history_revision = None
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
+            self._validate_turn_history(request_state, submission.history_revision)
+            if submission.resume_from_full_prompt:
+                # A rejected delta leaves the completed turn retryable.
+                request_state.turn_entry_finished = False
+                request_state.turn_resources_released = False
             request.external_req_id = request.request_id
             request.resume_from_full_prompt = submission.resume_from_full_prompt
             mm_features = getattr(request, "mm_features", None)

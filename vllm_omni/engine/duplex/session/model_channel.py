@@ -507,6 +507,7 @@ class ModelChannel:
                     already_submitted=already_submitted,
                     resumable=resumable,
                     resume_from_full_prompt=turn_continuation,
+                    history_revision=history_revision if use_delta else None,
                 )
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input
