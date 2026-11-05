@@ -27,6 +27,7 @@ from typing import Any
 
 import av
 from camera_utils import wasd_to_camera_payload
+from websockets.exceptions import ConnectionClosed
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -230,7 +231,8 @@ async def _run_prompt_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's prompt schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
@@ -238,7 +240,7 @@ async def _run_prompt_update_scheduler(
         payload = {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"scheduled-prompt-{update.at:.3f}",
+                "event_id": f"scheduled-prompt-{index}",
                 "event": {"prompt": update.prompt},
                 "transition_chunks": update.transition_chunks,
             },
@@ -255,13 +257,14 @@ async def _run_camera_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's camera schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
 
         interaction: dict[str, Any] = {
-            "event_id": f"scheduled-camera-{update.at:.3f}",
+            "event_id": f"scheduled-camera-{index}",
             "event": {"multi_modal_data": {"camera": update.camera}},
         }
         if update.transition_chunks is not None:
@@ -317,6 +320,16 @@ def save_video(
     )
 
 
+async def _send_heartbeats(websocket: Any, send_lock: asyncio.Lock) -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            async with send_lock:
+                await websocket.send(json.dumps({"type": "session.ping"}))
+        except ConnectionClosed:
+            return
+
+
 async def stream_video(args: argparse.Namespace) -> None:
     payload = build_session_start(args)
     output_path = Path(args.output)
@@ -331,11 +344,13 @@ async def stream_video(args: argparse.Namespace) -> None:
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
     camera_update_task: asyncio.Task[None] | None = None
+    heartbeat_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
         async with connect(url, max_size=None) as websocket:
             ws = websocket
+            heartbeat_task = asyncio.create_task(_send_heartbeats(websocket, send_lock))
             async with send_lock:
                 await websocket.send(json.dumps(payload))
             print(f"Connected: {url}")
@@ -432,6 +447,10 @@ async def stream_video(args: argparse.Namespace) -> None:
                 pass
         raise
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         if prompt_update_task is not None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

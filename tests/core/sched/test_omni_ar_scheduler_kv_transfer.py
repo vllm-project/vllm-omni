@@ -113,6 +113,7 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     adapter._confirmed_num_computed_tokens.return_value = 1
 
     sched = mocker.MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False

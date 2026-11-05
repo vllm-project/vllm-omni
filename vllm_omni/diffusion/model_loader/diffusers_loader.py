@@ -387,19 +387,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-        quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
-        )
-        use_torchao = (
-            not use_safetensors
-            and quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "torchao"
-            and getattr(quant_config, "is_checkpoint_torchao_serialized", False)
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
@@ -410,7 +402,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self.load_config.use_tqdm_on_load,
                 max_workers=num_threads,
             )
-        elif use_torchao:
+        elif not use_safetensors:
+            # PyTorch pickles (.bin/.pt/.pth); torchao-serialized checkpoints take this path too.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = pt_weights_iterator(
                 sorted_hf_weights_files,
