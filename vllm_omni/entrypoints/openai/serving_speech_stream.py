@@ -249,6 +249,8 @@ class OmniStreamingSpeechHandler:
                         if config is None:
                             return  # Error already sent, connection closing
                         continue  # Keep serving with the previous config
+                    else:
+                        logger.info("Streaming speech session configured: %s", new_config)
                     config = new_config
                     splitter = SpeechTextSplitter(config.split_granularity)
 
@@ -337,6 +339,7 @@ class OmniStreamingSpeechHandler:
                     await self._cleanup_commitment_utterance(commitment)
                     commitment = None
                     await websocket.close()
+                    logger.info("Streaming speech session closed")
                     return
 
                 else:
