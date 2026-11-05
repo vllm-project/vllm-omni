@@ -177,6 +177,7 @@ TWO_STAGE_CASES = (
         gemma_model_id="diffusers/LTX-2.3-Diffusers",
         gemma_model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
         gemma_model_env="VLLM_TEST_LTX23_MODEL",
+        enable_layerwise_offload=True,
         image=I2V_IMAGE,
     ),
     LTXAccuracyCase(
