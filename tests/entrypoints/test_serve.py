@@ -723,6 +723,17 @@ def test_serve_parser_rejects_negative_robot_openpi_idle_timeout() -> None:
         parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "-1"])
 
 
+def test_serve_parser_accepts_tts_streaming_idle_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--tts-streaming-idle-timeout", "45"])
+
+    assert args.tts_streaming_idle_timeout == 45
+    assert args.get_explicit_kwargs_dict()["tts_streaming_idle_timeout"] == 45
+
+
 def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
