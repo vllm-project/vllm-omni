@@ -219,7 +219,38 @@ def test_graph_capture_failure_falls_back_to_eager(mocker) -> None:
     capture_single.assert_not_called()
     assert not wrapper._loop_cache
 
+    # Mixed-length batch fallback: verify _run_eager_loop receives unbucketed x_mask (shape [2, 9])
+    # and matches serial execution for the shorter row.
+    eager_loop_spy = mocker.spy(wrapper, "_run_eager_loop")
+    batched_inputs = {name: torch.cat([tensor, tensor]) for name, tensor in inputs.items()}
+    x_mask_mixed = torch.tensor([[True] * 6 + [False] * 3, [True] * 9], device="cuda")
+    serial_short = sample_latents(
+        dit,
+        **inputs,
+        gen_frames=9,
+        x_mask=x_mask_mixed[:1],
+        t_grid=[0.0, 0.4, 1.0],
+        cfg_strength=0.0,
+        generator=torch.Generator(device="cuda").manual_seed(17),
+    )
+    fallback_batch = sample_latents(
+        dit,
+        **batched_inputs,
+        gen_frames=9,
+        x_mask=x_mask_mixed,
+        t_grid=[0.0, 0.4, 1.0],
+        cfg_strength=0.0,
+        generator=[
+            torch.Generator(device="cuda").manual_seed(17),
+            torch.Generator(device="cuda").manual_seed(23),
+        ],
+        sampler=wrapper,
+    )
+    assert eager_loop_spy.call_args.kwargs["x_mask"].shape == (2, 9)
+    torch.testing.assert_close(fallback_batch[:1, :6], serial_short[:, :6], atol=1e-5, rtol=1e-5)
 
+
+@pytest.mark.cpu
 def test_pad_batch_time_pads_batch_and_time() -> None:
     x = torch.ones(2, 3, 4)
     padded = AuKCUDAGraphWrapper._pad_batch_time(x, 4, 5)
@@ -233,6 +264,7 @@ def test_pad_batch_time_pads_batch_and_time() -> None:
     assert not padded_mask[2:].any() and not padded_mask[:, 3:].any()
 
 
+@pytest.mark.cpu
 def test_larger_loop_entry_reuses_near_batch_and_rejects_tiny_batch() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False)
     fake128 = object()
@@ -253,6 +285,7 @@ def test_larger_loop_entry_reuses_near_batch_and_rejects_tiny_batch() -> None:
     assert entry is None
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
 def test_batch_sampling_preserves_each_request_seed(cfg_strength: float) -> None:
@@ -322,6 +355,7 @@ def test_loop_replay_updates_schedule_and_reuses_larger_batch(cfg_strength: floa
     assert actual.dtype == torch.float32
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_text_only_eager_batch_with_unequal_lengths_matches_serial() -> None:
     """Masking must prevent padded text positions from leaking into text-only attention."""
@@ -375,6 +409,7 @@ def test_text_only_eager_batch_with_unequal_lengths_matches_serial() -> None:
     torch.testing.assert_close(actual_short, expected_serial, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_batched_unequal_target_lengths_matches_serial() -> None:
     """Masking on target latents ensures shorter requests in a batch match their serial generation."""
