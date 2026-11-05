@@ -248,7 +248,8 @@ class _BucketedEncoder:
         """
         if self._shim is not None:
             return 2
-        return self._default_time_axis if self._default_time_axis is not None else 1
+        assert self._default_time_axis in (1, 2), "verified model must specify time_axis"
+        return self._default_time_axis
 
     def _time_dim(self, features) -> int:
         return features.size(1) if self._axis == 1 else features.size(2)
@@ -464,25 +465,30 @@ class _BucketedEncoder:
 _installed_hop: int | None = None
 
 
-def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
+def _install_processor_hook(hop: int = _DEFAULT_HOP) -> bool:
+    """Install the length-publishing processor hook, returning True when the
+    hook is active for ``hop``. A mixed-hop second install returns False so the
+    caller can fail safe (leave the encoder unwrapped) instead of silently
+    publishing the wrong frame rate."""
     try:
         from vllm.multimodal.inputs import MultiModalFieldConfig
         from vllm.multimodal.processing import BaseMultiModalProcessor
 
         from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
     except Exception:
-        return
+        return False
     global _installed_hop
     if getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False):
         if _installed_hop is not None and _installed_hop != hop:
             logger.warning(
                 "Bucketed encoder processor hook already installed with hop %d; "
-                "a second install with hop %d is ignored (mixed-hop models in one "
-                "process are unsupported).",
+                "refusing to install with hop %d (mixed-hop models in one process "
+                "are unsupported). The encoder is left unwrapped.",
                 _installed_hop,
                 hop,
             )
-        return
+            return False
+        return True
 
     # Wrap the two concrete orchestration methods so that, for every multimodal
     # processor (both OmniMultiModalProcessor and plain BaseMultiModalProcessor
@@ -544,6 +550,7 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
     OmniMultiModalProcessor._bucket_frames_installed = True
     _installed_hop = hop
     logger.info("Bucketed encoder processor hook installed")
+    return True
 
 
 def _frames_from_mm_items(mm_items, hop: int = _DEFAULT_HOP) -> list[int] | None:
@@ -572,22 +579,21 @@ def install_bucketed_processor_hook(vllm_config=None) -> bool:
     Request preprocessing (and therefore ``_apply_hf_processor_main``) runs in
     the frontend/orchestrator process, not in the worker that wraps the encoder,
     so the hook must be registered where the frontend builds its multimodal
-    processor. Idempotent; returns True when bucketing is enabled (the hook is
-    installed or already was). ``vllm_config`` supplies the model's hop so the
-    published length matches the encoder's real frame rate.
+    processor. Idempotent; returns True when the hook is active. A None or
+    unverified ``vllm_config`` returns False (the model's encoder is not wrapped,
+    so the processor must not publish ``encoder_bucket_frames`` for it), and a
+    mixed-hop second install also returns False so the caller can fail safe.
     """
     if _rungs_from_env() is None:
         return False
     verified = _verified_knobs(vllm_config)
-    if vllm_config is not None and verified is None:
-        # Unverified model: leave it fully untouched (the worker's wrapper is
-        # also skipped), matching the warning in install_bucketed_encoders.
+    if verified is None:
+        # Unverified model (or no vllm_config): leave it fully untouched — the
+        # worker's wrapper is also skipped, so publishing lengths here would
+        # hand the model a field its encoder ignores.
         return False
-    hop = _DEFAULT_HOP
-    if verified is not None and verified.get("hop"):
-        hop = verified["hop"]
-    _install_processor_hook(hop)
-    return True
+    hop = verified.get("hop") or _DEFAULT_HOP
+    return _install_processor_hook(hop)
 
 
 def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder]) -> None:
@@ -635,6 +641,16 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         return []
 
     hop = verified.get("hop") or _DEFAULT_HOP
+    # Fail safe before wrapping: if the processor hook is already publishing a
+    # different frame rate (mixed-hop models in one process), wrapping this
+    # encoder would bucket by the wrong lengths.
+    if not _install_processor_hook(hop):
+        logger.warning(
+            "Bucketed encoder processor hook is unavailable for hop %d; "
+            "leaving encoders unwrapped so lengths are not mis-bucketed.",
+            hop,
+        )
+        return []
     rungs = _rungs_from_env(hop)
     ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
     pattern_src = os.environ.get(_ENV_MODULES, "").strip() or _MODULE_PATTERN
@@ -676,7 +692,6 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         logger.warning("Bucketed encoder enabled but no encoder matched %r", pattern_src)
         return []
 
-    _install_processor_hook(hop)
     _wrap_embed_multimodal(model, encoders)
     model._bucketed_installed = True
     logger.info("Bucketed encoder enabled over rungs %s for modules %s", rungs, wrapped)

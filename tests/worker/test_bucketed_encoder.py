@@ -136,16 +136,19 @@ def restore_processor_hook():
     from vllm.multimodal.processing import BaseMultiModalProcessor
 
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+    from vllm_omni.worker import bucketed_encoder
 
     saved_main = OmniMultiModalProcessor._apply_hf_processor_main
     saved_apply = BaseMultiModalProcessor._apply_hf_processor
     saved_cached = BaseMultiModalProcessor._cached_apply_hf_processor
     saved_flag = getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
+    saved_hop = bucketed_encoder._installed_hop
     yield
     OmniMultiModalProcessor._apply_hf_processor_main = saved_main
     BaseMultiModalProcessor._apply_hf_processor = saved_apply
     BaseMultiModalProcessor._cached_apply_hf_processor = saved_cached
     OmniMultiModalProcessor._bucket_frames_installed = saved_flag
+    bucketed_encoder._installed_hop = saved_hop
 
 
 def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
@@ -696,11 +699,17 @@ def test_processor_hook_is_frontend_installable_and_env_gated(monkeypatch, resto
     from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
     from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
 
+    whitelisted = _mock_vllm_config("step_audio_2")
+
     monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", raising=False)
-    assert install_bucketed_processor_hook() is False
+    assert install_bucketed_processor_hook(whitelisted) is False
 
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-    assert install_bucketed_processor_hook() is True
+    # None means unverified: the hook must not install for a model whose encoder
+    # will not be wrapped.
+    assert install_bucketed_processor_hook() is False
+    # A whitelisted model installs the hook.
+    assert install_bucketed_processor_hook(whitelisted) is True
     assert getattr(OmniMultiModalProcessor, "_bucket_frames_installed", False)
 
 
@@ -720,7 +729,7 @@ def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_pro
     from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
 
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "2,4,8,16,30")
-    install_bucketed_processor_hook()
+    install_bucketed_processor_hook(_mock_vllm_config("step_audio_2"))
 
     class Processor(OmniMultiModalProcessor):
         def _get_mm_fields_config(self, *args):
@@ -754,6 +763,39 @@ def test_processor_hook_adds_and_declares_bucket_frames(monkeypatch, restore_pro
                     elems = [elems]
                 bucket_values.extend(int(e.data) for e in elems)
     assert bucket_values == [300]
+
+
+def test_mixed_hop_install_fails_safe_and_leaves_encoder_unwrapped(monkeypatch, restore_processor_hook):
+    """A second model with a different hop must not wrap its encoder after the
+    first model already installed the processor hook: the published length uses
+    the first hop, so bucketing the second encoder with its own hop would give
+    silently wrong rung lengths. Both installers must fail safe instead."""
+    from vllm_omni.worker import bucketed_encoder
+    from vllm_omni.worker.bucketed_encoder import install_bucketed_processor_hook
+
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "0.4,1,2")
+
+    # First model installs the hook with hop 160.
+    monkeypatch.setattr(
+        bucketed_encoder,
+        "_verified_knobs",
+        lambda vllm_config: {"hop": 160, "context_margin": 0, "time_axis": 1},
+    )
+    assert install_bucketed_processor_hook(_mock_vllm_config("model_a")) is True
+
+    # Second model (hop 200): the processor hook refuses, and the worker wrapper
+    # is skipped so its encoder is never bucketed with the wrong frame rate.
+    monkeypatch.setattr(
+        bucketed_encoder,
+        "_verified_knobs",
+        lambda vllm_config: {"hop": 200, "context_margin": 0, "time_axis": 1},
+    )
+    assert install_bucketed_processor_hook(_mock_vllm_config("model_b")) is False
+
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=_mock_vllm_config("model_b")) == []
+    assert type(model.encoder.forward).__name__ != "_BucketedEncoder"
+    assert bucketed_encoder._installed_hop == 160  # first hop wins; second refused
 
 
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
