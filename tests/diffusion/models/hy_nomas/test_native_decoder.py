@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from tests.diffusion.models.hy_nomas.test_hy_nomas import DECODER_CONFIG
 from vllm_omni.diffusion.models.hy_nomas import decoder as decoder_module
-from vllm_omni.diffusion.models.hy_nomas import pixelumm, pixelumm_model
+from vllm_omni.diffusion.models.hy_nomas import decoder_kernels, pixelumm, pixelumm_model
 from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_decoder
 
@@ -245,3 +245,12 @@ def test_native_load_weights_stacks_qkv_and_mlp_projections():
     del checkpoint["decoder.head.norm.weight"]
     with pytest.raises(ValueError, match="missing 1 tensors"):
         tiny_decoder().load_weights(checkpoint.items())
+
+
+@torch.inference_mode()
+def test_fused_kernels_leave_cpu_to_eager():
+    x = torch.randn(1, 16, 8, 128, dtype=torch.bfloat16)
+    weight = torch.ones(64, dtype=torch.bfloat16)
+    cos, sin = decoder_module.mrope_tables(decoder_module.PixelUMMArchitecture(), (1, 4, 4), torch.device("cpu"))
+    # CPU never reaches Triton or torch.compile; the callers' eager math runs.
+    assert decoder_kernels.split_norm_rope(x, cos, sin, weight, weight, 1e-6) is None

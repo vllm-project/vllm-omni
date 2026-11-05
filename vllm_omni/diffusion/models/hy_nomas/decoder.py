@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.activation import SiluAndMul
+from vllm_omni.diffusion.models.hy_nomas.decoder_kernels import apply_mrope, split_norm_rope
 
 # Ported from jiaxiangc/diffusers at 12722ef11acf8e335f96cfd4faea17de78cd8909.
 # Preserve checkpoint names, FP32 normalization, and absolute-frame decoder noise.
@@ -104,11 +105,6 @@ def unpatchify(tokens: torch.Tensor, grid: tuple[int, int, int]) -> torch.Tensor
     return x.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(batch, 3, nt * pt, nh * ph, nw * pw)
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
 def mrope_tables(arch: PixelUMMArchitecture, grid: tuple[int, int, int], device) -> tuple[torch.Tensor, torch.Tensor]:
     """cos/sin [1, T*H*W, 1, head_dim] for a T/H/W-ordered grid, laid out [T | H | W]."""
     axes = [torch.arange(size, device=device) for size in grid]
@@ -125,13 +121,6 @@ def mrope_tables(arch: PixelUMMArchitecture, grid: tuple[int, int, int], device)
         torch.cat(cos_parts, dim=-1)[None, :, None, :],
         torch.cat(sin_parts, dim=-1)[None, :, None, :],
     )
-
-
-def apply_mrope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, sections) -> torch.Tensor:
-    """x [B,N,H,D]; each section is rotated within itself (rotate_half per axis)."""
-    parts = x.split(tuple(sections), dim=-1)
-    rotated = torch.cat([_rotate_half(part) for part in parts], dim=-1)
-    return x * cos + rotated * sin
 
 
 def local_attention_layout(grid, tile, device):
@@ -196,6 +185,10 @@ def _norm_rope(part, cos, sin, norm_t, norm_hw, sections, dtype):
 
 def prepare_qk(tensor, cos, sin, norm_t, norm_hw, sections, dtype):
     """Split FP32 Q/K norm and MRoPE for ``[B, N, heads, D]``, rounded once to ``dtype``."""
+    if dtype == tensor.dtype:
+        fused = split_norm_rope(tensor, cos, sin, norm_t.weight, norm_hw.weight, norm_t.eps)
+        if fused is not None:
+            return fused
     # Bound FP32 intermediates while preserving each token's reduction order.
     batch, tokens, heads, dim = tensor.shape
     chunk = max(1, _QK_CHUNK_INPUT_BYTES // (batch * heads * dim * 4))
