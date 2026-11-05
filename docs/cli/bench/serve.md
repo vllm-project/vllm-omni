@@ -328,6 +328,12 @@ filtering and local media. The default is three samples and single concurrency;
 without repeating it. `--seed` controls shuffling; `--disable-shuffle` preserves
 dataset order.
 
+For performance runs without judging, `--duplex-sample-pool-size N` selects a
+fixed pool and repeats it to reach `--num-prompts`, with distinct output
+identities. With this option, `--num-prompts 0` selects exactly `N` samples,
+rather than the full dataset. The same pool behavior applies to OmniInteract;
+answer evaluation and oversampling with `--no-oversample` are rejected.
+
 For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex.yaml`,
 use the same entrypoint with server-detected turns and no reference audio:
 
@@ -792,8 +798,10 @@ Clips remain unmodified: each math clip lasts about five minutes, with two
 questions roughly two and a half minutes apart. This measures intermittent
 generation under concurrent realtime input. Both jobs skip the extra endpoint
 readiness replay (`ready_check_timeout_sec: 0`) and use `num_warmups: 8`:
-one concurrent wave of eight full sessions replays the first sample before
-measurement. Warmup outputs enter neither performance statistics nor judging.
+one concurrent wave of eight full sessions replays identical first-sample inputs
+before measurement. The explicit count pins warmup to C8 even if runner defaults
+change; it does not represent the diversity or cache-hit rate of measured inputs.
+Warmup outputs enter neither performance statistics nor judging.
 Engine startup separately warms kernels and captures configured CUDA Graph
 batch sizes; full-session warmup does not establish that every shape is warm.
 The runner also supports a warmup list with one non-negative integer per sweep
@@ -802,8 +810,19 @@ point; a scalar applies to every point.
 At C8, 60 math sessions take approximately eight five-minute waves, or 40 minutes
 of formal replay, plus about five minutes of warmup. Startup, response drain,
 artifact publication and judge evaluation add to that estimate. Both jobs retain
-the 180-minute timeout; the full expanded workload still needs hardware validation.
+the 180-minute timeout; validation on the target H100/B200 CI hardware remains outstanding.
 OOM, request failures, incomplete artifacts and judge failures fail the job.
+For sizing context, the 2026-11-05 local H200 run (reported by the driver as
+L20X) took 11.5 minutes for the 120-session Omni-DuplexEval measured replay and
+22.7 minutes for the complete pytest job, including startup, warmup and judging.
+These are local observations, not an H100/B200 timeout guarantee.
+
+The generic summary also displays E2E latency and generated audio duration.
+E2E here spans a complete replayed session, including realtime input; it is not
+per-response generation latency. Client TTFT, append TTFP and append RTF appear
+in the separate duplex per-response summary. Server `busy_rtf` and `stall_ratio`
+require `duplex_session.collect_stats`; the nightly overlay leaves this optional
+instrumentation disabled, so these measurements are unavailable rather than zero.
 
 OmniInteract judging uses the same formal outputs as the performance report and
 records All Global IA-QTF1 plus evaluated/skipped counts. The official eligibility

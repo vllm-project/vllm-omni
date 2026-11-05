@@ -22,7 +22,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
-from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
+from tests.helpers.assertions import assert_duplex_artifact_publication
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -537,6 +537,10 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         accuracy = summary.get("accuracy")
         assert isinstance(accuracy, dict), "Omni-DuplexEval accuracy is missing"
         assert accuracy.get("status") == "completed", "Omni-DuplexEval accuracy did not complete"
+        assert all(
+            isinstance(accuracy.get(field), int) and not isinstance(accuracy[field], bool)
+            for field in ("total", "evaluated", "failed", "skipped")
+        ), "Omni-DuplexEval accuracy coverage is incomplete"
         assert (accuracy.get("total"), accuracy.get("evaluated"), accuracy.get("failed"), accuracy.get("skipped")) == (
             num_prompt,
             num_prompt,
@@ -583,6 +587,7 @@ def assert_result(result, params, num_prompt) -> None:
                     accuracy.get("total") == num_prompt
                     and isinstance(evaluated, int)
                     and isinstance(skipped, int)
+                    and not isinstance(skipped, bool)
                     and skipped >= 0
                     and evaluated + skipped == num_prompt
                 ), "OmniInteract accuracy coverage is incomplete"

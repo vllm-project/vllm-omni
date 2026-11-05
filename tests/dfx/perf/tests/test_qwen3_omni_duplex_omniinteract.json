@@ -42,7 +42,7 @@
         "omniinteract_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a_math",
         "omniinteract_max_video_duration_s": 600,
-        "percentile-metrics": "ttft,audio_ttfp,audio_rtf",
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
         "name": "c8_accuracy_response_v4",
         "duplex_metric_aggregation": "response",
         "metric-percentiles": "50,95",

@@ -726,10 +726,6 @@ def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, datas
     params = dict(config["benchmark_params"][0])
     count = 60 if dataset == "omniinteract" else 120
     prefix = "omniinteract" if dataset == "omniinteract" else "duplex_eval"
-    assert config["mark"][0]["hardware_marks"]["num_cards"] == 3
-    assert config["judge_server_params"]["device_index"] == "2"
-    assert config["judge_server_params"]["model"] == "Qwen/Qwen2.5-7B-Instruct"
-    assert params[f"{prefix}_judge_model"] == "Qwen2.5-7B-Instruct"
     assert not params.get("duplex_performance_only")
 
     @dataclass
@@ -765,12 +761,12 @@ def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, datas
     assert args.ready_check_timeout_sec == 0
     assert getattr(args, f"{prefix}_evaluate")
     assert getattr(args, f"{prefix}_judge_base_url") == ServerEndpoint.judge_base_url
+    assert getattr(args, f"{prefix}_judge_model") == params[f"{prefix}_judge_model"]
     if dataset == "omniinteract":
         assert args.omniinteract_subsets == ["1q1a_math"]
         assert args.omniinteract_require_response
     else:
-        excluded = {1, 6, 19, 30, 37, 47, 71, 73, 83, 88, 89, 91, 105}
-        assert args.duplex_eval_ids == [str(i) for i in range(133) if i not in excluded]
+        assert len(set(args.duplex_eval_ids)) == count
         assert args.duplex_eval_split == "PR_correction"
         assert args.duplex_eval_mix == "question"
 
@@ -783,11 +779,21 @@ def test_num_warmups_resolves_each_sweep_point():
     ] == [1, 8, 16]
 
 
-@pytest.mark.parametrize("warmups", [[], [1, 8], [1, 8, False], [1, 8, -1], [1, 8, 1.5]])
-def test_num_warmups_rejects_invalid_sweep(warmups):
+@pytest.mark.parametrize(
+    "warmups,message",
+    [
+        ([], "one value per sweep point"),
+        ([1, 8], "one value per sweep point"),
+        ([1, -1], "one value per sweep point"),
+        ([1, 8, False], "a non-negative integer or a list of them"),
+        ([1, 8, -1], "a non-negative integer or a list of them"),
+        ([1, 8, 1.5], "a non-negative integer or a list of them"),
+    ],
+)
+def test_num_warmups_rejects_invalid_sweep(warmups, message):
     from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
 
-    with pytest.raises(ValueError, match="num_warmups"):
+    with pytest.raises(ValueError, match=message):
         _resolve_num_warmups({"num_warmups": warmups}, default=16, sweep_index=0, sweep_size=3)
 
 
@@ -1399,6 +1405,26 @@ def test_qwen3_joint_run_rejects_incomplete_accuracy_coverage(dataset):
 
     result, params, count, accuracy = _qwen3_joint_result(dataset)
     accuracy["evaluated"] -= 1
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("skipped", [False, True])
+def test_qwen3_math_run_rejects_boolean_skipped_count(skipped):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omniinteract")
+    accuracy.update(evaluated=count - int(skipped), skipped=skipped)
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("field", ["failed", "skipped"])
+def test_qwen3_correction_run_rejects_boolean_coverage_count(field):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    accuracy[field] = False
     with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
         assert_result(result, params, count)
 

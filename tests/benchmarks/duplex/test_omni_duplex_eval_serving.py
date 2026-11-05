@@ -18,7 +18,7 @@ import websockets
 from aiohttp import web
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
+from tests.helpers.assertions import assert_duplex_artifact_publication
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_serving as adapter
 from vllm_omni.benchmarks.patch import patch
@@ -151,14 +151,16 @@ def test_repeated_sweep_runs_keep_artifacts_isolated(tmp_path, prepared):
         assert json.loads((root / "PR_correction/0.json").read_text())["sentences"] == [{"sentence": str(concurrency)}]
 
 
-@pytest.mark.parametrize("count", [1, 2, 4])
-def test_sample_pool_replays_inputs_with_distinct_metrics_and_artifacts(tmp_path, prepared, count):
-    args = _args(tmp_path, "--num-prompts", str(count), "--duplex-sample-pool-size", "2")
+@pytest.mark.parametrize("count,pool_size,expected_count", [(0, 1, 1), (1, 2, 1), (2, 2, 2), (4, 2, 4)])
+def test_sample_pool_replays_inputs_with_distinct_metrics_and_artifacts(
+    tmp_path, prepared, count, pool_size, expected_count
+):
+    args = _args(tmp_path, "--num-prompts", str(count), "--duplex-sample-pool-size", str(pool_size))
     preprocess_serve_args(args)
     samples = patch.get_samples(args, None)
-    assert len(samples) == args.num_prompts == count
-    assert len({sample.request_id for sample in samples}) == count
-    assert len({sample.sample.id for sample in samples}) == count
+    assert len(samples) == args.num_prompts == expected_count
+    assert len({sample.request_id for sample in samples}) == expected_count
+    assert len({sample.sample.id for sample in samples}) == expected_count
     if count == 4:
         assert [sample.sample.id for sample in samples] == ["0", "1", "0__repeat_1", "1__repeat_1"]
         assert samples[2].sample.video == samples[0].sample.video
@@ -169,7 +171,7 @@ def test_sample_pool_replays_inputs_with_distinct_metrics_and_artifacts(tmp_path
         output.duplex_eval_result = replace(_result(sample), timed_sentences=[{"sentence": str(index)}])
         outputs.append(output)
     summary = adapter.finalize_duplex_eval(samples, outputs)
-    assert summary["published"] == count and not summary["artifact_errors"]
+    assert summary["published"] == expected_count and not summary["artifact_errors"]
     for index, sample in enumerate(samples):
         path = sample.response_root / sample.sample.split / f"{sample.sample.id}.json"
         assert json.loads(path.read_text())["sentences"] == [{"sentence": str(index)}]

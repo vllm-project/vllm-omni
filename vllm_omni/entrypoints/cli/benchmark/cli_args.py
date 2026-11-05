@@ -227,9 +227,9 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
 
 
-def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
-    group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
+def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared duplex workload and metric options."""
+    group = parser.add_argument_group("Duplex Benchmark Options")
     group.add_argument(
         "--duplex-metric-aggregation",
         choices=("session", "response"),
@@ -242,9 +242,15 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Select a fixed pool of OmniInteract or Omni-DuplexEval sessions and cycle it to reach --num-prompts. "
+            "With a pool, --num-prompts 0 selects exactly the pool size instead of the full dataset. "
             "For performance runs without answer evaluation; repeated sessions use distinct output identities."
         ),
     )
+
+
+def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
+    group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
     group.add_argument(
         "--print-stage",
         action="store_true",
@@ -601,6 +607,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
+    add_duplex_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)

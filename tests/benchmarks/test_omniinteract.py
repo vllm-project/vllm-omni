@@ -20,7 +20,7 @@ import pytest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from vllm.benchmarks.serve import TaskType
 
-from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
+from tests.helpers.assertions import assert_duplex_artifact_publication
 from vllm_omni.benchmarks import omniinteract as oi
 from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data

@@ -42,7 +42,7 @@
         "duplex_eval_turn_detection": "server_vad",
         "duplex_eval_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
         "duplex_eval_response_root": "tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/PR_correction",
-        "percentile-metrics": "ttft,audio_ttfp,audio_rtf",
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
         "duplex_metric_aggregation": "response",
         "metric-percentiles": "50,95",
         "duplex_eval_ids": [
