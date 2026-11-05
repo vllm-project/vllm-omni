@@ -2378,6 +2378,36 @@ def test_stage_pool_requested_replica_rejects_locally_unavailable_replica() -> N
     assert all(not client.add_request_calls for client in clients)
 
 
+@pytest.mark.parametrize(
+    ("state", "replica_id", "expected_available"),
+    [
+        ("available", 0, True),
+        ("out-of-range-low", -1, False),
+        ("out-of-range-high", 2, False),
+        ("detached", 1, False),
+        ("marked-unavailable", 1, False),
+    ],
+)
+def test_local_explicit_validation_matches_automatic_availability(
+    state: str,
+    replica_id: int,
+    expected_available: bool,
+) -> None:
+    pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
+    if state == "detached":
+        pool.clients[replica_id] = None
+    elif state == "marked-unavailable":
+        pool.mark_replica_unavailable(replica_id)
+
+    automatic_available = pool.is_replica_available(replica_id)
+    assert automatic_available is expected_available
+    if automatic_available:
+        pool._validate_requested_replica(replica_id)
+    else:
+        with pytest.raises(OmniClientError):
+            pool._validate_requested_replica(replica_id)
+
+
 def test_bind_requested_replica_validates_once(mocker: MockerFixture) -> None:
     pool, _, _ = _distributed_routing_pool()
     validate = mocker.spy(pool, "_validate_requested_replica")
