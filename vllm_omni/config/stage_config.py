@@ -348,7 +348,7 @@ def _scheduler_path(cls: type[VLLMScheduler] | None) -> str | None:
 
 @dataclass(frozen=True)
 class StagePipelineConfig:
-    """Fixed topology for one stage (frozen, not user-configurable)."""
+    """Fixed topology and lifecycle defaults for one stage (frozen)."""
 
     stage_id: int
     model_stage: str
@@ -366,6 +366,8 @@ class StagePipelineConfig:
     hf_config_name: str | None = None
     engine_output_type: str | None = None
     model_arch: str | None = None
+    # LLM stage process cleanup grace in seconds; None retains vLLM's default.
+    shutdown_grace_s: float | None = None
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
@@ -1577,6 +1579,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                shutdown_grace_s=ps.shutdown_grace_s,
                 stage_role=ps.stage_role.value if ps.stage_role is not None else None,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
@@ -1622,6 +1625,7 @@ class StageConfig:
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    shutdown_grace_s: float | None = None
 
     def to_omegaconf(self) -> Any:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
@@ -1718,5 +1722,8 @@ class StageConfig:
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)
         config_dict.update(self.yaml_extras)
+
+        if self.shutdown_grace_s is not None:
+            config_dict["shutdown_grace_s"] = self.shutdown_grace_s
 
         return create_config(config_dict)

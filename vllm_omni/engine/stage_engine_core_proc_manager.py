@@ -14,12 +14,13 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
 Liveness monitoring is inherited from :class:`CoreEngineProcManager`.
-Spark's BiCodec stage receives extra exit grace for decoder cleanup.
+The stage configuration can supply extra process cleanup grace.
 """
 
 from __future__ import annotations
 
 import contextlib
+import math
 import threading
 import weakref
 from multiprocessing.process import BaseProcess
@@ -60,7 +61,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
     """
 
     def shutdown(self, timeout: float | None = None) -> None:
-        super().shutdown(timeout=self._codec_shutdown_grace_s if timeout is None else timeout)
+        super().shutdown(timeout=self._shutdown_grace_s if timeout is None else timeout)
 
     def __init__(
         self,
@@ -80,6 +81,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         tensor_queue: Queue | None = None,
         omni_parallel_stage_init: bool = False,
         omni_handshake_timeout_s: float | None = None,
+        shutdown_grace_s: float | None = None,
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
@@ -87,12 +89,9 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
-        model_config = getattr(vllm_config, "model_config", None)
-        # Spark's decoder can spend extra time in interpreter GC after releasing
-        # CUDA resources. Other stages retain the upstream shutdown policy.
-        self._codec_shutdown_grace_s = (
-            15.0 if getattr(model_config, "model_arch", None) == "SparkBiCodecDecoder" else None
-        )
+        if shutdown_grace_s is not None and (not math.isfinite(shutdown_grace_s) or shutdown_grace_s < 0):
+            raise ValueError("shutdown_grace_s must be finite and nonnegative, or None")
+        self._shutdown_grace_s = shutdown_grace_s
 
         # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
         # this to bound how long in-flight requests may drain. Omitting it makes

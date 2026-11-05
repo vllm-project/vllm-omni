@@ -49,12 +49,16 @@ The official source used in validation was
 `2f1ea9082400547242641f5271b6f941c9f439d1`. Make it importable in the
 Omni environment without installing its older pinned PyTorch over Omni's
 PyTorch. The Spark-specific imports used by the CI job are `einops==0.8.2`,
-`einx==0.4.3`, `omegaconf==2.3.1`, and `soxr==1.1.0`; install their
+`einx==0.4.3`, `frozendict==2.5.1`, `omegaconf==2.3.1`, and `soxr==1.1.0`; install their
 dependencies as needed and verify the environment with `pip check`.
 
 The CUDA CI dependency image caches that pinned source at `SPARK_TTS_SOURCE`
 and installs the codec dependencies during image construction. The offline
-GPU test uses those installed files.
+GPU test uses those installed files. Building this dependency layer still
+requires access to `github.com/SparkAudio/Spark-TTS` and the pinned commit.
+The build checks the resolved commit and imports BiCodec before accepting the
+image. A failed fetch stops image construction; it does not fall back to an
+unpinned revision. GPU test jobs do not clone or install Spark dependencies.
 
 Stage 0 validates the selected tokenizer's global and semantic code ranges
 and stop markers before constructing the model. A mismatched tokenizer raises
@@ -130,6 +134,11 @@ An empty or whitespace-only `SPARK_TTS_REF_TEXT` selects cloning without a
 transcript. A nonempty transcript requires semantic codes from the reference
 encoder. The decoder receives one scheduling placeholder per finished
 request; all speech codes are delivered through the stage connector.
+
+The Spark pipeline declares `shutdown_grace_s=15.0` for its BiCodec stage to
+allow decoder cleanup to finish. Other stages keep the upstream shutdown
+policy unless their pipeline declares a grace period. An explicit shutdown
+timeout takes precedence over this stage default.
 
 ## Verification and limits
 
