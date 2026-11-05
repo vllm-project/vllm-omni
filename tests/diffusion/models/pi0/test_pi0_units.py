@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU unit tests for the π0 (Pi-Zero) VLA model.
 
 Deliberately lightweight: pure utility code (config plumbing, mask building,
@@ -546,6 +546,7 @@ def _selfconsist_model(device):
     model = Pi0ForActionPrediction(
         Pi0Config(max_action_dim=32, max_state_dim=32, chunk_size=50, num_inference_steps=10, dtype="float32")
     )
+    assert _SELFCONSIST_CKPT is not None
     state = safetensors.torch.load_file(os.path.join(_SELFCONSIST_CKPT, "model.safetensors"))
     filled = model.load_weights(list(state.items()))
     expected = {n for n, _ in model.named_parameters() if "rotary_emb" not in n and not n.endswith(".inv_freq")}

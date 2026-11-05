@@ -710,6 +710,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        weight_version: str | None = None,
     ) -> OutputProcessorOutput:
         default_mm_type = _modality_to_type_string(self.output_modality)
 
@@ -718,10 +719,38 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        admission_outputs: list[OmniRequestOutput] = []
+        admission_aborts: list[str] = []
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None:
+                continue
+
+            # Paused-engine and other pre-execution failures ship RequestError
+            # and nothing was run. StagePool registers queue=None, so upstream's
+            # queue.put short-circuit does not run here or in super(). Key on
+            # error, not finish_reason: pooling cache misses use ERROR with
+            # error is None and must stay on the normal path. weight_version is
+            # forwarded only into super(), which is the detokenizer path.
+            error = getattr(eco, "error", None)
+            if error is not None:
+                if req_state.queue is not None:
+                    req_state.queue.put(error.to_exception())
+                else:
+                    message = getattr(error, "message", None)
+                    code = getattr(error, "code", None)
+                    external_id = getattr(req_state, "external_req_id", None) or eco.request_id
+                    admission_outputs.append(
+                        OmniRequestOutput.from_error(
+                            external_id,
+                            message if isinstance(message, str) and message else str(error),
+                            error_type=code if isinstance(code, str) else None,
+                        )
+                    )
+                if req_state.streaming_input:
+                    admission_aborts.append(eco.request_id)
+                self._finish_request(req_state)
                 continue
 
             # Accumulate multimodal tensors regardless of path.
@@ -770,10 +799,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
+            weight_version=weight_version,
         )
         return OutputProcessorOutput(
-            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
-            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
+            request_outputs=admission_outputs + mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=admission_aborts + mm_reqs_to_abort + upstream_processed.reqs_to_abort,
         )
 
     def _process_mm_only_outputs(
