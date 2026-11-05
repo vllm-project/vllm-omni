@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.config.stage_config import load_deploy_config, resolve_platform_duplex_session
 
 
 def modify_stage_config(
@@ -724,14 +724,15 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
-def get_deploy_duplex_max_sessions(rel_path: str) -> int:
+def get_deploy_duplex_max_sessions(rel_path: str, platform: str | None = None) -> int:
     """Return the duplex session capacity a deploy yaml admits.
 
     Loads through ``load_deploy_config`` so ``base_config`` merging and
     ``DuplexSessionRuntimeConfig`` defaults stay in lockstep with the server
     instead of being re-implemented here.
     """
-    return load_deploy_config(get_deploy_config_path(rel_path)).duplex_session.max_sessions
+    deploy = load_deploy_config(get_deploy_config_path(rel_path))
+    return resolve_platform_duplex_session(deploy, platform).max_sessions
 
 
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:

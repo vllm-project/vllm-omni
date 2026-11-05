@@ -28,9 +28,11 @@ from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
+    DeployConfig,
     DuplexSessionRuntimeConfig,
     PipelineConfig,
     load_deploy_config,
+    resolve_platform_duplex_session,
 )
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
@@ -75,6 +77,12 @@ _REQUEST_QUEUE_MAXSIZE = 256
 # Output messages one serving-loop wakeup takes before yielding the event loop.
 _OUTPUT_DRAIN_MAX_BATCH = 256
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
+
+
+def _load_engine_deploy_config(path: str | Path) -> DeployConfig:
+    deploy = load_deploy_config(path)
+    deploy.duplex_session = resolve_platform_duplex_session(deploy)
+    return deploy
 
 
 def load_and_resolve_stage_configs(
@@ -244,7 +252,7 @@ class OmniEngineBase:
                 deploy_config_source = candidate
         if deploy_config_source is not None:
             try:
-                self.deploy_config = load_deploy_config(deploy_config_source)
+                self.deploy_config = _load_engine_deploy_config(deploy_config_source)
                 self._deploy_config_source = str(deploy_config_source)
             except Exception:
                 if deploy_config_path is not None:
@@ -668,7 +676,7 @@ class OmniEngineBase:
                 # Already parsed in __init__; the same yaml twice is pure cost.
                 self.duplex_session_config = self.deploy_config.duplex_session
             else:
-                self.duplex_session_config = load_deploy_config(config_path).duplex_session
+                self.duplex_session_config = _load_engine_deploy_config(config_path).duplex_session
 
     def _resolve_stage_configs(
         self,

@@ -54,6 +54,8 @@ platforms:
         kv_cache_memory_bytes: 2147483648  # 2 GiB
 
   npu:
+    duplex_session:
+      max_sessions: 4
     stages:
       - stage_id: 0
         # Two-replica sizing, restated for the NPU render (see the note on the
@@ -66,7 +68,7 @@ platforms:
         kv_cache_memory_bytes: 6442450944
 
       - stage_id: 1
-        # Two-replica sizing, restated for the NPU render (base NPU: 8 / 0.10).
+        # Two-replica sizing, restated for the NPU render (base NPU: 16 / 0.10).
         max_num_seqs: 4
         gpu_memory_utilization: 0.08
         # Explicit KV cap: the auto-computed value does not leave room for the
