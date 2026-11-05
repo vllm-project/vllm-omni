@@ -53,12 +53,18 @@ def _pad_rows(value: torch.Tensor, target_batch: int) -> torch.Tensor:
     return torch.cat((value, value.new_zeros((missing, *value.shape[1:]))), dim=0)
 
 
-def _pad_cache_rows(value: torch.Tensor, target_batch: int) -> torch.Tensor:
-    """Append all-zero request slots to a packed cache (batch is dim 1)."""
-    missing = target_batch - int(value.shape[1])
+def _pad_cache_rows(value: torch.Tensor, target_batch: int, *, dim: int = 1) -> torch.Tensor:
+    """Append all-zero request slots to a cache, whose batch axis is ``dim``.
+
+    The CNN cache is ``(depth, batch, channels, width)``; the estimator attention
+    cache is ``(depth, 2, batch, heads, frames, head_dim)`` with the K/V half
+    ahead of the batch, so it pads along dim 2.
+    """
+    missing = target_batch - int(value.shape[dim])
     if missing <= 0:
         return value
-    return torch.cat((value, value.new_zeros((value.shape[0], missing, *value.shape[2:]))), dim=1)
+    shape = (*value.shape[:dim], missing, *value.shape[dim + 1 :])
+    return torch.cat((value, value.new_zeros(shape)), dim=dim)
 
 
 def _parse_batch_buckets(raw: object) -> tuple[int, ...]:
@@ -140,15 +146,25 @@ def _graphable_estimator_step(
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
     old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+    # Upstream expects ``[K | V]`` packed per layer while the kept buffers are split by
+    # K/V half: pack on the way in, unpack the result back.
+    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+        _pack_att_cache,
+        _packed_att_buffer,
+        _unpack_att_cache,
+    )
+
+    packed_out = _packed_att_buffer(att_out)
     result = estimator.blocks_forward_chunk(
         estimator_input,
         time_embedding,
         attn_mask,
         old_cnn,
-        old_att,
+        _pack_att_cache(old_att),
         cnn_out,
-        att_out,
+        packed_out,
     )
+    _unpack_att_cache(packed_out, att_out)
     return result, cnn_out, att_out
 
 
@@ -244,13 +260,14 @@ def _patched_estimator_step(
                 mask_inputs = (attn_mask,)
             if cnn_cache is not None:
                 cnn_cache = _pad_cache_rows(cnn_cache, padded_batch)
-                att_cache = _pad_cache_rows(att_cache, padded_batch)
+                att_cache = _pad_cache_rows(att_cache, padded_batch, dim=2)
 
     def _unpad(outputs):
         if padded_batch == live_batch:
             return outputs
         result, new_cnn, new_att = outputs
-        return (result[:live_batch], new_cnn[:, :live_batch], new_att[:, :live_batch])
+        # ``new_att`` keeps the split ``(depth, 2, batch, ...)`` layout.
+        return (result[:live_batch], new_cnn[:, :live_batch], new_att[:, :, :live_batch])
 
     if cnn_cache is None:
         return _unpad(

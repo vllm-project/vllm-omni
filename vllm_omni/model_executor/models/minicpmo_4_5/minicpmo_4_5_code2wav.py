@@ -35,7 +35,12 @@ from .batched_token2wav import (
 )
 from .code2wav_watchdog import Code2WavWatchdog
 from .config_flags import read_bool_flag
-from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .cuda_graph_wrapper import (
+    DEFAULT_HIFT_GRAPH_EXACT_BATCH_SIZES,
+    ResidentAttCache,
+    _format_memory_delta,
+    _memory_snapshot,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -439,8 +444,14 @@ class MiniCPMO45Code2Wav(nn.Module):
             "hift_max_lazy_graphs": int(extra.get("hift_max_lazy_graphs", 8)),
             "hift_graph_codec_chunk_frames": list(extra.get("hift_graph_codec_chunk_frames") or ()),
             "hift_graph_first_chunk_frames": list(extra.get("hift_graph_first_chunk_frames") or ()),
-            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames") or ()),
-            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes") or (1,)),
+            # Shared graph policy: continuation widths 3-33 (14-74 mel frames) at batch 1-2;
+            # those ~31 x 2 extra HiFT graphs cost warmup time and graph memory on every platform.
+            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames", (3, 33)) or ()),
+            # Same shape as continuation_frames: an explicit [] disables
+            # the batch-size graphs, a missing key keeps the shared default.
+            "hift_graph_exact_batch_sizes": list(
+                extra.get("hift_graph_exact_batch_sizes", DEFAULT_HIFT_GRAPH_EXACT_BATCH_SIZES) or ()
+            ),
         }
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
