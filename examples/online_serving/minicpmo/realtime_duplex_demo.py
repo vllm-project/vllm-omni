@@ -474,17 +474,21 @@ async def _drain_forced_post_commit_response(
     ``response.done`` -- even a cancelled one, or the settle of a pre-commit
     response -- means the promotion may still be in flight and the drain keeps
     waiting instead of re-asking into ``response_already_active``. A native
-    auto-response session never defers: its commit submits the retained input
-    at once or acknowledges with nothing scheduled, so a post-commit settle is
-    final -- the server is idle, and suppressing the re-ask there would strand
-    an already-answered session in ``TimeoutError``; the re-ask stays armed
-    and settles it on the forced answer or on the definitive refusal. Errors
-    reported after the commit suppress the re-ask either way, since the
-    server is refusing rather than slow. The flip side for CI triage on a
-    deferring session: if the server drops the deferred create after such
-    activity, the drain can only end in ``TimeoutError`` -- no re-ask will
-    have fired -- so a client timeout in that situation points at a lost
-    promotion on the server side, not at a missing fallback.
+    auto-response session never defers an audio-driven commit: it submits the
+    retained input at once or acknowledges with nothing scheduled, so a
+    post-commit settle is final -- the server is idle, and suppressing the
+    re-ask there would strand an already-answered session in ``TimeoutError``;
+    the re-ask stays armed and settles it on the forced answer or on the
+    definitive refusal. (The one deferral a native session still has is the
+    video-only commit -- no audio in the buffer while a response runs, on a
+    model that accepts video without audio and has no concurrent-turn
+    capability. This driver's commits all carry audio, so they never take
+    that path.) Errors reported after the commit suppress the re-ask either
+    way, since the server is refusing rather than slow. The flip side for CI
+    triage on a deferring session: if the server drops the deferred create
+    after such activity, the drain can only end in ``TimeoutError`` -- no
+    re-ask will have fired -- so a client timeout in that situation points
+    at a lost promotion on the server side, not at a missing fallback.
 
     A re-ask can itself fail client-side: a send landing inside a transport
     resume window raises ``DuplexConnectionError`` while the session is still
@@ -1003,10 +1007,19 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         timeout_s=args.timeout_s,
                         create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
                         # The MiniCPM-o session runs the native auto-response
-                        # scheduler: its commit never parks the forced create
-                        # behind an active response, so a settle that lands
-                        # after the commit is final instead of the preamble of
-                        # a promotion -- the re-ask must stay armed for it.
+                        # scheduler: its audio commits never park the forced
+                        # create behind an active response (the one deferral
+                        # left is a video-only commit, and this driver's
+                        # commits all carry audio), so a settle that lands
+                        # after the commit is final instead of the preamble
+                        # of a promotion -- the re-ask must stay armed for it.
+                        # The flag is read from the client config rather than
+                        # guessed: ``SessionConfig.to_payload`` puts this same
+                        # ``auto_response`` value into the session's
+                        # ``extra_body`` at connect time, and the server
+                        # derives its auto-response scheduling from exactly
+                        # that key, so the client copy is the value the
+                        # server is acting on.
                         commit_may_defer_create=not client.config.auto_response,
                         on_fallback_sent=lambda: fallback_progress.__setitem__("sent", True),
                     )

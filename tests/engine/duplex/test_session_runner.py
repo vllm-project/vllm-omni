@@ -1399,6 +1399,61 @@ async def test_auto_response_commit_with_create_response_precreates_the_forced_a
 
 
 @pytest.mark.asyncio
+async def test_create_response_commit_is_dropped_while_a_response_is_still_running() -> None:
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        # A first turn opens the response the session is still answering.
+        await h.run(append_audio(3200, value=0.05))
+        await h.run(commands.Commit())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, turn_id=0))
+        running_response_id = h.session.active_response_id
+        assert running_response_id is not None
+        # New speech then commits with an explicit response_create: the forced
+        # create is dropped rather than bound onto the running answer (which
+        # would misattribute the in-flight response), and the commit still
+        # submits the retained final input, keeping the client's re-ask armed
+        # for after that response settles.
+        await h.run(append_audio(3200, value=0.05))
+        events = await h.run(commands.Commit(create_response=True))
+        event_types = types(events)
+        assert "input_audio_buffer.committed" in event_types
+        assert "response.created" not in event_types
+        assert h.session.active_response_id == running_response_id
+        final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert final_append["final"] is True
+        assert base64.b64decode(final_append["payload"]["audio"]) == (
+            pcm_f32(3200, value=0.05) + pcm_f32(12800, value=0.0)
+        )
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_create_response_commit_is_dropped_without_model_native_turn_policy() -> None:
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        # The session's extra_body still drives the auto-response scheduler
+        # while the capability flag is off: a non-native session keeps opening
+        # its responses on model output, so the commit's forced create must
+        # not precreate there either -- only the retained committed input,
+        # which keeps the client's re-ask armed.
+        h.session.capabilities = replace(h.session.capabilities, supports_model_native_turn_policy=False)
+        for _ in range(7):
+            await h.run(append_audio(3200, value=0.05))
+        events = await h.run(commands.Commit(create_response=True))
+        event_types = types(events)
+        assert "input_audio_buffer.committed" in event_types
+        assert "response.created" not in event_types
+        final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert final_append["final"] is True
+        assert base64.b64decode(final_append["payload"]["audio"]) == (
+            pcm_f32(6400, value=0.05) + pcm_f32(9600, value=0.0)
+        )
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_touches_the_lease_and_acks() -> None:
     clock = {"now": 100.0}
     h = await open_harness(clock=lambda: clock["now"])

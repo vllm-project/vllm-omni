@@ -1586,15 +1586,13 @@ class EventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
-    def errors(self, exclude_indexes: Container[int] | None = None) -> list[dict[str, object]]:
+    def errors(self, exclude_indexes: Container[int] = frozenset()) -> list[dict[str, object]]:
         """Collected ``error`` events, optionally skipping forgive-list indexes.
 
         ``exclude_indexes`` refers to positions in :attr:`events`, so callers
         that forgive specific errors keep a single definition of what an error
         is instead of re-filtering ``events`` themselves.
         """
-        if exclude_indexes is None:
-            return [event for event in self.events if event.get("type") == "error"]
         return [
             event
             for index, event in enumerate(self.events)
