@@ -62,18 +62,85 @@ Incoming frames can be buffered while an answer is being generated; speech audio
 is delivered after synthesis finishes. Prompts retain up to four recent camera
 frames (thumbnail size at most 448×448) and eight recent text messages. Older
 history/frames are evicted when the expanded visual-token count plus the generation
-budget would exceed the configured Stage 0 context limit. The active instruction
+budget would exceed the configured JoyAI-stage context limit. The active instruction
 and newest frame are retained; an oversized instruction is reported as an error.
 These bounds provide a small working context, with summary memory planned in
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
-The next speech-input integration will reuse the Qwen3-ASR pipeline and audio-free
-bypass added by [#8031](https://github.com/vllm-project/vllm-omni/pull/8031), with
-audio buffering and commit handling in the unified Session. Summary memory and
-tool delegation follow the later steps in that RFC. The current profile accepts
+The current profile accepts
 text, images, and camera frames, and uses the existing CustomVoice
 `tts_speaker`, `tts_language`, and `tts_instruct` fields in `session.extra_body`.
 The default `joyai_vl_interaction.yaml` remains turn-based.
+
+### Speech input
+
+Select the ASR duplex overlay to accept microphone input on the same Session:
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_asr_duplex.yaml \
+  --port 8099
+```
+
+Send PCM audio through `input_audio_buffer.append`, then
+`input_audio_buffer.commit` with `create_response: true`; alternatively configure
+`session.audio.input.turn_detection` with `type: "server_vad"`. Session owns
+buffering, cancellation, VAD and playback acknowledgements. Qwen3-ASR transcribes
+each committed utterance; JoyAI receives that transcript together with the original
+visual inputs, standing instructions and committed conversation. Transcripts are
+added to the matching user history item, so later camera observations retain the
+spoken task. Text/video-only turns bypass ASR on this deployment. The final
+expanded prompt is checked against JoyAI's context budget after transcription.
+
+Speech output remains all-sync. Summary memory is a separate follow-up tracked by
+[RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
+
+### Tool delegation
+
+The duplex profile can hand a hard question to the client instead of answering it.
+Declare the one supported function with a `session.update`; the `tools` field is a
+top-level session key:
+
+```json
+{"type":"session.update","session":{"tools":[{
+  "type":"function","name":"delegate",
+  "description":"Ask a background helper to answer one question the current view cannot answer reliably.",
+  "parameters":{"type":"object","properties":{
+    "question":{"type":"string"},"note":{"type":"string"}},
+    "required":["question"],"additionalProperties":false}}]}}
+```
+
+Any other declaration is refused. With the tool declared, JoyAI may answer with
+`</response> <note> </delegation> <question>`; the session then publishes a standard
+function call instead of failing the observation:
+
+```json
+{"type":"response.function_call_arguments.done","call_id":"call_…",
+ "arguments":"{\"note\":\"Checking the pot.\",\"question\":\"Is the pot overheated?\"}"}
+```
+
+The client executes the question however it likes and returns the digest:
+
+```json
+{"type":"conversation.item.create","item":{
+  "type":"function_call_output","call_id":"call_…","output":"It is smoking."}}
+```
+
+The session ledger admits that result once; a duplicate, unknown or cancelled
+`call_id` is refused with `invalid_function_call_output`. An accepted result does not
+enter the conversation history — it becomes a `[Delegated Results]` block in later
+JoyAI prompts, so the model can answer it in a following observation.
+
+Two behaviours to plan for in a client:
+
+- A delegating observation publishes **two** terminal responses: the synthesised
+  function-call response and the spoken one. The note's audio belongs to the spoken
+  response, so its playback acknowledgement must name that `response_id`; acking the
+  function-call response is refused with `playback_item_not_found`.
+- The duplex profile is serial: the next camera commit is admitted only after the
+  note's playback is acknowledged in full. Ask the model to answer once the helper has
+  replied (a short user turn such as "Answer now with the result you received."), which
+  is what makes a delegated answer spoken.
 
 ### Browser client
 
@@ -89,8 +156,13 @@ python -m examples.online_serving.realtime_web --profile joyai-turn \
 Set the instruction, start the session, and enable Camera. Observations are
 committed once per second while idle; **Send observation** submits the current
 frame manually. The client waits for response completion and playback before
-submitting the latest pending frame. Microphone input is planned with ASR
-integration; generated speech already plays through the shared audio component.
+submitting the latest pending frame. With the ASR duplex deployment, add
+`--speech-input` for **Hold to talk**, releasing to commit a spoken instruction.
+Add `--speech-input --vad` for automatic speech commits with server VAD; camera
+frames accompany utterances, while automatic camera-only observations are paused
+in VAD mode. Starting speech clears queued reply audio immediately, including
+after reply generation has completed. Use push-to-talk for continuous camera
+observations between utterances.
 
 ## Standalone interaction server
 

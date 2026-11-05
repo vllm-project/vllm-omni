@@ -1,6 +1,5 @@
 # HSDP Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -144,7 +143,7 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 \
 In `DiffusionParallelConfig`:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `use_hsdp` | bool | False | Enable HSDP |
 | `hsdp_shard_size` | int | -1 | Number of GPUs to shard weights across. `-1` = auto (requires other parallelism > 1) |
 | `hsdp_replicate_size` | int | 1 | Number of replica groups. Each group holds a full sharded copy |

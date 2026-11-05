@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from functools import partial
+
 import pytest
 import torch
 
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
+from vllm.outputs import RequestError
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.stats import IterationStats, LoRARequestStates, RequestStateStats
@@ -40,7 +43,17 @@ def audio_scheduler():
     return request, sched
 
 
-def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop: bool = False, nan_count: int = 0):
+def _step(
+    mocker,
+    sched,
+    request: Request,
+    token: int | None,
+    mm_output,
+    *,
+    stop: bool = False,
+    nan_count: int = 0,
+    fast_decode: bool = False,
+):
     scheduler_output = mocker.Mock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {request.request_id: 1}
     scheduler_output.total_num_scheduled_tokens = 1
@@ -51,7 +64,7 @@ def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop
         req_id_to_index={request.request_id: 0},
         sampled_token_ids=[[]] if token is None else [[token]],
         multimodal_outputs=[mm_output],
-        num_nans_in_logits={request.request_id: nan_count},
+        num_nans_in_logits=None if fast_decode else {request.request_id: nan_count},
     )
 
     def _update(req, new_token_ids, **_kwargs):
@@ -66,25 +79,27 @@ def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop
     return list(outputs[request.client_index].outputs) if request.client_index in outputs else []
 
 
-def test_token_only_steps_ride_on_the_next_audio_output(mocker, audio_scheduler) -> None:
+@pytest.mark.parametrize("fast_decode", [False, True])
+def test_token_only_steps_ride_on_the_next_audio_output(mocker, audio_scheduler, fast_decode) -> None:
     request, sched = audio_scheduler
+    step = partial(_step, fast_decode=fast_decode)
 
-    (first,) = _step(mocker, sched, request, 10, {})
+    (first,) = step(mocker, sched, request, 10, {})
     assert first.new_token_ids == [10]
     assert first.prefill_stats is not None
     assert not first.is_coalesced
 
-    assert _step(mocker, sched, request, 11, {}) == []
-    assert _step(mocker, sched, request, None, None) == []
-    assert _step(mocker, sched, request, 12, {}) == []
+    assert step(mocker, sched, request, 11, {}) == []
+    assert step(mocker, sched, request, None, None) == []
+    assert step(mocker, sched, request, 12, {}) == []
 
-    (audio,) = _step(mocker, sched, request, 13, _AUDIO)
+    (audio,) = step(mocker, sched, request, 13, _AUDIO)
     assert audio.new_token_ids == [11, 12, 13]
     assert audio.multimodal_output is _AUDIO
     assert audio.is_coalesced
 
-    assert _step(mocker, sched, request, 14, {}) == []
-    (last,) = _step(mocker, sched, request, 15, {}, stop=True)
+    assert step(mocker, sched, request, 14, {}) == []
+    (last,) = step(mocker, sched, request, 15, {}, stop=True)
     assert last.new_token_ids == [14, 15]
     assert last.finish_reason is not None
     assert last.is_coalesced
@@ -150,7 +165,12 @@ def test_external_termination_flushes_pending_tokens_after_request_removal(
 
         sched._handle_failed_kv_load_outputs = finish_kv_failure
     elif termination == "grammar_error":
-        sched.grammar_compile_error_reqs = {request.request_id}
+        sched.grammar_compile_error_reqs = {
+            request.request_id: RequestError(
+                code="validation_error",
+                message="Invalid structured outputs: fixture",
+            )
+        }
     elif termination == "input_timeout":
         OmniSchedulerMixin._finish_input_timeout_requests(sched, {request.request_id})
     elif termination == "context_overflow":

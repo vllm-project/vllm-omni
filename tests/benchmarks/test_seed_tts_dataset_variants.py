@@ -10,6 +10,7 @@ vllm stubs are installed by tests/benchmarks/conftest.py before collection.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -238,6 +239,150 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
         assert req.seed_tts_utterance_id == "ok"
 
 
+def test_utmos_device_uses_visible_cuda_or_npu_ordinal():
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import _resolve_utmos_device
+
+    # Nightly accuracy keeps the server on the first visible card and scores on the second.
+    assert _resolve_utmos_device("cuda:1", "cuda:1", "0,1") == "cuda:1"
+    assert _resolve_utmos_device("", "cuda:1", "4,5") == "cuda:1"
+    assert _resolve_utmos_device("cuda:0", "npu:1", None) == "cuda:0"
+    assert _resolve_utmos_device("", "npu:1", None) == "npu:1"
+    assert _resolve_utmos_device("npu:1", "", "") == "npu:1"
+
+
+def test_utmos_device_rejects_cpu_empty_mask_and_out_of_range():
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import _resolve_utmos_device
+
+    with pytest.raises(ValueError, match="cannot run on"):
+        _resolve_utmos_device("cpu", "cuda:1", "0,1")
+    with pytest.raises(ValueError, match="outside CUDA_VISIBLE_DEVICES"):
+        _resolve_utmos_device("cuda:2", "", "0,1")
+    with pytest.raises(ValueError, match="set but empty"):
+        _resolve_utmos_device("", "", "")
+    with pytest.raises(ValueError, match="set but empty"):
+        _resolve_utmos_device("cuda:0", "", " , ")
+
+
+def test_utmos_npu_physical_id_uses_visible_mask():
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import _utmos_npu_physical_id
+
+    # Unset mask: logical ordinal is the physical id. Nightly scores on npu:1.
+    assert _utmos_npu_physical_id(1, None) == "1"
+    assert _utmos_npu_physical_id(0, None) == "0"
+    # Parent sees a subset; the child must be given the physical id, not the logical one.
+    assert _utmos_npu_physical_id(1, "6,7") == "7"
+    assert _utmos_npu_physical_id(0, "6,7") == "6"
+
+
+def test_utmos_npu_physical_id_rejects_empty_mask_and_out_of_range():
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import _utmos_npu_physical_id
+
+    with pytest.raises(ValueError, match="set but empty"):
+        _utmos_npu_physical_id(0, "")
+    with pytest.raises(ValueError, match="set but empty"):
+        _utmos_npu_physical_id(0, " , ")
+    with pytest.raises(ValueError, match="outside ASCEND_RT_VISIBLE_DEVICES"):
+        _utmos_npu_physical_id(1, "4")
+
+
+def test_utmos_npu_worker_start_isolates_one_card_and_restores_parent(monkeypatch):
+    """The child inherits a one-card mask; the parent keeps the eval mask for Whisper."""
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    seen: dict[str, str | None] = {}
+
+    class FakeConn:
+        def recv(self):
+            return ("ready", "")
+
+        def close(self):
+            pass
+
+        def poll(self, timeout):
+            assert timeout == 300
+            return True
+
+    class FakeProc:
+        def start(self):
+            seen["during_start"] = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            seen["terminated"] = "yes"
+
+    class FakeCtx:
+        def Pipe(self, duplex=True):
+            assert duplex is True
+            return FakeConn(), FakeConn()
+
+        def Process(self, target, args, daemon, name):
+            assert daemon is True
+            assert name == "utmos-npu"
+            assert args[0] == "/tmp/utmos.jit"
+            seen["target"] = target.__name__
+            return FakeProc()
+
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "6,7")
+    monkeypatch.setattr(seed_tts_eval.multiprocessing, "get_context", lambda method: FakeCtx())
+    monkeypatch.setattr(seed_tts_eval, "_utmos_npu_conn", None)
+    monkeypatch.setattr(seed_tts_eval, "_utmos_npu_proc", None)
+    monkeypatch.setattr(seed_tts_eval, "_utmos_model", None)
+
+    seed_tts_eval._start_utmos_npu_worker("/tmp/utmos.jit", "7")
+
+    assert seen["during_start"] == "7"
+    assert seen["target"] == "serve_utmos_npu"
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "6,7"
+    assert seed_tts_eval._utmos_model is seed_tts_eval._UTMOS_NPU_WORKER
+    assert seed_tts_eval._utmos_npu_conn is not None
+
+
+@pytest.mark.parametrize("failure", ["timeout", "eof"])
+def test_utmos_npu_worker_failure_retires_worker(monkeypatch, failure):
+    """A reply left in flight would shift every later score, so the worker must not be reused."""
+    import numpy as np
+
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    sent: list[object] = []
+
+    class FakeConn:
+        def send(self, payload):
+            sent.append(payload)
+
+        def poll(self, timeout):
+            return failure != "timeout"
+
+        def recv(self):
+            raise EOFError
+
+    class FakeProc:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            pass
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(seed_tts_eval, "_utmos_npu_conn", FakeConn())
+    monkeypatch.setattr(seed_tts_eval, "_utmos_npu_proc", FakeProc())
+    monkeypatch.setattr(seed_tts_eval, "_utmos_model", seed_tts_eval._UTMOS_NPU_WORKER)
+    monkeypatch.setattr(seed_tts_eval, "_utmos_jit_load_failed", False)
+
+    with pytest.raises((TimeoutError, EOFError)):
+        seed_tts_eval._utmos_predict_f32_16k(np.ones(16000, dtype=np.float32))
+
+    assert seed_tts_eval._utmos_npu_conn is None
+    assert seed_tts_eval._utmos_npu_proc is None
+    assert seed_tts_eval._utmos_jit_load_failed is True
+    assert seed_tts_eval._utmos_predict_f32_16k(np.ones(16000, dtype=np.float32)) is None
+    assert sent[-1] is None
+
+
 @pytest.mark.parametrize("audio_seconds", [0.1, 61])
 def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch, audio_seconds):
     from vllm_omni.benchmarks.data_modules import seed_tts_eval
@@ -302,3 +447,114 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch, audio_se
         assert calls["processor_kwargs"] == {}
         assert "return_timestamps" not in calls["generate_kwargs"]
         assert calls["no_timestamps"] is True
+
+
+@pytest.mark.parametrize("audio_seconds", [0.1, 61])
+def test_seed_tts_transcribe_retry_uses_language_task_kwargs(monkeypatch, audio_seconds):
+    """English-only checkpoints: ``get_decoder_prompt_ids`` rejects the
+    language/task kwargs, so the retry sends ``language``/``task`` to generate
+    instead of ``forced_decoder_ids`` — keeping attention_mask (and, for >30s
+    audio, return_timestamps) from the base kwargs."""
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    generate_calls = []
+
+    class FakeTensor:
+        def __init__(self, name: str):
+            self.name = name
+            self.device = None
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    class FakeProcessor:
+        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False, **kwargs):
+            return types.SimpleNamespace(
+                input_features=FakeTensor("features"),
+                attention_mask=FakeTensor("mask") if return_attention_mask else None,
+            )
+
+        def get_decoder_prompt_ids(self, **kwargs):
+            raise ValueError("unsupported named arguments")
+
+        def batch_decode(self, predicted_ids, *, skip_special_tokens):
+            assert predicted_ids == [[42]]
+            return ["hello"]
+
+    class FakeModel:
+        def generate(self, input_features, **kwargs):
+            generate_calls.append(kwargs)
+            return [[42]]
+
+    monkeypatch.setattr(seed_tts_eval, "_ensure_en_asr", lambda: None)
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", FakeProcessor())
+    monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
+    monkeypatch.setattr(seed_tts_eval, "_device", "cuda:1")
+
+    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(int(audio_seconds * 16000), dtype=np.float32))
+
+    assert text == "hello"
+    assert len(generate_calls) == 1
+    kwargs = generate_calls[0]
+    assert "forced_decoder_ids" not in kwargs
+    assert kwargs["language"] == "english"
+    assert kwargs["task"] == "transcribe"
+    assert kwargs["attention_mask"].device == "cuda:1"
+    assert kwargs.get("return_timestamps") is (True if audio_seconds > 30 else None)
+
+
+@pytest.mark.parametrize("audio_seconds", [0.1, 61])
+def test_seed_tts_transcribe_retry_falls_back_to_bare_kwargs(monkeypatch, audio_seconds):
+    """Checkpoints rejecting both ``forced_decoder_ids`` and the
+    ``language``/``task`` kwargs: the second retry calls generate with only the
+    base kwargs, attention_mask and return_timestamps still preserved."""
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    generate_calls = []
+
+    class FakeTensor:
+        def __init__(self, name: str):
+            self.name = name
+            self.device = None
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    class FakeProcessor:
+        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False, **kwargs):
+            return types.SimpleNamespace(
+                input_features=FakeTensor("features"),
+                attention_mask=FakeTensor("mask") if return_attention_mask else None,
+            )
+
+        def get_decoder_prompt_ids(self, **kwargs):
+            raise ValueError("unsupported named arguments")
+
+        def batch_decode(self, predicted_ids, *, skip_special_tokens):
+            assert predicted_ids == [[42]]
+            return ["hello"]
+
+    class FakeModel:
+        def generate(self, input_features, **kwargs):
+            generate_calls.append(kwargs)
+            if len(generate_calls) == 1:
+                raise ValueError("language not supported")
+            return [[42]]
+
+    monkeypatch.setattr(seed_tts_eval, "_ensure_en_asr", lambda: None)
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", FakeProcessor())
+    monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
+    monkeypatch.setattr(seed_tts_eval, "_device", "cuda:1")
+
+    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(int(audio_seconds * 16000), dtype=np.float32))
+
+    assert text == "hello"
+    assert len(generate_calls) == 2
+    assert generate_calls[0].get("language") == "english"
+    assert generate_calls[0].get("task") == "transcribe"
+    bare = generate_calls[1]
+    assert "language" not in bare and "task" not in bare and "forced_decoder_ids" not in bare
+    assert bare["attention_mask"].device == "cuda:1"
+    assert bare.get("return_timestamps") is (True if audio_seconds > 30 else None)
