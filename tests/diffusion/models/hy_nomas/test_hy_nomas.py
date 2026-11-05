@@ -512,6 +512,7 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
+        ({"custom_pipeline_args": {"decoder_backend": "unknown"}}, "decoder_backend"),
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),

@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     REQUIRED_FILES,
     HyNomasARConfig,
 )
+from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
@@ -109,7 +110,16 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
     return config
 
 
-def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
+def build_decoder(config: dict[str, Any], device: torch.device, *, backend: str = "reference") -> nn.Module:
+    if backend == "native":
+        # Diffusers metadata such as `_class_name` is not a constructor argument.
+        kwargs = {}
+        for name, value in config.items():
+            if not name.startswith("_"):
+                kwargs[name] = value
+        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+            vae = PixelUMMDecoder(**kwargs)
+        return vae.eval().requires_grad_(False)
     arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
     local_pixels = config["local_attention_tile_pixels"]
     if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
@@ -165,7 +175,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    allowed = {"text_encoder", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    allowed = {"text_encoder", "decoder_backend", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
     HyNomasARConfig.from_args(custom)
@@ -176,6 +186,8 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
     ):
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
+    if custom.get("decoder_backend", "reference") not in ("reference", "native"):
+        raise ValueError("Hy-Nomas decoder_backend must be reference or native.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
@@ -285,7 +297,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .eval()
             .requires_grad_(False)
         )
-        self.vae = build_decoder(decoder_config, self.device)
+        custom_args = od_config.custom_pipeline_args or {}
+        self.vae = build_decoder(decoder_config, self.device, backend=custom_args.get("decoder_backend", "reference"))
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
@@ -303,8 +316,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if component in components:
                 raise ValueError(f"Duplicate Hy-Nomas component weight stream: {component}")
             components.add(component)
-            loader = load_transformer_weights if component == "transformer" else load_component_weights
-            names = loader(getattr(self, component), ((name.partition(".")[2], value) for name, value in entries))
+            module = getattr(self, component)
+            stream = ((name.partition(".")[2], value) for name, value in entries)
+            if component == "transformer":
+                names = load_transformer_weights(module, stream)
+            elif hasattr(module, "load_weights"):
+                # The native decoder stacks the checkpoint's q/k/v and gate/up projections.
+                names = module.load_weights(stream)
+            else:
+                names = load_component_weights(module, stream)
             loaded.update(f"{component}.{name}" for name in names)
         if components != {"transformer", "vae"}:
             raise ValueError(
