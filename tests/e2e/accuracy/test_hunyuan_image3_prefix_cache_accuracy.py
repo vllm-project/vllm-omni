@@ -9,6 +9,7 @@ claim of identical conditioning or bitwise equivalence between the pipelines.
 """
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -102,7 +103,9 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
         measure_image_similarity,
         model_output_dir,
         write_accuracy_result,
+        write_json_artifact,
     )
+    from tests.e2e.accuracy.helpers import _json_safe_metric_value
     from tests.helpers.runtime import OmniServer
 
     configs = json.loads(_BENCHMARK_CONFIG.read_text())
@@ -211,13 +214,27 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
                 f"{label}: clip_score={clip_score:.6f} does not meet >= {_ACCURACY_THRESHOLDS['clip_score']}"
             )
     metrics_path = output_dir / "quality_metrics.json"
-    metrics_path.write_text(json.dumps(metrics, indent=2))
+    # Sanitize like result_acc_*.json (stringify nan/inf) so the sidecar stays
+    # JSON-standard; keep per-label detail here and flatten aggregates for the dashboard.
+    write_json_artifact(metrics_path, _json_safe_metric_value(metrics))
+    clip_scores = [scores["clip_score"] for scores in metrics.values()]
+    # Prefer a non-finite CLIP when present so the dashboard top-level mirrors fail-closed gates.
+    worst_clip = next((score for score in clip_scores if not math.isfinite(score)), min(clip_scores))
     write_accuracy_result(
         model_id=model,
         dataset="image_similarity",
-        metrics=metrics,
+        metrics={
+            "ssim": min(scores["ssim"] for scores in metrics.values()),
+            "psnr": min(scores["psnr"] for scores in metrics.values()),
+            "clip_score": worst_clip,
+        },
         baseline=dict(_ACCURACY_THRESHOLDS),
-        extra={"tp_size": tp_size, "sp_size": sp_size, "metrics_json": str(metrics_path)},
+        extra={
+            "tp_size": tp_size,
+            "sp_size": sp_size,
+            "metrics_json": str(metrics_path),
+            "per_label": metrics,
+        },
     )
     assert not clip_failures, "\n".join(clip_failures)
     for label, scores in metrics.items():
