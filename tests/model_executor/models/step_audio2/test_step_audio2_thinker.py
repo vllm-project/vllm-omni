@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Step-Audio2 thinker processor, encoder, and token handling."""
+
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -84,15 +86,21 @@ def test_token_config_constants():
     assert DEFAULT_TOKEN_CONFIG.audio_start == STEP_AUDIO2_AUDIO_START
 
 
-def test_mm_field_config_structure():
-    """Test that multimodal field config is properly structured for vLLM batching."""
-    from vllm.multimodal.inputs import MultiModalFieldConfig
+@pytest.mark.usefixtures("single_threaded_cpu")
+def test_mm_field_config_structure(audio_processor):
+    """Chunk metadata survives batching independently processed audio items."""
+    from vllm.multimodal.inputs import MultiModalKwargsItems
 
-    audio_lens = torch.tensor([100, 200, 150], dtype=torch.int32)
-
-    field_config = MultiModalFieldConfig.flat_from_sizes("audio", audio_lens)
-
-    assert field_config is not None
+    hf_processor, processor = audio_processor
+    items = []
+    for duration in (1, 40):
+        inputs = hf_processor(text="", audio=[create_dummy_audio(duration_sec=duration)[0]])
+        fields = processor._get_mm_fields_config(inputs, {})
+        items.extend(MultiModalKwargsItems.from_hf_inputs(inputs, fields)["audio"])
+    data = MultiModalKwargsItems({"audio": items}).get_data()
+    assert data["audio_num_chunks"].tolist() == [1, 2]
+    assert data["audio_mels"].shape == (3, 128, 2502)
+    assert data["audio_lens"].tolist() == [100, 2500, 1500]
 
 
 def test_audio_encoder_output_shape():
@@ -149,3 +157,88 @@ def test_has_audio_output():
 
     with_audio = [100, 200, 151700, 300]
     assert StepAudio2ThinkerForConditionalGeneration.has_audio_output(with_audio)
+
+
+@pytest.fixture
+def audio_processor():
+    from transformers import PreTrainedTokenizerBase
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2DummyInputsBuilder,
+        StepAudio2MultiModalProcessor,
+        StepAudio2ProcessingInfo,
+        StepAudio2Processor,
+    )
+
+    tokenizer = Mock(spec=PreTrainedTokenizerBase, return_value={})
+    tokens = {"<audio_start>": [151689], "<audio_patch>": [151690], "<audio_end>": [151691]}
+    tokenizer.encode.side_effect = lambda text, **kwargs: tokens[text]
+    hf_processor = StepAudio2Processor(tokenizer)
+    info = Mock(spec=StepAudio2ProcessingInfo, ctx=Mock(tokenizer=tokenizer))
+    info.get_tokenizer.return_value = tokenizer
+    info.get_hf_processor.return_value = hf_processor
+    info.get_data_parser.return_value = MultiModalDataParser(target_sr=16000)
+    return hf_processor, StepAudio2MultiModalProcessor(info, StepAudio2DummyInputsBuilder(info))
+
+
+@pytest.mark.usefixtures("single_threaded_cpu")
+@pytest.mark.parametrize(
+    "durations, expected_chunks, expected_lengths",
+    [
+        ((25,), [1], [313]),
+        ((30,), [2], [376]),
+        ((40,), [2], [501]),
+        ((50,), [2], [626]),
+        ((60,), [3], [751]),
+        ((1, 40, 2), [1, 2, 1], [13, 501, 25]),
+    ],
+)
+def test_audio_chunks_preserve_items_and_prompt_lengths(audio_processor, durations, expected_chunks, expected_lengths):
+    """Long audio stays one item with bounded chunks and matching patch counts."""
+    from vllm.multimodal.inputs import MultiModalKwargsItems
+
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        Adaptor,
+        AudioEncoder,
+        StepAudio2ThinkerForConditionalGeneration,
+    )
+
+    hf_processor, processor = audio_processor
+    audios = [create_dummy_audio(duration_sec=duration)[0] for duration in durations]
+    hf_inputs = hf_processor(text="", audio=audios)
+    mm_items = processor.data_parser.parse_mm_data({"audio": audios})
+    fields = processor._get_mm_fields_config(hf_inputs, {})
+    mm_kwargs = MultiModalKwargsItems.from_hf_inputs(hf_inputs, fields)
+    assert len(mm_kwargs["audio"]) == len(audios)
+
+    model = StepAudio2ThinkerForConditionalGeneration.__new__(StepAudio2ThinkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.encoder = AudioEncoder(128, 1500, 16, 2, 1)
+    model.adapter = Adaptor(n_state=16, n_hidden=32, adapter_state=32)
+    model.eval()
+    with torch.inference_mode():
+        embeddings = model.embed_multimodal(**mm_kwargs.get_data())
+
+    assert len(embeddings) == len(audios)
+    assert [len(embedding) for embedding in embeddings] == expected_lengths
+    replacement = processor._get_prompt_updates(mm_items, {}, mm_kwargs)[0].replacement
+    for i, n_chunks in enumerate(expected_chunks):
+        item_data = mm_kwargs["audio"][i].get_data()
+        assert item_data["audio_mels"].shape[0] == n_chunks
+        assert item_data["audio_mels"].shape[-1] <= 2502
+        assert len(item_data["audio_lens"]) == n_chunks
+        update = replacement(i)
+        assert update.full.count(151689) == n_chunks
+        assert update.full.count(151691) == n_chunks
+        assert update.is_embed(update.full).sum().item() == embeddings[i].shape[0]
+        assert embeddings[i].shape[0] > 0
+
+
+def test_text_only_audio_fields(audio_processor):
+    from vllm.multimodal.inputs import MultiModalKwargsItems
+
+    hf_processor, processor = audio_processor
+    inputs = hf_processor(text="")
+    fields = processor._get_mm_fields_config(inputs, {})
+    assert not MultiModalKwargsItems.from_hf_inputs(inputs, fields)
