@@ -295,9 +295,9 @@ Model responsibilities:
 - Build the `AttentionLayout` and the `PackedExecutionPlan` (which carries
   it) inside `pack_inputs`; step-invariant work is reused through the
   `cache` bundle the root hook hands back per CFG branch.
-- Keep mixed-resolution attention in the model's attention leaf, which reads
-  the plan (and its stream layout) from the armed step instead of a forward
-  argument.
+- Hand joint attention its named Q/K/V streams through
+  `Attention.forward_streams(streams, order=..., masks=...)` instead of
+  concatenating them; the model never reads the packed plan.
 
 `QwenImageMixFusionAdapter` is the reference implementation. Porting a model
 therefore means adding `models/<model>/mixfusion_adapter.py`, registering the
@@ -338,11 +338,14 @@ _mixfusion_plan = {
   states and RoPE tables), and the expand hooks map per-request conditioning
   rows to per-chunk rows. Without an armed step the model runs its serial
   forward unchanged.
-- Attention remains the one layout-aware leaf: the packed layout has
-  image-batch = num-chunks versus text-batch = num-requests, so joint
-  attention reassembles the per-request logical domain itself instead of
-  relying on a shared batch dimension. It reads the plan from the armed
-  step instead of a forward argument.
+- Attention remains the one layout-aware boundary, owned by the framework:
+  the packed layout has image-batch = num-chunks versus text-batch =
+  num-requests, so `Attention.forward_streams` reassembles the per-request
+  logical domain from the armed step's plan instead of relying on a shared
+  batch dimension. Outside an armed step it concatenates the streams in
+  `order` and runs one ordinary forward. The packed path and its dense
+  fallbacks call the terminal kernel dispatch (`_forward_kernel`), never the
+  public `forward`, so they cannot re-enter a layout-rewriting entry.
 - Paths the packed layout cannot express are refused by the driver's
   admission guards (above); model-specific refusals live in the adapter.
   For Qwen-Image, `can_pack` refuses `zero_cond_t` (editing), image

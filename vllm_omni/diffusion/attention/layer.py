@@ -42,13 +42,17 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
-from vllm_omni.diffusion.mixfusion.packed_attention import (
-    MIXFUSION_PLAN_KEY,
-    run_mixfusion_packed_attention,
-)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _armed_mixfusion_plan():
+    """The packed plan of the armed MixFusion step, or ``None`` outside one."""
+    if not is_forward_context_available():
+        return None
+    step = get_forward_context().mixfusion_step
+    return None if step is None else step.plan
 
 
 def _try_extract_layer_index(prefix: str) -> int | None:
@@ -461,13 +465,21 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if attn_metadata is not None and attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None:
-            # MixFusion chunked layout: recover each request to
-            # ``text + full image`` right before the kernel and scatter back
-            # after it, at the same pre/post boundary the sequence-parallel
-            # strategies use around their all-to-all.
-            return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+        return self._forward_kernel(query, key, value, attn_metadata)
 
+    def _forward_kernel(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """One attention call over an ordinary ``[B, S, H, D]`` layout.
+
+        The terminal dispatch every entry point shares (``forward``,
+        ``forward_packed`` and its dense fallbacks): it never re-enters a
+        layout-rewriting entry, so packed paths cannot recurse.
+        """
         if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
             # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
             # attention graph; otherwise scheduler dependency analysis can
@@ -475,6 +487,49 @@ class Attention(nn.Module):
             return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def forward_streams(
+        self,
+        streams: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        *,
+        order: tuple[str, ...],
+        masks: dict[str, torch.Tensor | None] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Joint attention over named ``[B, S_i, H, D]`` Q/K/V streams.
+
+        ``order`` is the token order of the joint sequence and ``masks`` the
+        optional ``[B, S_i]`` key-padding mask of each stream. Without an
+        armed MixFusion step the streams are concatenated along the sequence
+        (missing masks count as all-valid), run through one ordinary forward
+        and split per stream. Under an armed step they are in the step's
+        packed layout, whose plan already carries every stream's real
+        lengths: the framework recovers each request's joint sequence, runs
+        one packed forward and scatters the output back to every stream's
+        layout, so the model never reads the plan itself.
+        """
+        plan = _armed_mixfusion_plan()
+        if plan is not None:
+            from vllm_omni.diffusion.mixfusion.packed_attention import run_mixfusion_packed_attention
+
+            return run_mixfusion_packed_attention(self, streams, plan)
+        query = torch.cat([streams[name][0] for name in order], dim=1)
+        key = torch.cat([streams[name][1] for name in order], dim=1)
+        value = torch.cat([streams[name][2] for name in order], dim=1)
+        attn_metadata = None
+        if masks is not None and any(mask is not None for mask in masks.values()):
+            joint_mask = torch.cat(
+                [
+                    masks[name]
+                    if masks.get(name) is not None
+                    else torch.ones(streams[name][0].shape[:2], dtype=torch.bool, device=query.device)
+                    for name in order
+                ],
+                dim=1,
+            )
+            attn_metadata = AttentionMetadata(attn_mask=joint_mask)
+        out = self(query, key, value, attn_metadata)
+        lengths = [streams[name][0].shape[1] for name in order]
+        return dict(zip(order, out.split(lengths, dim=1)))
 
     def supports_multi_doc_packed_varlen(self, kv_cache_dtype: str | None = None) -> bool:
         """Whether one forward can isolate N packed documents via cu_seqlens.
@@ -521,7 +576,7 @@ class Attention(nn.Module):
             # head_dim] (TRTLLM's forward_cuda unpacks a 4-D query; Flash
             # accepts either layout and returns the one it got), and the
             # result returns to the flat packing.
-            out = self.forward(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), metadata)
+            out = self._forward_kernel(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), metadata)
             return out.reshape(query.shape)
         return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
 
@@ -551,7 +606,7 @@ class Attention(nn.Module):
             flat_rows = rows.reshape(-1)
             # Q and K/V may carry different head counts; each gets its own
             # bucket shape and scatters back to its own flat layout.
-            bucket_out = self.forward(
+            bucket_out = self._forward_kernel(
                 query.index_select(0, flat_rows).reshape(len(segments), length, *query.shape[1:]),
                 key.index_select(0, flat_rows).reshape(len(segments), length, *key.shape[1:]),
                 value.index_select(0, flat_rows).reshape(len(segments), length, *value.shape[1:]),
