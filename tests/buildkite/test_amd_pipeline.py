@@ -757,7 +757,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1416,
+        1420,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -1509,6 +1509,25 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             "omni_ming_flash_omni_function",
             "Expected exactly seven executed Ming-flash-omni offline tests",
         ),
+        "Qwen2.5-Omni expansion · 2-GPU": (
+            "mi300_2",
+            195,
+            "cards_2",
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py",
+            (
+                "test_audio_in_video_boundaries[False-omni_server0]",
+                "test_audio_in_video_boundaries[True-omni_server0]",
+                "test_text_to_text_001[omni_server0]",
+                "test_speaker_001[Chelsie-omni_server0]",
+                "test_speaker_001[ETHAN-omni_server0]",
+                "test_mix_to_audio[omni_runner0-rocm]",
+                "test_text_to_text[omni_runner0-rocm]",
+            ),
+            "artifacts/rocm-qwen25-omni-weekly/**/*",
+            "Expected exactly seven Qwen2.5-Omni weekly ROCm nodes",
+            "omni_qwen2_5_omni_expansion",
+            "Expected exactly seven executed Qwen2.5-Omni weekly tests",
+        ),
     }
 
     assert group["group"] == "Omni E2E Weekly"
@@ -1545,11 +1564,258 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
     assert "test_audio_to_text_audio_001" not in mimo_command
     assert "tests/e2e/online_serving/test_ming_flash_omni_expansion.py" not in weekly_text
     assert "test_covo_audio_expansion.py" not in weekly_text
-    assert "test_qwen2_5_omni_expansion.py" not in weekly_text
+    qwen_deps = dependencies["omni_qwen2_5_omni_expansion"]
+    for dependency in (
+        "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py",
+        "tests/conftest.py",
+        "tests/helpers/client.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+        "tests/helpers/stage_config.py",
+    ):
+        assert dependency in qwen_deps
+    qwen_weekly = "\n".join(_find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)["commands"])
+    known_red = "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]"
+    assert 'collection_status="$${PIPESTATUS[0]}"' in qwen_weekly
+    assert qwen_weekly.count(f"--deselect='{known_red}'") == 2
+    assert qwen_weekly.count(known_red) == 2
+    merge_qwen = "\n".join(_find_step("Omni Model Test Qwen2-5-Omni", AMD_MERGE_PIPELINE)["commands"])
+    assert len(re.findall(r"--run-level\s+['\"]?core_model['\"]?", merge_qwen)) == 2
+    merge_text = AMD_MERGE_PIPELINE.read_text(encoding="utf-8")
+    assert "Qwen2.5-Omni expansion · 2-GPU" not in merge_text
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 7, 0, None, 0),
+        (0, 7, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 7, 0, None, 1),
+        (0, 7, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Qwen2.5-Omni expansion · 2-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
+        artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="qwen25-omni-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    step = _find_step("Bagel img2img · 1-GPU", AMD_WEEKLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    node = "tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 90
+    assert step["source_file_dependencies"] == "diffusion_bagel_weekly"
+    assert step["artifact_paths"] == ["artifacts/rocm-bagel-weekly/**/*"]
+    assert "slow and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level full_model" in command
+    assert "timeout --signal=TERM --kill-after=2m 75m" in command
+    assert node in command
+    assert "H100-only Bagel nodes were collected." in command
+    assert "test_bagel_img2img_online[omni_server0]" in command
+    assert "Expected exactly one Bagel weekly ROCm node" in command
+    assert "Expected exactly one executed Bagel weekly test" in command
+    assert "collection_status=$$?" in command
+    assert 'exit "$$collection_status"' in command
+    assert "skipped != 0" in command
+    bagel_deps = flatten_paths(dependencies["diffusion_bagel_weekly"])
+    assert {
+        "tests/e2e/online_serving/test_bagel.py",
+        "tests/conftest.py",
+        "tests/helpers/client.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+        "tests/helpers/stage_config.py",
+        "vllm_omni/config/stage_config.py",
+        "vllm_omni/deploy/bagel.yaml",
+        "vllm_omni/diffusion/stage_diffusion_client.py",
+        "vllm_omni/diffusion/stage_diffusion_proc.py",
+        "vllm_omni/diffusion/models/bagel/",
+        "vllm_omni/diffusion/worker/diffusion_worker.py",
+        "vllm_omni/engine/async_omni_engine.py",
+        "vllm_omni/engine/orchestrator.py",
+        "vllm_omni/engine/stage_engine_core_proc.py",
+        "vllm_omni/engine/stage_init_deadline.py",
+        "vllm_omni/engine/stage_init_utils.py",
+        "vllm_omni/engine/stage_pool.py",
+        "vllm_omni/engine/stage_runtime.py",
+        "vllm_omni/entrypoints/async_omni.py",
+        "vllm_omni/model_executor/models/bagel/",
+        "vllm_omni/model_executor/stage_input_processors/bagel.py",
+        "vllm_omni/model_extras/bagel.py",
+        "vllm_omni/worker/base.py",
+    } <= bagel_deps
+    source = Path("tests/e2e/online_serving/test_bagel.py").read_text(encoding="utf-8")
+    params_source = source.split("test_params =", maxsplit=1)[1].split("def _build_text2img_messages", maxsplit=1)[0]
+    assert "stage_init_timeout=1800" in params_source
+    assert "init_timeout=2100" in params_source
+    img2img_marks = source.split("def test_bagel_img2img_online", maxsplit=1)[0]
+    assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in img2img_marks
+    text2img_marks = img2img_marks.split("def test_bagel_text2img_online", maxsplit=1)[0]
+    assert '"rocm"' not in text2img_marks
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+        assert "Bagel img2img · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_bagel_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Bagel img2img · 1-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly one executed Bagel weekly test",
+        artifact_env="ROCM_BAGEL_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="bagel-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+_MOSS_WEEKLY_NODES = (
+    "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_english[omni_runner0]",
+    "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_chinese[omni_runner0]",
+    "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_batch[omni_runner0]",
+)
+
+
+def test_moss_tts_weekly_selects_three_marked_nodes() -> None:
+    step = _find_step("Moss TTS expansion · 1-GPU", AMD_WEEKLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 90
+    assert step["source_file_dependencies"] == "tts_moss_tts_expansion"
+    assert step["artifact_paths"] == ["artifacts/rocm-moss-tts-weekly/**/*"]
+    assert "slow and tts and rocm and MI325 and cards_1" in command
+    assert "--run-level full_model" in command
+    assert "timeout --signal=TERM --kill-after=2m 75m" in command
+    assert "Expected exactly three Moss TTS weekly ROCm nodes" in command
+    assert "Expected exactly three executed Moss TTS weekly tests" in command
+    assert "skipped != 0" in command
+    assert 'collection_status="$${PIPESTATUS[0]}"' in command
+    for node in _MOSS_WEEKLY_NODES:
+        assert node in command
+    assert "test_moss_tts_realtime" not in command
+    moss_deps = dependencies["tts_moss_tts_expansion"]
+    for dependency in (
+        "tests/e2e/offline_inference/test_moss_tts_expansion.py",
+        "tests/conftest.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+        "vllm_omni/engine/orchestrator.py",
+        "vllm_omni/engine/stage_engine_core_proc.py",
+        "vllm_omni/model_executor/models/moss_tts/",
+        "vllm_omni/model_executor/stage_input_processors/moss_tts.py",
+    ):
+        assert dependency in moss_deps
+    source = Path("tests/e2e/offline_inference/test_moss_tts_expansion.py").read_text(encoding="utf-8")
+    assert "processing_moss_tts.MossTTSDelayProcessor" in source
+    assert "processor_cls.from_pretrained" in source
+    assert "AutoProcessor.from_pretrained" not in source
+    for pipeline_path in (
+        AMD_READY_PIPELINE,
+        AMD_MERGE_PIPELINE,
+        AMD_NIGHTLY_PIPELINE,
+    ):
+        pipeline_text = pipeline_path.read_text(encoding="utf-8")
+        assert "Moss TTS expansion · 1-GPU" not in pipeline_text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 3, 0, None, 0),
+        (0, 3, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 3, 0, None, 1),
+        (0, 3, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_moss_tts_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Moss TTS expansion · 1-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly three executed Moss TTS weekly tests",
+        artifact_env="ROCM_MOSS_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="moss-tts-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
@@ -3601,7 +3867,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    32 ids. R2-01 still collects 1416 model-executor nodes and does not run them.
+    32 ids. R2-01 still collects 1420 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3647,7 +3913,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "assert-pytest-collection.sh 1420" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -3858,7 +4124,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1416 model-executor nodes.
+    still collects 1420 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3910,7 +4176,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "assert-pytest-collection.sh 1420" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
