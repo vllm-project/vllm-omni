@@ -15,8 +15,8 @@ per batch size (similar spirit to ``cudagraph_specialize_lora``):
 | ALL_UND | ``und_expert`` only | mask all false |
 | ALL_GEN | ``gen_expert`` only | mask all true |
 
-Host ``.any()`` / ``.all()`` runs **outside** the captured region (graph
-dispatch). Inside the graph, mixed still uses the #9764 blend path.
+Host ``sum().item()`` runs **outside** the captured region (graph dispatch).
+Inside the graph, mixed still uses the #9764 blend path.
 """
 
 from __future__ import annotations
@@ -73,10 +73,13 @@ def moe_routing_key_from_mask(gen_token_mask: torch.Tensor | None) -> MoERouting
     if gen_token_mask is None or gen_token_mask.numel() == 0:
         return MoERoutingKey.BLEND
     flat = gen_token_mask.reshape(-1)
-    # Host sync is intentional: this runs before graph replay selection.
-    if not bool(flat.any().item()):
+    # One host sync per step: sum() then compare on the host, instead of a
+    # separate any().item() and all().item(). This sits on the FULL replay
+    # path, so the extra DtoH round trip is worth folding away.
+    num_gen = int(flat.sum().item())
+    if num_gen == 0:
         return MoERoutingKey.ALL_UND
-    if bool(flat.all().item()):
+    if num_gen == flat.numel():
         return MoERoutingKey.ALL_GEN
     return MoERoutingKey.BLEND
 

@@ -567,6 +567,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             # table being indexed: base ids clamp to base_vocab_size-1, gen ids
             # clamp to [0, gen_embed_tokens.num_embeddings-1]. Those rows are
             # ignored by where().
+            #
+            # Deliberately unconditional: the MoE routing specialty
+            # (moe_cudagraph.MoERoutingKey) specializes the experts, not this
+            # lookup, so ALL_UND / ALL_GEN graphs still embed both tables at
+            # capture and on every replay. Specializing embeddings too would
+            # need a second key family; until then this is the known tax.
             base_ids = input_ids.clamp(max=self.base_vocab_size - 1)
             base_emb = self.embed_tokens(base_ids)
             gen_ids = (input_ids - int(self.gen_vocab_start_index)).clamp(
