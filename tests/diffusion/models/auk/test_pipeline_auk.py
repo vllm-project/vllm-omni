@@ -125,6 +125,8 @@ class _StubVAE(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.register_buffer("global_mean", torch.full((LATENT_DIM,), 0.25))
+        self.register_buffer("global_log_std", torch.full((LATENT_DIM,), 4.0))
         self.encode_calls: list[dict[str, Any]] = []
         self.decode_calls = 0
         self.weights_path: str | None = None
@@ -783,6 +785,7 @@ class TestRequestParsing:
             decode_calls.append(latents.clone())
             return original_decode(latents)
 
+        record_decode.pad_for = original_decode.pad_for
         pipeline.vae_decode = record_decode
         req1 = _batch(
             _prompt(audio=_silence(0.5), knobs={"gen_seconds": 2.9}),
@@ -798,10 +801,11 @@ class TestRequestParsing:
         outputs = pipeline.forward(DiffusionRequestBatch([req1, req2]))
         assert len(decode_calls) == 1
         decoded_latents = decode_calls[0]
+        expected_pad = original_decode.pad_for(decoded_latents.device)
         # target_bucket is 160. Row 0 has 145 valid frames, row 1 has 155 valid frames.
-        # Padded frames [145:] in row 0 and [155:] in row 1 must be zeroed before reaching vae_decode.
-        assert torch.count_nonzero(decoded_latents[0, 145:]).item() == 0
-        assert torch.count_nonzero(decoded_latents[1, 155:]).item() == 0
+        # Padded frames [145:] in row 0 and [155:] in row 1 must be filled with normalized silence pad_for.
+        torch.testing.assert_close(decoded_latents[0, 145:], expected_pad.expand(15, -1))
+        torch.testing.assert_close(decoded_latents[1, 155:], expected_pad.expand(5, -1))
         assert len(outputs) == 2
         assert outputs[0].output.shape == (145 * HOP,)
         assert outputs[1].output.shape == (155 * HOP,)

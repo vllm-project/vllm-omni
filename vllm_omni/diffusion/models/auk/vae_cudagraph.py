@@ -151,6 +151,7 @@ class AuKVAEDecodeGraph:
         self._compiled: dict[tuple[int, int], _GraphEntry] = {}
         self._compiled_decode: Callable[[torch.Tensor], torch.Tensor] | None = None
         self._uncapturable_compiled_shapes: set[tuple[int, int]] = set()
+        self._uncapturable_plain_shapes: set[tuple[int, int]] = set()
         # Which path served the last call: "compiled", "graph" or "eager".
         self.last_mode: str | None = None
 
@@ -206,9 +207,12 @@ class AuKVAEDecodeGraph:
             bucket = round_up(frames, self.frame_alignment)
         entry, mode = self._lookup_graph(B, bucket)
         if entry is None:
+            target_b = self._batch_bucket(B)
+            if (target_b, bucket) in self._uncapturable_plain_shapes:
+                self.last_mode = "eager"
+                return self.vae.decode(latents)
             if len(self._cache) >= self.max_graphs:
                 self._retire_plain_graphs()
-            target_b = self._batch_bucket(B)
             pool = self._plain_pools.get(target_b)
             if pool is None:
                 pool = torch.cuda.graph_pool_handle()
@@ -234,11 +238,36 @@ class AuKVAEDecodeGraph:
                         exc_info=True,
                     )
                     self._uncapturable_compiled_shapes.add((target_b, bucket))
-                    entry = self._capture(
-                        bucket, latents.device, self.vae.decode, warm_iters=2, pool=pool, batch_size=target_b
-                    )
+                    pool = torch.cuda.graph_pool_handle()
+                    self._plain_pools[target_b] = pool
+                    try:
+                        entry = self._capture(
+                            bucket, latents.device, self.vae.decode, warm_iters=2, pool=pool, batch_size=target_b
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                            "falling back to eager vae.decode",
+                            target_b,
+                            bucket,
+                            exc_info=True,
+                        )
+                        self._uncapturable_plain_shapes.add((target_b, bucket))
+                        self._plain_pools.pop(target_b, None)
+                        self.last_mode = "eager"
+                        return self.vae.decode(latents)
                 else:
-                    raise
+                    logger.warning(
+                        "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                        "falling back to eager vae.decode",
+                        target_b,
+                        bucket,
+                        exc_info=True,
+                    )
+                    self._uncapturable_plain_shapes.add((target_b, bucket))
+                    self._plain_pools.pop(target_b, None)
+                    self.last_mode = "eager"
+                    return self.vae.decode(latents)
             self._cache[(target_b, bucket)] = entry
             mode = "graph"
         self.last_mode = mode
@@ -250,10 +279,10 @@ class AuKVAEDecodeGraph:
         else:
             entry.static_latents[:B, :frames].copy_(latents)
             if bucket > frames:
-                pad = self._pad_for(latents.device)
+                pad = self.pad_for(latents.device)
                 entry.static_latents[:B, frames:].copy_(pad.expand(B, bucket - frames, -1))
             if graph_b > B:
-                pad = self._pad_for(latents.device) if pad is None else pad
+                pad = self.pad_for(latents.device) if pad is None else pad
                 entry.static_latents[B:].copy_(pad.expand(graph_b - B, bucket, -1))
         entry.graph.replay()
         return entry.static_wav[:B, : frames * self.vae.hop_size]
@@ -300,9 +329,14 @@ class AuKVAEDecodeGraph:
         """The [latent_dim] normalized latent that AuKVAE.decode maps to raw zero."""
         pad = self._pad_latent
         if pad is None or pad.device != device:
-            mean = self.vae.global_mean.detach().float().to(device)
-            scale = torch.sqrt(self.vae.global_log_std.detach().float().to(device))
-            pad = -mean / scale
+            global_mean = getattr(self.vae, "global_mean", None)
+            global_log_std = getattr(self.vae, "global_log_std", None)
+            if isinstance(global_mean, torch.Tensor) and isinstance(global_log_std, torch.Tensor):
+                mean = global_mean.detach().float().to(device)
+                scale = torch.sqrt(global_log_std.detach().float().to(device))
+                pad = -mean / scale
+            else:
+                pad = torch.zeros((int(getattr(self.vae, "latent_dim", 1)),), dtype=torch.float32, device=device)
             self._pad_latent = pad
         return pad
 
