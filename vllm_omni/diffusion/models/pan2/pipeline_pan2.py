@@ -445,7 +445,7 @@ def _resolve_pan2_num_outputs(sampling_params: OmniDiffusionSamplingParams) -> i
 def _check_pan2_request(
     sampling_params: OmniDiffusionSamplingParams,
     prompt: OmniPromptType,
-    spatial_multiple: int = PAN2_VAE_SCALE_FACTOR_SPATIAL * 2,
+    spatial_multiple: int,
 ) -> None:
     """Reject the inputs PAN 2 does not support."""
     height, width, num_frames = sampling_params.height, sampling_params.width, sampling_params.num_frames
@@ -723,7 +723,8 @@ class PAN2Pipeline(
             raise ValueError("PAN 2 takes a single prompt per request.")
         sampling_params = req.sampling_params
         prompt_data = req.prompts[0]
-        _check_pan2_request(sampling_params, prompt_data)
+        spatial_multiple = self.vae_scale_factor_spatial * self.transformer.patch_size[1]
+        _check_pan2_request(sampling_params, prompt_data, spatial_multiple)
         num_outputs = _resolve_pan2_num_outputs(sampling_params)
         if isinstance(prompt_data, str):
             prompt, negative_prompt, multi_modal_data = prompt_data, None, {}
@@ -761,12 +762,13 @@ class PAN2Pipeline(
             cache_dit_spec = None
         self._cache_dit_runtime.prepare(cache_dit_spec)
 
-        multiple = self.vae_scale_factor_spatial * self.transformer.patch_size[1]
-        if height % multiple != 0 or width % multiple != 0:
-            raise ValueError(f"`height` and `width` must be divisible by {multiple}, got {height} and {width}.")
+        if height % spatial_multiple != 0 or width % spatial_multiple != 0:
+            raise OmniClientError(
+                f"PAN 2 `height` and `width` must be divisible by {spatial_multiple}, got {height} and {width}."
+            )
         if (num_frames - 1) % self.vae_scale_factor_temporal != 0:
-            raise ValueError(
-                f"`num_frames - 1` must be divisible by {self.vae_scale_factor_temporal}, got {num_frames}."
+            raise OmniClientError(
+                f"PAN 2 `num_frames - 1` must be divisible by {self.vae_scale_factor_temporal}, got {num_frames}."
             )
 
         device = self.device
