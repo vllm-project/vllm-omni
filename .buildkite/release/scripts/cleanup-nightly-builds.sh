@@ -7,7 +7,7 @@
 set -ex
 
 TAG_PREFIX="nightly-"
-REPO="vllm/vllm-omni"
+REPO="${DOCKERHUB_REPO:-vllm/vllm-omni}"
 REPO_API_URL="https://hub.docker.com/v2/repositories/${REPO}/tags"
 
 echo "Cleaning up tags with prefix: $TAG_PREFIX in repository: $REPO"
