@@ -81,6 +81,7 @@ def smoke_entry(tmp_path, monkeypatch):
         elif change == "policy":
             target_fps += 1
         return {
+            "git_revision": "conflicting-client" if change == "revision" else None,
             "config": {
                 "target_fps": target_fps,
                 "warmup_chunks": args.warmup_chunks,
@@ -151,9 +152,13 @@ def test_smoke_executes_the_recorded_profile_and_retains_raw_metrics(smoke_entry
     assert calls["cleanup"] == calls["lifecycle"] == calls["device_cleanup"] == 1
     metrics = json.loads((settings["output"] / "metrics.json").read_text())
     assert metrics["steady_samples"] == settings["num_chunks"] - settings["warmup_chunks"] - 1
+    from tests.dfx.lingbot_world.runner import git_revision
+
+    raw = json.loads((settings["output"] / "benchmark.json").read_text())
+    assert raw["git_revision"] == raw["server_revision"] == git_revision(ROOT)
 
 
-@pytest.mark.parametrize("change", ["missing", "reordered", "frames", "empty", "nonfinite", "policy"])
+@pytest.mark.parametrize("change", ["missing", "reordered", "frames", "empty", "nonfinite", "policy", "revision"])
 def test_smoke_rejects_invalid_raw_output_and_releases_server(smoke_entry, change):
     run, settings, calls = smoke_entry
     calls["corruption"] = change

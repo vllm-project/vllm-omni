@@ -15,6 +15,7 @@ from tests.dfx.lingbot_world.runner import (
     assert_device_cleanup,
     checked_assets,
     hardware_contract,
+    record_benchmark_revisions,
     server_arguments,
     server_environment,
 )
@@ -91,6 +92,9 @@ def test_cuda_smoke(lingbot_settings):
                     )
                 )
             )
-            write_json(output / "metrics.json", _measured_metrics(document, settings))
+            record_benchmark_revisions(document, ROOT)
+            metrics = _measured_metrics(document, settings)
+            write_json(output / "benchmark.json", document)
+            write_json(output / "metrics.json", metrics)
             lifecycle.test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(server)
     assert_device_cleanup(settings["dies"], settings["output"] / "cleanup.json")

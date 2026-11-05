@@ -102,6 +102,18 @@ def git_revision(root: Path) -> str:
     return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
 
 
+def record_benchmark_revisions(document: dict[str, Any], source: Path) -> None:
+    """Bind client measurements to this harness and the separate server source."""
+    revision = git_revision(ROOT)
+    if "git_revision" not in document or document["git_revision"] not in (None, revision):
+        raise RegressionError("Benchmark client revision differs from the attested harness")
+    # Source images omit .git, so the standalone client deliberately reports
+    # None. This harness can attest its image's full Buildkite commit without
+    # letting an installed standalone wheel claim an unrelated checkout.
+    document["git_revision"] = revision
+    document["server_revision"] = git_revision(source)
+
+
 def checked_assets(settings: dict[str, Any]) -> tuple[Path, dict[str, Path]]:
     """Resolve the pinned snapshot and verify every requested input checksum."""
     model = Path(os.environ["LINGBOT_MODEL_PATH"]).resolve()
@@ -428,8 +440,7 @@ def generate(
                         ]
                     )
                     document = asyncio.run(run_benchmark(args))
-                    # Server revision, not the client harness revision.
-                    document["server_revision"] = git_revision(source)
+                    record_benchmark_revisions(document, source)
                     write_json(destination / "benchmark.json", document)
                     case_results[case["id"]] = _measured_metrics(document, settings)
                 # Reuse lifecycle tests against this exact server, with the
