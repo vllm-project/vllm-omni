@@ -20,13 +20,16 @@ import io
 import json
 import mimetypes
 import os
+import tempfile
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import av
 from camera_utils import wasd_to_camera_payload
+from websockets.exceptions import ConnectionClosed
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -230,7 +233,8 @@ async def _run_prompt_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's prompt schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
@@ -238,7 +242,7 @@ async def _run_prompt_update_scheduler(
         payload = {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"scheduled-prompt-{update.at:.3f}",
+                "event_id": f"scheduled-prompt-{index}",
                 "event": {"prompt": update.prompt},
                 "transition_chunks": update.transition_chunks,
             },
@@ -255,13 +259,14 @@ async def _run_camera_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's camera schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
 
         interaction: dict[str, Any] = {
-            "event_id": f"scheduled-camera-{update.at:.3f}",
+            "event_id": f"scheduled-camera-{index}",
             "event": {"multi_modal_data": {"camera": update.camera}},
         }
         if update.transition_chunks is not None:
@@ -286,6 +291,75 @@ def _count_decoded_frames(video_bytes: bytes, *, stream_format: str) -> int | No
         return None
 
 
+def _fresh_rgb_frame(frame: av.VideoFrame) -> av.VideoFrame:
+    """Copy RGB pixels without carrying decoder color or picture-type metadata."""
+    rgb = frame.reformat(format="rgb24")
+    fresh = av.VideoFrame(rgb.width, rgb.height, "rgb24")
+    source = rgb.planes[0]
+    target = fresh.planes[0]
+    pixels = memoryview(source)
+    if source.line_size == target.line_size:
+        target.update(pixels[: target.buffer_size])
+    else:
+        packed = bytearray(target.buffer_size)
+        row_bytes = rgb.width * 3
+        for row in range(rgb.height):
+            src = row * source.line_size
+            dst = row * target.line_size
+            packed[dst : dst + row_bytes] = pixels[src : src + row_bytes]
+        target.update(packed)
+    return fresh
+
+
+def _finalize_video_bytes(video_bytes: bytes, *, stream_format: str, fps: float) -> bytes:
+    """Build a playback MP4 using only PyAV, retaining input on decode errors.
+
+    Video-only streams are re-encoded at the requested FPS. Streams with audio
+    are remuxed to preserve the compressed tracks and their original timing.
+    """
+    if not video_bytes:
+        return video_bytes
+    if stream_format.lower() != "m4s":
+        raise ValueError(f"Unsupported streaming video format: {stream_format}")
+
+    try:
+        with av.open(io.BytesIO(video_bytes), format="mp4") as source:
+            if source.streams.audio:
+                buffer = io.BytesIO()
+                media_streams = [stream for stream in source.streams if stream.type in ("video", "audio")]
+                with av.open(buffer, mode="w", format="mp4") as output:
+                    streams = {stream.index: output.add_stream_from_template(stream) for stream in media_streams}
+                    for packet in source.demux(*media_streams):
+                        if packet.dts is not None:
+                            packet.stream = streams[packet.stream.index]
+                            output.mux(packet)
+                return buffer.getvalue()
+            if not source.streams.video:
+                return video_bytes
+            frames = [_fresh_rgb_frame(frame) for frame in source.decode(video=0)]
+    except av.FFmpegError:
+        return video_bytes
+
+    if not frames:
+        return video_bytes
+
+    buffer = io.BytesIO()
+    rate = Fraction(fps).limit_denominator(10000)
+    with av.open(buffer, mode="w", format="mp4") as output:
+        video = cast(av.VideoStream, output.add_stream("h264", rate=rate))
+        video.width, video.height = frames[0].width, frames[0].height
+        video.pix_fmt = "yuv420p"
+        video.options = {"crf": "18"}
+        for index, frame in enumerate(frames):
+            frame.pts = index
+            frame.time_base = 1 / rate
+            for packet in video.encode(frame):
+                output.mux(packet)
+        for packet in video.encode():
+            output.mux(packet)
+    return buffer.getvalue()
+
+
 def save_video(
     chunks: list[bytes],
     output_path: Path,
@@ -293,28 +367,40 @@ def save_video(
     fps: float,
     stream_format: str,
 ) -> None:
+    """Finalize received chunks and atomically publish the local video file."""
     if not chunks:
         print("No video chunks received; nothing to save.")
         return
 
-    from vllm_omni.diffusion.utils.media_utils import finalize_streaming_video_bytes
-
     streamed_bytes = b"".join(chunks)
-    playback_bytes = finalize_streaming_video_bytes(
-        streamed_bytes,
-        input_format="m4s",
-        fps=fps,
-    )
+    playback_bytes = _finalize_video_bytes(streamed_bytes, stream_format=stream_format, fps=fps)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    with tmp_path.open("wb") as f:
-        f.write(playback_bytes)
-    os.replace(tmp_path, output_path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(playback_bytes)
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     print(
         f"Saved {len(chunks)} streamed chunk(s), {len(streamed_bytes)} streamed bytes "
         f"-> {len(playback_bytes)} playback bytes at {output_path}"
     )
+
+
+async def _send_heartbeats(websocket: Any, send_lock: asyncio.Lock) -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            async with send_lock:
+                await websocket.send(json.dumps({"type": "session.ping"}))
+        except ConnectionClosed:
+            return
 
 
 async def stream_video(args: argparse.Namespace) -> None:
@@ -331,11 +417,13 @@ async def stream_video(args: argparse.Namespace) -> None:
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
     camera_update_task: asyncio.Task[None] | None = None
+    heartbeat_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
         async with connect(url, max_size=None) as websocket:
             ws = websocket
+            heartbeat_task = asyncio.create_task(_send_heartbeats(websocket, send_lock))
             async with send_lock:
                 await websocket.send(json.dumps(payload))
             print(f"Connected: {url}")
@@ -432,6 +520,10 @@ async def stream_video(args: argparse.Namespace) -> None:
                 pass
         raise
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         if prompt_update_task is not None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
