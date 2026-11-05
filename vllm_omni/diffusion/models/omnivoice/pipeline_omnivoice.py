@@ -109,6 +109,35 @@ def _parse_asr_config(additional_config: Mapping[str, object] | None) -> tuple[b
     return load_asr_on_startup, model_name.strip(), asr_device.strip() if asr_device is not None else None
 
 
+_RUNTIME_FLAGS = ("enable_cuda_graph", "enable_tf32")
+
+
+def _parse_runtime_config(additional_config: Mapping[str, object] | None) -> dict[str, bool]:
+    """Return validated OmniVoice runtime overrides from the model config."""
+    if additional_config is None:
+        additional_config = {}
+    if not isinstance(additional_config, Mapping):
+        raise TypeError(f"additional_config must be a mapping or None, got {type(additional_config)!r}")
+
+    raw_config = additional_config.get("omnivoice_runtime", {})
+    if not isinstance(raw_config, Mapping):
+        raise TypeError(f"additional_config['omnivoice_runtime'] must be a mapping, got {type(raw_config)!r}")
+
+    unknown = set(raw_config) - set(_RUNTIME_FLAGS)
+    if unknown:
+        raise ValueError(f"Unknown additional_config['omnivoice_runtime'] keys: {sorted(unknown)}")
+
+    overrides: dict[str, bool] = {}
+    for name in _RUNTIME_FLAGS:
+        if name not in raw_config:
+            continue
+        value = raw_config[name]
+        if not isinstance(value, bool):
+            raise TypeError(f"additional_config['omnivoice_runtime']['{name}'] must be a bool")
+        overrides[name] = value
+    return overrides
+
+
 @dataclass
 class _PreparedOmniVoiceRequest:
     input_ids: torch.Tensor
@@ -271,6 +300,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         with open(config_path) as f:
             hf_config = json.load(f)
         self.config = OmniVoiceConfig(**hf_config)
+        for name, value in _parse_runtime_config(getattr(od_config, "additional_config", None)).items():
+            setattr(self.config, name, value)
 
         # Build generator and decoder
         self.generator = OmniVoiceGenerator(self.config, od_config)

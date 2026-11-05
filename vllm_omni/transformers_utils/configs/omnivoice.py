@@ -6,6 +6,22 @@ import os
 
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def _legacy_env_flag(name: str, default: bool) -> bool:
+    """Read a deprecated OmniVoice boolean environment switch (#6232)."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    logger.warning_once(
+        "%s is deprecated and will be removed in a future release. "
+        "Set additional_config.omnivoice_runtime in the OmniVoice stage config instead.",
+        name,
+    )
+    return value != "0"
 
 
 class OmniVoiceConfig(PretrainedConfig):
@@ -84,16 +100,18 @@ class OmniVoiceConfig(PretrainedConfig):
 
         # Serving
         self.speculative_config = None
-        # Precedence: config.json > OMNIVOICE_CUDA_GRAPH env var > default (enabled).
-        # Read once at init; changing OMNIVOICE_CUDA_GRAPH at runtime has no effect.
-        self.enable_cuda_graph = getattr(self, "enable_cuda_graph", os.environ.get("OMNIVOICE_CUDA_GRAPH", "1") != "0")
+        # Precedence: additional_config.omnivoice_runtime (applied by the pipeline)
+        # > config.json > deprecated OMNIVOICE_CUDA_GRAPH env var > default (enabled).
+        if not hasattr(self, "enable_cuda_graph"):
+            self.enable_cuda_graph = _legacy_env_flag("OMNIVOICE_CUDA_GRAPH", True)
         self.cuda_graph_capture_sizes = getattr(
             self,
             "cuda_graph_capture_sizes",
             [128, 192, 256, 320, 384, 448, 512, 640, 768, 1024],
         )
-        # TF32 matmuls: not bit-identical; opt-in (matches vLLM default-off), set OMNIVOICE_TF32=1 to enable.
-        self.enable_tf32 = getattr(self, "enable_tf32", os.environ.get("OMNIVOICE_TF32", "0") != "0")
+        # TF32 matmuls: not bit-identical; opt-in (matches vLLM default-off). Same precedence as above.
+        if not hasattr(self, "enable_tf32"):
+            self.enable_tf32 = _legacy_env_flag("OMNIVOICE_TF32", False)
 
 
 AutoConfig.register("omnivoice", OmniVoiceConfig)
