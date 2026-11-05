@@ -7,6 +7,7 @@ These utilities are model-agnostic and can be used by any TTS model stage
 processor (qwen3_omni, qwen2_5_omni, qwen3_tts, etc.).
 """
 
+from collections.abc import Mapping
 from typing import Any
 
 # =============================================================================
@@ -62,7 +63,7 @@ def extract_speaker_from_prompt(
     if prompt is None:
         return None
     p = prompt[index] if isinstance(prompt, list) and index < len(prompt) else prompt
-    if p is None:
+    if not isinstance(p, Mapping):
         return None
     add_info = p.get("additional_information")
     if not isinstance(add_info, dict):
@@ -149,7 +150,7 @@ def extract_language_from_prompt(
     if prompt is None:
         return None
     p = prompt[index] if isinstance(prompt, list) and index < len(prompt) else prompt
-    if p is None:
+    if not isinstance(p, Mapping):
         return None
     add_info = p.get("additional_information")
     if not isinstance(add_info, dict):
