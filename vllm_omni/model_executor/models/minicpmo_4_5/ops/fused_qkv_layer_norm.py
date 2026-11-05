@@ -127,6 +127,9 @@ def qkv_head_layer_norm(
             kv[1, :, :, :frames].copy_(values)
             return q_out
         pool_rows = rows.tolist() if rows is not None else range(batch)
+        # ``positions`` rows come from ``flatnonzero`` of the free-frame mask, so
+        # frame targets never repeat; a duplicate would make the winning write
+        # undefined here (last wins) and racy in the parallel Triton kernel.
         for n, pool_row in enumerate(pool_rows):
             frame_index = positions[n] if positions is not None else torch.arange(frames, device=kv.device)
             written = frame_index >= 0
