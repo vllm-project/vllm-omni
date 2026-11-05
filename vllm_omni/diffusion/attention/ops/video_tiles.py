@@ -66,6 +66,11 @@ def pack_video_tiles(
     CUDA inference combines gathering and padding in one kernel. CPU and
     autograd retain the indexed PyTorch implementation.
     """
+    if any(dim <= 0 for dim in (*dit_seq_shape, *tile_size)):
+        raise ValueError("dit_seq_shape and tile_size must contain positive dimensions")
+    if x.shape[1] != math.prod(dit_seq_shape):
+        raise ValueError(f"sequence length {x.shape[1]} must equal dit_seq_shape product {math.prod(dit_seq_shape)}")
+
     padded_length = math.prod([(n + tile - 1) // tile for n, tile in zip(dit_seq_shape, tile_size)]) * math.prod(
         tile_size
     )

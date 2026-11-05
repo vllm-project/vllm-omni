@@ -31,6 +31,34 @@ def test_pack_video_tiles_cpu_and_gradients(seq_shape):
     torch.testing.assert_close(x.grad, torch.ones_like(x), rtol=0, atol=0)
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("seq_len", [7, 9])
+def test_pack_video_tiles_rejects_sequence_length_mismatch(seq_len):
+    x = torch.randn(1, seq_len, 1, 8)
+    with pytest.raises(ValueError, match="sequence length"):
+        pack_video_tiles(x, (2, 2, 2), (4, 8, 8))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "seq_shape,tile_size",
+    [
+        ((0, 1, 1), (4, 8, 8)),
+        ((1, 0, 1), (4, 8, 8)),
+        ((1, 1, 0), (4, 8, 8)),
+        ((-1, 1, 1), (4, 8, 8)),
+        ((1, 1, 1), (0, 8, 8)),
+        ((1, 1, 1), (4, 0, 8)),
+        ((1, 1, 1), (4, 8, 0)),
+        ((1, 1, 1), (4, -1, 8)),
+    ],
+)
+def test_pack_video_tiles_rejects_nonpositive_dimensions(seq_shape, tile_size):
+    x = torch.randn(1, 1, 1, 8)
+    with pytest.raises(ValueError, match="positive"):
+        pack_video_tiles(x, seq_shape, tile_size)
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @requires_cuda
 @pytest.mark.parametrize("seq_shape", [(1, 1, 1), (4, 8, 8), (3, 10, 10), (5, 9, 17), (31, 22, 40)])
