@@ -15,10 +15,11 @@ stages:
     max_num_seqs: 16
     gpu_memory_utilization: 0.4
     enable_prefix_caching: false
+    enable_chunked_prefill: false
     skip_tokenizer_init: true
     tokenizer: gpt2
     async_scheduling: true
-    max_num_batched_tokens: 512
+    max_num_batched_tokens: 2560
     max_model_len: 2560
     devices: "0"
     output_connectors:
@@ -53,6 +54,7 @@ stages:
       s2mel_vocoder_cuda_graph: true
       s2mel_dit_cuda_graph: true
       s2mel_dit_cuda_graph_max_graphs: 16
+      s2mel_allow_tf32: true
       s2mel_vocoder_capture_sizes: [128, 256, 384, 512, 1024]
       s2mel_vocoder_compile_shapes: [256, 384, 512]
     default_sampling_params:
