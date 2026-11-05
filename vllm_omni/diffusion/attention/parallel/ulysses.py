@@ -290,7 +290,7 @@ class UlyssesParallelAttention:
     ):
         mode = get_ulysses_mode(default="strict")
         if self._ulysses_a2a_permute and current_omni_platform.is_npu() and mode != "strict":
-            raise ValueError("NPU SHMEM Ulysses currently supports only ulysses_mode='strict'")
+            raise ValueError("NPU symmetric memory Ulysses currently supports only ulysses_mode='strict'")
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
         if attn_metadata is not None:

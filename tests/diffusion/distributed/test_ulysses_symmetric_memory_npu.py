@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
 
 
 @pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
-def test_production_shmem_matches_hccl():
+def test_production_symmetric_memory_matches_hccl():
     import torch_npu  # noqa: F401
 
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -52,7 +52,7 @@ def test_production_shmem_matches_hccl():
         equal = torch.equal(actual.cpu().contiguous().view(torch.uint8), expected.cpu().contiguous().view(torch.uint8))
         failed = torch.tensor(int(not equal), device=device)
         dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-        assert failed.item() == 0, "SHMEM/HCCL output differs on at least one rank"
+        assert failed.item() == 0, "Symmetric memory/HCCL output differs on at least one rank"
 
     try:
         with torch.inference_mode():

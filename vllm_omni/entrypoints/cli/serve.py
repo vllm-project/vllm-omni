@@ -660,7 +660,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "Enable fused permute-free Ulysses all-to-all using platform-specific symmetric memory "
-                "(NCCL on CUDA, SHMEM on NPU). Only strict Ulysses layouts are eligible. "
+                "(NCCL on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM, CANN SHMEM and AscendC build tools, "
                 "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."

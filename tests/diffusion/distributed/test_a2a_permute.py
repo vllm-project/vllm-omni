@@ -48,7 +48,7 @@ def test_npu_initialization_never_builds_cuda(monkeypatch):
 
     calls = []
     module = SimpleNamespace(ensure_a2a_permute_available=lambda: calls.append("npu"))
-    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_shmem_npu", module)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
 
     def unexpected():
@@ -71,7 +71,7 @@ def test_grouped_npu_dispatch_preserves_fused_qkv(monkeypatch):
         return outputs
 
     module = SimpleNamespace(ulysses_qkv_fwd_group=forward)
-    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_shmem_npu", module)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
     assert a2a_permute.ulysses_qkv_fwd_group(query, key, value, "ulysses", 4) is outputs
 
 
