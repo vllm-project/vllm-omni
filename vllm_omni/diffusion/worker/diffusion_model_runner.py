@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import logging
 import math
 import time
 from collections.abc import Callable, Sequence
@@ -633,19 +634,21 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         Named ``_mb`` to match the public ``peak_memory_mb`` field.
         """
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
-        peak_allocated_bytes = current_omni_platform.max_memory_allocated()
-
-        pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
-
         peak_memory_mb = peak_reserved_bytes / (1024**2)
 
-        logger.debug(
-            "Peak GPU memory (this request): %s GiB reserved, %s GiB allocated, %s GiB pool overhead (%.1f%%)",
-            format_gib(peak_reserved_bytes),
-            format_gib(peak_allocated_bytes),
-            format_gib(pool_overhead_bytes),
-            pool_overhead_bytes / peak_reserved_bytes * 100 if peak_reserved_bytes > 0 else 0.0,
-        )
+        # The allocated peak only feeds the debug line, and each of these
+        # platform calls builds the full allocator statistics, so skip the
+        # second one on the request path unless that line will be emitted.
+        if logger.isEnabledFor(logging.DEBUG):
+            peak_allocated_bytes = current_omni_platform.max_memory_allocated()
+            pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
+            logger.debug(
+                "Peak GPU memory (this request): %s GiB reserved, %s GiB allocated, %s GiB pool overhead (%.1f%%)",
+                format_gib(peak_reserved_bytes),
+                format_gib(peak_allocated_bytes),
+                format_gib(pool_overhead_bytes),
+                pool_overhead_bytes / peak_reserved_bytes * 100 if peak_reserved_bytes > 0 else 0.0,
+            )
         return peak_memory_mb
 
     def _prepare_request_for_forward(

@@ -286,6 +286,23 @@ class TestRequestModeDispatch:
         assert out == "batch"
         executor.execute_request.assert_not_called()
 
+    def test_single_request_rpc_does_not_carry_the_config(self):
+        """The worker runs on the config it was started with, so the per-request
+        ``execute_model`` RPC sends a placeholder instead of pickling the config."""
+        executor, _, _ = _make_executor()
+        executor.od_config = SimpleNamespace(step_execution=False)
+        executor.collective_rpc = Mock(return_value=_tagged_output("solo"))
+        scheduler_output = _make_sched_output("solo")
+
+        result = executor.execute_request(scheduler_output)
+
+        executor.collective_rpc.assert_called_once()
+        assert executor.collective_rpc.call_args.args == ("execute_model",)
+        rpc_args = executor.collective_rpc.call_args.kwargs["args"]
+        assert rpc_args[0] is scheduler_output.scheduled_new_reqs[0].req
+        assert rpc_args[1] is None
+        assert [output.result.error for output in result.runner_outputs] == ["solo"]
+
     @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B")])
     def test_batch_path_routes_results_through_worker(self, request_ids):
         """End-to-end: a request-batch cycle goes out as one ``execute_model_batch``

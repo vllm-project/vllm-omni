@@ -796,11 +796,15 @@ class DiffusionWorker:
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[NewRequestData],
-        od_config: OmniDiffusionConfig,
+        od_config: OmniDiffusionConfig | None = None,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
         """Execute a forward pass by delegating to the model runner.
+
+        ``od_config`` is accepted for call compatibility and is not read: the
+        model runner executes with the config this worker was started with.
+        The multiprocess executor passes ``None`` for single requests.
 
         If *req* is a list (DP multi-concurrency), each rank picks one complete
         NewRequestData envelope based on its distributed rank. AllGather in
@@ -2031,7 +2035,7 @@ class WorkerWrapperBase:
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[NewRequestData],
-        od_config: OmniDiffusionConfig,
+        od_config: OmniDiffusionConfig | None = None,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
@@ -2040,7 +2044,7 @@ class WorkerWrapperBase:
 
         Args:
             req: Diffusion request.
-            od_config: OmniDiffusionConfig configuration
+            od_config: Unused; the worker runs on the config it was started with.
             kv_prefetch_job: Optional next-request KV prefetch descriptor.
 
         Returns:
