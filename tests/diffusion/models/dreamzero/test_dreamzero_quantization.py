@@ -3,12 +3,15 @@
 
 """Quantization wiring for the DreamZero DiT.
 
-Every vLLM parallel linear gets `quant_config` and a `prefix` equal to its
-module path; small plain-`nn.Linear` projections stay bf16.
+Every vLLM parallel linear in the blocks gets `quant_config`, and every one has
+a `prefix` equal to its module path; the i2v `img_emb` projection and small
+plain-`nn.Linear` projections stay bf16.
 
 CPU-only: the parallel linears, the patch conv and the attention layer are
 replaced by stand-ins.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -102,7 +105,10 @@ def _linears(model) -> dict[str, object]:
     return {path: mod for path, mod in model.named_modules() if isinstance(mod, _FakeLinear)}
 
 
-def _expected_paths(num_layers: int) -> set[str]:
+IMAGE_PROJECTIONS = {"img_emb.fc1", "img_emb.fc2"}
+
+
+def _quantized_paths(num_layers: int) -> set[str]:
     per_block = (
         "self_attn.qkv",
         "self_attn.o",
@@ -115,19 +121,19 @@ def _expected_paths(num_layers: int) -> set[str]:
         "ffn.0",
         "ffn.2",
     )
-    paths = {f"blocks.{i}.{name}" for i in range(num_layers) for name in per_block}
-    return paths | {"img_emb.fc1", "img_emb.fc2"}
+    return {f"blocks.{i}.{name}" for i in range(num_layers) for name in per_block}
 
 
 @pytest.mark.parametrize("num_layers", [1, 2])
-def test_every_gemm_linear_gets_the_quant_config(dz, num_layers):
+def test_every_block_linear_gets_the_quant_config(dz, num_layers):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     fp8_config = Fp8Config()
     linears = _linears(_build(dz, num_layers, quant_config=fp8_config))
 
-    assert set(linears) == _expected_paths(num_layers)
-    assert all(mod.quant_config is fp8_config for mod in linears.values())
+    assert set(linears) == _quantized_paths(num_layers) | IMAGE_PROJECTIONS
+    assert {path for path, mod in linears.items() if mod.quant_config is fp8_config} == _quantized_paths(num_layers)
+    assert all(linears[path].quant_config is None for path in IMAGE_PROJECTIONS)
 
 
 def test_prefix_matches_module_path(dz):
@@ -159,7 +165,7 @@ def test_t2v_has_no_image_projections(dz):
 def test_default_is_unquantized_and_prefixes_still_set(dz):
     linears = _linears(_build(dz, 1))
 
-    assert set(linears) == _expected_paths(1)
+    assert set(linears) == _quantized_paths(1) | IMAGE_PROJECTIONS
     assert all(mod.quant_config is None for mod in linears.values())
     assert all(mod.prefix == path for path, mod in linears.items())
 
@@ -179,3 +185,71 @@ def test_plain_linear_projections_stay_full_precision(dz):
     # head.head runs once per forward (not TP-critical), so it stays a plain
     # nn.Linear and takes no quant_config -- not an accuracy decision.
     assert not any(isinstance(mod, _FakeLinear) for mod in model.head.modules())
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.int8, None])
+def test_init_weights_rejects_pre_quantized_weights(dz, dtype):
+    model = _build(dz, 1)
+    linear = model.blocks[0].ffn[0]
+    if dtype is None:
+        del linear.weight
+    else:
+        linear.weight = nn.Parameter(torch.zeros(1, 1, dtype=dtype), requires_grad=False)
+
+    with pytest.raises(NotImplementedError, match="online quantization only"):
+        model.init_weights()
+
+
+class _ReachedTransformerError(Exception):
+    pass
+
+
+def _transformer_quant_config(monkeypatch, quantization_config):
+    """Run `DreamZeroPipeline.__init__` up to the DiT and return the quant_config it receives."""
+    from vllm_omni.diffusion.models.dreamzero import pipeline_dreamzero as p
+
+    captured = {}
+
+    def transformer(**kwargs):
+        captured.update(kwargs)
+        raise _ReachedTransformerError
+
+    root_cfg = {
+        "action_head_cfg": {
+            "config": {"diffusion_model_cfg": {}, "action_dim": 1, "max_state_dim": 1, "num_frame_per_block": 1}
+        }
+    }
+    vae = SimpleNamespace(
+        config=SimpleNamespace(latents_mean=[0.0], latents_std=[1.0]),
+        init_distributed=lambda: None,
+    )
+    monkeypatch.setattr(p.DreamZeroPipeline, "_load_repo_json", staticmethod(lambda *args: root_cfg))
+    monkeypatch.setattr(p, "AutoTokenizer", SimpleNamespace(from_pretrained=lambda *args, **kwargs: None))
+    monkeypatch.setattr(p, "UMT5EncoderModel", lambda config: None)
+    monkeypatch.setattr(p, "DreamZeroImageEncoder", lambda: None)
+    monkeypatch.setattr(p, "DistributedAutoencoderKLWan", lambda: vae)
+    monkeypatch.setattr(p, "resolve_offload_strategy", lambda od_config: p.OffloadStrategy.MODEL_LEVEL)
+    monkeypatch.setattr(p, "CausalWanModel", transformer)
+    od_config = SimpleNamespace(
+        engine_backend="ar_diffusion",
+        model="/nonexistent/dreamzero",
+        model_config={},
+        model_paths={},
+        quantization_config=quantization_config,
+    )
+
+    with pytest.raises(_ReachedTransformerError):
+        p.DreamZeroPipeline(od_config=od_config)
+    return captured["quant_config"]
+
+
+def test_pipeline_routes_quant_config_to_transformer(monkeypatch):
+    from vllm_omni.quantization import build_quant_config
+
+    global_config = build_quant_config("fp8")
+    assert _transformer_quant_config(monkeypatch, global_config) is global_config
+
+    transformer_only = _transformer_quant_config(monkeypatch, build_quant_config({"transformer": {"method": "fp8"}}))
+    assert transformer_only is not None and transformer_only.get_name() == "fp8"
+
+    assert _transformer_quant_config(monkeypatch, build_quant_config({"text_encoder": {"method": "fp8"}})) is None

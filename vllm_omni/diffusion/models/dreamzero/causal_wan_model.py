@@ -274,11 +274,10 @@ def fused_qk_rms_norm(
 class MLPProj(nn.Module):
     """CLIP feature projection for i2v.
     Uses ColumnParallelLinear + RowParallelLinear (Qwen3_VisionMLP pattern).
+    Takes no quant_config: it runs once per session, so FP8 would save nothing.
     """
 
-    def __init__(
-        self, in_dim: int, out_dim: int, quant_config: QuantizationConfig | None = None, prefix: str = ""
-    ) -> None:
+    def __init__(self, in_dim: int, out_dim: int, prefix: str = "") -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(in_dim)
         self.fc1 = ColumnParallelLinear(
@@ -286,7 +285,6 @@ class MLPProj(nn.Module):
             in_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
             prefix=f"{prefix}.fc1" if prefix else "fc1",
         )
         self.act = nn.GELU()
@@ -295,7 +293,6 @@ class MLPProj(nn.Module):
             out_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
             prefix=f"{prefix}.fc2" if prefix else "fc2",
         )
         self.norm2 = nn.LayerNorm(out_dim)
@@ -311,6 +308,24 @@ class MLPProj(nn.Module):
 
 # ── Cross-Attention ─────────────────────────────────────────────────
 # T2V and I2V cross-attention variants
+
+
+def _cross_attn_qkvo(
+    dim: int, quant_config: QuantizationConfig | None, prefix: str
+) -> tuple[ColumnParallelLinear, ColumnParallelLinear, ColumnParallelLinear, RowParallelLinear]:
+    def p(name: str) -> str:
+        return f"{prefix}.{name}" if prefix else name
+
+    q, k, v = (
+        ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, return_bias=False, quant_config=quant_config, prefix=p(name)
+        )
+        for name in ("q", "k", "v")
+    )
+    o = RowParallelLinear(
+        dim, dim, bias=True, input_is_parallel=True, return_bias=False, quant_config=quant_config, prefix=p("o")
+    )
+    return q, k, v, o
 
 
 class WanT2VCrossAttention(nn.Module):
@@ -339,42 +354,7 @@ class WanT2VCrossAttention(nn.Module):
             raise ValueError(f"num_heads={num_heads} must be divisible by tp_size={tp_size}.")
         self.tp_num_heads = num_heads // tp_size
         self.tp_inner_dim = self.tp_num_heads * self.head_dim
-        self.q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.q" if prefix else "q",
-        )
-        self.k = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k" if prefix else "k",
-        )
-        self.v = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v" if prefix else "v",
-        )
-        self.o = RowParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            input_is_parallel=True,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o" if prefix else "o",
-        )
+        self.q, self.k, self.v, self.o = _cross_attn_qkvo(dim, quant_config, prefix)
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = Attention(
@@ -440,42 +420,7 @@ class WanI2VCrossAttention(nn.Module):
             raise ValueError(f"num_heads={num_heads} must be divisible by tp_size={tp_size}.")
         self.tp_num_heads = num_heads // tp_size
         self.tp_inner_dim = self.tp_num_heads * self.head_dim
-        self.q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.q" if prefix else "q",
-        )
-        self.k = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k" if prefix else "k",
-        )
-        self.v = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v" if prefix else "v",
-        )
-        self.o = RowParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            input_is_parallel=True,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o" if prefix else "o",
-        )
+        self.q, self.k, self.v, self.o = _cross_attn_qkvo(dim, quant_config, prefix)
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.k_img = ColumnParallelLinear(
@@ -1023,9 +968,7 @@ class CausalWanModel(nn.Module):
         ]
 
         if model_type == "i2v":
-            self.img_emb = MLPProj(
-                1280, dim, quant_config=quant_config, prefix=f"{prefix}.img_emb" if prefix else "img_emb"
-            )
+            self.img_emb = MLPProj(1280, dim, prefix=f"{prefix}.img_emb" if prefix else "img_emb")
 
         self.init_weights()
 
@@ -1040,6 +983,12 @@ class CausalWanModel(nn.Module):
                 return
 
             if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+                # float8 dtypes pass is_floating_point(), so check the width too.
+                weight = getattr(module, "weight", None)
+                if weight is None or not weight.is_floating_point() or weight.element_size() < 2:
+                    raise NotImplementedError(
+                        "DreamZero supports online quantization only; pre-quantized checkpoints are not supported."
+                    )
                 fan_in = module.input_size
                 fan_out = module.output_size
                 bound = math.sqrt(6.0 / float(fan_in + fan_out))
