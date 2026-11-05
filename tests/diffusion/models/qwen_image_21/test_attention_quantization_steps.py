@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise step selectors through both Qwen2.1 denoising entry points."""
 
-from unittest.mock import Mock
-
 import pytest
 import torch
 from torch import nn
@@ -12,10 +10,16 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import get_forward_context, override_forward_context, set_forward_context
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
-from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
+from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
+    QwenImage21Pipeline,
+    get_qwen_image_21_pre_process_func,
+)
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.quantization.mxfp4_config import _is_w4a8_fallback_step
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -159,65 +163,111 @@ def test_step_mode_publishes_request_step(monkeypatch, step, expected):
     assert seen == [(step, expected)]
 
 
-@pytest.mark.parametrize("skip_steps", [None, "0,2"])
-@pytest.mark.parametrize("previous_step", [None, 0, 9])
-def test_step_mode_separates_quantization_steps_without_reordering_rows(monkeypatch, skip_steps, previous_step):
-    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps=skip_steps)
+def test_scheduled_requests_publish_the_common_step(monkeypatch, tmp_path):
+    # Use the Qwen admission hook and the real scheduler. Only encoding and
+    # device computation are replaced with small CPU tensors.
+    (tmp_path / "vae").mkdir()
+    (tmp_path / "vae/config.json").write_text('{"scale_factor_spatial": 16}')
+    config = OmniDiffusionConfig(
+        model=str(tmp_path), max_num_seqs=3, diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0,2"
+    )
+    preprocess = get_qwen_image_21_pre_process_func(config)
+    scheduler = StepScheduler()
+    scheduler.initialize(config)
     pipe = _step_pipeline(config)
     attention = _attention(config)
-    states = [_state("a", 1, 1.0), _state("b", 2, 2.0, rows=2), _state("c", 1, 3.0)]
-    seen = []
+    observed = []
 
-    def predict(*args, **kwargs):
-        hidden = args[2]["hidden_states"]
-        seen.append(
+    def add(request_id, total):
+        params = OmniDiffusionSamplingParams(num_inference_steps=total, height=1024, width=1024, seed=42)
+        scheduler.add_request(
+            preprocess(OmniDiffusionRequest(prompt="teapot", request_id=request_id, sampling_params=params))
+        )
+
+    def predict(_cfg, _scale, positive, *args, **kwargs):
+        hidden = positive["hidden_states"]
+        observed.append(
             (
                 get_forward_context().denoise_step_idx,
                 attention._with_kv_cache_dtype(None).extra["kv_cache_dtype"],
+                _is_w4a8_fallback_step([2]),
                 hidden.shape[0],
             )
         )
         return hidden
 
     monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=previous_step):
-        result = pipe.denoise_step(InputBatch.make_batch(states))
-        assert get_forward_context().denoise_step_idx == previous_step
-    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0]))
-    expected: list[tuple[int | None, str, int]]
-    if skip_steps:
-        expected = [(1, "mxfp8", 2), (2, "float", 2)]
-    else:
-        expected = [(None, "mxfp8", 4)]
-    assert seen == expected
+    monkeypatch.setattr(pipe, "scheduler_step_maybe_with_cfg", lambda noise, t, latents, cfg, **kw: latents)
+    states = {}
+    waves = []
+    add("long", 4)
+    add("short", 2)
+    for tick in range(6):
+        if tick == 1:
+            add("late", 2)
+        scheduled = scheduler.schedule()
+        for new in scheduled.scheduled_new_reqs:
+            state = _state(new.request_id, 0, 1.0)
+            state.timesteps = state.timesteps[: new.req.sampling_params.num_inference_steps]
+            states[new.request_id] = state
+        batch = [states[rid] for rid in scheduled.scheduled_request_ids]
+        waves.append([(state.request_id, state.step_index) for state in batch])
+        with set_forward_context(omni_diffusion_config=config):
+            noise = pipe.denoise_step(InputBatch.make_batch(batch))
+        outputs = []
+        for row, state in enumerate(batch):
+            pipe.step_scheduler(state, noise[row : row + 1])
+            outputs.append(
+                RunnerOutput(request_id=state.request_id, step_index=state.step_index, finished=state.denoise_completed)
+            )
+        scheduler.update_from_output(scheduled, BatchRunnerOutput.from_list(outputs))
+
+    assert waves == [
+        [("long", 0), ("short", 0)],
+        [("long", 1), ("short", 1)],
+        [("long", 2)],
+        [("long", 3)],
+        [("late", 0)],
+        [("late", 1)],
+    ]
+    assert observed == [
+        (0, "float", False, 2),
+        (1, "mxfp8", False, 2),
+        (2, "float", True, 1),
+        (3, "mxfp8", False, 1),
+        (0, "float", False, 1),
+        (1, "mxfp8", False, 1),
+    ]
 
 
-@pytest.mark.parametrize("dtype", [None, "auto", "float"])
 @pytest.mark.parametrize("different_prefix_lengths", [False, True])
-def test_native_decode_ignores_step_selector_but_preserves_prefix_groups(monkeypatch, dtype, different_prefix_lengths):
-    config = OmniDiffusionConfig(diffusion_kv_cache_dtype=dtype, diffusion_kv_cache_skip_steps="0")
+def test_decode_publishes_only_a_common_index_per_prefix_group(monkeypatch, different_prefix_lengths):
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
     pipe = _step_pipeline(config)
+    # Direct input exercises the scalar context boundary for mixed indices.
+    # Normal Qwen admission is covered by the scheduler test above.
     states = [_state("a", 1, 1.0), _state("b", 2, 2.0, rows=2), _state("c", 3, 3.0)]
     for state in states:
-        rows = state.latents.shape[0]
-        prefix_length = 2 if different_prefix_lengths and state.request_id == "b" else 1
-        state.latents = state.latents.to(torch.bfloat16)
-        state.extra["prefill_prompt_seq_len"] = prefix_length
-        state.extra["kv_cache"] = [{"cond": {part: torch.zeros(rows, prefix_length, 4) for part in ("key", "value")}}]
-    forward_rows = []
+        prefix = 2 if different_prefix_lengths and state.request_id == "b" else 1
+        state.extra["prefill_prompt_seq_len"] = prefix
+        state.extra["kv_cache"] = [
+            {"cond": {part: torch.zeros(state.latents.shape[0], prefix, 4) for part in ("key", "value")}}
+        ]
+    calls = []
 
-    def predict(*args, **kwargs):
-        hidden = args[2]["hidden_states"]
-        assert hidden.dtype == torch.bfloat16
-        forward_rows.append(hidden[:, 0, 0].tolist())
+    def predict(_cfg, _scale, positive, *args, **kwargs):
+        hidden = positive["hidden_states"]
+        calls.append((get_forward_context().denoise_step_idx, hidden[:, 0, 0].tolist()))
         return hidden
 
     monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config):
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9):
         result = pipe.denoise_step(InputBatch.make_batch(states))
-        assert get_forward_context().denoise_step_idx is None
-    assert forward_rows == ([[1.0, 3.0], [2.0, 2.0]] if different_prefix_lengths else [[1.0, 2.0, 2.0, 3.0]])
-    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0], dtype=torch.bfloat16))
+        assert get_forward_context().denoise_step_idx == 9
+    assert calls == (
+        [(None, [1.0, 3.0]), (2, [2.0, 2.0])] if different_prefix_lengths else [(None, [1.0, 2.0, 2.0, 3.0])]
+    )
+    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0]))
 
 
 @pytest.mark.parametrize("previous_step", [None, 0, 9])
@@ -247,9 +297,9 @@ def _entry_point(monkeypatch, config, mode, predict):
 @pytest.mark.parametrize("mode", ["request", "step"])
 @pytest.mark.parametrize("failure", [None, "activation", "forward"])
 @pytest.mark.parametrize("previous_step", [None, 0, 9])
-def test_restoration_does_not_reactivate_runtime(monkeypatch, mode, failure, previous_step):
+def test_restoration_does_not_reactivate_runtime(monkeypatch, mocker, mode, failure, previous_step):
     config = OmniDiffusionConfig()
-    runtime = Mock()
+    runtime = mocker.Mock()
     if failure == "activation":
         runtime.ensure_active.side_effect = RuntimeError("activation failed")
 
@@ -309,145 +359,3 @@ def test_entry_without_forward_context(monkeypatch, mode):
     run = _entry_point(monkeypatch, OmniDiffusionConfig(), mode, predict)
     with override_forward_context(None):
         assert run().shape == (1, 2, 4)
-
-
-def test_step_mode_groups_mixed_prefix_lengths_and_steps(monkeypatch):
-    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0,2")
-    pipe = _step_pipeline(config)
-    attention = _attention(config)
-    states = [_state("a", 1, 1.0), _state("b", 2, 2.0), _state("c", 2, 3.0), _state("d", 1, 4.0, rows=2)]
-    for state in states:
-        prefix_length = 2 if state.request_id == "b" else 1
-        state.extra["prefill_prompt_seq_len"] = prefix_length
-        state.extra["kv_cache"] = [
-            {"cond": {part: torch.zeros(state.latents.shape[0], prefix_length, 4) for part in ("key", "value")}}
-        ]
-    assert pipe._needs_decode_seq_len_split(states)
-    assert len({state.step_index for state in states}) > 1
-    seen = []
-
-    def predict(*args, **kwargs):
-        hidden = args[2]["hidden_states"]
-        seen.append(
-            (
-                get_forward_context().denoise_step_idx,
-                attention._with_kv_cache_dtype(None).extra["kv_cache_dtype"],
-                hidden[:, 0, 0].tolist(),
-            )
-        )
-        return hidden
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config):
-        result = pipe.denoise_step(InputBatch.make_batch(states))
-        assert get_forward_context().denoise_step_idx is None
-    assert seen == [(1, "mxfp8", [1.0, 4.0, 4.0]), (2, "float", [2.0]), (2, "float", [3.0])]
-    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 3.0, 4.0, 4.0]))
-
-
-def test_step_mode_accepts_config_without_parsed_step_selector(monkeypatch):
-    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8")
-    # Remove both the instance field and its dataclass default to exercise a
-    # config producer that does not expose the optional parsed selector.
-    monkeypatch.delattr(config, "diffusion_kv_cache_skip_step_indices")
-    monkeypatch.delattr(OmniDiffusionConfig, "diffusion_kv_cache_skip_step_indices")
-    pipe = _step_pipeline(config)
-    calls = []
-
-    def predict(*args, **kwargs):
-        hidden = args[2]["hidden_states"]
-        calls.append(hidden.shape[0])
-        return hidden
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config):
-        result = pipe.denoise_step(InputBatch.make_batch([_state("a", 1, 1.0), _state("b", 2, 2.0)]))
-    assert calls == [2]
-    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0]))
-
-
-def _decode_states():
-    states = [_state("a", 1, 1.0), _state("b", 2, 2.0, rows=2), _state("c", 3, 3.0)]
-    for state in states:
-        state.extra["prefill_prompt_seq_len"] = 1
-        state.extra["kv_cache"] = [
-            {"cond": {part: torch.zeros(state.latents.shape[0], 1, 4) for part in ("key", "value")}}
-        ]
-    return states
-
-
-@pytest.mark.parametrize("dtype,skip", [("mxfp8", "0"), ("mxfp8", None), (None, "0"), ("float", None)])
-def test_grouping_preserves_linear_fallback_independently_of_attention(monkeypatch, dtype, skip):
-    from vllm_omni.quantization import mxfp4_config
-    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
-    from vllm_omni.quantization.mxfp8_config import MXFPLinearMethodBase
-
-    config = OmniDiffusionConfig(diffusion_kv_cache_dtype=dtype, diffusion_kv_cache_skip_steps=skip)
-    pipe = _step_pipeline(config)
-    quant = DiffusionMXFP4Config(w4a8_fallback_steps=[2])
-    pipe.transformer.quant_config = quant
-    attention = _attention(config)
-    linear = mxfp4_config.NPUMxfp4LinearMethod(quant)
-    layer = nn.Linear(4, 4, bias=False)
-    layer.weight_scale = torch.ones(1)
-    branches = []
-
-    def a4(self, layer, x, bias, ori_dtype):
-        branches.append("A4")
-        return x + 4
-
-    def a8(x, weight, scale, bias, ori_dtype):
-        branches.append("A8")
-        return x + 8
-
-    # Keep the real Linear branch selection; replace only device execution.
-    monkeypatch.setattr(MXFPLinearMethodBase, "_apply_inner", a4)
-    monkeypatch.setattr(mxfp4_config, "_npu_w4a8_matmul", a8)
-    seen = []
-
-    def predict(*args, **kwargs):
-        hidden = args[2]["hidden_states"]
-        metadata = attention._with_kv_cache_dtype(None)
-        seen.append((get_forward_context().denoise_step_idx, metadata.extra["kv_cache_dtype"] if metadata else None))
-        return linear._apply_inner(layer, hidden, None, hidden.dtype)
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9):
-        result = pipe.denoise_step(InputBatch.make_batch(_decode_states()))
-        assert get_forward_context().denoise_step_idx == 9
-    expected_dtype = "mxfp8" if dtype == "mxfp8" else None
-    assert seen == [(1, expected_dtype), (2, expected_dtype), (3, expected_dtype)]
-    assert branches == ["A4", "A8", "A4"]
-    torch.testing.assert_close(result[:, 0, 0], torch.tensor([5.0, 10.0, 10.0, 7.0]))
-
-
-@pytest.mark.parametrize("fallback_steps", [None, []])
-def test_linear_without_step_fallback_keeps_native_mixed_batch(monkeypatch, fallback_steps):
-    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
-
-    config = OmniDiffusionConfig(diffusion_kv_cache_skip_steps="0")
-    pipe = _step_pipeline(config)
-    pipe.transformer.quant_config = DiffusionMXFP4Config(w4a8_fallback_steps=fallback_steps)
-    seen = []
-
-    def predict(*args, **kwargs):
-        seen.append(get_forward_context().denoise_step_idx)
-        torch.testing.assert_close(args[2]["timestep"], torch.tensor([0.7, 0.2, 0.2, 0.001]))
-        return args[2]["hidden_states"]
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=9):
-        result = pipe.denoise_step(InputBatch.make_batch(_decode_states()))
-        assert get_forward_context().denoise_step_idx == 9
-    assert seen == [None]
-    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0]))
-
-
-def test_step_grouping_rejects_mixed_kv_phases():
-    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
-    pipe = _step_pipeline(config)
-    states = _decode_states()
-    states[0].extra["kv_cache"] = None
-    with set_forward_context(omni_diffusion_config=config):
-        with pytest.raises(ValueError, match="mixed KV-cache phases"):
-            pipe.denoise_step(InputBatch.make_batch(states))

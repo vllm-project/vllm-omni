@@ -171,18 +171,9 @@ This requires an Ascend installation with compatible MindIE-SD MXFP8
 attention operators. It changes attention compute only; Linear weights and
 the persistent prefix KV cache keep their existing precision.
 
-The pipeline publishes zero-based denoising indices in both whole-request
-and step-wise execution. When `diffusion_kv_cache_dtype` enables quantization
-and step selectors are configured, step-wise batches at different indices are
-evaluated separately and restored to request order. Retaining a step selector
-with `diffusion_kv_cache_dtype` set to `None`, `auto`, or `float` does not split
-batches by step; existing prefix-length compatibility grouping still applies.
-
-Linear W4A8 step fallback independently requires same-step groups, including
-when Attention uses native precision. The scalar context always describes a
-real common step; it is never a representative for different steps. Different
-steps with identical precision remain separate when a step selector is active.
-Merging those groups requires an explicit shared execution-policy context.
+The selector counts denoising forwards from zero in both whole-request and
+step execution. With the configuration above, step 0 uses the model's native
+precision and subsequent eligible dense decode steps use MXFP8.
 
 Without the explicit step-0 exclusion, structural prefill still fails rather
 than silently changing precision. Padded decode batches carrying a mask are

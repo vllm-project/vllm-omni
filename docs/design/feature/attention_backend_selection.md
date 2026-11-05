@@ -113,32 +113,14 @@ provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
 
-Denoising-step precision selectors are consumed by the shared `Attention`
-layer from `ForwardContext.denoise_step_idx`. A pipeline that exposes step
-selectors must publish the zero-based index before both CFG branches.
-Qwen-Image-2.1 restores the entering context's previous index on normal and
-exceptional exit in both request and step execution, including when publishing
-the index fails during lazy paged-KV activation. Restoration only writes the
-saved selector; it does not invoke the setter or activate paged KV. The worker
-retains ownership of that lifecycle. This preserves an outer caller's selector,
-not arbitrary nested pipeline/cache execution.
-When step selectors control an enabled `diffusion_kv_cache_dtype`
-quantization policy, heterogeneous step batches are split so one request cannot
-inherit another request's precision policy. With `None`, `auto`, or `float`,
-retaining a step selector does not introduce step-based splitting. Existing
-prefix-length compatibility grouping still applies.
-
-Linear W4A8 step fallback independently requires same-step groups, including
-when Attention uses native precision. The scalar context always describes a
-real common step; it is never a representative for different steps. Different
-steps with identical precision remain separate when a step selector is active.
-Merging those groups requires an explicit shared execution-policy context.
- Explicit backend quant
-specs are not controlled by this step selector.
-The shared `is_quantized_attention_dtype` predicate classifies the unified
-precision knob for configuration validation, `Attention`, and pipeline batching;
-backend capability checks remain separate.
-This does not change backend selection or relax unsupported mask checks.
+Qwen-Image-2.1 publishes a zero-based denoising index in
+`ForwardContext.denoise_step_idx` before running the transformer. Both CFG
+branches see the same index. In step execution, Qwen defers new first-step
+requests while a batch is decoding. The runner advances each scheduled request
+once per iteration, so requests admitted together share an index even if their
+total step counts differ. Each transformer forward publishes its common index,
+or `None` if its input states disagree. On exit the pipeline restores the
+previous index directly, preserving the worker's paged-KV activation scope.
 
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
 For tile128 it expands the selected mask into 64-token compute blocks

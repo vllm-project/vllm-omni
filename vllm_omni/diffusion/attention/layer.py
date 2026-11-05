@@ -34,7 +34,6 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import is_quantized_attention_dtype
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
@@ -391,7 +390,7 @@ class Attention(nn.Module):
             dtype = None
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if is_quantized_attention_dtype(dtype):
+        if dtype and dtype != "float":
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
@@ -426,7 +425,7 @@ class Attention(nn.Module):
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
         dtype = self._kv_cache_dtype
-        if not is_quantized_attention_dtype(dtype):
+        if dtype in (None, "float"):
             dtype = None
         elif disabled:
             dtype = "float"
@@ -764,7 +763,7 @@ class Attention(nn.Module):
                 f"Explicit backend {self.attn_backend.get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata)}"
             )
-        if attn_metadata is not None and is_quantized_attention_dtype(attn_metadata.extra.get("kv_cache_dtype")):
+        if attn_metadata is not None and attn_metadata.extra.get("kv_cache_dtype") not in (None, "float"):
             return (
                 "Cross SDPA fallback does not support quantized K/V; "
                 "disable KV quantization or select a compatible backend"
