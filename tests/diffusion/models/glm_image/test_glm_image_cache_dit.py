@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from typing import cast
@@ -11,8 +11,8 @@ from torch import nn
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
-from vllm_omni.diffusion.models.glm_image.pipeline_glm_image import GlmImagePipeline
 from vllm_omni.diffusion.models.glm_image.glm_image_transformer import GlmImageTransformer2DModel
+from vllm_omni.diffusion.models.glm_image.pipeline_glm_image import GlmImagePipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
