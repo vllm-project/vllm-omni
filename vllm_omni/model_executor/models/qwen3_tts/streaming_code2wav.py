@@ -27,6 +27,12 @@ class _RequestDecodeState:
     prefix_frames: int = 0
 
 
+def _gather_prefix_rows(codes: torch.Tensor, rows: list[int], frames: int) -> torch.Tensor:
+    """Gather a shared-prefix group's rows in one index_select."""
+    selected = index_to_device(rows, codes.device)
+    return codes[:, :, :frames].index_select(0, selected)
+
+
 class StreamingCode2Wav:
     """Decode new frames without recomputing the suffix's left context.
 
@@ -186,9 +192,8 @@ class StreamingCode2Wav:
                 records = [self.request_states[request_ids[row]] for row in part]
                 # Every row in this group shares the same prefix length, so one
                 # index_select replaces a per-row slice + cat.
-                selected = index_to_device(part, codes.device)
                 self._run_batch(
-                    codes[:, :, :frames].index_select(0, selected),
+                    _gather_prefix_rows(codes, part, frames),
                     [record.slot for record in records],
                     [0] * len(part),
                     prefix=True,
