@@ -33,7 +33,7 @@ Path(target, "serving_dependencies.pth").write_text(
 PY
     # Inherit torch/CUDA and serving dependencies. Pin reference-only packages
     # locally: this Diffusers revision needs torchao's FqnToConfig API on import.
-    "$reference_env/bin/python" -m pip install --no-deps \
+    "$reference_env/bin/python" -m pip install --no-deps --force-reinstall \
         'diffusers @ git+https://github.com/huggingface/diffusers.git@2a1433913c7044f34fa4767dd84b28bba0bb0ecf' \
         'torchao==0.16.0'
 ); then
