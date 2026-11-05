@@ -691,12 +691,33 @@ def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.Mo
     assert encode_prompt.call_count == 0
 
 
-def test_config_incompatible_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "extra_args,config_patch,expected_match",
+    [
+        ({"keep_steps": 2}, {"kv_offload_config": "tier2"}, "reference-KV offload"),
+        ({"keep_steps": 2, "pad_seq_len": 64}, dict(), "pad_seq_len"),
+        ({"keep_steps": 2}, {"step_execution": True}, "step execution"),
+        (
+            {"keep_steps": 2, "latent_refine": {"steps": 4}},
+            dict(),
+            "latent refine/upscale",
+        ),
+        (
+            {"keep_steps": 2, "latent_upscale": {"latent_height": 48, "latent_width": 48}},
+            dict(),
+            "latent refine/upscale",
+        ),
+    ],
+)
+def test_config_incompatible_keep_steps_fails_before_any_encoder_pass(
+    monkeypatch, extra_args, config_patch, expected_match
+):
     """Restrictions decidable from the config alone reject before any Qwen pass."""
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
-    pipeline.od_config.kv_offload_config = "tier2"
-    with pytest.raises(OmniClientError, match="reference-KV offload"):
-        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
+    for key, value in config_patch.items():
+        setattr(pipeline.od_config, key, value)
+    with pytest.raises(OmniClientError, match=expected_match):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(**extra_args))
     assert encode_prompt.call_count == 0
 
 

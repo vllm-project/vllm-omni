@@ -3035,13 +3035,18 @@ class MiniMaxH3Pipeline(
         requests that can never switch do not pay for that pass. Covered here:
         malformed ``keep_steps``, the degenerate ``== num_steps`` value, and
         every restriction decidable from the request config alone (pinned
-        schedules, task, audio labels, timeline guides, ``continue_from``,
-        ``pad_seq_len``, step execution, reference-KV offload, turbo/native
-        LoRA, latent refine/upscale). Still enforced only in the authoritative
-        check, because they need encoded conditioning or runtime model state:
-        audio-reference/guide tensors, latent-mask editing, control rows,
-        resolved latent continuations, the AdaLN sidecar, and cache_dit
-        quality. Rejection here happens after media preparation
+        schedules -- including the fused FastH3 student, whose resolver branch
+        returns a pinned ladder -- task, audio labels, timeline guides,
+        ``continue_from``, ``pad_seq_len``, step execution, reference-KV
+        offload, turbo/native LoRA, latent refine/upscale). Still enforced
+        only in the authoritative check, because they need encoded
+        conditioning or runtime model state: audio-reference/guide tensors,
+        latent-mask editing, control rows, the AdaLN sidecar, and cache_dit
+        quality. Resolved latent continuations are covered up front as well:
+        ``_resolve_latent_continuation`` resolves exclusively from
+        ``extra["continue_from"]``; the authoritative-side check on the
+        resolved object stays as a guard in case another source is ever
+        added. Rejection here happens after media preparation
         (``prepare_encoder_inputs`` already decoded the references) but before
         any Qwen/VAE model encode. Returns the validated integer, or ``None``
         when ``keep_steps`` is absent or equals the step count (degenerate:
@@ -3181,6 +3186,10 @@ class MiniMaxH3Pipeline(
                         task=task,
                         condition_labels=prepared.condition_labels,
                         timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
+                        # MediaInput requires height/width, so this always
+                        # matches the authoritative side's canvas-derived
+                        # latent size (continue_from, which could rewrite
+                        # it, is rejected above before this point matters).
                         latent_hw=(int(prepared.media.height) // 16, int(prepared.media.width) // 16),
                     )
                 base_encode_needed = (
