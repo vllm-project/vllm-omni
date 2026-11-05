@@ -461,7 +461,6 @@ class _BucketedEncoder:
 # --------------------------------------------------------------- auto install
 
 
-_processor_hook_lock = threading.RLock()
 _installed_hop: int | None = None
 
 
@@ -495,12 +494,18 @@ def _install_processor_hook(hop: int = _DEFAULT_HOP) -> None:
 
     def _wrap(orig):
         def wrapped(self, *args, **kwargs):
-            # The per-call instance-attribute swap is guarded by a reentrant
-            # lock: _cached_apply_hf_processor calls back into _apply_hf_processor,
-            # so the outer and inner wraps nest on the same thread. The lock keeps
-            # concurrent callers on different threads from observing each other's
-            # temporary _main / _get.
-            with _processor_hook_lock:
+            # The per-call instance-attribute swap is guarded by a per-instance
+            # reentrant lock: _cached_apply_hf_processor calls back into
+            # _apply_hf_processor, so the outer and inner wraps nest on the same
+            # thread, while distinct processor instances stay concurrent. Only the
+            # same instance must serialize (its _main/_get can hold one closure at
+            # a time); different instances never touch each other's attributes.
+            lock = self.__dict__.get("_bucket_processor_lock")
+            if lock is None:
+                # setdefault resolves the first-use race atomically; both threads
+                # reuse whichever lock wins rather than two disjoint locks.
+                lock = self.__dict__.setdefault("_bucket_processor_lock", threading.RLock())
+            with lock:
                 # Both callbacks are assigned as plain functions on the instance,
                 # so they are invoked WITHOUT binding self; the captured originals
                 # are already bound methods.
