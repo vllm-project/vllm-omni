@@ -527,7 +527,7 @@ def _prepare_diffusion_quant_config(
         quant_config.maybe_update_config(od_config.model)
     diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
     if diffusion_packed_modules_mapping is not None:
-        model_class.packed_modules_mapping = diffusion_packed_modules_mapping
+        setattr(model_class, "packed_modules_mapping", diffusion_packed_modules_mapping)
     configure_quant_config(quant_config, model_class)
 
 
@@ -587,6 +587,7 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
+            assert isinstance(model.vae, DistributedVaeMixin)
             model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
 
         # Apply sequence parallelism if enabled

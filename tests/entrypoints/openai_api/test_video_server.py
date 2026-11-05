@@ -3996,7 +3996,7 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
     engine.controlnet_model_path = "/configured/control.safetensors"
-    captured = {}
+    captured: dict[str, float | str] = {}
     original = engine.generate
 
     async def generate(prompt, request_id, sampling_params_list):
@@ -4036,7 +4036,9 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
     for key in ("control_path", "source_path", "mask_path"):
         if key in captured:
-            assert not Path(captured[key]).exists()
+            path = captured[key]
+            assert isinstance(path, str)
+            assert not Path(path).exists()
 
 
 @pytest.mark.parametrize(("endpoint", "with_hint"), [("/v1/videos/sync", False), ("/v1/videos", True)])

@@ -233,7 +233,7 @@ class Attention(nn.Module):
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
             self.attn_backend = attn_backend_cls
-            self.attn_impl_cls = self.attn_backend.get_impl_cls()
+            self.attn_impl_cls: type[AttentionImpl] | type[nn.Module] = self.attn_backend.get_impl_cls()
             if impl_overrides is not None:
                 override = impl_overrides.get(attn_backend_cls.get_name())
                 if override is not None:
@@ -349,6 +349,7 @@ class Attention(nn.Module):
             return None
         assert self.attn_backend is not None  # Custom attention cannot opt into paged KV.
         dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
+        assert isinstance(dtype, torch.dtype), "Model dtype must be resolved before creating a KV cache spec"
         # Keep backend layout discovery under the same config context used by
         # upstream vLLM's attention-spec collector.  vLLM 0.29 moved the
         # block-stride decision off the spec and onto the single physical
@@ -398,7 +399,7 @@ class Attention(nn.Module):
                     "factors. Use Ulysses SP instead."
                 )
             platform_key = current_omni_platform.device_name
-            if not self.attention.supports_kv_cache_dtype(dtype, platform_key):
+            if not cast(AttentionImpl, self.attention).supports_kv_cache_dtype(dtype, platform_key):
                 raise ValueError(
                     f"Attention backend {self.attn_backend.get_name()} does not support "
                     f"kv_cache_dtype={dtype!r} on {platform_key}. Select a compatible "
@@ -658,7 +659,7 @@ class Attention(nn.Module):
                 value,
                 omni_attn_metadata=attn_metadata,
             )
-            out = self.attention.forward_paged(paged_kv_context)
+            out = cast(AttentionImpl, self.attention).forward_paged(paged_kv_context)
         else:
             attn_metadata = self._with_kv_cache_dtype(attn_metadata)
             if self.use_ring and strategy is not self._no_parallel_strategy:
