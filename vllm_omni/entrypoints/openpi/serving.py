@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
 
+from vllm_omni.utils import latency_trace
+
 logger = init_logger(__name__)
 
 ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
@@ -195,6 +197,8 @@ class ServingRealtimeRobotOpenPI:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
         request = self.build_request(obs, session_id=session_id, reset=reset)
+        latency_trace.bind(request.request_id)
+        latency_trace.mark(request.request_id, "serving_request_built")
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
@@ -211,6 +215,7 @@ class ServingRealtimeRobotOpenPI:
         if result is None:
             raise RuntimeError("Robot OpenPI request produced no output.")
 
+        latency_trace.mark(request.request_id, "serving_engine_done")
         return self._extract_actions(result)
 
     def _stage_sampling_params_list(self, diffusion_params: OmniDiffusionSamplingParams) -> list[OmniSamplingParams]:

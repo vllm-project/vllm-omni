@@ -17,6 +17,12 @@ Usage:
 
 Reports p50/p95/min/max over --iters round trips, plus the device-level memory
 high-water mark sampled from nvidia-smi during the run.
+
+For engine-path attribution (see bench_engine_overhead_pi05.py), --requests-out
+appends one row per request with the client's ``time.perf_counter_ns()`` stamps,
+the clock the server's ``VLLM_OMNI_LATENCY_TRACE_DIR`` trace uses on the same
+host, and --request-seed with --save-actions makes two servers comparable
+output for output.
 """
 
 from __future__ import annotations
@@ -92,6 +98,18 @@ def main() -> int:
     ap.add_argument("--gpu-index", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--request-seed", type=int, default=None, help="Noise seed sent with every request.")
+    ap.add_argument(
+        "--requests-out", default=None, help="Append per-request client timestamps (JSONL), warmup included."
+    )
+    ap.add_argument("--round", type=int, default=0, help="Label written to every --requests-out row.")
+    ap.add_argument("--save-actions", default=None, help="Save the last timed action chunk (.npz).")
+    ap.add_argument(
+        "--no-memory-sampler",
+        action="store_true",
+        help="Do not poll nvidia-smi during the run (device_peak_mib is then 0). On the server's host the "
+        "sampler adds about 0.2 ms to every round trip.",
+    )
     args = ap.parse_args()
 
     import websockets.sync.client as ws_client
@@ -107,18 +125,24 @@ def main() -> int:
         metadata = msgpack_numpy.unpackb(conn.recv())
         print("handshake:", json.dumps({k: str(v) for k, v in dict(metadata).items()}, indent=1))
 
-        def one_round_trip() -> tuple[float, tuple]:
+        request_rows: list[dict] = []
+
+        def one_round_trip(warmup: bool = False) -> tuple[float, np.ndarray]:
             payload = make_obs(views=args.views, prompt=args.prompt, session_id=session_id, rng=rng)
             if args.num_inference_steps is not None:
                 payload["sampling_params"] = {"num_inference_steps": args.num_inference_steps}
+            if args.request_seed is not None:
+                payload["seed"] = args.request_seed
             payload["endpoint"] = "infer"
             # The timed region is everything the robot pays for: pack, send,
             # server, receive, unpack. Starting after pack or stopping before
             # unpack measures the wire and the server, not the client.
-            t0 = time.perf_counter()
+            t0 = time.perf_counter_ns()
             blob = packer.pack(payload)
             conn.send(blob)
+            t_sent = time.perf_counter_ns()
             raw = conn.recv()
+            t_received = time.perf_counter_ns()
             if isinstance(raw, str):
                 raise RuntimeError(f"Inference failed: {raw}")
             reply = msgpack_numpy.unpackb(raw)
@@ -126,21 +150,36 @@ def main() -> int:
             if isinstance(reply, dict) and reply.get("type") == "error":
                 raise RuntimeError(f"Inference failed: {reply.get('message', reply)}")
             actions = np.asarray(reply, dtype=np.float32)
-            dt = (time.perf_counter() - t0) * 1000.0
-            return dt, actions.shape
+            t_done = time.perf_counter_ns()
+            request_rows.append(
+                {
+                    "round": args.round,
+                    "views": args.views,
+                    "session_id": session_id,
+                    "index": len(request_rows),
+                    "warmup": warmup,
+                    "cli_start": t0,
+                    "cli_sent": t_sent,
+                    "cli_received": t_received,
+                    "cli_done": t_done,
+                }
+            )
+            return (t_done - t0) / 1e6, actions
 
         for _ in range(args.warmup):
-            one_round_trip()
+            one_round_trip(warmup=True)
 
         sampler = MemorySampler(args.gpu_index)
-        sampler.start()
+        if not args.no_memory_sampler:
+            sampler.start()
         samples: list[float] = []
         shapes = set()
         for _ in range(args.iters):
-            dt, shape = one_round_trip()
+            dt, actions = one_round_trip()
             samples.append(dt)
-            shapes.add(shape)
-        sampler.stop()
+            shapes.add(actions.shape)
+        if not args.no_memory_sampler:
+            sampler.stop()
     finally:
         conn.close()
 
@@ -167,6 +206,11 @@ def main() -> int:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=1)
         print("wrote", args.out)
+    if args.requests_out:
+        with open(args.requests_out, "a", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(row) + "\n" for row in request_rows)
+    if args.save_actions:
+        np.savez(args.save_actions, **{f"views{args.views}": actions})
     return 0
 
 

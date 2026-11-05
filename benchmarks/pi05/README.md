@@ -6,6 +6,8 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 | --- | --- | --- |
 | `e2e_latency_pi05.py` | Client E2E round trip over the OpenPI websocket: msgpack pack, send, engine, denoise, unpack. Reports p50/p95/min/max and the device memory peak sampled from `nvidia-smi`. | A running server |
 | `bench_pi05.py` | Model-level `sample_actions` latency and output shape over a batch size × camera-view sweep, with no serving stack. Writes `pi05_sweep.csv` and `pi05_sweep.md`. | A GPU and the checkpoint |
+| `bench_engine_overhead_pi05.py` | BS=1 latency of the layers in between: model-only and in-process pipeline in one clean process, then `Omni.generate` with the `uni` or `mp` executor. With `--trace-dir`, the per-request marks of `vllm_omni.utils.latency_trace`. | A GPU and the checkpoint |
+| `run_engine_overhead_matrix.sh`, `report_engine_overhead_pi05.py` | The full matrix for one dtype (independent runs of every layer plus traced and untraced client E2E, for one or two source trees) and its tables: the four layers, their gaps on the same requests, and p50/p95 per engine segment. | A GPU and the checkpoint |
 
 ## Client E2E latency
 
@@ -31,6 +33,18 @@ It runs the optimized path by default; pass `--enforce-eager` for the eager base
 python benchmarks/pi05/bench_pi05.py --bs 1 --views 3 --warmup 5 --iters 30 --out pi05_bench/
 # eager baseline
 python benchmarks/pi05/bench_pi05.py --enforce-eager --bs 1 --views 3 --warmup 5 --iters 30 --out pi05_bench_eager/
+```
+
+## Engine overhead
+
+The time between the model and the client is attributed with an opt-in trace: with `VLLM_OMNI_LATENCY_TRACE_DIR` set, every process stamps each request at about 40 points on one clock, and the report sums consecutive stamps into segments.
+
+```bash
+# profile of the current tree: 3 runs per layer, 20 warmup + 200 timed requests per camera count
+VARIANTS=after RUNS=3 WARMUP=20 ITERS=200 REQUESTS=200 bash benchmarks/pi05/run_engine_overhead_matrix.sh bf16 results/
+# against a reference checkout as well
+BEFORE_TREE=/path/to/reference/vllm-omni RUNS=3 WARMUP=20 ITERS=200 REQUESTS=200 bash benchmarks/pi05/run_engine_overhead_matrix.sh bf16 results/
+python benchmarks/pi05/report_engine_overhead_pi05.py results/ --out-md results/report.md --out-json results/report.json
 ```
 
 ## Reference results

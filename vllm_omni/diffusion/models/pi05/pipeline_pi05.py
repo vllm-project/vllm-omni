@@ -39,6 +39,7 @@ from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPredictio
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.utils import latency_trace
 
 logger = init_logger(__name__)
 
@@ -306,6 +307,8 @@ class Pi05Pipeline(nn.Module):
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+        trace_id = getattr(req, "request_id", None) if latency_trace.ENABLED else None
+        latency_trace.mark(trace_id, "pipeline_forward_start")
         extra_args = getattr(req.sampling_params, "extra_args", None) or {}
         robot_obs = extra_args.get("robot_obs")
 
@@ -339,6 +342,7 @@ class Pi05Pipeline(nn.Module):
         if num_steps is not None:
             num_steps = int(num_steps)
 
+        latency_trace.mark(trace_id, "model_start")
         actions = self.model.sample_actions(
             images=images,
             image_masks=image_masks,
@@ -347,5 +351,13 @@ class Pi05Pipeline(nn.Module):
             num_steps=num_steps,
             generator=req.sampling_params.generator,
         )
+        if trace_id is not None:
+            # The action conversion below blocks on the device anyway; an
+            # explicit sync here only moves that wait inside the model span.
+            if actions.is_cuda:
+                torch.accelerator.synchronize()
+            latency_trace.mark(trace_id, "model_end")
 
-        return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
+        output = DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
+        latency_trace.mark(trace_id, "pipeline_forward_end")
+        return output

@@ -32,6 +32,7 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID, diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -146,6 +147,7 @@ class InlineStageDiffusionClient(StageClientBase):
         payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         try:
+            latency_trace.mark(request_id, "client_dispatch_start")
             request = OmniDiffusionRequest(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -178,6 +180,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 if not result.request_id:
                     result.request_id = request_id
                 self._output_queue.put_nowait(result)
+                latency_trace.mark(request_id, "client_output_queued")
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
             metrics = diffusion_exception_metrics(e)

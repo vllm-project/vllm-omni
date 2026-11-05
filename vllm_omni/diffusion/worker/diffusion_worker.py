@@ -90,6 +90,7 @@ from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
+from vllm_omni.utils import latency_trace
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 if TYPE_CHECKING:
@@ -828,6 +829,7 @@ class DiffusionWorker:
             diffusion_kv_metadata = new_req.diffusion_kv_metadata
         else:
             request = req
+        latency_trace.mark(request.request_id, "worker_execute_start")
 
         if self.lora_manager is not None:
             try:
@@ -847,6 +849,7 @@ class DiffusionWorker:
             output = self.model_runner.execute_model(request, **kwargs)
         if profiler:
             profiler.step()
+        latency_trace.mark(request.request_id, "worker_execute_end")
 
         # Each primary rank returns its own output tagged with its DP rank
         # so the executor can match results to requests by dp_rank.
@@ -1443,6 +1446,7 @@ class WorkerProc:
             with self._async_output_done:
                 self._async_output_pending += 1
             assert self._async_output_queue is not None, "Async output queue not initialized"
+            latency_trace.remember(async_output_id, latency_trace.current())
             self._async_output_queue.put((output, async_output_id, gpu_event))
             msg = AsyncDiffusionOutput(
                 kind=AsyncOutputKind.COMPUTE_DONE,
@@ -1486,6 +1490,8 @@ class WorkerProc:
             if item is None:
                 break
             output, async_output_id, gpu_event = item
+            _trace_rid = latency_trace.recall(async_output_id)
+            latency_trace.mark(_trace_rid, "worker_output_pack_start")
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
@@ -1501,6 +1507,7 @@ class WorkerProc:
                         output=output,
                     )
                 )
+                latency_trace.mark(_trace_rid, "worker_output_ready_enqueued")
             except Exception:
                 logger.exception(
                     "Async output packing failed for id '%s'; sending error",
@@ -1703,6 +1710,7 @@ class WorkerProc:
             msg = None
             try:
                 msg = self.recv_message()
+                _t_msg_received = latency_trace.now_ns()
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()
@@ -1730,9 +1738,18 @@ class WorkerProc:
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
                 try:
                     rpc_id = msg.get("rpc_id")
+                    if latency_trace.ENABLED:
+                        latency_trace.unbind()
+                        _rpc_args = msg.get("args") or ()
+                        if msg.get("method") == "execute_model" and _rpc_args:
+                            _trace_rid = getattr(_rpc_args[0], "request_id", None)
+                            if _trace_rid is not None:
+                                latency_trace.bind(_trace_rid)
+                                latency_trace.mark(_trace_rid, "worker_msg_received", _t_msg_received)
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
                         self._return_result(result, rpc_id=rpc_id)
+                        latency_trace.mark_current("worker_reply_enqueued")
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)

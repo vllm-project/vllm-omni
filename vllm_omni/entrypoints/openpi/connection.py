@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """WebSocket connection for robot policy inference (OpenPI protocol).
 
@@ -41,6 +41,7 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openpi.serving import (
     ServingRealtimeRobotOpenPI,
 )
+from vllm_omni.utils import latency_trace
 
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
@@ -246,6 +247,8 @@ class RobotRealtimeConnection:
                 if "bytes" not in msg or not msg["bytes"]:
                     continue
 
+                latency_trace.unbind()
+                latency_trace.defer("ws_received")
                 try:
                     obs = self._unpack_request(msg["bytes"])
                 except Exception:
@@ -256,6 +259,7 @@ class RobotRealtimeConnection:
                         break
                     continue
 
+                latency_trace.defer("ws_unpacked")
                 try:
                     endpoint = obs.pop("endpoint", "infer")
 
@@ -280,7 +284,11 @@ class RobotRealtimeConnection:
                             session_id=session_id,
                             reset=reset,
                         )
-                        await self.websocket.send_bytes(_pack(actions))
+                        latency_trace.mark_current("serving_infer_done")
+                        reply = _pack(actions)
+                        latency_trace.mark_current("ws_reply_packed")
+                        await self.websocket.send_bytes(reply)
+                        latency_trace.mark_current("ws_reply_sent")
                 except Exception:
                     logger.exception("Error handling request")
                     try:

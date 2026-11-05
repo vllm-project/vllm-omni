@@ -88,6 +88,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -803,6 +804,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
+            if latency_trace.ENABLED:
+                for req in reqs:
+                    latency_trace.mark(req.request_id, "runner_start")
             for req in reqs:
                 self._prepare_request_for_forward(
                     req,
@@ -923,6 +927,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 cache_summary(self.pipeline, details=True)
 
         self._maybe_send_stage_payload(reqs, outputs)
+        if latency_trace.ENABLED:
+            for req in reqs:
+                latency_trace.mark(req.request_id, "runner_end")
 
         return self._runner_output_from_outputs(reqs, outputs)
 
