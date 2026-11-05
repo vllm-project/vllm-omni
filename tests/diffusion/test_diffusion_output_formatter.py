@@ -44,8 +44,30 @@ def _request(
     )
 
 
-def _config(model_class_name: str = "mock_model") -> SimpleNamespace:
-    return SimpleNamespace(model_class_name=model_class_name)
+def _config(model_class_name: str = "mock_model", *, streaming_output: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(model_class_name=model_class_name, streaming_output=streaming_output)
+
+
+@pytest.mark.parametrize("streaming_output", [False, True])
+@pytest.mark.parametrize("chunk_index,total_chunks", [(0, 1), (4, 5)])
+def test_terminal_video_keeps_model_chunk_index_for_configured_stream(
+    monkeypatch, streaming_output, chunk_index, total_chunks
+):
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    postprocess_output = normalize_diffusion_postprocess_output({"payload": {"video": ["frame-0"]}})
+    [result] = format_diffusion_outputs(
+        request=_request(),
+        od_config=_config(streaming_output=streaming_output),
+        diffusion_output=DiffusionOutput(chunk_index=chunk_index, total_chunks=total_chunks, finished=True),
+        output_data=None,
+        postprocess_output=postprocess_output,
+    )
+    metadata = (result.multimodal_output or {}).get("metadata", {})
+    if streaming_output or total_chunks > 1:
+        assert metadata["stream"]["generation_chunk_index"] == chunk_index
+    else:
+        assert "stream" not in metadata
+    assert result.finished and result.images == ["frame-0"]
 
 
 def test_formatter_preserves_single_video_audio_actions_and_metadata(
