@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import sys
 from collections.abc import Callable, Mapping
+from importlib.machinery import ModuleSpec
 from types import ModuleType
 from typing import Any
 
@@ -48,8 +49,16 @@ def _register_humming_stubs() -> None:
     }
 
     registry: dict[str, ModuleType] = {}
+    packages = {"humming", "humming.utils"}
     for name, attrs in submodules.items():
         mod = ModuleType(name)
+        is_package = name in packages
+        # vLLM probes optional dependencies with importlib.util.find_spec().
+        # Modules already present in sys.modules need a non-None spec or that
+        # probe raises ValueError instead of reporting the module as present.
+        mod.__spec__ = ModuleSpec(name, loader=None, is_package=is_package)
+        if is_package:
+            setattr(mod, "__path__", [])
         for attr in attrs:
             setattr(mod, attr, type(attr, (), {}))
         registry[name] = mod
