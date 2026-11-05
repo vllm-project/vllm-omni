@@ -50,10 +50,18 @@ def measurement_campaign(tmp_path, monkeypatch, request):
             "cards": 4,
             "dies": 4,
             "devices": [{"name": "Ascend910B3", "total_bytes": 64 * 1024**3}] * 4,
-            "packages": {"torch": "2.10.0", "vllm": "0.31.0"},
+            "packages": dict(profile["inference_runtime"]["packages"]),
         },
         "deploy_sha256": sha256(runner.ROOT / profile["deploy_config"]),
     }
+    if snapshot := profile["inference_runtime"].get("source_snapshot_sha256"):
+        # Synthetic producer evidence uses the same canonical snapshot as the profile.
+        lock = json.loads((runner.ROOT / "tests/dfx/lingbot_world/runtime_sources.lock.json").read_text())
+        contract["hardware"]["source_attestations"] = {
+            "schema_version": 1,
+            "source_snapshot_sha256": snapshot,
+            "packages": copy.deepcopy(lock["packages"]),
+        }
     write_json(
         Path(profile["reference_calibration"]),
         {
