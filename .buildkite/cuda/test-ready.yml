@@ -34,16 +34,34 @@ steps:
           - "artifacts/cuda-other/*"
         commands:
           - |
-            bash -o pipefail <<'BASH'
             export CPU_OTHER_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/cuda-other"
-            mkdir -p "$$CPU_OTHER_ARTIFACT_DIR"
             export PYTHONUNBUFFERED=1
-            pytest -sv tests/ -m 'core_model and cpu' \
+            bash .buildkite/common/scripts/run-pytest-ci.sh "$$CPU_OTHER_ARTIFACT_DIR" pytest -sv tests/ -m 'core_model and cpu' \
               --ignore=tests/diffusion --ignore=tests/model_executor \
               --ignore=tests/entrypoints --ignore=tests/engine \
-              --junitxml="$$CPU_OTHER_ARTIFACT_DIR/pytest.xml" 2>&1 | tee "$$CPU_OTHER_ARTIFACT_DIR/pytest.log"
-            BASH
+              --ignore-glob=tests/benchmarks/test_lingbot_world_*.py \
+              --junitxml="$$CPU_OTHER_ARTIFACT_DIR/pytest.xml"
         mirror_hardwares: l4_1
+
+      - label: "Simple · LingBot World Regression Contract Test"
+        key: ready-lingbot-world-unit
+        env:
+          CI_POLICY_FILE: tests/dfx/lingbot_world/quality.json
+        concurrency: 1
+        concurrency_group: vllm-omni/lingbot-world/l4-cpu
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        timeout_in_minutes: 20
+        mirror_hardwares: l4_1
+        artifact_paths:
+          - "lingbot-artifacts/unit/**/*"
+        commands:
+          - |
+            CUDA_VISIBLE_DEVICES="" bash .buildkite/common/scripts/run-pytest-ci.sh lingbot-artifacts/unit \
+              python -m pytest -sv -p tests.dfx.lingbot_world.conftest \
+              tests/benchmarks/test_lingbot_world_*.py --lingbot-output=lingbot-artifacts/unit \
+              -m 'core_model and cpu' --run-level core_model --junitxml=lingbot-artifacts/unit/pytest.xml
 
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
@@ -310,23 +328,7 @@ steps:
             "
         mirror_hardwares: h100_1
 
-  - group: "LingBot World PR gates"
-    depends_on: upload-ready-pipeline
-    steps:
-      - label: "LingBot World · CPU regression gates"
-        key: ready-lingbot-world-unit
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        timeout_in_minutes: 20
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/unit/**/*"
-        commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh unit tests/dfx/lingbot_world/quality.json lingbot-artifacts/unit
-      - label: "LingBot World · real-checkpoint stream and cancellation"
+      - label: "Diffusion · LingBot World Stream and Cancellation Test"
         key: ready-lingbot-world-smoke
         concurrency: 1
         concurrency_group: vllm-omni/lingbot-world/cuda-generation
@@ -338,4 +340,4 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/cuda-smoke/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh smoke tests/dfx/lingbot_world/configs/cuda_smoke.json lingbot-artifacts/cuda-smoke
+          - bash tests/dfx/lingbot_world/run_ci.sh smoke tests/dfx/lingbot_world/configs/cuda_smoke.json lingbot-artifacts/cuda-smoke

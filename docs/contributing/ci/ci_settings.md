@@ -15,7 +15,8 @@ Canonical layout (prefer these paths for new changes):
 │   │   ├── ci_conditions.py         # Shared gates, YAML whitelists, uploader constants
 │   │   ├── skip_ci.py               # skip-ci decision (docs / skip-mark / CI YAML paths)
 │   │   ├── upload_pipeline.py       # Bootstrap + test-pipeline uploader (CUDA/NPU)
-│   │   └── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
+│   │   ├── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
+│   │   └── run-pytest-ci.sh         # Shared JUnit/setup-failure guard for pytest jobs
 │   ├── ci_mirror_hardwares.yml      # CUDA/NPU hardware presets (referenced by name only)
 │   └── ci_source_file_dependencies.yml  # L2–L5 path-prefix presets (referenced by name only)
 ├── cuda/                            # Primary NVIDIA CUDA CI
@@ -97,7 +98,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Upload:** `upload_pipeline.py --upload` expands uploader-only keys before Buildkite upload.
 
-    **Hardware in YAML:** omit `mirror_hardwares` to compose `{chip}_{n}` from pytest `-m` (SKU + `cards_n`). Several positive `cards_*` take the **max** n (`cards_2 and cards_3` → `{chip}_3`). `not cards_1` with no positive `cards_*` uses that chip's **highest existing** preset in `ci_mirror_hardwares.yml` (L4 → `l4_4`, H100 → `h100_4`, B200 → `b200_4`). Set a **preset string** to force a pool (marks are ignored). Do **not** set `agents` / `plugins` on the same step as `mirror_hardwares`. `MIRROR_HW=b200` remaps inferred jobs whose `-m` includes `B200`, and omits CUDA `h100_*` / `l4_*` strings. Jobs whose `-m` does not match (unset: no H100/L4; set: no B200) are **skipped**.
+    **Hardware in YAML:** omit `mirror_hardwares` to compose `{chip}_{n}` from pytest `-m` (SKU + `cards_n`). Several positive `cards_*` take the **max** n (`cards_2 and cards_3` → `{chip}_3`). `not cards_1` with no positive `cards_*` uses that chip's **highest inferable** preset in `ci_mirror_hardwares.yml` (L4 → `l4_4`, H100 → `h100_4`, B200 → `b200_4`). Set a **preset string** to force a pool (marks are ignored). Do **not** set `agents` / `plugins` on the same step as `mirror_hardwares`. `MIRROR_HW=b200` remaps inferred jobs whose `-m` includes `B200`, and omits CUDA `h100_*` / `l4_*` strings. Jobs whose `-m` does not match (unset: no H100/L4; set: no B200) are **skipped**.
 
     ```yaml
     # inferred: H100+B200 + cards_2 → h100_2, or b200_2 when MIRROR_HW=b200
@@ -114,6 +115,8 @@ Canonical layout (prefer these paths for new changes):
     ```
 
     Inferred form: unset/`empty` `MIRROR_HW` matches `H100` or `L4` in `-m` (both present → H100); no match skips the step. `MIRROR_HW=b200` must appear in `-m` or the step is skipped. The uploader does **not** rewrite pytest `-m`; B200 collection comes from the YAML expression and from tests that declare `B200` in `hardware_test` / `hardware_marks` (for example `res={"cuda": ["H100", "B200"]}`). `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. A CUDA preset string such as `mirror_hardwares: h100_4` is skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`. A `mirror_hardwares` name that is not a key in `ci_mirror_hardwares.yml` **fails the upload**.
+
+    Presets may set uploader-only `infer_from_marks: false` when reserved capacity differs from the test's device count. Such a preset requires an explicit `mirror_hardwares` string and is excluded from `not cards_1` inference. For example, `h100_8` reserves eight devices for isolation while LingBot's profile still uses four. The uploader strips this metadata before upload; unrelated inferred H100 jobs retain `h100_4`.
 
     **Path filter in YAML:** `source_file_dependencies: <preset>` (string, or a list of preset names)—preset names in [`common/ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). Required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; see [Step filtering](#step-filtering).
 
@@ -483,7 +486,14 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 ### Labels and grouping
 
 - Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` weekly runs on a release line (`main` or `release/vX.Y.Z`, `WEEKLY=1`).
+- Put real-checkpoint PR smoke tests in the existing **E2E Test** group. Use **`:card_index_dividers: World Model Test`** for nightly/weekly world-model campaigns rather than one top-level group per model.
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
+
+### Pytest reports and setup failures
+
+Use `.buildkite/common/scripts/run-pytest-ci.sh <artifact-directory> <command...>` when a pytest job needs retained setup/interruption evidence. Pass `--junitxml=<artifact-directory>/pytest.xml` to pytest and declare the directory in the step's ordinary `artifact_paths`. The wrapper initializes a failed JUnit report before setup, captures source/package metadata, preserves the command's nonzero status, and retains structured errors. It rejects a zero exit with missing, empty, incomplete, failed or entirely skipped JUnit. Set `CI_POLICY_FILE` only when the job also needs to retain a copy of its input policy.
+
+The ordinary CUDA Simple Other job and LingBot contract/model jobs share this wrapper. Keep workload-specific provisioning beside the tests; shared pipeline admission, hardware expansion and artifact upload remain in the existing Buildkite mechanisms. Buildkite already records console output, so the wrapper does not create a second full text log. Preserve model-server, evaluator and raw measurement artifacts needed to diagnose failures.
 
 ### Per-model coverage
 

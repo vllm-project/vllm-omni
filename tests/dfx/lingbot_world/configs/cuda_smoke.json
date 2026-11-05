@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "reference_revision": "48cebe5a248d4b0160f20c7fc18b5d1c46883872",
+  "reference_revision": "61d19b6094189136ad047bf8b060d4180c3c60bf",
   "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
   "height": 192,
   "width": 320,
@@ -33,5 +33,12 @@
   "dies": 1,
   "deploy_config": "benchmarks/lingbot_world/configs/single_gpu_ci.yaml",
   "memory_growth_budget_bytes": 268435456,
-  "warmup_num_chunks": 1
+  "warmup_num_chunks": 1,
+  "reference_repository": "https://github.com/tzhouam/vllm-omni.git",
+  "inference_runtime": {
+    "packages": {
+      "vllm": "0.33.0",
+      "torch": "2.14.0"
+    }
+  }
 }

@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from benchmarks.lingbot_world.precision import save_tensor_sample
-from benchmarks.lingbot_world.regression import RegressionError, sha256, write_json
+from benchmarks.lingbot_world.regression import RegressionError, contract_digest, sha256, write_json
 from tests.benchmarks.test_lingbot_world_regression import document
 from tests.dfx.lingbot_world import runner
 from tests.dfx.lingbot_world.runner import git_revision as source_revision
@@ -35,6 +35,7 @@ def measurement_campaign(tmp_path, monkeypatch, request):
         from tests.dfx.lingbot_world.prepare import profile_for_case_shard
 
         profile = profile_for_case_shard(profile, f"{shard}/6")
+    profile["reference_calibration"] = str(tmp_path / "reference-calibration.json")
     profile_path = tmp_path / "profile.json"
     write_json(profile_path, profile)
     source = tmp_path / "measurements"
@@ -53,6 +54,19 @@ def measurement_campaign(tmp_path, monkeypatch, request):
         },
         "deploy_sha256": sha256(runner.ROOT / profile["deploy_config"]),
     }
+    write_json(
+        Path(profile["reference_calibration"]),
+        {
+            "workload": profile,
+            "hardware": contract["hardware"],
+            "deploy_sha256": contract["deploy_sha256"],
+            "engine_environment": contract["engine_environment"],
+            "qualified_profile_sha256": contract_digest(profile),
+            "startup_stall_calibration": {"selected_floor_ms": 0.0},
+            "ttfc_calibration": {"selected_floor_ms": 0.0},
+            "p95_reference_cv_calibration": {"selected_ceiling": 0.03},
+        },
+    )
     cases = [case["id"] for case in profile["cases"]]
     for repeat in range(3):
         root = source / f"pair-{repeat}"
@@ -376,7 +390,7 @@ def test_aggregate_launcher_executes_pytest_and_returns_nonzero_for_regression(m
         result = subprocess.run(
             [
                 "bash",
-                str(runner.ROOT / ".buildkite/common/scripts/run-lingbot-ci.sh"),
+                str(runner.ROOT / "tests/dfx/lingbot_world/run_ci.sh"),
                 "aggregate",
                 str(settings["profile_path"]),
                 str(output),

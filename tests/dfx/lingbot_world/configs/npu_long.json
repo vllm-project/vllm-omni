@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "reference_revision": "48cebe5a248d4b0160f20c7fc18b5d1c46883872",
+  "reference_revision": "61d19b6094189136ad047bf8b060d4180c3c60bf",
   "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
   "height": 480,
   "width": 832,
@@ -37,5 +37,20 @@
   "memory_growth_budget_bytes": 268435456,
   "measured_sessions": 2,
   "warmup_num_chunks": 8,
-  "transient_noise_sigma": 3.0
+  "transient_noise_sigma": 3.0,
+  "reference_repository": "https://github.com/tzhouam/vllm-omni.git",
+  "inference_runtime": {
+    "packages": {
+      "vllm": "0.33.0+empty",
+      "torch": "2.10.0+cpu",
+      "torch-npu": "2.10.0.post7",
+      "vllm-ascend": "0.19.1rc2.dev3349+g221fb096c.d20261104"
+    },
+    "source_revisions": {
+      "vllm": "4ba787ec9959e566d3b587a796dff07673324da5",
+      "vllm-ascend": "221fb096cd1cdf9f0b273da9b9624fbf4bb7f200"
+    }
+  },
+  "reference_calibration": "tests/dfx/lingbot_world/calibration/npu_long_v033_reference.json",
+  "quality_reference_population": "tests/dfx/lingbot_world/calibration/npu_long_v033_quality_population.json"
 }

@@ -46,13 +46,14 @@ BOOTSTRAP_STEPS_TEMPLATE = """steps:
 
 def test_exclusive_h100_reservation_keeps_four_card_inference_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
-    expanded = _expand_mirror_hardwares({"label": "LingBot performance", "mirror_hardwares": "h100_4_exclusive"})
+    expanded = _expand_mirror_hardwares({"label": "LingBot performance", "mirror_hardwares": "h100_8"})
     assert expanded is not None
+    assert "infer_from_marks" not in expanded
     container = expanded["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
     assert container["resources"]["limits"]["nvidia.com/gpu"] == 8
     assert expanded["agents"]["queue"] == "mithril-h100-pool"
     monkeypatch.setenv("MIRROR_HW", "b200")
-    assert _expand_mirror_hardwares({"mirror_hardwares": "h100_4_exclusive"}) is None
+    assert _expand_mirror_hardwares({"mirror_hardwares": "h100_8"}) is None
 
 
 def _render(changed_files: list[str]) -> str:
@@ -454,10 +455,10 @@ def test_mirror_hardwares_inferred_skips_unmatched_chip(
 
 
 def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
-    with pytest.raises(ValueError, match="has no preset 'h100_8'"):
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    with pytest.raises(ValueError, match="has no preset 'b200_8'"):
         _expand_mirror_hardwares(
-            {"label": "H100 8-gpu", "commands": ['pytest -sv tests/e2e -m "H100 and cards_8"']},
+            {"label": "B200 8-gpu", "commands": ['pytest -sv tests/e2e -m "B200 and cards_8"']},
         )
 
 
@@ -1198,12 +1199,16 @@ def test_lingbot_resource_budget_survives_pipeline_expansion(
     jobs = [
         step
         for step in _iter_steps(rendered)
-        if any("run-lingbot-ci.sh " in command for command in step.get("commands", []))
+        if step.get("key") == "ready-lingbot-world-unit"
+        or any("run_ci.sh " in command for command in step.get("commands", []))
     ]
     assert len(jobs) == expected_jobs
     for step in jobs:
-        command = next(command for command in step["commands"] if "run-lingbot-ci.sh " in command)
-        role = command.split("run-lingbot-ci.sh ", 1)[1].split()[0]
+        if step.get("key") == "ready-lingbot-world-unit":
+            role = "unit"
+        else:
+            command = next(command for command in step["commands"] if "run_ci.sh " in command)
+            role = command.split("run_ci.sh ", 1)[1].split()[0]
         platform = pipeline_path.parent.name
         # Stable organization-wide groups: no build, branch, level or matrix suffix.
         if role in {"smoke", "generate", "collect"}:
@@ -1246,7 +1251,7 @@ def test_lingbot_npu_admission_requires_pr_opt_in_after_pipeline_expansion(
     path = Path(f".buildkite/npu/test-npu-{level}.yml")
     source = yaml.safe_load(path.read_text())
     rendered = _render_test_pipeline(source, ["tests/dfx/lingbot_world/runner.py"], pipeline_path=path)
-    group = next(step for step in rendered["steps"] if "LingBot World NPU" in step.get("group", ""))
+    group = next(step for step in rendered["steps"] if step.get("group") == ":card_index_dividers: World Model Test")
     condition = group["if"]
     values = {
         "build.pull_request.id == null": not is_pr,
@@ -1290,5 +1295,46 @@ def test_lingbot_npu_infra_retry_does_not_retry_test_failures(filename: str) -> 
     for step in steps:
         assert step["agents"]["queue"] == "ascend-a2b3"
         assert step["agents"]["resource_class"] == "npu-8"
-        assert step["retry"] == {"automatic": [{"exit_status": -1, "limit": 1}, {"exit_status": 128, "limit": 1}]}
+        assert step["retry"] == {
+            "manual": {"permit_on_passed": True},
+            "automatic": [{"exit_status": -1, "limit": 1}, {"exit_status": 128, "limit": 1}],
+        }
         assert not step.get("soft_fail")
+
+
+def test_ready_lingbot_smoke_survives_the_shared_e2e_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda/test-ready.yml")
+    source = yaml.safe_load(path.read_text())
+    rendered = _render_test_pipeline(source, None, pipeline_path=path, e2e_only=True)
+    keyed = {step.get("key"): step for step in _iter_steps(rendered)}
+    smoke = keyed["ready-lingbot-world-smoke"]
+    assert smoke["agents"]["queue"] == "mithril-h100-pool"
+    assert _gpu_limit(smoke) == 1
+    assert not smoke.get("soft_fail") and smoke["artifact_paths"]
+    assert "ready-lingbot-world-unit" not in keyed
+
+
+def test_ready_cpu_contracts_have_one_owner_and_shared_failure_reporting() -> None:
+    source = yaml.safe_load(Path(".buildkite/cuda/test-ready.yml").read_text())
+    simple = next(group for group in source["steps"] if group.get("group") == ":card_index_dividers: Simple Test")
+    steps = {step["label"]: step for step in simple["steps"]}
+    other = "\n".join(steps["Simple · Other Test"]["commands"])
+    dedicated = "\n".join(steps["Simple · LingBot World Regression Contract Test"]["commands"])
+    assert "--ignore-glob=tests/benchmarks/test_lingbot_world_*.py" in other
+    assert "tests/benchmarks/test_lingbot_world_*.py" in dedicated
+    assert "-p tests.dfx.lingbot_world.conftest" in dedicated
+    # These contracts retain their existing generic Simple jobs; the model
+    # gate no longer replays them under a second command.
+    for path in ("tests/buildkite", "tests/helpers", "tests/diffusion/models", "tests/diffusion/offloader"):
+        assert path not in dedicated
+    for command in (other, dedicated):
+        assert ".buildkite/common/scripts/run-pytest-ci.sh" in command
+        assert "--junitxml=" in command
+        assert "tee " not in command
+
+
+def test_isolation_reservation_requires_an_explicit_preset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    with pytest.raises(ValueError, match="select it explicitly with mirror_hardwares"):
+        _expand_mirror_hardwares({"commands": ['pytest -sv tests/e2e -m "H100 and cards_8"']})

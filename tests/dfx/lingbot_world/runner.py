@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -323,8 +324,10 @@ def _measured_metrics(document: dict, settings: dict) -> dict[str, float]:
     return performance_metrics(document, num_chunks=settings["num_chunks"], min_steady=settings["min_steady_samples"])
 
 
-def generate(settings: dict[str, Any], *, measurement_repeat: int | None = None) -> dict[str, Any]:
-    """Collect all starts, or one NPU pair for a separately gated long campaign."""
+def generate(
+    settings: dict[str, Any], *, measurement_repeat: int | None = None, reference_only: bool = False
+) -> dict[str, Any]:
+    """Collect paired acceptance data or a reference-only training cohort."""
     if measurement_repeat is not None and (
         type(measurement_repeat) is not int or measurement_repeat not in range(3) or settings["platform"] != "npu"
     ):
@@ -351,10 +354,14 @@ def generate(settings: dict[str, Any], *, measurement_repeat: int | None = None)
         "engine_environment": dict(ENGINE_ENVIRONMENT),
     }
     write_json(output / "contract.json", contract)
-    records: dict[str, Any] = {"reference": [], "candidate": []}
+    records: dict[str, Any] = {"reference": []} if reference_only else {"reference": [], "candidate": []}
     for repeat in [measurement_repeat] if measurement_repeat is not None else range(3):
         # Alternate AB/BA to reduce bias from thermal/host-load drift.
-        order = ("reference", "candidate") if repeat % 2 == 0 else ("candidate", "reference")
+        order = (
+            ("reference",)
+            if reference_only
+            else (("reference", "candidate") if repeat % 2 == 0 else ("candidate", "reference"))
+        )
         for role in order:
             source = reference if role == "reference" else ROOT
             arm = output / role / str(repeat)
@@ -450,6 +457,20 @@ def generate(settings: dict[str, Any], *, measurement_repeat: int | None = None)
             assert_device_cleanup(settings["dies"], arm / "cleanup.json")
             records[role].append(case_results)
             write_json(output / "progress.json", {"records": records, "contract": contract})
+    if reference_only:
+        report = _reference_collection_report(settings, contract, records)
+        # Collection completion is deliberately different from acceptance.
+        # No frozen threshold is consulted or written during this campaign.
+        if measurement_repeat is None:
+            write_json(output / "generation.json", report)
+        else:
+            report.update(repeat=measurement_repeat, status="reference_measurement_complete")
+            write_json(output / "measurement.json", report)
+            write_json(
+                output / "generation.json",
+                {"passed": False, "status": "awaiting_reference_aggregate", "reference_only": True},
+            )
+        return report
     if measurement_repeat is not None:
         measurement = {
             "measurement_only": True,
@@ -473,6 +494,115 @@ def generate(settings: dict[str, Any], *, measurement_repeat: int | None = None)
     return _finalize_measurements(settings, contract, records)
 
 
+def _reference_collection_report(settings: dict[str, Any], contract: dict, records: dict) -> dict[str, Any]:
+    output = settings["output"]
+    job_id = os.environ.get("BUILDKITE_JOB_ID") or None
+    return {
+        "passed": False,
+        "status": "reference_collection_complete",
+        "reference_only": True,
+        "measurement_only": True,
+        "complete": True,
+        "contract": contract,
+        "records": records,
+        "reference_revision": settings["reference_revision"],
+        "harness_revision": git_revision(ROOT),
+        "reference_protocol_sha256": sha256(ROOT / "tests/dfx/lingbot_world/calibration/v033_reference_protocol.json"),
+        "collection_id": str(uuid.uuid4()),
+        "collection_backend": "buildkite" if job_id is not None else "local",
+        "buildkite_job_id": job_id,
+        "artifacts": {
+            str(path.relative_to(output)): sha256(path) for path in (output / "reference").rglob("*") if path.is_file()
+        },
+    }
+
+
+def validate_reference_collection(
+    settings: dict[str, Any], generation: Path, manifest: dict, *, measurement_repeat: int | None = None
+) -> None:
+    """Verify a complete cohort, or one explicitly selected matrix producer."""
+    if measurement_repeat is not None and (
+        type(measurement_repeat) is not int
+        or measurement_repeat not in range(3)
+        or type(manifest.get("repeat")) is not int
+        or manifest["repeat"] != measurement_repeat
+        or settings["platform"] != "npu"
+    ):
+        raise RegressionError("Reference measurement requires the matching NPU repeat index")
+    repeats = [measurement_repeat] if measurement_repeat is not None else list(range(3))
+    try:
+        identity = manifest.get("collection_id")
+        if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
+            raise ValueError("invalid collection identity")
+    except ValueError as error:
+        raise RegressionError("Reference collection requires its recorded UUID identity") from error
+    job_id = manifest.get("buildkite_job_id")
+    if (
+        (manifest.get("collection_backend") == "local" and job_id is not None)
+        or (manifest.get("collection_backend") == "buildkite" and (not isinstance(job_id, str) or not job_id))
+        or manifest.get("collection_backend") not in {"local", "buildkite"}
+    ):
+        raise RegressionError("Reference collection backend and job provenance differ")
+    if (
+        manifest.get("reference_only") is not True
+        or manifest.get("measurement_only") is not True
+        or manifest.get("complete") is not True
+        or manifest.get("passed") is not False
+        or "candidate_revision" in manifest
+        or manifest.get("reference_revision") != settings["reference_revision"]
+        or manifest.get("harness_revision") != git_revision(ROOT)
+        or manifest.get("reference_protocol_sha256")
+        != sha256(ROOT / "tests/dfx/lingbot_world/calibration/v033_reference_protocol.json")
+        or manifest.get("contract", {}).get("profile") != read_json(settings["profile_path"])
+        or manifest.get("contract", {}).get("deploy_sha256") != sha256(ROOT / settings["deploy_config"])
+        or manifest.get("contract", {}).get("engine_environment") != ENGINE_ENVIRONMENT
+        or (generation / "candidate").exists()
+    ):
+        raise RegressionError("Incomplete, wrong-source or mixed reference-only collection")
+    cases = {case["id"] for case in settings["cases"]}
+    records = manifest.get("records", {})
+    if (
+        set(records) != {"reference"}
+        or len(records["reference"]) != len(repeats)
+        or any(set(row) != cases for row in records["reference"])
+    ):
+        raise RegressionError("Reference collection has an incomplete independent-start population")
+    required = {f"reference/{repeat}/precision.npz" for repeat in repeats}
+    required |= {
+        f"reference/{repeat}/{case}/{name}"
+        for repeat in repeats
+        for case in cases
+        for name in ("benchmark.json", "rollout.mp4")
+    }
+    artifacts = manifest.get("artifacts", {})
+    if not required.issubset(artifacts):
+        raise RegressionError("Reference collection is missing hashed measurement artifacts")
+    for relative, digest in artifacts.items():
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "reference":
+            raise RegressionError(f"Unsafe or non-reference collection artifact: {relative}")
+        if measurement_repeat is not None and (len(path.parts) < 3 or path.parts[1] != str(measurement_repeat)):
+            raise RegressionError(f"Wrong-repeat reference measurement artifact: {relative}")
+        if not (generation / path).resolve().is_relative_to(generation.resolve()):
+            raise RegressionError(f"Reference artifact escapes its collection: {relative}")
+        if sha256(generation / path) != digest:
+            raise RegressionError(f"Reference collection artifact checksum mismatch: {relative}")
+    request_ids: set[str] = set()
+    for index, repeat in enumerate(repeats):
+        for case in cases:
+            raw = read_json(generation / "reference" / str(repeat) / case / "benchmark.json")
+            if (
+                raw.get("git_revision") != manifest["harness_revision"]
+                or raw.get("server_revision") != settings["reference_revision"]
+                or _measured_metrics(raw, settings) != records["reference"][index][case]
+            ):
+                raise RegressionError("Reference collection source or raw measurements changed")
+            identities = {session["request_id"] for session in raw["sessions"]}
+            if identities & request_ids:
+                raise RegressionError("Reference requests were reused across independent starts")
+            request_ids.update(identities)
+
+
 def _finalize_measurements(settings: dict[str, Any], contract: dict, records: dict) -> dict[str, Any]:
     output = settings["output"]
     cases = {case["id"] for case in settings["cases"]}
@@ -484,17 +614,24 @@ def _finalize_measurements(settings: dict[str, Any], contract: dict, records: di
     ttfc_floor = 0.0
     p95_max_cv: float | None = None
     calibration_error: str | None = None
-    if settings.get("platform") == "cuda":
-        calibration_path = ROOT / "tests/dfx/lingbot_world/calibration/cuda_nightly_reference.json"
-        calibration = read_json(calibration_path)
-        write_json(output / "reference-calibration.json", calibration)
+    if settings.get("platform") == "cuda" or settings.get("reference_calibration"):
+        calibration_path = ROOT / settings.get(
+            "reference_calibration", "tests/dfx/lingbot_world/calibration/cuda_nightly_reference.json"
+        )
         try:
+            if not calibration_path.is_file():
+                raise RegressionError(f"Frozen reference calibration is not available: {calibration_path.name}")
+            calibration = read_json(calibration_path)
+            write_json(output / "reference-calibration.json", calibration)
             verify_reference_calibration_contract(contract, calibration)
         except RegressionError as error:
             calibration_error = str(error)
             write_json(
                 output / "calibration-error.json",
-                {"error": calibration_error, "reference_record_sha256": sha256(calibration_path)},
+                {
+                    "error": calibration_error,
+                    "reference_record_sha256": sha256(calibration_path) if calibration_path.is_file() else None,
+                },
             )
         else:
             startup_stall_floor = calibration["startup_stall_calibration"]["selected_floor_ms"]
@@ -578,6 +715,15 @@ def _finalize_measurements(settings: dict[str, Any], contract: dict, records: di
 
 def aggregate_measurements(settings: dict[str, Any]) -> dict[str, Any]:
     """Verify three complete NPU pairs before applying the full regression gate."""
+    return _aggregate_measurements(settings, reference_only=False)
+
+
+def aggregate_reference_measurements(settings: dict[str, Any]) -> dict[str, Any]:
+    """Reassemble three independent NPU reference producers without acceptance."""
+    return _aggregate_measurements(settings, reference_only=True)
+
+
+def _aggregate_measurements(settings: dict[str, Any], *, reference_only: bool) -> dict[str, Any]:
     source = settings["generation"]
     output = settings["output"].resolve()
     if source is None or settings["platform"] != "npu":
@@ -589,19 +735,36 @@ def aggregate_measurements(settings: dict[str, Any]) -> dict[str, Any]:
     if any((output / role).exists() for role in ("reference", "candidate")):
         raise RegressionError("Use a fresh aggregate output directory")
     revision = git_revision(ROOT)
-    write_json(output / "generation.json", {"passed": False, "status": "aggregating", "candidate_revision": revision})
+    write_json(
+        output / "generation.json",
+        {
+            "passed": False,
+            "status": "aggregating",
+            "harness_revision" if reference_only else "candidate_revision": revision,
+        },
+    )
     profile = read_json(settings["profile_path"])
     cases = {case["id"] for case in settings["cases"]}
     contract = None
-    records: dict[str, list] = {"reference": [], "candidate": []}
+    records: dict[str, list] = {"reference": []} if reference_only else {"reference": [], "candidate": []}
     provenance = []
     request_ids: set[str] = set()
+    collection_ids: set[str] = set()
+    producer_jobs: set[str] = set()
     for repeat in range(3):
         root = source / f"pair-{repeat}"
         if not (root / "measurement.json").is_file():
             raise RegressionError(f"Missing measurement pair {repeat}")
         manifest = read_json(root / "measurement.json")
-        if (
+        if reference_only:
+            validate_reference_collection(settings, root, manifest, measurement_repeat=repeat)
+            identity = manifest["collection_id"]
+            job = manifest["buildkite_job_id"] if manifest["collection_backend"] == "buildkite" else f"local:{identity}"
+            if identity in collection_ids or job in producer_jobs:
+                raise RegressionError("Reference producers were reused across independent starts")
+            collection_ids.add(identity)
+            producer_jobs.add(job)
+        elif (
             manifest.get("complete") is not True
             or manifest.get("measurement_only") is not True
             or type(manifest.get("repeat")) is not int
@@ -668,11 +831,31 @@ def aggregate_measurements(settings: dict[str, Any]) -> dict[str, Any]:
                     raise RegressionError("Measured requests were reused across independent starts")
                 request_ids.update(identities)
             records[role].append(metrics)
-        provenance.append({"repeat": repeat, "buildkite_job_id": manifest.get("buildkite_job_id")})
+        if reference_only:
+            relative = f"reference/provenance/measurement-{repeat}.json"
+            destination = output / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / "measurement.json", destination)
+            provenance.append(
+                {
+                    "repeat": repeat,
+                    "collection_id": manifest["collection_id"],
+                    "collection_backend": manifest["collection_backend"],
+                    "buildkite_job_id": manifest["buildkite_job_id"],
+                    "manifest_path": relative,
+                    "manifest_sha256": sha256(destination),
+                }
+            )
+        else:
+            provenance.append({"repeat": repeat, "buildkite_job_id": manifest.get("buildkite_job_id")})
     assert contract is not None
     write_json(output / "progress.json", {"records": records, "contract": contract})
     write_json(output / "measurement-jobs.json", provenance)
-    report = _finalize_measurements(settings, contract, records)
+    if reference_only:
+        report = _reference_collection_report(settings, contract, records)
+        validate_reference_collection(settings, output, report)
+    else:
+        report = _finalize_measurements(settings, contract, records)
     report["measurement_jobs"] = provenance
     write_json(output / "generation.json", report)
     return report

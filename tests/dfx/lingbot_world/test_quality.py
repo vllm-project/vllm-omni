@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import uuid
 from itertools import combinations
 from pathlib import Path
 
@@ -26,14 +27,19 @@ from benchmarks.lingbot_world.regression import (
 )
 from benchmarks.lingbot_world.video_quality import compare_video_pair_in_environment, evaluate_video_quality
 from tests.dfx.lingbot_world.opencv_provider import validate_opencv_provider_record
-from tests.dfx.lingbot_world.runner import ROOT, git_revision, hardware_contract
+from tests.dfx.lingbot_world.runner import ROOT, git_revision, hardware_contract, validate_reference_collection
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_wbench_vbench_and_video_precision(lingbot_settings):
+def test_wbench_vbench_and_video_precision(lingbot_settings, monkeypatch):
+    evaluate_quality(lingbot_settings, monkeypatch)
+
+
+def evaluate_quality(lingbot_settings, monkeypatch, *, reference_only=False):
+    """Share scoring/decoder verification without conflating collection and acceptance."""
     settings = lingbot_settings
     output = settings["output"]
     output.mkdir(parents=True, exist_ok=True)
@@ -44,11 +50,15 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
         raise RegressionError("--lingbot-generation must name the downloaded generation artifact directory")
     generation = generation.resolve()
     manifest = read_json(generation / "generation.json")
+    if reference_only:
+        validate_reference_collection(settings, generation, manifest)
+    elif manifest.get("reference_only"):
+        raise RegressionError("Reference-only collection cannot establish candidate acceptance")
     if type(manifest.get("passed")) is not bool or manifest.get("contract", {}).get("profile") != read_json(
         settings["profile_path"]
     ):
         raise RegressionError("Generation is incomplete or belongs to a different profile")
-    if manifest["candidate_revision"] != revision:
+    if manifest.get("harness_revision" if reference_only else "candidate_revision") != revision:
         raise RegressionError("Generation artifacts belong to a different candidate commit")
     selected_cases = settings["cases"]
     case_index = settings.get("quality_case_index")
@@ -58,7 +68,7 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
         selected_cases = [selected_cases[case_index]]
     videos = {}
     for index, case in enumerate(selected_cases):
-        for role in ("reference", "candidate"):
+        for role in ("reference",) if reference_only else ("reference", "candidate"):
             for repeat in range(3):
                 videos[f"case{index}_{role}{repeat}"] = generation / role / str(repeat) / case["id"] / "rollout.mp4"
     required = {str(path.relative_to(generation)) for path in videos.values()}
@@ -74,17 +84,21 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
     write_json(output / "quality-policy.json", limits)
     write_json(output / "profile.json", manifest["contract"]["profile"])
     calibration_errors = []
-    if settings["platform"] == "cuda":
-        calibration_path = ROOT / "tests/dfx/lingbot_world/calibration/cuda_nightly_reference.json"
-        calibration = read_json(calibration_path)
-        write_json(output / "reference-calibration.json", calibration)
+    if (settings["platform"] == "cuda" or settings.get("reference_calibration")) and not reference_only:
+        calibration_path = ROOT / settings.get(
+            "reference_calibration", "tests/dfx/lingbot_world/calibration/cuda_nightly_reference.json"
+        )
         try:
+            if not calibration_path.is_file():
+                raise RegressionError(f"Frozen reference calibration is not available: {calibration_path.name}")
+            calibration = read_json(calibration_path)
+            write_json(output / "reference-calibration.json", calibration)
             verify_reference_calibration_contract(manifest["contract"], calibration)
         except RegressionError as error:
             calibration_errors.append(
                 {
                     "record": str(calibration_path.relative_to(ROOT)),
-                    "sha256": sha256(calibration_path),
+                    "sha256": sha256(calibration_path) if calibration_path.is_file() else None,
                     "error": str(error),
                 }
             )
@@ -105,11 +119,16 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
     population = None
     population_path = None
     population_files = {40: "cuda_nightly_quality_population.json", 600: "cuda_long_quality_population.json"}
-    if settings["platform"] == "cuda" and settings["num_chunks"] in population_files:
-        population_path = ROOT / "tests/dfx/lingbot_world/calibration" / population_files[settings["num_chunks"]]
-        population = read_json(population_path)
-        write_json(output / "quality-reference-population.json", population)
+    selected_population = settings.get("quality_reference_population")
+    if selected_population is None and settings["platform"] == "cuda" and settings["num_chunks"] in population_files:
+        selected_population = "tests/dfx/lingbot_world/calibration/" + population_files[settings["num_chunks"]]
+    if selected_population is not None and not reference_only:
+        population_path = ROOT / selected_population
         try:
+            if not population_path.is_file():
+                raise RegressionError(f"Frozen reference quality population is not available: {population_path.name}")
+            population = read_json(population_path)
+            write_json(output / "quality-reference-population.json", population)
             verify_quality_population_contract(
                 population,
                 manifest["contract"],
@@ -121,7 +140,7 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
             calibration_errors.append(
                 {
                     "record": str(population_path.relative_to(ROOT)),
-                    "sha256": sha256(population_path),
+                    "sha256": sha256(population_path) if population_path.is_file() else None,
                     "error": str(error),
                 }
             )
@@ -139,11 +158,11 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
             check=True,
             timeout=30,
         )
-    os.environ["VBENCH_CACHE_DIR"] = str(evaluator_root / "vbench-cache")
-    os.environ["WBENCH_WEIGHTS_DIR"] = str(evaluator_root / "wbench/weights")
+    monkeypatch.setenv("VBENCH_CACHE_DIR", str(evaluator_root / "vbench-cache"))
+    monkeypatch.setenv("WBENCH_WEIGHTS_DIR", str(evaluator_root / "wbench/weights"))
     # No model downloads or evaluator backend changes during scoring.
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     report = {
         "passed": False,
         "candidate_revision": revision,
@@ -165,7 +184,23 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
         ),
         "evaluator_lock_sha256": sha256(ROOT / "tests/dfx/lingbot_world/evaluators.lock.json"),
     }
-    if population_path is not None:
+    if reference_only:
+        quality_job_id = os.environ.get("BUILDKITE_JOB_ID") or None
+        report.update(reference_only=True, measurement_only=True, complete=False)
+        report.pop("candidate_revision")
+        report["harness_revision"] = revision
+        report["reference_revision"] = manifest["reference_revision"]
+        report["reference_protocol_sha256"] = manifest["reference_protocol_sha256"]
+        report["collection_id"] = manifest["collection_id"]
+        report["collection_backend"] = manifest["collection_backend"]
+        report["buildkite_job_id"] = manifest["buildkite_job_id"]
+        report["quality_collection_id"] = str(uuid.uuid4())
+        report["quality_collection_backend"] = "buildkite" if quality_job_id is not None else "local"
+        report["quality_buildkite_job_id"] = quality_job_id
+        if "measurement_jobs" in manifest:
+            report["measurement_jobs"] = manifest["measurement_jobs"]
+        report["contract"] = manifest["contract"]
+    if population_path is not None and population_path.is_file():
         report["reference_population_sha256"] = sha256(population_path)
     # A forced job timeout can bypass finally; retain provenance before workers start.
     write_json(output / "quality.json", report)
@@ -203,8 +238,16 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
             tolerances = {
                 name: value for name, value in candidate_tolerances[suite].items() if name not in binary_dimensions
             }
-            cases = {}
+            cases: dict[str, object] = {}
             for index, case in enumerate(selected_cases):
+                if reference_only:
+                    cases[case["id"]] = {
+                        "reference_scores": [
+                            evaluation["scores"][f"case{index}_reference{repeat}"] for repeat in range(3)
+                        ],
+                        "checks": [],
+                    }
+                    continue
                 if calibration_errors:
                     cases[case["id"]] = [
                         {"passed": False, "status": "unjudged", "calibration_errors": calibration_errors}
@@ -218,7 +261,7 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
                 if population is not None:
                     calibrated_case = population["cases"][case["id"]]
                     quality_reference = calibrated_case["suites"][suite]
-                    if population["schema_version"] == 3:
+                    if population["schema_version"] in (3, 4):
                         case_spreads = calibrated_case["max_reference_spreads"][suite]
                     # Keep the fresh cohort's spread gate, then reject fresh
                     # references that degrade beyond the reviewed population.
@@ -294,7 +337,7 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
                     ssim_stride=24,
                     timeout_s=limits["timeout_s"],
                 )
-                for repeat in range(3)
+                for repeat in ([] if reference_only else range(3))
             ]
             quality_reference = reference if population is None else population["cases"][case["id"]]["pixels"]
             for row in [*reference, *candidate]:
@@ -332,18 +375,38 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
                 "candidate": candidate,
                 "checks": [check_pixel(row) for row in candidate],
             }
-        report["quality_passed"] = (
-            not calibration_errors
-            and all(
-                check["passed"] for suite in report["suites"].values() for checks in suite.values() for check in checks
+        if reference_only:
+            report["complete"] = True
+            report["status"] = "reference_quality_collection_complete"
+            report["artifacts"] = {
+                str(path.relative_to(output)): sha256(path)
+                for path in output.rglob("*")
+                # pytest and the shared launcher finalize these after the
+                # scoring function returns; retain them as ordinary CI
+                # evidence without snapshotting their temporary contents.
+                if path.is_file()
+                and path not in {output / "quality.json", output / "pytest.xml", output / "setup-failure.json"}
+            }
+        else:
+            report["quality_passed"] = (
+                not calibration_errors
+                and all(
+                    check["passed"]
+                    for suite in report["suites"].values()
+                    for checks in suite.values()
+                    for check in checks
+                )
+                and all(
+                    check["passed"]
+                    for case in report["pixels"].values()
+                    for check in [*case["reference_checks"], *case["checks"]]
+                )
             )
-            and all(
-                check["passed"]
-                for case in report["pixels"].values()
-                for check in [*case["reference_checks"], *case["checks"]]
-            )
-        )
         report["passed"] = report["generation_passed"] and report["quality_passed"]
     finally:
         write_json(output / "quality.json", report)
-    assert report["passed"], f"Quality regression; see {output}/quality.json"
+    if reference_only:
+        assert report["complete"], f"Incomplete reference quality collection; see {output}/quality.json"
+    else:
+        assert report["passed"], f"Quality regression; see {output}/quality.json"
+    return report

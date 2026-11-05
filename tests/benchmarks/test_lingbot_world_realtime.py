@@ -1007,3 +1007,106 @@ def test_short_sample_report_qualifies_tail_percentiles(capsys) -> None:
     metrics = compute_metrics(_records([1.0] * 16), fps=12)
     print_report(metrics, workload=_workload(num_chunks=16), endpoint="ws://test", sessions=1, target_fps=12)
     assert "not reliable tail estimates" in capsys.readouterr().out
+
+
+def _unified_args(flags):
+    from vllm_omni.entrypoints.cli.benchmark.main import OmniBenchmarkSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    parser = TrackingArgumentParser()
+    OmniBenchmarkSubcommand().subparser_init(parser.add_subparsers())
+    return parser.parse_args(["bench", "realtime-video", "--omni", *flags])
+
+
+def test_source_compatibility_imports_share_packaged_implementation() -> None:
+    from benchmarks.lingbot_world import benchmark_lingbot_world_realtime as legacy
+    from benchmarks.lingbot_world import workload as legacy_workload
+    from vllm_omni.benchmarks.lingbot_world import realtime, workload
+
+    assert legacy is realtime
+    assert legacy_workload is workload
+    assert realtime._git_revision() is not None
+
+
+def test_installed_benchmark_does_not_claim_unrelated_source_revision(tmp_path, monkeypatch) -> None:
+    from vllm_omni.benchmarks.lingbot_world import realtime
+
+    monkeypatch.setattr(realtime, "REPO_ROOT", tmp_path)
+    assert realtime._git_revision() is None
+
+
+def test_unified_cli_preserves_standalone_workload_and_measurement_defaults() -> None:
+    standalone = vars(parse_args([]))
+    unified = vars(_unified_args([]))
+    assert {name: unified[name] for name in standalone} == standalone
+
+
+def test_unified_cli_executes_repeated_streaming_sessions(tmp_path) -> None:
+    async def scenario() -> None:
+        server = _serve(_emit_rollout)
+        output = tmp_path / "unified.json"
+        async with server as url:
+            args = _unified_args(
+                [
+                    "--base-url",
+                    url,
+                    "--image",
+                    _IMAGE,
+                    "--num-chunks",
+                    "10",
+                    "--warmup-sessions",
+                    "1",
+                    "--warmup-num-chunks",
+                    "8",
+                    "--sessions",
+                    "2",
+                    "--target-fps",
+                    "12",
+                    "--ping-interval",
+                    "0",
+                    "--output-json",
+                    str(output),
+                ]
+            )
+            await asyncio.to_thread(args.dispatch_function, args)
+        report = json.loads(output.read_text())
+        assert report["benchmark"] == "lingbot_world_realtime"
+        assert [chunks_for_num_frames(payload["num_frames"]) for payload in server.start_payloads] == [8, 10, 10]
+        assert len(report["warmups"]) == 1
+        assert [len(session["chunks"]) for session in report["sessions"]] == [10, 10]
+        assert report["metrics"]["sessions"] == 2
+        assert report["config"]["target_fps"] == 12
+        assert report["config"]["mux_fps"] == 16
+        assert report["config"]["warmup_chunks"] == 6
+
+    _run(scenario())
+
+
+def test_unified_cli_fails_and_retains_partial_session_evidence(tmp_path) -> None:
+    async def short_rollout(websocket, payload):
+        await _emit_rollout(websocket, payload, chunks=1)
+
+    async def scenario() -> None:
+        output = tmp_path / "incomplete.json"
+        async with _serve(short_rollout) as url:
+            args = _unified_args(
+                ["--base-url", url, "--image", _IMAGE, "--num-chunks", "10", "--output-json", str(output)]
+            )
+            with pytest.raises(SystemExit) as failed:
+                await asyncio.to_thread(args.dispatch_function, args)
+        assert failed.value.code == 1
+        assert not output.exists()
+        trace = json.loads((tmp_path / "incomplete-session-0-failure.json").read_text())
+        assert trace["complete"] is False
+        assert len(trace["chunks"]) == 1
+        assert trace["error"]["type"] == "BenchmarkError"
+
+    _run(scenario())
+
+
+def test_unified_cli_rejects_invalid_settings_before_opening_session(capsys) -> None:
+    args = _unified_args(["--sessions", "0"])
+    with pytest.raises(SystemExit) as failed:
+        args.dispatch_function(args)
+    assert failed.value.code == 2
+    assert "--sessions must be at least 1" in capsys.readouterr().err

@@ -47,6 +47,14 @@ outputs before using timings as performance evidence.
 Test workload parsing and metric calculations with deterministic fixtures. Do
 not compare materially different workloads or runtime settings.
 
+`vllm bench realtime-video --omni` owns the public realtime-video measurement
+entrypoint. Packaged workload, protocol and metric code lives under
+`vllm_omni.benchmarks.lingbot_world`; the historical source script is a compatibility
+wrapper. Both paths share argument validation, warmups, successful-result JSON
+and partial-session failure evidence. An installed wheel does not claim an
+unrelated checkout's source revision. Frozen-reference acceptance and native
+quality evaluation remain additional pytest policies around that shared client.
+
 The [LingBot World regression suite](https://github.com/vllm-project/vllm-omni/blob/main/tests/dfx/lingbot_world/README.md)
 wraps the served realtime workload in blocking pytest jobs. It measures a frozen
 reference on the same hardware/dependencies, calibrates from three independent

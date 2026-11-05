@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -22,6 +23,19 @@ from benchmarks.lingbot_world.regression import RegressionError, read_json, sha2
 from tests.dfx.lingbot_world.opencv_provider import PROVIDER, validate_opencv_provider_record
 
 ROOT = Path(__file__).resolve().parents[3]
+CUDA_RUNTIME = {"packages": {"vllm": "0.33.0", "torch": "2.14.0"}}
+NPU_RUNTIME = {
+    "packages": {
+        "vllm": "0.33.0+empty",
+        "torch": "2.10.0+cpu",
+        "torch-npu": "2.10.0.post7",
+        "vllm-ascend": "0.19.1rc2.dev3349+g221fb096c.d20261104",
+    },
+    "source_revisions": {
+        "vllm": "4ba787ec9959e566d3b587a796dff07673324da5",
+        "vllm-ascend": "221fb096cd1cdf9f0b273da9b9624fbf4bb7f200",
+    },
+}
 
 
 def profile_for_case_shard(settings: dict, selection: str) -> dict:
@@ -32,7 +46,12 @@ def profile_for_case_shard(settings: dict, selection: str) -> dict:
     cases = settings["cases"]
     if count < 1 or index >= count or count > len(cases):
         raise RegressionError("Case shard would be empty or outside the configured population")
-    return {**settings, "cases": cases[index::count], "case_shard": {"index": index, "count": count}}
+    selected = {**settings, "cases": cases[index::count], "case_shard": {"index": index, "count": count}}
+    for key in ("reference_calibration", "quality_reference_population"):
+        if key in settings:
+            path = Path(settings[key])
+            selected[key] = str(path.with_name(f"{path.stem}_shard{index}of{count}{path.suffix}"))
+    return selected
 
 
 def select_cuda_devices(available: int, mask: str | None, *, dies: int, reserved_cards: int) -> str:
@@ -152,11 +171,74 @@ def checkout(path: Path, url: str, revision: str, *, submodules: bool = False) -
         )
 
 
-def verify_inference_runtime() -> None:
-    version = importlib.metadata.version("vllm")
-    parsed = Version(version)
-    if parsed.base_version != "0.32.0" or parsed.is_prerelease or parsed.is_devrelease:
-        raise RegressionError(f"LingBot reference requires vLLM 0.32.0, found {version}")
+def verify_editable_runtime_sources(expected: dict[str, str]) -> dict[str, str]:
+    """Attest the vendor image's actual editable checkouts, independent of tags."""
+    revisions = {}
+    for package, revision in expected.items():
+        provenance = importlib.metadata.distribution(package).read_text("direct_url.json")
+        try:
+            record = json.loads(provenance or "{}")
+            url = urllib.parse.urlparse(record.get("url", ""))
+            if (
+                url.scheme != "file"
+                or url.netloc not in ("", "localhost")
+                or not record.get("dir_info", {}).get("editable")
+            ):
+                raise ValueError("no editable source provenance")
+            source = Path(urllib.parse.unquote(url.path))
+            actual = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True, timeout=30
+            ).strip()
+            dirty = subprocess.check_output(
+                ["git", "-C", str(source), "status", "--porcelain"], text=True, timeout=30
+            ).strip()
+        except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            raise RegressionError(f"Cannot attest {package} editable runtime source") from error
+        if actual != revision or dirty:
+            raise RegressionError(
+                f"LingBot NPU runtime source is changed or dirty: {package} (expected {revision}, found {actual})"
+            )
+        revisions[package] = actual
+    return revisions
+
+
+def verify_inference_runtime(
+    platform: str = "cuda", *, profile_runtime: dict[str, dict[str, str]] | None = None
+) -> dict[str, dict[str, str]]:
+    # A local vendor suffix is allowed; RC/dev builds cannot impersonate the
+    # final release used for the paired measurements. Ascend owns its Torch
+    # stack and must never receive the CUDA wheel to satisfy this check.
+    if profile_runtime is not None and profile_runtime != {"cuda": CUDA_RUNTIME, "npu": NPU_RUNTIME}.get(platform):
+        raise RegressionError("Profile inference runtime does not match the pinned runtime contract")
+    expected = {"vllm": "0.33.0"}
+    observed: dict[str, dict[str, str]] = {"packages": {}}
+    if platform == "cuda":
+        expected["torch"] = "2.14.0"
+    elif platform == "npu":
+        # Vendor images can retain a development plugin version even when
+        # built for final vLLM 0.33. Source imports and measured package/image
+        # identities establish compatibility; the image tag alone does not.
+        for package, version in NPU_RUNTIME["packages"].items():
+            try:
+                actual = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError as error:
+                raise RegressionError(f"LingBot NPU reference requires the integrated {package} runtime") from error
+            if actual != version:
+                raise RegressionError(f"LingBot NPU reference requires {package} {version}, found {actual}")
+            observed["packages"][package] = actual
+        observed["source_revisions"] = verify_editable_runtime_sources(NPU_RUNTIME["source_revisions"])
+    else:
+        raise RegressionError(f"Unsupported LingBot inference platform: {platform}")
+    for package, release in expected.items():
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RegressionError(f"LingBot {platform} reference requires {package} {release}") from error
+        parsed = Version(version)
+        if parsed.base_version != release or parsed.is_prerelease or parsed.is_devrelease:
+            raise RegressionError(f"LingBot {platform} reference requires {package} {release}, found {version}")
+        observed["packages"][package] = version
+    return observed
 
 
 def verify_source_imports(reference: Path) -> None:
@@ -172,7 +254,9 @@ def verify_source_imports(reference: Path) -> None:
                     "-c",
                     "import sys; from pathlib import Path; import vllm_omni; "
                     "assert Path(vllm_omni.__file__).resolve().parent == Path(sys.argv[1]) / 'vllm_omni'; "
-                    "import vllm_omni.entrypoints.cli.main",
+                    "import vllm_omni.diffusion.models.lingbot_world.pipeline; "
+                    "from vllm_omni.entrypoints.cli.main import main; "
+                    "sys.argv = ['vllm', 'serve', '--omni', '--help']; main()",
                     str(source),
                 ],
                 cwd=source,
@@ -353,8 +437,10 @@ def main():
         if args.profile is None:
             parser.error("reference needs --profile")
         settings = read_json(args.profile)
-        verify_inference_runtime()
-        checkout(args.root.resolve(), "https://github.com/vllm-project/vllm-omni.git", settings["reference_revision"])
+        inference_runtime = verify_inference_runtime(
+            settings["platform"], profile_runtime=settings.get("inference_runtime")
+        )
+        checkout(args.root.resolve(), settings["reference_repository"], settings["reference_revision"])
         verify_source_imports(args.root)
         model = os.environ.get("LINGBOT_MODEL_PATH")
         if model is None:
@@ -384,7 +470,12 @@ def main():
                 if path.startswith("transformer/") and path.endswith(".safetensors")
             )
             write_json(
-                args.env_output, {"model_path": str(model_path), "resources": collect_resources(model_path / weight)}
+                args.env_output,
+                {
+                    "model_path": str(model_path),
+                    "resources": collect_resources(model_path / weight),
+                    "inference_runtime": inference_runtime,
+                },
             )
 
 

@@ -3,39 +3,61 @@
 The suite drives the real `WS /v1/realtime/video` endpoint. CPU tests validate
 gate logic separately and are not model performance evidence.
 
-## Current production reference: CUDA nightly calibration frozen
+## vLLM 0.33 reference and qualification status
 
-The initial production baseline is pinned to
-`48cebe5a248d4b0160f20c7fc18b5d1c46883872` for both CUDA and NPU. It contains the
-accepted main implementation and the NPU offload fix; its `vllm_omni` tree is
-`467d4cea37b5667d5ede38286c4072f0f0848133`. The candidate incorporates newer accepted main changes and is checked against
-this frozen reference. Its LingBot model and deployment configuration are unchanged. This reference was refreshed for vLLM 0.32.0 on
-2026-10-20. The pin includes
-Omni `v0.32.0rc1` at `da572cddb38383deae9caef33b8d490e292ef071`
-and the NPU offload fix, plus the compiler-context fix required by PyTorch 2.13.
-The previous vLLM 0.32.0 reference
-`37adcce0a204440de9541d5155baa16a7e081d6d` passed serving imports but failed
-compiled SP4 reference warmup in CUDA build 17624. Its failed jobs remain
-unqualified historical evidence. The older reference
-`4134c7f421a195407da6f779f21c3e40c93a2440` imports a removed vLLM API;
-CUDA build 17617 and NPU build 9340 failed runtime setup and provide no
-calibration evidence. Future candidate changes remain compared
-against the frozen reference; updating a candidate must not advance this pin.
+The inference source is frozen at
+`61d19b6094189136ad047bf8b060d4180c3c60bf` in
+`https://github.com/tzhouam/vllm-omni.git`. Every profile records both the
+repository and full revision, so provisioning can fetch the immutable source
+without relying on an upstream branch containing the reference commit.
+This reference starts from accepted main
+`02286829737a54167e890185bcbb6948ed9afbcf` and carries exactly the three established
+LingBot compiler and offload files from
+`48cebe5a248d4b0160f20c7fc18b5d1c46883872`. It contains no candidate harness or
+new performance optimization. Updating a candidate must not advance this pin.
 
-CUDA nightly calibration is frozen from the reference roles of builds
-[17633](https://buildkite.com/vllm/vllm-omni/builds/17633) and
-[17640](https://buildkite.com/vllm/vllm-omni/builds/17640), three independent
-starts per cohort. The reference and runtime now match the active records.
-The next independent campaign must validate these frozen records and the final
-candidate source; fitting and offline construction controls do not establish
-acceptance. The records retain `independent_validation_complete: false` as
-freeze-time provenance. Consult the PR's actual CI results for subsequent
-qualification. Weekly, long and NPU calibration remain pending.
+The runtime migration is necessary: the previous reference `48cebe5a` fails
+actual serving startup on vLLM 0.33 because
+`vllm.entrypoints.launchers.cli_args` was removed. The new reference and candidate
+both pass explicit LingBot pipeline imports and `serve --omni --help` on vLLM
+0.33.0 / PyTorch 2.14.0. These CPU preflights do not qualify model inference,
+performance, numerical precision or video quality on either platform.
 
-The predecessors remain byte-identical under
-[calibration/history](calibration/history/README.md), and their original failed
-jobs remain failed. Candidate observations never select calibration values;
-historical candidate videos cannot become reference videos.
+The retained vLLM 0.32 calibration records were frozen from reference roles of
+CUDA builds [17633](https://buildkite.com/vllm/vllm-omni/builds/17633) and
+[17640](https://buildkite.com/vllm/vllm-omni/builds/17640). They and
+[calibration/history](calibration/history/README.md) remain byte-identical.
+Their old source/runtime contracts deliberately reject the new profiles.
+CUDA nightly, weekly, 600-chunk and NPU qualification on the new reference remain
+pending until fresh reference-only calibration and independent acceptance run.
+No earlier green build qualifies this new source/runtime combination.
+
+The predeclared replacement method is retained in
+[calibration/v033_reference_protocol.json](calibration/v033_reference_protocol.json).
+Collect two independent three-start reference cohorts for each exact platform
+and workload. Reference collection never starts a candidate server, never reads
+or rewrites calibration thresholds, and writes `passed: false` alongside
+`reference_only: true`, `measurement_only: true` and `complete: true` when
+collection succeeds. Separate reference-quality collection retains native raw
+scores and within-cohort pixel comparisons with the same completion semantics.
+Calibration must combine all six actual reference videos per case and recompute
+all 15 unordered pairs in the pinned evaluator environment. Only after freezing
+the replacement records may a fresh paired campaign establish acceptance.
+Candidate observations never select calibration values, and historical
+candidate videos cannot become reference videos.
+
+For a Buildkite construction campaign, set `LINGBOT_REFERENCE_ONLY=1` at build
+creation. Existing `generate` and `evaluate` commands select `reference` and
+`reference-quality`; split NPU `collect` and `aggregate` commands select
+`reference-collect` and `reference-aggregate`, preserving the three existing
+matrix repeats and their complete artifact checks. These tests collect evidence
+and cannot establish candidate acceptance. The launcher records its requested stage, effective stage and phase
+in `ci-configuration.json` and prints the phase in the job log. Use a build
+message identifying reference-only calibration. Unset the variable, or set it to
+`0`, for the later independent acceptance campaign. The ready pipeline's smoke
+job retains its ordinary acceptance phase even when a construction build also
+selects reference collectors; smoke artifacts are never calibration inputs.
+Invalid switch values and unknown stages fail before provisioning.
 
 Before collecting new values, use this reference-only protocol:
 
@@ -63,41 +85,100 @@ Before collecting new values, use this reference-only protocol:
    negative controls, and investigate failures without refitting to them.
    Promote qualified records and archive their predecessors byte for byte.
 
+Reference collection and scoring use separate output roots for each cohort:
+
+```bash
+PROFILE=tests/dfx/lingbot_world/configs/cuda_nightly.json
+for COHORT in 1 2; do
+  bash tests/dfx/lingbot_world/run_ci.sh reference "$PROFILE" \
+    "lingbot-artifacts/cohort-$COHORT/generation"
+  bash tests/dfx/lingbot_world/run_ci.sh reference-quality "$PROFILE" \
+    "lingbot-artifacts/cohort-$COHORT/quality" \
+    "lingbot-artifacts/cohort-$COHORT/generation"
+done
+python -m tests.dfx.lingbot_world.calibrate \
+  --generation lingbot-artifacts/cohort-1/generation \
+  --generation lingbot-artifacts/cohort-2/generation \
+  --quality lingbot-artifacts/cohort-1/quality \
+  --quality lingbot-artifacts/cohort-2/quality \
+  --protocol tests/dfx/lingbot_world/calibration/v033_reference_protocol.json \
+  --python "$LINGBOT_EVALUATOR_PYTHON" --output lingbot-artifacts/frozen-v033
+```
+
+Generation requires the profile's full device reservation; reference quality
+and calibration pair evaluation use the pinned one-GPU evaluator environment.
+Export `LINGBOT_EVALUATOR_PYTHON` in the caller before invoking the builder.
+The builder refuses to overwrite its frozen calibration and population files.
+Promote those immutable records only after their independent reference/candidate
+qualification passes; a completed collection or builder command is not acceptance.
+
+Weekly CI scores each generation shard in three separate evaluator jobs. After
+downloading one cohort, combine its three completed per-case quality roots before
+passing that cohort to the builder:
+
+```bash
+python -m tests.dfx.lingbot_world.combine_reference_quality \
+  --generation lingbot-artifacts/cuda-weekly/shard-0 \
+  --quality lingbot-artifacts/cuda-weekly-quality/shard-0/case-0 \
+  --quality lingbot-artifacts/cuda-weekly-quality/shard-0/case-1 \
+  --quality lingbot-artifacts/cuda-weekly-quality/shard-0/case-2 \
+  --output lingbot-artifacts/cohort-1/quality-shard-0
+```
+
+The combiner preserves and hashes all original reports and native outputs,
+requires identical generation, protocol and evaluator provenance, and rejects
+missing cases, reused evaluator producers or candidate observations. It keeps
+`passed: false`; it creates no calibration or acceptance result. Repeat for the
+second cohort and all six shards, using the NPU artifact prefixes for NPU.
+Run the builder separately for each pair of matching shard cohorts. Each shard
+produces its own immutable `*_shardNof6.json` calibration and quality population;
+an unsharded profile or another shard's records cannot qualify that shard.
+All six shards then require independent reference/candidate acceptance.
+
 ## Prerequisites and commands
 
-Use the inference environment matching `docker/Dockerfile.ci` (vLLM 0.32.0)
+Use the inference environment matching `docker/Dockerfile.ci` (vLLM 0.33.0 / PyTorch 2.14.0)
 and development dependencies. Reserve devices with the host scheduler before
 inference. Full CUDA profiles use four GPUs while reserving all eight GPU slots
 of a node in the H100 pool; NPU reserves eight Ascend A2 devices and uses four. The smoke
 uses the real 14B checkpoint at 192×320 on one GPU. Full performance/quality
 profiles remain 480×832. CI provides exclusive devices.
 
-Reference preparation requires vLLM 0.32.0 and imports both reference and
-candidate serving entrypoints in separate processes before model downloads.
+Reference preparation requires final vLLM 0.33.0; CUDA also requires final
+PyTorch 2.14.0. It imports each source's LingBot pipeline and executes its actual
+`serve --omni --help` entrypoint in a separate process before model downloads.
 The CPU gate also compiles the real attention block with a cross-attention
 graph break, checks exact eager/compiled outputs and K/V reuse, and verifies
 leased-output lifetimes and native fallback. These checks cover the observed
 `nullcontext(None)` failure without disabling compilation or changing workloads.
 Each process verifies that it loaded the requested source checkout. A package
 or import mismatch fails setup without starting model inference. NPU also
-requires a compatible vLLM-Ascend stack: the current `Dockerfile.npu.ci` base
-still bundles vLLM 0.31.0 and cannot run this reference. As of 2026-10-20,
-neither `quay.io/atlas-ci/vllm-ascend` nor `quay.io/ascend/vllm-ascend`
-publishes a `v0.32.0` tag. Keep NPU collection pending until a compatible
-image is available; do not replace its integrated stack with a CUDA wheel.
+requires an integrated vLLM 0.33 Ascend stack, including `torch-npu` and
+`vllm-ascend`, that passes the same two-source preflight. Pin the vendor image
+by digest and retain its actual package versions: a `v0.33.0` image tag can still
+contain a development `vllm-ascend` package and vendor-specific Torch version.
+Source preflight and package metadata do not establish NPU model qualification.
+Do not replace the integrated vendor stack with a CUDA wheel.
 
 For PR builds, LingBot NPU jobs require `npu-test` together with `nightly-test`
 or `weekly-test`. A shared nightly/weekly label alone must not allocate NPU
 benchmark resources. Scheduled non-PR runs still use `NIGHTLY=1` or `WEEKLY=1`.
 
-The CUDA performance preset prevents other GPU jobs from sharing the eight-GPU
-node during paired measurements. The launcher verifies all eight reserved
+The explicit `h100_8` preset requests eight `nvidia.com/gpu` scheduler slots
+on `mithril-h100-pool`, preventing another GPU job from sharing a current
+eight-GPU node during paired measurements. The name describes reserved
+capacity; each full profile still sets `dies: 4`. This reservation is excluded
+from implicit marker inference, so existing `not cards_1` jobs retain their
+four-GPU allocation. The launcher verifies all eight reserved
 devices, records their UUIDs in `allocation.json`, then preserves the original
 device mapping while exposing only four to inference. This retains SP4, memory
 and precision settings. It changes scheduling isolation rather than regression
 thresholds. A four-GPU allocation cannot silently run an exclusive profile.
 For a local full CUDA run, reserve eight devices with `gpu run --gpus 8 -- ...`
-before invoking the launcher.
+before invoking the launcher. The public nightly/weekly scheduling remains
+configured; maintainer confirmation of shared-pool versus local-runner
+placement is pending. A local run uses the same launcher, profiles, full
+measurements and gates, after its scheduler grants all eight devices.
 
 NPU generation and long-pair collection use the existing `a2b3_npu_8`
 scheduler preset. Before model preparation, a separate preflight process
@@ -120,10 +201,21 @@ pytest -q --confcutdir=tests/benchmarks \
   tests/benchmarks/test_lingbot_world_ci.py
 ```
 
-The `unit` stage captures CPU test artifacts without loading a checkpoint.
-It also runs the shared pipeline uploader and AMD pipeline contract tests, so
-changes to reservations, retry rules, shell setup or artifact capture must retain
-the existing CI selections and failure semantics.
+The CPU regression job belongs to the existing Simple Test group and runs only
+`tests/benchmarks/test_lingbot_world_*.py`, without loading a checkpoint. The
+ordinary Other Test sweep excludes those exact files. Shared uploader, AMD,
+helper, diffusion-model and offloader contracts retain their existing Simple
+jobs and are no longer replayed in the dedicated model job. The scheduled
+nightly CPU coverage job still collects the whole suite for its distinct
+coverage purpose. Selected model-contract skips remain failures through the
+explicit DFX pytest plugin.
+
+The shared `run-pytest-ci.sh` wrapper handles report initialization, package and
+source metadata, setup/interruption errors and exit propagation. Both the
+ordinary Other Test job and model jobs use it. Only paired-checkout, device-mask
+and evaluator preparation remains in `tests/dfx/lingbot_world/run_ci.sh` beside
+the workload tests; hardware expansion, job admission and artifact upload use
+the existing shared Buildkite mechanisms.
 The model stages download the pinned checkpoint if `LINGBOT_MODEL_PATH` is unset.
 Only that explicit provisioning subprocess enables Hub access; inference keeps
 the runner's offline setting.
@@ -131,11 +223,15 @@ For an existing local or mirrored checkpoint, export that path first. All model
 files and images must match `assets.lock.json`; directory names do not matter.
 
 ```bash
-BUILDKITE=true bash .buildkite/common/scripts/run-lingbot-ci.sh unit \
-  tests/dfx/lingbot_world/quality.json lingbot-artifacts/unit
-bash .buildkite/common/scripts/run-lingbot-ci.sh smoke \
+BUILDKITE=true CUDA_VISIBLE_DEVICES="" \
+  CI_POLICY_FILE=tests/dfx/lingbot_world/quality.json \
+  bash .buildkite/common/scripts/run-pytest-ci.sh lingbot-artifacts/unit \
+  python -m pytest -sv -p tests.dfx.lingbot_world.conftest \
+  tests/benchmarks/test_lingbot_world_*.py --lingbot-output=lingbot-artifacts/unit \
+  -m 'core_model and cpu' --run-level core_model --junitxml=lingbot-artifacts/unit/pytest.xml
+bash tests/dfx/lingbot_world/run_ci.sh smoke \
   tests/dfx/lingbot_world/configs/cuda_smoke.json lingbot-artifacts/cuda-smoke
-bash .buildkite/common/scripts/run-lingbot-ci.sh generate \
+bash tests/dfx/lingbot_world/run_ci.sh generate \
   tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly
 ```
 
@@ -494,13 +590,16 @@ this video-quality suite.
 
 ## Buildkite and baseline maintenance
 
-- READY: a dedicated CPU unit gate and a one-GPU real-checkpoint
-  stream/cancellation smoke. The unit job uses the standard L4 CI image with
-  accelerators masked, and retains JUnit, logs, the quality policy and package
-  versions. Selected skips fail through the same pytest hook as model jobs.
-- NIGHTLY: independent CUDA/NPU generation followed by one-GPU evaluation.
+- READY: CPU benchmark contracts in Simple Test and a one-GPU real-checkpoint
+  stream/cancellation smoke in the existing E2E Test group. The CPU job uses the
+  standard L4 CI image with accelerators masked, and retains JUnit, the quality
+  policy and package versions. Selected skips fail through the same pytest hook
+  as model jobs. The smoke also survives the uploader's `--e2e` weekly sweep.
+- NIGHTLY: independent CUDA/NPU generation in the standard
+  `:card_index_dividers: World Model Test` group, followed by one-GPU evaluation.
   The NPU build provisions its matching CUDA evaluator image in the same build.
-- WEEKLY/manual (`weekly-test`): three scenes, three camera patterns and two
+- WEEKLY/manual (`weekly-test`): the same World Model Test group, three scenes,
+  three camera patterns and two
   seeds (18 cases), 160 chunks each across the groups above, plus the complete
   600-chunk long profile. NPU long quality waits for all three collected pairs
   and their CPU performance/precision aggregation gate.
@@ -532,11 +631,17 @@ semantics.
 Selected jobs are blocking. Missing prerequisites and skipped CI tests fail.
 NPU generation uses the existing infrastructure retry codes (`-1`, `128`),
 with one retry per code. Pytest failures and OOM are never automatically retried.
+The generation steps preserve `retry.manual.permit_on_passed: true` alongside
+their narrow automatic infrastructure retries. Numerical, quality, OOM and
+cancellation failures do not become automatic reruns.
 JUnit, raw chunks, measured limits, precision captures, memory/events, videos,
-scores and logs are retained through `artifact_paths`, including failed jobs.
+scores and server/capture/evaluator logs are retained through `artifact_paths`,
+including failed jobs. Buildkite retains job console output, so the shared
+wrapper and Other Test no longer duplicate it as `run.log` or `pytest.log`.
 A failed placeholder JUnit report is written before provisioning so a forced
 SIGKILL still leaves failure evidence. Pytest replaces it on completion; normal
-failure and SIGTERM also retain structured launcher errors.
+failure and SIGTERM also retain structured launcher errors. A zero exit with
+missing, empty, incomplete, failed or entirely skipped JUnit is rejected.
 Provisioning records host available/total RAM, cgroup membership, raw memory
 limits/peaks/pressure counters, available v1/v2 CPU quota/throttling/pressure
 counters and CPU-set masks,
@@ -578,11 +683,11 @@ invoking both `generate` and `evaluate`. For one NPU weekly group:
 ```bash
 for repeat in 0 1 2; do
   LINGBOT_CASE_SHARD=0/6 LINGBOT_MEASUREMENT_REPEAT="$repeat" \
-    bash .buildkite/common/scripts/run-lingbot-ci.sh collect \
+    bash tests/dfx/lingbot_world/run_ci.sh collect \
     tests/dfx/lingbot_world/configs/npu_weekly.json \
     "lingbot-artifacts/npu-weekly-measurements/shard-0/pair-$repeat"
 done
-LINGBOT_CASE_SHARD=0/6 bash .buildkite/common/scripts/run-lingbot-ci.sh aggregate \
+LINGBOT_CASE_SHARD=0/6 bash tests/dfx/lingbot_world/run_ci.sh aggregate \
   tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly/shard-0 \
   lingbot-artifacts/npu-weekly-measurements/shard-0
 ```
@@ -598,7 +703,7 @@ visible devices.
 Then run the CPU gate without loading a checkpoint:
 
 ```bash
-bash .buildkite/common/scripts/run-lingbot-ci.sh aggregate \
+bash tests/dfx/lingbot_world/run_ci.sh aggregate \
   tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long \
   lingbot-artifacts/npu-long-measurements
 ```
@@ -651,7 +756,7 @@ This prevents an unusually favorable three-reference cohort from silently
 tightening the candidate gate. Model, deployment, inputs, hardware/runtime,
 asset or evaluator changes reject population reuse. CUDA 600-chunk runs use the
 separate population described above; NPU and CUDA weekly profiles retain their
-own reference comparisons. The active nightly record binds both vLLM 0.32.0 reference
+own reference comparisons. The retained vLLM 0.32 nightly record binds both historical reference
 cohorts and freshly recomputed pixel summaries from their actual reference
 videos, using NumPy 1.26.4, OpenCV 4.11.0.86 and scikit-image 0.25.2; the OpenCV
 build hash is retained. No local interpreter paths are required by the record.

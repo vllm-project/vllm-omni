@@ -26,7 +26,7 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
-    positive ``cards_*`` uses that chip's highest existing preset). An explicit
+    positive ``cards_*`` uses that chip's highest inferable preset). An explicit
     preset string (``h100_2``) is used as-is (marks are ignored). Names that
     are not keys in ``ci_mirror_hardwares.yml`` fail the upload.
 
@@ -470,7 +470,7 @@ def _compose_mirror_hardware_name(
     Unset ``MIRROR_HW``: ``H100`` if in ``-m``, else ``L4``, else skip.
     Set ``MIRROR_HW``: that chip if in ``-m``, else skip.
     ``cards`` is a registered ``cards_n``, ``"max"`` for that chip's highest
-    existing preset, or None (error after a chip matched — no ``cards_*``).
+    inferable preset, or None (error after a chip matched — no ``cards_*``).
     """
     selector = _get_mirror_hw_selector()
     if selector:
@@ -498,7 +498,11 @@ def _compose_mirror_hardware_name(
         )
     known = _load_mirror_hardwares()
     if count is None:
-        available = [n for n in sorted(registered) if f"{chip}_{n}" in known]
+        available = [
+            n
+            for n in sorted(registered)
+            if f"{chip}_{n}" in known and known[f"{chip}_{n}"].get("infer_from_marks", True)
+        ]
         if not available:
             raise ValueError(
                 f"{count_source} in step {step_label!r} has no CUDA count presets for {chip}",
@@ -508,6 +512,10 @@ def _compose_mirror_hardware_name(
     if chosen not in known:
         raise ValueError(
             f"{count_source} in step {step_label!r} has no preset {chosen!r}",
+        )
+    if not known[chosen].get("infer_from_marks", True):
+        raise ValueError(
+            f"preset {chosen!r} reserves isolation capacity; select it explicitly with mirror_hardwares",
         )
     _log(f"{step_label}: {count_source} → {chosen!r}")
     return chosen
@@ -588,7 +596,7 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             f"unknown mirror_hardwares {preset_name!r} in step {step_label!r}; known: {known}",
         )
 
-    expanded = copy.deepcopy(preset)
+    expanded = {key: copy.deepcopy(value) for key, value in preset.items() if key != "infer_from_marks"}
     merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
     # A scheduled build's HF_TOKEN may override a pod env entry with the same
     # name. The preset injects the Kubernetes secret under a collision-proof

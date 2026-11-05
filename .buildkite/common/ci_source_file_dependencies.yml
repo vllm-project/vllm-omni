@@ -248,7 +248,7 @@ source_file_dependencies:
     - vllm_omni/entrypoints/openai/video_stream_base.py
     - vllm_omni/diffusion/distributed/autoencoders/
     - requirements/lingbot-quality
-    - .buildkite/common/scripts/run-lingbot-ci.sh
+    - .buildkite/common/scripts/run-pytest-ci.sh
   # Hardware presets and shared test helpers. Not a job key — do not attach this
   # to a step. Fallback-only diffs keep every job, even when a job lists a shared
   # path. Mixed diffs use normal job dependencies when any job-key prefix matches.

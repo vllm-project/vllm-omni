@@ -1,6 +1,6 @@
 steps:
 
-  - group: "LingBot World NPU weekly regression"
+  - group: ":card_index_dividers: World Model Test"
     depends_on: upload-weekly-pipeline
     if: (build.pull_request.id == null || build.pull_request.labels includes "npu-test") && (build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test")
     steps:
@@ -30,6 +30,8 @@ steps:
         mirror_hardwares: a2b3_npu_8
         # Match existing infra retry codes; pytest and OOM still fail.
         retry:
+          manual:
+            permit_on_passed: true
           automatic:
             - exit_status: -1
               limit: 1
@@ -38,7 +40,7 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/npu-weekly-measurements/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh collect tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly-measurements/shard-{{matrix.shard}}/pair-{{matrix.repeat}}
+          - bash tests/dfx/lingbot_world/run_ci.sh collect tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly-measurements/shard-{{matrix.shard}}/pair-{{matrix.repeat}}
       - label: "LingBot World · NPU weekly performance and precision gate"
         key: lingbot-npu-weekly-gate
         concurrency: 1
@@ -61,7 +63,7 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/npu-weekly/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh aggregate tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly/shard-{{matrix.shard}} lingbot-artifacts/npu-weekly-measurements/shard-{{matrix.shard}}
+          - bash tests/dfx/lingbot_world/run_ci.sh aggregate tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly/shard-{{matrix.shard}} lingbot-artifacts/npu-weekly-measurements/shard-{{matrix.shard}}
       - label: "LingBot World · NPU videos WBench/VBench gate on GPU"
         key: lingbot-npu-weekly-quality
         concurrency: 2
@@ -85,7 +87,7 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/npu-weekly-quality/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh evaluate tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly-quality/shard-{{matrix.shard}}/case-{{matrix.case}} lingbot-artifacts/npu-weekly/shard-{{matrix.shard}}
+          - bash tests/dfx/lingbot_world/run_ci.sh evaluate tests/dfx/lingbot_world/configs/npu_weekly.json lingbot-artifacts/npu-weekly-quality/shard-{{matrix.shard}}/case-{{matrix.case}} lingbot-artifacts/npu-weekly/shard-{{matrix.shard}}
       - label: "LingBot World · NPU long session and bounded memory"
         key: lingbot-npu-weekly-long
         concurrency: 1
@@ -102,6 +104,8 @@ steps:
         mirror_hardwares: a2b3_npu_8
         # Match existing infra retry codes; pytest and OOM still fail.
         retry:
+          manual:
+            permit_on_passed: true
           automatic:
             - exit_status: -1
               limit: 1
@@ -110,7 +114,7 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/npu-long-measurements/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh collect tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long-measurements/pair-{{matrix.repeat}}
+          - bash tests/dfx/lingbot_world/run_ci.sh collect tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long-measurements/pair-{{matrix.repeat}}
       - label: "LingBot World · NPU long performance and precision gate"
         key: lingbot-npu-weekly-long-gate
         concurrency: 1
@@ -126,7 +130,7 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/npu-long/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh aggregate tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long lingbot-artifacts/npu-long-measurements
+          - bash tests/dfx/lingbot_world/run_ci.sh aggregate tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long lingbot-artifacts/npu-long-measurements
       - label: "LingBot World · NPU long-rollout WBench/VBench gate"
         key: lingbot-npu-weekly-long-quality
         concurrency: 2
@@ -143,4 +147,4 @@ steps:
         artifact_paths:
           - "lingbot-artifacts/npu-long-quality/**/*"
         commands:
-          - bash .buildkite/common/scripts/run-lingbot-ci.sh evaluate tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long-quality lingbot-artifacts/npu-long
+          - bash tests/dfx/lingbot_world/run_ci.sh evaluate tests/dfx/lingbot_world/configs/npu_long.json lingbot-artifacts/npu-long-quality lingbot-artifacts/npu-long

@@ -176,7 +176,7 @@ def test_smoke_propagates_device_cleanup_failure_after_valid_inference(smoke_ent
 # AMD coverage lives in test_amd_cpu_timing.py with main's shared CPU runner.
 @pytest.mark.parametrize("shell", ["/bin/sh", "/bin/bash"])
 @pytest.mark.parametrize("status", [0, 1, 2, 134])
-def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, shell: str, status: int):
+def test_cpu_console_preserves_pytest_exit_and_junit_artifacts(tmp_path: Path, shell: str, status: int):
     source = ".buildkite/cuda/test-ready.yml"
     pipeline = yaml.safe_load((ROOT / source).read_text())
     label = "Simple · Other Test"
@@ -185,6 +185,9 @@ def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, s
     checkout = tmp_path / "agent-checkout"
     application.mkdir()
     checkout.mkdir()
+    wrapper = application / ".buildkite/common/scripts/run-pytest-ci.sh"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text((ROOT / ".buildkite/common/scripts/run-pytest-ci.sh").read_text())
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     pytest_cli = bin_dir / "pytest"
@@ -195,7 +198,7 @@ def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, s
         "print('pytest stdout', flush=True)\n"
         "print('pytest stderr', file=sys.stderr, flush=True)\n"
         "report = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml='))\n"
-        "Path(report).write_text('<testsuite/>')\n"
+        "Path(report).write_text('<testsuite><testcase name=\"stub\"/></testsuite>')\n"
         f"sys.exit({status})\n"
     )
     pytest_cli.chmod(0o755)
@@ -216,8 +219,8 @@ def test_cpu_logging_preserves_pytest_exit_and_agent_artifacts(tmp_path: Path, s
     assert result.returncode == status, result.stdout + result.stderr
     output = checkout / "artifacts/cuda-other"
     stem = "pytest"
-    log = (output / (stem + ".log")).read_text()
-    assert "pytest stdout" in log and "pytest stderr" in log
+    assert "pytest stdout" in result.stdout and "pytest stderr" in result.stderr
+    assert not (output / (stem + ".log")).exists()
     assert ET.parse(output / (stem + ".xml")).getroot().tag == "testsuite"
 
 
@@ -585,9 +588,13 @@ def test_weekly_shards_cover_every_original_case_once_without_changing_measureme
     assert len(ids) == len(set(ids)) == len(original["cases"]) == 18
     assert set(ids) == {case["id"] for case in original["cases"]}
     assert all(len(shard["cases"]) == 18 // count for shard in shards)
+    calibration_paths = {"reference_calibration", "quality_reference_population"}
+    for key in calibration_paths:
+        assert len({shard[key] for shard in shards}) == count
+        assert original[key] not in {shard[key] for shard in shards}
     for shard in shards:
-        assert {k: v for k, v in shard.items() if k not in {"cases", "case_shard"}} == {
-            k: v for k, v in original.items() if k != "cases"
+        assert {k: v for k, v in shard.items() if k not in {"cases", "case_shard", *calibration_paths}} == {
+            k: v for k, v in original.items() if k not in {"cases", *calibration_paths}
         }
 
 
@@ -852,15 +859,15 @@ def evaluator_repository(root: Path):
     (root / "requirements/lingbot-quality.txt").write_text("example==1\n")
 
 
-@pytest.mark.parametrize("version", ["0.32.0", "0.32.0+ascend", "0.31.0", "0.33.0", "0.32.0rc1", "0.32.0.dev1"])
-def test_inference_runtime_requires_v032_release(version, monkeypatch):
+@pytest.mark.parametrize("version", ["0.33.0", "0.33.0+vendor", "0.32.0", "0.34.0", "0.33.0rc1", "0.33.0.dev1"])
+def test_inference_runtime_requires_v033_release(version, monkeypatch):
     from tests.dfx.lingbot_world import prepare
 
-    monkeypatch.setattr(prepare.importlib.metadata, "version", lambda name: version)
-    if version in {"0.32.0", "0.32.0+ascend"}:
+    monkeypatch.setattr(prepare.importlib.metadata, "version", lambda name: version if name == "vllm" else "2.14.0")
+    if version in {"0.33.0", "0.33.0+vendor"}:
         prepare.verify_inference_runtime()
     else:
-        with pytest.raises(RegressionError, match="requires vLLM 0.32.0"):
+        with pytest.raises(RegressionError, match="requires vllm 0.33.0"):
             prepare.verify_inference_runtime()
 
 
@@ -873,7 +880,12 @@ def test_source_import_preflight_uses_each_checkout(tmp_path, monkeypatch, broke
         cli = package / "entrypoints/cli"
         cli.mkdir(parents=True)
         (package / "__init__.py").write_text("")
+        model = package / "diffusion/models/lingbot_world"
+        model.mkdir(parents=True)
+        (model / "pipeline.py").write_text("")
         (cli / "main.py").write_text("raise ImportError('removed runtime API')\n" if role == broken_role else "")
+        if role != broken_role:
+            (cli / "main.py").write_text("def main(): pass\n")
     monkeypatch.setattr(prepare, "ROOT", tmp_path / "candidate")
     # A candidate inherited from the job must not shadow the reference.
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "candidate"))
@@ -889,7 +901,11 @@ def test_reference_preparation_checks_compatibility_before_model_download(tmp_pa
     from tests.dfx.lingbot_world import prepare
 
     profile = tmp_path / "profile.json"
-    profile.write_text(json.dumps({"reference_revision": "a" * 40}))
+    profile.write_text(
+        json.dumps(
+            {"reference_revision": "a" * 40, "reference_repository": "https://example.test/ref", "platform": "cuda"}
+        )
+    )
     monkeypatch.setattr(
         sys, "argv", ["prepare", "reference", "--profile", str(profile), "--root", str(tmp_path / "ref")]
     )
@@ -901,7 +917,7 @@ def test_reference_preparation_checks_compatibility_before_model_download(tmp_pa
         if stage == failure:
             raise RegressionError("incompatible source/runtime")
 
-    monkeypatch.setattr(prepare, "verify_inference_runtime", lambda: check("runtime"))
+    monkeypatch.setattr(prepare, "verify_inference_runtime", lambda platform, **kwargs: check("runtime"))
     monkeypatch.setattr(prepare, "checkout", lambda *args: check("checkout"))
     monkeypatch.setattr(prepare, "verify_source_imports", lambda *args: check("imports"))
     monkeypatch.setattr(prepare.subprocess, "check_output", lambda *args, **kwargs: pytest.fail("download started"))
@@ -914,13 +930,17 @@ def test_explicit_model_provisioning_preserves_offline_inference(tmp_path: Path,
     from tests.dfx.lingbot_world import prepare
 
     profile = tmp_path / "profile.json"
-    profile.write_text(json.dumps({"reference_revision": "a" * 40}))
+    profile.write_text(
+        json.dumps(
+            {"reference_revision": "a" * 40, "reference_repository": "https://example.test/ref", "platform": "cuda"}
+        )
+    )
     model = tmp_path / "model"
     model.mkdir()
     output = tmp_path / "model.json"
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.delenv("LINGBOT_MODEL_PATH", raising=False)
-    monkeypatch.setattr(prepare, "verify_inference_runtime", lambda: None)
+    monkeypatch.setattr(prepare, "verify_inference_runtime", lambda platform, **kwargs: None)
     monkeypatch.setattr(prepare, "verify_source_imports", lambda *args: None)
     monkeypatch.setattr(prepare, "checkout", lambda *args: None)
     monkeypatch.setattr(
@@ -1062,6 +1082,8 @@ def leaves(document):
         (False, "quality_case_2"),
         (True, "quality_case_invalid"),
         (True, "quality_case_corrupt"),
+        (False, "reference_only"),
+        (False, "reference_only_bad_decoder"),
     ],
 )
 def test_quality_retains_scores_after_generation_failure_without_passing(
@@ -1070,7 +1092,7 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
     import cv2
     import numpy as np
 
-    from benchmarks.lingbot_world.regression import sha256, write_json
+    from benchmarks.lingbot_world.regression import read_json, sha256, write_json
     from tests.dfx.lingbot_world import test_quality as gate
 
     source = tmp_path / "source"
@@ -1141,11 +1163,32 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
     }
     if mutation != "opencv_provider_missing":
         write_json(tmp_path / "evaluators/opencv-provider.json", provider_record)
-    for name in ("VBENCH_CACHE_DIR", "WBENCH_WEIGHTS_DIR", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
-        monkeypatch.setenv(name, os.environ.get(name, ""))
+    environment_names = ("VBENCH_CACHE_DIR", "WBENCH_WEIGHTS_DIR", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    for index, name in enumerate(environment_names):
+        if index % 2:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, f"caller-{name}")
+    caller_environment = {name: os.environ.get(name) for name in environment_names}
+
+    def run_quality_gate():
+        # Exercise fixture teardown after both success and failed quality gates.
+        # Preserve absent variables as absent and existing caller values exactly.
+        try:
+            with monkeypatch.context() as scoring_environment:
+                if mutation and mutation.startswith("reference_only"):
+                    gate.evaluate_quality(settings, scoring_environment, reference_only=True)
+                else:
+                    gate.test_wbench_vbench_and_video_precision(settings, scoring_environment)
+        finally:
+            assert {name: os.environ.get(name) for name in environment_names} == caller_environment
+
     calls = []
 
     def score(videos, output, *, suite, dimensions, **kwargs):
+        assert os.environ["VBENCH_CACHE_DIR"] == str(tmp_path / "evaluators/vbench-cache")
+        assert os.environ["WBENCH_WEIGHTS_DIR"] == str(tmp_path / "evaluators/wbench/weights")
+        assert os.environ["HF_HUB_OFFLINE"] == os.environ["TRANSFORMERS_OFFLINE"] == "1"
         calls.append(suite)
         if mutation and mutation.startswith("quality_case_"):
             assert len(videos) == 6
@@ -1153,7 +1196,14 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
         # A job-level kill can prevent the coordinator's finally block from running.
         checkpoint = json.loads((output.parent / "quality.json").read_text())
         assert checkpoint["evaluator_packages"] == packages
-        assert checkpoint["candidate_revision"] == "snapshot"
+        assert (
+            checkpoint[
+                "harness_revision" if mutation and mutation.startswith("reference_only") else "candidate_revision"
+            ]
+            == "snapshot"
+        )
+        if mutation and mutation.startswith("reference_only"):
+            assert len(videos) == 3 and all("reference" in label for label in videos)
         assert checkpoint["evaluator_opencv_provider"] == provider_record
         assert checkpoint["evaluator_hardware"] == {"unit_test": True}
         assert checkpoint["generation_manifest_sha256"] == sha256(generation / "generation.json")
@@ -1219,7 +1269,8 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
         row["pixel_environment"] = {
             "packages": dict(pixel_packages),
             "synthetic_boundary": True,
-            "opencv_build_sha256": ("c" if mutation == "opencv_worker_build" else "a") * 64,
+            "opencv_build_sha256": ("c" if mutation in {"opencv_worker_build", "reference_only_bad_decoder"} else "a")
+            * 64,
         }
         return row
 
@@ -1235,6 +1286,41 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
         "mux_fps": 16,
         "cases": [{"id": "scene"}],
     }
+    if mutation and mutation.startswith("reference_only"):
+        manifest = read_json(generation / "generation.json")
+        manifest.update(
+            reference_only=True,
+            measurement_only=True,
+            complete=True,
+            harness_revision="snapshot",
+            reference_revision="reference",
+            reference_protocol_sha256="p" * 64,
+            collection_id="00000000-0000-4000-8000-000000000001",
+            collection_backend="local",
+            buildkite_job_id=None,
+            measurement_jobs=[
+                {
+                    "repeat": repeat,
+                    "collection_id": f"00000000-0000-4000-8000-{repeat + 2:012d}",
+                    "collection_backend": "local",
+                    "buildkite_job_id": None,
+                }
+                for repeat in range(3)
+            ],
+        )
+        manifest["artifacts"] = {path: digest for path, digest in artifacts.items() if path.startswith("reference/")}
+        write_json(generation / "generation.json", manifest)
+        # Full collection provenance/independence is checked separately in
+        # test_lingbot_world_runtime; this exercises the shared scoring stack.
+        monkeypatch.setattr(gate, "validate_reference_collection", lambda *args: None)
+        monkeypatch.setattr(
+            gate, "verify_reference_calibration_contract", lambda *args: pytest.fail("fitting consulted calibration")
+        )
+        monkeypatch.setenv("BUILDKITE_JOB_ID", "actual-evaluator-job")
+        output.mkdir(parents=True)
+        (output / "pytest.xml").write_text("temporary launcher JUnit")
+        write_json(output / "setup-failure.json", {"status": "incomplete"})
+        write_json(output / "environment.json", {"stable_launcher_metadata": True})
     if mutation and mutation.startswith("quality_case_"):
         settings["cases"] = [{"id": f"scene-{index}"} for index in range(3)]
         settings["quality_case_index"] = (
@@ -1258,7 +1344,7 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
             (generation / "candidate/2/scene-0/rollout.mp4").write_bytes(b"corrupt")
         if mutation in ("quality_case_invalid", "quality_case_corrupt"):
             with pytest.raises(RegressionError, match="Quality case index|checksum"):
-                gate.test_wbench_vbench_and_video_precision(settings)
+                run_quality_gate()
             assert calls == []
             assert not json.loads((output / "quality.json").read_text())["passed"]
             return
@@ -1381,20 +1467,47 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
             return row
 
         monkeypatch.setattr(gate, "compare_video_pair_in_environment", compare)
+    if mutation and mutation.startswith("reference_only"):
+        if mutation == "reference_only_bad_decoder":
+            with pytest.raises(RegressionError, match="Pixel worker OpenCV build"):
+                run_quality_gate()
+        else:
+            run_quality_gate()
+            report = read_json(output / "quality.json")
+            assert report["complete"] and report["measurement_only"] and report["reference_only"]
+            assert not report["passed"] and not report["quality_passed"]
+            assert all(len(rows["scene"]["reference_scores"]) == 3 for rows in report["suites"].values())
+            assert len(report["pixels"]["scene"]["reference_repeat"]) == 3
+            assert report["pixels"]["scene"]["candidate"] == report["pixels"]["scene"]["checks"] == []
+            assert {"vbench-raw.json", "wbench-raw.json"} <= set(report["artifacts"])
+            assert report["measurement_jobs"] == read_json(generation / "generation.json")["measurement_jobs"]
+            assert report["buildkite_job_id"] is None
+            assert report["quality_buildkite_job_id"] == "actual-evaluator-job"
+            assert report["quality_collection_backend"] == "buildkite"
+            assert report["quality_collection_id"] != report["collection_id"]
+            assert {"pytest.xml", "setup-failure.json"}.isdisjoint(report["artifacts"])
+            assert "environment.json" in report["artifacts"]
+            # The wrapper's normal success path must not invalidate the
+            # retained scoring artifacts after the test has completed.
+            (output / "pytest.xml").write_text("final pytest JUnit")
+            (output / "setup-failure.json").unlink()
+            assert all(sha256(output / path) == digest for path, digest in report["artifacts"].items())
+        assert calls == ["vbench", "wbench"]
+        return
     if mutation in ("unlisted", "corrupt"):
         with pytest.raises(RegressionError, match="checksum|Unhashed"):
-            gate.test_wbench_vbench_and_video_precision(settings)
+            run_quality_gate()
         assert calls == []
         assert json.loads((output / "quality.json").read_text())["candidate_revision"] == "snapshot"
         return
     if mutation == "opencv_provider_missing":
         with pytest.raises(FileNotFoundError, match="opencv-provider"):
-            gate.test_wbench_vbench_and_video_precision(settings)
+            run_quality_gate()
         assert calls == []
         return
     if mutation == "opencv_worker_build":
         with pytest.raises(RegressionError, match="Pixel worker OpenCV build"):
-            gate.test_wbench_vbench_and_video_precision(settings)
+            run_quality_gate()
         assert calls == ["vbench", "wbench"]
         assert not json.loads((output / "quality.json").read_text())["passed"]
         return
@@ -1407,10 +1520,10 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
         and mutation != "population_case_spread_tight"
     )
     if generation_passed and quality_passed:
-        gate.test_wbench_vbench_and_video_precision(settings)
+        run_quality_gate()
     else:
         with pytest.raises(AssertionError, match="Quality regression"):
-            gate.test_wbench_vbench_and_video_precision(settings)
+            run_quality_gate()
     report = json.loads((output / "quality.json").read_text())
     assert calls == ["vbench", "wbench"]
     assert report["quality_passed"] is quality_passed
@@ -1458,8 +1571,11 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
 def test_cuda_generation_retries_only_one_lost_agent(level, key):
     steps = leaves(yaml.safe_load((ROOT / f".buildkite/cuda/test-{level}.yml").read_text()))
     step = next(item for item in steps if item.get("key") == key)
-    assert step["retry"] == {"automatic": [{"exit_status": -1, "limit": 1}]}
-    assert step["mirror_hardwares"] == "h100_4_exclusive" and not step.get("soft_fail")
+    assert step["retry"] == {
+        "manual": {"permit_on_passed": True},
+        "automatic": [{"exit_status": -1, "limit": 1}],
+    }
+    assert step["mirror_hardwares"] == "h100_8" and not step.get("soft_fail")
     rules = step["retry"]["automatic"]
     # Numerical/quality assertions, OOM, cancellation and timeout stay failed.
     for status in (1, 2, 124, 128, 130, 137, 143):
@@ -1476,7 +1592,7 @@ def test_generation_and_gpu_evaluation_are_blocking_and_connected(platform, leve
     generate, evaluate = keyed[prefix + "-generation"], keyed[prefix + "-quality"]
     assert len(evaluate["commands"][0].split()) == 6
     if platform == "cuda":
-        assert generate["mirror_hardwares"] == "h100_4_exclusive"
+        assert generate["mirror_hardwares"] == "h100_8"
     else:
         assert generate["mirror_hardwares"] == "a2b3_npu_8"
     producer = prefix + ("-gate" if platform == "npu" else "-generation")
@@ -1515,7 +1631,7 @@ def test_generation_and_gpu_evaluation_are_blocking_and_connected(platform, leve
             assert generate["matrix"] == shard_matrix
             # Six videos per evaluator; all 18 cases remain required matrix jobs.
             assert evaluate["timeout_in_minutes"] == 240
-            assert keyed[prefix + "-long"]["mirror_hardwares"] == "h100_4_exclusive"
+            assert keyed[prefix + "-long"]["mirror_hardwares"] == "h100_8"
         else:
             assert generate["matrix"] == {"setup": {"shard": [str(i) for i in range(count)], "repeat": ["0", "1", "2"]}}
             assert generate["env"]["LINGBOT_MEASUREMENT_REPEAT"] == "{{matrix.repeat}}"
@@ -1667,7 +1783,7 @@ def test_matrix_artifact_handoff_uses_unique_build_prefix(tmp_path, stage):
     result = subprocess.run(
         [
             "bash",
-            str(ROOT / ".buildkite/common/scripts/run-lingbot-ci.sh"),
+            str(ROOT / "tests/dfx/lingbot_world/run_ci.sh"),
             stage,
             str(ROOT / "tests/dfx/lingbot_world/configs/npu_long.json"),
             str(output),
@@ -1714,7 +1830,7 @@ def test_quality_launcher_forwards_case_selection(tmp_path: Path, case_index):
     result = subprocess.run(
         [
             "bash",
-            str(ROOT / ".buildkite/common/scripts/run-lingbot-ci.sh"),
+            str(ROOT / "tests/dfx/lingbot_world/run_ci.sh"),
             "evaluate",
             "profile.json",
             str(output),
@@ -1732,13 +1848,13 @@ def test_quality_launcher_forwards_case_selection(tmp_path: Path, case_index):
     assert ET.parse(output / "pytest.xml").find("testcase/failure") is not None
 
 
-@pytest.mark.parametrize("stage", ["generate", "unit"])
+@pytest.mark.parametrize("stage", ["generate", "aggregate"])
 def test_launcher_setup_failure_retains_nonzero_exit_and_junit(tmp_path: Path, stage):
     output = tmp_path / "artifacts"
     result = subprocess.run(
         [
             "bash",
-            str(ROOT / ".buildkite/common/scripts/run-lingbot-ci.sh"),
+            str(ROOT / "tests/dfx/lingbot_world/run_ci.sh"),
             stage,
             str(tmp_path / "missing-profile.json"),
             str(output),
@@ -1783,7 +1899,7 @@ def test_npu_launcher_limits_visibility_before_model_preparation(tmp_path, stage
     result = subprocess.run(
         [
             "bash",
-            str(ROOT / ".buildkite/common/scripts/run-lingbot-ci.sh"),
+            str(ROOT / "tests/dfx/lingbot_world/run_ci.sh"),
             stage,
             str(ROOT / "tests/dfx/lingbot_world/configs/npu_nightly.json"),
             str(output),
@@ -1833,7 +1949,7 @@ def test_launcher_cancellation_retains_failure_junit(tmp_path: Path, cancel_sign
     profile.write_text(json.dumps({"platform": "npu", "dies": 4}))
     output = tmp_path / "artifacts"
     process = subprocess.Popen(
-        ["bash", str(ROOT / ".buildkite/common/scripts/run-lingbot-ci.sh"), "generate", str(profile), str(output)],
+        ["bash", str(ROOT / "tests/dfx/lingbot_world/run_ci.sh"), "generate", str(profile), str(output)],
         cwd=ROOT,
         env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
         stdout=subprocess.PIPE,
