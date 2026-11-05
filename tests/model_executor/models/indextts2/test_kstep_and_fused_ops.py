@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for IndexTTS K-step sampling and fused ops integration."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -16,6 +17,8 @@ from vllm_omni.model_executor.models.indextts2.ops.fused_qkv_layer_norm import (
 from vllm_omni.model_executor.models.indextts2.ops.fused_residual_layer_norm import (
     residual_layer_norm,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_sample_token_tensor_1d_and_2d():

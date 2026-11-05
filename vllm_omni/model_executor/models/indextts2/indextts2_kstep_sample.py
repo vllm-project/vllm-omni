@@ -47,9 +47,7 @@ def sample_token_tensor(
     if orig_1d:
         filtered_logits = filtered_logits.unsqueeze(0)
     if filtered_logits.shape[0] != 1:
-        raise ValueError(
-            f"sample_token_tensor expects a single-row logit tensor, got batch={filtered_logits.shape[0]}"
-        )
+        raise ValueError(f"sample_token_tensor expects a single-row logit tensor, got batch={filtered_logits.shape[0]}")
 
     # Repetition penalty
     if repetition_penalty != 1.0 and past_tokens is not None and past_tokens.numel() > 0:
@@ -139,7 +137,9 @@ def talker_kstep_decode(
         write_pos = past_num
 
     current_hidden = initial_hidden_states
-    stop_tokens_t = torch.tensor(stop_token_ids, dtype=torch.long, device=device)
+    step_tokens_buf = torch.empty(max(1, k_steps), dtype=torch.long, device=device)
+    raw_latents: list[torch.Tensor] = []
+    steps_run = 0
 
     for step_idx in range(k_steps):
         logits = talker.compute_logits(current_hidden)
@@ -147,7 +147,14 @@ def talker_kstep_decode(
             break
         logits = logits.squeeze(0).squeeze(0)  # (vocab_size,)
 
-        active_past = static_tokens_buf[:curr_len] if curr_len > 0 else None
+        if curr_len > 0:
+            if write_pos > max_decode_tokens:
+                active_past = static_tokens_buf.roll(-(write_pos % max_decode_tokens), dims=0)
+            else:
+                active_past = static_tokens_buf[:curr_len]
+        else:
+            active_past = None
+
         token_t = sample_token_tensor(
             logits,
             temperature=temperature,
@@ -159,21 +166,17 @@ def talker_kstep_decode(
             current_step=curr_len,
         )
 
-        # In-place write to static buffer with ring index (zero DtoD allocation / zero clone)
+        # In-place write to static buffers on device (deferring host materialization until after loop)
         slot = write_pos % max_decode_tokens
         static_tokens_buf[slot : slot + 1].copy_(token_t)
+        step_tokens_buf[step_idx : step_idx + 1].copy_(token_t)
         write_pos += 1
         if curr_len < max_decode_tokens:
             curr_len += 1
-        sampled_tokens.append(int(token_t.item()))
+        steps_run += 1
 
         if use_latent:
-            accumulated_latents.append(current_hidden.detach())
-
-        # Check termination in tensor
-        if (token_t == stop_tokens_t).any():
-            finished = True
-            break
+            raw_latents.append(current_hidden.detach())
 
         if step_idx < k_steps - 1:
             mel_pos = torch.tensor([start_pos + step_idx + 1], dtype=torch.long, device=device)
@@ -183,9 +186,34 @@ def talker_kstep_decode(
                 hidden = layer(hidden)
             current_hidden = talker.final_norm(talker.ln_f(hidden))
 
+    # Materialize sampled tokens once after the K-step loop and truncate at first stop token
+    stop_set = set(stop_token_ids)
+    raw_tokens = step_tokens_buf[:steps_run].tolist() if steps_run > 0 else []
+    kept_steps = 0
+    for idx, tok in enumerate(raw_tokens):
+        tok_int = int(tok)
+        sampled_tokens.append(tok_int)
+        if use_latent and idx < len(raw_latents):
+            accumulated_latents.append(raw_latents[idx])
+        kept_steps += 1
+        if tok_int in stop_set:
+            finished = True
+            break
+
+    # Adjust ring cursor if a stop token terminated before steps_run
+    extra_steps = steps_run - kept_steps
+    if extra_steps > 0:
+        write_pos -= extra_steps
+        past_init = (
+            min(past_tokens_tensor.numel(), max_decode_tokens)
+            if (past_tokens_tensor is not None and past_tokens_tensor.numel() > 0)
+            else 0
+        )
+        curr_len = min(max_decode_tokens, past_init + kept_steps)
+
     # If buffer wrapped around, roll so earliest token is at index 0 and latest at the end
     if write_pos > max_decode_tokens:
-        sampled_tensor = static_tokens_buf.roll(- (write_pos % max_decode_tokens), dims=0)
+        sampled_tensor = static_tokens_buf.roll(-(write_pos % max_decode_tokens), dims=0)
     else:
         sampled_tensor = static_tokens_buf[:curr_len]
 

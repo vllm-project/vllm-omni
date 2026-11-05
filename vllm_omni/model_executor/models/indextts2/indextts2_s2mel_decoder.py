@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 Stage 1: S2Mel decoder + BigVGAN vocoder.
 
 Receives mel_codes + latent from Stage 0 (GPT AR talker), runs flow matching
@@ -1257,7 +1257,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             estimator = getattr(cfm, "estimator", None) if cfm is not None else None
             if estimator is not None:
                 self._enable_dit_cuda_graph(estimator)
-        if device.type == "cuda":
+        if device.type == "cuda" and bool(getattr(self.config, "s2mel_allow_tf32", False)):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         self._dit_runtime_configured = True
