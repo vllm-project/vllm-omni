@@ -579,8 +579,9 @@ def finish_video(decoded: torch.Tensor, sample: torch.Tensor, frame_count: int, 
 
 
 def sample_noise(condition: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
-    # Reference randn_like preserves latent strides; RNG values follow storage order.
-    return torch.empty_like(condition).normal_(generator=generator)
+    # Reference randn_like preserves latent strides.
+    device = "cpu" if generator.device.type == "cpu" else condition.device
+    return torch.empty_like(condition, device=device).normal_(generator=generator).to(condition.device)
 
 
 class SeedVR2Pipeline(nn.Module):
