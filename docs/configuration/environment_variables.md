@@ -131,23 +131,28 @@ end-to-end transcript equivalence (see the Step-Audio-2-mini measurement below).
 Measured on the real checkpoints, the main numbers are (reference data; the exact
 values depend on the actual audio length distribution):
 
-* Covo-Audio-Chat (lossy): per-row on/off cosine down to ~0.5 on short clips, WER
-  24.5% -> 24.7% (off -> on) on LibriSpeech test-clean, ~1.85x encoder speedup, and
-  E2E at max-concurrency 16: TTFT P50 104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2
-  req/s (+21.7%).
+* Covo-Audio-Chat (lossy): per-row on/off cosine down to ~0.5 on short clips,
+  WER(off) 24.00%, WER(on) 24.58%, WER(on vs off) 11.10% on LibriSpeech
+  test-clean, ~1.85x encoder speedup, and E2E at max-concurrency 16: TTFT P50
+  104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%).
 * Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
   bfloat16), and 1.62-3.7x encoder speedup depending on the batch length mix.
   End-to-end WER is contributor-reported from one `benchmarks/encoder_bucketing_wer.py`
   run (single RTX 5090 32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
   temperature 0, repetition penalty 1.05, seed 42; buckets 2,4,8,16,30 s; same
   checkout with the feature off -> on) on LibriSpeech test-clean clips of <= 29 s
-  (199 clips measured): 1.58% -> 1.54% (off -> on) on the 197/199 clips that stay
-  clean in both passes, and 9.55% -> 17.45% over all 199 clips, including one
-  clean-to-rambling transition (a clean off transcript becomes over-generated
-  with bucketing on). The clean cohort keeps only clips that neither over- nor
-  under-generate in either pass, using a reference-length filter that never looks
-  at which configuration produced the clip; it removes task failures, not
-  recognition errors. These are contributor-reported measurements, not
+  (199 clips measured): WER(off) 1.58%, WER(on) 1.54%, WER(on vs off) 0.22% on
+  the 197/199 clips that stay clean in both passes, and WER(off) 9.55% / WER(on)
+  17.45% over all 199 clips, including one clean-to-rambling transition (a clean
+  off transcript becomes over-generated with bucketing on). The clean cohort
+  keeps only clips that neither over- nor under-generate in either pass, using a
+  reference-length filter that never looks at which configuration produced the
+  clip; it removes task failures, not recognition errors. WER(off) and WER(on)
+  are absolute, measured against the ground-truth reference; WER(on vs off) is
+  relative, measured against the bucketing-off transcript, so it isolates the
+  text change bucketing introduces from the model's own paraphrase/rewrite
+  baseline (the ~24% absolute Covo WER mostly reflects that baseline, not
+  bucketing damage). These are contributor-reported measurements, not
   independently reproduced results.
 
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
