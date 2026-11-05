@@ -80,6 +80,59 @@ def test_two_stage_generate_keeps_ar_params_and_replaces_dit():
     assert sampling_params_for_engine(SimpleNamespace(num_stages=1), "only") == "only"
 
 
+def test_glm_two_stage_params_pass_live_sampling_resolver():
+    """Regression for the registered GLM AR+DiT contract (#9715 review).
+
+    A single OmniDiffusionSamplingParams must fail the live resolver on a
+    two-stage engine. The benchmark helper must produce a list that reaches
+    generation instead of argument validation.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.entrypoints.omni_base import OmniBase
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    base = object.__new__(OmniBase)
+    base.engine = MagicMock()
+    base.engine.num_stages = 2
+    ar_default = SamplingParams(max_tokens=128, seed=42)
+    dit_default = OmniDiffusionSamplingParams(
+        height=1024,
+        width=1024,
+        num_inference_steps=50,
+        seed=42,
+    )
+    base.default_sampling_params_list = [ar_default, dit_default]
+    base.sampling_constraints_list = [{}, {}]
+
+    dit_override = OmniDiffusionSamplingParams(
+        height=512,
+        width=512,
+        num_inference_steps=8,
+        seed=7,
+        extra_args={"prior_token_ids": [1, 2, 3]},
+    )
+
+    with pytest.raises(ValueError, match="Expected 2 sampling params"):
+        base.resolve_sampling_params_list(dit_override)
+
+    # Fake engine used by OmniSession.generate: expose the same stage contract.
+    fake = SimpleNamespace(
+        num_stages=2,
+        default_sampling_params_list=base.default_sampling_params_list,
+    )
+    params = sampling_params_for_engine(fake, dit_override)
+    resolved = base.resolve_sampling_params_list(params)
+    assert len(resolved) == 2
+    assert resolved[0] is ar_default or resolved[0].max_tokens == 128
+    assert resolved[1].height == 512
+    assert resolved[1].width == 512
+    assert resolved[1].num_inference_steps == 8
+    assert resolved[1].extra_args["prior_token_ids"] == [1, 2, 3]
+
+
 def test_omni_session_constructs_once_per_config():
     with OmniSession(_FakeOmni, model="fake") as baseline:
         warm_and_time(baseline, prompt="a", sampling_params=None, repeats=2)
