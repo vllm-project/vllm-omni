@@ -23,20 +23,31 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
+    "is_cuda,session_mode,dtype,default_attention",
+    [
+        (True, "duplex", torch.bfloat16, "eager"),
+        (True, "duplex", torch.float16, "sdpa"),
+        (True, "turn", torch.bfloat16, "sdpa"),
+        (False, "duplex", torch.bfloat16, "sdpa"),
+    ],
+)
+@pytest.mark.parametrize(
     ("engine_attention", "vision_attention", "expected"),
     [
-        (None, None, SiglipSdpaAttention),
+        (None, None, None),
         (None, "sdpa", SiglipSdpaAttention),
         (None, "eager", SiglipAttention),
         ("eager", "sdpa", SiglipAttention),
         ("sdpa", "eager", SiglipSdpaAttention),
     ],
 )
-def test_thinker_vision_defaults_to_sdpa_and_respects_overrides(
-    monkeypatch, engine_attention, vision_attention, expected
+def test_thinker_vision_attention_defaults_and_overrides(
+    monkeypatch, engine_attention, vision_attention, expected, is_cuda, session_mode, dtype, default_attention
 ):
+    from vllm_omni import platforms
     from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_llm as module
 
+    monkeypatch.setattr(platforms.current_omni_platform, "is_cuda", lambda: is_cuda)
     vision = SiglipVisionConfig(
         hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=4, image_size=28, patch_size=2
     )
@@ -52,11 +63,15 @@ def test_thinker_vision_defaults_to_sdpa_and_respects_overrides(
         hf_config=config,
         multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda modality: 1),
         enforce_eager=True,
+        session_mode=session_mode,
+        dtype=dtype,
         _attn_implementation=engine_attention,
     )
     model = MiniCPMO45OmniLLMForConditionalGeneration(vllm_config=SimpleNamespace(model_config=model_config))
+    if expected is None:
+        expected = SiglipAttention if default_attention == "eager" else SiglipSdpaAttention
     assert type(model.vpm.encoder.layers[0].self_attn) is expected
-    assert model.resampler.attn_implementation == (engine_attention or vision_attention or "sdpa")
+    assert model.resampler.attn_implementation == (engine_attention or vision_attention or default_attention)
 
 
 def test_fused_layers_match_eager_packed_layers() -> None:

@@ -230,7 +230,8 @@ async def _run_prompt_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's prompt schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
@@ -238,7 +239,7 @@ async def _run_prompt_update_scheduler(
         payload = {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"scheduled-prompt-{update.at:.3f}",
+                "event_id": f"scheduled-prompt-{index}",
                 "event": {"prompt": update.prompt},
                 "transition_chunks": update.transition_chunks,
             },
@@ -255,13 +256,14 @@ async def _run_camera_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's camera schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
 
         interaction: dict[str, Any] = {
-            "event_id": f"scheduled-camera-{update.at:.3f}",
+            "event_id": f"scheduled-camera-{index}",
             "event": {"multi_modal_data": {"camera": update.camera}},
         }
         if update.transition_chunks is not None:

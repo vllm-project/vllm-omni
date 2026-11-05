@@ -88,6 +88,11 @@ class OmniSchedulingCoordinator:
         # detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
 
+    @property
+    def receives_chunks(self) -> bool:
+        """Whether this coordinator receives streamed input from upstream."""
+        return self._stage_id > 0 and self._async_chunk
+
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
@@ -107,7 +112,7 @@ class OmniSchedulingCoordinator:
             chunk_ready_req_ids: IDs with a newly arrived chunk this cycle.
             chunk_finished_req_ids: IDs whose final chunk has arrived.
         """
-        if self._stage_id == 0 or not self._async_chunk:
+        if not self.receives_chunks:
             return
 
         self.finished_requests.update(chunk_finished_req_ids)

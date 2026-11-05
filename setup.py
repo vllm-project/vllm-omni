@@ -23,10 +23,10 @@ def uninstall_onnxruntime() -> None:
     with ROCm-specific dependencies.
     """
     try:
-        import pkg_resources
+        from importlib.metadata import PackageNotFoundError, metadata
 
         try:
-            pkg_resources.get_distribution("onnxruntime")
+            metadata("onnxruntime")
             print("Found onnxruntime installed, uninstalling for ROCm compatibility...")
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime"],
@@ -34,7 +34,7 @@ def uninstall_onnxruntime() -> None:
                 stderr=subprocess.DEVNULL,
             )
             print("Successfully uninstalled onnxruntime")
-        except pkg_resources.DistributionNotFound:
+        except PackageNotFoundError:
             print("onnxruntime not installed, skipping uninstall")
     except Exception as e:
         print(f"Warning: Failed to uninstall onnxruntime: {e}")

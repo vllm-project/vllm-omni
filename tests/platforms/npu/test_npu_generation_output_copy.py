@@ -140,3 +140,39 @@ def test_async_output_fallbacks(guard, monkeypatch):
     assert output._copies.event is None
     output = output.get_output()
     torch.testing.assert_close(output.multimodal_outputs[0]["model_outputs"], torch.full((24000,), 3.0))
+
+
+@torch.inference_mode()
+def test_mapping_payload_copies_asynchronously(monkeypatch):
+    """A mapping payload must use the batch's async D2H, not a blocking ``.to("cpu")``.
+
+    PR #9021 replaced the mapping branch's ``to_host.copy`` with
+    ``tensor.detach().to("cpu").contiguous()`` while factoring out
+    ``split_mapping_outputs``. That made every mapping tensor a synchronous
+    device-to-host copy on the caller's thread: the tensor and list branches
+    keep the pinned, event-tracked batch copy, so only mapping payloads
+    regressed. On a stage-2 (audio) output this showed up as 37 blocking
+    ``aten::copy_`` calls costing 1.1 s of a c8 run.
+    """
+    from vllm_omni.platforms.npu.worker import npu_generation_model_runner as module
+
+    blocking: list[int] = []
+    real_copy = module._NPUHostCopyBatch.copy
+
+    def spy(self, value):
+        blocking.append(1)
+        return real_copy(self, value)
+
+    monkeypatch.setattr(module._NPUHostCopyBatch, "copy", spy)
+
+    source = torch.arange(4 * 24000, device="npu", dtype=torch.float32).reshape(4, 24000)
+    runner = make_runner({"audio": list(source.unbind()), "sr": torch.tensor(24000)}, 4)
+    output = runner.sample_tokens(None)
+
+    # Every per-request tensor went through the batch copy, so an event was
+    # recorded and the sources stay alive until the consumer waits.
+    assert blocking, "mapping payload bypassed _NPUHostCopyBatch.copy"
+    assert output._copies.event is not None
+    assert output._copies.sources
+    resolved = output.get_output()
+    assert resolved.multimodal_outputs[0]["audio"].device.type == "cpu"
