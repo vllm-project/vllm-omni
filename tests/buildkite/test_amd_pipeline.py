@@ -757,7 +757,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1416,
+        1420,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -1509,6 +1509,25 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             "omni_ming_flash_omni_function",
             "Expected exactly seven executed Ming-flash-omni offline tests",
         ),
+        "Qwen2.5-Omni expansion · 2-GPU": (
+            "mi300_2",
+            195,
+            "cards_2",
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py",
+            (
+                "test_audio_in_video_boundaries[False-omni_server0]",
+                "test_audio_in_video_boundaries[True-omni_server0]",
+                "test_text_to_text_001[omni_server0]",
+                "test_speaker_001[Chelsie-omni_server0]",
+                "test_speaker_001[ETHAN-omni_server0]",
+                "test_mix_to_audio[omni_runner0-rocm]",
+                "test_text_to_text[omni_runner0-rocm]",
+            ),
+            "artifacts/rocm-qwen25-omni-weekly/**/*",
+            "Expected exactly seven Qwen2.5-Omni weekly ROCm nodes",
+            "omni_qwen2_5_omni_expansion",
+            "Expected exactly seven executed Qwen2.5-Omni weekly tests",
+        ),
     }
 
     assert group["group"] == "Omni E2E Weekly"
@@ -1545,11 +1564,64 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
     assert "test_audio_to_text_audio_001" not in mimo_command
     assert "tests/e2e/online_serving/test_ming_flash_omni_expansion.py" not in weekly_text
     assert "test_covo_audio_expansion.py" not in weekly_text
-    assert "test_qwen2_5_omni_expansion.py" not in weekly_text
+    qwen_deps = dependencies["omni_qwen2_5_omni_expansion"]
+    for dependency in (
+        "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py",
+        "tests/conftest.py",
+        "tests/helpers/client.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+        "tests/helpers/stage_config.py",
+    ):
+        assert dependency in qwen_deps
+    qwen_weekly = "\n".join(_find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)["commands"])
+    known_red = "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]"
+    assert 'collection_status="$${PIPESTATUS[0]}"' in qwen_weekly
+    assert qwen_weekly.count(f"--deselect='{known_red}'") == 2
+    assert qwen_weekly.count(known_red) == 2
+    merge_qwen = "\n".join(_find_step("Omni Model Test Qwen2-5-Omni", AMD_MERGE_PIPELINE)["commands"])
+    assert len(re.findall(r"--run-level\s+['\"]?core_model['\"]?", merge_qwen)) == 2
+    merge_text = AMD_MERGE_PIPELINE.read_text(encoding="utf-8")
+    assert "Qwen2.5-Omni expansion · 2-GPU" not in merge_text
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 7, 0, None, 0),
+        (0, 7, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 7, 0, None, 1),
+        (0, 7, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Qwen2.5-Omni expansion · 2-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
+        artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="qwen25-omni-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
@@ -3601,7 +3673,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    32 ids. R2-01 still collects 1416 model-executor nodes and does not run them.
+    32 ids. R2-01 still collects 1420 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3647,7 +3719,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "assert-pytest-collection.sh 1420" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -3858,7 +3930,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1416 model-executor nodes.
+    still collects 1420 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3910,7 +3982,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "assert-pytest-collection.sh 1420" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
