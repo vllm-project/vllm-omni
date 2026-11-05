@@ -23,7 +23,7 @@ from tests.engine.test_duplex_orchestrator import (
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
-from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy, resolve_deploy_yaml
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.contracts import DuplexOutputAction, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
@@ -272,6 +272,17 @@ def test_laya_overlay_only_changes_the_judge_stage():
     assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 192
     options = judge["hf_overrides"]["response_judge"]
     assert options["reply_option"] in options["options"]
+
+
+@pytest.mark.parametrize("pipeline_dtype", [None, "bfloat16", "float32"])
+def test_laya_dtype_does_not_inherit_pipeline_default(pipeline_dtype):
+    pipeline = resolve_pipeline_config("aura_omni_judged")
+    deploy = load_deploy_config(get_deploy_config_path("aura_omni_judged_laya.yaml"))
+    deploy.dtype = pipeline_dtype
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert stages[1].yaml_engine_args["dtype"] == "float16"
+    # The judge override must not change the host model precision.
+    assert stages[2].yaml_engine_args.get("dtype") == pipeline_dtype
 
 
 def _pool_with_decoder(name):

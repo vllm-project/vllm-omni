@@ -17,6 +17,8 @@ stages:
     model: /path/to/laya-multilingual-vllm
     model_arch: LayaDecisionModel
     runner: pooling
+    # Keep threshold decisions independent of the pipeline-wide deploy dtype.
+    dtype: float16
     # Pooling is one forward pass: sync scheduler, no prefix cache (encoder-only).
     async_scheduling: false
     enable_prefix_caching: false
