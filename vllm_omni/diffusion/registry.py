@@ -597,6 +597,8 @@ def initialize_model(
         # re-layout it performs stays offloadable by sleep mode.
         _apply_wan_vae_fastpath_if_enabled(model, od_config)
 
+        current_omni_platform.apply_diffusion_model_patches(model, od_config)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
