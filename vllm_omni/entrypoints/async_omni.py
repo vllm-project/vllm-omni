@@ -11,6 +11,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -63,6 +64,15 @@ class _SubmitRevokedError(Exception):
 
 
 CACHE_RESET_TIMEOUT_S = 60.0
+
+
+def ar_level2_wake_enabled() -> bool:
+    """Whether AR stages may wake after ``sleep(level=2)`` (``VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS=1``).
+
+    Level 2 discards the weights, so the caller must rewrite every parameter
+    (e.g. an RL full-weight sync) before generating again.
+    """
+    return os.environ.get("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "0") == "1"
 
 
 class AsyncOmni(AsyncOmniBase, EngineClient):
@@ -1191,6 +1201,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -1201,16 +1212,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             stages: List of stage IDs to profile. If None, profiles all stages.
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
         """
         validate_profile_iteration_bounds(delay_iterations, max_iterations)
         # Mirror upstream ExecutorBase.profile: forward the per-session
         # controls as kwargs only when set, so workers without them keep
         # working with plain (is_start, profile_prefix) args.
-        kwargs: dict[str, int] = {}
+        kwargs: dict[str, Any] = {}
         if delay_iterations is not None:
             kwargs["delay_iterations"] = delay_iterations
         if max_iterations is not None:
             kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
         return await self.collective_rpc(
             method="profile",
             args=(True, profile_prefix),
@@ -1384,7 +1398,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 for sid in ar_stage_ids
             )
             self._record_stage_sleep(ar_stage_ids, sleep_tags)
-            if level == 2:
+            if level == 2 and not ar_level2_wake_enabled():
                 self._level2_sleeping = True
 
         if diffusion_stage_ids:
@@ -1469,7 +1483,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 "wake_up() after sleep(level=2) is not yet implemented: weights were "
                 "discarded from GPU and reloading from disk is not yet supported. "
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
-                "and supports fast DMA restore."
+                "and supports fast DMA restore. AR-only callers that rewrite every "
+                "weight after wake (RL weight sync) can set "
+                "VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS=1."
             )
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         target_stage_ids = ar_stage_ids + diffusion_stage_ids
