@@ -312,12 +312,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             custom_pipeline_name: Optional custom pipeline class name to use.
         """
 
-        if load_format == "dummy":
-            return
         if getattr(self, "_weight_share_backend", None) is not None:
             raise RuntimeError(
                 "A weight-sharing load was already attempted; tear down the sharing group before retrying."
             )
+        shared_group = getattr(self.od_config, "weight_sharing", None)
+        if shared_group is not None and load_format not in (None, "default"):
+            raise ValueError(f"shared-backbone loading requires load_format='default', got {load_format!r}")
+        if load_format == "dummy":
+            return
 
         # Resolve environment overrides before model loading. Rank-local
         # prompt-cache hits cannot safely skip text-encoder collectives.
@@ -354,7 +357,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         # Load model within forward context
         weight_sharing_backend = None
-        shared_group = getattr(self.od_config, "weight_sharing", None)
         if shared_group is not None:
             if shared_group.role != "consumer":
                 raise ValueError("diffusion weight sharing requires role='consumer'")

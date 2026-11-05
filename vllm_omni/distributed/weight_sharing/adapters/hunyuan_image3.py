@@ -105,7 +105,10 @@ def collect_shared_bindings(backbone: Any) -> dict[str, torch.Tensor]:
     """
     return {
         name: param.detach()
-        for name, param in sorted((name, param) for name, param in backbone.named_parameters() if is_shared_param(name))
+        for name, param in sorted(
+            ((name, param) for name, param in backbone.named_parameters() if is_shared_param(name)),
+            key=lambda item: item[0],
+        )
     }
 
 

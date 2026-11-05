@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from tests.distributed.weight_sharing.helpers import FakeCodec, load_class_methods, make_context, make_weights
 
@@ -53,7 +54,7 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
 
     def attach(received_backend, received_model, *, payload, group, device_index):
         assert received_model is model
-        assert device_index == 3  # Current device, not the loader's target-device index.
+        assert device_index == 3
         assert received_backend is runner._weight_share_backend is backend
         assert group is loader.od_config.weight_sharing
         assert runner._weight_share_session_id == "session"
@@ -67,7 +68,7 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
         "DiffusersPipelineLoader",
         ["load_model", "_get_shared_weight_group", "_load_model_with_shared_backbone"],
         {
-            "torch": SimpleNamespace(device=lambda _: SimpleNamespace(index=0)),
+            "torch": torch,
             "set_default_torch_dtype": lambda _: nullcontext(),
             **{name: offload_config[name] for name in ("resolve_offload", "OffloadStrategy", "DIT_COMPONENT")},
         },
@@ -100,7 +101,7 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
     runner = runner_cls()
     runner.od_config = loader.od_config
     runner.vllm_config = SimpleNamespace()
-    runner.device = "cuda:0"
+    runner.device = "cuda:3"
     return SimpleNamespace(
         runner=runner, loader=loader, model=model, adapter=adapter, backend=backend, codec=codec, factory=factory
     )
@@ -136,8 +137,9 @@ def test_load_failure_retains_backend_and_blocks_retry(consumer_load, contracts,
             assert all(not lease.expired() for lease in r.codec.leases)
 
     calls = list(r.codec.calls)
-    with pytest.raises(RuntimeError, match="already attempted"):
-        r.runner.load_model()
+    for load_format in ("default", "dummy"):
+        with pytest.raises(RuntimeError, match="already attempted"):
+            r.runner.load_model(load_format=load_format)
     assert r.codec.calls == calls
     r.factory.assert_called_once_with()
     r.adapter.open_backbone_import.assert_called_once()
@@ -160,16 +162,27 @@ def test_pipeline_return_keeps_same_backend_on_runner(consumer_load, load_format
     r.factory.assert_called_once_with()
 
 
-@pytest.mark.parametrize("load_format", ["diffusers", "custom_pipeline", "unknown"])
+@pytest.mark.parametrize("load_format", ["diffusers", "custom_pipeline", "dummy", "unknown"])
 def test_shared_backbone_rejects_load_format_before_construction(consumer_load, load_format):
     r = consumer_load
     r.loader._init_from_load_format.side_effect = AssertionError("must reject before model construction")
     with pytest.raises(ValueError, match="shared-backbone loading requires load_format='default'"):
         r.runner.load_model(load_format=load_format)
+    r.factory.assert_not_called()
     r.loader._init_from_load_format.assert_not_called()
     r.adapter.open_backbone_import.assert_not_called()
     r.loader.load_weights.assert_not_called()
     assert not r.codec.imports
+
+
+def test_dummy_without_sharing_skips_loading(consumer_load):
+    r = consumer_load
+    r.runner.od_config.weight_sharing = None
+    r.loader.load_model = Mock()
+    r.runner.load_model(load_format="dummy")
+    r.loader.load_model.assert_not_called()
+    r.factory.assert_not_called()
+    assert not hasattr(r.runner, "pipeline")
 
 
 def test_loader_requires_caller_owned_backend(consumer_load):
@@ -256,3 +269,14 @@ def test_shared_backbone_allows_private_encoder_offload(consumer_load, mode):
         r.runner.load_model(initialize_lora=Mock(side_effect=LoadError("after load")))
     assert r.runner.pipeline is r.model
     r.adapter.open_backbone_import.assert_called_once()
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "xpu:0"])
+def test_device_mismatch_is_rejected_before_construction(consumer_load, device):
+    r = consumer_load
+    r.runner.device = device
+    with pytest.raises(ValueError, match="does not match current device index 3"):
+        r.runner.load_model()
+    r.loader._init_from_load_format.assert_not_called()
+    r.adapter.open_backbone_import.assert_not_called()
+    assert not r.codec.imports

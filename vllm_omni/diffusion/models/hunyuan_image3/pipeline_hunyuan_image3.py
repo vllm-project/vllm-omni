@@ -4,7 +4,6 @@
 import copy
 import logging
 from collections.abc import Iterable
-from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -62,6 +61,7 @@ from .request_layout import HunyuanPreparedLayout
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -528,7 +528,7 @@ class HunyuanImage3Pipeline(
         )
 
     @staticmethod
-    def get_weight_sharing_adapter() -> ModuleType:
+    def get_weight_sharing_adapter() -> "WeightSharingAdapter":
         """Return the model-specific shared-weight operations used by the loader."""
         from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
 

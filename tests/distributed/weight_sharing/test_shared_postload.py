@@ -20,7 +20,8 @@ TRANSFORMER = "vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transfor
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_meta_attention_initializes_only_private_rope_on_execution_device(shared):
+@pytest.mark.parametrize("cached_meta", [False, True])
+def test_meta_attention_initializes_only_private_rope_on_execution_device(shared, cached_meta):
     cached_rope = None
 
     def get_rope(**kwargs):
@@ -29,6 +30,10 @@ def test_meta_attention_initializes_only_private_rope_on_execution_device(shared
             cached_rope = nn.Module()
             cached_rope.register_buffer("cos_sin_cache", torch.arange(8).float().cos(), persistent=False)
         return cached_rope
+
+    if cached_meta:
+        with torch.device("meta"):
+            get_rope()
 
     attention_cls = load_class_methods(
         TRANSFORMER,
@@ -49,6 +54,10 @@ def test_meta_attention_initializes_only_private_rope_on_execution_device(shared
         base_class=nn.Module,
     )
     config = SimpleNamespace(num_key_value_heads=1, use_qk_norm=False)
+    if shared and cached_meta:
+        with torch.device("meta"), pytest.raises(ValueError, match="cached meta RoPE"):
+            attention_cls(config, 4, 1, 1, rope_device=torch.device("cpu"))
+        return
     with torch.device("meta"):
         layers = [attention_cls(config, 4, 1, 1, rope_device=torch.device("cpu") if shared else None) for _ in range(2)]
     for layer in layers:

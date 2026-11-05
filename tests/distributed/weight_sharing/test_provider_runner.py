@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from tests.distributed.weight_sharing.helpers import FakeCodec, load_class_methods, make_context, make_weights
 
@@ -48,7 +49,7 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
 
     def publish(backend, model, *, group, device_index):
         assert model is runner.model
-        assert device_index == 3  # Current device, not runner.device.index or TP rank.
+        assert device_index == 3
         bindings, spec = make_weights(contracts, two_storages=True)
         return backend.prepare_export(bindings, spec, context)
 
@@ -56,7 +57,7 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
     runner.vllm_config = SimpleNamespace(
         weight_sharing=SimpleNamespace(role="provider", session_id=context.identity.session_id, group_id="group")
     )
-    runner.device = SimpleNamespace(index=0)
+    runner.device = torch.device("cuda:3")
     runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
     runner.adapter = SimpleNamespace(publish_backbone=Mock(side_effect=publish))
     runner.model = SimpleNamespace(get_weight_sharing_adapter=Mock(return_value=runner.adapter))
@@ -146,4 +147,15 @@ def test_missing_adapter_is_rejected_before_export(provider_runner):
     with pytest.raises(ValueError, match="get_weight_sharing_adapter"):
         runner.publish()
     factory.assert_not_called()
+    assert not codec.exports
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "xpu:0"])
+def test_device_mismatch_is_rejected_before_export(provider_runner, device):
+    runner, backend, codec, factory = provider_runner
+    runner.device = torch.device(device)
+    with pytest.raises(ValueError, match="does not match current device index 3"):
+        runner.publish()
+    factory.assert_not_called()
+    runner.adapter.publish_backbone.assert_not_called()
     assert not codec.exports

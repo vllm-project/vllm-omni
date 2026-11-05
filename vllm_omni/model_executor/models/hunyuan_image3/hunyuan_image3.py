@@ -4,8 +4,7 @@ import gc
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from types import ModuleType
-from typing import Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import numpy as np
 import regex as re
@@ -95,6 +94,9 @@ from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import 
 )
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
 
 logger = init_logger(__name__)
 
@@ -2232,7 +2234,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         return loaded_params
 
     @staticmethod
-    def get_weight_sharing_adapter() -> ModuleType:
+    def get_weight_sharing_adapter() -> "WeightSharingAdapter":
         """Return the model-specific shared-weight operations used by the runner."""
         from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
 

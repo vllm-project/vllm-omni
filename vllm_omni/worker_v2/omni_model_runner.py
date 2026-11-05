@@ -54,6 +54,7 @@ from vllm_omni.worker_v2.warmup import is_warmup_request
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
 logger = init_logger(__name__)
@@ -373,6 +374,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return plane.attach_omni_connector_output(output)
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
+        # Shared weights allow only one load attempt per worker lifetime.
+        # Reload requires full sharing-group teardown and worker recreation.
         if getattr(self, "_weight_share_backend", None) is not None:
             raise RuntimeError(
                 "A weight-sharing load was already attempted; tear down the sharing group before retrying."
@@ -448,11 +451,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 f"weight sharing requested for a provider rank, but {type(self.model).__name__} "
                 "has no get_weight_sharing_adapter hook"
             )
-        adapter = get_adapter()
+        adapter: WeightSharingAdapter = get_adapter()
         from vllm_omni.distributed.weight_sharing import TorchIpcBackend
         from vllm_omni.platforms import current_omni_platform
 
         device_index = current_omni_platform.current_device()
+        if self.device.type not in ("cpu", "meta") and self.device.index not in (None, device_index):
+            raise ValueError(
+                f"Weight-sharing target device {self.device} does not match current device index {device_index}"
+            )
         backend = TorchIpcBackend()
         # Retain partial exports and their diagnostics if publish raises. The
         # session ID remains queryable once the backend registers the session.

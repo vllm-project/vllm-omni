@@ -68,6 +68,8 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.distributed.weight_sharing.backend import ImportedWeights
     from vllm_omni.distributed.weight_sharing.contracts import WeightSharingBackend
 
 
@@ -729,6 +731,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         The caller retains the backend and session identity across load failures;
         a failed shared load must not be replayed with a replacement backend.
+        The runner validates the load format before requesting shared loading.
         """
         self.host_weight_plan = None
         self._hwr_state = None
@@ -767,7 +770,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             if weight_sharing_backend is None:
                 raise ValueError("shared-backbone loading requires a runner-owned weight-sharing backend")
             return self._load_model_with_shared_backbone(
-                shared_group, load_format, custom_pipeline_name, target_device, weight_sharing_backend
+                shared_group, custom_pipeline_name, target_device, weight_sharing_backend
             )
 
         with set_default_torch_dtype(self.od_config.dtype):
@@ -1360,7 +1363,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
     def _load_model_with_shared_backbone(
         self,
         shared_group: Any,
-        load_format: str | None,
         custom_pipeline_name: str | type[nn.Module] | None,
         target_device: torch.device,
         backend: "WeightSharingBackend",
@@ -1375,8 +1377,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """
         if getattr(shared_group, "role", None) != "consumer":
             raise ValueError("diffusion weight sharing requires role='consumer'")
-        if load_format != "default":
-            raise ValueError(f"shared-backbone loading requires load_format='default', got {load_format!r}")
         if self.quant_config is not None:
             raise ValueError("shared-backbone loading does not support quantization in v1")
         if self.parallel_config.use_hsdp:
@@ -1384,6 +1384,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         resolved_offload = resolve_offload(self.od_config)
         if resolved_offload.strategy is not OffloadStrategy.NONE and resolved_offload.offloads(DIT_COMPONENT):
             raise ValueError("shared-backbone loading does not support DiT offload; imported weights must remain bound")
+
+        from vllm_omni.platforms import current_omni_platform
+
+        device_index = current_omni_platform.current_device()
+        if target_device.type not in ("cpu", "meta") and target_device.index not in (None, device_index):
+            raise ValueError(
+                f"Weight-sharing target device {target_device} does not match current device index {device_index}"
+            )
 
         with set_default_torch_dtype(self.od_config.dtype):
             model = self._init_from_load_format(
@@ -1397,11 +1405,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         get_adapter = getattr(model, "get_weight_sharing_adapter", None)
         if not callable(get_adapter):
             raise ValueError(f"consumer model {type(model).__name__} has no get_weight_sharing_adapter hook")
-        adapter = get_adapter()
+        adapter: WeightSharingAdapter = get_adapter()
 
-        from vllm_omni.platforms import current_omni_platform
-
-        device_index = current_omni_platform.current_device()
         payload = getattr(shared_group, "payload", None)
         if payload is None:
             raise ValueError("consumer weight sharing requires the provider's claimed payload")
@@ -1433,6 +1438,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # lifecycle handles here too for normal teardown.
         model._weight_share_backend = backend
         model._weight_share_import = None
+        imported: ImportedWeights | None
         try:
             imported = adapter.open_backbone_import(
                 backend, model, payload=payload, group=shared_group, device_index=device_index

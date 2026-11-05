@@ -1831,6 +1831,11 @@ class HunYuanAttention(nn.Module):
                 rope_parameters=rope_scaling,
                 is_neox_style=True,
             )
+        # get_rope may return a cached module without observing rope_device.
+        if rope_device is not None and self.rotary_emb.cos_sin_cache.is_meta:
+            raise ValueError(
+                "Shared-backbone loading received a cached meta RoPE; a materialized RoPE cache is required."
+            )
         # which attention, from vllm or omni?
         # try use Atten from diffusion
         self.attn = Attention(
