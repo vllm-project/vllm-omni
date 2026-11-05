@@ -188,9 +188,15 @@ def _ensure_guardrails_initialized(od_config: OmniDiffusionConfig) -> None:
     _init_default_guardrails(offload_to_cpu=bool(model_config.get("offload_guardrail_models", False)))
 
 
+def _guardrails_not_initialized() -> RuntimeError:
+    # Fail closed: a check that is on must never pass a request because its guardrail was not loaded.
+    return RuntimeError("The PAN 2 guardrails are enabled but were not initialized.")
+
+
 def _check_text_safety(prompt: str) -> None:
-    if _text_guardrail is not None:
-        _text_guardrail(prompt)
+    if _text_guardrail is None:
+        raise _guardrails_not_initialized()
+    _text_guardrail(prompt)
 
 
 def _video_to_uint8_frames(video: torch.Tensor) -> np.ndarray:
@@ -207,13 +213,13 @@ def _video_to_uint8_frames(video: torch.Tensor) -> np.ndarray:
     return frames
 
 
-def _check_video_safety(video: torch.Tensor) -> list[np.ndarray] | None:
+def _check_video_safety(video: torch.Tensor) -> list[np.ndarray]:
     """Check each video of a decoded `[B, C, T, H, W]` batch; raises `GuardrailViolationError` when one is blocked.
 
-    Returns the checked uint8 frames of each video, or None when the guardrails are not loaded.
+    Returns the checked uint8 frames of each video.
     """
     if _video_guardrail is None:
-        return None
+        raise _guardrails_not_initialized()
     checked_frames = []
     for sample in video:
         frames = _video_to_uint8_frames(sample)
@@ -246,6 +252,9 @@ def get_pan2_pre_process_func(
 
 
 def get_pan2_post_process_func(od_config: OmniDiffusionConfig) -> Callable[..., PAN2PostProcessOutput]:
+    # Load the guardrails here too, so the video check does not depend on the pre-process function being built first.
+    if is_guardrails_enabled(od_config):
+        _ensure_guardrails_initialized(od_config)
     video_processor = VideoProcessor(vae_scale_factor=16)
 
     def post_process_func(
