@@ -2,8 +2,11 @@
 #
 # Use for intentional t2i AR decode graphs. Mixed batches still use the #9764
 # dual-expert + torch.where blend graph. With #9865, Mammoth AR also captures
-# all-und / all-gen specialized graphs so uniform batches skip the unused
-# expert (host picks the graph from gen_token_mask before replay).
+# all-und / all-gen specialized graphs. FULL replay
+# (GPUARModelRunner.execute_model) classifies the unpadded scheduled token
+# ids and selects that graph; mixed or unknown batches stay on blend.
+# Padding is not part of the mask: pad ids are usually 0 and would otherwise
+# look like understanding tokens.
 #
 # For und-only / chat AR, prefer mammoth_moda2_ar.yaml (eager) unless you
 # intentionally want FULL. Sampling stays at the base mammoth_moda2.yaml

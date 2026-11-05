@@ -21,10 +21,10 @@ dispatch). Inside the graph, mixed still uses the #9764 blend path.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import IntEnum
-from typing import Iterator
 
 import torch
 
@@ -37,8 +37,9 @@ class MoERoutingKey(IntEnum):
     ALL_GEN = 2
 
 
-# Active specialty for the current capture / replay. Default BLEND preserves
-# #9764 behaviour until the runner wires mask-keyed dispatch.
+# Active specialty while a graph is being captured. Replay does not consult
+# this: the runner selects the already-recorded graph via BatchDescriptor.
+# Default BLEND preserves #9764 if capture forgets to enter a scope.
 _moe_routing_key: ContextVar[MoERoutingKey] = ContextVar(
     "mammoth_moda2_moe_routing_key",
     default=MoERoutingKey.BLEND,
@@ -88,6 +89,42 @@ def moe_routing_key_from_input_ids(
     if input_ids is None or input_ids.numel() == 0:
         return MoERoutingKey.BLEND
     return moe_routing_key_from_mask(input_ids >= gen_vocab_start_index)
+
+
+def routing_ids_for_replay(
+    cpu_ids: torch.Tensor | None,
+    gpu_ids: torch.Tensor | None,
+    *,
+    num_tokens: int,
+    prev_sampled_token_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Scheduled token ids used to pick a specialty graph on replay.
+
+    ``num_tokens`` is the unpadded scheduled count. CUDA-graph padding sits
+    in the tail and is usually 0, which classifies as understanding. Including
+    it turns an all-gen decode into a mixed batch, so the runner would keep
+    replaying the blend graph.
+
+    Async scheduling writes the newest decode ids only into the GPU buffer
+    (from ``prev_sampled_token_ids``). The CPU buffer is stale for those
+    positions; reading it would pick the wrong expert.
+    """
+    if num_tokens <= 0:
+        return None
+
+    def _slice(ids: torch.Tensor | None) -> torch.Tensor | None:
+        if ids is None or ids.numel() < num_tokens:
+            return None
+        return ids[:num_tokens]
+
+    if prev_sampled_token_ids is not None:
+        gpu_slice = _slice(gpu_ids)
+        if gpu_slice is not None:
+            return gpu_slice
+    cpu_slice = _slice(cpu_ids)
+    if cpu_slice is not None:
+        return cpu_slice
+    return _slice(gpu_ids)
 
 
 def capture_mask_for_routing_key(

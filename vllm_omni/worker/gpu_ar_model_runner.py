@@ -1341,6 +1341,13 @@ class GPUARModelRunner(
                 use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+            # #9865: dispatch defaults moe_routing_key to BLEND. Retarget from
+            # the unpadded scheduled ids so ALL_UND / ALL_GEN replay on decode.
+            batch_desc = self._select_moe_replay_batch_descriptor(
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_unpadded,
+            )
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs]

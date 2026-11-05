@@ -43,6 +43,33 @@ def with_moe_routing_key(
     return replace(desc, moe_routing_key=int(key))
 
 
+def apply_moe_routing_key(
+    mode: CUDAGraphMode,
+    desc: BatchDescriptor,
+    key: MoERoutingKey | int,
+    captured: Iterable[BatchDescriptor] | None,
+    *,
+    enabled: bool,
+) -> BatchDescriptor:
+    """Return the captured descriptor for ``key``, else the blend graph.
+
+    Upstream ``dispatch`` does not take a routing key. FULL replay therefore
+    has to retarget the descriptor it already computed. When neither the
+    specialty nor the blend key was captured, the original descriptor is
+    kept so an existing graph still hits.
+    """
+    if not enabled or mode == CUDAGraphMode.NONE:
+        return replace(desc, moe_routing_key=int(MoERoutingKey.BLEND))
+    captured_keys = () if captured is None else captured
+    keyed = replace(desc, moe_routing_key=int(key))
+    if keyed in captured_keys:
+        return keyed
+    blend = replace(desc, moe_routing_key=int(MoERoutingKey.BLEND))
+    if blend in captured_keys:
+        return blend
+    return desc
+
+
 def sort_capture_descs(descs: list[BatchDescriptor]) -> list[BatchDescriptor]:
     """Largest batches first; within a size, BLEND then ALL_UND then ALL_GEN."""
     return sorted(
@@ -107,7 +134,16 @@ def patch_cudagraph_dispatcher_moe_routing() -> bool:
             out.append((mode, sort_capture_descs(list(descs))))
         return out
 
-    def dispatch(self, num_tokens, uniform_decode=False, has_lora=False, num_active_loras=0, valid_modes=None, invalid_modes=None, moe_routing_key: int = 0):
+    def dispatch(
+        self,
+        num_tokens,
+        uniform_decode=False,
+        has_lora=False,
+        num_active_loras=0,
+        valid_modes=None,
+        invalid_modes=None,
+        moe_routing_key: int = 0,
+    ):
         mode, desc = _orig_dispatch(
             self,
             num_tokens,
@@ -119,14 +155,16 @@ def patch_cudagraph_dispatcher_moe_routing() -> bool:
         )
         if mode == CUDAGraphMode.NONE or not _moe_enabled(self):
             return mode, replace(desc, moe_routing_key=int(MoERoutingKey.BLEND))
-        keyed = replace(desc, moe_routing_key=int(moe_routing_key))
-        if keyed in self.cudagraph_keys.get(mode, ()):
-            return mode, keyed
-        # Fall back to BLEND graph if the specialized key was not captured.
-        blend = replace(desc, moe_routing_key=int(MoERoutingKey.BLEND))
-        if blend in self.cudagraph_keys.get(mode, ()):
-            return mode, blend
-        return mode, keyed
+        # Callers that omit moe_routing_key stay on BLEND. AR FULL replay
+        # retargets the descriptor afterwards; see
+        # OmniGPUModelRunner._select_moe_replay_batch_descriptor.
+        return mode, apply_moe_routing_key(
+            mode,
+            desc,
+            moe_routing_key,
+            self.cudagraph_keys.get(mode, ()),
+            enabled=True,
+        )
 
     initialize_cudagraph_keys._omni_moe_routing = True  # type: ignore[attr-defined]
     CudagraphDispatcher._create_padded_batch_descriptor = _create_padded_batch_descriptor

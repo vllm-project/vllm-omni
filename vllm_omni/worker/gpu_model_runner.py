@@ -35,7 +35,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
-from vllm_omni.cudagraph.moe_routing_dispatcher import with_moe_routing_key
+from vllm_omni.cudagraph.moe_routing_dispatcher import apply_moe_routing_key, with_moe_routing_key
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -44,6 +44,7 @@ from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
     MoERoutingKey,
     moe_routing_key_from_input_ids,
     moe_routing_key_scope,
+    routing_ids_for_replay,
 )
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -1009,6 +1010,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         *,
         force_moe_routing_key: int | None = None,
         num_tokens: int | None = None,
+        token_ids: torch.Tensor | None = None,
+        token_ids_provided: bool = False,
     ) -> MoERoutingKey:
         if force_moe_routing_key is not None:
             return MoERoutingKey(int(force_moe_routing_key))
@@ -1025,10 +1028,54 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if gen_start is not None:
                 break
             cursor = getattr(cursor, "language_model", None) or getattr(cursor, "ar", None)
-        if gen_start is None or num_tokens is None:
+        if gen_start is None:
+            return MoERoutingKey.BLEND
+        if token_ids_provided:
+            return moe_routing_key_from_input_ids(token_ids, int(gen_start))
+        if num_tokens is None:
             return MoERoutingKey.BLEND
         input_ids = self.input_ids.gpu[:num_tokens]
         return moe_routing_key_from_input_ids(input_ids, int(gen_start))
+
+    def _select_moe_replay_batch_descriptor(self, mode, batch_desc, num_tokens: int):
+        """Choose the FULL specialty graph for this step's scheduled tokens.
+
+        Capture records BLEND / ALL_UND / ALL_GEN. ``CudagraphDispatcher.dispatch``
+        is invoked by upstream padding logic without a routing key, so the
+        descriptor it returns is BLEND. Replay has to retarget that descriptor
+        before ``set_forward_context`` or the specialized graphs never run.
+        """
+        if not self._moe_routing_specialize_enabled():
+            return batch_desc
+        input_ids = getattr(self, "input_ids", None)
+        prev_sampled = getattr(getattr(self, "input_batch", None), "prev_sampled_token_ids", None)
+        token_ids = routing_ids_for_replay(
+            None if input_ids is None else getattr(input_ids, "cpu", None),
+            None if input_ids is None else getattr(input_ids, "gpu", None),
+            num_tokens=num_tokens,
+            prev_sampled_token_ids=prev_sampled,
+        )
+        requested = self._resolve_moe_routing_key(token_ids=token_ids, token_ids_provided=True)
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        captured = () if dispatcher is None else dispatcher.cudagraph_keys.get(mode, ())
+        selected = apply_moe_routing_key(mode, batch_desc, requested, captured, enabled=True)
+        selected_key = int(getattr(selected, "moe_routing_key", int(MoERoutingKey.BLEND)))
+        if getattr(self, "_last_moe_routing_replay_key", None) != selected_key:
+            logger.info(
+                "Mammoth MoE CUDA-graph replay specialty is %s (requested %s, num_tokens=%s, mode=%s)",
+                MoERoutingKey(selected_key).name,
+                requested.name,
+                num_tokens,
+                getattr(mode, "name", mode),
+            )
+        else:
+            logger.debug(
+                "Mammoth MoE CUDA-graph replay specialty %s (num_tokens=%s)",
+                MoERoutingKey(selected_key).name,
+                num_tokens,
+            )
+        self._last_moe_routing_replay_key = selected_key
+        return selected
 
     def _warmup_and_capture(
         self,
@@ -1211,7 +1258,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 force_num_active_loras=num_active_loras,
             )
         )
-        # #9865: pin the MoE specialty on the graph key used for capture/replay.
+        # #9865: pin the MoE specialty on the graph key used for capture.
+        # Live FULL replay retargets its own descriptor in execute_model.
         moe_key = self._resolve_moe_routing_key(
             force_moe_routing_key=force_moe_routing_key,
             num_tokens=num_tokens_unpadded,
