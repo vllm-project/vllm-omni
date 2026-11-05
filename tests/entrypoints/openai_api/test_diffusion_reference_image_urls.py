@@ -19,6 +19,8 @@ import pytest
 from PIL import Image
 
 from tests.helpers.serving_chat import build_serving_chat
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -287,3 +289,176 @@ class TestGenerateDiffusionImagesFromUrl:
         connector.fetch_image_async.assert_not_awaited()
         gen_prompt = engine.generate.call_args.kwargs["prompt"]
         assert isinstance(gen_prompt["multi_modal_data"]["image"], Image.Image)
+
+
+class _AwaitableAsyncIterable:
+    """Result wrapper usable as both ``await x`` and ``async for ... in x``."""
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def __await__(self):
+        if False:  # pragma: no cover - generator marker
+            yield
+        return self._value
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._value is None:
+            raise StopAsyncIteration
+        value, self._value = self._value, None
+        return value
+
+
+class _FakeDiffusionEngine:
+    """Pure-diffusion engine stand-in covering both call forms of generate()
+    (``await`` on the images path, ``async for`` on the chat path)."""
+
+    def __init__(self, output_pil: Image.Image) -> None:
+        self.result = SimpleNamespace(
+            final_output_type="image",
+            images=[output_pil],
+            multimodal_output={},
+            stage_durations=None,
+            peak_memory_mb=None,
+            metrics=None,
+            prompt=None,
+        )
+        self.stage_configs: list[object] = []
+        self.calls: list[dict[str, object]] = []
+
+    def generate(self, prompt, sampling_params_list=None, request_id=None, **kwargs):
+        self.calls.append({"prompt": prompt, "kwargs": kwargs})
+        return _AwaitableAsyncIterable(self.result)
+
+
+def _build_for_diffusion(
+    output_pil: Image.Image | None = None,
+    *,
+    allowed_local_media_path: str = "",
+    allowed_media_domains: list[str] | None = None,
+) -> tuple[OmniOpenAIServingChat, _FakeDiffusionEngine]:
+    """Build the handler the way pure-diffusion servers do (api_server.py):
+    via for_diffusion(), which bypasses __init__ and has no model_config."""
+    engine = _FakeDiffusionEngine(output_pil or _make_pil((0, 255, 0)))
+    serving = OmniOpenAIServingChat.for_diffusion(
+        diffusion_engine=engine,  # type: ignore[arg-type]
+        model_name="test-diffusion-model",
+        allowed_local_media_path=allowed_local_media_path,
+        allowed_media_domains=allowed_media_domains,
+    )
+    return serving, engine
+
+
+def _chat_request(content_url: str | None) -> ChatCompletionRequest:
+    content: list[dict[str, object]] = [{"type": "text", "text": "edit this image"}]
+    if content_url is not None:
+        content.append({"type": "image_url", "image_url": {"url": content_url}})
+    return ChatCompletionRequest(
+        model="test-diffusion-model",
+        messages=[{"role": "user", "content": content}],
+    )
+
+
+class TestForDiffusionReferenceImages:
+    """Regression for the #9829 review finding: for_diffusion() instances
+    never set model_config, so reference-image resolution must not depend
+    on it. Base64 inputs decode locally; http(s) URLs go through
+    MediaConnector with the SSRF args threaded via for_diffusion()."""
+
+    @pytest.mark.asyncio
+    async def test_base64_resolves_without_model_config(self):
+        serving, _engine = _build_for_diffusion()
+        assert "model_config" not in vars(serving)
+
+        resolved = await serving._resolve_reference_images_to_pil([_make_b64()])
+
+        assert len(resolved) == 1
+        assert isinstance(resolved[0], Image.Image)
+
+    @pytest.mark.asyncio
+    async def test_pure_base64_never_constructs_media_connector(self):
+        serving, _engine = _build_for_diffusion()
+        with patch(CONNECTOR_TARGET) as connector_cls:
+            resolved = await serving._resolve_reference_images_to_pil([_make_b64()])
+
+        connector_cls.assert_not_called()
+        assert len(resolved) == 1
+
+    @pytest.mark.asyncio
+    async def test_url_uses_for_diffusion_media_domains(self):
+        serving, _engine = _build_for_diffusion(
+            allowed_local_media_path="/data/media",
+            allowed_media_domains=["example.com"],
+        )
+        with patch(CONNECTOR_TARGET) as connector_cls:
+            connector_cls.return_value.fetch_image_async = AsyncMock(return_value=_make_pil())
+
+            resolved = await serving._resolve_reference_images_to_pil([TEST_URL])
+
+        connector_cls.assert_called_once_with(
+            media_io_kwargs=None,
+            allowed_local_media_path="/data/media",
+            allowed_media_domains=["example.com"],
+        )
+        assert len(resolved) == 1
+
+    @pytest.mark.asyncio
+    async def test_url_reference_reaches_generation_as_pil(self):
+        url_pil = _make_pil((255, 0, 0))
+        output_pil = _make_pil((0, 255, 0))
+        serving, engine = _build_for_diffusion(output_pil)
+
+        with patch(CONNECTOR_TARGET) as connector_cls:
+            connector_cls.return_value.fetch_image_async = AsyncMock(return_value=url_pil)
+
+            result = await serving.generate_diffusion_images(
+                prompt="a red square",
+                reference_images=[TEST_URL],
+            )
+
+        images = result[0]
+        assert images == [output_pil]
+        gen_prompt = engine.calls[0]["prompt"]
+        assert gen_prompt["multi_modal_data"]["image"] is url_pil
+
+    @pytest.mark.asyncio
+    async def test_base64_chat_completion_succeeds_without_model_config(self):
+        # Before the fix this returned 500: "Image generation failed:
+        # 'OmniOpenAIServingChat' object has no attribute 'model_config'".
+        output_pil = _make_pil((0, 255, 0))
+        serving, engine = _build_for_diffusion(output_pil)
+
+        response = await serving.create_chat_completion(_chat_request(_make_data_url()), raw_request=None)
+
+        assert not isinstance(response, ErrorResponse)
+        gen_prompt = engine.calls[0]["prompt"]
+        assert isinstance(gen_prompt["multi_modal_data"]["image"], Image.Image)
+
+    @pytest.mark.asyncio
+    async def test_url_chat_completion_succeeds_without_model_config(self):
+        output_pil = _make_pil((0, 255, 0))
+        serving, engine = _build_for_diffusion(output_pil)
+
+        with patch(CONNECTOR_TARGET) as connector_cls:
+            connector_cls.return_value.fetch_image_async = AsyncMock(return_value=_make_pil((255, 0, 0)))
+
+            response = await serving.create_chat_completion(_chat_request(TEST_URL), raw_request=None)
+
+        assert not isinstance(response, ErrorResponse)
+        gen_prompt = engine.calls[0]["prompt"]
+        assert isinstance(gen_prompt["multi_modal_data"]["image"], Image.Image)
+        connector_cls.return_value.fetch_image_async.assert_awaited_once_with(TEST_URL)
+
+    @pytest.mark.asyncio
+    async def test_text_only_chat_completion_unaffected(self):
+        output_pil = _make_pil((0, 255, 0))
+        serving, engine = _build_for_diffusion(output_pil)
+
+        response = await serving.create_chat_completion(_chat_request(None), raw_request=None)
+
+        assert not isinstance(response, ErrorResponse)
+        gen_prompt = engine.calls[0]["prompt"]
+        assert "multi_modal_data" not in gen_prompt

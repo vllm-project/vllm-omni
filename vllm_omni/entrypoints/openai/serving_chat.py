@@ -186,6 +186,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _diffusion_engine: AsyncOmni | None = None
     _diffusion_model_name: str = ""
     _supported_speakers: set[str] | None = None
+    # SSRF controls for reference-image fetching. Pure-diffusion instances are
+    # built via for_diffusion() (bypassing __init__), so these are threaded
+    # from engine args there; normally-built instances resolve them from
+    # model_config instead (see _media_connector_kwargs).
+    _allowed_local_media_path: str = ""
+    _allowed_media_domains: list[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
     # Common fields stay at the request root, but still participate in
@@ -421,6 +427,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         diffusion_engine: AsyncOmni,
         model_name: str,
         enable_force_include_usage: bool = False,
+        allowed_local_media_path: str = "",
+        allowed_media_domains: list[str] | None = None,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
@@ -428,6 +436,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             diffusion_engine: The async diffusion engine
             model_name: Name of the model being served
             enable_force_include_usage: Always send a usage chunk on streams
+            allowed_local_media_path: Local directory allowed for media loads
+                (threaded from engine args; pure-diffusion instances have no
+                model_config to read it from)
+            allowed_media_domains: Domain allowlist for http(s) media fetches
+                (SSRF protection, threaded from engine args)
 
         Returns:
             OmniOpenAIServingChat instance configured for diffusion mode
@@ -445,6 +458,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance.enable_force_include_usage = enable_force_include_usage
         instance.engine_client = None
         instance.has_kv_connector = False
+        instance._allowed_local_media_path = allowed_local_media_path
+        instance._allowed_media_domains = allowed_media_domains
         # Extra body/output params are resolved lazily on first use; see
         # _get_diffusion_extra_body_params / _get_diffusion_extra_output_params.
         return instance
@@ -3481,6 +3496,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return engine_prompt, sampling_params_list
 
+    def _media_connector_kwargs(self) -> dict[str, Any]:
+        """Resolve MediaConnector SSRF kwargs for both construction paths.
+
+        Pure-diffusion instances are created via for_diffusion() (bypassing
+        __init__), so they carry the engine-args-threaded
+        ``_allowed_local_media_path`` / ``_allowed_media_domains`` directly.
+        Normally-built instances read them off model_config.
+        """
+        if self._diffusion_mode:
+            return {
+                "allowed_local_media_path": self._allowed_local_media_path,
+                "allowed_media_domains": self._allowed_media_domains,
+            }
+        config = getattr(self, "model_config", None)
+        return {
+            "allowed_local_media_path": getattr(config, "allowed_local_media_path", "") or "",
+            "allowed_media_domains": getattr(config, "allowed_media_domains", None),
+        }
+
     async def _resolve_reference_images_to_pil(
         self,
         reference_images: list[str],
@@ -3494,15 +3528,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         ``allowed_media_domains`` (SSRF protections) apply. Undecodable
         entries are skipped with a warning, preserving the previous
         best-effort decode behavior.
+
+        The connector is constructed lazily: base64-only inputs never touch
+        it (nor the media config), so the base64 decode path keeps working
+        on instances without model_config (pure-diffusion mode).
         """
         pil_images: list[Image.Image] = []
         if not reference_images:
             return pil_images
-        connector = MediaConnector(
-            media_io_kwargs=media_io_kwargs,
-            allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", "") or "",
-            allowed_media_domains=getattr(self.model_config, "allowed_media_domains", None),
-        )
+        connector: MediaConnector | None = None
+        if any(img_str.startswith(("http://", "https://")) for img_str in reference_images):
+            connector = MediaConnector(
+                media_io_kwargs=media_io_kwargs,
+                **self._media_connector_kwargs(),
+            )
         for img_str in reference_images:
             try:
                 if img_str.startswith(("http://", "https://")):
@@ -3925,7 +3964,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Resolve reference images (base64 or http(s) URL) to PIL images.
             # URLs are fetched through MediaConnector (SSRF-safe).
-            pil_images = await self._resolve_reference_images_to_pil(reference_images)
+            pil_images = await self._resolve_reference_images_to_pil(
+                reference_images,
+                media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            )
 
             # Build generation kwargs
             gen_prompt: OmniTextPrompt = OmniTextPrompt(
