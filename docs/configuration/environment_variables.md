@@ -133,10 +133,10 @@ values depend on the actual audio length distribution):
   1.6% -> 1.5% on LibriSpeech test-clean (greedy), and 1.62-3.7x encoder speedup
   depending on the batch length mix.
 
-| `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 100` mel frames. Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name means the feature is a no-op. | Experimental |
+| `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_MODULES` | Regex | Overrides the wrapped-module name pattern (default matches names ending in `encoder`, `audio_encoder`, `speech_encoder`, `audio_tower`, or `whisper_encoder`) | Use to opt in module names outside the default pattern, e.g. `reference_encoder`. | Experimental |
-| `VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS` | `1`, `2`, or `auto`; default `auto` | Which feature axis is time: `1` for time-major `(B, T, D)`, `2` for channels-first `(B, mel, T)` | `auto` infers from the length scale; the fixed-window Whisper recipe always uses axis `2`. | Experimental |
-| `VLLM_OMNI_AUDIO_BUCKET_CONTEXT_MARGIN` | Non-negative integer; default `0` | Extra feature frames the encoder's front conv reads beyond the reported length; read when the worker installs bucketed encoders | Env var wins over a per-model `bucketing_context_margin` class attribute; negative values are clamped to `0`. | Experimental |
+
+> The per-model knobs (`hop`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the two knobs above are user-facing deployment settings; a model not in the whitelist cannot enable bucketing.
 
 ### NIXL stage transfer
 
