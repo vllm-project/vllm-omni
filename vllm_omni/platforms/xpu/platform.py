@@ -3,6 +3,7 @@
 
 import os
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import torch
 from vllm.config import VllmConfig
@@ -86,7 +87,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/platforms/xpu/stage_configs"
+        return str(Path(__file__).resolve().parent / "stage_configs")
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:

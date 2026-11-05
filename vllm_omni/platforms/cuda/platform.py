@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
+from pathlib import Path
 
 import torch
 import vllm.envs as envs
@@ -36,7 +37,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/deploy"
+        return str(Path(__file__).resolve().parents[2] / "deploy")
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:
