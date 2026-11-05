@@ -15,9 +15,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
-from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
-from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
 
@@ -742,62 +740,10 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
 
 def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Apply MixFusion packed-layout hooks if MixFusion is enabled.
+    """Mount MixFusion (hooks + driver) on a capable pipeline; see ``mixfusion.setup``."""
+    from vllm_omni.diffusion.mixfusion.setup import mount_mixfusion
 
-    This is the MixFusion counterpart of :func:`_apply_sequence_parallel_if_enabled`:
-    it applies the ``_mixfusion_plan`` hooks to transformer models that declare
-    one. The hooks pack per-request latents into the chunk-stacked layout at the
-    module boundaries only while the pipeline has armed a ``MixFusionStep`` on
-    the forward context, so a model with the hooks installed still runs its
-    serial forward unchanged when MixFusion is not requested.
-
-    It also mounts the model-agnostic
-    :class:`~vllm_omni.diffusion.mixfusion.driver.MixFusionDriver`, the entry
-    point for ragged batches even without a plan: its serial fallback has to
-    run because the dense path cannot accept list latents. A request may opt in
-    on any ``supports_mixfusion`` pipeline (the server flag only sets the
-    default), so the driver is mounted for every capable pipeline.
-
-    Args:
-        model: The pipeline model (e.g., QwenImagePipeline).
-        od_config: The OmniDiffusion configuration.
-    """
-
-    if not (getattr(od_config, "enable_mixfusion", False) or supports_mixfusion(od_config)):
-        return
-
-    # Prefer the pipeline's declared DiT components so custom component names
-    # receive the same hooks as conventional transformer names.
-    transformer_attrs = getattr(model, "_dit_modules", None) or ("transformer", "transformer_2", "dit", "unet")
-    transformers = []
-    search_root = model
-    for attr in transformer_attrs:
-        if not hasattr(search_root, attr):
-            # Some pipelines nest the module that owns the transformer.
-            module = find_module_with_attr(search_root, attr)
-            if module is None:
-                continue
-            search_root = module
-        transformer = getattr(search_root, attr)
-        if transformer is not None:
-            transformers.append((attr, transformer))
-    if not transformers:
-        return
-
-    # The driver only knows the model through its adapter, and one step packs
-    # one DiT: mount the first DiT that declares both a plan and an adapter.
-    # Without one, the driver still serves ragged batches serially. Admission
-    # rejects SP per step, so the hooks stay inert there.
-    for attr, transformer in transformers:
-        plan = getattr(transformer, "_mixfusion_plan", None)
-        adapter = getattr(transformer, "mixfusion_adapter", None)
-        if plan is not None and adapter is not None:
-            logger.info(f"Applying MixFusion hooks to {transformer.__class__.__name__} ({attr}): {', '.join(plan)}")
-            apply_mixfusion(transformer, plan)
-            model.mixfusion_driver = MixFusionDriver(model, transformer, adapter)
-            return
-    logger.warning("No transformer declares a _mixfusion_plan and adapter; MixFusion requests run serially.")
-    model.mixfusion_driver = MixFusionDriver(model, transformers[0][1], None)
+    mount_mixfusion(model, od_config, supported=supports_mixfusion(od_config))
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

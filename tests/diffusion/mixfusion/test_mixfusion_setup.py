@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Mounting tests for ``_apply_mixfusion_if_enabled`` (CPU).
+"""Startup wiring tests for ``mixfusion.setup`` (CPU).
 
 The server-level ``enable_mixfusion`` flag only sets the request-level
 default; a request may opt in whenever the pipeline declares
@@ -16,9 +16,9 @@ from types import SimpleNamespace
 import pytest
 from torch import nn
 
-from vllm_omni.diffusion import registry
 from vllm_omni.diffusion.hooks.mixfusion import MixFusionRoot
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+from vllm_omni.diffusion.mixfusion.setup import mount_mixfusion, validate_mixfusion_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -44,17 +44,16 @@ def _od_config(*, enable: bool):
     return SimpleNamespace(enable_mixfusion=enable)
 
 
-def _mount(monkeypatch, *, supports: bool, adapter: object | None, enable: bool = False):
-    monkeypatch.setattr(registry, "supports_mixfusion", lambda od_config: supports)
+def _mount(*, supports: bool, adapter: object | None, enable: bool = False):
     transformer = _FakeTransformer(adapter=adapter)
     pipeline = _FakePipeline(transformer)
-    registry._apply_mixfusion_if_enabled(pipeline, _od_config(enable=enable))
+    mount_mixfusion(pipeline, _od_config(enable=enable), supported=supports)
     return pipeline, transformer
 
 
-def test_request_opt_in_mounts_driver_with_server_flag_off(monkeypatch):
+def test_request_opt_in_mounts_driver_with_server_flag_off():
     adapter = object()
-    pipeline, transformer = _mount(monkeypatch, supports=True, adapter=adapter)
+    pipeline, transformer = _mount(supports=True, adapter=adapter)
 
     driver = pipeline.mixfusion_driver
     assert isinstance(driver, MixFusionDriver)
@@ -63,15 +62,15 @@ def test_request_opt_in_mounts_driver_with_server_flag_off(monkeypatch):
     assert transformer._mixfusion_hooks_applied is True
 
 
-def test_unsupported_pipeline_mounts_nothing(monkeypatch):
-    pipeline, transformer = _mount(monkeypatch, supports=False, adapter=object())
+def test_unsupported_pipeline_mounts_nothing():
+    pipeline, transformer = _mount(supports=False, adapter=object())
 
     assert not hasattr(pipeline, "mixfusion_driver")
     assert getattr(transformer, "_mixfusion_hooks_applied", False) is False
 
 
-def test_transformer_without_adapter_gets_a_serial_driver(monkeypatch):
-    pipeline, transformer = _mount(monkeypatch, supports=True, adapter=None)
+def test_transformer_without_adapter_gets_a_serial_driver():
+    pipeline, transformer = _mount(supports=True, adapter=None)
 
     # Ragged batches still need the serial fallback instead of reaching the
     # dense path with a list.
@@ -80,10 +79,40 @@ def test_transformer_without_adapter_gets_a_serial_driver(monkeypatch):
     assert getattr(transformer, "_mixfusion_hooks_applied", False) is False
 
 
-def test_pipeline_without_transformer_mounts_nothing(monkeypatch):
-    monkeypatch.setattr(registry, "supports_mixfusion", lambda od_config: True)
+def test_pipeline_without_transformer_mounts_nothing():
     pipeline = _FakePipeline(None)
 
-    registry._apply_mixfusion_if_enabled(pipeline, _od_config(enable=False))
+    mount_mixfusion(pipeline, _od_config(enable=False), supported=True)
 
     assert not hasattr(pipeline, "mixfusion_driver")
+
+
+@pytest.mark.parametrize(
+    ("config", "supported", "outcome"),
+    [
+        ({}, False, False),
+        ({"enable_mixfusion": True}, True, True),
+        ({"enable_mixfusion": True}, False, "does not support MixFusion"),
+        # Scheduler-paged KV is request-level only; MixFusion needs steps.
+        ({"enable_mixfusion": True, "diffusion_kv_mode": "PAGED_SCHEDULER"}, True, "paged_scheduler"),
+    ],
+)
+def test_validate_mixfusion_config(config, supported, outcome):
+    from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+
+    if "diffusion_kv_mode" in config:
+        config = {**config, "diffusion_kv_mode": DiffusionKVCacheMode[config["diffusion_kv_mode"]]}
+    od_config = SimpleNamespace(model_class_name="Stub", **config)
+    lookups: list = []
+
+    def capability(config):
+        lookups.append(config)
+        return supported
+
+    if isinstance(outcome, str):
+        with pytest.raises(ValueError, match=outcome):
+            validate_mixfusion_config(od_config, supported=capability)
+    else:
+        assert validate_mixfusion_config(od_config, supported=capability) is outcome
+    # The pipeline class is only resolved when MixFusion is enabled.
+    assert len(lookups) == (1 if config.get("enable_mixfusion") else 0)

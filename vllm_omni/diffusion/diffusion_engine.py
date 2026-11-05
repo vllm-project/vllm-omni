@@ -47,6 +47,7 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.mixfusion.setup import validate_mixfusion_config
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     any_selected_component_uses_allgather,
@@ -367,18 +368,10 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
-        # Server-level MixFusion on a pipeline that cannot denoise mixed
-        # resolutions is a configuration error: the scheduler would relax
-        # height/width out of the batch key and the runner would crash on the
-        # resulting shape mismatch. Fail fast at startup instead.
-        if bool(getattr(od_config, "enable_mixfusion", False)) and not supports_mixfusion(od_config):
-            raise ValueError(
-                f"{getattr(od_config, 'model_class_name', None)!r} does not support MixFusion. "
-                "Disable enable_mixfusion, or choose a pipeline with supports_mixfusion=True."
-            )
+        mixfusion_needs_steps = validate_mixfusion_config(od_config, supported=supports_mixfusion)
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
-        if bool(getattr(od_config, "enable_mixfusion", False)) and not self.step_execution:
+        if mixfusion_needs_steps and not self.step_execution:
             logger.warning("enable_mixfusion=True requires step_execution=True; enabling step execution.")
             od_config.step_execution = True
             self.step_execution = True

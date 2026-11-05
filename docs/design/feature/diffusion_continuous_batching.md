@@ -204,19 +204,23 @@ cost of a pipeline contract the scheduler must not assume generically:
   (read via `getattr`, not part of the runtime protocol check). Currently
   only `QwenImagePipeline` sets it.
 - The engine resolves the capability through the registry at startup and
-  rejects server-level `enable_mixfusion` on pipelines without it. Because
+  `mixfusion.setup.validate_mixfusion_config` rejects server-level
+  `enable_mixfusion` on pipelines without it, or together with
+  `diffusion_kv_mode=paged_scheduler` (request-level only). Because
   resolution only leaves the step-batch key under the `StepScheduler`,
   server-level `enable_mixfusion` also enables step execution automatically
   (same coupling as `streaming_output`).
 - The scheduler resolves the capability in `initialize()` and only then
-  applies the shape relaxation. On an unsupported pipeline, a request-level
+  applies the shape relaxation through `mixfusion.request.relax_step_batch_key`.
+  Every MixFusion decision lives under `vllm_omni/diffusion/mixfusion/`;
+  the shared engine, loader and schedulers only make one call each. On an unsupported pipeline, a request-level
   `extra_args={"enable_mixfusion": True}` degrades to a no-op: resolution
   stays in the key and per-prompt `additional_information` requests keep
   their key.
 
 With the capability present, the model runner hands every denoise step to
 `pipeline.mixfusion_driver`, a model-agnostic `MixFusionDriver` that
-`registry._apply_mixfusion_if_enabled` mounts at model load. The driver
+`mixfusion.setup.mount_mixfusion` mounts at model load. The driver
 dispatches on the batch: dense (tensor) latents go straight to
 `pipeline.denoise_step`; list latents return `None` when the pipeline is
 interrupted and otherwise take one packed forward only when
@@ -273,7 +277,7 @@ model-specific one:
 
 Framework responsibilities:
 
-- `registry._apply_mixfusion_if_enabled` mounts the driver and calls
+- `mixfusion.setup.mount_mixfusion` (called once by the model loader) mounts the driver and calls
   `apply_mixfusion(transformer, plan)`; the hooks stay inert unless the
   driver arms a `MixFusionStep`.
 - The driver never interprets the model-specific payloads it carries

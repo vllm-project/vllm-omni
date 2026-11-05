@@ -6,12 +6,9 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.mixfusion.request import request_batch_key_allowed
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import (
-    BaseScheduler,
-    _has_per_prompt_inputs,
-    _mixfusion_requested,
-)
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -120,12 +117,7 @@ class RequestScheduler(BaseScheduler):
         stays in the key even for MixFusion requests; only per-prompt inputs
         make a MixFusion request unbatchable.
         """
-        requested = _mixfusion_requested(
-            request,
-            server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
-            supported=self._mixfusion_supported,
-        )
-        if requested and _has_per_prompt_inputs(request):
+        if not request_batch_key_allowed(request, self.od_config, supported=self._mixfusion_supported):
             return None
         return build_request_batch_sampling_params_key(request)
 

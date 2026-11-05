@@ -26,7 +26,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
-from vllm_omni.diffusion.mixfusion.request import RELAXED_STEP_KEY_FIELDS
+from vllm_omni.diffusion.mixfusion.request import relax_step_batch_key
 from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -53,43 +53,6 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
     "lora_int_id",
     "use_step_execution",
 }
-
-
-def _mixfusion_requested(request: OmniDiffusionRequest, *, server_default: bool, supported: bool) -> bool:
-    """Whether ``request`` opts into MixFusion on a capable pipeline.
-
-    On a pipeline without the capability a request-level flag is a no-op, so
-    resolution keeps splitting the key as if MixFusion were off. (A
-    server-level flag on such a pipeline is rejected at engine startup.)
-    """
-    extra_args = request.sampling_params.extra_args or {}
-    return supported and bool(extra_args.get("enable_mixfusion", server_default))
-
-
-def _has_per_prompt_inputs(request: OmniDiffusionRequest) -> bool:
-    prompt = request.prompt
-    return isinstance(prompt, dict) and bool(prompt.get("additional_information"))
-
-
-def _apply_mixfusion_shape_relaxation(
-    request: OmniDiffusionRequest,
-    values: dict,
-    *,
-    server_default: bool,
-    supported: bool,
-) -> dict | None:
-    """Drop resolution from a step-batch key when the request opts in.
-
-    Step batches resolve shapes per request (packed or serial ragged). A
-    prompt with per-request ``additional_information`` cannot share a key.
-    """
-    if not _mixfusion_requested(request, server_default=server_default, supported=supported):
-        return values
-    if _has_per_prompt_inputs(request):
-        return None
-    for name in RELAXED_STEP_KEY_FIELDS:
-        values[name] = None
-    return values
 
 
 class BaseScheduler(ABC):
@@ -794,12 +757,7 @@ class BaseScheduler(ABC):
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs = _apply_mixfusion_shape_relaxation(
-            request,
-            key_kwargs,
-            server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
-            supported=self._mixfusion_supported,
-        )
+        key_kwargs = relax_step_batch_key(request, key_kwargs, self.od_config, supported=self._mixfusion_supported)
         if key_kwargs is None:
             return None
         return StepBatchSamplingParamsKey(
