@@ -41,7 +41,7 @@ import time
 import wave
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Container, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -1586,8 +1586,20 @@ class EventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
-    def errors(self) -> list[dict[str, object]]:
-        return [event for event in self.events if event.get("type") == "error"]
+    def errors(self, exclude_indexes: Container[int] | None = None) -> list[dict[str, object]]:
+        """Collected ``error`` events, optionally skipping forgive-list indexes.
+
+        ``exclude_indexes`` refers to positions in :attr:`events`, so callers
+        that forgive specific errors keep a single definition of what an error
+        is instead of re-filtering ``events`` themselves.
+        """
+        if exclude_indexes is None:
+            return [event for event in self.events if event.get("type") == "error"]
+        return [
+            event
+            for index, event in enumerate(self.events)
+            if event.get("type") == "error" and index not in exclude_indexes
+        ]
 
     def response_is_done(self, response_id: str) -> bool:
         return any(

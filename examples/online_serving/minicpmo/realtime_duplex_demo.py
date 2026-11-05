@@ -359,11 +359,15 @@ async def _commit_input_after_playback_checkpoint(
     then safely advance response-local playback that drained in the meantime.
 
     ``create_response`` sets the commit's ``response_create`` flag. Native
-    duplex sessions never auto-respond: the model decides per unit whether to
-    speak or keep listening, so a session can end with the last user turn
-    unanswered. Forwarding this flag makes the commit itself ask for one
-    response built from the committed input, which is the only protocol-level
-    way to make the final answer mandatory instead of model luck.
+    duplex sessions auto-respond: the model decides per unit whether to speak
+    or keep listening, so a session can end with the last user turn
+    unanswered. Forwarding this flag makes the commit ask for one response
+    built from the committed input: when the commit retains answerable audio,
+    the server opens the forced response immediately (``precreate_response``);
+    when the input was already consumed unit by unit, the server answers the
+    commit without scheduling anything and the drain's ``response.create``
+    re-ask settles the session on a definitive refusal. Either way the final
+    turn reaches a definitive state instead of ending on model luck.
     """
     await acknowledge_collected_playback(client, collector)
     commit_sent_at_s = time.monotonic()
@@ -448,6 +452,7 @@ async def _drain_forced_post_commit_response(
     settle_quiet_s: float = _FORCED_RESPONSE_SETTLE_QUIET_S,
     fallback_retry_window_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S,
     fallback_retry_interval_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S,
+    commit_may_defer_create: bool = True,
     on_fallback_sent: Callable[[], None] | None = None,
 ) -> bool:
     """Drain the commit-requested response, re-asking if it never opens.
@@ -461,19 +466,25 @@ async def _drain_forced_post_commit_response(
     spontaneous settle and the promoted forced create.
 
     If no response opened, ``response.create`` is the protocol's second,
-    explicit way to ask for the same answer -- but only on a server that has
-    not seen any response activity since the commit: a commit held behind an
-    active response is promoted with its forced create once that response
-    settles, and re-asking then just yields ``response_already_active``. A
-    post-commit ``response.done`` -- even a cancelled one, or the settle of a
-    pre-commit response -- means the server is already working through its
-    queue and the promotion may still be in flight, so it suppresses the
-    re-ask as well. Errors reported after the commit suppress it too, since
-    the server is refusing rather than slow. The flip side for CI triage: if
-    the server drops the deferred create after such activity, the drain can
-    only end in ``TimeoutError`` -- no re-ask will have fired -- so a client
-    timeout in that situation points at a lost promotion on the server side,
-    not at a missing fallback.
+    explicit way to ask for the same answer. Whether a post-commit
+    ``response.done`` may keep the re-ask armed depends on how the server can
+    treat the commit (``commit_may_defer_create``): a session whose model does
+    not auto-respond can hold the commit behind an active response and promote
+    it with its forced create once that response settles, so a post-commit
+    ``response.done`` -- even a cancelled one, or the settle of a pre-commit
+    response -- means the promotion may still be in flight and the drain keeps
+    waiting instead of re-asking into ``response_already_active``. A native
+    auto-response session never defers: its commit submits the retained input
+    at once or acknowledges with nothing scheduled, so a post-commit settle is
+    final -- the server is idle, and suppressing the re-ask there would strand
+    an already-answered session in ``TimeoutError``; the re-ask stays armed
+    and settles it on the forced answer or on the definitive refusal. Errors
+    reported after the commit suppress the re-ask either way, since the
+    server is refusing rather than slow. The flip side for CI triage on a
+    deferring session: if the server drops the deferred create after such
+    activity, the drain can only end in ``TimeoutError`` -- no re-ask will
+    have fired -- so a client timeout in that situation points at a lost
+    promotion on the server side, not at a missing fallback.
 
     A re-ask can itself fail client-side: a send landing inside a transport
     resume window raises ``DuplexConnectionError`` while the session is still
@@ -509,7 +520,10 @@ async def _drain_forced_post_commit_response(
     except TimeoutError:
         if (
             _event_count_after(collector.events, "error", committed_index) == 0
-            and _event_count_after(collector.events, "response.done", committed_index) == 0
+            and (
+                not commit_may_defer_create
+                or _event_count_after(collector.events, "response.done", committed_index) == 0
+            )
             and not _response_in_progress(collector.events)
         ):
             retry_deadline_s = time.monotonic() + min(fallback_retry_window_s, timeout_s)
@@ -519,7 +533,10 @@ async def _drain_forced_post_commit_response(
                     break
                 if (
                     _event_count_after(collector.events, "error", committed_index)
-                    or _event_count_after(collector.events, "response.done", committed_index)
+                    or (
+                        commit_may_defer_create
+                        and _event_count_after(collector.events, "response.done", committed_index)
+                    )
                     or _response_in_progress(collector.events)
                 ):
                     break
@@ -985,6 +1002,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         committed_index=committed_index,
                         timeout_s=args.timeout_s,
                         create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
+                        # The MiniCPM-o session runs the native auto-response
+                        # scheduler: its commit never parks the forced create
+                        # behind an active response, so a settle that lands
+                        # after the commit is final instead of the preamble of
+                        # a promotion -- the re-ask must stay armed for it.
+                        commit_may_defer_create=not client.config.auto_response,
                         on_fallback_sent=lambda: fallback_progress.__setitem__("sent", True),
                     )
                 else:
@@ -1061,11 +1084,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             if final_create_response and committed_index is not None
             else frozenset()
         )
-        errors = [
-            event
-            for index, event in enumerate(collector.events)
-            if event.get("type") == "error" and index not in forgiven_indexes
-        ]
+        errors = collector.errors(exclude_indexes=forgiven_indexes)
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:

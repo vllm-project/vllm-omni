@@ -2712,8 +2712,23 @@ class DuplexSessionRunner:
         self.emit(committed_payload)
         return True
 
-    async def _commit_and_start_auto_response(self, event: dict[str, object], *, realtime_item_id: object) -> None:
-        """Commit the buffered turn and submit it, letting the model answer it."""
+    async def _commit_and_start_auto_response(
+        self, event: dict[str, object], *, realtime_item_id: object, precreate_response: bool = False
+    ) -> None:
+        """Commit the buffered turn and submit it, letting the model answer it.
+
+        ``precreate_response`` honors an explicit ``response_create`` on the
+        commit -- but only for a model-native session whose model can decide
+        per unit to keep listening and thereby strand the final user turn;
+        then the forced answer opens its response immediately instead of
+        waiting for the model's own speak decision (or for the client's
+        ``response.create`` re-ask). A session without model-native turn policy
+        (e.g. AURA) keeps opening its responses on model output, and while
+        another response is still running the flag is dropped as well:
+        binding this turn onto the active response would misattribute the
+        in-flight answer. In both skipped cases the retained committed input
+        keeps the client's re-ask armed.
+        """
         session = self.session
         model_state = self.model_state
         prefix_reservations = self._reserve_commit_prefixes()
@@ -2768,7 +2783,11 @@ class DuplexSessionRunner:
             await self._start_append(
                 {**final_payload, "duplex_turn_id": data_plane_turn_id},
                 final=True,
-                precreate_response=False,
+                precreate_response=(
+                    precreate_response
+                    and session.capabilities.supports_model_native_turn_policy
+                    and session.active_response_id is None
+                ),
                 operation_id=commit_reservation.operation_id,
                 retained_committed_payload=final_payload,
             )
@@ -2903,7 +2922,11 @@ class DuplexSessionRunner:
                     ):
                         return
             if commit_action is CommitAction.START_AUTO_RESPONSE:
-                await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
+                await self._commit_and_start_auto_response(
+                    event,
+                    realtime_item_id=realtime_item_id,
+                    precreate_response=precreate_response_requested,
+                )
                 return
         if event_type == "response.create":
             if session.unanswered_user_items() or model_state.committed_audio_payload is not None:

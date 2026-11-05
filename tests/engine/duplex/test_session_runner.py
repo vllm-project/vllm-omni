@@ -1365,6 +1365,40 @@ async def test_auto_response_commit_releases_residual_audio_before_the_next_turn
 
 
 @pytest.mark.asyncio
+async def test_auto_response_commit_with_create_response_precreates_the_forced_answer() -> None:
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        for _ in range(7):
+            await h.run(append_audio(3200, value=0.05))
+        events = await h.run(commands.Commit(create_response=True))
+        # The explicit request opens the forced response at the commit itself
+        # instead of leaving the answer to the model's own speak decision:
+        # a native auto-response session can no longer strand the final user
+        # turn on a listen decision.
+        event_types = types(events)
+        assert "input_audio_buffer.committed" in event_types
+        committed_at = event_types.index("input_audio_buffer.committed")
+        assert "response.created" in event_types[committed_at:]
+        created = find(events, "response.created")
+        assert created.response_id == h.session.active_response_id
+        # The commit still submits the answerable final input: the residual
+        # speech plus the padding silence, retained for the forced answer.
+        final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert final_append["final"] is True
+        assert base64.b64decode(final_append["payload"]["audio"]) == (
+            pcm_f32(6400, value=0.05) + pcm_f32(9600, value=0.0)
+        )
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, turn_id=0))
+        events = await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, turn_end=True, turn_id=0))
+        done = find(events, "response.done")
+        assert done.status == "completed"
+        # The precreated response is the one the model's answer settles.
+        assert done.response_id == created.response_id
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_touches_the_lease_and_acks() -> None:
     clock = {"now": 100.0}
     h = await open_harness(clock=lambda: clock["now"])

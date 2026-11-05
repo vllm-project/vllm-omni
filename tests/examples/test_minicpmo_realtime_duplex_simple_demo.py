@@ -691,6 +691,47 @@ def test_drain_does_not_reask_when_a_post_commit_response_already_settled():
     assert sent == []
 
 
+def test_native_drain_reasks_after_a_post_commit_settle_when_nothing_was_deferred():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-precommit"}})
+    collector.add({"type": "input_audio_buffer.committed"})
+    # The response that opened before the commit settles after it, and the
+    # unit-aligned input left nothing retained: the server acknowledged the
+    # commit without scheduling another response.
+    collector.add({"type": "response.done", "response": {"id": "resp-precommit"}})
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        async def send(self, event):
+            sent.append(event)
+            collector.add(
+                {
+                    "type": "error",
+                    "error": {"code": "response_create_without_input"},
+                }
+            )
+
+    fallback = asyncio.run(
+        demo._drain_forced_post_commit_response(
+            _Client(),
+            collector,
+            committed_index=1,
+            timeout_s=0.05,
+            create_timeout_s=0.05,
+            settle_quiet_s=0.0,
+            commit_may_defer_create=False,
+        )
+    )
+
+    # A native auto-response session never parks its forced create behind the
+    # response that settled: that settle is final, the server is idle, and the
+    # re-ask settles the session on the definitive refusal instead of
+    # stranding an already-answered session in a client timeout.
+    assert sent == [{"type": "response.create"}]
+    assert fallback is True
+
+
 def test_post_commit_settle_lets_a_cancelled_response_close_without_blocking_the_drain():
     demo = _load_demo_module()
     # A cancelled spontaneous response must close its own creation (so its id
