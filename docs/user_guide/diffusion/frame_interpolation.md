@@ -114,7 +114,9 @@ in `[0, 1]`. Layout and signed floating ranges are not inferred by this API.
 The result has the same layout and dtype on the selected model execution
 device. A CPU input may be transport state; it does not force CPU execution.
 
-The following synthetic example encodes using the plan's **absolute** FPS:
+The following small synthetic example encodes using the plan's **absolute**
+FPS. Its float32 output needs 8,847,360 bytes (about 8.4 MiB); the explicit
+16 MiB output budget below is for this 32×32 example.
 
 ```python
 from fractions import Fraction
@@ -127,7 +129,12 @@ from vllm_omni.diffusion.postprocess.rife_interpolator import resample_video_ten
 
 video = torch.rand(1, 3, 192, 32, 32)  # Synthetic source, not model output.
 plan = FrameInterpolationPlan(192, Fraction(24), Fraction(48), Fraction(15))
-output = resample_video_tensor(video, plan, model_path="/path/to/RIFE-4.22.lite")
+output = resample_video_tensor(
+    video,
+    plan,
+    model_path="/path/to/RIFE-4.22.lite",
+    max_output_bytes=16 * 1024**2,
+)
 rgb = (output[0].permute(1, 2, 3, 0).float().clamp(0, 1) * 255).round()
 rgb = rgb.to(dtype=torch.uint8, device="cpu").numpy()
 with av.open("resampled.mp4", "w") as container:
@@ -151,6 +158,27 @@ interpret variable-frame-rate timestamps. `max_output_bytes` defaults to
 loading or device transfer. This is **not** a bound on total memory: model
 weights, input/normalization tensors, inference workspaces, output dtype
 conversion and encoding require additional capacity.
+
+Budget the actual output shape before increasing the resolution:
+
+```text
+float32 output bytes = batch * 3 * output_frames * height * width * 4
+```
+
+For the same 720-frame plan with batch size one:
+
+| Resolution | Float32 output allocation |
+| ------------ | --------------------------- |
+| 32×32 | 8.4 MiB |
+| 832×480 | 3.21 GiB |
+| 1088×1920 | 16.81 GiB |
+
+Both larger examples exceed the default 1 GiB cap. After provisioning enough
+memory for the output **and** the other allocations above, pass an explicit
+budget, such as `max_output_bytes=4 * 1024**3` for the 832×480 output. Raising
+this limit does not reserve memory or guarantee that inference will fit. Batch
+size multiplies the output cost, and lower-precision input still uses a
+float32 output buffer during interpolation.
 
 An optional `check_cancel` callback can raise at slot boundaries. The helper
 propagates cancellation and inference errors without changing the clock or
