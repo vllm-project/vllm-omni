@@ -293,6 +293,15 @@ class DiffusionParallelConfig:
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
 
+    vae_encode_parallel_size: int = 1
+    """Number of ranks used for image-level data-parallel reference encoding.
+
+    Only used by pipelines that opt into it (currently MiniMax-H3 reference
+    images). The degree is independent of ``vae_patch_parallel_size``; it is
+    enabled per request when at least two reference images are present. Ranks
+    beyond the image count participate with an empty work assignment.
+    """
+
     text_encoder_tp_size: int = 1
     """Number of ranks used to tensor-parallel shard the diffusion text encoder.
 
@@ -350,6 +359,7 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        assert self.vae_encode_parallel_size > 0, "VAE encode parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
