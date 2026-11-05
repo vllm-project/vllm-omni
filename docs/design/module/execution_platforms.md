@@ -46,6 +46,13 @@ External platforms use `Operator.register_oot(Implementation)` before model
 construction and implement `forward_oot`. Overrides preserve the operator's
 constructor, parameters, and outputs; `forward_native` is the default fallback.
 
+ROCm platform initialization keeps checkpoint metadata discovery independent
+of the diffusion runtime registry. Its optional VAE GroupNorm substitution runs
+from `initialize_model` after model construction and VAE/runtime setup, rather
+than installing a registry monkeypatch during platform discovery. It preserves
+AITER capability checks, the HunyuanImage3 PyTorch GroupNorm exemption, and the
+existing fallback when the optional AITER optimization fails.
+
 ## Candidate invariants
 
 ### PLATFORM-INV-001: Capabilities are explicit
