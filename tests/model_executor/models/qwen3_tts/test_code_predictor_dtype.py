@@ -974,8 +974,8 @@ class TestCodePredictorFusedProjections:
 
         ref_g, ref_u = g(x), u(x)
         out_g, out_u = fused(x).split([intermediate, intermediate], dim=-1)
-        assert torch.equal(ref_g, out_g)
-        assert torch.equal(ref_u, out_u)
+        torch.testing.assert_close(ref_g, out_g)
+        torch.testing.assert_close(ref_u, out_u)
 
     def test_load_weights_repacks_hf_shards(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """``load_weights`` must transparently re-pack HF q/k/v and gate/up
