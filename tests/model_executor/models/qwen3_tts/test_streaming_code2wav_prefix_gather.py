@@ -10,3 +10,8 @@ def test_prefix_gather_matches_per_row_cat():
         expected = torch.cat([codes[row : row + 1, :, :frames] for row in rows], dim=0)
         actual = _gather_prefix_rows(codes, rows, frames)
         assert torch.equal(expected, actual)
+
+    # Empty groups are never produced by prefix_groups today, but the helper
+    # should still return a well-shaped empty tensor rather than raise.
+    empty = _gather_prefix_rows(codes, [], 5)
+    assert empty.shape == (0, 4, 5)
