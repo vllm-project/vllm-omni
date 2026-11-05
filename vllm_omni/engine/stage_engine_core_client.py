@@ -12,7 +12,7 @@ from __future__ import annotations
 import inspect
 import os
 import socket
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 import vllm.v1.engine as _vllm_engine_module
@@ -30,12 +30,13 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
-from vllm_omni.engine.stage_client import StageClientBase
+from vllm_omni.engine.stage_client import STAGE_SHUTDOWN_TIMEOUT_S, StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
     from vllm.renderers import BaseRenderer
     from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine.core_client import BackgroundResources
 
     from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -78,7 +79,17 @@ class StageEngineCoreClientBase(StageClientBase):
     (`resources.engine_manager`), matching `MPClient` ownership.
     """
 
+    # Created by the concrete multiprocessing client in the cooperative MRO.
+    resources: BackgroundResources
     replica_id: int = 0
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        # Keep upstream process ownership and forced-exit fallback. An explicit
+        # timeout (including zero) must still take precedence over our default.
+        if timeout is None:
+            timeout = STAGE_SHUTDOWN_TIMEOUT_S
+        # The concrete MP client supplies this method through the MRO.
+        cast(AsyncMPClient, super()).shutdown(timeout=timeout)
 
     @staticmethod
     def make_async_mp_client(
@@ -201,7 +212,7 @@ class StageEngineCoreClientBase(StageClientBase):
             )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager
-                self.start_engine_core_monitor()
+                cast(MPClient, self).start_engine_core_monitor()
             if coordinator is not None:
                 self.resources.coordinator = coordinator
         except Exception:
@@ -256,7 +267,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.replica_id,
             request.request_id,
         )
-        await super().add_request_async(request)
+        await cast(AsyncMPClient, super()).add_request_async(request)
 
     # ==================== Stage Methods ====================
 
@@ -525,7 +536,7 @@ class StageEngineCoreClientBase(StageClientBase):
         control operations should be executed here and then fanned in-core
         across the workers managed by this EngineCore client.
         """
-        return await super().collective_rpc_async(
+        return await cast(AsyncMPClient, super()).collective_rpc_async(
             method=method,
             timeout=timeout,
             args=args,

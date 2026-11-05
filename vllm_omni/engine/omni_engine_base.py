@@ -54,7 +54,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator import OrchestratorBase
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
-from vllm_omni.engine.stage_client import StageClient
+from vllm_omni.engine.stage_client import STAGE_SHUTDOWN_TIMEOUT_S, StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
@@ -962,14 +962,26 @@ class OmniEngineBase:
                 logger.exception("[OmniEngine] Failed to close correlated RPC client")
 
         orchestrator_stopped = False
+        # The orchestrator retires replicas sequentially. Reserve their cleanup
+        # windows in addition to the existing orchestration/transport allowance;
+        # counting logical stages would under-budget replicated deployments.
+        replica_count = sum(
+            client is not None
+            for pool in getattr(getattr(self, "_runtime", None), "stage_pools", ())
+            for client in pool.clients
+        )
+        # Diffusion clients may wait once for graceful RPC shutdown and once
+        # for signal-based shutdown. Reserve both phases for each replica;
+        # EngineCore clients normally consume only one of these windows.
+        join_timeout = SHUTDOWN_JOIN_TIMEOUT_S + replica_count * 2 * STAGE_SHUTDOWN_TIMEOUT_S
         try:
             if self.is_alive():
-                self.orchestrator_thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
+                self.orchestrator_thread.join(timeout=join_timeout)
             orchestrator_stopped = not self.is_alive()
             if not orchestrator_stopped:
                 logger.error(
                     "[OmniEngine] Orchestrator did not stop within %.1f seconds; continuing cleanup",
-                    SHUTDOWN_JOIN_TIMEOUT_S,
+                    join_timeout,
                 )
         except Exception:
             logger.exception("[OmniEngine] Failed to join Orchestrator thread")

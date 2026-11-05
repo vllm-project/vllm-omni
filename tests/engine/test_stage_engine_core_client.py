@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for StageEngineCoreClient.check_health()."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 from vllm import SamplingParams
-from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
+from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient, MPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.stage_engine_core_client import (
@@ -20,6 +20,15 @@ from vllm_omni.engine.stage_engine_core_client import (
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("client_cls", [StageEngineCoreClient, DPLBStageEngineCoreClient])
+@pytest.mark.parametrize("timeout, expected", [(None, 10.0), (0.0, 0.0), (0.1, 0.1), (27.0, 27.0)])
+def test_shutdown_reserves_finalization_time_and_preserves_explicit_deadline(client_cls, timeout, expected):
+    client = object.__new__(client_cls)
+    with patch.object(MPClient, "shutdown", autospec=True) as shutdown:
+        client.shutdown(timeout=timeout)
+    shutdown.assert_called_once_with(client, timeout=expected)
 
 
 def _make_client(*, engine_dead=False):
