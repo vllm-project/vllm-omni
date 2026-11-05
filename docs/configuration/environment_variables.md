@@ -118,9 +118,12 @@ no matching fixed-window recipe, or over-long/empty batches), the wrapper return
 Numerically, the path is **lossy for unmasked, absolute-positional encoders** (the
 fixed-window Whisper family, e.g. Covo-Audio-Chat): feature-off attends over the full
 extractor padding while the bucketed path attends over the smaller rung window, so the
-two outputs differ. **Mask-aware encoders stay lossless** (e.g. Step-Audio-2-mini, whose
-`AudioEncoder` masks padding via `make_non_pad_mask`): the on/off outputs are identical
-in fp32 and nearly identical in bfloat16.
+two outputs differ. **Mask-aware encoders keep the encoder output numerically
+unchanged** (e.g. Step-Audio-2-mini, whose `AudioEncoder` masks padding via
+`make_non_pad_mask`): the on/off encoder outputs are identical in fp32 and nearly
+identical in bfloat16. This is a numerical comparison at the encoder boundary; it
+does not establish end-to-end transcript equivalence (see the Step-Audio-2-mini
+measurement below).
 
 Measured on the real checkpoints, the main numbers are (reference data; the exact
 values depend on the actual audio length distribution):
@@ -129,9 +132,20 @@ values depend on the actual audio length distribution):
   24.5% -> 24.7% (off -> on) on LibriSpeech test-clean, ~1.85x encoder speedup, and
   E2E at max-concurrency 16: TTFT P50 104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2
   req/s (+21.7%).
-* Step-Audio-2-mini (lossless): on/off cosine 1.0 in fp32 (~0.997 in bfloat16), WER
-  1.6% -> 1.5% on LibriSpeech test-clean (greedy), and 1.62-3.7x encoder speedup
-  depending on the batch length mix.
+* Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
+  bfloat16), and 1.62-3.7x encoder speedup depending on the batch length mix.
+  End-to-end WER is contributor-reported from one `benchmarks/encoder_bucketing_wer.py`
+  run (single RTX 5090 32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
+  temperature 0, repetition penalty 1.05, seed 42; buckets 2,4,8,16,30 s; same
+  checkout with the feature off -> on) on LibriSpeech test-clean clips of <= 29 s
+  (199 clips measured): 1.58% -> 1.54% (off -> on) on the 197/199 clips that stay
+  clean in both passes, and 9.55% -> 17.45% over all 199 clips, including one
+  clean-to-rambling transition (a clean off transcript becomes over-generated
+  with bucketing on). The clean cohort keeps only clips that neither over- nor
+  under-generate in either pass, using a reference-length filter that never looks
+  at which configuration produced the clip; it removes task failures, not
+  recognition errors. These are contributor-reported measurements, not
+  independently reproduced results.
 
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_MODULES` | Regex | Overrides the wrapped-module name pattern (default matches names ending in `encoder`, `audio_encoder`, `speech_encoder`, `audio_tower`, or `whisper_encoder`) | Use to opt in module names outside the default pattern, e.g. `reference_encoder`. | Experimental |
