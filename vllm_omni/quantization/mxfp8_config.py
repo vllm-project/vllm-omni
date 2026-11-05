@@ -80,9 +80,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_MXFP8_SCALE_METHODS = {"ocp": 0, "amax_pow2_ceil": 1}
 
-def _mx_scale_alg() -> int:
-    return int(os.environ.get("VLLM_OMNI_MXFP8_SCALE_ALG", "0"))
+
+def _mx_scale_method_to_alg() -> int:
+    """Translate the named block-scale selection method at the CANN boundary."""
+    method = os.environ.get("VLLM_OMNI_MXFP8_SCALE_METHOD", "ocp")
+    if method not in _MXFP8_SCALE_METHODS:
+        raise ValueError("VLLM_OMNI_MXFP8_SCALE_METHOD must be 'ocp' or 'amax_pow2_ceil'")
+    return _MXFP8_SCALE_METHODS[method]
 
 
 def _current_denoise_step() -> int | None:
@@ -496,7 +502,7 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
         return torch_npu.npu_dynamic_mx_quant(
             x,
             dst_type=torch_npu.float8_e4m3fn,
-            scale_alg=_mx_scale_alg(),
+            scale_alg=_mx_scale_method_to_alg(),
         )
 
     def _quant_matmul(
@@ -604,7 +610,7 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
         weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(
             layer.weight,
             dst_type=torch_npu.float8_e4m3fn,
-            scale_alg=_mx_scale_alg(),
+            scale_alg=_mx_scale_method_to_alg(),
         )
 
         # Normalize to canonical layout shared with offline path.
