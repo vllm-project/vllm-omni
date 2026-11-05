@@ -15,8 +15,8 @@
 # limitations under the License.
 
 # Vendored from NVIDIA-NeMo/Speech (branch nemotron-labs-voicechat) nemo/collections/speechlm2/modules/ear_tts_model.py; training-only code removed.
-# NOTE: DuplexEARTTS (duplex_ear_tts.py) imports RVQEARTTSModel from THIS file, not from
-# rvq_ear_tts_model.py — both variants are vendored to match upstream exactly.
+# NOTE: DuplexEARTTS (duplex_ear_tts.py) imports RVQEARTTSModel from this file, not rvq_ear_tts_model.py.
+# Local changes: CharAwareSubwordEncoder.prepare_inputs packs character IDs on the host; forward reuses the mask width.
 
 import json
 import math
@@ -858,6 +858,7 @@ class CharAwareSubwordEncoder(nn.Module):
         max_len = max(lengths, default=0)
         # Character metadata is already on the host; pack it before transfer.
         padded_chars = [chars + [self.char_padding_idx] * (max_len - len(chars)) for chars in char_id_list]
+        # Keep empty selections two-dimensional: torch.tensor([]) has shape (0,).
         char_ids = torch.tensor(padded_chars, dtype=torch.long, device=device).reshape(len(lengths), max_len)
         char_lengths = torch.tensor(lengths, dtype=torch.long, device=device)
 
