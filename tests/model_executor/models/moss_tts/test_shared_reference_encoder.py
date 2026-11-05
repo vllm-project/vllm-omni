@@ -113,7 +113,13 @@ def test_client_round_trip_and_per_clip_errors(host_dir):
 def test_host_merges_clips_from_concurrent_clients(host_dir):
     gate = threading.Event()
     recorder = _Recorder(gate)
-    host = shared.SharedReferenceEncoderHost(host_dir, [(recorder, None)])
+    entered = threading.Event()
+
+    def encode(wavs):
+        entered.set()
+        return recorder(wavs)
+
+    host = shared.SharedReferenceEncoderHost(host_dir, [(encode, None)])
     try:
         results = {}
 
@@ -123,16 +129,20 @@ def test_host_merges_clips_from_concurrent_clients(host_dir):
         # Encoding is held until both clients' clips are queued.
         warm = threading.Thread(target=lambda: host.encode([torch.full((1, 10), 1.0)]))
         warm.start()
+        assert entered.wait(2), "warm singleton must enter the encoder before clients queue"
         threads = [threading.Thread(target=send, args=(n, v)) for n, v in (("a", 2.0), ("b", 4.0))]
         for thread in threads:
             thread.start()
-        threading.Timer(0.5, gate.set).start()
+        with host._ready:
+            assert host._ready.wait_for(lambda: len(host._pending) == 4, timeout=2)
+        gate.set()
         for thread in (warm, *threads):
             thread.join(10)
         # Both clients' clips were encoded together, not one request at a time.
         assert sum(recorder.batches) == 5 and max(recorder.batches) >= 4
         assert all(int(c[0, 0]) == 2 for c in results["a"]) and all(int(c[0, 0]) == 4 for c in results["b"])
     finally:
+        gate.set()
         host.close()
 
 

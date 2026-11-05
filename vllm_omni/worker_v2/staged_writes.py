@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _installed = False
+# Match upstream `_apply_write_kernel`: one program per 1024-element chunk.
+_WRITE_BLOCK_SIZE = 1024
 
 
 class _PendingWrite(NamedTuple):
@@ -192,6 +194,7 @@ def install() -> None:
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
         self._staged_len += size
+        self._staged_write_max_len = max(self._staged_write_max_len, size)
         self._staged_write_cu_lens.append(self._staged_len)
 
     def stage_write_elem(self, index: int, x) -> None:
@@ -204,6 +207,7 @@ def install() -> None:
         else:
             contents.append([x])
         self._staged_len += 1
+        self._staged_write_max_len = max(self._staged_write_max_len, 1)
         self._staged_write_cu_lens.append(self._staged_len)
 
     def apply_write(self) -> None:
@@ -230,12 +234,14 @@ def install() -> None:
             self._staged_write_contents = []
             self._staged_write_cu_lens = []
             self._staged_len = 0
+            self._staged_write_max_len = 0
             return
         indices_uva = self.write_indices.copy_to_uva(np.asarray(self._staged_write_indices, dtype=np.int32))
         starts_uva = self.write_starts.copy_to_uva(np.asarray(self._staged_write_starts, dtype=np.int32))
         cu_lens_uva = self.write_cu_lens.copy_to_uva(np.asarray(self._staged_write_cu_lens, dtype=np.int32))
         contents_uva = self.write_contents.copy_to_uva(_concat(self._staged_write_contents, self._np_dtype))
-        apply_kernel[(n,)](
+        n_chunks = max(triton.cdiv(self._staged_write_max_len, _WRITE_BLOCK_SIZE), 1)
+        apply_kernel[(n, n_chunks)](
             self.gpu,
             self.gpu.stride(0),
             indices_uva,
@@ -243,7 +249,7 @@ def install() -> None:
             contents_uva,
             cu_lens_uva,
             None,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=_WRITE_BLOCK_SIZE,
             MULTI_GROUP=False,
         )
         self.clear_staged_writes()
@@ -254,6 +260,7 @@ def install() -> None:
         self._staged_write_contents.clear()
         self._staged_write_cu_lens.clear()
         self._staged_len = 0
+        self._staged_write_max_len = 0
 
     def fused_init(self, device, max_writes, max_concurrency=None):
         orig_fused_init(self, device, max_writes, max_concurrency)
@@ -266,6 +273,7 @@ def install() -> None:
         chunks: list[np.ndarray] = []
         cu_lens: list[np.ndarray] = []
         base = 0
+        max_len = 0
         for group_id, t in enumerate(tensors):
             n = len(t._staged_write_indices)
             if n == 0:
@@ -276,6 +284,7 @@ def install() -> None:
             chunks.extend(t._staged_write_contents)
             cu_lens.append(np.asarray(t._staged_write_cu_lens, dtype=np.int32) + base)
             base += t._staged_len
+            max_len = max(max_len, t._staged_write_max_len)
         if not group_ids:
             return
         group_ids_uva = self.group_ids.copy_to_uva(np.asarray(group_ids, dtype=np.int32))
@@ -283,7 +292,8 @@ def install() -> None:
         starts_uva = self.starts.copy_to_uva(np.asarray(starts, dtype=np.int32))
         cu_lens_uva = self.cu_lens.copy_to_uva(_concat(cu_lens, np.dtype(np.int32)))
         contents_uva = self.contents.copy_to_uva(_concat(chunks, np.dtype(np.int32)))
-        apply_kernel[(len(group_ids),)](
+        n_chunks = max(triton.cdiv(max_len, _WRITE_BLOCK_SIZE), 1)
+        apply_kernel[(len(group_ids), n_chunks)](
             output_ptrs,
             output_strides,
             indices_uva,
@@ -291,7 +301,7 @@ def install() -> None:
             contents_uva,
             cu_lens_uva,
             group_ids_uva,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=_WRITE_BLOCK_SIZE,
             MULTI_GROUP=True,
         )
         for t in tensors:
