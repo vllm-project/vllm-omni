@@ -422,12 +422,14 @@ class AudexCausalSpeechDecoderModel(PreTrainedModel):
         chunk_frames: int = 1,
         sample_rate: int | None = None,
         return_numpy: bool = True,
+        graph_runner: Any = None,
     ) -> AudexCausalSpeechDecoderSession:
         return AudexCausalSpeechDecoderSession(
             decoder=self,
             chunk_frames=chunk_frames,
             sample_rate=sample_rate or self.config.sample_rate,
             return_numpy=return_numpy,
+            graph_runner=graph_runner,
         )
 
     def forward(
@@ -447,6 +449,7 @@ class AudexCausalSpeechDecoderSession:
         chunk_frames: int,
         sample_rate: int,
         return_numpy: bool,
+        graph_runner: Any = None,
     ):
         if chunk_frames <= 0:
             raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
@@ -454,6 +457,7 @@ class AudexCausalSpeechDecoderSession:
         self.chunk_frames = chunk_frames
         self.sample_rate = sample_rate
         self.return_numpy = return_numpy
+        self._graph_runner = graph_runner
         self.cache = decoder.create_cache()
         self.buffer: list[list[int]] = []
 
@@ -487,6 +491,24 @@ class AudexCausalSpeechDecoderSession:
 
     def _decode_buffered_frames(self, emit_frames: int, *, flush: bool) -> torch.Tensor:
         with torch.inference_mode():
+            # Steady-state chunks (full emit width, complete lookahead window)
+            # can be served by a CUDA-graphed replay; anything else — the
+            # flush tail with padded lookahead, a different emit width, or a
+            # position past the runner's cap — falls through to the eager
+            # path below, which is always correct.
+            if self._graph_runner is not None and emit_frames == self.chunk_frames:
+                lookahead = self.decoder.lookahead_steps
+                future = self.buffer[emit_frames : emit_frames + lookahead] if lookahead else []
+                if len(future) == lookahead and all(len(frame) == 1 for frame in self.buffer[:emit_frames + lookahead]):
+                    wav = self._graph_runner.decode(
+                        [frame[0] for frame in self.buffer[:emit_frames]],
+                        [frame[0] for frame in future],
+                        self.cache,
+                    )
+                    if wav is not None:
+                        # the runner returns a view of a static output buffer
+                        # reused by the next replay
+                        return wav.clone()
             vq_emb = self._embed_speech_token_frames(self.buffer[:emit_frames])
             lookahead_vq_emb = None
             if self.decoder.lookahead_steps > 0:
