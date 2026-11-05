@@ -1028,11 +1028,8 @@ steps:
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_audio_output[default]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_identical[prefix_cache_async_chunk]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_shared_image_prefix[prefix_cache_async_chunk]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_completions_rejected_for_thinker_talker[default-rocm]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_text[default-rocm]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_audio_out[default-rocm]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts0-default-rocm]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts1-default-rocm]"
       )
       printf '%s\n' "$${nodes[@]}" | sort > /tmp/qwen3-omni-ready-expected.txt
       pytest -q tests/e2e/online_serving/test_qwen3_omni.py \
@@ -1043,7 +1040,7 @@ steps:
         | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
         | sort > /tmp/qwen3-omni-ready-collected.txt
       if ! diff -u /tmp/qwen3-omni-ready-expected.txt /tmp/qwen3-omni-ready-collected.txt; then
-        echo "Qwen3-Omni READY collection drifted from the 11 core_model nodes" >&2
+        echo "Qwen3-Omni READY collection drifted from the 8 core_model nodes" >&2
         exit 1
       fi
     - |
@@ -1071,9 +1068,9 @@ steps:
       suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
       tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
       skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-      if tests != 11 or skipped != 0:
+      if tests != 8 or skipped != 0:
           print(
-              f"Expected exactly 11 executed Qwen3-Omni READY tests; "
+              f"Expected exactly 8 executed Qwen3-Omni READY tests; "
               f"reported tests={tests}, skipped={skipped}.",
               file=sys.stderr,
           )

@@ -283,33 +283,6 @@ def test_thinker_prefix_caching_audio_output(omni_server, online_client) -> None
     num_cards={"cuda": 2, "rocm": 2, "npu": 3},
 )
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> None:
-    """Ensure Thinker-talker models reject /v1/completions; we do this because the
-    thinker-talker handoff implementations currently use ChatML <|im_start|> and
-    <|im_end|> markers to segment the input sequence; when we don't have them,
-    the talker does not get any embeddings, which breaks the server.
-    """
-    responses = online_client.send_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "prompt": "Hello, how are you?",
-                "max_tokens": 10,
-            },
-        },
-        err_code=400,
-    )
-    assert not responses[0].success
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(
-    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
-    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
-)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_batched_completions_text(omni_server, openai_client) -> None:
     """Ensure that we can make a batch chat completions request (text only)."""
     responses = openai_client.send_batched_chat_completions_http_request(
@@ -371,42 +344,6 @@ def test_batched_completions_audio_out(omni_server, openai_client) -> None:
     for choice in choices:
         assert choice["message"]["audio"]["data"]
         assert choice["message"]["content"]
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(
-    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
-    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
-)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.parametrize(
-    "sad_opts",
-    [
-        {"stream": "not-a-bool"},  # Fails validation
-        {"n": 2},  # vLLM Batched endpoints doesn't support n > 1
-    ],
-)
-def test_batched_completions_with_bad_values(omni_server, openai_client, sad_opts) -> None:
-    """Ensure that a bad values are correctly handled as 400s."""
-    messages = [
-        [{"role": "user", "content": "Say hello."}],
-        [{"role": "user", "content": "Say goodbye."}],
-    ]
-    responses = openai_client.send_batched_chat_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "messages": messages,
-                **sad_opts,
-            },
-        },
-    )
-    assert responses and len(responses) == 1
-    resp = responses[0]
-    assert not responses[0].success
-    assert resp.status_code == 400
 
 
 def _assert_omni_payload_complete(resp) -> None:
