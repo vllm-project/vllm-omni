@@ -333,7 +333,8 @@ class _MiniDiT(nn.Module):
             # Simulate Attention: att_cache contributes a bias when non-empty.
             # Upstream: if att_cache[b_idx] is None, skips cat entirely (different path).
             att_b = att_cache[b_idx] if att_cache is not None else None
-            if att_b is not None and att_b.shape[3] > 0:
+            # att_b is (B, 1, old_att_len, hidden): the frame axis is dim 2.
+            if att_b is not None and att_b.shape[2] > 0:
                 x += att_b.sum(dim=(1, 2), keepdim=False).unsqueeze(1)
             x = self.blocks[b_idx](x)
             x = x + t

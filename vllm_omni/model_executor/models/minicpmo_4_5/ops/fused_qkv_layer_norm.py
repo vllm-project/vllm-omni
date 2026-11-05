@@ -131,8 +131,8 @@ def qkv_head_layer_norm(
             frame_index = positions[n] if positions is not None else torch.arange(frames, device=kv.device)
             written = frame_index >= 0
             destination = frame_index[written].to(kv.device)
-            kv[0, pool_row, destination] = keys[n][:, written]
-            kv[1, pool_row, destination] = values[n][:, written]
+            kv[0, pool_row, :, destination] = keys[n][:, written]
+            kv[1, pool_row, :, destination] = values[n][:, written]
         return q_out
     if batch * frames == 0:
         return q_out
