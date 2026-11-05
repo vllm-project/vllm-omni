@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 @pytest.fixture(params=["_SPATIAL_PAD_VERDICTS", "_CONV_OUT_LAYOUT_VERDICTS"])
 def verdict_cache(request, monkeypatch):
-    cache = weakref.WeakKeyDictionary()
+    cache: weakref.WeakKeyDictionary[nn.Module, dict[tuple, bool]] = weakref.WeakKeyDictionary()
     monkeypatch.setattr(fp, request.param, cache)
     return request.param, cache
 
@@ -133,8 +133,8 @@ def test_evicted_verdict_is_revalidated(verdict_cache, cpu_assembly, monkeypatch
             assert torch.equal(output, expected)
         assert len(cache[conv]) <= 2
 
-    # One comparison on random operands decides each new shape.
-    check = [matches]
+    # Acceptance requires all eight probes; rejection stops at the first mismatch.
+    check = [True] * 8 if matches else [False]
     run(4)
     run(5)
     assert comparisons == check * 2
@@ -206,7 +206,7 @@ def test_verdict_is_not_taken_from_degenerate_operands(
 @pytest.mark.parametrize("history", [None, 1, 2])
 def test_causal_conv_forward_shares_spatial_padding_verdicts(cpu_assembly, monkeypatch, matches: bool, history) -> None:
     """A normally called (e.g. hooked) convolution keeps the verified cuDNN padding path."""
-    cache = weakref.WeakKeyDictionary()
+    cache: weakref.WeakKeyDictionary[nn.Module, dict[tuple, bool]] = weakref.WeakKeyDictionary()
     monkeypatch.setattr(fp, "_SPATIAL_PAD_VERDICTS", cache)
     generator = torch.Generator().manual_seed(0)
     conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
@@ -234,7 +234,7 @@ def test_causal_conv_forward_shares_spatial_padding_verdicts(cpu_assembly, monke
     monkeypatch.setattr(fp, "_bitwise_equal", compare)
     for _ in range(2):
         assert torch.equal(fp.causal_conv_forward(conv, x, cache_x), expected)
-    check = [matches]
+    check = [True] * 8 if matches else [False]
     assert comparisons == check  # Verified once, then reused.
     assert list(cache[conv].values()) == [matches]
     # The cached call site shares the verdict instead of probing again.

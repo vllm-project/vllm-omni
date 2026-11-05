@@ -2805,6 +2805,10 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
     assert sampled is not None
+    # Keep the complete token that reaches the soft character target.
+    assert sampled.sampled_token_ids.tolist() == [[candidate]]
+    sampling_metadata.output_token_ids[0].append(candidate)
+    sampled = model.sample(logits, sampling_metadata)
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
 

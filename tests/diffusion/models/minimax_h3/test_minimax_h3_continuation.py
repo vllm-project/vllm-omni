@@ -133,6 +133,27 @@ def test_global_offset_moves_temporal_references_but_not_images_or_padding():
             torch.testing.assert_close(shifted[key], value)
 
 
+def test_global_offset_moves_image_timeline_guides_with_the_window():
+    kwargs = dict(
+        text_len=3,
+        latent_t=12,
+        latent_h=4,
+        latent_w=4,
+        audio_t=68,
+        guide_blocks=[
+            {"kind": "video_audio", "frame_index": 0, "ref_audio_t": 37, "latent_t": 7, "latent_h": 4, "latent_w": 4},
+            {"kind": "image", "frame_index": 82, "latent_h": 4, "latent_w": 4},
+        ],
+        ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}],
+    )
+    base = minimax_h3_packed_sequence_ref2va_blocks(**kwargs)
+    shifted = minimax_h3_packed_sequence_ref2va_blocks(**kwargs, temporal_offset=425.0)
+    delta = (shifted["img_position_ids"] - base["img_position_ids"])[:, 0]
+    guide_rows = slice(3, 3 + 7 * 4 + 2 * 37 + 4)
+    torch.testing.assert_close(delta[guide_rows], torch.full_like(delta[guide_rows], 425))
+    assert torch.count_nonzero(delta[guide_rows.stop : guide_rows.stop + 4]) == 0  # static image reference
+
+
 def test_long_ref2va_defaults_to_continuation_with_explicit_full_opt_out():
     assert resolve_continuation({"long_video": True}, task="ref2va", step_execution=False) == (277, 22)
     assert resolve_continuation({}, task="ref2va", step_execution=False) is None
