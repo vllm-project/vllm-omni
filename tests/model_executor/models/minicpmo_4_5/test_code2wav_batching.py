@@ -2388,6 +2388,9 @@ def test_ragged_cfm_mask_preserves_query_and_cache_validity(offsets):
     def replay(**kwargs):
         mask = kwargs["attn_mask"]
         cache_lengths = offsets or (0, 0)
+        # Whole-Euler replay receives B noise rows but a 2B CFG mask.
+        # The Euler loop duplicates each request's noise for both CFG branches.
+        assert kwargs["x"].shape[0] == len(cache_lengths)
         for row, start in enumerate(cache_lengths):
             torch.testing.assert_close(kwargs["x"][row, 0], torch.arange(start, start + 3, dtype=torch.float32))
         expected = torch.zeros(4, 3, 3 + max(cache_lengths), dtype=torch.bool)

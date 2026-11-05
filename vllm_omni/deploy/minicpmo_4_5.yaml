@@ -59,7 +59,7 @@ connectors:
       # one padded CFM solve with per-request masks, noise offsets and cache
       # trimming; HiFT runs in compatible subgroups. CNN/HiFT cache shapes,
       # dtypes, devices and the configured cache-epoch policy still constrain
-      # batching. No effect off NPU; set false to restore same-shape batching.
+      # batching. No effect off NPU.
       # Opt in by setting this to true in a deployment copy or overlay.
       # Keep same-shape batching as the shipped default while broader
       # production mixed-history occupancy is evaluated.
