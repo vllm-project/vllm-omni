@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+import time
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -59,6 +60,32 @@ def test_qwen3_tts_npu_mrv2_serves_audio(omni_server, online_client, stream):
     online_client.send_audio_speech_request(request_config)
 
 
+def _wait_for_no_running_requests(metrics_url: str, timeout_s: float = 120.0) -> None:
+    """Wait until Omni reports that both active and queued requests are gone."""
+    import requests
+
+    metric_names = ("vllm_omni:num_requests_running", "vllm_omni:num_requests_waiting")
+    deadline = time.monotonic() + timeout_s
+    latest: dict[str, list[float]] = {}
+    while time.monotonic() < deadline:
+        response = requests.get(metrics_url, timeout=5)
+        response.raise_for_status()
+        samples: dict[str, list[float]] = {name: [] for name in metric_names}
+        for line in response.text.splitlines():
+            for name in metric_names:
+                if line.startswith(f"{name}{{"):
+                    try:
+                        samples[name].append(float(line.rsplit(maxsplit=1)[1]))
+                    except (IndexError, ValueError):
+                        continue
+        latest = samples
+        if all(samples[name] and all(value == 0 for value in samples[name]) for name in metric_names):
+            return
+        time.sleep(1)
+
+    pytest.fail(f"Omni did not release the aborted request within {timeout_s:.0f}s; latest request gauges: {latest}")
+
+
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"npu": "A3"}, num_cards=1)
@@ -81,12 +108,9 @@ def test_qwen3_tts_npu_mrv2_stream_abort_and_long_input(omni_server, openai_clie
     import requests
 
     url = f"{openai_client.base_url.rstrip(chr(47))}/v1/audio/speech"
-    long_text = " ".join(
-        [
-            "The weather is nice today, and the warm sunlight makes the garden feel peaceful.",
-            "We can take a walk beside the river, listen to the birds, and talk about the books we enjoy.",
-        ]
-    )
+    sentence = "The weather is nice today, and the warm sunlight makes the garden feel peaceful."
+    long_text = " ".join([sentence] * 64)
+    assert len(long_text.split()) > 512
     payload = {
         "model": omni_server.model,
         "input": long_text,
@@ -103,6 +127,9 @@ def test_qwen3_tts_npu_mrv2_stream_abort_and_long_input(omni_server, openai_clie
         assert response.status_code == 200, response.text[:200]
         first_chunk = next((chunk for chunk in response.iter_content(chunk_size=None) if chunk), b"")
         assert first_chunk, "stream returned no audio before disconnect"
+
+    metrics_url = f"{openai_client.base_url.rstrip(chr(47))}/metrics"
+    _wait_for_no_running_requests(metrics_url)
 
     full_response = requests.post(
         url,

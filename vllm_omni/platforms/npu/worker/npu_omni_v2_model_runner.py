@@ -232,7 +232,14 @@ class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
 
 
 class NPUOmniGenerationModelRunner(OmniGenerationModelRunner, NPUModelRunner):
-    """Non-autoregressive Omni generation stages on Ascend Model Runner V2."""
+    """Attention-free Omni generation stages on Ascend Model Runner V2.
+
+    Omni's load and capture wrappers are first in the MRO and use cooperative
+    super() calls, which continue into Ascend's runner. Input preparation,
+    dummy batches, forward context, and KV initialization explicitly use the
+    Ascend implementations below. Code2Wav is the supported generation stage;
+    it has no paged KV or slot mapping.
+    """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         _default_ascend_decode_graph_flag()
@@ -280,7 +287,12 @@ class NPUOmniGenerationModelRunner(OmniGenerationModelRunner, NPUModelRunner):
 
         if "cudagraph_runtime_mode" in kwargs:
             kwargs["aclgraph_runtime_mode"] = kwargs.pop("cudagraph_runtime_mode")
-        kwargs.pop("slot_mapping", None)
+        slot_mapping = kwargs.pop("slot_mapping", None)
+        if slot_mapping is not None:
+            raise NotImplementedError(
+                "NPU Omni generation stages do not support slot_mapping; use this runner only for "
+                "attention-free stages such as Code2Wav."
+            )
         kwargs.pop("is_padding", None)
         kwargs.setdefault("model_instance", getattr(self, "model", None))
         return set_ascend_forward_context(attn_metadata, vllm_config, **kwargs)

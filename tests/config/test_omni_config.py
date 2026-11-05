@@ -1159,6 +1159,18 @@ def test_qwen3_tts_mrv2_profile_enables_npu_for_both_stages():
     assert default_npu.model_runner == "v1"
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "qwen3_tts_high_concurrency_mrv2.yaml",
+        "qwen3_tts_high_concurrency_mrv2_b4.yaml",
+    ],
+)
+def test_qwen3_tts_high_concurrency_mrv2_profiles_keep_npu_on_v1(filename):
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform="npu")
+    assert deploy.model_runner == "v1"
+
+
 def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
     mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")

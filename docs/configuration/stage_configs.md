@@ -582,9 +582,9 @@ to opt in on NPU. XPU, ROCm and MUSA stay on V1. Select one of these profiles:
 | --- | --- | --- | --- |
 | `qwen3_tts.yaml` | CUDA V2; NPU V1 | Existing defaults | Shipped default; experimental |
 | `qwen3_tts_mrv2.yaml` | CUDA/NPU V2 | B1 | Explicit MRV2 profile; opts NPU into V2 |
-| `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
-| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
-| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
+| `qwen3_tts_high_concurrency_mrv2.yaml` | CUDA V2; NPU V1 | B1, B2 | Opt-in throughput tuning |
+| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | CUDA V2; NPU V1 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | CUDA V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
 | `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 

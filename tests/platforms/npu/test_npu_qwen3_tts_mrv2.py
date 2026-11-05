@@ -36,9 +36,9 @@ def test_qwen3_tts_state_factory_selects_npu_and_generic_states(monkeypatch):
 
     factory = Qwen3TTSTalkerForConditionalGeneration.create_mrv2_model_state
     npu_result = factory(object(), None, None, torch.device("npu"))
-    cpu_result = factory(object(), None, None, torch.device("cpu"))
+    cuda_result = factory(object(), None, None, torch.device("cuda"))
     assert npu_result == "npu-state"
-    assert cpu_result == "omni-state"
+    assert cuda_result == "omni-state"
     assert [call[0] for call in calls] == ["npu", "omni"]
 
 
@@ -81,6 +81,20 @@ def test_generation_worker_selects_stage_runner(monkeypatch, use_v2):
     assert worker.model_runner.config is worker.vllm_config
 
 
+def test_npu_generation_runner_mro_preserves_ascend_backend_methods():
+    from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+
+    from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniGenerationModelRunner
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    mro = NPUOmniGenerationModelRunner.__mro__
+    assert mro.index(NPUModelRunner) > mro.index(OmniGPUModelRunner)
+    assert NPUOmniGenerationModelRunner.load_model is OmniGPUModelRunner.load_model
+    assert NPUOmniGenerationModelRunner.capture_model is OmniGPUModelRunner.capture_model
+    assert NPUOmniGenerationModelRunner._dummy_run is NPUModelRunner._dummy_run
+    assert NPUOmniGenerationModelRunner.initialize_kv_cache.__qualname__.startswith("NPUOmniGenerationModelRunner.")
+
+
 def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch):
     from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
@@ -119,7 +133,7 @@ def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch
         "config",
         num_tokens=7,
         cudagraph_runtime_mode="PIECEWISE",
-        slot_mapping=object(),
+        slot_mapping=None,
         is_padding=True,
     )
     assert result is context
@@ -128,3 +142,10 @@ def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch
         "aclgraph_runtime_mode": "PIECEWISE",
         "model_instance": "model-instance",
     }
+    with pytest.raises(NotImplementedError, match="slot_mapping"):
+        NPUOmniGenerationModelRunner._forward_context(
+            runner,
+            None,
+            "config",
+            slot_mapping=object(),
+        )
