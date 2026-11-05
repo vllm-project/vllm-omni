@@ -373,6 +373,74 @@ def test_streaming_attention_rejects_vdn_before_running_kernels(vdn_window):
         )
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"reference_kv_state": object()},
+        {"reference_kv_compact": True},
+        {"reference_kv_layer_index": 3},
+    ],
+    ids=["state", "compact", "layer_index"],
+)
+def test_streaming_attention_rejects_reference_kv_reuse(kwargs):
+    """Any reference-KV request inside a streaming context fails fast, including
+    a lone ``reference_kv_layer_index`` that the guard previously ignored."""
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.models.taomate_h3.attention import (
+        StreamContext,
+        TaoMateH3StreamingAttention,
+        stream_context,
+    )
+
+    attention = object.__new__(TaoMateH3StreamingAttention)
+    nn.Module.__init__(attention)
+    attention.layer_name = "blocks.0.attn"
+    with (
+        stream_context(Mock(spec=StreamContext)),
+        pytest.raises(ValueError, match="does not support reference KV reuse"),
+    ):
+        attention(
+            torch.zeros(2, 4),
+            rope_table=None,
+            cu_seqlens=torch.tensor([0, 2]),
+            max_seqlen=2,
+            **kwargs,
+        )
+
+
+def test_streaming_attention_forwards_reference_kv_kwargs_on_base_path(monkeypatch):
+    """Outside a streaming context (refiner / teacher path) the three
+    reference-KV kwargs reach ``MiniMaxH3Attention.forward`` unchanged."""
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.models.taomate_h3.attention import (
+        MiniMaxH3Attention,
+        TaoMateH3StreamingAttention,
+    )
+
+    attention = object.__new__(TaoMateH3StreamingAttention)
+    nn.Module.__init__(attention)
+    attention.layer_name = None
+    hidden = torch.zeros(2, 4)
+    base_forward = Mock(return_value=hidden)
+    monkeypatch.setattr(MiniMaxH3Attention, "forward", base_forward)
+    kv_state = object()
+    output = attention(
+        hidden,
+        rope_table=None,
+        cu_seqlens=torch.tensor([0, 2]),
+        max_seqlen=2,
+        reference_kv_state=kv_state,
+        reference_kv_layer_index=3,
+        reference_kv_compact=False,
+    )
+    assert output is hidden
+    assert base_forward.call_args.kwargs["reference_kv_state"] is kv_state
+    assert base_forward.call_args.kwargs["reference_kv_layer_index"] == 3
+    assert base_forward.call_args.kwargs["reference_kv_compact"] is False
+
+
 # ----------------------------------------------------------------------------
 # LoRA adapter
 
@@ -1516,3 +1584,11 @@ def test_streaming_attention_preserves_minimax_forward_contract() -> None:
         assert name in streaming, name
         if param.kind is Parameter.KEYWORD_ONLY:
             assert streaming[name].kind is Parameter.KEYWORD_ONLY, name
+        assert streaming[name].default == param.default, (
+            f"{name}: streaming default {streaming[name].default!r} diverges from base {param.default!r}"
+        )
+    for name, param in streaming.items():
+        if name not in base:
+            assert param.default is not Parameter.empty, (
+                f"{name}: streaming-only parameter must have a default so base callers stay valid"
+            )

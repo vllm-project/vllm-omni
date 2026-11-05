@@ -181,7 +181,7 @@ class TaoMateH3StreamingAttention(MiniMaxH3Attention):
                 reference_kv_compact=reference_kv_compact,
                 vdn_window=vdn_window,
             )
-        if reference_kv_state is not None or reference_kv_compact:
+        if reference_kv_state is not None or reference_kv_layer_index is not None or reference_kv_compact:
             raise ValueError("TaoMate-H3 streaming attention does not support reference KV reuse")
         if vdn_window is not None:
             raise ValueError("TaoMate-H3 streaming attention does not support VDN windows")
