@@ -221,6 +221,33 @@ must schedule at least two chunks: a one-chunk cold request skips the sink that
 every continuation reads, so CausVidWan refuses it rather than letting the next
 request fail on the sink owner alone.
 
+### Capacity feedback and placement
+
+Admission and the worker are two halves of one loop. The scheduler reserves a
+session's increment (`SessionCapacityLedger.reserve`); after each batch the worker
+reports what the session's pool key actually holds as `CapacityUsage` (logical
+versions plus worker bytes), and the ledger reconciles it against the grant.
+Holding more than the grant is an overcommit: it cannot be paid for out of another
+session's budget, so the request fails closed instead of continuing on borrowed
+capacity, and the session's retained history is released with it (the ledger keeps
+the overcommit record). A batch wave reconciles every retained session it ran before
+failing. Reset and close report the empty holding before the key is released, so
+the ledger does not drift from the worker; an ephemeral request id with no grant
+leaves no ledger entry. The ledger is opt-in (`bind_capacity_ledger`): no scheduler
+binds one yet, so a deployment without it behaves as before.
+
+Retention and the live window share one pool, so the worker-side window stays a
+fixed startup quota; the ledger is its admission-side counterpart and does not
+resize the pool at runtime. Reporting both directions is what keeps the numbers
+aligned, not a dynamic resize.
+
+Session placement is the other half. `SessionRouter` (worker side) and `StagePool`
+(engine side) both bind a session to the replica that holds it: the first request
+binds, a follow-up must find its owner, and a lost owner is refused or explicitly
+restarted cold with the loss recorded. Two replicas of one stage each own their own
+history, so a follow-up served by a replica that never held the session is a cold
+start by definition and must not be reported as a continuation.
+
 ## Configuration
 
 | Layer | Key | Meaning |

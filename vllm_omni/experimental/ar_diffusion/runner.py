@@ -32,6 +32,11 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVCon
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.reservation import (
+    CapacityUsage,
+    ReservationOvercommitError,
+    SessionCapacityLedger,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -127,6 +132,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
+        # Admission-side capacity ledger for session pool keys (roadmap 2.3). Opt-in:
+        # a deployment without a ledger behaves exactly as before.
+        self._capacity_ledger: SessionCapacityLedger | None = None
         self._perf_e2e_times: list[float] = []
         # Wall-clock start of each request's in-flight stepwise chunk, so
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
@@ -491,11 +499,51 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         persist = explicit and not close_session
         return kv_id, persist, reset, close_session
 
+    def bind_capacity_ledger(self, ledger: SessionCapacityLedger | None) -> None:
+        """Install the scheduler's session capacity ledger for this worker."""
+        self._capacity_ledger = ledger
+
+    def _report_session_capacity(self, kv_id: str, *, fail_closed: bool = True) -> None:
+        """Report what a session pool key actually holds so the ledger can reconcile.
+
+        This is the worker half of the reservation loop: admission reserved the
+        increment, and after the batch the worker states the truth. Holding more
+        than the grant is an overcommit -- it cannot be paid for out of another
+        session's budget -- so the request fails closed instead of continuing on
+        borrowed capacity. Teardown reports with ``fail_closed=False``: releasing a
+        key must not turn into a second failure.
+        """
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is None or self.noisy_kv_cache is None:
+            return
+        versions, nbytes = self.noisy_kv_cache.session_usage(kv_id)
+        if not versions and ledger.grant(kv_id) is None and ledger.usage(kv_id) is None:
+            # Nothing reserved and nothing held (an ephemeral request id): there is
+            # no ledger entry to keep in step, so do not create one per request.
+            return
+        try:
+            ledger.reconcile(kv_id, CapacityUsage(versions=versions, bytes=nbytes))
+        except ReservationOvercommitError:
+            logger.warning(
+                "AR-Diffusion session=%s exceeded its capacity grant (%d bytes, %d versions)",
+                kv_id,
+                nbytes,
+                versions,
+            )
+            if fail_closed:
+                # Fail closed means the retained history goes too, or the next
+                # continuation would keep running on the unreserved capacity. The
+                # ledger keeps the overcommit record for the scheduler.
+                NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+                raise
+
     def release_noisy_kv(self, kv_id: str) -> None:
         """Drop retained Noisy KV versions for ``kv_id`` (outer session reset/close)."""
         if self.noisy_kv_cache is None:
             return
         NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+        # Report the empty holding so the ledger never drifts from the worker.
+        self._report_session_capacity(kv_id, fail_closed=False)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
     def _make_chunk_context(self, *, batch: ARDiffusionBatch | None = None):
@@ -551,6 +599,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     kv_id,
                 )
                 raise
+            if persist:
+                # Worker half of the reservation loop; raises on overcommit and
+                # leaves the request failed rather than continuing on borrowed
+                # capacity.
+                self._report_session_capacity(kv_id)
             if close_session or not persist:
                 # Ephemeral requests and explicit close drop the pool key; a
                 # persistent session_id leaves retained history for the outer owner.
@@ -602,7 +655,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             ctx = self._make_chunk_context(batch=batch)
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
-                    return super().execute_model_batch(scheduler_output, od_config)
+                    output = super().execute_model_batch(scheduler_output, od_config)
             except Exception:
                 for kv_id in dict.fromkeys(batch_kv_ids):
                     ctx.kv.release_session(kv_id)
@@ -611,6 +664,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     list(dict.fromkeys(batch_kv_ids)),
                 )
                 raise
+            # Same worker report as request mode, per retained session of this wave.
+            # Every session is reconciled first; an overcommit has already released
+            # its own history, and the wave then fails as a whole.
+            overcommit: ReservationOvercommitError | None = None
+            for kv_id in dict.fromkeys(sid for sid in batch_sessions if sid is not None):
+                try:
+                    self._report_session_capacity(kv_id)
+                except ReservationOvercommitError as exc:
+                    overcommit = overcommit or exc
+            if overcommit is not None:
+                raise overcommit
+            return output
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )

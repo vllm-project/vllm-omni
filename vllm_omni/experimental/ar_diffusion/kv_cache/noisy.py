@@ -547,6 +547,19 @@ class NoisyKVCache:
     def clear_session_structure(self, kv_id: str) -> None:
         self._session_structural_keys.pop(kv_id, None)
 
+    def session_usage(self, kv_id: str) -> tuple[int, int]:
+        """(versions, bytes) the pool key ``kv_id`` currently holds.
+
+        ``versions`` is the logical retained-version count and the second value the
+        footprint of those versions. A pool key holds one block's layer, so each
+        version costs ``bytes_per_version``; ``reserved_bytes`` is the same unit
+        summed over every layer's slots. Both are what the scheduler's ledger
+        needs to reconcile a grant against reality; the physical layout stays
+        private to this pool.
+        """
+        versions = sum(1 for key in self.pool.keys if key[0] == kv_id)
+        return versions, versions * self.bytes_per_version
+
 
 def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
     """History cells to retain across requests for ``schedule``.
