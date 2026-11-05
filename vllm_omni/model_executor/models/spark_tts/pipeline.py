@@ -29,6 +29,8 @@ SPARK_TTS_PIPELINE = PipelineConfig(
             model_stage="spark_tts_bicodec",
             execution_type=StageExecutionType.LLM_GENERATION,
             model_arch="SparkBiCodecDecoder",
+            # Allow interpreter GC to finish after releasing codec resources.
+            shutdown_grace_s=15.0,
             model_subdir="BiCodec",
             tokenizer_subdir="LLM",
             input_sources=(0,),

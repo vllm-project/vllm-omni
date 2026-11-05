@@ -1078,6 +1078,7 @@ def _launch_omni_core_engines(
                         omni_coordinator_address=omni_coordinator_address,
                         omni_replica_base_id=replica_id,
                         omni_parallel_stage_init=omni_parallel_stage_init,
+                        shutdown_grace_s=getattr(stage_config, "shutdown_grace_s", None),
                     )
             else:
                 if omni_parallel_stage_init:
@@ -1221,6 +1222,7 @@ def launch_stage_replica(
             omni_replica_base_id=replica_id,
             omni_parallel_stage_init=omni_parallel_stage_init,
             omni_handshake_timeout_s=handshake_timeout_s,
+            shutdown_grace_s=getattr(stage_config, "shutdown_grace_s", None),
         )
 
     resources = StageReplicaResources(manager=engine_manager, addresses=addresses)
@@ -1303,6 +1305,7 @@ def launch_headless_llm_replica(
         omni_stage_id=stage_id,
         omni_coordinator_address=response.coordinator_router_address,
         omni_replica_base_id=response.replica_id,
+        shutdown_grace_s=getattr(stage_config, "shutdown_grace_s", None),
     )
     logger.info(
         "[Headless] Stage %d replica id=%d up (coord=%s)",
@@ -1561,6 +1564,8 @@ def launch_headless_diffusion_replicas(
         else stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
     )
     if omni_conn_cfg:
+        # The resolver returns both endpoints together with a connector config.
+        assert omni_from is not None and omni_to is not None
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the
