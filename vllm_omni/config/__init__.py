@@ -37,6 +37,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.config.yaml_util import (
     create_config,
     load_yaml_config,
@@ -87,6 +88,7 @@ __all__ = [
     "StageConfigFactory",
     "StageDeployConfig",
     "StageType",
+    "WatermarkConfig",
     "StageExecutionType",
     "StagePipelineConfig",
     "load_deploy_config",

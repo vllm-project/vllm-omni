@@ -81,8 +81,9 @@ generation stages, while diffusion stages keep their own LoRA fields on
 or projected through two config concerns. Effective-engine-argument tests cover
 both the dynamic mapping and this exclusion boundary.
 
-`CompilationConfig` and `ProfilerConfig` are direct structured-stage fields:
-`stage.compilation_config` and `stage.profiler_config`. They accept mapping/YAML
+`CompilationConfig`, `KernelConfig`, and `ProfilerConfig` are direct structured-stage
+fields: `stage.compilation_config`, `stage.kernel_config`, and
+`stage.profiler_config`. They accept mapping/YAML
 inputs and complete upstream value objects. Mapping inputs are validated and
 materialized as their concrete upstream types when the structured config is
 constructed, so downstream consumers see one resolved representation.
