@@ -118,9 +118,11 @@ def test_discovery_does_not_import_runtime_registry(checkpoint):
     code = (
         "import sys; "
         "from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index; "
-        f"assert get_diffusion_model_index({str(checkpoint)!r})['_class_name'] == 'HyNomasModularPipeline'; "
-        "assert 'vllm_omni.diffusion.registry' not in sys.modules; "
-        "assert 'hymm' not in sys.modules"
+        f"index = get_diffusion_model_index({str(checkpoint)!r}); "
+        "assert index['_class_name'] == 'HyNomasModularPipeline', f'Unexpected model index: {index!r}'; "
+        "assert 'vllm_omni.diffusion.registry' not in sys.modules, "
+        "'Model discovery unexpectedly imported vllm_omni.diffusion.registry'; "
+        "assert 'hymm' not in sys.modules, 'Model discovery unexpectedly imported hymm'"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}
