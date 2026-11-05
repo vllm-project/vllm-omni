@@ -1005,6 +1005,29 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     def _moe_routing_specialize_enabled(self) -> bool:
         return bool(getattr(self.compilation_config, "cudagraph_specialize_moe_routing", False))
 
+    def _warn_missing_gen_vocab_start_index_once(self) -> None:
+        if getattr(self, "_warned_missing_gen_vocab_start_index", False):
+            return
+        self._warned_missing_gen_vocab_start_index = True
+        logger.warning(
+            "cudagraph_specialize_moe_routing is enabled but no gen_vocab_start_index "
+            "was found on the model; MoE CUDA-graph replay will stay on the BLEND "
+            "graph and the ALL_UND / ALL_GEN graphs will never be selected. Check "
+            "the model wrapper path used by this stage."
+        )
+
+    def _find_gen_vocab_start_index(self) -> int | None:
+        cursor = getattr(self, "model", None)
+        # Mammoth pipeline wraps AR as ``model.ar.language_model``.
+        for _ in range(4):
+            if cursor is None:
+                return None
+            gen_start = getattr(cursor, "gen_vocab_start_index", None)
+            if gen_start is not None:
+                return int(gen_start)
+            cursor = getattr(cursor, "language_model", None) or getattr(cursor, "ar", None)
+        return None
+
     def _resolve_moe_routing_key(
         self,
         *,
@@ -1017,18 +1040,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return MoERoutingKey(int(force_moe_routing_key))
         if not self._moe_routing_specialize_enabled():
             return MoERoutingKey.BLEND
-        model = getattr(self, "model", None)
-        gen_start = None
-        cursor = model
-        # Mammoth pipeline wraps AR as ``model.ar.language_model``.
-        for _ in range(4):
-            if cursor is None:
-                break
-            gen_start = getattr(cursor, "gen_vocab_start_index", None)
-            if gen_start is not None:
-                break
-            cursor = getattr(cursor, "language_model", None) or getattr(cursor, "ar", None)
+        gen_start = self._find_gen_vocab_start_index()
         if gen_start is None:
+            # Specialize is on, so ALL_UND / ALL_GEN graphs are being captured
+            # for a model we cannot classify. Warning once here keeps the
+            # pre-fix failure mode (capture then never select) visible instead
+            # of silent.
+            self._warn_missing_gen_vocab_start_index_once()
             return MoERoutingKey.BLEND
         if token_ids_provided:
             return moe_routing_key_from_input_ids(token_ids, int(gen_start))
@@ -1060,19 +1078,25 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         captured = () if dispatcher is None else dispatcher.cudagraph_keys.get(mode, ())
         selected = apply_moe_routing_key(mode, batch_desc, requested, captured, enabled=True)
         selected_key = int(getattr(selected, "moe_routing_key", int(MoERoutingKey.BLEND)))
-        if getattr(self, "_last_moe_routing_replay_key", None) != selected_key:
-            logger.info(
-                "Mammoth MoE CUDA-graph replay specialty is %s (requested %s, num_tokens=%s, mode=%s)",
+        # Mixed und/gen traffic flips this every few steps, so only the first
+        # selection is worth INFO. Later flips stay at DEBUG to keep the worker
+        # log readable.
+        if getattr(self, "_last_moe_routing_replay_key", None) is not None:
+            logger.debug(
+                "Mammoth MoE CUDA-graph replay specialty %s (requested %s, num_tokens=%s, mode=%s)",
                 MoERoutingKey(selected_key).name,
                 requested.name,
                 num_tokens,
                 getattr(mode, "name", mode),
             )
         else:
-            logger.debug(
-                "Mammoth MoE CUDA-graph replay specialty %s (num_tokens=%s)",
+            logger.info(
+                "Mammoth MoE CUDA-graph replay specialty is %s (requested %s, num_tokens=%s, mode=%s); "
+                "further changes log at DEBUG",
                 MoERoutingKey(selected_key).name,
+                requested.name,
                 num_tokens,
+                getattr(mode, "name", mode),
             )
         self._last_moe_routing_replay_key = selected_key
         return selected
