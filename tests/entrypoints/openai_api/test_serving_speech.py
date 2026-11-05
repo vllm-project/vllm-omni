@@ -6248,6 +6248,61 @@ class TestTTSAsyncOffloading:
         assert stage0_params.extra_args["tts_local_seed"] == 42
         assert moss_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
 
+    def test_prepare_speech_generation_moss_explicit_seed_overrides_default(
+        self, moss_tts_server, mocker: MockerFixture
+    ):
+        """An explicit request.seed must win over the deploy default seed.
+
+        The serving layer writes request.seed after the adapter hook, so the
+        residual MTP sampler should see the request's value, not the stage-0
+        default (42) that the adapter setdefault'd earlier.
+        """
+        moss_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        moss_tts_server._adapter.build = mocker.AsyncMock(
+            return_value=PreparedRequest(
+                prompt={"prompt": "hello"},
+                tts_params={},
+                model_type="moss_tts",
+            )
+        )
+        request = OpenAICreateSpeechRequest(input="hello", seed=7)
+
+        asyncio.run(moss_tts_server._prepare_speech_generation(request))
+
+        stage0_params = moss_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 7
+        assert stage0_params.extra_args["tts_local_seed"] == 7
+        assert moss_tts_server.engine_client.default_sampling_params_list[0].seed == 42
+        assert moss_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
+
+    def test_prepare_speech_generation_moss_does_not_mutate_shared_extra_args(
+        self, moss_tts_server, mocker: MockerFixture
+    ):
+        """The default-seed hook must deepcopy before writing tts_local_seed.
+
+        A shared stage-0 default that already carries extra_args must keep its
+        original entries and never gain tts_local_seed in place.
+        """
+        shared = SimpleNamespace(max_tokens=2048, seed=42, extra_args={"foo": "bar"})
+        moss_tts_server.engine_client.default_sampling_params_list = [shared]
+        moss_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        moss_tts_server._adapter.build = mocker.AsyncMock(
+            return_value=PreparedRequest(
+                prompt={"prompt": "hello"},
+                tts_params={},
+                model_type="moss_tts",
+            )
+        )
+        request = OpenAICreateSpeechRequest(input="hello")
+
+        asyncio.run(moss_tts_server._prepare_speech_generation(request))
+
+        stage0_params = moss_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args == {"foo": "bar", "tts_local_seed": 42}
+        assert stage0_params.extra_args is not shared.extra_args
+        assert shared.extra_args == {"foo": "bar"}
+
     def test_prepare_speech_generation_uses_adapter_model_type_label(
         self,
         voxtral_server,
