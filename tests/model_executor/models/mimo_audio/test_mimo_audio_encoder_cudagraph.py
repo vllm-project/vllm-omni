@@ -188,7 +188,8 @@ def test_manager_matches_eager_across_tiers_and_falls_back_out_of_range() -> Non
         dtype=torch.bfloat16,
         model=model,
     )
-    manager.capture(torch.cuda.graph_pool_handle())
+    with torch.cuda.stream(torch.cuda.Stream()):
+        manager.capture(torch.cuda.graph_pool_handle())
 
     for rows, expected_hits, expected_misses in (
         (1, 1, 0),
