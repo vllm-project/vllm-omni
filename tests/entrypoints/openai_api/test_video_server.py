@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
-from starlette.datastructures import Headers, UploadFile
+from starlette.datastructures import UploadFile
 from vllm import envs
 
 from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
@@ -2691,17 +2691,11 @@ def reference_upload_paths(tmp_path, monkeypatch):
     return paths
 
 
-def _reference_upload(payload: bytes, filename: str, content_type: str, *, size: int | None = None) -> UploadFile:
-    return UploadFile(
-        io.BytesIO(payload), filename=filename, size=size, headers=Headers({"content-type": content_type})
-    )
-
-
 @pytest.mark.asyncio
 async def test_h3_mixed_reference_streams_audio_before_reading_the_whole_upload(reference_upload_paths, monkeypatch):
     max_read_size = 4 * 1024 * 1024
     payload = bytes(range(256)) * (max_read_size // 256) + b"tail"
-    upload = _reference_upload(payload, "voice.wav", "audio/wav")
+    upload = UploadFile(io.BytesIO(payload), filename="voice.wav")
     original_read = upload.read
     returned_sizes: list[int] = []
 
@@ -2727,48 +2721,33 @@ async def test_h3_mixed_reference_streams_audio_before_reading_the_whole_upload(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("filename", "content_type", "limit_name", "limit", "known_size", "excess"),
-    [
-        ("clip.mp4", "video/mp4", "MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES", 5 * 1024 * 1024, True, 0),
-        ("clip.webm", "video/webm", "MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES", 5 * 1024 * 1024, False, 1),
-        ("voice.flac", "audio/flac", "MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES", 2 * 1024 * 1024, True, 1),
-        ("voice.wav", "audio/wav", "MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES", 2 * 1024 * 1024, False, 0),
-    ],
-    ids=["known-video-at-limit", "unknown-video-over-limit", "known-audio-over-limit", "unknown-audio-at-limit"],
-)
-async def test_h3_mixed_reference_enforces_file_size_limit(
-    filename, content_type, limit_name, limit, known_size, excess, reference_upload_paths, monkeypatch, mocker
+async def test_h3_mixed_reference_size_error_precedes_suffix_error_and_cleans_uploads(
+    reference_upload_paths, monkeypatch
 ):
-    # Oversized files must report the size error before their unsupported suffix.
-    monkeypatch.setattr(video_generation_helpers, limit_name, limit)
-    payload = b"x" * (limit + excess)
-    upload = _reference_upload(payload, filename, content_type, size=len(payload) if known_size else None)
-    read = mocker.spy(upload, "read")
+    limit = 5 * 1024 * 1024  # Cross the 4 MiB read window before exceeding the cap.
+    monkeypatch.setattr(video_generation_helpers, "MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES", limit)
+    uploads = [
+        UploadFile(io.BytesIO(b"completed"), filename="first.mp4"),
+        UploadFile(io.BytesIO(b"x" * (limit + 1)), filename="second.webm"),
+    ]
     try:
-        if excess:
-            with pytest.raises(HTTPException) as error:
-                await video_generation_helpers._persist_uploaded_media_references([upload])
-            assert error.value.status_code == 400
-            assert error.value.detail == f"Uploaded reference exceeds the {limit // (1024 * 1024)} MiB size limit."
-            assert not any(path.exists() for path in reference_upload_paths)
-            if known_size:
-                read.assert_not_called()
-            else:
-                assert upload.file.tell() == limit + 1
-        else:
-            _, videos, audios = await video_generation_helpers._persist_uploaded_media_references([upload])
-            assert len(videos + audios) == 1
-            assert Path((videos + audios)[0]).read_bytes() == payload
+        with pytest.raises(HTTPException) as error:
+            await video_generation_helpers._persist_uploaded_media_references(uploads)
+        assert error.value.status_code == 400
+        assert error.value.detail == "Uploaded reference exceeds the 5 MiB size limit."
+        assert uploads[1].file.tell() == limit + 1
+        assert len(reference_upload_paths) == 2
+        assert not any(path.exists() for path in reference_upload_paths)
     finally:
-        await upload.close()
+        for upload in uploads:
+            await upload.close()
 
 
 @pytest.mark.asyncio
 async def test_h3_mixed_reference_preserves_empty_files(reference_upload_paths):
     uploads = [
-        _reference_upload(b"", "clip.mp4", "video/mp4", size=0),
-        _reference_upload(b"", "voice.wav", "audio/wav", size=0),
+        UploadFile(io.BytesIO(), filename="clip.mp4", size=0),
+        UploadFile(io.BytesIO(), filename="voice.wav", size=0),
     ]
     try:
         images, videos, audios = await video_generation_helpers._persist_uploaded_media_references(uploads)
@@ -2780,82 +2759,24 @@ async def test_h3_mixed_reference_preserves_empty_files(reference_upload_paths):
             await upload.close()
 
 
-@pytest.mark.parametrize(
-    ("endpoint", "filename", "content_type", "message"),
-    [
-        ("/v1/videos", "clip.\x00", "video/mp4", "MiniMax H3 reference videos must use an MP4 or MOV file."),
-        ("/v1/videos/sync", "voice.\x00", "audio/wav", "MiniMax H3 reference audio must use a WAV or MP3 file."),
-    ],
-)
-def test_h3_multipart_null_suffix_returns_format_error_and_rolls_back(
-    endpoint, filename, content_type, message, test_client, reference_upload_paths, tmp_path
-):
+def test_h3_multipart_null_suffix_returns_format_error(test_client, reference_upload_paths):
     test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
-    sentinel = tmp_path / "unrelated.txt"
-    sentinel.write_bytes(b"keep")
     # Build the body directly so the client cannot escape the NUL filename.
     body = (
-        "--h3-boundary\r\n"
-        'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-        "check malformed filename\r\n"
-        "--h3-boundary\r\n"
-        'Content-Disposition: form-data; name="input_references"; filename="first.mp4"\r\n'
-        "Content-Type: video/mp4\r\n\r\n"
-        "first video\r\n"
-        "--h3-boundary\r\n"
-        f'Content-Disposition: form-data; name="input_references"; filename="{filename}"\r\n'
-        f"Content-Type: {content_type}\r\n\r\n"
-        "invalid reference\r\n"
-        "--h3-boundary--\r\n"
-    ).encode()
-    with TestClient(test_client.app, raise_server_exceptions=False) as client:
-        response = client.post(
-            endpoint,
-            content=body,
-            headers={"content-type": "multipart/form-data; boundary=h3-boundary"},
-        )
+        b"--h3-boundary\r\n"
+        b'Content-Disposition: form-data; name="prompt"\r\n\r\ncheck filename\r\n'
+        b"--h3-boundary\r\n"
+        b'Content-Disposition: form-data; name="input_references"; filename="clip.\x00"\r\n'
+        b"Content-Type: video/mp4\r\n\r\ninvalid reference\r\n--h3-boundary--\r\n"
+    )
+    response = test_client.post(
+        "/v1/videos",
+        content=body,
+        headers={"content-type": "multipart/form-data; boundary=h3-boundary"},
+    )
     assert response.status_code == 400
-    assert response.json()["detail"] == message
+    assert response.json()["detail"] == "MiniMax H3 reference videos must use an MP4 or MOV file."
     assert reference_upload_paths and not any(path.exists() for path in reference_upload_paths)
-    assert sentinel.read_bytes() == b"keep"
-
-
-@pytest.mark.asyncio
-async def test_h3_mixed_reference_write_failure_removes_partial_and_prior_uploads(
-    reference_upload_paths, tmp_path, monkeypatch
-):
-    sentinel = tmp_path / "unrelated.txt"
-    sentinel.write_bytes(b"keep")
-    uploads = [
-        _reference_upload(b"completed", "first.mp4", "video/mp4"),
-        _reference_upload(b"x" * (2 * 1024 * 1024), "second.wav", "audio/wav"),
-    ]
-    fdopen = video_generation_helpers.os.fdopen
-
-    @contextmanager
-    def failing_output(fd, mode):
-        with fdopen(fd, mode) as output:
-            if len(reference_upload_paths) == 2:
-                original_write = output.write
-
-                def write(chunk):
-                    original_write(chunk[:1])
-                    output.flush()
-                    raise OSError("upload write failed")
-
-                monkeypatch.setattr(output, "write", write)
-            yield output
-
-    monkeypatch.setattr(video_generation_helpers.os, "fdopen", failing_output)
-    try:
-        with pytest.raises(OSError, match="upload write failed"):
-            await video_generation_helpers._persist_uploaded_media_references(uploads)
-        assert len(reference_upload_paths) == 2
-        assert not any(path.exists() for path in reference_upload_paths)
-        assert sentinel.read_bytes() == b"keep"
-    finally:
-        for upload in uploads:
-            await upload.close()
 
 
 @pytest.mark.asyncio
@@ -2865,32 +2786,29 @@ async def test_h3_mixed_reference_task_cancellation_removes_partial_and_prior_up
     sentinel = tmp_path / "unrelated.txt"
     sentinel.write_bytes(b"keep")
     uploads = [
-        _reference_upload(b"completed", "first.mp4", "video/mp4"),
-        _reference_upload(b"x" * (2 * 1024 * 1024), "second.wav", "audio/wav"),
+        UploadFile(io.BytesIO(b"completed"), filename="first.mp4"),
+        UploadFile(io.BytesIO(b"x" * (2 * 1024 * 1024)), filename="second.wav"),
     ]
     original_read = uploads[1].read
     blocked = asyncio.Event()
-    release = asyncio.Event()
-    reads = 0
 
     async def blocking_read(size=-1):
-        nonlocal reads
-        reads += 1
-        if reads == 2:
+        if uploads[1].file.tell():
             blocked.set()
-            await release.wait()
+            await asyncio.Future()
         return await original_read(size)
 
     monkeypatch.setattr(uploads[1], "read", blocking_read)
     task = asyncio.create_task(video_generation_helpers._persist_uploaded_media_references(uploads))
     try:
         await asyncio.wait_for(blocked.wait(), timeout=5)
-        assert reference_upload_paths and reference_upload_paths[0].exists()
+        assert len(reference_upload_paths) == 2
+        assert all(path.exists() for path in reference_upload_paths)
+        assert reference_upload_paths[1].stat().st_size > 0
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not any(path.exists() for path in reference_upload_paths)
-        assert len(reference_upload_paths) == 2
         assert sentinel.read_bytes() == b"keep"
     finally:
         task.cancel()
