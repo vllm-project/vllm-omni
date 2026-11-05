@@ -11,14 +11,9 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.ops import qkv_head_layer_norm
 
-pytestmark = [
-    pytest.mark.core_model,
-    # The bug lives on the CPU fallback, so the CPU job must collect this file too.
-    pytest.mark.cpu,
-    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
-]
+pytestmark = [pytest.mark.core_model]
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+_needs_accelerator = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm device required")
 
 
 def _inputs(device: str, *, batch: int, frames: int, heads: int, head_dim: int) -> tuple:
@@ -43,7 +38,17 @@ def _split(qkv: torch.Tensor, heads: int, head_dim: int, k_norm: torch.nn.LayerN
     return k_norm(packed[:, :, 1].transpose(1, 2)), packed[:, :, 2].transpose(1, 2)
 
 
-@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "device",
+    [
+        # The CPU fallback is what the CPU job selects with ``-m "core_model and cpu"``.
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param(
+            "cuda",
+            marks=[*hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1), _needs_accelerator],
+        ),
+    ],
+)
 @pytest.mark.parametrize("affine", [True, False])
 def test_slot_rows_match_direct_kv(device: str, affine: bool) -> None:
     """``rows`` only remaps the batch row; per-frame K/V values stay identical."""
@@ -74,7 +79,17 @@ def test_slot_rows_match_direct_kv(device: str, affine: bool) -> None:
             assert torch.count_nonzero(pooled[:, row]) == 0
 
 
-@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "device",
+    [
+        # The CPU fallback is what the CPU job selects with ``-m "core_model and cpu"``.
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param(
+            "cuda",
+            marks=[*hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1), _needs_accelerator],
+        ),
+    ],
+)
 @pytest.mark.parametrize("affine", [True, False])
 def test_slot_positions_scatter_kv(device: str, affine: bool) -> None:
     """``positions`` scatter each frame onto ``kv`` dim 3; negative entries are skipped."""
