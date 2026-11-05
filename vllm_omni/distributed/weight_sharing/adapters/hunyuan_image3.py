@@ -122,8 +122,8 @@ def attach_imported_weights(backbone: Any, imported: ImportedWeights) -> None:
     import torch
 
     expected = shared_backbone_names(backbone)
-    missing = sorted(set(imported) - set(expected))
-    extra = sorted(set(expected) - set(imported))
+    missing = sorted(set(expected) - set(imported))
+    extra = sorted(set(imported) - set(expected))
     if missing or extra:
         raise CompatibilityError(
             f"imported views do not match the shared backbone layout (missing={missing}, extra={extra})"

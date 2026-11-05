@@ -316,14 +316,22 @@ def test_attach_imported_weights_shares_storage(adapter, backbone):
 def test_attach_imported_weights_rejects_mismatch(adapter, backbone):
     bindings = adapter.collect_shared_bindings(backbone)
     missing = dict(bindings)
-    missing.pop(next(iter(missing)))
-    with pytest.raises(adapter.CompatibilityError):
+    missing_name = next(iter(missing))
+    missing.pop(missing_name)
+    with pytest.raises(adapter.CompatibilityError) as exc:
         adapter.attach_imported_weights(backbone, missing)
+    assert (
+        str(exc.value) == f"imported views do not match the shared backbone layout (missing={[missing_name]}, extra=[])"
+    )
 
     extra = dict(bindings)
     extra["layers.0.self_attn.not_shared.weight"] = torch.randn(DIM, DIM)
-    with pytest.raises(adapter.CompatibilityError):
+    with pytest.raises(adapter.CompatibilityError) as exc:
         adapter.attach_imported_weights(backbone, extra)
+    assert str(exc.value) == (
+        "imported views do not match the shared backbone layout "
+        "(missing=[], extra=['layers.0.self_attn.not_shared.weight'])"
+    )
 
 
 def test_validate_supported_layout(adapter):

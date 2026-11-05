@@ -424,6 +424,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
         self._publish_shared_backbone_if_configured()
 
+    def reload_weights(self, *args: Any, **kwargs: Any) -> None:
+        """Preserve upstream reload arguments, but reject updates to shared weights."""
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A weight-sharing load was already attempted; "
+                "weight updates require full sharing-group teardown and worker recreation."
+            )
+        super().reload_weights(*args, **kwargs)
+
     def _publish_shared_backbone_if_configured(self) -> None:
         """Publish finalized AR backbone weights when this rank is a provider.
 

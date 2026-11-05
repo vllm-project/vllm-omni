@@ -19,11 +19,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def provider_runner(weight_sharing, contracts, monkeypatch):
     class UpstreamRunner:
         load_model = Mock(side_effect=RuntimeError("upstream load reached"))
+        reload_weights = Mock(side_effect=RuntimeError("upstream load reached"))
 
     runner_cls = load_class_methods(
         "vllm_omni/worker_v2/omni_model_runner.py",
         "OmniGPUModelRunner",
-        ["load_model", "_publish_shared_backbone_if_configured"],
+        ["load_model", "reload_weights", "_publish_shared_backbone_if_configured"],
         {"logger": Mock(), "_model_state_patch_lock": nullcontext()},
         base_class=UpstreamRunner,
     )
@@ -70,7 +71,8 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
 
 
 @pytest.mark.parametrize("previous_attempt", [None, "published", "failed"])
-def test_load_checks_sharing_before_upstream_load(provider_runner, previous_attempt):
+@pytest.mark.parametrize("operation", ["load_model", "reload_weights"])
+def test_load_checks_sharing_before_upstream_load(provider_runner, previous_attempt, operation):
     runner, backend, codec, factory = provider_runner
     if previous_attempt == "failed":
         runner.adapter.publish_backbone.side_effect = RuntimeError("publish failed")
@@ -80,11 +82,11 @@ def test_load_checks_sharing_before_upstream_load(provider_runner, previous_atte
         runner.publish()
     original_model = runner.model
     calls = list(codec.calls)
-    upstream_load = getattr(type(runner).__bases__[0], "load_model")
+    upstream_load = getattr(type(runner).__bases__[0], operation)
 
     message = "upstream load reached" if previous_attempt is None else "already attempted"
     with pytest.raises(RuntimeError, match=message):
-        runner.load_model()
+        getattr(runner, operation)()
     assert runner.model is original_model
     assert codec.calls == calls
     assert upstream_load.call_count == (1 if previous_attempt is None else 0)
@@ -166,3 +168,13 @@ def test_device_mismatch_is_rejected_before_export(provider_runner, device):
     factory.assert_not_called()
     runner.adapter.publish_backbone.assert_not_called()
     assert not codec.exports
+
+
+def test_ordinary_reload_forwards_arguments(provider_runner):
+    runner, _, _, _ = provider_runner
+    runner.vllm_config.weight_sharing = None
+    upstream_reload = type(runner).__bases__[0].reload_weights
+    upstream_reload.side_effect = None
+    weights = iter(())
+    runner.reload_weights(weights, weights_path="checkpoint", is_checkpoint_format=False)
+    upstream_reload.assert_called_once_with(weights, weights_path="checkpoint", is_checkpoint_format=False)
