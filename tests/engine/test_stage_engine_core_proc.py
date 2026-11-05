@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, UtilityOutput
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -61,26 +62,38 @@ def test_turn_retirement_preserves_resident_scheduler_request(mocker, native):
     engine.model_executor = SimpleNamespace(
         collective_rpc=lambda method, args=(): [run_method(wrapper, method, args, {})]
     )
-    engine.omni_finish_turn("resident")
+    result = engine.omni_finish_turn("resident")
     assert engine.scheduler.requests["resident"] is request
     assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
     if native:
+        assert result is None
         runner.finish_omni_turn.assert_called_once_with("resident")
     else:
         assert adapter is not None
         adapter.release_shm_resources.assert_called_once_with("resident", wait=True)
+        assert result is adapter.release_shm_resources.return_value
     request.status = RequestStatus.RUNNING
     with pytest.raises(RuntimeError, match="unfinished turn"):
         engine.omni_finish_turn("resident")
 
 
-def test_turn_retirement_propagates_transport_failure(mocker):
+def test_turn_retirement_replies_after_cleanup_without_blocking_engine_loop(mocker):
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    cleanup: Future[None] = Future()
     adapter = mocker.Mock()
-    adapter.release_shm_resources.side_effect = TimeoutError("save thread stalled")
+    adapter.release_shm_resources.return_value = cleanup
     engine.scheduler = SimpleNamespace(requests={}, chunk_transfer_adapter=adapter)
-    with pytest.raises(TimeoutError, match="save thread stalled"):
-        engine.omni_finish_turn("resident")
+    replies: list[UtilityOutput] = []
+    output = UtilityOutput(call_id=1)
+
+    EngineCoreProc._invoke_utility_method(
+        "omni_finish_turn", lambda: engine.omni_finish_turn("resident"), output, replies.append
+    )
+    # The engine loop continues; the utility reply waits for the save thread.
+    assert replies == []
+    cleanup.set_exception(OSError("unlink failed"))
+    assert replies == [output]
+    assert output.failure_message is not None and "unlink failed" in output.failure_message
 
 
 class WrappedUniProcExecutor(UniProcExecutor):

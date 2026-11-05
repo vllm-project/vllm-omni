@@ -150,6 +150,16 @@ class DuplexCapabilities:
     #: a plugin; see :func:`apply_session_stats_capability`.
     supports_session_stats: bool = False
 
+    @property
+    def resident_turn_entry(self) -> bool:
+        """The entry-stage request and its KV stay resident across committed turns."""
+        return self.supports_core_resumable_request and self.supports_turn_commit_only
+
+    @property
+    def commits_turns(self) -> bool:
+        """Responses, downstream stages and history settle once per committed turn."""
+        return not self.supports_core_resumable_request or self.supports_turn_commit_only
+
     def as_dict(self) -> dict[str, object]:
         return {
             "supports_session_adapter": self.supports_session_adapter,

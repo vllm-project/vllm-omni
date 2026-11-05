@@ -4,7 +4,6 @@
 import threading
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -130,18 +129,17 @@ def test_turn_release_acknowledges_unlink_and_followup_cleanup_before_reuse(shm_
     ext_id = f"turn_{uuid.uuid4().hex}"
     key = f"{ext_id}_0_0"
     assert connector.put("0", "1", key, "old turn")[0]
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        released = executor.submit(adapter.release_shm_resources, ext_id, wait=True)
-        with adapter._save_cond:
-            assert adapter._save_cond.wait_for(lambda: bool(adapter._pending_save_reqs), timeout=2)
-        # An in-flight aborted send may append this behind the release marker.
-        adapter._pending_save_reqs.append({"cleanup_shm": (f"{ext_id}_0", 1)})
+    # The caller gets a pending future instead of waiting on the save thread.
+    released = adapter.release_shm_resources(ext_id, wait=True)
+    assert released is not None and not released.done()
+    # An in-flight aborted send may append this behind the release marker.
+    adapter._pending_save_reqs.append({"cleanup_shm": (f"{ext_id}_0", 1)})
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert connector.get("0", "1", key) is None
+    assert not released.done()
+    while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
-        assert connector.get("0", "1", key) is None
-        assert not released.done()
-        while adapter._pending_save_reqs:
-            adapter._send_single_request(adapter._pending_save_reqs.popleft())
-        released.result(timeout=2)
+    released.result(timeout=0)
     assert connector.put("0", "1", key, "new turn")[0]
     assert not adapter._pending_save_reqs
     assert connector.get("0", "1", key)[0] == "new turn"
@@ -154,13 +152,11 @@ def test_turn_release_reports_unlink_failure(shm_sender, monkeypatch):
         raise OSError("unlink failed")
 
     monkeypatch.setattr(connector, "cleanup_prefix", fail)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        released = executor.submit(adapter.release_shm_resources, "resident", wait=True)
-        with adapter._save_cond:
-            assert adapter._save_cond.wait_for(lambda: bool(adapter._pending_save_reqs), timeout=2)
-        adapter._send_single_request(adapter._pending_save_reqs.popleft())
-        with pytest.raises(OSError, match="unlink failed"):
-            released.result(timeout=2)
+    released = adapter.release_shm_resources("resident", wait=True)
+    assert released is not None
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    with pytest.raises(OSError, match="unlink failed"):
+        released.result(timeout=0)
 
 
 @pytest.mark.parametrize("fail_terminal", [False, True])

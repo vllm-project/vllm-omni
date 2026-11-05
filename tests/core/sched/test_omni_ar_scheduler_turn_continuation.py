@@ -20,6 +20,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.engine import token_prefix_digest
 # isort: on
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -165,6 +166,7 @@ def test_direct_turn_delta_reuses_resident_blocks_without_snapshot_hashes():
     blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)[0][:2]
     update = _request([999, 100, 101])
     update.append_prefix_length = 34
+    update.append_prefix_digest = token_prefix_digest(list(range(34)))
     # These are hashes of the suffix alone and cannot match the resident prefix.
     update.block_hashes.clear()
     scheduler.add_request(update)
@@ -179,14 +181,16 @@ def test_direct_turn_delta_reuses_resident_blocks_without_snapshot_hashes():
     assert list(request.output_token_ids) == [888]
 
 
-@pytest.mark.parametrize("missing", [False, True])
-def test_stale_turn_delta_fails_only_its_request(missing):
+@pytest.mark.parametrize("stale", ["length", "content", "missing"])
+def test_stale_turn_delta_fails_only_its_request(stale):
     scheduler = _scheduler()
-    if not missing:
+    if stale != "missing":
         resident = _request(list(range(33)))
         _stop_with_in_flight_decode(scheduler, resident)
     update = _request([999, 100])
-    update.append_prefix_length = 123
+    update.append_prefix_length = 123 if stale == "length" else 34
+    # A same-length ledger that diverged from the resident tokens is stale too.
+    update.append_prefix_digest = token_prefix_digest([7] + list(range(1, 34)))
     scheduler.add_request(update)
     assert "resident" not in scheduler.requests
     assert "resident" in scheduler._streaming_context_overflow
@@ -209,6 +213,7 @@ def test_native_turn_stop_emits_transport_terminal_without_freeing_kv():
     assert not scheduler.update_from_output(lookahead, _output(request, 777))
     update = _request([999, 100, 101])
     update.append_prefix_length = 34
+    update.append_prefix_digest = token_prefix_digest(list(range(34)))
     scheduler.add_request(update)
     resumed = scheduler.schedule()
     [arrival] = resumed.scheduled_new_reqs

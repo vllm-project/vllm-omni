@@ -47,6 +47,7 @@ class OmniRequest(Request):
         payload_sender_info: PayloadSenderInfo | None = None,
         resume_from_full_prompt: bool = False,
         append_prefix_length: int | None = None,
+        append_prefix_digest: bytes | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -70,6 +71,7 @@ class OmniRequest(Request):
         self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
         self.resume_from_full_prompt = resume_from_full_prompt
         self.append_prefix_length = append_prefix_length
+        self.append_prefix_digest = append_prefix_digest
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -121,6 +123,7 @@ class OmniRequest(Request):
             resumable=request.resumable,
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
             append_prefix_length=getattr(request, "append_prefix_length", None),
+            append_prefix_digest=getattr(request, "append_prefix_digest", None),
             session_id=request.session_id,
             kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
@@ -148,6 +151,7 @@ class OmniStreamingUpdate:
     model_intermediate_buffer: dict | None = None
     resume_from_full_prompt: bool = False
     append_prefix_length: int | None = None
+    append_prefix_digest: bytes | None = None
     block_hashes: "tuple[BlockHash, ...]" = ()
     cache_salt: str | None = None
 
@@ -165,6 +169,7 @@ class OmniStreamingUpdate:
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
             append_prefix_length=getattr(request, "append_prefix_length", None),
+            append_prefix_digest=getattr(request, "append_prefix_digest", None),
             block_hashes=tuple(request.block_hashes) if getattr(request, "resume_from_full_prompt", False) else (),
             cache_salt=request.cache_salt,
         )

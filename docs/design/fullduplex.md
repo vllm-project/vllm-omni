@@ -700,12 +700,13 @@ is invalidated by edits to previously submitted history. After checking the
 last heard reply against completed output, the normal path renders only new
 user messages and sends their processed tokens and media to
 EngineCore; resident feature data is reused there, never replayed from frontend
-cache handles. The engine validates the expected prefix length and salt without
-comparing history hashes. APC and hidden-state prefix replay remain enabled.
+cache handles. The engine validates the expected prefix length, a digest of
+its token content and the salt without comparing history hashes. APC and hidden-state prefix replay remain enabled.
 History edits and incompatible boundaries use the full-snapshot fallback.
 The ledger follows the request epoch, and cancellation joins input preparation
 before releasing the submission guard. `DuplexStagePort.finish_turn` releases only downstream turn
-state. Cancel, close and expiry still clean up every owned stage, including the
+state; its EngineCore acknowledgement completes from the save thread without
+blocking the engine loop, and a failed retirement closes the session. Cancel, close and expiry still clean up every owned stage, including the
 resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#resident-thinker-kv-continuation)
 for runner restrictions and fallback behavior.
 

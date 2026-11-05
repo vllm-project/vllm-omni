@@ -60,7 +60,7 @@ history invalidate it. The token ledger checks the latest heard reply against
 completed output before rendering a delta, without rebuilding old history or
 decoding old media. Window eviction and tool turns use a full snapshot.
 EngineCore validates the resident prefix
-length and salt, without comparing history block hashes. Old materialized media
+length, token-content digest and salt, without comparing history block hashes. Old materialized media
 remain in the resident request; only new media touch the sender/receiver caches.
 APC stays enabled and upstream maintains hashes for newly completed blocks.
 History changes and incompatible boundaries use the full-snapshot fallback,

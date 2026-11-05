@@ -1225,7 +1225,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
-    def release_shm_resources(self, request_id: str, *, wait: bool = False) -> None:
+    def release_shm_resources(self, request_id: str, *, wait: bool = False) -> Future[None] | None:
         """Queue reclaim of inter-stage segments this request left unconsumed.
 
         Safe only once every stage has finished with the request: the producer
@@ -1237,11 +1237,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Like abort cleanup, the unlink runs on the save thread, so the
         scheduler never performs SHM I/O. ``wait`` is used only by explicit
-        turn-retirement RPCs; it acknowledges unlink before same-ID reuse and
-        raises on cleanup failure or timeout.
+        turn-retirement RPCs. It returns a future that completes after the
+        unlink and its follow-up cleanup, or fails with the cleanup error;
+        callers must not block the scheduler thread on it.
         """
         if not isinstance(self.connector, SharedMemoryConnector):
-            return
+            return None
         external_req_id = self.request_ids_mapping.get(request_id, request_id)
         completion: Future[None] | None = Future() if wait else None
         self._pending_save_reqs.append(
@@ -1249,8 +1250,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         with self._save_cond:
             self._save_cond.notify()
-        if completion is not None:
-            completion.result(timeout=5.0)
+        return completion
 
     def _release_shm_prefix(self, key_prefix: str) -> None:
         reclaimed = self.connector.cleanup_prefix(key_prefix)

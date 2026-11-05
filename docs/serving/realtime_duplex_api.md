@@ -90,8 +90,9 @@ re-injected exactly once because upstream discards the final uncomputed sample.
 Frontend output processing and downstream prewarm retain the complete token
 context. Old materialized media remain in EngineCore.
 
-The direct-append path validates the resident prefix length and cache salt,
-then extends the existing request without comparing full-history block hashes.
+The direct-append path validates the resident prefix length, a digest of its
+token content and the cache salt, then extends the existing request without
+comparing full-history block hashes.
 Prefix caching stays enabled: upstream still maintains block hashes for APC,
 and Omni replays complete cached hidden-state blocks for Talker. The partial
 block tail is recomputed. A missing or stale resident fails only that request.
@@ -127,7 +128,17 @@ the next turn rebuilds it. Closing or expiring a session releases its resident
 resources. New audio may buffer during a response, but another generation must
 wait for that response to complete or be cancelled. Idle sessions retain KV
 until teardown, which must be included in
-deployment memory and session-capacity planning. Full history rendering and
+deployment memory and session-capacity planning. Upstream preemption selects
+only running requests, so it never reclaims an idle resident; under KV pressure
+active turns are preempted first. Releasing idle residents' KV is not yet
+implemented.
+
+Any stage failure during a resident turn closes the session. The Thinker
+request shares its ID with that turn's Talker and Code2Wav requests, so failure
+cleanup also aborts the resident KV. A failure to retire the previous turn's
+transport closes the session for the same reason: the resident ID cannot be
+reused safely. Deployments that fall back to per-turn requests keep per-turn
+failure recovery. Full history rendering and
 multimodal cache processing remain; this feature does not claim a measured
 latency improvement.
 
