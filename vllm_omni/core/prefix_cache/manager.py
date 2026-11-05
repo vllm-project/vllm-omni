@@ -1666,9 +1666,11 @@ class OmniPrefixCacheManager:
         Continuation rule, checked atomically (``append_beyond``): a
         batch starting at the stored length appends in full; a batch
         starting behind it — a block-truncated pool hit, where the
-        stored stream already extends past the hit — appends only its
-        not-yet-stored tail; a batch starting ahead (a gap) is
-        refused. The position is the turn-start offset (the request's
+        stored stream already extends past the hit — first passes a
+        content check on its overlapping prefix (a mismatch invalidates
+        the whole session, so a forked stream can never serve stale
+        rows), then appends only its not-yet-stored tail; a batch
+        starting ahead (a gap) is refused. The position is the turn-start offset (the request's
         STARTED hit_end) plus rows this request saved earlier in the
         turn, both snapshotted into the step context at publish. For a
         start step this reduces to the pool-hit length; for decode steps

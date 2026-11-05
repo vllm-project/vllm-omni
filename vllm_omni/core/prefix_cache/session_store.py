@@ -17,7 +17,8 @@ Ownership rules, all enforced here so callers cannot misalign rows:
   end of the (session, key) stream; there is no positional write. The
   manager appends a batch at its session position when that position
   equals the stored length (exact continuation); a batch starting
-  behind the stored length appends only its not-yet-stored tail, and
+  behind the stored length first content-checks its overlapping
+  prefix, then appends only its not-yet-stored tail, and
   a batch starting ahead (a gap) is still refused — so a stream
   always describes one token sequence from position 0. A turn that
   starts with a pool hit instead seeds the stream first: materialize
@@ -28,6 +29,10 @@ Ownership rules, all enforced here so callers cannot misalign rows:
   append starts a fresh stream; a later turn whose hit length is
   nonzero rebuilds the stream from its pool-hit prefix when the pool
   covers it, and only stalls when the pool does not cover the prefix.
+  ``append_beyond`` also invalidates: a batch overlapping stored rows
+  is content-checked (within tolerance) against them, and a mismatch
+  means the session forked, so the whole session is dropped rather
+  than serving stale rows later.
 - Per-session copies, never shared rows. Segments belong to exactly one
   session, so dropping a session can never corrupt another session's
   hits — the hazard that rules out namespacing the slot pool itself.
@@ -50,6 +55,16 @@ import torch
 SessionId = str
 ReqId = str
 TensorName = str
+
+# Fork-detection tolerance for append_beyond's overlap check.
+# UNMEASURED starting default, not a validated threshold: bf16 rows
+# recomputed in different batch shapes differ by a few ULPs, so the check
+# must tolerate low-bit noise or it would false-positive normal
+# continuation. A too-tight bound costs cache hits (fail-closed
+# invalidation), never correctness; validate against real model outputs
+# in different batch shapes before relying on these values.
+_CONTENT_RTOL = 1e-2
+_CONTENT_ATOL = 1e-2
 
 
 class SessionPrefixStore:
@@ -154,14 +169,24 @@ class SessionPrefixStore:
 
         ``rows`` covers [batch_start, batch_start + len(rows)). Atomically
         under the store lock:
-        - batch fully covered (batch end <= stored): no-op, returns True;
+        - batch fully covered (batch end <= stored): the batch is
+          content-checked against the stored rows at the same positions;
+          a match is a no-op returning True, a mismatch means the session
+          forked, so the whole session is invalidated and False is
+          returned (nothing is stored);
         - batch overlaps the stored prefix (stored in [batch_start,
-          batch end)): appends only rows[stored - batch_start:], so a
-          block-truncated pool hit (offset < stored) no longer rejects
-          the whole batch and freezes the stream;
+          batch end)): the overlapping prefix is content-checked the
+          same way; on a match only rows[stored - batch_start:] appends,
+          so a block-truncated pool hit (offset < stored) no longer
+          rejects the whole batch and freezes the stream; on a mismatch
+          the session is invalidated and nothing is stored;
         - batch starts ahead of the stored length (a gap): returns False
           and stores nothing — the missing middle cannot be filled from
           this batch, so the stream stalls exactly as before.
+        The manager ignores the return value: the real brake is the
+        invalidation itself (lengths reset to 0, so later same-round
+        batches are gap-refused and the next round reseeds). False is
+        only the truthful "nothing stored" signal.
         Raises ValueError for a non-tensor/empty batch, a negative
         batch_start, or a trailing-shape mismatch with the stream.
         """
@@ -174,10 +199,73 @@ class SessionPrefixStore:
             stored = self._lengths.get(entry, 0)
             batch_end = batch_start + int(rows.shape[0])
             if batch_end <= stored:
+                if not self._overlap_matches_locked(entry, batch_start, batch_end, rows):
+                    self._invalidate_locked(session_id)
+                    return False
                 return True
             if stored < batch_start:
                 return False
+            if batch_start < stored and not self._overlap_matches_locked(
+                entry, batch_start, stored, rows[: stored - batch_start]
+            ):
+                self._invalidate_locked(session_id)
+                return False
             return self._append_locked(session_id, key, rows[stored - batch_start :], expected_length=stored)
+
+    def _slice_locked(self, entry: tuple[SessionId, TensorName], start: int, end: int) -> torch.Tensor | None:
+        """Concatenated stored rows for [start, end); caller holds ``_lock``.
+
+        Cross-segment: the window may span several segments. Returns None
+        when the window is not fully covered (callers treat that as a
+        content mismatch: fail closed, never serve or keep stale rows).
+        """
+        segments = self._segments.get(entry)
+        if segments is None:
+            return None
+        parts: list[torch.Tensor] = []
+        pos = 0
+        for seg in segments:
+            seg_end = pos + int(seg.shape[0])
+            if seg_end <= start:
+                pos = seg_end
+                continue
+            if pos >= end:
+                break
+            parts.append(seg[max(start - pos, 0) : min(end - pos, int(seg.shape[0]))])
+            pos = seg_end
+        if sum(int(p.shape[0]) for p in parts) != end - start:
+            return None
+        return torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+
+    def _overlap_matches_locked(
+        self, entry: tuple[SessionId, TensorName], start: int, end: int, rows: torch.Tensor
+    ) -> bool:
+        """True when ``rows`` matches stored [start, end) within tolerance.
+
+        Caller holds ``_lock``. Comparison is fail-closed: any shape
+        mismatch, device/dtype error, or non-finite difference counts as
+        a mismatch (the session is invalidated) rather than risking a
+        stale stream. Tolerance is approximate on purpose: the same
+        tokens recomputed in different batch shapes differ by low-bit
+        bf16 noise, and exact equality would false-positive normal
+        continuation.
+        """
+        if end <= start:
+            return True
+        try:
+            stored = self._slice_locked(entry, start, end)
+            if stored is None or tuple(stored.shape) != tuple(rows.shape):
+                return False
+            return bool(
+                torch.allclose(
+                    stored.detach().cpu(),
+                    rows.detach().cpu(),
+                    rtol=_CONTENT_RTOL,
+                    atol=_CONTENT_ATOL,
+                )
+            )
+        except (RuntimeError, ValueError, TypeError):
+            return False
 
     def _append(
         self,
@@ -281,13 +369,22 @@ class SessionPrefixStore:
         rebuild a fresh stream. Returns the number of segments dropped.
         """
         with self._lock:
-            dropped = 0
-            for entry in [e for e in self._segments if e[0] == session_id]:
-                segments = self._segments.pop(entry)
-                self._lengths.pop(entry, None)
-                dropped += len(segments)
-                self._stored_bytes -= sum(s.numel() * s.element_size() for s in segments)
-            return dropped
+            return self._invalidate_locked(session_id)
+
+    def _invalidate_locked(self, session_id: SessionId) -> int:
+        """Invalidate body; the caller must hold ``_lock``.
+
+        Separate from ``invalidate`` because ``append_beyond`` already
+        holds the lock when a fork is detected, and the lock is
+        non-reentrant: calling ``invalidate`` there would deadlock.
+        """
+        dropped = 0
+        for entry in [e for e in self._segments if e[0] == session_id]:
+            segments = self._segments.pop(entry)
+            self._lengths.pop(entry, None)
+            dropped += len(segments)
+            self._stored_bytes -= sum(s.numel() * s.element_size() for s in segments)
+        return dropped
 
     def drop(self, session_id: SessionId) -> int:
         """End a session: invalidate its segments and unbind its requests."""

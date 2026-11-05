@@ -530,9 +530,11 @@ history or ends.
   unbinds; the session continues and its rows stay servable.
 - Retention: each consumed step appends its new rows at their session
   position: exact continuation appends in full, a batch starting
-  behind the stored length (a block-truncated pool hit) appends only
-  its not-yet-stored tail, and a batch starting ahead (a gap) is
-  refused. The position is the turn-start offset (the request's STARTED hit_end)
+  behind the stored length (a block-truncated pool hit) first passes a
+  content check on its overlapping prefix (within tolerance), then
+  appends only its not-yet-stored tail, and a batch starting ahead
+  (a gap) is refused. The position is the turn-start offset (the
+  request's STARTED hit_end)
   plus rows the request saved earlier in the turn, both snapshotted into
   the step context at publish — so decode steps, which carry no pool
   hit, append at their true sequence position too. Discarded steps
@@ -540,7 +542,9 @@ history or ends.
   materialized steps through `materialize`. The slot pool is
   untouched, so existing cross-request sharing is unchanged.
 - Coarse invalidation: `invalidate_session` drops a session's segments
-  wholesale on any history mutation (edit, truncation, interruption).
+  wholesale on any history mutation (edit, truncation, interruption),
+  or when an appending batch's overlapping rows mismatch the stored
+  rows (a forked session detected at append time).
   Segments are per-session copies, so dropping one session can never
   corrupt another's hits. A later turn whose hit length is nonzero
   after an invalidation rebuilds the stream from its pool-hit prefix

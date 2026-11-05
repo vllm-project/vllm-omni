@@ -178,6 +178,76 @@ def test_append_beyond_exact_continuation_appends_in_full():
     assert torch.equal(store.fetch("sess-A", "hidden", 8), _rows(0, 8))
 
 
+# Fork-detection tests (direction 1): block-aligned batches, as a real
+# pool hit is always block aligned. A batch overlapping stored rows must
+# carry the same content there; a mismatch means the session forked, so
+# the whole session is invalidated instead of serving stale rows later.
+def test_append_beyond_noop_mismatch_invalidates_session():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 32))
+    store.append("sess-A", "other", _rows(0, 32))
+    # Branch B rewrites positions [0, 16) with different content; the
+    # batch is fully covered, so without a content check it no-ops.
+    assert not store.append_beyond("sess-A", "hidden", 0, _rows(100, 16))
+    # Whole session is gone, all keys, not just the mismatched one.
+    assert store.stored_tokens("sess-A", "hidden") == 0
+    assert store.stored_tokens("sess-A", "other") == 0
+    assert store.fetch("sess-A", "hidden", 1) is None
+    # Rebuild from scratch works (the seeding path appends at 0).
+    assert store.append("sess-A", "hidden", _rows(100, 16))
+    assert torch.equal(store.fetch("sess-A", "hidden", 16), _rows(100, 16))
+
+
+def test_append_beyond_overlap_mismatch_invalidates_session():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 32))
+    store.append("sess-A", "other", _rows(0, 32))
+    # Batch [16, 48): overlapping prefix is fork content, tail is new.
+    batch = torch.cat([_rows(100, 16), _rows(32, 16)], dim=0)
+    assert not store.append_beyond("sess-A", "hidden", 16, batch)
+    assert store.stored_tokens("sess-A", "hidden") == 0
+    assert store.stored_tokens("sess-A", "other") == 0
+    # No misaligned tail was stored: the stream is empty, not
+    # old-prefix + new-tail.
+    assert store.fetch("sess-A", "hidden", 1) is None
+
+
+def test_append_beyond_overlap_mismatch_spans_segments():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 16))
+    store.append("sess-A", "hidden", _rows(16, 16))
+    # Batch [8, 40): overlapping [8, 32) spans both stored segments.
+    batch = torch.cat([_rows(100, 24), _rows(32, 8)], dim=0)
+    assert not store.append_beyond("sess-A", "hidden", 8, batch)
+    assert store.stored_tokens("sess-A", "hidden") == 0
+
+
+def test_append_beyond_overlap_match_within_tolerance_appends_tail():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 32))
+    # Same prefix up to numeric noise: only the tail appends.
+    batch = torch.cat([_rows(16, 16) + 0.001, _rows(32, 16)], dim=0)
+    assert store.append_beyond("sess-A", "hidden", 16, batch)
+    assert store.stored_tokens("sess-A", "hidden") == 48
+    assert torch.equal(store.fetch("sess-A", "hidden", 48), _rows(0, 48))
+
+
+def test_append_beyond_noop_match_within_tolerance_is_noop():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 32))
+    assert store.append_beyond("sess-A", "hidden", 0, _rows(0, 16) + 0.001)
+    assert store.stored_tokens("sess-A", "hidden") == 32
+    assert torch.equal(store.fetch("sess-A", "hidden", 32), _rows(0, 32))
+
+
+def test_append_beyond_beyond_tolerance_mismatch_invalidates():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 32))
+    # Perturbation 1.0 exceeds atol + rtol*|value| at row 0 (allowed 0.01).
+    assert not store.append_beyond("sess-A", "hidden", 0, _rows(0, 16) + 1.0)
+    assert store.stored_tokens("sess-A", "hidden") == 0
+
+
 def test_concurrent_append_invalidate_fetch_never_serves_misaligned_rows():
     """Writer/invalidator/reader race: a fetch is always None or the
     exact [0, upto) prefix of the current stream.
