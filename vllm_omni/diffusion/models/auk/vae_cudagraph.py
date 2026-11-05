@@ -329,14 +329,9 @@ class AuKVAEDecodeGraph:
         """The [latent_dim] normalized latent that AuKVAE.decode maps to raw zero."""
         pad = self._pad_latent
         if pad is None or pad.device != device:
-            global_mean = getattr(self.vae, "global_mean", None)
-            global_log_std = getattr(self.vae, "global_log_std", None)
-            if isinstance(global_mean, torch.Tensor) and isinstance(global_log_std, torch.Tensor):
-                mean = global_mean.detach().float().to(device)
-                scale = torch.sqrt(global_log_std.detach().float().to(device))
-                pad = -mean / scale
-            else:
-                pad = torch.zeros((int(getattr(self.vae, "latent_dim", 1)),), dtype=torch.float32, device=device)
+            mean = self.vae.global_mean.detach().float().to(device)
+            scale = torch.sqrt(self.vae.global_log_std.detach().float().to(device))
+            pad = -mean / scale
             self._pad_latent = pad
         return pad
 
