@@ -41,12 +41,18 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
     create_s2v_transformer_from_config,
 )
-from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, selected_offload_components
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    OffloadStrategy,
+    resolve_offload_strategy,
+    selected_offload_components,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
@@ -536,6 +542,9 @@ class Wan22S2VPipeline(
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
     dummy_run_num_frames: ClassVar[int] = 0
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts.
+    default_num_inference_steps: ClassVar[int] = 40
 
     def __init__(
         self,
@@ -593,6 +602,16 @@ class Wan22S2VPipeline(
     # Format-specific initialization
     # ------------------------------------------------------------------
 
+    def _create_transformer(self, config: dict) -> nn.Module:
+        """Create the S2V transformer. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        # Same rule as the T2V/I2V pipeline: auto-detected startup metadata is not a
+        # user policy, so let the checkpoint's own config.json decide.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        quant_config = resolve_wan_transformer_quant_config(config, quant_config, "transformer")
+        return create_s2v_transformer_from_config(config, quant_config=quant_config)
+
     def _init_diffusers_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from a diffusers-format model with subfolders."""
         # -- Weight sources for transformer (loaded via load_weights) --
@@ -627,7 +646,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, "transformer", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
 
     def _init_original_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from the original Wan2.2 checkpoint layout.
@@ -659,7 +678,10 @@ class Wan22S2VPipeline(
 
         t5_checkpoint = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
         self.text_encoder = UMT5EncoderModel(_WAN_UMT5_CONFIG)
-        _cpu_offload = self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload
+        _cpu_offload = resolve_offload_strategy(self.od_config) in (
+            OffloadStrategy.MODEL_LEVEL,
+            OffloadStrategy.LAYER_WISE,
+        )
         self.text_encoder = _load_wan_t5_as_umt5(self.text_encoder, t5_checkpoint, dtype=dtype)
         if not _cpu_offload:
             self.text_encoder = self.text_encoder.to(self.device)
@@ -681,7 +703,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, ".", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
 
     # ------------------------------------------------------------------
     # Properties
@@ -1108,7 +1130,9 @@ class Wan22S2VPipeline(
     def _should_release_dit_before_decode(self) -> bool:
         if getattr(self.od_config.parallel_config, "use_hsdp", False):
             return False
-        return self.od_config.enable_cpu_offload and DIT_COMPONENT in selected_offload_components(self.od_config)
+        return resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL and (
+            DIT_COMPONENT in selected_offload_components(self.od_config)
+        )
 
     def forward(
         self,
@@ -1120,7 +1144,7 @@ class Wan22S2VPipeline(
         height: int = 704,
         width: int = 1024,
         infer_frames: int | None = None,
-        num_inference_steps: int = 40,
+        num_inference_steps: int | None = None,
         guidance_scale: float = 4.5,
         num_repeat: int | None = None,
         pose_video: str | None = None,
@@ -1189,7 +1213,7 @@ class Wan22S2VPipeline(
             or (req_num_frames if req_num_frames and req_num_frames > 1 else None)
             or self._DEFAULT_INFER_FRAMES
         )
-        num_steps = common.num_inference_steps or num_inference_steps
+        num_steps = common.num_inference_steps or num_inference_steps or self.default_num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         # The request's output_type is what serving honours downstream; the keyword
         # argument only carries a default for direct callers. Reading it here is what

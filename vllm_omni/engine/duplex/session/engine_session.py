@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -43,6 +43,15 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseConfig,
     DuplexLeaseState,
 )
+from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
+from vllm_omni.metrics.stats import (
+    DUPLEX_STAGE_TABLE_EXCLUDE,
+    OrchestratorAggregator,
+    StageRequestStats,
+    _one_row_per_stage,
+    _tpot_interval_weight,
+)
+from vllm_omni.metrics.utils import _as_int, _as_optional_int
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.plugin import DuplexModelSessionState
@@ -55,26 +64,6 @@ def _default_lease() -> DuplexLeaseState:
 
 def _object_dict(**fields: object) -> dict[str, object]:
     return dict(fields)
-
-
-def _as_int(value: object, default: int = 0) -> int:
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    return default
-
-
-def _as_optional_int(value: object) -> int | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    return None
 
 
 def _copy_mapping(value: object) -> dict[str, object] | None:
@@ -94,6 +83,7 @@ class InputBufferState:
     commit_seq: int = 0
     overlap_speech_ms: int = 0
     reserved_input_bytes: int = 0
+    queued_input_bytes: int = 0
     pending_turns: int = 0
 
 
@@ -105,14 +95,32 @@ class ResponseState:
     active_response_input_commit_seq: int | None = None
     active_response_awaits_input_commit: bool = False
     last_response_id: str | None = None
+    #: Overlapped-input: prior-turn Stage2/3 request ids still draining under
+    #: their own ``response_id`` after the next turn opened a new response.
+    draining_response_by_request: dict[str, str] = field(default_factory=dict)
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     pending_options: ResponseCreateOptions | None = None
-    active_options: ResponseCreateOptions | None = None
     active_config: DuplexSessionConfig | None = None
     stage_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
     stage_metric_tpot_weight: dict[str, int] = field(default_factory=dict)
+    request_started_at_s_by_turn: dict[int, float] = field(default_factory=dict)
+    active_response_request_started_at_s: float | None = None
+    active_response_ttft_ms: float | None = None
+    active_response_ttfp_ms: float | None = None
+
+
+RESPONSE_REQUEST_MEASUREMENT_ORIGIN: dict[str, str] = {
+    "ttft": (
+        "accepted native-append start to first non-empty text output; "
+        "pending turns keep the latest append before first output, so overlapping user speech shortens TTFT"
+    ),
+    "ttfp": (
+        "accepted native-append start to first audio output; "
+        "pending turns keep the latest append before first output, so overlapping user speech shortens TTFP"
+    ),
+}
 
 
 @dataclass
@@ -124,6 +132,7 @@ class PlaybackLedger:
 @dataclass
 class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
+    revision: int = 0
     #: User items added by ``conversation.item.create`` that no response has
     #: answered yet. A turn can start from these alone, the way the Realtime
     #: protocol allows, without any audio having been committed.
@@ -131,13 +140,13 @@ class ConversationHistory:
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
+    # Preserve audio provenance with stored history after releasing its cursor.
+    retired_audio_item_ids: set[str] = field(default_factory=set)
     pending_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
-    pending_item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
-    pending_item_input_commit_seqs: dict[str, int] = field(default_factory=dict)
     pending_truncations_ms: dict[str, int] = field(default_factory=dict)
     hard_truncations_ms: dict[str, int] = field(default_factory=dict)
-    last_assistant_full_message: dict[str, object] | None = None
-    last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
+    # Original text, conservative character offset, evidence audio cutoff.
+    heard_prefixes: dict[str, tuple[str, int, int]] = field(default_factory=dict)
     assistant_response_snapshots: dict[str, tuple[dict[str, object], tuple[DuplexAssistantAudioTextMark, ...], int]] = (
         field(default_factory=dict)
     )
@@ -156,6 +165,7 @@ class DuplexRequestResource:
     request_id: str
     fence: DuplexFence
     submitted: bool = False
+    input_audio_part: dict[str, object] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -194,6 +204,8 @@ class DuplexEngineSession:
     _runtime_config: dict[str, object] = field(default_factory=dict, repr=False)
     #: Bumped on every published session / runtime config change.
     config_generation: int = 0
+    #: User session settings, separate from model-owned chunk/tool state.
+    config_revision: int = 0
     #: Stage request ids reserved or submitted for this session, keyed by ``(stage_id, request_id)``.
     request_resources: dict[tuple[int, str], DuplexRequestResource] = field(default_factory=dict, repr=False)
     #: Highest fence accepted for a stage request (monotonic; reset of the append
@@ -214,6 +226,17 @@ class DuplexEngineSession:
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
+    #: Pipeline width for the per-response ``OrchestratorAggregator`` table.
+    num_stages: int = 1
+    #: Same serve ``log_stats`` gate as HTTP ``build_and_log_summary``.
+    log_stats: bool = False
+    _response_aggregator: OrchestratorAggregator | None = field(default=None, repr=False)
+    #: ``StageRequestStats`` that arrived before ``begin_response`` (stage 0
+    #: feeding TTS). Replayed onto the aggregator when the response opens.
+    _pending_stage_request_stats: list[tuple[int, StageRequestStats]] = field(default_factory=list, repr=False)
+    #: Server-side stage work and audio by turn and chunk (RFC #8325); None when
+    #: the deployment does not collect session stats.
+    perf: SessionPerfLedger | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.accepted_fence is None:
@@ -265,9 +288,9 @@ class DuplexEngineSession:
         self._validate_fence(self.fence)
         self.lease.detach(self._clock())
 
-    def resume_lease(self, *, expected_lease_generation: int) -> int:
+    def resume_lease(self, *, expected_lease_generation: int, control_id: str | None = None) -> int:
         self._validate_fence(self.fence)
-        return self.lease.resume(self._clock(), expected_generation=expected_lease_generation)
+        return self.lease.resume(self._clock(), expected_generation=expected_lease_generation, control_id=control_id)
 
     def begin_lease_operation(self, fence: DuplexFence, operation_id: str) -> None:
         self._validate_fence(fence)
@@ -372,12 +395,34 @@ class DuplexEngineSession:
         }
         return stale
 
-    def cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
-        stale = self.prepare_cancel_fence(cancelled_fence, next_fence)
-        self.release_fence(cancelled_fence)
-        return stale
+    def release_resources_for_request_ids(self, request_ids: Iterable[str]) -> list[str]:
+        """Drop bindings for these request ids, whichever fence they sit on.
 
-    def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
+        Fence-scoped cancellation only releases the fence being cancelled.
+        Overlapped draining output stages belong to an older turn fence and
+        would otherwise stay until the session closes.
+        """
+        wanted = {request_id for request_id in request_ids if isinstance(request_id, str) and request_id}
+        if not wanted:
+            return []
+
+        released = list(
+            dict.fromkeys(
+                resource.request_id for resource in self.request_resources.values() if resource.request_id in wanted
+            )
+        )
+        self.request_resources = {
+            resource_key: resource
+            for resource_key, resource in self.request_resources.items()
+            if resource.request_id not in wanted
+        }
+        return released
+
+    def prepare_cancel_fence(
+        self,
+        cancelled_fence: DuplexFence,
+        next_fence: DuplexFence,
+    ) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
         current = self.accepted_fence
         if cancelled_fence.session_id != self.session_id:
@@ -425,9 +470,21 @@ class DuplexEngineSession:
         return self._input.commit_seq
 
     @property
+    def history_revision(self) -> int:
+        """Monotonic version of committed history, including edits and playback cuts."""
+        return self._conversation.revision
+
+    @property
     def history(self) -> tuple[dict[str, object], ...]:
         placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
         return tuple(dict(message) for message in self._conversation.messages if id(message) not in placeholders)
+
+    def history_snapshot(self) -> tuple[tuple[dict[str, object], ...], tuple[str | None, ...]]:
+        """Snapshot committed messages and their aligned, optional item identities."""
+        placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
+        item_ids = {id(message): item_id for item_id, message in self._conversation.item_ids.items()}
+        messages = [message for message in self._conversation.messages if id(message) not in placeholders]
+        return tuple(dict(message) for message in messages), tuple(item_ids.get(id(message)) for message in messages)
 
     @property
     def active_request_id(self) -> str | None:
@@ -457,14 +514,12 @@ class DuplexEngineSession:
     def assistant_audio_text_marks(self) -> tuple[DuplexAssistantAudioTextMark, ...]:
         return tuple(self._response.assistant_audio_text_marks)
 
-    @property
-    def last_assistant_full_message(self) -> dict[str, object] | None:
-        message = self._conversation.last_assistant_full_message
-        return dict(message) if message is not None else None
-
-    @property
-    def last_assistant_audio_text_marks(self) -> tuple[DuplexAssistantAudioTextMark, ...]:
-        return tuple(self._conversation.last_assistant_audio_text_marks)
+    def has_audio_only_response(self, response_id: str) -> bool:
+        # A draining snapshot can still receive text after its first audio ACK.
+        if self.response_has_draining_request(response_id):
+            return False
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        return snapshot is not None and snapshot[0].get("content") == ""
 
     def has_assistant_response_item(self, response_id: str, item_id: str) -> bool:
         if item_id != f"item_{response_id}":
@@ -482,11 +537,8 @@ class DuplexEngineSession:
         # assistant turn after a newer user input.
         if item_id in self._conversation.item_ids or item_id in self._conversation.history_item_placeholders:
             return False
-        input_commit_seq = self._conversation.pending_item_input_commit_seqs.get(item_id)
-        if input_commit_seq is None:
-            snapshot = self._conversation.assistant_response_snapshots.get(response_id)
-            if snapshot is not None:
-                input_commit_seq = snapshot[2]
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        input_commit_seq = snapshot[2] if snapshot is not None else None
         if input_commit_seq is None and self.active_response_id == response_id:
             input_commit_seq = self._response.active_response_input_commit_seq
         return input_commit_seq is not None and self.input_commit_seq > input_commit_seq
@@ -505,6 +557,7 @@ class DuplexEngineSession:
         message: dict[str, object],
     ) -> dict[str, object]:
         """Materialize or update a response item without changing its order."""
+        self._conversation.revision += 1
         existing = self._conversation.item_ids.get(item_id)
         if existing is not None:
             if existing is not message:
@@ -539,7 +592,47 @@ class DuplexEngineSession:
         if response_id is None or response_id == self.active_response_id:
             return
         self._conversation.assistant_response_snapshots.pop(response_id, None)
-        self._conversation.hard_truncations_ms.pop(f"item_{response_id}", None)
+        item_id = f"item_{response_id}"
+        # An audio-only response may have registered an empty pending item.
+        # Its full ACK has no text to materialize, but still releases that state.
+        self._conversation.pending_item_ids.pop(item_id, None)
+        self._conversation.pending_truncations_ms.pop(item_id, None)
+        self._conversation.hard_truncations_ms.pop(item_id, None)
+        self._conversation.heard_prefixes.pop(item_id, None)
+        self._discard_history_item_placeholder(item_id)
+
+    def retire_history_calibration(self, response_id: str) -> None:
+        """Release retired evidence while keeping the committed turn immutable.
+
+        Only the stored prefix and its evidence cutoff survive with the history
+        item. Without the original recording, an earlier truncate must clear
+        that prefix rather than estimate a new alignment or restore full text.
+        """
+        if response_id == self.active_response_id or self.response_has_draining_request(response_id):
+            return
+        item_id = f"item_{response_id}"
+        if (
+            response_id not in self._conversation.assistant_response_snapshots
+            and item_id not in self._conversation.hard_truncations_ms
+        ):
+            return
+        prefix = self._conversation.heard_prefixes.get(item_id)
+        cutoff = prefix[2] if prefix is not None else self.history_audio_cutoff(response_id)
+        message = self._conversation.item_ids.get(item_id)
+        if message is None and item_id in self._conversation.history_item_placeholders:
+            message = self._store_history_item_message(item_id, _object_dict(role="assistant", content=""))
+        self.release_response_history_snapshot(response_id)
+        self.release_response_playback(response_id)
+        self._conversation.item_audio_text_marks.pop(item_id, None)
+        if message is not None and isinstance(content := message.get("content"), str):
+            # Share the stored string; do not retain the original full reply.
+            self._conversation.heard_prefixes[item_id] = (content, len(content), cutoff)
+
+    def history_calibration_retired(self, response_id: str) -> bool:
+        return (
+            f"item_{response_id}" in self._conversation.heard_prefixes
+            and response_id not in self._conversation.assistant_response_snapshots
+        )
 
     @property
     def playback(self) -> DuplexPlaybackView:
@@ -553,16 +646,34 @@ class DuplexEngineSession:
     def pending_history_item_ids(self) -> Mapping[str, dict[str, object]]:
         return MappingProxyType({key: dict(value) for key, value in self._conversation.pending_item_ids.items()})
 
-    @property
-    def pending_history_truncations_ms(self) -> Mapping[str, int]:
-        return MappingProxyType(dict(self._conversation.pending_truncations_ms))
-
     def replace_config(self, config: DuplexSessionConfig) -> None:
         previous_seed = self.config.initial_user_text
         self.config = config
         self.config_generation += 1
+        self.config_revision += 1
         if config.initial_user_text and config.initial_user_text != previous_seed:
             self.notify_new_user_item()
+
+    def restore_config(self, previous: DuplexSessionConfig) -> None:
+        """Undo a ``replace_config`` whose candidate never finished adopting.
+
+        The forward replace already assigned the candidate, bumped
+        ``config_generation``, and may have counted its seed text. Putting the
+        previous object back through ``replace_config`` would count that seed
+        again and advance the generation a second time.
+        """
+        candidate = self.config
+        if (
+            candidate.initial_user_text
+            and candidate.initial_user_text != previous.initial_user_text
+            and self._conversation.unanswered_user_items > 0
+        ):
+            self._conversation.unanswered_user_items -= 1
+        self.config = previous
+        if self.config_generation > 0:
+            self.config_generation -= 1
+        if self.config_revision > 0:
+            self.config_revision -= 1
 
     def transition_turn(self, state: DuplexTurnState) -> None:
         self.turn_state = state
@@ -587,11 +698,55 @@ class DuplexEngineSession:
             return False
         if turn_id is None:
             return True
+        # Overlapped input opens a new response_id per released turn; each
+        # response only accepts its own turn. Draining prior TTS is keyed by
+        # request_id → response_id, not by this guard.
         active_turn_id = self._response.active_response_turn_id
-        return active_turn_id is None or int(turn_id) == active_turn_id
+        if active_turn_id is None or int(turn_id) == int(active_turn_id):
+            return True
+        return False
+
+    def bind_draining_request(self, request_id: str, response_id: str) -> None:
+        """Map a still-playing draining-stage request onto the response that owns it."""
+        if request_id and response_id:
+            self._response.draining_response_by_request[request_id] = response_id
+
+    def response_id_for_request(self, request_id: str | None) -> str | None:
+        if isinstance(request_id, str) and request_id in self._response.draining_response_by_request:
+            return self._response.draining_response_by_request[request_id]
+        return self._response.active_response_id
+
+    def pop_draining_request(self, request_id: str | None) -> str | None:
+        if not isinstance(request_id, str):
+            return None
+        return self._response.draining_response_by_request.pop(request_id, None)
+
+    def is_draining_request(self, request_id: str | None) -> bool:
+        return isinstance(request_id, str) and request_id in self._response.draining_response_by_request
+
+    def response_has_draining_request(self, response_id: str | None) -> bool:
+        if response_id is None:
+            return False
+        return any(resp == response_id for resp in self._response.draining_response_by_request.values())
+
+    def draining_request_ids(self) -> list[str]:
+        """Request ids whose TTS is still running under a previous response."""
+        return list(self._response.draining_response_by_request)
+
+    def clear_draining_requests(self) -> None:
+        self._response.draining_response_by_request.clear()
+
+    def clear_draining_for_response(self, response_id: str | None) -> None:
+        """Drop draining bindings owned by ``response_id``; leave other responses intact."""
+        if response_id is None:
+            return
+        self._response.draining_response_by_request = {
+            rid: resp for rid, resp in self._response.draining_response_by_request.items() if resp != response_id
+        }
 
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
+        self._conversation.revision += 1
 
     def notify_new_user_item(self) -> None:
         """Record a user item that a later ``response.create`` may answer."""
@@ -607,23 +762,31 @@ class DuplexEngineSession:
 
     @property
     def pending_input_bytes(self) -> int:
-        return self._input.reserved_input_bytes
+        return self._input.reserved_input_bytes + self._input.queued_input_bytes
 
     @property
     def pending_input_turns(self) -> int:
         return self._input.pending_turns
 
-    def reserve_input_bytes(self, size: int, *, limit: int) -> bool:
+    def reserve_input_bytes(self, size: int, *, limit: int, queued: bool = False) -> bool:
         size = max(0, int(size))
-        if self._input.reserved_input_bytes + size > int(limit):
+        if self.pending_input_bytes + size > int(limit):
             return False
-        self._input.reserved_input_bytes += size
+        if queued:
+            self._input.queued_input_bytes += size
+        else:
+            self._input.reserved_input_bytes += size
         return True
 
-    def release_input_bytes(self, size: int) -> None:
-        self._input.reserved_input_bytes = max(0, self._input.reserved_input_bytes - max(0, int(size)))
+    def release_input_bytes(self, size: int, *, queued: bool = False) -> None:
+        size = max(0, int(size))
+        if queued:
+            self._input.queued_input_bytes = max(0, self._input.queued_input_bytes - size)
+        else:
+            self._input.reserved_input_bytes = max(0, self._input.reserved_input_bytes - size)
 
-    def release_all_input_bytes(self) -> None:
+    def release_buffered_input_bytes(self) -> None:
+        # Buffered audio can be discarded without releasing later mailbox appends.
         self._input.reserved_input_bytes = 0
 
     def reserve_pending_turn(self, *, limit: int) -> bool:
@@ -639,9 +802,9 @@ class DuplexEngineSession:
         self.turn_state = DuplexTurnState.USER_SPEAKING
 
     def cancel_pending_input(self) -> dict[str, int]:
-        """Drop every pending reservation; the PCM buffer itself is model state cleared by the runner."""
+        """Drop processed input reservations, not appends still queued in the mailbox."""
         cancelled = {"text_chunks": 0, "audio_chunks": 0}
-        self._input.reserved_input_bytes = 0
+        self.release_buffered_input_bytes()
         self._input.pending_turns = 0
         self.turn_state = DuplexTurnState.IDLE
         return cancelled
@@ -663,7 +826,7 @@ class DuplexEngineSession:
         message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
             message["transcript"] = transcript
-        self._conversation.messages.append(message)
+        self.append_history_message(message)
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
             message=message,
@@ -672,12 +835,58 @@ class DuplexEngineSession:
             input_commit_seq=self._input.commit_seq,
         )
 
+    def input_audio_part(self, item_id: str) -> dict[str, object] | None:
+        """Return the native audio part whose identity owns this item's ASR."""
+        message = self._conversation.item_ids.get(item_id)
+        if message is None or message.get("role") != "user":
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "audio_url"
+                and part.get("audio_url") == {"url": "native-duplex:input-audio"}
+            ):
+                return part
+        return None
+
+    def update_input_transcript(
+        self,
+        item_id: str,
+        transcript: str,
+        *,
+        audio_part: dict[str, object] | None,
+    ) -> bool:
+        """Attach ASR text only to the audio part captured for this request.
+
+        Public item IDs can be deleted and reused. A fresh native placeholder
+        has the same value, but must not receive the old audio's transcript.
+        """
+        if audio_part is None or self.input_audio_part(item_id) is not audio_part:
+            return False
+        message = self._conversation.item_ids[item_id]
+        if "transcript" in message or "transcript" in audio_part:
+            return False
+        audio_part["transcript"] = transcript
+        message["transcript"] = transcript
+        self._conversation.revision += 1
+        return True
+
     def complete_model_turn(self, turn_id: int) -> None:
         """Advance the model-owned output identity after its terminal signal."""
         completed_turn_id = int(turn_id)
+        self._response.request_started_at_s_by_turn = {
+            pending_turn_id: started_at_s
+            for pending_turn_id, started_at_s in self._response.request_started_at_s_by_turn.items()
+            if pending_turn_id > completed_turn_id
+        }
         if completed_turn_id >= self.turn_id:
             self.turn_id = completed_turn_id + 1
             self.sync_fence()
+        if self.perf is not None:
+            self.perf.close_turns(epoch=self.epoch, up_to_turn_id=completed_turn_id)
 
     def _bind_active_response_to_input_commit(self, input_commit_seq: int) -> None:
         if self.active_response_id is not None and self._response.active_response_awaits_input_commit:
@@ -697,38 +906,211 @@ class DuplexEngineSession:
     def _activate_response_options(self) -> None:
         options = self._response.pending_options
         self._response.active_config = copy.deepcopy(self.config)
-        self._response.active_options = options
         self._response.pending_options = None
         if options is not None:
             options.apply_to(self._response.active_config)
 
     def _restore_response_config(self) -> None:
         self._response.active_config = None
-        self._response.active_options = None
         self._response.pending_options = None
 
+    def snapshot_active_response_for_drain(self) -> None:
+        """Keep the active response ACK-admissible after a later response starts.
+
+        Overlapped commit calls ``begin_response`` while prior TTS is still
+        draining. That clears the live text buffer and playback cursor.
+        ``end_response`` is the normal snapshot, but it would also close the
+        response. Copy the same snapshot (and reserve the history slot) first
+        so a playback ACK for the draining response is not
+        ``playback_item_not_found``.
+        """
+        response_id = self.active_response_id
+        if response_id is None:
+            return
+        if response_id not in self._playback.by_response:
+            self._playback.by_response[response_id] = self._playback.current
+        assistant_text = "".join(self._response.assistant_text_buffer).strip()
+        message = _object_dict(role="assistant", content=assistant_text)
+        seq = self._response.active_response_input_commit_seq
+        if seq is None:
+            seq = self.input_commit_seq
+        self._conversation.assistant_response_snapshots[response_id] = (
+            copy.deepcopy(message),
+            tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+            seq,
+        )
+        self.reserve_history_item(f"item_{response_id}")
+
+    def append_draining_assistant_text(self, response_id: str, text: str) -> None:
+        """Append text onto a snapshotted draining response, not the active one."""
+        if not text:
+            return
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        if snapshot is None:
+            return
+        message, marks, seq = snapshot
+        content = message.get("content")
+        if not isinstance(content, str):
+            content = ""
+        message["content"] = content + text
+        self._conversation.assistant_response_snapshots[response_id] = (message, marks, seq)
+
+    def assistant_transcript(self, response_id: str | None = None) -> str:
+        """Joined assistant text for the active response, or a draining snapshot."""
+        if response_id is not None and response_id != self.active_response_id:
+            snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+            if snapshot is None:
+                return ""
+            content = snapshot[0].get("content")
+            return content if isinstance(content, str) else ""
+        return "".join(self._response.assistant_text_buffer)
+
     def begin_response(self, *, turn_id: int | None = None) -> str:
+        if self._response_aggregator is not None:
+            self._log_response_aggregator()
         self._activate_response_options()
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self._clear_response_request_timing()
+        self._response.active_response_request_started_at_s = self._response.request_started_at_s_by_turn.pop(
+            self._response.active_response_turn_id,
+            None,
+        )
         self._response.active_response_input_commit_seq = self.input_commit_seq
         self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
         self._clear_response_metrics()
-        self._conversation.last_assistant_full_message = None
-        self._conversation.last_assistant_audio_text_marks.clear()
         self._playback.current = DuplexPlaybackCursor()
         self._playback.by_response[response_id] = self._playback.current
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
+        self._start_response_aggregator()
+        if self.perf is not None:
+            self.perf.bind_response(
+                epoch=self.epoch, turn_id=self._response.active_response_turn_id, response_id=response_id
+            )
         return response_id
 
     def _clear_response_metrics(self) -> None:
         self._response.stage_metrics.clear()
         self._response.stage_metric_tpot_weighted_ms.clear()
         self._response.stage_metric_tpot_weight.clear()
+
+    def _response_aggregator_wall_start_ts(self) -> float:
+        now_wall_s = time.time()
+        started_at_s = self._response.active_response_request_started_at_s
+        if started_at_s is None:
+            return now_wall_s
+        elapsed_s = max(0.0, self._clock() - started_at_s)
+        return now_wall_s - elapsed_s
+
+    def _new_response_aggregator(self) -> OrchestratorAggregator:
+        num_stages = max(int(self.num_stages), 1)
+        return OrchestratorAggregator(
+            num_stages=num_stages,
+            log_stats=True,
+            wall_start_ts=self._response_aggregator_wall_start_ts(),
+            final_stage_id_for_e2e=num_stages - 1,
+            stage_table_exclude=DUPLEX_STAGE_TABLE_EXCLUDE,
+        )
+
+    def _start_response_aggregator(self) -> None:
+        if not self.log_stats:
+            self._pending_stage_request_stats.clear()
+            return
+        self._response_aggregator = self._new_response_aggregator()
+        pending, self._pending_stage_request_stats = self._pending_stage_request_stats, []
+        for stage_id, stats in pending:
+            self._record_stage_request_stats(stage_id, stats)
+
+    def _record_stage_request_stats(self, stage_id: int, metrics: StageRequestStats) -> None:
+        aggregator = self._response_aggregator
+        request_id = self.active_response_id
+        if aggregator is None or request_id is None:
+            return
+        if stage_id < 0 or stage_id >= aggregator.num_stages:
+            return
+        aggregator.on_stage_metrics(stage_id, request_id, metrics, metrics.final_output_type)
+
+    def observe_stage_request_stats(self, stage_id: int, metrics: StageRequestStats) -> None:
+        """Feed one engine ``StageRequestStats`` into the response's logger table."""
+        if not self.log_stats:
+            return
+        event = copy.copy(metrics)
+        if event.stage_id is None:
+            event.stage_id = stage_id
+        if self.active_response_id is None:
+            self._pending_stage_request_stats.append((int(stage_id), event))
+            return
+        if self._response_aggregator is None:
+            self._start_response_aggregator()
+        self._record_stage_request_stats(int(stage_id), event)
+
+    def _log_response_aggregator(self) -> None:
+        aggregator = self._response_aggregator
+        self._response_aggregator = None
+        self._pending_stage_request_stats.clear()
+        if aggregator is None:
+            return
+        response_id = self._response.active_response_id
+        if response_id is not None and str(response_id) not in aggregator.e2e_done:
+            final_stage = aggregator.num_stages - 1 if aggregator.num_stages > 0 else 0
+            aggregator.on_finalize_request(final_stage, response_id, aggregator.wall_start_ts)
+        for rid, events in aggregator.stage_events.items():
+            aggregator.stage_events[rid] = _one_row_per_stage(events)
+        aggregator.build_and_log_summary()
+
+    def _clear_response_request_timing(self) -> None:
+        self._response.active_response_request_started_at_s = None
+        self._response.active_response_ttft_ms = None
+        self._response.active_response_ttfp_ms = None
+
+    def mark_model_turn_request_started(self, turn_id: int, started_at_s: float) -> None:
+        """Record the native request start that can own one model turn.
+
+        Pending turns keep the latest accepted append. After ``begin_response``
+        the first accepted append wins; later appends must not rebind.
+        """
+        turn_id = int(turn_id)
+        started_at_s = float(started_at_s)
+        if self.active_response_turn_id == turn_id:
+            if self._response.active_response_request_started_at_s is None:
+                self._response.active_response_request_started_at_s = started_at_s
+            return
+        self._response.request_started_at_s_by_turn[turn_id] = started_at_s
+
+    def mark_response_first_outputs(
+        self,
+        *,
+        observed_at_s: float,
+        has_text: bool,
+        has_audio: bool,
+    ) -> dict[str, object]:
+        """Return server-monotonic TTF metrics newly observed for the active response."""
+        started_at_s = self._response.active_response_request_started_at_s
+        if started_at_s is None:
+            return {}
+        elapsed_ms = max(0.0, (float(observed_at_s) - started_at_s) * 1000.0)
+        newly_observed = False
+        if has_text and self._response.active_response_ttft_ms is None:
+            self._response.active_response_ttft_ms = elapsed_ms
+            newly_observed = True
+        if has_audio and self._response.active_response_ttfp_ms is None:
+            self._response.active_response_ttfp_ms = elapsed_ms
+            newly_observed = True
+        if not newly_observed:
+            return {}
+        metrics: dict[str, object] = {
+            "source": "server_monotonic_request_start",
+            "measurement_origin": dict(RESPONSE_REQUEST_MEASUREMENT_ORIGIN),
+        }
+        if self._response.active_response_ttft_ms is not None:
+            metrics["ttft_ms"] = self._response.active_response_ttft_ms
+        if self._response.active_response_ttfp_ms is not None:
+            metrics["ttfp_ms"] = self._response.active_response_ttfp_ms
+        return metrics
 
     def stash_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
         """Hold a stage snapshot until a response exists to attribute it to.
@@ -826,7 +1208,7 @@ class DuplexEngineSession:
             tpot_ms = raw_values.get("vllm_tpot_ms")
             token_count = raw_values.get("num_tokens_out")
             if isinstance(tpot_ms, int | float) and tpot_ms > 0:
-                weight = max(int(token_count) - 1, 1) if isinstance(token_count, int | float) else 1
+                weight = _tpot_interval_weight(token_count)
                 self._response.stage_metric_tpot_weighted_ms[stage_id] = (
                     self._response.stage_metric_tpot_weighted_ms.get(stage_id, 0.0) + float(tpot_ms) * weight
                 )
@@ -841,23 +1223,6 @@ class DuplexEngineSession:
                 if name not in handled_fields:
                     current[str(name)] = copy.deepcopy(value)
 
-        return copy.deepcopy(self._response.stage_metrics)
-
-    def replace_response_stage_metric_snapshots(
-        self,
-        stage_metrics: Mapping[Any, Any] | None,
-    ) -> dict[str, dict[str, object]]:
-        """Merge cumulative chat snapshots by replacing each stage's latest value."""
-        if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
-            return copy.deepcopy(self._response.stage_metrics)
-
-        for raw_stage_id, raw_values in stage_metrics.items():
-            if not isinstance(raw_values, Mapping):
-                continue
-            stage_id = str(raw_stage_id)
-            self._response.stage_metrics[stage_id] = copy.deepcopy(dict(raw_values))
-            self._response.stage_metric_tpot_weighted_ms.pop(stage_id, None)
-            self._response.stage_metric_tpot_weight.pop(stage_id, None)
         return copy.deepcopy(self._response.stage_metrics)
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
@@ -881,7 +1246,18 @@ class DuplexEngineSession:
         audio_text_marks: list[dict[str, object]] | None = None,
         text_requires_complete_audio: bool = False,
         audio_complete: bool = False,
+        response_id: str | None = None,
     ) -> None:
+        if response_id is not None and response_id != self.active_response_id:
+            self._mark_draining_audio_sent(
+                response_id,
+                duration_ms,
+                text_chars=text_chars,
+                audio_text_marks=audio_text_marks,
+                text_requires_complete_audio=text_requires_complete_audio,
+                audio_complete=audio_complete,
+            )
+            return
         playback = self._playback.current
         playback.text_requires_complete_audio |= text_requires_complete_audio
         playback.audio_complete |= audio_complete
@@ -911,6 +1287,52 @@ class DuplexEngineSession:
                 )
         self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
 
+    def _mark_draining_audio_sent(
+        self,
+        response_id: str,
+        duration_ms: int | None,
+        *,
+        text_chars: int | None,
+        audio_text_marks: list[dict[str, object]] | None,
+        text_requires_complete_audio: bool,
+        audio_complete: bool,
+    ) -> None:
+        """Attribute audio to a draining response, not the newly active cursor."""
+        playback = self._playback_cursor_for_response(response_id)
+        playback.text_requires_complete_audio |= text_requires_complete_audio
+        playback.audio_complete |= audio_complete
+        marks: list[DuplexAssistantAudioTextMark] = []
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        if snapshot is not None:
+            marks = list(snapshot[1])
+        if duration_ms is not None:
+            playback.generated_ms = max(playback.generated_ms, duration_ms)
+            playback.sent_ms = max(playback.sent_ms, duration_ms)
+            if text_chars is not None and text_chars >= 0:
+                marks.append(
+                    DuplexAssistantAudioTextMark(
+                        text_chars=int(text_chars),
+                        audio_end_ms=max(0, int(duration_ms)),
+                    )
+                )
+        if audio_text_marks:
+            for raw_mark in audio_text_marks:
+                if not isinstance(raw_mark, dict):
+                    continue
+                raw_text_chars = raw_mark.get("text_chars")
+                raw_audio_end_ms = raw_mark.get("audio_end_ms", raw_mark.get("audio_ms"))
+                if not isinstance(raw_text_chars, int | float) or not isinstance(raw_audio_end_ms, int | float):
+                    continue
+                marks.append(
+                    DuplexAssistantAudioTextMark(
+                        text_chars=max(0, int(raw_text_chars)),
+                        audio_end_ms=max(0, int(raw_audio_end_ms)),
+                    )
+                )
+        if snapshot is not None:
+            message, _, seq = snapshot
+            self._conversation.assistant_response_snapshots[response_id] = (message, tuple(marks), seq)
+
     def _playback_cursor_for_response(self, response_id: str | None = None) -> DuplexPlaybackCursor:
         if response_id is None:
             return self._playback.current
@@ -923,7 +1345,12 @@ class DuplexEngineSession:
         return playback
 
     def playback_for_response(self, response_id: str | None = None) -> DuplexPlaybackView:
-        return self._playback_cursor_for_response(response_id).snapshot()
+        # Reading late cancellation/output metadata must not recreate a retired
+        # cursor. Only generation and validated ACKs may allocate one.
+        if response_id is None:
+            return self._playback.current.snapshot()
+        playback = self._playback.by_response.get(response_id)
+        return playback.snapshot() if playback is not None else DuplexPlaybackCursor().snapshot()
 
     def acknowledge_playback(
         self,
@@ -949,7 +1376,113 @@ class DuplexEngineSession:
     def release_response_playback(self, response_id: str | None) -> None:
         if response_id is None or response_id == self.active_response_id:
             return
-        self._playback.by_response.pop(response_id, None)
+        playback = self._playback.by_response.pop(response_id, None)
+        item_id = f"item_{response_id}"
+        if (
+            playback is not None
+            and max(playback.sent_ms, playback.generated_ms) > 0
+            and item_id in self._conversation.item_ids
+        ):
+            self._conversation.retired_audio_item_ids.add(item_id)
+
+    def history_item_has_audio(self, item_id: str) -> bool:
+        """Whether this item's response produced audio, including after cleanup.
+
+        A transcript or an empty cursor does not establish audio ownership.
+        Retired provenance follows the stored item's lifetime, not an ACK's.
+        """
+        playback = self._playback_cursor_for_item_id(item_id)
+        return item_id in self._conversation.retired_audio_item_ids or (
+            playback is not None and max(playback.sent_ms, playback.generated_ms) > 0
+        )
+
+    def finalize_response_playback(self, response_id: str | None, *, require_audio_complete: bool = False) -> bool:
+        """Reconcile history and release finished, acknowledged or truncated output.
+
+        ACK and output completion may arrive in either order. Both paths use
+        this check; neither requires another client ACK to finish cleanup.
+        Calibration retains incomplete evidence in its bounded cache.
+        Returns whether answer text was committed, for plugin settlement.
+        """
+        if (
+            response_id is None
+            or response_id == self.active_response_id
+            or self.response_has_draining_request(response_id)
+        ):
+            return False
+        if self.history_calibration_retired(response_id):
+            self.release_response_playback(response_id)
+            return False
+        playback = self._playback.by_response.get(response_id)
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        committed_history = False
+        item_id = f"item_{response_id}"
+        hard_truncated = item_id in self._conversation.hard_truncations_ms
+        if hard_truncated and playback is self._playback.current:
+            # Playback stopped even if calibration retains the response cursor.
+            # Detach only this reply's gate; a newer reply keeps its own cursor.
+            self._playback.current = DuplexPlaybackCursor()
+        if playback is not None:
+            total_ms = max(playback.sent_ms, playback.generated_ms)
+            if self.has_assistant_response_item(response_id, item_id):
+                if require_audio_complete and total_ms > 0 and snapshot is not None and snapshot[0].get("content"):
+                    # Calibration still needs the original reply after a stop,
+                    # including its hard cutoff. Its cache owns bounded retirement.
+                    if not playback.audio_complete or self.history_audio_cutoff(response_id) < total_ms:
+                        return False
+                elif not hard_truncated and playback.committed_ms < total_ms:
+                    return False
+            if snapshot is not None and total_ms > 0 and not self.playback_ack_is_too_late(response_id, item_id):
+                if self.has_audio_only_response(response_id):
+                    self.register_history_item(item_id, _object_dict(role="assistant", content=""))
+                else:
+                    # The terminal output may supply text/completion metadata
+                    # after the last ACK. Apply the retained cursor before
+                    # discarding the final transcript and truncation limits.
+                    committed_history = self.truncate_history_item(
+                        item_id, audio_end_ms=playback.committed_ms, playback=playback
+                    )
+        retain_alignment = (
+            bool(self._conversation.item_audio_text_marks.get(item_id))
+            and (playback is None or not playback.text_requires_complete_audio)
+            and item_id not in self._conversation.heard_prefixes
+        )
+        if hard_truncated and (require_audio_complete or not retain_alignment):
+            # Without usable alignment, retain the conservative prefix/cutoff.
+            self.retire_history_calibration(response_id)
+        else:
+            # Ordinary aligned history keeps its cheap timing marks, just as
+            # after a full ACK. A later explicit stop can shorten it accurately;
+            # releasing the full snapshot prevents ACKs from expanding it.
+            if retain_alignment and snapshot is not None and playback is not None:
+                marks = self._conversation.item_audio_text_marks[item_id]
+                total_ms = max(playback.sent_ms, playback.generated_ms)
+                if max(mark.audio_end_ms for mark in marks) < total_ms:
+                    # Preserve the interpolation tail before its total duration
+                    # and original text length disappear with the snapshot.
+                    marks.append(
+                        DuplexAssistantAudioTextMark(
+                            text_chars=self._message_text_len(snapshot[0]), audio_end_ms=total_ms
+                        )
+                    )
+            self.release_response_playback(response_id)
+            self.release_response_history_snapshot(response_id)
+        return committed_history
+
+    def release_finished_drain_response(self, response_id: str | None, *, require_audio_complete: bool = False) -> bool:
+        """Finish a natural TTS drain, retaining any audio still awaiting ACK."""
+        if (
+            response_id is None
+            or response_id == self.active_response_id
+            or self.response_has_draining_request(response_id)
+        ):
+            return False
+        playback = self._playback.by_response.get(response_id)
+        if playback is not None:
+            # A terminal event need not carry another audio chunk or repeat
+            # audio_complete. Cancellation does not take this natural-end path.
+            playback.audio_complete = True
+        return self.finalize_response_playback(response_id, require_audio_complete=require_audio_complete)
 
     def clear_playback_cursor(self) -> None:
         self._playback.current = DuplexPlaybackCursor()
@@ -963,22 +1496,22 @@ class DuplexEngineSession:
         playback_commit_policy: str | None = None,
         preserve_request: bool = False,
     ) -> dict[str, object] | None:
+        self._log_response_aggregator()
         response_id = self._response.active_response_id
+        if self.perf is not None and response_id is not None:
+            self.perf.end_response(response_id)
         response_input_commit_seq = self._response.active_response_input_commit_seq
         if response_input_commit_seq is None:
             response_input_commit_seq = self.input_commit_seq
         response_history_is_late = self.input_commit_seq > response_input_commit_seq
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
         message: dict[str, object] | None = None
-        if assistant_text:
-            self._conversation.last_assistant_full_message = _object_dict(role="assistant", content=assistant_text)
-            self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
-            if response_id is not None:
-                self._conversation.assistant_response_snapshots[response_id] = (
-                    copy.deepcopy(self._conversation.last_assistant_full_message),
-                    tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
-                    response_input_commit_seq,
-                )
+        if assistant_text and response_id is not None:
+            self._conversation.assistant_response_snapshots[response_id] = (
+                _object_dict(role="assistant", content=assistant_text),
+                tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+                response_input_commit_seq,
+            )
         if commit_text and assistant_text and not response_history_is_late:
             committed_text = self._playback_committed_text(
                 assistant_text,
@@ -992,7 +1525,7 @@ class DuplexEngineSession:
             if item_id is not None and item_id in self._conversation.history_item_placeholders:
                 self._store_history_item_message(item_id, message)
             else:
-                self._conversation.messages.append(message)
+                self.append_history_message(message)
         effective_playback_policy = playback_commit_policy or self.config.playback_commit_policy
         if (
             response_id is not None
@@ -1002,14 +1535,27 @@ class DuplexEngineSession:
         ):
             self.register_history_item(f"item_{response_id}", None)
         elif response_id is not None and not assistant_text:
+            # Sent audio has no transcript to store, but the client still has
+            # to ack it. Dropping the item makes that ack fail and leaves
+            # sent_ms ahead of committed_ms, so the next response cannot start.
+            playback = self.playback_for_response(response_id)
+            if max(playback.sent_ms, playback.generated_ms) > 0:
+                self._conversation.assistant_response_snapshots[response_id] = (
+                    _object_dict(role="assistant", content=""),
+                    tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+                    response_input_commit_seq,
+                )
             self._discard_history_item_placeholder(f"item_{response_id}")
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
+        # Keep draining bindings for other responses (older TTS may still play).
+        self.clear_draining_for_response(response_id)
         self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()
@@ -1022,15 +1568,20 @@ class DuplexEngineSession:
         response_snapshot = (
             self._conversation.assistant_response_snapshots.get(response_id) if response_id is not None else None
         )
-        response_audio_text_marks = list(response_snapshot[1]) if response_snapshot is not None else None
         if message is None:
             if response_snapshot is None:
                 return
-            last_message, audio_text_marks, _ = response_snapshot
-            self._conversation.pending_item_ids[item_id] = copy.deepcopy(last_message)
-            self._conversation.pending_item_input_commit_seqs[item_id] = response_snapshot[2]
-            if audio_text_marks:
-                self._conversation.pending_item_audio_text_marks[item_id] = list(copy.deepcopy(audio_text_marks))
+            self._conversation.pending_item_ids[item_id] = copy.deepcopy(response_snapshot[0])
+            playback = self._playback_cursor_for_item_id(item_id)
+            if (
+                item_id in self._conversation.history_item_placeholders
+                and playback is not None
+                and playback.text_requires_complete_audio
+            ):
+                # Keep the assistant turn between its user inputs even when
+                # unaligned audio cannot establish any heard text. A later
+                # full playback ACK fills this same slot from the snapshot.
+                self._store_history_item_message(item_id, _object_dict(role="assistant", content=""))
             pending_audio_ms = self._conversation.pending_truncations_ms.get(item_id)
             if pending_audio_ms is not None:
                 self.truncate_history_item(
@@ -1039,17 +1590,25 @@ class DuplexEngineSession:
                     playback=self._playback_cursor_for_item_id(item_id),
                 )
             return
+        if item_id in self._conversation.retired_audio_item_ids:
+            # Replacing finalized context does not give the new message the
+            # retired reply's audio ownership, alignment, or permanent cutoff.
+            self._conversation.retired_audio_item_ids.discard(item_id)
+            self._conversation.item_audio_text_marks.pop(item_id, None)
+            self._conversation.heard_prefixes.pop(item_id, None)
+            self._conversation.hard_truncations_ms.pop(item_id, None)
+            self._conversation.pending_truncations_ms.pop(item_id, None)
         message = self._store_history_item_message(item_id, message)
         pending_audio_ms = self._conversation.pending_truncations_ms.get(item_id)
         self._conversation.pending_item_ids.pop(item_id, None)
-        self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-        self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
         if message.get("role") == "assistant":
-            marks = (
-                response_audio_text_marks
-                if response_audio_text_marks is not None
-                else self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
-            )
+            if response_snapshot is not None:
+                marks = list(response_snapshot[1])
+            elif response_id is not None and response_id == self.active_response_id:
+                marks = self._response.assistant_audio_text_marks
+            else:
+                # Imported or retired items do not own the latest response's marks.
+                marks = []
             if marks:
                 self._conversation.item_audio_text_marks[item_id] = list(marks)
         if pending_audio_ms is not None:
@@ -1061,22 +1620,56 @@ class DuplexEngineSession:
 
     def delete_history_item(self, item_id: str) -> bool:
         response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
+        audio_only = response_id is not None and self.has_audio_only_response(response_id)
+        if audio_only:
+            self.release_response_playback(response_id)
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)
+        self._conversation.retired_audio_item_ids.discard(item_id)
         pending = self._conversation.pending_item_ids.pop(item_id, None)
-        self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-        self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
         self._conversation.pending_truncations_ms.pop(item_id, None)
         self._conversation.hard_truncations_ms.pop(item_id, None)
+        self._conversation.heard_prefixes.pop(item_id, None)
         removed_placeholder = self._discard_history_item_placeholder(item_id)
         if response_id is not None:
             self._conversation.assistant_response_snapshots.pop(response_id, None)
+            # Deletion revokes future ACKs, so no ended reply needs its cursor.
+            # This also works without calibration or before cache eviction.
+            if not self.response_has_draining_request(response_id):
+                self.release_response_playback(response_id)
         if message is None:
-            return pending is not None or removed_placeholder
-        try:
-            self._conversation.messages.remove(message)
-        except ValueError:
-            pass
+            return pending is not None or removed_placeholder or audio_only
+        self._conversation.revision += 1
+        # Distinct response items can have identical (including empty) content.
+        self._conversation.messages = [
+            candidate for candidate in self._conversation.messages if candidate is not message
+        ]
+        return True
+
+    def history_audio_cutoff(self, response_id: str) -> int:
+        playback = self.playback_for_response(response_id)
+        cutoff = min(playback.committed_ms, max(playback.generated_ms, playback.sent_ms))
+        return max(0, min(cutoff, self._conversation.hard_truncations_ms.get(f"item_{response_id}", cutoff)))
+
+    def apply_heard_text(self, response_id: str, *, text: str, audio_end_ms: int, char_end: int) -> bool:
+        """Validate an async result against the current reply and permanent cutoff."""
+        item_id = f"item_{response_id}"
+        if (
+            self.state != DuplexSessionState.OPEN
+            or self.config.playback_commit_policy != DuplexPlaybackCommitPolicy.ACK_ONLY.value
+            or response_id == self.active_response_id
+            or response_id not in self._conversation.assistant_response_snapshots
+            or item_id not in self._conversation.item_ids
+            or self.assistant_transcript(response_id) != text
+            or not 0 <= char_end <= len(text)
+            or audio_end_ms <= 0
+            or audio_end_ms > self.history_audio_cutoff(response_id)
+        ):
+            return False
+        self._conversation.heard_prefixes[item_id] = (text, char_end, audio_end_ms)
+        self.truncate_history_item(item_id, audio_end_ms=self.history_audio_cutoff(response_id))
+        # The validated prefix was applied even when it intentionally kept no
+        # text. truncate_history_item's bool also serves legacy ACK semantics.
         return True
 
     def truncate_history_item(
@@ -1087,8 +1680,24 @@ class DuplexEngineSession:
         playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
         hard: bool = False,
     ) -> bool:
-        playback = playback or self._playback_cursor_for_item_id(item_id)
+        """Apply this item's heard prefix; a hard cut without audio is a no-op."""
+        if hard and not self.history_item_has_audio(item_id):
+            return False
         audio_end_ms = max(0, int(audio_end_ms))
+        response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
+        if response_id is not None and self.history_calibration_retired(response_id):
+            # Old ACKs cannot expand or shrink a finalized prefix. A stricter
+            # explicit cutoff clears it because its alignment evidence expired.
+            text, char_end, cutoff = self._conversation.heard_prefixes[item_id]
+            if not hard or audio_end_ms >= cutoff:
+                return False
+            text, char_end, cutoff = "", 0, audio_end_ms
+            self._conversation.heard_prefixes[item_id] = (text, char_end, cutoff)
+            self._store_history_item_message(item_id, _object_dict(role="assistant", content=text[:char_end]))
+            return True
+        # Every history edit uses only this item's evidence. Missing evidence
+        # must never fall back to another response's cursor or timing marks.
+        playback = playback or self._playback_cursor_for_item_id(item_id) or DuplexPlaybackCursor()
         if hard:
             previous_cap_ms = self._conversation.hard_truncations_ms.get(item_id)
             self._conversation.hard_truncations_ms[item_id] = (
@@ -1097,80 +1706,72 @@ class DuplexEngineSession:
         hard_cap_ms = self._conversation.hard_truncations_ms.get(item_id)
         if hard_cap_ms is not None:
             audio_end_ms = min(audio_end_ms, hard_cap_ms)
-        response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
         response_snapshot = (
             self._conversation.assistant_response_snapshots.get(response_id) if response_id is not None else None
         )
         if response_snapshot is not None:
             full_message, full_marks, _ = response_snapshot
             message = copy.deepcopy(full_message)
-            changed = self._truncate_message_to_audio_ms(
-                message,
-                audio_end_ms=audio_end_ms,
-                marks=list(full_marks),
-                playback=playback,
-            )
+            prefix = self._conversation.heard_prefixes.get(item_id)
+            if prefix is not None and not hard:
+                # Ordinary ACKs are cumulative: an older ACK must not erase
+                # already confirmed text. A hard truncate still only tightens.
+                audio_end_ms = max(audio_end_ms, playback.committed_ms)
+                if hard_cap_ms is not None:
+                    audio_end_ms = min(audio_end_ms, hard_cap_ms)
+            fully_played = playback.audio_complete and audio_end_ms >= max(playback.generated_ms, playback.sent_ms)
+            if prefix is not None and message.get("content") == prefix[0] and not fully_played:
+                keep_chars = prefix[1] if audio_end_ms >= prefix[2] else 0
+                message["content"] = prefix[0][:keep_chars].rstrip()
+                changed = True
+            else:
+                changed = self._truncate_message_to_audio_ms(
+                    message,
+                    audio_end_ms=audio_end_ms,
+                    marks=list(full_marks),
+                    playback=playback,
+                )
             if not changed or self._message_text_len(message) <= 0:
+                # A stricter permanent truncate must also clear a previously
+                # calibrated prefix. Keep the original turn boundary in place.
+                if changed and (prefix is not None or hard) and item_id in self._conversation.item_ids:
+                    self._store_history_item_message(item_id, message)
                 self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
                 return False
             self._store_history_item_message(item_id, message)
             if full_marks:
                 self._conversation.item_audio_text_marks[item_id] = list(copy.deepcopy(full_marks))
             self._conversation.pending_item_ids.pop(item_id, None)
-            self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-            self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
             self._conversation.pending_truncations_ms.pop(item_id, None)
             return True
 
         stored_message = self._conversation.item_ids.get(item_id)
         if stored_message is None:
-            pending = self._conversation.pending_item_ids.get(item_id)
-            if pending is None:
-                self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
-                return False
-            message = dict(pending)
-            changed = self._truncate_message_to_audio_ms(
-                message,
-                audio_end_ms=audio_end_ms,
-                marks=self._conversation.pending_item_audio_text_marks.get(item_id),
-                playback=playback,
-            )
-            if not changed or self._message_text_len(message) <= 0:
-                if changed:
-                    self._conversation.pending_item_ids.pop(item_id, None)
-                    self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-                    self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
-                    self._conversation.pending_truncations_ms.pop(item_id, None)
-                    if item_id.startswith("item_"):
-                        self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
-                return changed
-            self._conversation.messages.append(message)
-            self._conversation.item_ids[item_id] = message
-            if item_id in self._conversation.pending_item_audio_text_marks:
-                self._conversation.item_audio_text_marks[item_id] = list(
-                    self._conversation.pending_item_audio_text_marks[item_id]
-                )
-            self._conversation.pending_item_ids.pop(item_id, None)
-            self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-            self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
-            self._conversation.pending_truncations_ms.pop(item_id, None)
-            if item_id.startswith("item_"):
-                self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
-            return True
+            self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
+            return False
+        if not hard and max(playback.sent_ms, playback.generated_ms) == 0:
+            # No response snapshot or output cursor remains: this is finalized
+            # history. Delayed progress ACKs cannot shorten it; only a new
+            # explicit truncate may change the stored prefix.
+            return False
         message = stored_message
         changed = self._truncate_message_to_audio_ms(
             message,
             audio_end_ms=audio_end_ms,
-            marks=self._conversation.item_audio_text_marks.get(item_id),
+            marks=self._conversation.item_audio_text_marks.get(item_id, []),
             playback=playback,
         )
-        if changed and self._message_text_len(message) <= 0:
+        if changed:
+            self._conversation.revision += 1
+        # Explicit truncation clears content, not the turn. The command also
+        # sends a playback ACK, which must still find this item even at zero.
+        if changed and self._message_text_len(message) <= 0 and not hard:
             self._conversation.item_ids.pop(item_id, None)
             self._conversation.item_audio_text_marks.pop(item_id, None)
-            try:
-                self._conversation.messages.remove(message)
-            except ValueError:
-                pass
+            self._conversation.retired_audio_item_ids.discard(item_id)
+            self._conversation.messages = [
+                candidate for candidate in self._conversation.messages if candidate is not message
+            ]
             if item_id.startswith("item_"):
                 self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
         elif changed and item_id.startswith("item_"):
@@ -1182,8 +1783,8 @@ class DuplexEngineSession:
         message: dict[str, object],
         *,
         audio_end_ms: int,
-        marks: list[DuplexAssistantAudioTextMark] | None = None,
-        playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
+        marks: list[DuplexAssistantAudioTextMark],
+        playback: DuplexPlaybackCursor | DuplexPlaybackView,
     ) -> bool:
         content = message.get("content")
         if isinstance(content, str):
@@ -1262,38 +1863,46 @@ class DuplexEngineSession:
             # client that never acks playback can be credited with.
             if commit_all:
                 return assistant_text
-            keep_chars = self._text_chars_for_audio_ms(committed_ms, len(assistant_text))
+            keep_chars = self._text_chars_for_audio_ms(
+                committed_ms,
+                len(assistant_text),
+                marks=self._response.assistant_audio_text_marks,
+                playback=self._playback.current,
+            )
             return assistant_text[:keep_chars].rstrip()
         if sent_ms <= 0 or committed_ms >= sent_ms:
             return assistant_text
         if committed_ms <= 0:
             return assistant_text if commit_all else ""
-        keep_chars = self._text_chars_for_audio_ms(committed_ms, len(assistant_text))
+        keep_chars = self._text_chars_for_audio_ms(
+            committed_ms,
+            len(assistant_text),
+            marks=self._response.assistant_audio_text_marks,
+            playback=self._playback.current,
+        )
         if keep_chars <= 0:
             return ""
         return assistant_text[:keep_chars].rstrip()
 
+    @staticmethod
     def _text_chars_for_audio_ms(
-        self,
         audio_end_ms: int,
         text_len: int,
         *,
-        marks: list[DuplexAssistantAudioTextMark] | None = None,
-        playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
+        marks: list[DuplexAssistantAudioTextMark],
+        playback: DuplexPlaybackCursor | DuplexPlaybackView,
     ) -> int:
         if text_len <= 0:
             return 0
         audio_end_ms = max(0, int(audio_end_ms))
-        marks = marks if marks is not None else self._response.assistant_audio_text_marks
-        playback = playback or self._playback.current
         if playback.text_requires_complete_audio:
             # Unaligned streams cannot establish a spoken prefix. A terminal
             # boundary plus its playback ACK can establish the whole answer.
             total_ms = max(playback.sent_ms, playback.generated_ms)
             return text_len if playback.audio_complete and total_ms > 0 and audio_end_ms >= total_ms else 0
         if not marks:
-            sent_ms = max(1, playback.sent_ms, playback.generated_ms)
-            return int(text_len * max(0.0, min(1.0, audio_end_ms / sent_ms)))
+            sent_ms = max(playback.sent_ms, playback.generated_ms)
+            return int(text_len * min(1.0, audio_end_ms / sent_ms)) if sent_ms > 0 else 0
         marks = sorted(
             (mark for mark in marks if mark.audio_end_ms >= 0 and mark.text_chars >= 0),
             key=lambda mark: mark.audio_end_ms,
@@ -1306,16 +1915,18 @@ class DuplexEngineSession:
         previous_chars = 0
         for mark in marks:
             mark_ms = max(previous_ms, mark.audio_end_ms)
-            mark_chars = min(text_len, max(previous_chars, mark.text_chars))
+            # Marks refer to the original transcript, even after the stored
+            # text was shortened. Clamp the result, not the interpolation scale.
+            mark_chars = max(previous_chars, mark.text_chars)
             if audio_end_ms <= mark_ms:
                 if mark_ms <= previous_ms:
-                    return mark_chars
+                    return min(text_len, mark_chars)
                 ratio = (audio_end_ms - previous_ms) / max(1, mark_ms - previous_ms)
-                return int(previous_chars + (mark_chars - previous_chars) * max(0.0, min(1.0, ratio)))
+                return min(text_len, int(previous_chars + (mark_chars - previous_chars) * max(0.0, min(1.0, ratio))))
             previous_ms = mark_ms
             previous_chars = mark_chars
         final_ms = max(playback.sent_ms, playback.generated_ms, previous_ms)
-        if audio_end_ms >= final_ms:
+        if audio_end_ms >= final_ms or previous_chars >= text_len:
             return text_len
         ratio = (audio_end_ms - previous_ms) / max(1, final_ms - previous_ms)
         return int(previous_chars + (text_len - previous_chars) * max(0.0, min(1.0, ratio)))
@@ -1326,6 +1937,9 @@ class DuplexEngineSession:
         return self._playback.by_response.get(item_id.removeprefix("item_"))
 
     def barge_in(self) -> int:
+        self._log_response_aggregator()
+        if self.perf is not None:
+            self.perf.cancel_epoch(self.epoch)
         self.epoch += 1
         self.sync_fence()
         self._response.assistant_text_buffer.clear()
@@ -1333,8 +1947,11 @@ class DuplexEngineSession:
         self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.request_started_at_s_by_turn.clear()
+        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
+        self._response.draining_response_by_request.clear()
         self._clear_response_metrics()
         self._restore_response_config()
         self.turn_state = DuplexTurnState.BARGE_IN
@@ -1345,9 +1962,16 @@ class DuplexEngineSession:
             self.state = DuplexSessionState.CLOSING
 
     def close(self) -> None:
+        self._log_response_aggregator()
+        if self.perf is not None:
+            self.perf.close_all()
         self.state = DuplexSessionState.CLOSED
+        self.release_buffered_input_bytes()
+        self._input.queued_input_bytes = 0
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self._response.request_started_at_s_by_turn.clear()
+        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
@@ -1399,6 +2023,7 @@ class DuplexEngineSession:
             "overlap_barge_in_ms": self.config.overlap_barge_in_ms,
             "overlap_silence_rms": self.config.overlap_silence_rms,
             "playback_commit_policy": self.config.playback_commit_policy,
+            "watermarking": self.config.watermarking,
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
         }

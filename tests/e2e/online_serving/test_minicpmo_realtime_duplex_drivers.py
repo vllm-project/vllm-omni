@@ -229,6 +229,46 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
         assert len(session["audio_delta_timings"]) == 2
 
 
+def test_realtime_duplex_demo_pair_omits_ref_audio_for_model_default(monkeypatch):
+    demo = _load_pair_demo_module()
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(demo, "_summarize_session", lambda **kwargs: {"ok": True})
+
+    result = asyncio.run(
+        demo._run_demo_process(
+            label="a",
+            args=SimpleNamespace(
+                url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+                model="openbmb/MiniCPM-o-4_5",
+                chunk_ms=200,
+                timeout_s=5.0,
+                no_realtime_pacing=False,
+                require_audio=False,
+                ref_audio=None,
+            ),
+            input_wav="input.wav",
+            output_dir="out",
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--ref-audio" not in command
+    assert result["ok"] is True
+
+
 def test_realtime_duplex_demo_pair_rejects_false_green_audio_contract(tmp_path):
     demo = _load_pair_demo_module()
     output = tmp_path / "session"
@@ -289,7 +329,7 @@ def test_realtime_duplex_demo_pair_default_requires_multiple_audio_deltas(monkey
     assert args.min_audio_deltas_per_session == 2
 
 
-def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_demo_pair_allows_model_default_ref_audio(monkeypatch):
     demo = _load_pair_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -307,11 +347,12 @@ def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
-def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_soft_interrupt_allows_model_default_ref_audio(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -325,8 +366,9 @@ def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
 def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
@@ -360,8 +402,6 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
         wav_file.setsampwidth(2)
         wav_file.setframerate(16_000)
         wav_file.writeframes(b"\x00\x00" * 320)
-    ref_audio = tmp_path / "ref.wav"
-    ref_audio.write_bytes(b"ref")
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     captured: dict[str, object] = {}
@@ -392,7 +432,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
                 url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
                 model="openbmb/MiniCPM-o-4_5",
                 input_wav=str(input_wav),
-                ref_audio=str(ref_audio),
+                ref_audio=None,
                 output_dir=str(output_dir),
                 summary_output=None,
                 chunk_ms=200,
@@ -411,6 +451,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
 
     command = captured["command"]
     assert isinstance(command, list)
+    assert "--ref-audio" not in command
     assert "--temperature" in command
     assert command[command.index("--temperature") + 1] == "0.0"
     assert result["ok"] is True
@@ -1611,6 +1652,73 @@ def test_realtime_duplex_demo_response_required_skips_audio_only_model_turn(monk
     assert outcome == "speak"
 
 
+@pytest.mark.parametrize("finished_before_commit", [False, True])
+def test_realtime_duplex_demo_checkpoints_early_response_before_commit(monkeypatch, finished_before_commit):
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    session = DuplexEngineSession(
+        session_id="early-response",
+        config=DuplexSessionConfig(model="test", playback_commit_policy="ack_only"),
+        num_stages=1,
+    )
+    response_id = session.begin_response()
+
+    def finish_response():
+        session.end_response()
+        state.add(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "metadata": {"playback": {"sent_ms": 400}},
+                },
+            }
+        )
+
+    async def fake_send_pcm16(*args, **kwargs):
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(400, text_chars=5, audio_complete=True)
+        state.add({"type": "response.created", "response": {"id": response_id}})
+        state.add({"type": "response.output_audio.delta", "response_id": response_id, "delta": "YQ=="})
+        state.add({"type": "response.output_audio_transcript.delta", "response_id": response_id, "delta": "hello"})
+        if finished_before_commit:
+            finish_response()
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            event = demo.json.loads(payload)
+            if event["type"] == "input_audio_buffer.commit":
+                session.commit_audio_input(transcript="the complete input")
+                if not finished_before_commit:
+                    finish_response()
+            elif event["type"] == "playback.ack":
+                for reply in apply_playback_ack(session, event):
+                    assert reply.type != "error", reply
+                    state.add({"type": reply.type, "event": reply.details})
+
+    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
+    actual_id, outcome = asyncio.run(
+        demo._send_clean_turn(
+            FakeWebSocket(),
+            state,
+            b"\0\0",
+            transcript="fixture",
+            duration_ms=None,
+            chunk_ms=200,
+            timeout_s=0.1,
+            require_audio=True,
+            validation_mode="response-required",
+        )
+    )
+    assert (actual_id, outcome) == (response_id, "speak")
+    assert state.response_playback_history_committed(response_id)
+
+
 def test_realtime_duplex_demo_no_hint_realtime_turn_omits_transcript_hint(monkeypatch):
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -1781,7 +1889,7 @@ def test_realtime_duplex_demo_playback_gate_covers_unassigned_completed_response
         }
     )
 
-    assert not demo._all_response_playback_history_committed(
+    assert not demo._all_response_playback_settled(
         state,
         state.completed_response_ids(),
     )
@@ -1832,7 +1940,73 @@ def test_realtime_duplex_demo_acks_unassigned_completed_response():
     asyncio.run(demo._ack_all_completed_response_playback(ws, state, timeout_s=0.1))
 
     assert [message["response_id"] for message in ws.messages] == ["resp-unassigned"]
-    assert demo._all_response_playback_history_committed(state, state.completed_response_ids())
+    assert demo._all_response_playback_settled(state, state.completed_response_ids())
+
+
+@pytest.mark.parametrize(
+    "transcript,acked_ms,ack_item,accepted",
+    [
+        ("", 1200, "item_resp-audio", True),
+        ("", 600, "item_resp-audio", False),
+        ("", 1200, "item_other", False),
+        ("hello", 1200, "item_resp-audio", False),
+    ],
+)
+def test_realtime_duplex_demo_audio_only_playback_ack(transcript, acked_ms, ack_item, accepted):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response": {"id": "resp-audio"}})
+    _add_response_transcript(state, "resp-audio", transcript=transcript)
+    state.events[-1]["response"]["metadata"] = {"playback": {"sent_ms": 1200}}
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            state.add(
+                {
+                    "type": "playback.acknowledged",
+                    "event": {
+                        "item_id": ack_item,
+                        "history_committed": False,
+                        "playback": {"committed_ms": acked_ms},
+                    },
+                }
+            )
+
+    async def acknowledge():
+        await demo._ack_response_playback(
+            FakeWebSocket(), state, "resp-audio", timeout_s=0.05, label="audio-only response"
+        )
+
+    if accepted:
+        asyncio.run(acknowledge())
+        assert demo._all_response_playback_settled(state, ["resp-audio"])
+        assert not state.response_playback_history_committed("resp-audio")
+    else:
+        with pytest.raises(TimeoutError):
+            asyncio.run(acknowledge())
+
+
+def test_realtime_duplex_demo_playback_surfaces_server_error():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-late",
+                "metadata": {"playback": {"sent_ms": 400}},
+            },
+        }
+    )
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            state.add({"type": "error", "code": "playback_ack_too_late", "message": "late ACK"})
+
+    with pytest.raises(RuntimeError, match="resp-late.*playback_ack_too_late"):
+        asyncio.run(
+            demo._ack_response_playback(FakeWebSocket(), state, "resp-late", timeout_s=0.1, label="second turn")
+        )
 
 
 def test_realtime_duplex_demo_model_policy_does_not_assume_one_response_per_physical_input():
@@ -1847,6 +2021,18 @@ def test_realtime_duplex_demo_model_policy_does_not_assume_one_response_per_phys
         ["resp-1", "resp-2", "resp-3", "resp-4"],
         expected_turns=3,
         validation_mode="response-required",
+    )
+    assert demo._response_cardinality_ok(
+        ["resp-1", "resp-2", "resp-3", "resp-4"],
+        expected_turns=3,
+        validation_mode="response-required",
+        allow_extra_responses=True,
+    )
+    assert not demo._response_cardinality_ok(
+        ["resp-1", "resp-2"],
+        expected_turns=3,
+        validation_mode="response-required",
+        allow_extra_responses=True,
     )
 
 
@@ -2006,19 +2192,18 @@ def test_realtime_duplex_demo_streams_one_video_frame_per_model_unit():
     messages = _send_seconds_of_audio(demo, seconds=3, frames=["f0", "f1", "f2", "f3"])
 
     # Frame k rides the append that closes model unit k, so Stage0 can bind it
-    # to that unit's audio. 3 s of audio closes units at 1030 ms and 2030 ms and
-    # leaves a residual too short for a third, so only two frames go out.
-    assert _sent_video_frames(messages) == [["f0"], ["f1"]]
+    # to that unit's audio. 3 s of audio closes units at 1000, 2000, and 3000 ms.
+    assert _sent_video_frames(messages) == [["f0"], ["f1"], ["f2"]]
     frame_indices = [index for index, message in enumerate(messages) if "video_frames" in message]
-    assert frame_indices == [5, 10]
+    assert frame_indices == [4, 9, 14]
     # The carrying appends are exactly the ones that reach a unit boundary.
-    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1200, 2200]
+    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1000, 2000, 3000]
 
 
 def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
     """Regression: frame 0 used to ride the very first 200 ms append.
 
-    Stage0 cannot close a unit until 1030 ms of audio has arrived, and it does
+    Stage0 cannot close a unit until 1000 ms of audio has arrived, and it does
     not carry frames across appends, so a frame sent that early was silently
     dropped and every later frame ended up one unit ahead of its audio.
     """
@@ -2035,11 +2220,19 @@ def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
 def test_realtime_duplex_demo_holds_the_last_video_frame_when_audio_outlives_the_clip():
     demo = _load_demo_module()
 
-    # 4 s of audio closes three units (1030/2030/3030 ms); the two-frame clip
-    # holds its last frame for the third.
-    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [["a"], ["b"], ["b"]]
+    # 4 s of audio closes four units; the two-frame clip holds its last frame.
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [
+        ["a"],
+        ["b"],
+        ["b"],
+        ["b"],
+    ]
     # A still image is a one-element clip and therefore repeats every unit.
-    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [["still"], ["still"]]
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [
+        ["still"],
+        ["still"],
+        ["still"],
+    ]
 
 
 def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_base_frame():
@@ -2055,7 +2248,7 @@ def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_bas
     # Official pairing is frame_list=[base, composite of that unit's interior],
     # so the composite belongs to the same unit as the base beside it -- never
     # to the previous one. A unit without interior sub-frames sends base alone.
-    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"]]
+    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"], ["f2"]]
 
 
 def test_minicpmo_duplex_camera_fixture_returns_flat_base_frame_track(tmp_path, monkeypatch):
@@ -2162,6 +2355,7 @@ def test_example_demo_extracts_video_soundtrack_only_when_wav_is_absent(tmp_path
         assert video_path == Path("/tmp/clip.mp4")
         return extracted, ["v0"], ["s0"]
 
+    monkeypatch.setattr(demo, "_video_has_audio", lambda path: True)
     monkeypatch.setattr(demo, "_extract_video_input", fake_extract)
 
     wav_out, frames, stacked = demo._resolve_duplex_av_inputs(

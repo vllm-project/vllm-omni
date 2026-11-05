@@ -561,35 +561,15 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             )
         ]
 
-    def _preprocess_hf_mm_data(
-        self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
-            mm_data,
-            hf_processor_mm_kwargs,
-        )
-        mm_data = dict(mm_data)
-        audios = mm_data.pop("audios", [])
-        if audios:
-            if isinstance(audios, str):
-                mm_data["audio"] = [audios]
-            elif isinstance(audios, (list, tuple)):
-                mm_data["audio"] = audios
-            else:
-                mm_data["audio"] = [audios]
-        return mm_data, hf_processor_mm_kwargs
-
     def _postprocess_hf_mm_data(
         self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_data: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
         processed_data: BatchFeature,
     ) -> BatchFeature:
         processed_data = super()._postprocess_hf_mm_data(
-            mm_data,
-            hf_processor_mm_kwargs,
+            hf_data,
+            hf_kwargs,
             processed_data,
         )
         if "audio_mels" not in processed_data:

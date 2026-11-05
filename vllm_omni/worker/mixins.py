@@ -7,13 +7,23 @@ from typing import Any
 
 
 class OmniWorkerMixin:
-    """Mixin to ensure Omni plugins are loaded in worker processes."""
+    """Shared Omni plugin and native KV connector setup for workers."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         from vllm_omni.plugins import load_omni_general_plugins
 
         load_omni_general_plugins()
+
+    def initialize_from_config(self, kv_cache_config) -> None:
+        # The concrete GPU/NPU/XPU worker supplies this method through the MRO.
+        super().initialize_from_config(kv_cache_config)  # type: ignore[misc]
+        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+
+        if has_kv_transfer_group():
+            from vllm_omni.diffusion.diffusion_kv.kv_connector import install_mooncake_cfg_fanout
+
+            install_mooncake_cfg_fanout(get_kv_transfer_group())
 
 
 def maybe_unpad_input_ids(model, input_ids, num_tokens_unpadded):

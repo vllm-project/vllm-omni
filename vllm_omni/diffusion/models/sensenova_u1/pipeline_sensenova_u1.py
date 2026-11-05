@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -30,10 +31,12 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.lora.loader import (
     LoraLoaderMixin,
     _apply_diffusers_lora_alpha_scaling,
@@ -46,6 +49,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
@@ -231,6 +235,16 @@ def _build_abs_positions_from_grid_hw(grid_hw, device=None):
     return pid % W_per_patch, pid // W_per_patch
 
 
+@dataclass(frozen=True)
+class VisionGrid:
+    sizes: list[tuple[int, int]]
+    positions: tuple[torch.Tensor, torch.Tensor]
+
+    @classmethod
+    def from_tensor(cls, grid_hw: torch.Tensor) -> VisionGrid:
+        return cls([tuple(size) for size in grid_hw.tolist()], _build_abs_positions_from_grid_hw(grid_hw))
+
+
 class NEOVisionEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -266,12 +280,14 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("cos_cached_y", cos_y, persistent=False)
         self.register_buffer("sin_cached_y", sin_y, persistent=False)
 
-    def forward(self, pixel_values, grid_hw=None):
+    def forward(self, pixel_values, grid_hw=None, grid: VisionGrid | None = None):
         pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
 
         # 2D RoPE
-        abs_x, abs_y = _build_abs_positions_from_grid_hw(grid_hw)
+        if grid is None:
+            grid = VisionGrid.from_tensor(grid_hw)
+        abs_x, abs_y = grid.positions
         dim_half = self.embed_dim // 2
         p1 = _apply_rotary_emb_1d(
             patch_embeds[:, :dim_half].float(),
@@ -289,8 +305,7 @@ class NEOVisionEmbeddings(nn.Module):
 
         patches_list = []
         cur = 0
-        for i in range(grid_hw.shape[0]):
-            h, w = grid_hw[i]
+        for h, w in grid.sizes:
             pe = patch_embeds[cur : cur + h * w].view(h, w, -1).unsqueeze(0)
             pe = self.dense_embedding(pe.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             patches_list.append(pe.view(-1, pe.shape[-1]))
@@ -304,8 +319,8 @@ class NEOVisionModel(nn.Module):
         super().__init__()
         self.embeddings = NEOVisionEmbeddings(config)
 
-    def forward(self, pixel_values=None, grid_hw=None, **_kwargs):
-        return self.embeddings(pixel_values, grid_hw=grid_hw)
+    def forward(self, pixel_values=None, grid_hw=None, grid: VisionGrid | None = None, **_kwargs):
+        return self.embeddings(pixel_values, grid_hw=grid_hw, grid=grid)
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +512,9 @@ class SenseNovaU1Pipeline(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
+        quant_config = resolve_component_quant_config(od_config.quantization_config, "language_model")
         self.od_config = od_config
+        self._unsupported_quant_methods_check(quant_config)
         self.device = get_local_device()
         model_path = od_config.model
         self.local_model_path = _resolve_model_path(model_path)
@@ -513,6 +530,7 @@ class SenseNovaU1Pipeline(
         # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=quant_config,
             prefix="language_model",
         )
         # Cache-DiT hooks pipeline.transformer(.blocks), so it must point at the
@@ -576,16 +594,38 @@ class SenseNovaU1Pipeline(
         ]
 
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "_t2i_prefix_forward",
+                "_it2i_prefix_forward",
+                "_generate_think",
+                "_generate_text",
+                "_run_denoising_loop",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
 
-    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None):
+    def _unsupported_quant_methods_check(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject online FP8 combined with distilled LoRA."""
+        if (
+            quant_config is None
+            or quant_config.get_name() != "fp8"
+            or getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        ):
+            return
+
+        if self.od_config.lora_backend == "distill" and self.od_config.lora_path:
+            raise ValueError(
+                "SenseNova does not support online FP8 with distilled LoRA "
+                "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
+            )
+
+    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None, grid: VisionGrid | None = None):
         if gen_model:
-            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw)
+            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw, grid=grid)
         return self.vision_model(pixel_values=pixel_values, grid_hw=grid_hw)
 
     def _build_t2i_text_inputs(self, query):
@@ -691,9 +731,8 @@ class SenseNovaU1Pipeline(
         denoising_model = self.language_model if cache_dit_skip else self.denoising_transformer
         outputs = denoising_model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
-                (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
-            ),
+            exist_und=False,
+            exist_gen=True,
             indexes=indexes_image,
             attention_mask=attn_mask,
             past_key_values=past_key_values,
@@ -1134,15 +1173,13 @@ class SenseNovaU1Pipeline(
             kwargs["cache_dit_skip"] = True
         return kwargs
 
-    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg: bool):
         if not is_it2i:
-            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
-            if not (in_interval and p.cfg_scale > 1):
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
@@ -1156,14 +1193,11 @@ class SenseNovaU1Pipeline(
             )
             return noise_pred
         else:
-            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
-            needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
-            has_cached_partner = use_cfg and needs_cfg
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            if not use_cfg or not needs_cfg:
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
@@ -1475,6 +1509,27 @@ class SenseNovaU1Pipeline(
         """Shared denoising loop for both T2I and IT2I."""
         merge_size = self.merge_size
         image_prediction = ns.image_prediction
+        grid = VisionGrid.from_tensor(ns.grid_hw)
+        times = ns.timesteps[:-1]
+        if is_it2i:
+            cfg_steps = ((times > p.cfg_interval[0]) & (times < p.cfg_interval[1])) | (p.cfg_interval[0] == 0)
+            cfg_steps &= p.cfg_scale != 1 or p.img_cfg_scale != 1
+        else:
+            cfg_steps = (times >= p.cfg_interval[0]) & (times <= p.cfg_interval[1])
+            cfg_steps &= p.cfg_scale > 1
+        cfg_steps = cfg_steps.tolist()
+
+        noise_scale_emb = None
+        if self.model_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full(
+                (p.batch_size * ns.token_h * ns.token_w,),
+                ns.noise_scale / self.model_cfg.noise_scale_max_value,
+                dtype=ns.timesteps.dtype,
+                device=ns.timesteps.device,
+            )
+            noise_scale_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
+                p.batch_size, ns.token_h * ns.token_w, -1
+            )
 
         for step_i in range(p.num_steps):
             t = ns.timesteps[step_i]
@@ -1486,6 +1541,7 @@ class SenseNovaU1Pipeline(
                 image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
                 gen_model=True,
                 grid_hw=ns.grid_hw,
+                grid=grid,
             ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
             t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
@@ -1494,17 +1550,13 @@ class SenseNovaU1Pipeline(
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.model_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
-                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
-                    p.batch_size,
-                    ns.token_h * ns.token_w,
-                    -1,
-                )
-                timestep_embeddings = timestep_embeddings + ns_emb
+            if noise_scale_emb is not None:
+                timestep_embeddings = timestep_embeddings + noise_scale_emb
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
+            v_pred = self._denoise(
+                image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, cfg_steps[step_i]
+            )
             z = z + (t_next - t) * v_pred
             image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
 
@@ -1650,29 +1702,43 @@ class SenseNovaU1Pipeline(
             applied += 1
         return applied
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        num_experts = max(
+            getattr(self.llm_cfg, "num_experts", 0) or 0,
+            getattr(self.llm_cfg, "gen_num_experts", 0) or 0,
+        )
+        if num_experts <= 1:
+            return []
+        return FusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.get_expert_mapping()
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            loaded = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    break
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(stacked_name)
-                loaded = True
-                break
+            # Expert FFN shards must skip the stacked mapping: ``.gate_proj`` is
+            # a substring of ``experts.{i}.gate_proj``, which would fuse them
+            # into a dense gate_up_proj instead of reaching the FusedMoE loader.
+            is_expert_weight = ".experts." in name
 
-            if loaded:
+            if not is_expert_weight and self._load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping, loaded_params
+            ):
+                continue
+
+            if is_expert_weight:
+                # A shard that matches no mapping belongs to an expert this rank
+                # does not own, so dropping it here is expected under TP/EP.
+                self._load_expert_weight(name, loaded_weight, params_dict, expert_params_mapping, loaded_params)
                 continue
 
             if name not in params_dict:
@@ -1690,3 +1756,54 @@ class SenseNovaU1Pipeline(
             loaded_params.add(name)
 
         return loaded_params
+
+    @staticmethod
+    def _load_stacked_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        stacked_params_mapping: list[tuple[str, str, str | int]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            if stacked_name not in params_dict:
+                return False
+            param = params_dict[stacked_name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(stacked_name)
+            return True
+        return False
+
+    @staticmethod
+    def _load_expert_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        expert_params_mapping: list[tuple[str, str, int, str]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            param = params_dict.get(stacked_name)
+            weight_loader = getattr(param, "weight_loader", None) if param is not None else None
+            if weight_loader is None:
+                continue
+            success = weight_loader(
+                param,
+                loaded_weight,
+                stacked_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_params.add(stacked_name)
+                return True
+        return False

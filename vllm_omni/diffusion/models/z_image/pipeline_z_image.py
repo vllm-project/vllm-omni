@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -220,7 +220,11 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             od_config,
             hf_config=text_encoder_config,
         ).to(self._execution_device)
-        if text_encoder_config.tie_word_embeddings:
+        # Online FP8 rewrites lm_head.weight in place (transpose + fp8). Sharing
+        # that storage with the token embedding turns vocab lookup into an OOB
+        # gather. Leave the tied head detached whenever a quant config is set;
+        # prompt encoding reads hidden states, not logits.
+        if text_encoder_config.tie_word_embeddings and not od_config.quantization_config:
             self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
         vae_config = DistributedAutoencoderKL.load_config(model, subfolder="vae", local_files_only=local_files_only)
@@ -584,7 +588,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
         # 5. Prepare timesteps
         if image is None:
-            image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+            # for both [B, C, H, W] and multi-layer/frame [B, C, F, H, W]
+            image_seq_len = (latents.shape[-2] // 2) * (latents.shape[-1] // 2)
             mu = calculate_shift(
                 image_seq_len,
                 self.scheduler.config.get("base_image_seq_len", 256),
@@ -643,7 +648,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             latents_typed = latents.to(self.od_config.dtype)
 
             if apply_cfg:
-                latent_model_input = latents_typed.repeat(2, 1, 1, 1)
+                repeat_dims = (2,) + (1,) * (latents_typed.ndim - 1)
+                latent_model_input = latents_typed.repeat(*repeat_dims)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                 timestep_model_input = timestep.repeat(2)
             else:
@@ -651,9 +657,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
 
-            latent_model_input = latent_model_input.unsqueeze(2)
+            if latent_model_input.ndim == 4:
+                latent_model_input = latent_model_input.unsqueeze(2)
             latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
+            if getattr(self, "_uses_cudagraph_trees", False):
+                # check Ming-Image
+                torch.compiler.cudagraph_mark_step_begin()
             model_out_list = self.transformer(
                 latent_model_input_list,
                 timestep_model_input,
@@ -690,7 +700,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             else:
                 noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
 
-            noise_pred = noise_pred.squeeze(2)
+            if latents.ndim == 4:
+                noise_pred = noise_pred.squeeze(2)
             noise_pred = -noise_pred
 
             # compute the previous noisy sample x_t -> x_t-1

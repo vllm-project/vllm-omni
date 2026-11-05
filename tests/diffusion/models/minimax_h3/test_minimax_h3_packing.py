@@ -192,6 +192,247 @@ def test_condition_noise_accepts_a_reference_video_longer_than_the_target():
     assert result.shape == rows.shape
 
 
+@pytest.mark.parametrize(
+    ("condition_shapes", "noncontiguous"),
+    [([(1, 4, 6)], False), ([(1, 4, 6), (3, 8, 4), (7, 4, 4)], True)],
+)
+@pytest.mark.parametrize("noise_aug", [0.0, 0.999])
+def test_condition_noise_preserves_fp32_recipe_and_owns_output(condition_shapes, noncontiguous, noise_aug):
+    from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
+        minimax_h3_imgvid_cond_noise_aug_rows,
+        minimax_h3_imgvid_cond_noise_rows,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+        minimax_h3_patchify_video_latent,
+    )
+
+    row_count = sum(t * (h // 2) * (w // 2) for t, h, w in condition_shapes)
+    clean_generator = torch.Generator(device="cpu").manual_seed(31)
+    shape = (96, row_count) if noncontiguous else (row_count, 96)
+    clean_rows = torch.randn(shape, generator=clean_generator, dtype=torch.float32)
+    if noncontiguous:
+        clean_rows = clean_rows.t()
+        assert not clean_rows.is_contiguous()
+    clean_before = clean_rows.clone()
+    rng_before = torch.get_rng_state().clone()
+    target_latent_t = 2
+    seed = 2101
+    timestep = torch.tensor(noise_aug, dtype=torch.float32)
+    expected_parts = []
+    expected_noise_parts = []
+    offset = 0
+    # Match the original per-reference FP32 recipe exactly.
+    for t, h, w in condition_shapes:
+        full_t = max(target_latent_t + len(condition_shapes), t)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(1, 24, full_t, h, w, generator=generator, dtype=torch.float32)[:, :, :t]
+        noise_rows = minimax_h3_patchify_video_latent(noise, patch_size=(1, 2, 2))
+        expected_noise_parts.append(noise_rows)
+        count = noise_rows.shape[0]
+        expected_parts.append(timestep * clean_rows[offset : offset + count] + (1.0 - timestep) * noise_rows)
+        offset += count
+    expected = torch.cat(expected_parts)
+    expected_noise = torch.cat(expected_noise_parts)
+    precomputed_noise = minimax_h3_imgvid_cond_noise_rows(
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed,
+    )
+
+    result = minimax_h3_imgvid_cond_noise_aug_rows(
+        clean_rows,
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed,
+        noise_aug=noise_aug,
+    )
+    precomputed_result = minimax_h3_imgvid_cond_noise_aug_rows(
+        clean_rows,
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed,
+        noise_aug=noise_aug,
+        precomputed_noise_rows=precomputed_noise,
+    )
+    different_seed_noise = minimax_h3_imgvid_cond_noise_rows(
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed + 1,
+    )
+
+    assert torch.equal(result.view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(precomputed_noise.view(torch.int32), expected_noise.view(torch.int32))
+    assert torch.equal(precomputed_result.view(torch.int32), result.view(torch.int32))
+    assert not torch.equal(different_seed_noise, precomputed_noise)
+    assert precomputed_noise.device.type == "cpu"
+    assert precomputed_noise.dtype == torch.float32
+    assert torch.equal(clean_rows, clean_before)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert result.dtype == torch.float32
+    assert result.device.type == "cpu"
+    assert result.is_contiguous()
+    assert result.untyped_storage().data_ptr() != clean_rows.untyped_storage().data_ptr()
+    result.zero_()
+    assert torch.equal(clean_rows, clean_before)
+
+
+def test_guided_condition_noise_is_independent_of_other_conditions_and_target():
+    from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
+        minimax_h3_audio_cond_noise_aug_rows,
+        minimax_h3_imgvid_cond_noise_aug_rows,
+    )
+
+    first = torch.arange(1 * 2 * 3 * 96, dtype=torch.float32).reshape(-1, 96) / 1000
+    second = torch.ones(2 * 2 * 3, 96)
+
+    def visual(rows, shapes, target_latent_t):
+        return minimax_h3_imgvid_cond_noise_aug_rows(
+            rows,
+            condition_shapes=shapes,
+            target_latent_t=target_latent_t,
+            imgvid_cond_num_frames=len(shapes),
+            seed=11,
+            noise_aug=0.9,
+            guided=True,
+        )
+
+    alone = visual(first, [(1, 4, 6)], 3)
+    together = visual(torch.cat([first, second]), [(1, 4, 6), (2, 4, 6)], 9)
+    torch.testing.assert_close(together[: first.shape[0]], alone, rtol=0, atol=0)
+    noise = torch.randn(first.shape, generator=torch.Generator().manual_seed(11))
+    torch.testing.assert_close(alone, 0.9 * first + (1.0 - 0.9) * noise, rtol=0, atol=0)
+
+    audio = torch.linspace(-1, 1, 2 * 5 * 32).reshape(-1, 32)
+    guided = minimax_h3_audio_cond_noise_aug_rows(audio, condition_audio_t=[5], seed=3, noise_aug=0.75, guided=True)
+    legacy = minimax_h3_audio_cond_noise_aug_rows(audio, condition_audio_t=[5], seed=3, noise_aug=0.75)
+    torch.testing.assert_close(guided, legacy)
+    torch.testing.assert_close(
+        minimax_h3_audio_cond_noise_aug_rows(audio, condition_audio_t=[5], seed=3, noise_aug=1.0, guided=True), audio
+    )
+
+
+def test_guides_preserve_insertion_order_overlaps_and_reference_adjusted_origins():
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        MINIMAX_H3_AUDIO_REF_COND_ID,
+        MINIMAX_H3_IMGVID_COND_ID,
+        MINIMAX_H3_PAD_ID,
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    image = {"kind": "image", "frame_index": 36, "latent_h": 4, "latent_w": 6}
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=3,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=5,
+        guide_blocks=[
+            image,
+            {"kind": "video_audio", "frame_index": 1, "latent_t": 6, "latent_h": 2, "latent_w": 4, "ref_audio_t": 3},
+            {"kind": "audio", "frame_index": 0, "ref_audio_t": 2},
+            {"kind": "video", "frame_index": 1, "latent_t": 2, "latent_h": 4, "latent_w": 2, "ref_audio_t": 0},
+            image,
+        ],
+        ref_blocks=[
+            {"kind": "image", "latent_h": 2, "latent_w": 2},
+            {"kind": "video_audio", "latent_t": 2, "latent_h": 2, "latent_w": 4, "ref_audio_t": 3},
+            {"kind": "audio", "ref_audio_t": 2},
+            {"kind": "video", "latent_t": 1, "latent_h": 2, "latent_w": 2, "ref_audio_t": 0},
+        ],
+    )
+
+    assert packed["cu_seqlens"].tolist() == [0, 79, 128]
+    assert packed["video_row_start"].item() == 67
+    assert packed["video_spans"] == (
+        {"start": 9, "latent_grid": (6, 1, 2), "role": "reference"},
+        {"start": 31, "latent_grid": (2, 2, 1), "role": "reference"},
+        {"start": 48, "latent_grid": (2, 1, 2), "role": "reference"},
+        {"start": 56, "latent_grid": (1, 1, 1), "role": "reference"},
+        {"start": 67, "latent_grid": (2, 2, 3), "role": "target"},
+    )
+    visual_anchors = [*range(3, 21), *range(31, 42), *range(48, 52), 56]
+    audio_anchors = [*range(21, 31), *range(42, 48), *range(52, 56)]
+    assert packed["img_pos"].tolist() == visual_anchors + list(range(67, 79))
+    assert packed["audio_pos"].tolist() == audio_anchors + list(range(57, 67))
+    assert packed["update_mask"].tolist() == [False] * 34 + [True] * 12
+    assert packed["audio_update_mask"].tolist() == [False] * 20 + [True] * 10
+    assert (packed["input_ids"][visual_anchors] == MINIMAX_H3_IMGVID_COND_ID).all()
+    assert (packed["input_ids"][audio_anchors] == MINIMAX_H3_AUDIO_REF_COND_ID).all()
+    assert packed["text_pos"].tolist() == [0, 1, 2]
+    for modality, tag in (("img", 0), ("audio", 2)):
+        positions = packed[f"{modality}_pos"]
+        mask = packed["image_mask" if modality == "img" else "audio_mask"]
+        assert torch.equal(mask.nonzero().flatten(), positions)
+        assert (packed["token_tags"][positions] == tag).all()
+    assert (packed["token_tags"][:3] == 1).all()
+    assert (packed["input_ids"][79:] == MINIMAX_H3_PAD_ID).all()
+    assert (packed["token_tags"][79:] == -1).all()
+    assert packed["document_id"].tolist() == [0] * 79 + [1] * 49
+    assert not packed["img_position_ids"][79:].any()
+
+    g = packed["img_position_ids"]
+    assert g.dtype == torch.float64
+    scale = 5.0 / 3.0
+    origin = 3.0 + 1.0 + (scale + 4 * scale) + 2.0 + scale
+    assert g[57, 0].item() == origin
+    assert g[67, 0].item() == origin
+    # References retain their own timeline even though they follow guides physically.
+    assert g[41, 0].item() == 3.0
+    assert g[42, 0].item() == g[48, 0].item() == 4.0
+    assert g[52, 0].item() == 4.0 + scale + 4 * scale
+    assert g[56, 0].item() == 4.0 + scale + 4 * scale + 2.0
+    assert (g[3:9, 0] == origin + 36 * scale).all()
+    assert torch.equal(g[3:9], g[35:41])  # repeated images are not deduplicated
+    assert torch.equal(g[3:9, 1:], g[67:73, 1:])  # local still spatial grid
+    clip_t = g[9:21, 0].reshape(6, 2)
+    expected_t = origin + scale + torch.tensor([0, 1, 5, 9, 13, 17], dtype=torch.float64) * scale
+    torch.testing.assert_close(clip_t[:, 0], expected_t, rtol=0, atol=1e-14)
+    assert torch.equal(clip_t[:, 0], clip_t[:, 1])
+    assert g[9, 0].item() == g[21, 0].item() == g[31, 0].item() == origin + scale
+    torch.testing.assert_close(
+        g[21:27, 0], (origin + scale + torch.arange(3, dtype=torch.float64)).repeat(2), rtol=0, atol=0
+    )
+    torch.testing.assert_close(g[27:31, 0], (origin + torch.arange(2, dtype=torch.float64)).repeat(2), rtol=0, atol=0)
+    # AV audio uses its visual width grid, standalone audio uses the target grid.
+    assert (g[21:24, 2] == g[9:11, 2].min()).all()
+    assert (g[24:27, 2] == g[9:11, 2].max()).all()
+    assert (g[27:29, 2] == g[67:73, 2].min()).all()
+    assert (g[29:31, 2] == g[67:73, 2].max()).all()
+
+
+@pytest.mark.parametrize("guides", [None, []])
+@pytest.mark.parametrize(
+    "ref_blocks",
+    [
+        [],
+        [
+            {"kind": "image", "latent_h": 2, "latent_w": 4},
+            {"kind": "audio", "ref_audio_t": 0},
+            {"kind": "video", "ref_audio_t": 40, "latent_t": 17, "latent_h": 4, "latent_w": 2},
+            {"kind": "video_audio", "ref_audio_t": 0, "latent_t": 1, "latent_h": 2, "latent_w": 2},
+        ],
+    ],
+)
+def test_empty_guides_are_identical_to_omitted_guides(guides, ref_blocks):
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    kwargs = dict(text_len=4, latent_t=17, latent_h=4, latent_w=6, audio_t=5, ref_blocks=ref_blocks)
+    legacy = minimax_h3_packed_sequence_ref2va_blocks(**kwargs)
+    explicit = minimax_h3_packed_sequence_ref2va_blocks(**kwargs, guide_blocks=guides)
+    assert legacy.keys() == explicit.keys()
+    for key, value in legacy.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(value, explicit[key]), key
+        else:
+            assert value == explicit[key], key
+
+
 def test_explicit_seq_len_pins_one_shape_across_prompt_lengths():
     """Prompts of different token counts must land on the same packed length.
 

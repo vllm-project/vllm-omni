@@ -20,12 +20,16 @@ import io
 import json
 import mimetypes
 import os
+import tempfile
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import av
+from camera_utils import wasd_to_camera_payload
+from websockets.exceptions import ConnectionClosed
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -54,6 +58,15 @@ class ScheduledPromptUpdate:
     at: float
     prompt: str
     transition_chunks: int
+
+
+@dataclass(frozen=True)
+class ScheduledCameraUpdate:
+    """Client-side schedule entry for a midway camera ``session.interaction``."""
+
+    at: float
+    camera: dict[str, Any]
+    transition_chunks: int | None
 
 
 def _image_reference(value: str) -> dict[str, Any]:
@@ -119,6 +132,61 @@ def _parse_prompt_updates(value: str) -> list[ScheduledPromptUpdate]:
     return sorted(updates, key=lambda update: update.at)
 
 
+def _parse_camera_updates(value: str) -> list[ScheduledCameraUpdate]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--camera-updates must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise argparse.ArgumentTypeError("--camera-updates must be a JSON array")
+
+    updates: list[ScheduledCameraUpdate] = []
+    for index, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}] must be a JSON object")
+        try:
+            at = float(item["at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}] must have a valid 'at' field") from exc
+        if at < 0:
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}].at must be >= 0")
+
+        if "camera" in item:
+            camera = item["camera"]
+            if not isinstance(camera, dict):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].camera must be an object")
+        elif "actions" in item:
+            actions = item["actions"]
+            if not isinstance(actions, list):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].actions must be a list of WASD/IJKL keys")
+            mode = item.get("mode", "velocity")
+            if mode not in ("target", "velocity"):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].mode must be target or velocity")
+            camera = wasd_to_camera_payload(actions, mode=mode)
+        else:
+            raise argparse.ArgumentTypeError(
+                f"--camera-updates[{index}] must provide 'camera' (structural SE3) "
+                "or 'actions' (client-side WASD helper)"
+            )
+
+        transition_chunks: int | None
+        if "transition_chunks" not in item:
+            transition_chunks = None if camera.get("mode") == "velocity" else DEFAULT_TRANSITION_CHUNKS
+        else:
+            try:
+                transition_chunks = int(item["transition_chunks"])
+            except (TypeError, ValueError) as exc:
+                raise argparse.ArgumentTypeError(
+                    f"--camera-updates[{index}].transition_chunks must be an integer"
+                ) from exc
+            if transition_chunks < 0:
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].transition_chunks must be >= 0")
+
+        updates.append(ScheduledCameraUpdate(at=at, camera=camera, transition_chunks=transition_chunks))
+
+    return sorted(updates, key=lambda update: update.at)
+
+
 def _maybe_set(payload: dict[str, Any], key: str, value: Any) -> None:
     if value is not None:
         payload[key] = value
@@ -165,7 +233,8 @@ async def _run_prompt_update_scheduler(
     video_started_at: float,
     send_lock: asyncio.Lock,
 ) -> None:
-    for update in updates:
+    """Send one session's prompt schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
         delay = (video_started_at + update.at) - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
@@ -173,11 +242,36 @@ async def _run_prompt_update_scheduler(
         payload = {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"scheduled-{update.at:.3f}",
+                "event_id": f"scheduled-prompt-{index}",
                 "event": {"prompt": update.prompt},
                 "transition_chunks": update.transition_chunks,
             },
         }
+        async with send_lock:
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+        print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
+
+
+async def _run_camera_update_scheduler(
+    websocket: Any,
+    updates: list[ScheduledCameraUpdate],
+    *,
+    video_started_at: float,
+    send_lock: asyncio.Lock,
+) -> None:
+    """Send one session's camera schedule with IDs independent of timestamps."""
+    for index, update in enumerate(updates):
+        delay = (video_started_at + update.at) - time.perf_counter()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        interaction: dict[str, Any] = {
+            "event_id": f"scheduled-camera-{index}",
+            "event": {"multi_modal_data": {"camera": update.camera}},
+        }
+        if update.transition_chunks is not None:
+            interaction["transition_chunks"] = update.transition_chunks
+        payload = {"type": "session.interaction", "interaction": interaction}
         async with send_lock:
             await websocket.send(json.dumps(payload, ensure_ascii=False))
         print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
@@ -197,6 +291,75 @@ def _count_decoded_frames(video_bytes: bytes, *, stream_format: str) -> int | No
         return None
 
 
+def _fresh_rgb_frame(frame: av.VideoFrame) -> av.VideoFrame:
+    """Copy RGB pixels without carrying decoder color or picture-type metadata."""
+    rgb = frame.reformat(format="rgb24")
+    fresh = av.VideoFrame(rgb.width, rgb.height, "rgb24")
+    source = rgb.planes[0]
+    target = fresh.planes[0]
+    pixels = memoryview(source)
+    if source.line_size == target.line_size:
+        target.update(pixels[: target.buffer_size])
+    else:
+        packed = bytearray(target.buffer_size)
+        row_bytes = rgb.width * 3
+        for row in range(rgb.height):
+            src = row * source.line_size
+            dst = row * target.line_size
+            packed[dst : dst + row_bytes] = pixels[src : src + row_bytes]
+        target.update(packed)
+    return fresh
+
+
+def _finalize_video_bytes(video_bytes: bytes, *, stream_format: str, fps: float) -> bytes:
+    """Build a playback MP4 using only PyAV, retaining input on decode errors.
+
+    Video-only streams are re-encoded at the requested FPS. Streams with audio
+    are remuxed to preserve the compressed tracks and their original timing.
+    """
+    if not video_bytes:
+        return video_bytes
+    if stream_format.lower() != "m4s":
+        raise ValueError(f"Unsupported streaming video format: {stream_format}")
+
+    try:
+        with av.open(io.BytesIO(video_bytes), format="mp4") as source:
+            if source.streams.audio:
+                buffer = io.BytesIO()
+                media_streams = [stream for stream in source.streams if stream.type in ("video", "audio")]
+                with av.open(buffer, mode="w", format="mp4") as output:
+                    streams = {stream.index: output.add_stream_from_template(stream) for stream in media_streams}
+                    for packet in source.demux(*media_streams):
+                        if packet.dts is not None:
+                            packet.stream = streams[packet.stream.index]
+                            output.mux(packet)
+                return buffer.getvalue()
+            if not source.streams.video:
+                return video_bytes
+            frames = [_fresh_rgb_frame(frame) for frame in source.decode(video=0)]
+    except av.FFmpegError:
+        return video_bytes
+
+    if not frames:
+        return video_bytes
+
+    buffer = io.BytesIO()
+    rate = Fraction(fps).limit_denominator(10000)
+    with av.open(buffer, mode="w", format="mp4") as output:
+        video = cast(av.VideoStream, output.add_stream("h264", rate=rate))
+        video.width, video.height = frames[0].width, frames[0].height
+        video.pix_fmt = "yuv420p"
+        video.options = {"crf": "18"}
+        for index, frame in enumerate(frames):
+            frame.pts = index
+            frame.time_base = 1 / rate
+            for packet in video.encode(frame):
+                output.mux(packet)
+        for packet in video.encode():
+            output.mux(packet)
+    return buffer.getvalue()
+
+
 def save_video(
     chunks: list[bytes],
     output_path: Path,
@@ -204,28 +367,40 @@ def save_video(
     fps: float,
     stream_format: str,
 ) -> None:
+    """Finalize received chunks and atomically publish the local video file."""
     if not chunks:
         print("No video chunks received; nothing to save.")
         return
 
-    from vllm_omni.diffusion.utils.media_utils import finalize_streaming_video_bytes
-
     streamed_bytes = b"".join(chunks)
-    playback_bytes = finalize_streaming_video_bytes(
-        streamed_bytes,
-        input_format="m4s",
-        fps=fps,
-    )
+    playback_bytes = _finalize_video_bytes(streamed_bytes, stream_format=stream_format, fps=fps)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    with tmp_path.open("wb") as f:
-        f.write(playback_bytes)
-    os.replace(tmp_path, output_path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(playback_bytes)
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     print(
         f"Saved {len(chunks)} streamed chunk(s), {len(streamed_bytes)} streamed bytes "
         f"-> {len(playback_bytes)} playback bytes at {output_path}"
     )
+
+
+async def _send_heartbeats(websocket: Any, send_lock: asyncio.Lock) -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            async with send_lock:
+                await websocket.send(json.dumps({"type": "session.ping"}))
+        except ConnectionClosed:
+            return
 
 
 async def stream_video(args: argparse.Namespace) -> None:
@@ -241,11 +416,14 @@ async def stream_video(args: argparse.Namespace) -> None:
     ws = None
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
+    camera_update_task: asyncio.Task[None] | None = None
+    heartbeat_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
         async with connect(url, max_size=None) as websocket:
             ws = websocket
+            heartbeat_task = asyncio.create_task(_send_heartbeats(websocket, send_lock))
             async with send_lock:
                 await websocket.send(json.dumps(payload))
             print(f"Connected: {url}")
@@ -295,12 +473,21 @@ async def stream_video(args: argparse.Namespace) -> None:
                 if msg_type == "video.start":
                     stream_format = msg.get("format") or stream_format
                     print(f"Video session started: request_id={msg.get('request_id')} format={msg.get('format')}")
+                    video_started_at = time.perf_counter()
                     if args.prompt_updates and prompt_update_task is None:
-                        video_started_at = time.perf_counter()
                         prompt_update_task = asyncio.create_task(
                             _run_prompt_update_scheduler(
                                 websocket,
                                 args.prompt_updates,
+                                video_started_at=video_started_at,
+                                send_lock=send_lock,
+                            )
+                        )
+                    if args.camera_updates and camera_update_task is None:
+                        camera_update_task = asyncio.create_task(
+                            _run_camera_update_scheduler(
+                                websocket,
+                                args.camera_updates,
                                 video_started_at=video_started_at,
                                 send_lock=send_lock,
                             )
@@ -315,6 +502,8 @@ async def stream_video(args: argparse.Namespace) -> None:
                     done = True
                     if prompt_update_task is not None:
                         prompt_update_task.cancel()
+                    if camera_update_task is not None:
+                        camera_update_task.cancel()
                     break
                 elif msg_type == "error":
                     print(f"ERROR: {msg.get('message', msg)}")
@@ -331,10 +520,18 @@ async def stream_video(args: argparse.Namespace) -> None:
                 pass
         raise
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         if prompt_update_task is not None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await prompt_update_task
+        if camera_update_task is not None:
+            camera_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await camera_update_task
         print(
             "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"
         )
@@ -405,9 +602,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON object merged into extra_params; overrides preset keys on conflict.",
     )
-    # Midway prompt updates are pipeline-specific: a model that does not implement
-    # them (LingBot-World, for one) rejects the whole session on the first one, so
-    # nothing is scheduled unless the caller asks for it.
+    # Midway interactions are pipeline-specific: unsupported modalities reject
+    # the update (and may leave the session running). Nothing is scheduled unless
+    # the caller asks for it.
     parser.add_argument(
         "--prompt-updates",
         type=_parse_prompt_updates,
@@ -417,6 +614,19 @@ def parse_args() -> argparse.Namespace:
             "Each object requires "
             "'at' (seconds after video.start) and 'prompt'. Optional "
             f"'transition_chunks' defaults to {DEFAULT_TRANSITION_CHUNKS}."
+        ),
+    )
+    parser.add_argument(
+        "--camera-updates",
+        type=_parse_camera_updates,
+        default=[],
+        help=(
+            "JSON array of scheduled camera updates for models that register the "
+            "camera modality (e.g. LingBot-World). Each object needs 'at' and either "
+            "'camera' (structural SE3: mode + translation/rotation) or "
+            "'actions' (client-side WASD/IJKL helper converted before send). "
+            "Optional 'transition_chunks' defaults to None for velocity and "
+            f"{DEFAULT_TRANSITION_CHUNKS} for target."
         ),
     )
     return parser.parse_args()

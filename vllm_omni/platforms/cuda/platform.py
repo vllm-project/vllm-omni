@@ -116,12 +116,6 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         else:
             flash_attn_supported = compute_supported and packages_available
 
-        # cuDNN 9.5+ ships Blackwell FMHA kernels. If the runtime is older,
-        # skip the CUDNN_ATTN default rather than selecting a backend whose
-        # kernel selector may reject the runtime shape.
-        cudnn_version = torch.backends.cudnn.version() or 0
-        cudnn_blackwell_ready = cudnn_version >= 90500
-
         # FlashInfer edges cuDNN by ~4% at the kernel level on sm_120 but
         # regresses ~2x at e2e on HV-1.5 because its dense-prefill path cannot
         # represent every diffusion attention mask without changing semantics.
@@ -232,7 +226,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     )
 
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
-                # Same loader/cache as execution (Hub versions 1 then 2). A missing
+                # Same loader/cache as execution, including FA2 stable-ABI builds. A missing
                 # torch/CUDA variant used to degrade silently to native/SDPA (#6971).
                 hub_repo = (
                     "kernels-community/flash-attn3"
@@ -329,7 +323,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
             )
             return DiffusionAttentionBackendEnum.TRTLLM_ATTN.get_path()
 
-        if is_blackwell and cudnn_blackwell_ready:
+        # Torch 2.14 can initialize CUDA while querying the cuDNN version.
+        # Only the automatic Blackwell fallback needs this probe; explicit
+        # selections and other architectures must not initialize cuDNN here.
+        cudnn_version = (torch.backends.cudnn.version() or 0) if is_blackwell else 0
+        if is_blackwell and cudnn_version >= 90500:
             from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend
 
             # Unknown head_size is a capability probe (SP auto-pad), not a
@@ -360,7 +358,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                 )
                 return DiffusionAttentionBackendEnum.FLASHINFER_ATTN.get_path()
 
-        if is_blackwell and not cudnn_blackwell_ready:
+        if is_blackwell and cudnn_version < 90500:
             logger.warning(
                 "Detected Blackwell %s but cuDNN %d < 9.5 — no tuned Blackwell FMHA. "
                 "Automatic backend selection will use FlashInfer when available, otherwise SDPA.",
@@ -424,6 +422,10 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.cuda.memory_reserved(device))
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)
 
@@ -449,4 +451,12 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)
+        # Mirrors upstream CudaPlatformBase defaults: `gelu_and_mul_sparse` is
+        # implemented by `triton` and `native` only, so it must not fall back to
+        # `default` (which contains `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=rms_norm,
+            gelu_and_mul_sparse=["triton", "native"],
+        )

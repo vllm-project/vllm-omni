@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scheduling-side coordination for full_payload input waiting.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Scheduling-side coordination for chunk and full-payload input waiting.
 
-Manages WAITING_FOR_INPUT state transitions based on readiness signals
-from OmniConnectorOutput, without ever calling connector.put()/get().
-
-Chunk waiting (WAITING_FOR_CHUNK) lives on OmniChunkTransferAdapter.
+Manages WAITING_FOR_CHUNK and WAITING_FOR_INPUT state transitions based on
+readiness signals from OmniConnectorOutput, without calling connector I/O.
 """
 
 from __future__ import annotations
@@ -18,8 +16,17 @@ from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.outputs import SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
+
+
+def uses_native_mrv2_data_plane(
+    model_config: Any,
+    *,
+    use_v2_model_runner: bool,
+) -> bool:
+    return bool(use_v2_model_runner and getattr(model_config, "supports_native_mrv2_data_plane", False))
 
 
 def uses_full_payload_input_coordinator(model_config: Any) -> bool:
@@ -38,7 +45,7 @@ def uses_full_payload_input_coordinator(model_config: Any) -> bool:
 
 
 class OmniSchedulingCoordinator:
-    """Pure-scheduling coordinator for full_payload input waiting.
+    """Pure-scheduling coordinator for chunk and full-payload input waiting.
 
     The Scheduler owns an instance of this class.  It consumes readiness
     signals produced by the Model Runner's ``OmniConnectorModelRunnerMixin``
@@ -46,12 +53,28 @@ class OmniSchedulingCoordinator:
     transitions accordingly.
     """
 
-    def __init__(self, stage_id: int = 0):
+    def __init__(
+        self,
+        scheduler_max_num_seqs: int = 0,
+        stage_id: int = 0,
+        async_chunk: bool = False,
+    ) -> None:
         self._stage_id = stage_id
+        self._scheduler_max_num_seqs = scheduler_max_num_seqs
+        self._async_chunk = async_chunk
 
         self.finished_requests: set[str] = set()
+        self.requests_with_ready_chunks: set[str] = set()
+        self.input_terminal_req_ids: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
+        self._waiting_for_chunk_waiting: deque[Any] = deque()
+        self._waiting_for_chunk_running: deque[Any] = deque()
+
+        # Request IDs that were newly registered for chunk recv this cycle.
+        # The engine/Model Runner should call register_chunk_recv() for these
+        # so the bg thread starts polling.
+        self.pending_chunk_registrations: list[OmniChunkRecvHandle] = []
         # Requests waiting for full_payload stage input (WAITING_FOR_INPUT).
         self._waiting_for_input: deque[Any] = deque()
         # Per-cycle list of minimal handles to ship to the model runner so it
@@ -65,9 +88,55 @@ class OmniSchedulingCoordinator:
         # detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
 
+    @property
+    def receives_chunks(self) -> bool:
+        """Whether this coordinator receives streamed input from upstream."""
+        return self._stage_id > 0 and self._async_chunk
+
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
+
+    def process_pending_chunks(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+        chunk_ready_req_ids: set[str],
+        chunk_finished_req_ids: set[str],
+    ) -> None:
+        """Transition requests whose chunks have arrived.
+
+        Args:
+            waiting_queue: Scheduler's waiting request queue.
+            running_queue: Scheduler's running request list.
+            chunk_ready_req_ids: IDs with a newly arrived chunk this cycle.
+            chunk_finished_req_ids: IDs whose final chunk has arrived.
+        """
+        if not self.receives_chunks:
+            return
+
+        self.finished_requests.update(chunk_finished_req_ids)
+        self.pending_chunk_registrations = []
+
+        self._process_chunk_queue(
+            waiting_queue,
+            self._waiting_for_chunk_waiting,
+            RequestStatus.WAITING,
+            chunk_ready_req_ids,
+        )
+        self._process_chunk_queue(
+            running_queue,
+            self._waiting_for_chunk_running,
+            RequestStatus.RUNNING,
+            chunk_ready_req_ids,
+        )
+        while len(running_queue) > self._scheduler_max_num_seqs:
+            request = running_queue.pop()
+            # Must reset status to WAITING so the scheduler treats it as
+            # schedulable work.  KV blocks are NOT freed here (unlike a
+            # real preemption), so PREEMPTED would be incorrect.
+            request.status = RequestStatus.WAITING
+            waiting_queue.prepend_requests([request])
 
     def process_pending_full_payload_inputs(
         self,
@@ -120,8 +189,8 @@ class OmniSchedulingCoordinator:
                 self.pending_input_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
-                        payload_sender_info=getattr(request, "payload_sender_info", None),
+                        external_req_id=request.external_req_id,
+                        payload_sender_info=request.payload_sender_info,
                     )
                 )
             elif request.status == RequestStatus.WAITING_FOR_INPUT:
@@ -134,8 +203,8 @@ class OmniSchedulingCoordinator:
                     self.pending_input_registrations.append(
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
-                            external_req_id=getattr(request, "external_req_id", None),
-                            payload_sender_info=getattr(request, "payload_sender_info", None),
+                            external_req_id=request.external_req_id,
+                            payload_sender_info=request.payload_sender_info,
                         )
                     )
         if to_remove:
@@ -144,10 +213,29 @@ class OmniSchedulingCoordinator:
             waiting_queue.remove_requests(to_remove)
 
     def free_finished_request(self, request_id: str) -> None:
-        """Prune internal tracking sets for a freed request to prevent unbounded growth."""
+        """Prune all coordinator state owned by a freed request."""
         self._full_payload_input_received.discard(request_id)
         self.finished_requests.discard(request_id)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.input_terminal_req_ids.discard(request_id)
         self._waiting_since.pop(request_id, None)
+        for queue_attr in (
+            "_waiting_for_chunk_waiting",
+            "_waiting_for_chunk_running",
+            "_waiting_for_input",
+        ):
+            queue = getattr(self, queue_attr)
+            setattr(
+                self,
+                queue_attr,
+                deque(request for request in queue if request.request_id != request_id),
+            )
+        self.pending_chunk_registrations = [
+            handle for handle in self.pending_chunk_registrations if handle.request_id != request_id
+        ]
+        self.pending_input_registrations = [
+            handle for handle in self.pending_input_registrations if handle.request_id != request_id
+        ]
 
     def collect_timed_out_request_ids(
         self,
@@ -178,11 +266,14 @@ class OmniSchedulingCoordinator:
 
         # Defensively remove from coordinator internal queues (may already
         # be empty if restore_queues() has run).
-        remaining: deque[Any] = deque()
-        for request in self._waiting_for_input:
-            if request.request_id not in timed_out_ids:
-                remaining.append(request)
-        self._waiting_for_input = remaining
+        for queue_attr in (
+            "_waiting_for_chunk_waiting",
+            "_waiting_for_chunk_running",
+            "_waiting_for_input",
+        ):
+            queue = getattr(self, queue_attr)
+            remaining = deque(request for request in queue if request.request_id not in timed_out_ids)
+            setattr(self, queue_attr, remaining)
 
         for req_id in timed_out_ids:
             self._waiting_since.pop(req_id, None)
@@ -198,96 +289,196 @@ class OmniSchedulingCoordinator:
     def restore_queues(
         self,
         waiting_queue: Any,
+        running_queue: list[Request] | None = None,
     ) -> None:
-        """Return waiting-for-input requests to the waiting queue."""
+        """Return waiting-for-chunk/input requests to scheduling queues."""
+        for request in self._waiting_for_chunk_waiting:
+            waiting_queue.add_request(request)
+        self._waiting_for_chunk_waiting = deque()
+
+        if running_queue is not None and self._waiting_for_chunk_running:
+            running_queue.extend(self._waiting_for_chunk_running)
+        self._waiting_for_chunk_running = deque()
+
         for request in self._waiting_for_input:
             waiting_queue.add_request(request)
         self._waiting_for_input = deque()
 
-    @staticmethod
-    def _flatten_prompt_token_ids(value: Any) -> list[int]:
-        """Normalize connector metadata into flat prompt token ids."""
-        if value is None:
-            return []
-        if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "tolist"):
-            value = value.detach().cpu().tolist()
-        elif hasattr(value, "tolist") and not isinstance(value, (list, tuple)):
-            value = value.tolist()
-
-        if isinstance(value, (list, tuple)):
-            flattened: list[int] = []
-            for item in value:
-                if hasattr(item, "detach") and hasattr(item, "cpu") and hasattr(item, "tolist"):
-                    item = item.detach().cpu().tolist()
-                elif hasattr(item, "tolist") and not isinstance(item, (list, tuple)):
-                    item = item.tolist()
-                if isinstance(item, (list, tuple)):
-                    flattened.extend(int(token_id) for token_id in item)
-                else:
-                    flattened.append(int(item))
-            return flattened
-        return [int(value)]
-
     def update_request_metadata(
         self,
         requests: dict[str, Request],
-        request_metadata: dict[str, dict[str, Any]],
-        model_mode: str = "ar",
+        request_metadata: dict[str, SchedulingMetadataUpdate],
     ) -> None:
-        """Apply received scheduling metadata to request objects.
-
-        For AR mode: only scheduler-visible metadata is applied locally.
-        For Generation mode: updates ``request.prompt_token_ids``.
-
-        Additionally, if the payload contains ``next_stage_prompt_len``,
-        updates the request's ``prompt_token_ids`` to the correct length.
-        """
-        for req_id, metadata in request_metadata.items():
+        """Apply typed runner updates without interpreting payload metadata."""
+        for req_id, update in request_metadata.items():
             request = requests.get(req_id)
             if request is None:
                 continue
+            if update.input_terminal:
+                self.input_terminal_req_ids.add(req_id)
+            self._apply_scheduling_update(request, update)
 
-            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni).
-            # Only apply when the request has not started decoding yet
-            # (no output tokens). Resetting a mid-decode request would
-            # destroy generated tokens and desync KV cache state.
-            if "next_stage_prompt_len" in metadata:
-                next_len = metadata["next_stage_prompt_len"]
-                if isinstance(next_len, int) and next_len > 0:
-                    output_token_ids = getattr(request, "_output_token_ids", None)
-                    has_decode_output = output_token_ids is not None and len(output_token_ids) > 0
-                    if has_decode_output:
-                        logger.debug(
-                            "[Coordinator stage-%s] Skipping prompt resize for req %s: "
-                            "request already has %s output tokens",
-                            self._stage_id,
-                            req_id,
-                            len(output_token_ids),
-                        )
-                    else:
-                        current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
-                        current_prompt_len = len(current_prompt_ids)
-                        if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
-                            new_prompt = [0] * next_len
-                            request.prompt_token_ids = new_prompt
-                            request.num_prompt_tokens = next_len
-                            request._all_token_ids.clear()
-                            request._all_token_ids.extend(new_prompt)
-                            request._output_token_ids.clear()
-                            request.num_computed_tokens = 0
-                            logger.debug(
-                                "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
-                                self._stage_id,
-                                next_len,
-                                req_id,
-                            )
-
-            if model_mode != "ar":
-                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
-                if new_ids:
-                    request.prompt_token_ids = new_ids
-                    request.num_prompt_tokens = len(new_ids)
+    def _apply_scheduling_update(self, request: Request, update: SchedulingMetadataUpdate) -> None:
+        if update.resize_prompt_to is not None:
+            output_token_ids = getattr(request, "_output_token_ids", None)
+            if output_token_ids is None or not output_token_ids:
+                next_len = update.resize_prompt_to
+                current_prompt_ids = getattr(request, "prompt_token_ids", ()) or ()
+                if len(current_prompt_ids) != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
+                    new_prompt = [0] * next_len
+                    request.prompt_token_ids = new_prompt
+                    request.num_prompt_tokens = next_len
                     request._all_token_ids.clear()
-                    request._all_token_ids.extend(new_ids)
+                    request._all_token_ids.extend(new_prompt)
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
+
+        if update.prompt_token_ids is not None:
+            prompt_token_ids = list(update.prompt_token_ids)
+            request.prompt_token_ids = prompt_token_ids
+            request.num_prompt_tokens = len(prompt_token_ids)
+            request._all_token_ids.clear()
+            request._all_token_ids.extend(prompt_token_ids)
+            request._output_token_ids.clear()
+            request.num_computed_tokens = 0
+
+    def postprocess_scheduler_output(
+        self,
+        scheduler_output: Any,
+        requests: dict[str, Request] | None = None,
+    ) -> None:
+        """Clear per-cycle ready state after scheduler output is materialized."""
+        self._clear_chunk_ready(scheduler_output)
+        self.input_terminal_req_ids.difference_update(
+            self._scheduled_request_ids(scheduler_output),
+        )
+
+    def get_scheduled_input_terminal_req_ids(
+        self,
+        scheduler_output: Any,
+    ) -> set[str]:
+        """Return terminal inputs executed by this immutable scheduler step."""
+        return self.input_terminal_req_ids.intersection(
+            self._scheduled_request_ids(scheduler_output),
+        )
+
+    @staticmethod
+    def _scheduled_request_ids(scheduler_output: Any) -> set[str]:
+        num_scheduled_tokens = getattr(
+            scheduler_output,
+            "num_scheduled_tokens",
+            None,
+        )
+        if num_scheduled_tokens is not None:
+            return set(num_scheduled_tokens)
+
+        request_ids = {req.req_id for req in getattr(scheduler_output, "scheduled_new_reqs", ())}
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        request_ids.update(getattr(cached_reqs, "req_ids", ()))
+        return request_ids
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _process_chunk_queue(
+        self,
+        queue: Any,
+        waiting_for_chunk_list: deque[Any],
+        target_status: RequestStatus,
+        chunk_ready_req_ids: set[str],
+    ) -> None:
+        """Single-pass partition of the queue.
+
+        Walks the queue snapshot once, appending each request to either the
+        retained list or the waiting_for_chunk_list, then rebuilds the queue
+        from the retained list (or calls bulk remove for queue objects).
+        This avoids the O(N) per-request ``queue.remove()`` scan that made
+        the previous implementation O(N·K) on every scheduler cycle.
+        """
+        is_list_queue = isinstance(queue, list)
+        if is_list_queue:
+            retained: list[Any] = []
+        else:
+            to_remove: list[Any] = []
+
+        for request in queue:
+            request_can_run = self._request_can_run(request, chunk_ready_req_ids)
+            move_to_waiting = False
+
+            if request.status != RequestStatus.WAITING_FOR_CHUNK:
+                if request_can_run:
+                    if request.request_id in chunk_ready_req_ids:
+                        self.requests_with_ready_chunks.add(request.request_id)
+                    # stays in queue
+                elif request.status == RequestStatus.WAITING_FOR_INPUT:
+                    # stays in queue — input coordinator owns this transition
+                    pass
+                else:
+                    # needs to be parked for chunk recv
+                    self.pending_chunk_registrations.append(
+                        OmniChunkRecvHandle(
+                            request_id=request.request_id,
+                            external_req_id=request.external_req_id,
+                        )
+                    )
+                    request.status = RequestStatus.WAITING_FOR_CHUNK
+                    self._waiting_since.setdefault(request.request_id, time.monotonic())
+                    move_to_waiting = True
+            else:
+                if request_can_run:
+                    request.status = target_status
+                    if request.request_id in chunk_ready_req_ids:
+                        self.requests_with_ready_chunks.add(request.request_id)
+                    self._waiting_since.pop(request.request_id, None)
+                    # stays in queue
+                else:
+                    # already WAITING_FOR_CHUNK and still can't run — stays parked
+                    # (but we still need to move it out of this queue partition)
+                    move_to_waiting = True
+
+            if move_to_waiting:
+                waiting_for_chunk_list.append(request)
+                if is_list_queue:
+                    continue  # skip this request in retained
+                else:
+                    to_remove.append(request)
+            else:
+                if is_list_queue:
+                    retained.append(request)
+                # else: the request stays, nothing to do
+
+        if is_list_queue:
+            # Single O(N) slice assignment instead of K individual O(N) removes.
+            queue[:] = retained
+        elif to_remove:
+            try:
+                queue.remove_requests(to_remove)
+            except AttributeError:
+                # Fallback for queue types lacking bulk remove — still better
+                # than remove-in-loop because we batch the O(N) scan once.
+                for request in to_remove:
+                    queue.remove_request(request)
+
+    def _request_can_run(
+        self,
+        request: Request,
+        chunk_ready_req_ids: set[str],
+    ) -> bool:
+        req_id = request.request_id
+        if req_id in self.finished_requests:
+            # Admit the final payload or terminal marker for cleanup.
+            return True
+
+        return req_id in chunk_ready_req_ids or req_id in self.requests_with_ready_chunks
+
+    def _clear_chunk_ready(self, scheduler_output: Any) -> None:
+        if scheduler_output.scheduled_new_reqs:
+            for req_data in scheduler_output.scheduled_new_reqs:
+                req_id = getattr(req_data, "req_id", None)
+                if req_id is not None:
+                    self.requests_with_ready_chunks.discard(req_id)
+
+        if scheduler_output.scheduled_cached_reqs:
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                self.requests_with_ready_chunks.discard(req_id)

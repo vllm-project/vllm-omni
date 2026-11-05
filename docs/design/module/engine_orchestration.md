@@ -78,9 +78,9 @@ the boundary affected by the in-flight stage client/process refactor in
 [#5441](https://github.com/vllm-project/vllm-omni/pull/5441). Names and
 responsibilities proposed only by that PR are not current contracts.
 
-The orchestration loop also has an opt-in event-driven mode
-(`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, default off) proposed in
-[#5221](https://github.com/vllm-project/vllm-omni/pull/5221). It changes poll
+The orchestration loop is event-driven by default, as proposed in
+[#5221](https://github.com/vllm-project/vllm-omni/pull/5221);
+`VLLM_OMNI_EVENT_DRIVEN_ORCH=0` selects the legacy 1 ms poll loop. The mode changes poll
 cadence only: the routing, ordering, and terminal-state contracts below hold
 identically on both loops.
 
@@ -136,6 +136,13 @@ is request-terminal. Output-processor abort state is committed only after the
 physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
+
+Multimodal cache-miss feedback invalidates only the reported hashes in the
+owning sender cache before request error delivery. Downstream caches are
+updated under the preprocessing lock; stage 0 feedback crosses to the frontend
+and is applied while draining outputs, including cancelled requests. Ordinary
+request failures retain retryable classification; duplex session termination
+keeps its existing semantics.
 
 ## Promotion gate
 

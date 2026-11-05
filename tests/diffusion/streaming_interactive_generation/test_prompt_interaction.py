@@ -28,6 +28,7 @@ from vllm_omni.diffusion.interaction.modality_handlers.prompt import (
     PromptSession,
 )
 from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -78,7 +79,7 @@ def _make_diffusion_request_state(*, request_id: str = "req-1", fps: int | None 
         prompt="hello",
     )
     state.prompt_embeds = torch.zeros(1, 4, 2)
-    state.extra = {"window_num_frames": 8}
+    state.extra = {"window_num_frames": 8, "num_latent_frames_per_chunk": 3}
     return state
 
 
@@ -109,7 +110,12 @@ def _make_diffusion_model_runner(
     # instances; unit tests of submit_interaction stub this. Stepwise path tests
     # rebind to the real method.
     runner._supports_step_mode = lambda: True
-    runner._interaction_coordinator = None
+    # Mirror load_model: coordinator is always present once the runner is "loaded".
+    # Build now so handlers capture the pipeline's current encode_prompt (tests may
+    # rebind the mock before calling this helper).
+    runner._interaction_coordinator = InteractionCoordinator.build(pipeline, runner.od_config)
+    if hasattr(pipeline, "_interaction_coordinator"):
+        pipeline._interaction_coordinator = runner._interaction_coordinator
     return runner
 
 
@@ -155,6 +161,7 @@ class TestPromptUpdateExecution:
             supports_step_execution = True
 
         runner = _make_diffusion_model_runner(pipeline=_UnsupportedPipeline())
+        runner.state_cache["req-1"] = _make_diffusion_request_state()
         with pytest.raises(ValueError, match="not supported"):
             runner.submit_interaction("req-1", _prompt_interaction())
 
@@ -168,24 +175,97 @@ class TestPromptUpdateExecution:
         "interaction",
         [
             {},
-            {"multi_modal_data": {"camera": {"type": "pose"}}},
-            {"event": {"prompt": "updated", "multi_modal_data": {"camera": {"type": "pose"}}}},
-            {"event": {"prompt": "updated", "multi_modal_data": {}}},
-            {"event": {"prompt": "updated", "multi_modal_data": None}},
-            {"event": {"prompt": "updated", "multi_modal_data": "bad"}},
+            {"event_id": "bad", "event": {"multi_modal_data": {}}},
+            {"event_id": "bad", "event": {"multi_modal_data": None}},
+            {"event_id": "bad", "event": {"prompt": "updated", "multi_modal_data": "bad"}},
+            {
+                "event_id": "cam-only",
+                "event": {
+                    "multi_modal_data": {
+                        "camera": {
+                            "mode": "velocity",
+                            "data": {"translation": [0.0, 0.0, 0.05], "rotation": [0.0, 0.0, 0.0, 1.0]},
+                        },
+                    }
+                },
+            },
+            {
+                "event_id": "cam-and-prompt",
+                "event": {
+                    "prompt": "updated",
+                    "multi_modal_data": {
+                        "camera": {
+                            "mode": "velocity",
+                            "data": {"translation": [0.0, 0.0, 0.05], "rotation": [0.0, 0.0, 0.0, 1.0]},
+                        },
+                    },
+                },
+            },
         ],
     )
-    def test_runner_interaction_rejects_structural_payloads_until_implemented(
+    def test_runner_rejects_unsupported_interactions(
         self,
         pipeline: HeliosPipeline,
         interaction: dict[str, Any],
     ) -> None:
-        """Unsupported interaction dict shapes are preserved to and rejected by the runner."""
+        """Helios has no camera handler; malformed / unsupported payloads are rejected."""
         runner = _make_diffusion_model_runner(pipeline=pipeline)
-        runner.state_cache["req-1"] = _make_diffusion_request_state()
+        state = _make_diffusion_request_state()
+        runner.state_cache["req-1"] = state
 
-        with pytest.raises(NotImplementedError, match="Only text-only prompt update interactions"):
+        with pytest.raises((ValueError, KeyError, AttributeError, TypeError)):
             runner.submit_interaction("req-1", cast(Any, interaction))
+
+        # Rejected composite/malformed events must leave interaction queues unchanged.
+        pipeline.encode_prompt.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+        assert "prompt" not in state.interaction_sessions
+        assert "camera" not in state.interaction_sessions
+
+    def test_rejected_composite_leaves_existing_prompt_queue_unchanged(
+        self,
+        pipeline: HeliosPipeline,
+    ) -> None:
+        """Helios must not apply a composite prompt when camera modality is unsupported."""
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        state = _make_diffusion_request_state()
+        runner.state_cache["req-1"] = state
+        runner.submit_interaction("req-1", _prompt_interaction("already-queued", event_id="prior"))
+        session = state.interaction_sessions["prompt"]
+        assert isinstance(session, PromptSession)
+        prior = session.pending_event
+        assert prior is not None
+        assert prior.event_id == "prior"
+        pipeline.encode_prompt.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+
+        with pytest.raises(ValueError, match="camera"):
+            runner.submit_interaction(
+                "req-1",
+                cast(
+                    Any,
+                    {
+                        "event_id": "cam-and-prompt",
+                        "event": {
+                            "prompt": "should-not-replace",
+                            "multi_modal_data": {
+                                "camera": {
+                                    "mode": "velocity",
+                                    "data": {
+                                        "translation": [0.0, 0.0, 0.05],
+                                        "rotation": [0.0, 0.0, 0.0, 1.0],
+                                    },
+                                },
+                            },
+                        },
+                    },
+                ),
+            )
+
+        pipeline.encode_prompt.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+        pending = session.pending_event
+        assert pending is not None
+        assert pending.event_id == "prior"
+        assert pending.prompt == "already-queued"
+        assert "camera" not in state.interaction_sessions
 
     @pytest.mark.parametrize("model_class_name", ["HeliosPipeline", "HeliosPyramidPipeline"])
     def test_coordinator_registers_prompt_for_helios_aliases(
@@ -367,7 +447,11 @@ class TestPromptUpdateExecution:
                         f"that use the chunk media timeline, got {fps!r} "
                         f"(request_id={state.request_id!r})"
                     )
-                return ChunkMediaSpec(num_frames=int(state.extra["window_num_frames"]), fps=float(fps))
+                return ChunkMediaSpec(
+                    num_media_frames=int(state.extra["window_num_frames"]),
+                    fps=float(fps),
+                    num_latent_frames=int(state.extra["window_num_frames"]),
+                )
 
             def prepare_encode(self, state: StepRequestState) -> StepRequestState:
                 state.prompt_embeds = torch.zeros(1, 4, 2)
@@ -433,10 +517,13 @@ class TestPromptUpdateExecution:
         monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
         monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
 
-        scheduler_output = SimpleNamespace(
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
             finished_req_ids=set(),
-            scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+            scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Admit request and run first denoise step (no chunk boundary yet).
         DiffusionModelRunner.execute_stepwise(runner, scheduler_output)  # pyright: ignore[reportArgumentType]
@@ -445,10 +532,13 @@ class TestPromptUpdateExecution:
 
         runner.submit_interaction("req", _prompt_interaction("new scene", transition_chunks=2))
 
-        cached = SimpleNamespace(
+        cached = DiffusionSchedulerOutput(
+            step_id=1,
             finished_req_ids=set(),
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+            scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Second step completes chunk 0: apply runs (no peek), metadata staged.
         chunk0 = DiffusionModelRunner.execute_stepwise(runner, cached).get_request_output("req")  # pyright: ignore[reportArgumentType]
@@ -631,6 +721,7 @@ class TestPromptUpdateIntegration:
         omni = object.__new__(AsyncOmni)
         omni.engine = engine  # pyright: ignore[reportAttributeAccessIssue]
         omni.log_stats = False
+        omni.collect_stage_metrics = True
         omni._pause_cond = asyncio.Condition()
         omni._paused = False
         omni.request_states = {}
@@ -731,11 +822,16 @@ class TestPromptUpdateIntegration:
                 )
             )
 
-        async def try_get_output_async(self) -> Any | None:
-            try:
-                return self._fixture.output_sync_q.get_nowait()
-            except queue.Empty:
-                return None
+        async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+            msgs: list[Any] = []
+            while len(msgs) < max_messages:
+                try:
+                    msgs.append(self._fixture.output_sync_q.get_nowait())
+                except queue.Empty:
+                    break
+            if not msgs:
+                await asyncio.sleep(0.001)
+            return msgs
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]
@@ -811,3 +907,17 @@ class TestPromptUpdateIntegration:
 
         def abort(self, request_id: str) -> None:
             del request_id
+
+
+def test_unpaced_prompt_updates_keep_latest_pending_target(pipeline):
+    state = _make_diffusion_request_state()
+    handler = PromptInteractionHandler.from_pipeline(pipeline)
+    for index, prompt in enumerate(("first", "latest")):
+        handler.enqueue(
+            state, event_id=prompt, received_at=float(index), payload={"prompt": prompt}, transition_chunks=1
+        )
+    session = state.interaction_sessions["prompt"]
+    assert isinstance(session, PromptSession)
+    assert session.pending_event is not None
+    assert session.pending_event.event_id == "latest"
+    assert session.pending_event.prompt == "latest"

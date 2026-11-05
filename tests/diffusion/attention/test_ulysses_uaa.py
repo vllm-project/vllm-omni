@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
+from contextlib import AbstractContextManager
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_distributed_init_method
+from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -24,7 +29,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.mark.core_model
@@ -518,6 +523,7 @@ def test_advanced_uaa_hybrid_rejects_non_gqa_shapes(monkeypatch: pytest.MonkeyPa
         strategy.pre_attention(query, key, value, None)
 
 
+@pytest.mark.cpu
 def test_strict_ulysses_reshards_vsa_gate_with_qkv(monkeypatch) -> None:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
@@ -578,6 +584,7 @@ def _run_attention_case(
     num_kv_heads: int | None = None,
     has_joint: bool = False,
     joint_strategy: str = "front",
+    mask_layout: str | None = None,
 ) -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
@@ -620,6 +627,7 @@ def _run_attention_case(
             q_full = torch.from_numpy(payload["q"]).to(device=device)
             k_full = torch.from_numpy(payload["k"]).to(device=device)
             v_full = torch.from_numpy(payload["v"]).to(device=device)
+            mask_full = torch.from_numpy(payload["mask"]).to(device=device) if "mask" in payload else None
             if has_joint:
                 joint_q = torch.from_numpy(payload["joint_q"]).to(device=device)
                 joint_k = torch.from_numpy(payload["joint_k"]).to(device=device)
@@ -640,6 +648,7 @@ def _run_attention_case(
                     v = torch.cat([v_full, joint_v], dim=1)
             else:
                 q, k, v = q_full, k_full, v_full
+            mask = mask_full
         else:
             if split_sizes is None:
                 # NOTE: torch.chunk may return fewer than `world_size` chunks for some
@@ -659,14 +668,18 @@ def _run_attention_case(
                 q = torch.split(q_full, split_sizes, dim=1)[local_rank].contiguous()
                 k = torch.split(k_full, split_sizes, dim=1)[local_rank].contiguous()
                 v = torch.split(v_full, split_sizes, dim=1)[local_rank].contiguous()
+            if mask_full is None:
+                mask = None
+            elif mask_layout == "global":
+                mask = mask_full
+            else:
+                raise ValueError("mask_layout must be 'global' when a mask is provided.")
             # The Attention layer only enables SP communication when ForwardContext.sp_active is True.
             # In production this is managed by SequenceParallelSplitHook/GatherHook, but here we
             # shard manually for testing.
             get_forward_context()._sp_shard_depth = 1
 
             if has_joint:
-                from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-
                 attn_metadata = AttentionMetadata(
                     joint_query=joint_q,
                     joint_key=joint_k,
@@ -682,6 +695,8 @@ def _run_attention_case(
             raise ValueError(f"Invalid sdp_kernel_mode: {sdp_kernel_mode!r}")
 
         with sdp_ctx:
+            if mask is not None:
+                attn_metadata = AttentionMetadata(attn_mask=mask)
             out_local = attn(q, k, v, attn_metadata=attn_metadata).contiguous()
 
         if world_size == 1:
@@ -736,17 +751,35 @@ def _run_attention_case(
     "sp_world_size,seq_len,joint_len,num_heads,num_kv_heads",
     [
         # MHA (num_kv_heads=None, joint_len=None)
-        (2, 6, None, 3, None),  # head_cnt not divisible by P=2
-        (2, 5, None, 4, None),  # seq_len not divisible by P=2
-        (4, 9, None, 30, None),  # Z-Image-like: head_cnt not divisible by P=4
-        (4, 10, None, 8, None),  # seq_len not divisible by P=4
+        pytest.param(
+            2, 6, None, 3, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # head_cnt not divisible by P=2
+        pytest.param(
+            2, 5, None, 4, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # seq_len not divisible by P=2
+        pytest.param(
+            4, 9, None, 30, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),  # Z-Image-like: head_cnt not divisible by P=4
+        pytest.param(
+            4, 10, None, 8, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),  # seq_len not divisible by P=4
         # GQA (joint_len=None)
-        (2, 6, None, 28, 7),  # BOOGU-like GQA: neither Q nor KV divisible by P=2
-        (2, 5, None, 6, 3),  # KV divisible by P, Q is not
-        (4, 8, None, 12, 3),  # KV not divisible by P=4
+        pytest.param(
+            2, 6, None, 28, 7, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # BOOGU-like GQA: neither Q nor KV divisible by P=2
+        pytest.param(
+            2, 5, None, 6, 3, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # KV divisible by P, Q is not
+        pytest.param(
+            4, 8, None, 12, 3, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),  # KV not divisible by P=4
         # Joint GQA (MMDiT-style text stream via AttentionMetadata.joint_*)
-        (2, 6, 5, 28, 7),  # BOOGU-like GQA joint: KV=7 not divisible by P=2
-        (2, 5, 4, 6, 3),  # KV divisible by P, Q is not
+        pytest.param(
+            2, 6, 5, 28, 7, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # BOOGU-like GQA joint: KV=7 not divisible by P=2
+        pytest.param(
+            2, 5, 4, 6, 3, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # KV divisible by P, Q is not
     ],
 )
 def test_ulysses_uaa_matches_baseline(
@@ -771,8 +804,8 @@ def test_ulysses_uaa_matches_baseline(
     kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
     has_joint = joint_len is not None
 
-    base_init_method = get_distributed_init_method()
-    sp_init_method = get_distributed_init_method()
+    base_init_method = get_file_store_init_method()
+    sp_init_method = get_file_store_init_method()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
@@ -908,7 +941,7 @@ def _run_contract_skip_case(
         ctx = get_forward_context()
         ctx._sp_shard_depth = 1
 
-        def make_sdp_ctx() -> object:
+        def make_sdp_ctx() -> AbstractContextManager[None]:
             # Fresh instance per phase: the @contextmanager instance releases
             # its state on first exit and cannot be re-entered.
             return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
@@ -952,6 +985,7 @@ def _run_contract_skip_case(
     destroy_distributed_env()
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads",
     [
@@ -977,7 +1011,7 @@ def test_ulysses_uaa_contract_skips_length_gather_matches_slow_path(num_heads: i
     head_size = 8
     seq_len = 6  # divisible by 2 so both ranks hold equal-length shards
 
-    init_method = get_distributed_init_method()
+    init_method = get_file_store_init_method()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
@@ -1011,6 +1045,106 @@ def test_ulysses_uaa_contract_skips_length_gather_matches_slow_path(num_heads: i
             pass
 
 
+@pytest.mark.core_model
+@pytest.mark.parametrize("mask_layout", ["global"])
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_ulysses_uaa_2d_mask_layout_matches_baseline(
+    mask_layout: str,
+) -> None:
+    world_size = 2
+    batch_size = 2
+    seq_len = 5
+    split_sizes = [2, 3]
+    num_heads = 3
+    head_size = 8
+
+    base_init_method = get_file_store_init_method()
+    sp_init_method = get_file_store_init_method()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
+        input_file = f_in.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_base:
+        baseline_file = f_base.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_sp:
+        sp_file = f_sp.name
+
+    try:
+        torch.manual_seed(0)
+        q = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        k = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        v = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        mask = torch.tensor(
+            [
+                [True, True, True, True, False],
+                [True, True, True, False, False],
+            ],
+            dtype=torch.bool,
+        )
+        np.savez(
+            input_file,
+            q=q.numpy(),
+            k=k.numpy(),
+            v=v.numpy(),
+            mask=mask.numpy(),
+        )
+
+        # Baseline (no SP), mask is used verbatim.
+        torch.multiprocessing.spawn(
+            _run_attention_case,
+            args=(
+                1,
+                base_init_method,
+                input_file,
+                baseline_file,
+                num_heads,
+                head_size,
+                1,
+                "strict",
+                1,
+                None,
+                "math",
+                None,
+                False,
+                "front",
+                "global",
+            ),
+            nprocs=1,
+        )
+        # SP (Ulysses-P with UAA), mask is shared globally across ranks.
+        torch.multiprocessing.spawn(
+            _run_attention_case,
+            args=(
+                world_size,
+                sp_init_method,
+                input_file,
+                sp_file,
+                num_heads,
+                head_size,
+                world_size,
+                "advanced_uaa",
+                1,
+                split_sizes,
+                "math",
+                None,
+                False,
+                "front",
+                mask_layout,
+            ),
+            nprocs=world_size,
+        )
+
+        baseline = torch.from_numpy(np.load(baseline_file, allow_pickle=False))
+        sp = torch.from_numpy(np.load(sp_file, allow_pickle=False))
+        torch.testing.assert_close(sp, baseline, atol=1e-5, rtol=1e-5)
+    finally:
+        for path in (input_file, baseline_file, sp_file):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,joint_len",
     [
@@ -1039,8 +1173,8 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline(
     # rank0/1 -> 3+2=5, rank2/3 -> 3+2=5
     split_sizes = [3, 2, 3, 2]
 
-    base_init_method = get_distributed_init_method()
-    sp_init_method = get_distributed_init_method()
+    base_init_method = get_file_store_init_method()
+    sp_init_method = get_file_store_init_method()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
@@ -1120,3 +1254,29 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline(
                 os.remove(path)
             except OSError:
                 pass
+
+
+@pytest.mark.cpu
+def test_default_ulysses_import_does_not_require_optional_symmem_backend():
+    # Use a fresh interpreter: successful CUDA E2E cannot cover missing optional
+    # dependencies, and this test module already imported Ulysses above.
+    code = """
+import importlib.abc
+import sys
+
+blocked = {
+    "vllm_omni.diffusion.distributed.a2a_permute",
+    "vllm_omni.diffusion.distributed.qkv_a2a",
+}
+
+class WithoutOptionalBackend(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise ImportError("optional symmetric-memory backend unavailable")
+
+sys.meta_path.insert(0, WithoutOptionalBackend())
+from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
+assert blocked.isdisjoint(sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", code], text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr

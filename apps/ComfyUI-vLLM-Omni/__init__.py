@@ -21,15 +21,20 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateImage,
     VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
+    VLLMOmniLatentMaskEditing,
+    VLLMOmniMiniMaxH3Guide,
     VLLMOmniMiniMaxH3Params,
+    VLLMOmniMiniMaxH3TemporalMask,
     VLLMOmniQwenTTSParams,
     VLLMOmniRemoteLoRA,
+    VLLMOmniRestoreVideo,
     VLLMOmniSamplingParamsList,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
     VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
     VLLMOmniWanParams,
+    VLLMOmniYuE2Params,
 )
 
 # A dictionary that contains all nodes you want to export with their names
@@ -37,11 +42,15 @@ NODE_CLASS_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
+    "VLLMOmniRestoreVideo": VLLMOmniRestoreVideo,
     "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
     "VLLMOmniTTS": VLLMOmniTTS,
     "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
     "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
     "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
+    "VLLMOmniLatentMaskEditing": VLLMOmniLatentMaskEditing,
+    "VLLMOmniMiniMaxH3TemporalMask": VLLMOmniMiniMaxH3TemporalMask,
+    "VLLMOmniMiniMaxH3Guide": VLLMOmniMiniMaxH3Guide,
     # === Params ===
     "VLLMOmniARSampling": VLLMOmniARSampling,
     "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
@@ -50,6 +59,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniFastH3Deployment": VLLMOmniFastH3Deployment,
     "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
     "VLLMOmniWanParams": VLLMOmniWanParams,
+    "VLLMOmniYuE2Params": VLLMOmniYuE2Params,
     "VLLMOmniMiniMaxH3Params": VLLMOmniMiniMaxH3Params,
 }
 
@@ -58,11 +68,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
+    "VLLMOmniRestoreVideo": "Restore Video (SeedVR2)",
     "VLLMOmniUnderstanding": "Multimodality Understanding",
     "VLLMOmniTTS": "TTS (Text to Speech)",
     "VLLMOmniGenerateMusic": "Generate Music",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
     "VLLMOmniVideoReferences": "Video References",
+    "VLLMOmniLatentMaskEditing": "Latent Mask Editing",
+    "VLLMOmniMiniMaxH3TemporalMask": "MiniMax-H3 Temporal Mask",
+    "VLLMOmniMiniMaxH3Guide": "MiniMax H3 Add Guide",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
     "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",
@@ -71,7 +85,21 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniFastH3Deployment": "FastH3 Deployment",
     "VLLMOmniQwenTTSParams": "Qwen TTS Params",
     "VLLMOmniWanParams": "Wan Video Params",
+    "VLLMOmniYuE2Params": "YuE2 Params",
     "VLLMOmniMiniMaxH3Params": "MiniMax-H3 Video Params",
 }
 
 WEB_DIRECTORY = "./web"
+
+# The `model` dropdown is fed by a same-origin proxy route on the ComfyUI
+# server (see comfyui_vllm_omni/routes.py): a browser-side fetch would resolve
+# `localhost` to the user's own machine for remote deployments.
+try:
+    from server import PromptServer
+
+    from .comfyui_vllm_omni.routes import register_routes
+
+    register_routes(PromptServer.instance)
+except ImportError:
+    # Outside a ComfyUI runtime (e.g. unit tests) there is no server module.
+    pass

@@ -6,7 +6,9 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
@@ -153,6 +155,62 @@ def test_fused_qk_norm_rope_half_split_general_dim():
     torch.testing.assert_close(actual[1], expected[1], atol=0.0625, rtol=0.02)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("eps", [1e-6, 1e-5])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_fused_qk_norm_rope_cuda_rms_norm_is_bitwise(eps, table_dtype):
+    from vllm import _custom_ops as ops
+
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _apply_rope_table, fused_qk_norm_rope
+
+    torch.manual_seed(17)
+    qkv = torch.randn(257, 13, 128, device="cuda", dtype=torch.bfloat16)
+    q, k = qkv[:, :7], qkv[:, 7:10]
+    weights = [torch.empty(128, device="cuda", dtype=torch.bfloat16).uniform_(0.5, 1.5) for _ in range(2)]
+    theta = torch.randn(257, 64, device="cuda")
+    table = torch.cat((theta.cos(), theta.sin()), dim=-1).to(table_dtype)
+    expected = []
+    for x, weight in zip((q, k), weights):
+        normalized = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        ops.rms_norm(normalized, x.contiguous(), weight, eps)
+        expected.append(_apply_rope_table(normalized, table, 128, interleaved=True, dtype=torch.float32))
+    actual = fused_qk_norm_rope(q, k, *weights, table, eps, interleaved=True, cuda_rms_norm=True)
+    for a, e in zip(actual, expected):
+        assert torch.equal(a.view(torch.int16), e.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_fused_joint_qkv_norm_rope_cuda_rms_norm_is_bitwise(table_dtype):
+    """Joint op with ``cuda_rms_norm``: per-stream vLLM CUDA RMSNorm, cat,
+    fp32 interleaved RoPE — bit for bit, including the V gather."""
+    from vllm import _custom_ops as ops
+
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _apply_rope_table, fused_joint_qkv_norm_rope
+
+    batch, txt_len, img_len, eps = 2, 77, 1030, 1e-6
+    (q0, k0, v0, q1, k1, v1), (q0_w, k0_w, q1_w, k1_w), rope_table = _flux2_inputs(batch, txt_len, img_len, heads=8)
+    rope_table = rope_table.to(table_dtype)
+    heads = q0.shape[2]
+
+    def cuda_norm(x, weight):
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        ops.rms_norm(out, x.contiguous(), weight, eps)
+        return out
+
+    def expected(a, b, a_w, b_w):
+        joint = torch.cat((cuda_norm(a, a_w), cuda_norm(b, b_w)), dim=1).reshape(-1, heads, _FLUX2_HEAD_DIM)
+        rotated = _apply_rope_table(joint, rope_table, _FLUX2_HEAD_DIM, interleaved=True, dtype=torch.float32)
+        return rotated.view(batch, txt_len + img_len, heads, _FLUX2_HEAD_DIM)
+
+    actual = fused_joint_qkv_norm_rope(
+        q0, k0, v0, q1, k1, v1, q0_w, k0_w, q1_w, k1_w, rope_table, eps, cuda_rms_norm=True
+    )
+    for a, e in zip(actual[:2], (expected(q0, q1, q0_w, q1_w), expected(k0, k1, k0_w, k1_w))):
+        assert torch.equal(a.view(torch.int16), e.view(torch.int16))
+    assert torch.equal(actual[2], torch.cat((v0, v1), dim=1))
+
+
 def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
     """The op-level token-gate override: unset or blank -> caller's default; a
     non-negative integer string overrides it (``0`` = always fuse); anything
@@ -173,3 +231,326 @@ def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
         monkeypatch.setenv(env, bad)
         with pytest.raises(ValueError, match=env):
             fused_qk_norm_rope_min_tokens(2048)
+
+
+# ---- two-stream (joint) variant: Flux.2 double-block geometry ----
+
+_FLUX2_HEAD_DIM = 128
+
+
+def _flux2_inputs(batch: int, txt_len: int, img_len: int, heads: int = 48, strided: bool = True):
+    """Text/image Q/K/V as chunked-QKV projection views plus a joint table."""
+    torch.manual_seed(23)
+    dim = heads * _FLUX2_HEAD_DIM
+
+    def qkv(seq_len):
+        proj = torch.randn(batch, seq_len, 3 * dim, device="cuda", dtype=torch.bfloat16)
+        if strided:
+            q, k, v = proj.chunk(3, dim=-1)
+        else:
+            q, k, v = (proj[..., i * dim : (i + 1) * dim].contiguous() for i in range(3))
+        return tuple(t.unflatten(-1, (heads, -1)) for t in (q, k, v))
+
+    q0, k0, v0 = qkv(txt_len)
+    q1, k1, v1 = qkv(img_len)
+    weights = [torch.rand(_FLUX2_HEAD_DIM, device="cuda", dtype=torch.bfloat16) + 0.5 for _ in range(4)]
+    freqs = torch.randn(batch * (txt_len + img_len), _FLUX2_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+    rope_table = torch.cat((torch.cos(freqs), torch.sin(freqs)), dim=-1)
+    return (q0, k0, v0, q1, k1, v1), weights, rope_table
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("batch,txt_len,img_len", [(1, 512, 4096), (2, 77, 1030), (1, 0, 64), (3, 5, 0)])
+@pytest.mark.parametrize("table_dtype", [torch.float32, torch.bfloat16])
+def test_fused_joint_qkv_norm_rope_matches_single_stream_op(batch, txt_len, img_len, table_dtype):
+    """Joint kernel == per-stream single kernel on the concatenated rows, bitwise.
+
+    The joint op's Q/K arithmetic is the single-stream kernel's; the only new
+    logic is the stream/row routing and the V gather, so equality must be
+    exact.
+    """
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+        _launch_fused_joint_qkv_norm_rope,
+        _launch_fused_qk_norm_rope,
+        fused_joint_qkv_norm_rope,
+    )
+
+    (q0, k0, v0, q1, k1, v1), (q0_w, k0_w, q1_w, k1_w), rope_table = _flux2_inputs(batch, txt_len, img_len)
+    rope_table = rope_table.to(table_dtype)
+    seq_total = txt_len + img_len
+    heads = q0.shape[2]
+
+    def expected():
+        # Per-stream single op rows, gathered into joint token order.
+        table = rope_table.view(batch, seq_total, -1)
+        parts_q, parts_k = [], []
+        for b in range(batch):
+            row_q, row_k = [], []
+            for q, k, qw, kw, sl in (
+                (q0, k0, q0_w, k0_w, slice(0, txt_len)),
+                (q1, k1, q1_w, k1_w, slice(txt_len, None)),
+            ):
+                if q.shape[1] == 0:
+                    continue
+                oq, ok = _launch_fused_qk_norm_rope(
+                    q[b], k[b], qw, kw, table[b, sl].contiguous(), _EPS, interleaved=True
+                )
+                row_q.append(oq)
+                row_k.append(ok)
+            parts_q.append(torch.cat(row_q, dim=0))
+            parts_k.append(torch.cat(row_k, dim=0))
+        return torch.stack(parts_q), torch.stack(parts_k), torch.cat((v0, v1), dim=1)
+
+    exp_q, exp_k, exp_v = expected()
+    for actual in (
+        fused_joint_qkv_norm_rope(q0, k0, v0, q1, k1, v1, q0_w, k0_w, q1_w, k1_w, rope_table, _EPS),
+        _launch_fused_joint_qkv_norm_rope(q0, k0, v0, q1, k1, v1, q0_w, k0_w, q1_w, k1_w, rope_table, _EPS),
+    ):
+        assert actual[0].shape == (batch, seq_total, heads, _FLUX2_HEAD_DIM)
+        assert torch.equal(actual[0], exp_q)
+        assert torch.equal(actual[1], exp_k)
+        assert torch.equal(actual[2], exp_v)
+        assert all(t.is_contiguous() for t in actual)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_joint_qkv_norm_rope_matches_eager_reference():
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+        _eager_joint_qkv_norm_rope,
+        _launch_fused_joint_qkv_norm_rope,
+    )
+
+    streams, weights, rope_table = _flux2_inputs(2, 64, 300, heads=6)
+    expected = _eager_joint_qkv_norm_rope(*streams, *weights, rope_table, _EPS, _FLUX2_HEAD_DIM, _FLUX2_HEAD_DIM)
+    actual = _launch_fused_joint_qkv_norm_rope(*streams, *weights, rope_table, _EPS)
+    torch.testing.assert_close(actual[0], expected[0], atol=0.0625, rtol=0.02)
+    torch.testing.assert_close(actual[1], expected[1], atol=0.0625, rtol=0.02)
+    assert torch.equal(actual[2], expected[2])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("cuda_rms_norm", [False, True])
+def test_fused_joint_qkv_norm_rope_matches_flux2_eager_chain(cuda_rms_norm):
+    """Against the chain Flux.2's double block runs today: vLLM RMSNorm per
+    stream, cat (text first), interleaved RoPE via RotaryEmbedding. With
+    ``cuda_rms_norm`` the fused output must be bit-identical to it."""
+    from vllm import ir
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_joint_qkv_norm_rope
+    from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+    from vllm_omni.platforms import current_omni_platform
+
+    batch, txt_len, img_len = 2, 128, 1024
+    (q0, k0, v0, q1, k1, v1), weights, _ = _flux2_inputs(batch, txt_len, img_len, heads=8)
+    norms = []
+    config = VllmConfig()
+    with set_current_vllm_config(config), current_omni_platform.get_default_ir_op_priority(config).set_priority():
+        for w in weights:
+            norm = RMSNorm(_FLUX2_HEAD_DIM, eps=1e-6).cuda().to(torch.bfloat16)
+            norm.weight.data.copy_(w)
+            norms.append(norm)
+        norm_added_q, norm_added_k, norm_q, norm_k = norms
+        # Flux2PosEmbed-style [S, D/2] theta-width cos/sin shared by the batch.
+        freqs = torch.randn(txt_len + img_len, _FLUX2_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+        cos, sin = torch.cos(freqs), torch.sin(freqs)
+        rope = RotaryEmbedding(is_neox_style=False)
+
+        # The production provider of the eager chain; the CUDA-matching mode reproduces it.
+        assert ir.ops.rms_norm.dispatch(q1, norm_q.weight, 1e-6, None).provider == "vllm_c"
+        exp_q = torch.cat([norm_added_q(q0), norm_q(q1)], dim=1)
+        exp_k = torch.cat([norm_added_k(k0), norm_k(k1)], dim=1)
+        exp_v = torch.cat([v0, v1], dim=1)
+        exp_q, exp_k = apply_rope_to_qk(rope, exp_q, exp_k, (cos, sin))
+
+    table = torch.cat((cos, sin), dim=-1).to(torch.bfloat16)
+    table = table.unsqueeze(0).expand(batch, -1, -1).reshape(-1, _FLUX2_HEAD_DIM)
+    act_q, act_k, act_v = fused_joint_qkv_norm_rope(
+        q0,
+        k0,
+        v0,
+        q1,
+        k1,
+        v1,
+        norm_added_q.weight,
+        norm_added_k.weight,
+        norm_q.weight,
+        norm_k.weight,
+        table,
+        1e-6,
+        cuda_rms_norm=cuda_rms_norm,
+    )
+    if cuda_rms_norm:
+        assert torch.equal(act_q.view(torch.int16), exp_q.view(torch.int16))
+        assert torch.equal(act_k.view(torch.int16), exp_k.view(torch.int16))
+    else:
+        torch.testing.assert_close(act_q, exp_q, atol=0.0625, rtol=0.02)
+        torch.testing.assert_close(act_k, exp_k, atol=0.0625, rtol=0.02)
+    assert torch.equal(act_v, exp_v)
+
+
+def test_fused_joint_qkv_norm_rope_rejects_bad_shapes():
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_joint_qkv_norm_rope
+
+    q0 = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    q1 = torch.randn(1, 6, 2, 8, dtype=torch.bfloat16)
+    w = torch.ones(8, dtype=torch.bfloat16)
+    table = torch.zeros(10, 8)
+    with pytest.raises(ValueError, match="incompatible"):
+        fused_joint_qkv_norm_rope(q0, q0, q0, q1, q1, q1[:, :5], w, w, w, w, table, 1e-6)
+    with pytest.raises(ValueError, match="rope_table"):
+        fused_joint_qkv_norm_rope(q0, q0, q0, q1, q1, q1, w, w, w, w, table[:9], 1e-6)
+    with pytest.raises(ValueError, match="batch, seq, heads, head_dim"):
+        fused_joint_qkv_norm_rope(q0[0], q0, q0, q1, q1, q1, w, w, w, w, table, 1e-6)
+
+
+def test_pack_qk_norm_rope_table_skips_when_fused_path_unavailable():
+    """No table (and no allocation) on devices/dtypes the fused kernel cannot
+    serve: CPU tensors, non-bf16 activations, unsupported geometry."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import pack_qk_norm_rope_table
+
+    cos, sin = torch.randn(16, 64), torch.randn(16, 64)  # CPU
+    assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16) is None
+    if torch.cuda.is_available() and HAS_TRITON:
+        cos, sin = cos.cuda(), sin.cuda()
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float16) is None
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float32, activation_dtype=torch.float16) is None
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, head_dim=512) is None  # > 256
+        table = pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16)
+        assert table is not None and table.shape == (32, 128) and table.dtype == torch.bfloat16
+        # fp32 table for bf16 activations (Qwen-Image style) is allowed
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float32, activation_dtype=torch.bfloat16) is not None
+
+
+def test_pack_qk_norm_rope_table_skips_under_sequence_parallel(monkeypatch):
+    """Under SP (``sequence_parallel_size > 1``) no table is packed: RoPE is
+    applied per stream/shard and the consumer keeps its eager chain."""
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
+
+    monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
+    cos, sin = torch.randn(8, 4), torch.randn(8, 4)
+
+    for sp_size in (2, 8):
+        assert mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, sequence_parallel_size=sp_size) is None
+    for inactive_sp_size in (None, 0, 1):
+        assert (
+            mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, sequence_parallel_size=inactive_sp_size)
+            is not None
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("cuda_rms_norm", [False, True])
+def test_fused_ops_bitwise_under_torch_compile_and_cuda_graph(cuda_rms_norm):
+    """Both custom ops under ``torch.compile(fullgraph=True)`` and under CUDA
+    graph capture/replay produce exactly the eager op's outputs."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_joint_qkv_norm_rope, fused_qk_norm_rope
+
+    torch.manual_seed(3)
+    batch, txt_len, img_len = 2, 512, 4096
+    (q0, k0, v0, q1, k1, v1), (q0_w, k0_w, q1_w, k1_w), rope_table = _flux2_inputs(batch, txt_len, img_len)
+    seq_total = txt_len + img_len
+    heads = q0.shape[2]
+
+    def joint(q0, k0, v0, q1, k1, v1, table):
+        return fused_joint_qkv_norm_rope(
+            q0, k0, v0, q1, k1, v1, q0_w, k0_w, q1_w, k1_w, table, _EPS, cuda_rms_norm=cuda_rms_norm
+        )
+
+    # Single-stream op over the joint sequence (the single blocks' call).
+    qkv = torch.randn(batch * seq_total, heads * _FLUX2_HEAD_DIM * 3, device="cuda", dtype=torch.bfloat16)
+    sq, sk, _ = (t.unflatten(-1, (heads, -1)) for t in qkv.chunk(3, dim=-1))
+
+    def single(q, k, table):
+        return fused_qk_norm_rope(q, k, q0_w, k0_w, table, _EPS, interleaved=True, cuda_rms_norm=cuda_rms_norm)
+
+    joint_inputs = (q0, k0, v0, q1, k1, v1, rope_table)
+    single_inputs = (sq, sk, rope_table)
+    eager_joint = joint(*joint_inputs)
+    eager_single = single(*single_inputs)
+
+    def check(actual, expected):
+        assert len(actual) == len(expected)
+        for a, e in zip(actual, expected):
+            assert torch.equal(a, e)
+
+    compiled_joint = torch.compile(joint, fullgraph=True)
+    compiled_single = torch.compile(single, fullgraph=True)
+    check(compiled_joint(*joint_inputs), eager_joint)
+    check(compiled_single(*single_inputs), eager_single)
+
+    # CUDA graph: capture on a side stream after warmup, replay, compare.
+    for fn, inputs, expected in ((joint, joint_inputs, eager_joint), (single, single_inputs, eager_single)):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                fn(*inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = fn(*inputs)
+        graph.replay()
+        torch.accelerator.synchronize()
+        check(static_out, expected)
+        graph.replay()
+        torch.accelerator.synchronize()
+        check(static_out, expected)
+
+
+def test_pack_qk_norm_rope_table_identity_rows(monkeypatch):
+    """``identity_rows`` appends ``cos = 1, sin = 0`` rows after the rotated
+    rows (per batch element)."""
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
+
+    monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
+    cos, sin = torch.randn(5, 4), torch.randn(5, 4)
+    table = mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, identity_rows=3)
+    assert table is not None and table.shape == (2 * 8, 8) and table.dtype == torch.bfloat16
+    per_batch = table.view(2, 8, 8)
+    assert torch.equal(per_batch[0], per_batch[1])
+    assert torch.equal(per_batch[0, :5], torch.cat((cos, sin), dim=-1).to(torch.bfloat16))
+    assert torch.equal(per_batch[0, 5:, :4], torch.ones(3, 4, dtype=torch.bfloat16))
+    assert torch.equal(per_batch[0, 5:, 4:], torch.zeros(3, 4, dtype=torch.bfloat16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_fused_qk_norm_rope_large_storage_offsets(interleaved):
+    """Only three tokens, but the last row lies beyond signed 32-bit indexing."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+
+    # 4 GiB of backing storage; initialize only the three small visible rows.
+    q = torch.empty_strided((3, 1, 128), (2**30, 128, 1), device="cuda", dtype=torch.bfloat16)
+    q.fill_(1)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    table = torch.zeros(3, 96, device="cuda", dtype=torch.bfloat16)
+    table[:, :48] = 1
+    actual = fused_qk_norm_rope(q, q, weight, weight, table, _EPS, interleaved=interleaved)
+    for value in actual:
+        torch.testing.assert_close(value, torch.ones_like(value))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("large_stream", [0, 1])
+def test_fused_joint_qkv_norm_rope_large_storage_offsets(large_stream):
+    """Both input streams must retain 64-bit addressing for Q, K, and V."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _launch_fused_joint_qkv_norm_rope
+
+    # As in the single-stream regression, touch only three rows of a 4 GiB view.
+    large = torch.empty_strided((1, 3, 1, 128), (3 * 2**30, 2**30, 128, 1), device="cuda", dtype=torch.bfloat16)
+    large.fill_(1)
+    small = torch.ones((1, 2, 1, 128), device="cuda", dtype=torch.bfloat16)
+    q0, q1 = (large, small) if large_stream == 0 else (small, large)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    table = torch.zeros(5, 96, device="cuda", dtype=torch.bfloat16)
+    table[:, :48] = 1
+    actual = _launch_fused_joint_qkv_norm_rope(q0, q0, q0, q1, q1, q1, weight, weight, weight, weight, table, _EPS)
+    for value in actual:
+        assert value.shape == (1, 5, 1, 128)
+        torch.testing.assert_close(value, torch.ones_like(value), atol=0, rtol=0)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 Stage 0: GPT-2 AR Talker with vLLM-native PagedAttention.
 
 Predicts mel codes autoregressively and collects hidden_states as latent
@@ -158,17 +158,18 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = True
         self.requires_raw_input_tokens = True
         self.enable_update_additional_information = True
-        # Stage 1 consumes the hidden-state stream only in the legacy
-        # ``use_gpt_latent`` mode.  IndexTTS 2.5 transports mel codes plus
-        # reference conditioning, so asking the generic runner to include
-        # hidden states would add a synchronous [num_tokens, model_dim] D2H
-        # copy on every decode step without adding anything to the payload.
-        self.omni_pooler_payload_include_hidden = self.use_gpt_latent
+        # S2Mel never reads the generic pooler ``hidden`` key: latent mode
+        # ships the aligned GPT latent as ``hidden_states.latent`` from
+        # make_omni_output, and no-latent mode needs no hidden state at all.
+        # Including it would add a synchronous [num_tokens, model_dim] D2H
+        # copy plus a CPU-side concat on every decode step, which also
+        # serializes async scheduling.
+        self.omni_pooler_payload_include_hidden = False
         # S2Mel consumes the complete sequence only at request end. In latent
         # mode the runner retains aligned code/latent deltas on GPU; no-latent
         # mode reuses the CPU output-token history and retains only conditioning
         # metadata here.
-        self.omni_payload_at_request_end = self.config.model_type == "indextts2_5"
+        self.omni_payload_at_request_end = True
         self.omni_request_end_token_ids = ()
         self._speaker_cache = get_speaker_cache()
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {

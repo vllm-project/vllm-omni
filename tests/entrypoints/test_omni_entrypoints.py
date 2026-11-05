@@ -19,19 +19,21 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import StageConfig
+from vllm_omni.config.stage_config import StageConfig, StageType
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
+from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.errors import (
     OmniClientError,
     client_error_from_metadata,
     client_error_metadata,
     is_client_error_status,
 )
+from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -107,7 +109,13 @@ class FakeAsyncOmniEngine:
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
         self.stage_configs = [
-            StageConfig(stage_id=i, model_stage="dummy-model").to_omegaconf() for i in range(self.num_stages)
+            StageConfig(
+                stage_id=i,
+                model_stage="dummy-model",
+                stage_type=StageType(metadata.stage_type),
+                is_comprehension=getattr(metadata, "is_comprehension", False),
+            ).to_omegaconf()
+            for i, metadata in enumerate(self.stage_metadata)
         ]
         self.default_sampling_params_list = default_sampling_params_list or [
             SamplingParams(max_tokens=8) for _ in range(self.num_stages)
@@ -159,8 +167,13 @@ class FakeAsyncOmniEngine:
         except queue.Empty:
             return None
 
-    async def try_get_output_async(self) -> Any | None:
-        return self.try_get_output()
+    async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+        msgs: list[Any] = []
+        while len(msgs) < max_messages and (msg := self.try_get_output()) is not None:
+            msgs.append(msg)
+        if not msgs:
+            await asyncio.sleep(0.001)
+        return msgs
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         return self.stage_metadata[stage_id]
@@ -202,6 +215,58 @@ def _make_base():
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_disabled_stage_metrics_preserve_speech_completion_without_full_merge(monkeypatch):
+    base = _make_base()
+    base.collect_stage_metrics = False
+    base._enable_ar_profiler = False
+    base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm", final_output=True, final_output_type="audio", model_stage="code2wav"
+    )
+    base._publish_request_gauges = MagicMock()
+    metrics = OrchestratorAggregator(2, False, 0.0, 1)
+    diagnostic_latencies = MagicMock()
+    diagnostic_latencies.__iter__.side_effect = AssertionError("diagnostic arrays merged")
+    for count, reason in [(100, None), (91, "length")]:
+        metrics.on_stage_metrics(
+            0,
+            "req-no-metrics",
+            StageRequestStats(
+                batch_id=0,
+                batch_size=1,
+                num_tokens_in=0,
+                num_tokens_out=count,
+                finish_reason=reason,
+                stage_gen_time_ms=0.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+                stage_stats=StageStats(),
+                inter_output_latencies_ms=diagnostic_latencies,
+                vllm_itls_ms=diagnostic_latencies,
+            ),
+            "text",
+        )
+    merge = MagicMock(wraps=OrchestratorAggregator._merge_stage_metric_event)
+    monkeypatch.setattr(OrchestratorAggregator, "_merge_stage_metric_event", merge)
+    result = OutputMessage(
+        request_id="req-no-metrics",
+        stage_id=1,
+        engine_outputs=OmniRequestOutput(request_id="req-no-metrics", finished=False, final_output_type="audio"),
+        finished=False,
+    )
+
+    output = base._process_single_result(result, 1, metrics, {}, 0.0, 1)
+
+    assert output is not None
+    counter = SpeechOutputTokenCounter()
+    counter.observe(output)
+    assert counter.stage0_finish_reason == "length"
+    assert counter.total() == 191
+    assert "inter_output_latencies_ms" not in output.metrics["stage_metrics"]["0"]
+    assert merge.call_count == 2
+    assert all(call.kwargs == {"collect_stage_metrics": False} for call in merge.call_args_list)
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
@@ -481,7 +546,7 @@ def test_model_config_and_vllm_config_forward_from_comprehension_stage():
     io_processor = SimpleNamespace(name="io-processor")
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
-        stage_clients=[SimpleNamespace(is_comprehension=False), SimpleNamespace(is_comprehension=True)],
+        stage_configs=[SimpleNamespace(is_comprehension=False), SimpleNamespace(is_comprehension=True)],
         stage_vllm_configs=[None, vllm_config],
     )
     omni.input_processor = input_processor
@@ -502,7 +567,7 @@ def test_openai_serving_models_can_consume_async_omni_compat_attrs():
     io_processor = SimpleNamespace(name="io-processor")
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
-        stage_clients=[SimpleNamespace(is_comprehension=True)],
+        stage_configs=[SimpleNamespace(is_comprehension=True)],
         stage_vllm_configs=[vllm_config],
     )
     omni.input_processor = input_processor
@@ -524,10 +589,11 @@ def test_get_diffusion_od_config_returns_diffusion_stage_config():
     diffusion_od_config = object()
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", od_config=diffusion_od_config),
-        ]
+        ],
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
@@ -537,13 +603,31 @@ def test_get_diffusion_od_config_falls_back_to_inner_engine():
     diffusion_od_config = object()
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", _engine=SimpleNamespace(od_config=diffusion_od_config)),
-        ]
+        ],
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
+
+
+@pytest.mark.asyncio
+async def test_async_omni_rejects_diffusion_list_prompt_without_stage_clients(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    engine.stage_clients = []
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(ValueError, match="single prompt per request"):
+            async for _ in app.generate(prompt=["prompt-1", "prompt-2"], request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
 
 
 @pytest.mark.asyncio
@@ -969,12 +1053,23 @@ def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):
     assert len(outputs) == 2
 
 
-def test_fatal_error_raises_engine_dead():
+@pytest.mark.parametrize("request_id", [None, "removed"])
+def test_fatal_error_raises_engine_dead(request_id: str | None):
     base = _make_base()
-    msg = ErrorMessage(error="orchestrator crashed", fatal=True)
+    msg = ErrorMessage(error="orchestrator crashed", fatal=True, request_id=request_id)
 
     with pytest.raises(EngineDeadError, match="orchestrator crashed"):
         base._handle_output_message(msg)
+
+
+def test_non_fatal_error_for_unknown_request_is_ignored():
+    base = _make_base()
+    active_state = ClientRequestState("active")
+    base.request_states["active"] = active_state
+    msg = ErrorMessage(error="cancelled request failed", request_id="removed")
+
+    assert base._handle_output_message(msg) == (True, None, None, None)
+    assert base.request_states == {"active": active_state}
 
 
 def test_non_fatal_error_raises_runtime():
@@ -1133,6 +1228,7 @@ def test_async_omni_errored_property_alive():
     )
 
     assert omni.errored is False
+    assert omni.is_stopped is False
 
 
 def test_async_omni_errored_property_dead_engine():
@@ -1143,6 +1239,7 @@ def test_async_omni_errored_property_dead_engine():
     )
 
     assert omni.errored is True
+    assert omni.is_stopped is True
 
 
 def test_async_omni_errored_false_when_stage_dead():
@@ -1455,3 +1552,178 @@ def test_del_shutsdown_engine(monkeypatch: pytest.MonkeyPatch):
     del app
     gc.collect()
     assert engine.shutdown_called
+
+
+def _client_error_then_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    """First request is rejected with a 4xx client error; later ones complete normally."""
+    if len(engine.submitted) == 1:
+        _enqueue_client_error_message(engine, msg)
+    else:
+        _enqueue_omni_final_only_outputs(engine, msg)
+
+
+def test_omni_generate_client_error_keeps_engine_usable(monkeypatch: pytest.MonkeyPatch):
+    """Issue #8449: a non-fatal client error must fail only that generate() call.
+
+    The rejected request is aborted and the error propagates with its status
+    metadata, but the engine stays up so the next generate() succeeds, matching
+    AsyncOmni. Before the fix list-mode generate() closed the engine and the
+    second call died with janus.ShutDown.
+    """
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_client_error_then_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            app.generate(["blocked"], use_tqdm=False)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.error_type == "BadRequestError"
+        rejected_id = engine.submitted[0]["request_id"]
+        assert engine.aborted == [[rejected_id]]
+        assert rejected_id not in app.request_states
+        assert not engine.shutdown_called
+
+        outputs = app.generate(["p2"], use_tqdm=False)
+    finally:
+        app.shutdown()
+
+    assert [output.stage_id for output in outputs] == [0, 2]
+    assert len(engine.submitted) == 2
+
+
+@pytest.mark.parametrize("py_generator", [False, True], ids=["list", "generator"])
+@pytest.mark.parametrize(
+    ("enqueue_error", "exception_type"),
+    [
+        pytest.param(_enqueue_client_error_message, OmniClientError, id="client-error"),
+        pytest.param(_enqueue_error_message, RuntimeError, id="server-error"),
+    ],
+)
+def test_omni_generate_discards_errors_from_aborted_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    py_generator: bool,
+    enqueue_error: Callable[[FakeAsyncOmniEngine, dict[str, Any]], None],
+    exception_type: type[Exception],
+):
+    def enqueue_batch_errors_then_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["prompt"] == "valid":
+            _enqueue_omni_final_only_outputs(engine, msg)
+        else:
+            enqueue_error(engine, msg)
+
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=enqueue_batch_errors_then_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(exception_type) as exc_info:
+            list(app.generate(["bad-1", "bad-2"], py_generator=py_generator, use_tqdm=False))
+
+        assert type(exc_info.value) is exception_type
+        assert len(engine.submitted) == 2
+        assert len(engine.aborted) == 1
+        assert set(engine.aborted[0]) == {msg["request_id"] for msg in engine.submitted}
+        assert not app.request_states
+        assert engine.output_q.qsize() == 1
+        assert not engine.shutdown_called
+
+        outputs = list(app.generate(["valid"], py_generator=py_generator, use_tqdm=False))
+
+        assert [output.stage_id for output in outputs] == [0, 2]
+        assert len(engine.submitted) == 3
+        assert len(engine.aborted) == 1
+        assert engine.output_q.empty()
+        assert not app.request_states
+        assert not engine.shutdown_called
+    finally:
+        app.shutdown()
+
+
+def test_omni_generate_server_error_keeps_engine_usable(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal server-side error (RuntimeError, no 4xx status) also leaves the engine up."""
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_error_message,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(RuntimeError, match="engine boom") as exc_info:
+            app.generate(["boom"], use_tqdm=False)
+        assert not isinstance(exc_info.value, OmniClientError)
+        assert not engine.shutdown_called
+        assert engine.aborted == [[engine.submitted[0]["request_id"]]]
+    finally:
+        app.shutdown()
+
+
+def test_omni_generate_fatal_error_still_closes_engine(monkeypatch: pytest.MonkeyPatch):
+    """A fatal ErrorMessage means the engine is unusable: generate() keeps closing it."""
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_fatal_error_message,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    with pytest.raises(EngineDeadError, match="engine dead") as exc_info:
+        app.generate(["dead"], use_tqdm=False)
+
+    assert isinstance(exc_info.value, OmniEngineDeadError)
+    assert engine.shutdown_called
+
+
+@pytest.mark.parametrize("py_generator", [False, True])
+def test_omni_submit_error_aborts_partial_batch(monkeypatch: pytest.MonkeyPatch, py_generator: bool):
+    def reject_bad_prompt(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["prompt"] == "bad":
+            raise ValueError("invalid prompt")
+        if msg["prompt"] == "retry":
+            _enqueue_omni_final_only_outputs(engine, msg)
+
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=reject_bad_prompt)
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(ValueError, match="invalid prompt"):
+            list(app.generate(["ok", "bad", "not submitted"], py_generator=py_generator, use_tqdm=False))
+
+        assert [msg["prompt"] for msg in engine.submitted] == ["ok", "bad"]
+        assert len(engine.aborted) == 1
+        assert set(engine.aborted[0]) == {msg["request_id"] for msg in engine.submitted}
+        assert not app.request_states
+        assert not engine.shutdown_called
+        outputs = list(app.generate(["retry"], py_generator=py_generator, use_tqdm=False))
+        assert [output.stage_id for output in outputs] == [0, 2]
+    finally:
+        app.shutdown()
+
+
+def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+
+    def dead_orchestrator() -> None:
+        engine._alive = False
+        raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+
+    monkeypatch.setattr(engine, "try_get_output", dead_orchestrator)
+    try:
+        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
+            app.generate(["hello"], use_tqdm=False)
+        assert engine.shutdown_called
+        assert engine.aborted == [[engine.submitted[0]["request_id"]]]
+        assert not app.request_states
+    finally:
+        app.shutdown()
