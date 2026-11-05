@@ -184,7 +184,7 @@ def test_trained_cfm_long_stream_matches_independent_graphs(
                     next_states.append((cnn.clone(), result[2][row].clone()))
                 reference = [(value[1], value[2]) for value in expected]
                 current = next_states
-                if chunk >= 3:
+                if chunk >= (3 if variable_queries else 1):
                     assert all(value[1].shape[4] == prompt_lengths[row] + 100 for row, value in enumerate(current))
         assert accepted.count(batch) >= 24
         stats = wrapper.stats_snapshot()

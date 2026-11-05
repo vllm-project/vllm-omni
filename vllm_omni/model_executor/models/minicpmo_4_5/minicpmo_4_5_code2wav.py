@@ -534,6 +534,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
         self._npu_mixed_history_batching = read_bool_flag(extra, "cfm_npu_mixed_history_batching", False)
         self._npu_cross_reference_batching = read_bool_flag(extra, "cfm_npu_cross_reference_batching", False)
+        if self._npu_mixed_history_batching and not self._npu_cross_reference_batching:
+            logger.warning(
+                "cfm_npu_mixed_history_batching requires cfm_npu_cross_reference_batching=true; "
+                "NPU mixed-history batching will remain inactive"
+            )
         if self._npu_cross_reference_batching and self._min_batch_size != 1:
             logger.warning(
                 "cfm_npu_cross_reference_batching requires code2wav_min_batch_size=1, but got %d; "
@@ -1084,7 +1089,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             if len(groups) != 1:
                 raise _batch_error("npu_cross_reference_shape_mismatch")
             if getattr(self, "_npu_mixed_history_batching", False):
-                self.backend._whole_euler_graph_wrapper.npu_mixed_history = True
                 return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
             # Keep uniform padding and fallback policy; conditions and caches
             # remain per request. Mixed-history NPU guards are unchanged.
@@ -1893,6 +1897,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
             watchdog=self._watchdog,
         )
+        wrapper = self.backend._whole_euler_graph_wrapper
+        if wrapper is not None:
+            wrapper.npu_mixed_history = self._npu_mixed_history_batching and self._npu_cross_reference_batching
         # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
         # runners without that hook, the first chunk that needs a graph. Capturing
         # under vLLM's weight load held GiBs, so the sweep must not run here.

@@ -550,3 +550,50 @@ def test_ragged_npu_groups_allow_lengths_but_keep_hift_boundary():
     assert group(items, states, features, cross_turn=False) == [[0], [1]]
     states[1].hift_cache["mel"] = torch.nn.functional.pad(states[1].hift_cache["mel"], (0, 1))
     assert group(items, states, features, cross_turn=False, mixed_history=True) == [[0], [1]]
+
+
+def test_mixed_history_requires_cross_reference_warning(monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr("vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav.logger.warning", warning)
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(
+        cfm_npu_cross_reference_batching=False, cfm_npu_mixed_history_batching=True
+    )
+    MiniCPMO45Code2Wav(vllm_config=config)
+    assert any("requires cfm_npu_cross_reference_batching=true" in str(call) for call in warning.call_args_list)
+
+
+def test_ragged_npu_staggered_final_and_fresh_request():
+    model, _, calls = _candidate(mixed_history=True)
+    singles = {row: _candidate(False)[0] for row in range(3)}
+    for chunk in range(10):
+        # Row 0 finishes while row 1 continues; row 2 then joins as a fresh row.
+        rows = [0, 1] if chunk <= 4 else [1, 2]
+        infos = [
+            _request(
+                row, chunk if row != 2 else chunk - 5, count=12 + row * 2, last=(row == 0 and chunk == 4) or chunk == 9
+            )
+            for row in rows
+        ]
+        calls.clear()
+        actual = _forward(model, infos)
+        if chunk == 4:
+            assert calls == [2], "Mixed final flags must share CFM"
+        if chunk == 5:
+            assert calls == [1, 1], "Fresh and continuing rows retain separate buckets"
+        for index, row in enumerate(rows):
+            expected = _forward(singles[row], [infos[index]])
+            torch.testing.assert_close(
+                actual.multimodal_outputs["model_outputs"][index], expected.multimodal_outputs["model_outputs"][0]
+            )
+            key = f"voice-{row}"
+            assert (key in model._states) == (key in singles[row]._states)
+            if key in model._states:
+                for kind in ("flow_cache", "hift_cache"):
+                    got = getattr(model._states[key].token2wav, kind)
+                    wanted = getattr(singles[row]._states[key].token2wav, kind)
+                    for name in wanted:
+                        torch.testing.assert_close(got[name], wanted[name])
+        if chunk >= 4:
+            assert "voice-0" not in model._states
+    assert not model._states
