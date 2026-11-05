@@ -162,9 +162,7 @@ def test_moe_routing_key_from_mask_classifies_batches() -> None:
     assert moe_routing_key_from_mask(torch.zeros(0, dtype=torch.bool)) is MoERoutingKey.BLEND
     assert moe_routing_key_from_mask(torch.zeros(4, dtype=torch.bool)) is MoERoutingKey.ALL_UND
     assert moe_routing_key_from_mask(torch.ones(4, dtype=torch.bool)) is MoERoutingKey.ALL_GEN
-    assert (
-        moe_routing_key_from_mask(torch.tensor([False, True, False])) is MoERoutingKey.BLEND
-    )
+    assert moe_routing_key_from_mask(torch.tensor([False, True, False])) is MoERoutingKey.BLEND
 
 
 def test_ar_wrappers_keep_raw_input_tokens() -> None:

@@ -13,7 +13,7 @@ from torch import nn
 from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import CUDAGraphMode, CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
