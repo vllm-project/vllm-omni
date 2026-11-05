@@ -167,7 +167,12 @@ def checkout(path: Path, url: str, revision: str, *, submodules: bool = False) -
         path.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", str(path)], check=True)
         subprocess.run(["git", "-C", str(path), "remote", "add", "origin", url], check=True)
-        subprocess.run(["git", "-C", str(path), "fetch", "--depth=1", "origin", revision], check=True, timeout=600)
+        # Avoid the HTTP/2 stream cancellations observed during pinned reference fetches.
+        subprocess.run(
+            ["git", "-c", "http.version=HTTP/1.1", "-C", str(path), "fetch", "--depth=1", "origin", revision],
+            check=True,
+            timeout=600,
+        )
         subprocess.run(["git", "-C", str(path), "checkout", "--detach", "FETCH_HEAD"], check=True)
     actual = subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
     if actual != revision:
