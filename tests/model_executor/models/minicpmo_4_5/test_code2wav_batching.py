@@ -245,7 +245,9 @@ def test_cfm_fused_body_defaults_on_for_npu(monkeypatch, extra, expected):
     ("extra", "max_num_seqs", "micro"),
     [
         ({}, 6, 6),
-        ({}, 64, 16),
+        ({}, 16, 16),
+        ({}, 32, 32),
+        ({}, 64, 64),
         ({"micro_batch_size": 2}, 6, 2),
         ({"max_graph_batch": 8}, 64, 8),
     ],
@@ -258,8 +260,7 @@ def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_se
     model = MiniCPMO45Code2Wav(vllm_config=config)
 
     assert model._cfm_graph_config["micro_batch_size"] == micro
-    if "max_graph_batch" in extra:
-        assert model._cfm_graph_config["max_graph_batch"] == extra["max_graph_batch"]
+    assert model._cfm_graph_config["max_graph_batch"] == extra.get("max_graph_batch", max_num_seqs)
 
 
 @pytest.mark.parametrize("rows,expected", [(16, list(range(1, 9))), ([1, 3, 8, 16], [1, 3, 8])])

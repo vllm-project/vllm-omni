@@ -21,6 +21,31 @@ Duplex defaults to the V1 session path; `minicpmo_4_5_duplex_mrv2.yaml` is the
 opt-in CUDA overlay that runs all three duplex stages on MRv2. Turn results do
 not establish duplex performance or interruption correctness.
 
+The base `minicpmo_4_5.yaml` profile targets high-concurrency serving on
+large-memory devices: GPU stages and duplex admission default to 32 requests;
+NPU stages and admission default to 16. CUDA Talker reserves 8 GiB for KV;
+NPU retains 4 GiB. Specialized memory/topology overlays retain their own caps.
+These capacities are configuration defaults, not validated full-context limits
+on every GPU/NPU SKU.
+
+Code2Wav derives Whole-Euler admission (`max_graph_batch`) from Stage 2
+`max_num_seqs` when omitted. Its workspace rows (`micro_batch_size`) default
+to that concurrency, bounded by an explicitly smaller `max_graph_batch`.
+The base profile omits both overrides. An explicit smaller `micro_batch_size`
+remains available for memory-constrained deployments: larger batches replay
+in groups over the shared workspace. For example, changing 4 to 32 rows grows
+the default five-step attention workspace from 1.25 GiB to 10 GiB; persistent
+request caches and the other stages need additional memory.
+
+The base profile allows 36 Whole-Euler graphs for the default six batch sizes,
+three cache offsets and steady/final query widths. Encoder graphs retain four
+rows and 12 entries; they have independent workspace and replay grouping.
+The redundant runtime encoder capture threshold is omitted because successful
+startup precapture disables request-time capture by default. NPU auxiliary
+batch buckets include 16, while the auxiliary graph pool remains bounded at
+32 entries. Validate co-located NPU memory and audio quality on the target SKU
+before relying on C16 capacity.
+
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
 matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA also

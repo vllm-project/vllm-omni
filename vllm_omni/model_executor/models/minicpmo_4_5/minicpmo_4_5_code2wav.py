@@ -459,15 +459,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         }
         enable_whole_euler = read_bool_flag(extra, "enable_whole_euler", True)
         max_graph_batch_raw = extra.get("max_graph_batch")
-        max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
-        max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
+        max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else max_num_seqs
         micro_batch_size_raw = extra.get("micro_batch_size")
         if micro_batch_size_raw is not None:
             micro_batch_size = int(micro_batch_size_raw)
         else:
             # The Whole-Euler arena reserves one attention cache per micro-batch
             # row, so size it for the most requests this stage ever batches.
-            micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
+            micro_batch_size = min(int(max_num_seqs), max_graph_batch) if max_num_seqs else None
         encoder_rows = extra.get("code2wav_encoder_graph_rows", 1)
         if isinstance(encoder_rows, (list, tuple)):
             encoder_rows = sorted({int(row) for row in encoder_rows})
