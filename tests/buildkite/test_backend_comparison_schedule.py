@@ -38,7 +38,7 @@ def comparison_runner(tmp_path: Path):
         '{"steps":[{"key":"image-build-sglang-omni"},'
         '{"key":"nightly-sglang-omni-qwen3-omni","plugins":[{'
         '"github.com/buildkite-plugins/kubernetes-buildkite-plugin":'
-        '{"podSpec":{"containers":[{"resources":{"limits":{}}}]}}}]}]}'
+        '{"podSpec":{"containers":[{"image":"registry/repo:tag","resources":{"limits":{}}}]}}}]}]}'
     )
     git = bindir / "git"
     git.write_text('#!/bin/bash\nprintf "%s\\n" "$TEST_CHECKOUT"\n')
@@ -132,6 +132,27 @@ def test_manual_smokes_require_explicit_models_and_api_source(
         ]
 
 
+def test_minicpm_performance_runs_after_audio_smoke_on_one_gpu(comparison_runner, tmp_path):
+    result, calls = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": "smoke", "BUILDKITE_SOURCE": "api", "BACKEND_COMPARISON_CASES": "minicpm-o-perf"}
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == ["buildkite-agent pipeline upload"]
+    image, job = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert image["key"] == "image-build-sglang-omni"
+    assert job["key"] == "perf-sglang-minicpm-o"
+    plugin = job["plugins"][0]["github.com/buildkite-plugins/kubernetes-buildkite-plugin"]
+    assert plugin["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 1
+    commands = job["command"]
+    assert commands.startswith("set -eu")
+    assert commands.index(".completed == 1") < commands.index("--test-config-file tests/dfx/perf/tests/")
+    assert commands.index("--test-config-file tests/dfx/perf/tests/") < commands.index(".completed == 32")
+    assert job["artifact_paths"] == [
+        "tests/dfx/perf/results/minicpm-smoke/*.json",
+        "tests/dfx/perf/results/result_test_sglang_minicpmo_4_5_*.json",
+    ]
+
+
 def test_existing_label_selected_comparison_still_uploads(comparison_runner):
     result, calls = comparison_runner(
         {"BACKEND_COMPARISON_ONLY": "", "BUILDKITE_BRANCH": "congw729:ci/separate-image", "BUILDKITE_SOURCE": "webhook"}
@@ -188,3 +209,34 @@ def test_child_jobs_verify_the_uploader_commit_before_work(tmp_path: Path, check
             text=True,
         )
         assert (result.returncode == 0) == checkout_matches
+
+
+def test_qwen_image_performance_uses_only_the_verified_image(comparison_runner, tmp_path):
+    result, calls = comparison_runner(
+        {
+            "BACKEND_COMPARISON_ONLY": "smoke",
+            "BUILDKITE_SOURCE": "api",
+            "BACKEND_COMPARISON_CASES": "qwen-image-21-perf",
+        }
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == ["buildkite-agent pipeline upload"]
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert job["key"] == "perf-sglang-qwen-image-21"
+    assert "depends_on" not in job
+    (container,) = next(iter(job["plugins"][0].values()))["podSpec"]["containers"]
+    assert container["image"] == "registry/repo@" + job["env"]["COMPARISON_IMAGE_DIGEST"]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+    (config,) = json.loads((ROOT / job["env"]["COMPARISON_CONFIG"]).read_text())
+    reference = json.loads((ROOT / "tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json").read_text())[0]
+    assert config["server_type"] == "sglang-diffusion"
+    assert config["server_params"]["model"] == reference["server_params"]["model"]
+    (workload,) = config["benchmark_params"]
+    daily = reference["benchmark_params"][0]
+    # Defaults resolved by the common client on build 18773.
+    assert workload == {
+        **daily,
+        "seed": 0,
+        "num_warmups": 2,
+        "extra_body": {**daily["extra_body"], "return_stage_metrics": True},
+    }

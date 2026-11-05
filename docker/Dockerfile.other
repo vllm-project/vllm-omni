@@ -35,7 +35,7 @@ RUN git clone --filter=blob:none https://github.com/openucx/ucx.git /tmp/ucx && 
 RUN printf '%s\n' 'protobuf>=6.31.1,<7.0.0' > /tmp/sglang-overrides.txt && \
     uv pip install --python /opt/sglang/bin/python3 --no-build-isolation --prerelease=allow \
       --overrides /tmp/sglang-overrides.txt \
-      "sglang-omni @ git+https://github.com/sgl-project/sglang-omni.git@${SGLANG_OMNI_COMMIT}" \
+      "sglang-omni[minicpm-o] @ git+https://github.com/sgl-project/sglang-omni.git@${SGLANG_OMNI_COMMIT}" \
       "pytest>=8" && \
     uv pip install --python /opt/sglang/bin/python3 --no-deps "qwen-tts==0.1.1" && \
     uv pip install --python /opt/sglang/bin/python3 --no-deps --reinstall "flashinfer-python==0.7.1" && \
@@ -51,7 +51,9 @@ RUN "${VLLM_OMNI_VENV}/bin/python" -c "from vllm._version import __commit_id__; 
 RUN cd "$(/opt/sglang/bin/python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" && \
     git apply "${APP_DIR}/docker/patches/sglang-omni-ignore-eos.patch"
 
-RUN CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -m pytest \
+RUN CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -c \
+      "from sglang_omni.models.minicpm_o.components.token2wav.speech_tokenizer_weights import load_tokenizer_weights" && \
+    CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -m pytest \
       --noconftest -o addopts='' -q tests/dfx/perf/tests/test_sglang_sampling.py
 
 # pytest and the common benchmark client use vLLM; only the server uses SGLang.

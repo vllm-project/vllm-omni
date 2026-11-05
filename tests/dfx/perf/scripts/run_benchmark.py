@@ -24,7 +24,7 @@ from tests.dfx.conftest import (
     resolve_pytest_marks,
     run_benchmark,
 )
-from tests.dfx.perf.scripts.sglang_omni_server import SglangOmniServer, sglang_server_entries
+from tests.dfx.perf.scripts.sglang_omni_server import SGLANG_SERVER_TYPES, SglangOmniServer, sglang_server_entries
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -78,7 +78,7 @@ _server_types = {config.get("server_type", "vllm-omni") for config in BENCHMARK_
 if len(_server_types) > 1:
     raise ValueError(f"A benchmark config file must use one server type, got: {sorted(_server_types)}")
 SERVER_TYPE = next(iter(_server_types), "vllm-omni")
-if SERVER_TYPE == "sglang-omni":
+if SERVER_TYPE in SGLANG_SERVER_TYPES:
     _server_entries = sglang_server_entries(BENCHMARK_CONFIGS)
     paired_benchmark_params = create_paired_benchmark_pytest_params(
         _server_entries,
@@ -319,7 +319,7 @@ def omni_server_context():
 
 @pytest.fixture
 def omni_server(request, omni_server_context):
-    if SERVER_TYPE == "sglang-omni":
+    if SERVER_TYPE in SGLANG_SERVER_TYPES:
         key = json.dumps(request.param, sort_keys=True)
         return omni_server_context.acquire(key, lambda: SglangOmniServer(request.param))
     return omni_server_context.acquire(request.param, lambda: _start_omni_server(request.param))
@@ -656,7 +656,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     print(f"Benchmark parameters: {benchmark_params}")
 
     provenance = None
-    if SERVER_TYPE == "sglang-omni" and CONFIG_FILE_PATH:
+    if SERVER_TYPE in SGLANG_SERVER_TYPES and CONFIG_FILE_PATH:
         from tests.dfx.perf.scripts.experiment_metadata import (
             comparison_provenance,
             configured_num_gpus,
@@ -667,6 +667,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             test_config=CONFIG_FILE_PATH,
             server_config=omni_server.config_path,
             server_revision=omni_server.server_revision,
+            server_type=SERVER_TYPE,
         )
         provenance["num_gpus"] = configured_num_gpus(_config_for_test(test_name) or {})
         provenance["num_gpus_source"] = "test_config.hardware_marks.num_cards"

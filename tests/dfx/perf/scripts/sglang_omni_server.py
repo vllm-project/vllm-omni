@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""SGLang-Omni server adapter for DFX performance benchmarks."""
+"""Launch the selected SGLang server in its own environment for DFX benchmarks."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
+SGLANG_SERVER_TYPES = {"sglang-omni", "sglang-diffusion"}
 
 
 def _open_port() -> int:
@@ -69,13 +70,14 @@ def _serve_args(values: dict[str, Any]) -> list[str]:
 def sglang_server_entries(configs: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
     entries: list[tuple[dict[str, Any], str]] = []
     for config in configs:
-        if config.get("server_type") != "sglang-omni":
+        if config.get("server_type") not in SGLANG_SERVER_TYPES:
             continue
         params = config["server_params"]
         entries.append(
             (
                 {
                     "test_name": config["test_name"],
+                    "server_type": config["server_type"],
                     "model": params["model"],
                     "serve_args": _serve_args(params.get("serve_args", {})),
                     "env": params.get("env", {}),
@@ -87,9 +89,8 @@ def sglang_server_entries(configs: list[dict[str, Any]]) -> list[tuple[dict[str,
 
 
 class SglangOmniServer:
-    server_type = "sglang-omni"
-
     def __init__(self, config: dict[str, Any]) -> None:
+        self.server_type = config.get("server_type", "sglang-omni")
         self.model = config["model"]
         self.host = "127.0.0.1"
         self.port = _open_port()
@@ -101,7 +102,19 @@ class SglangOmniServer:
 
     def __enter__(self) -> SglangOmniServer:
         executable = _executable()
-        self.server_revision = _installed_revision(executable)
+        if self.server_type == "sglang-diffusion":
+            launcher = Path(shutil.which(executable) or executable).with_name("sglang")
+            executable = str(launcher)
+            self.server_revision = subprocess.check_output(
+                [
+                    str(launcher.with_name("python3")),
+                    "-c",
+                    "from importlib.metadata import version; print(version('sglang'))",
+                ],
+                text=True,
+            ).strip()
+        else:
+            self.server_revision = _installed_revision(executable)
         command = [
             executable,
             "serve",
@@ -115,19 +128,19 @@ class SglangOmniServer:
         ]
         env = os.environ.copy()
         env.update(self._env)
-        print(f"Launching SGLang-Omni: {' '.join(command)}")
+        print(f"Launching {self.server_type}: {' '.join(command)}")
         self._proc = subprocess.Popen(command, cwd=_REPO_ROOT, env=env, start_new_session=True)
         deadline = time.monotonic() + int(os.environ.get("SGLANG_OMNI_SERVER_TIMEOUT", "1800"))
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
-                raise RuntimeError(f"SGLang-Omni exited with code {self._proc.returncode}")
+                raise RuntimeError(f"{self.server_type} exited with code {self._proc.returncode}")
             with socket.socket() as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0:
                     return self
             time.sleep(2)
         self.__exit__()
-        raise TimeoutError(f"SGLang-Omni did not become ready on {self.host}:{self.port}")
+        raise TimeoutError(f"{self.server_type} did not become ready on {self.host}:{self.port}")
 
     def __exit__(self, *_: object) -> None:
         if self._proc is None or self._proc.poll() is not None:

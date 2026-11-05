@@ -55,25 +55,28 @@ def file_fingerprint(path: str | Path) -> dict[str, str]:
 
 
 def comparison_provenance(
-    *, test_config: str, server_config: str | None, server_revision: str | None
+    *, test_config: str, server_config: str | None, server_revision: str | None, server_type: str = "sglang-omni"
 ) -> dict[str, object]:
+    runner_paths = [
+        "tests/dfx/conftest.py",
+        "tests/dfx/perf/scripts/run_benchmark.py",
+        "tests/dfx/perf/scripts/sglang_omni_server.py",
+        "tests/dfx/perf/scripts/experiment_metadata.py",
+    ]
+    if server_type == "sglang-diffusion":
+        runner_paths.extend(["vllm_omni/benchmarks/patch/patch.py", "vllm_omni/benchmarks/metrics/metrics.py"])
     return {
         "schema_version": 1,
         "runner_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, text=True).strip(),
-        "server_type": "sglang-omni",
+        "server_type": server_type,
         "server_revision": server_revision,
-        "runner_files": [
-            file_fingerprint(path)
-            for path in (
-                "tests/dfx/conftest.py",
-                "tests/dfx/perf/scripts/run_benchmark.py",
-                "tests/dfx/perf/scripts/sglang_omni_server.py",
-                "tests/dfx/perf/scripts/experiment_metadata.py",
-            )
-        ],
+        "runner_files": [file_fingerprint(path) for path in runner_paths],
         "test_config": file_fingerprint(test_config),
         "server_config": file_fingerprint(server_config) if server_config else None,
-        "server_patches": [file_fingerprint("docker/patches/sglang-omni-ignore-eos.patch")],
+        "server_patches": [file_fingerprint("docker/patches/sglang-omni-ignore-eos.patch")]
+        if server_type == "sglang-omni"
+        else [],
+        **({"image_digest": os.environ.get("COMPARISON_IMAGE_DIGEST")} if server_type == "sglang-diffusion" else {}),
         "buildkite": {
             field: os.environ.get(f"BUILDKITE_{field.upper()}")
             for field in ("build_id", "job_id", "step_key", "pipeline_slug", "branch", "source", "commit")
