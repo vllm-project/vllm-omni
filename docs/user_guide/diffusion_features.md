@@ -216,7 +216,11 @@ The following tables show which models support each feature:
 > unvalidated on this model, not known-broken.
 > 6. PAN 2 rejects ring and all-gather sequence parallelism at startup: its padded
 > joint video/text sequence needs an attention mask those modes do not carry. Use
-> Ulysses (`--usp`), CFG-Parallel, and Tensor-Parallel, alone or combined. Layerwise and
+> Ulysses (`--usp`), CFG-Parallel, and Tensor-Parallel, alone or combined. Under
+> Ulysses, PAN 2 always masks the padding sequence parallelism adds, whatever
+> `mask_sp_padding` is set to, so the output matches one GPU; attention backends
+> that cannot take a mask, such as `SAGE_ATTN` and `SAGE_ATTN_3`, fail when that
+> padding is needed (for example 704x1248 at `--usp 4`). Layerwise and
 > distributed layerwise offload combine with all three; HSDP does not reduce memory
 > together with distributed layerwise offload, so use one or the other.
 

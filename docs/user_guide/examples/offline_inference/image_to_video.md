@@ -79,6 +79,9 @@ python image_to_video.py \
 PAN 2 needs a structured prompt; the plain prompt above only shows the command.
 See the [PAN 2 recipe](../../../../recipes/IFM/PAN2.md) for details.
 
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`.
+
 ### SANA-Video-2B
 
 SANA checkpoints identify their upstream T2V pipeline in `model_index.json`.

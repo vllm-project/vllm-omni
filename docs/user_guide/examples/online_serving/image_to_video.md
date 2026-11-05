@@ -295,6 +295,10 @@ Complete](#poll-until-complete). PAN 2 needs a structured prompt; the plain
 prompt above only shows the command. See the [PAN 2
 recipe](../../../../recipes/IFM/PAN2.md) for details.
 
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`. `--no-guardrails`
+turns them off at your own risk.
+
 ## Example materials
 
 ??? abstract "run_curl_hunyuan_video_15.sh"

@@ -117,7 +117,7 @@ EXCLUDED_MODELS = [
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
     # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
-    # (real-checkpoint E2E) instead of a tiny model.
+    # with a tiny modular checkpoint. Real-checkpoint parity is checked after merge.
     "PAN2ModularPipeline",
 ]
 
