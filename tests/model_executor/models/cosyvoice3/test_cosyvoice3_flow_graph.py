@@ -165,3 +165,49 @@ def test_captured_flow_graphs_serve_a_stream_without_recording(monkeypatch):
     assert prefix.used_pages == 0
     for output, reference in zip(actual, expected):
         torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@torch.inference_mode()
+def test_full_prefix_pool_hops_recompute_without_recording(monkeypatch):
+    """Hops that miss a full prefix pool recompute without the graph runner:
+    no layout records on demand and the mel matches eager Flow."""
+    model = _tiny_packed_streaming(monkeypatch, prefix_gib="0.25", graphs="1")
+    monkeypatch.setattr(model, "_get_hift_batcher", lambda: SimpleNamespace(warm_fft_plans=lambda frames: 0))
+    model.capture_graphs(n_timesteps=3, row_frames=128)
+    runner = model._packed_estimator.graph_runner
+    monkeypatch.setattr(model._flow_prefix_cache, "reserve", lambda state, frames: False)
+    torch.manual_seed(5)
+    requests = _items(_REQUESTS)
+    model._packed_estimator.graph_runner = None
+    expected = _stream(model, requests)
+    model._packed_estimator.graph_runner = runner
+    layouts = set(runner.graphs)
+    actual = _stream(model, requests)
+    assert set(runner.graphs) == layouts
+    for output, reference in zip(actual, expected):
+        torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@torch.inference_mode()
+def test_flow_graph_runner_retires_a_generation_at_its_limit(monkeypatch):
+    """Without a prefix pool every hop records its own layout; at the limit the
+    runner retires all of its graphs, and the next generation still matches
+    eager Flow on a replayed stream."""
+    monkeypatch.setenv("COSYVOICE3_FLOW_GRAPH_MAX", "2")
+    model = _tiny_packed_streaming(monkeypatch, prefix_gib="0", graphs="1")
+    estimator = model._get_packed_estimator(torch.bfloat16)
+    runner = estimator.graph_runner
+    torch.manual_seed(5)
+    requests = _items(_REQUESTS)
+    estimator.graph_runner = None
+    expected = _stream(model, requests)
+    estimator.graph_runner = runner
+    # Two non-final hop layouts and the final layout: three for a limit of two.
+    for _ in range(2):
+        actual = _stream(model, requests)
+        assert len(runner.graphs) <= 2
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+    assert runner.flushes >= 2

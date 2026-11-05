@@ -626,7 +626,9 @@ class CosyVoice3Code2Wav(nn.Module):
         for every Flow row slot up to ``row_frames`` frames a row (a short
         sentence's prompt and speech) and, with HiFT batching and decode graphs
         on, every padded HiFT batch up to ``hift_frames`` wide (F0 margin,
-        overlap and a 100-token hop). Longer Flow layouts still record on demand.
+        overlap and a 100-token hop). Longer Flow layouts still record on demand,
+        up to ``COSYVOICE3_FLOW_GRAPH_MAX`` graphs per cache before the cache
+        retires them all; hops that miss a full prefix pool run without graphs.
         HiFT's cuFFT plans are created here too, for every width up to
         ``hift_frames``, whether or not decode graphs are on.
         """
@@ -717,7 +719,15 @@ class CosyVoice3Code2Wav(nn.Module):
             flow_states = [None if value is None else value[1] for value in served]
             misses = [position for position, value in enumerate(served) if value is None]
             if misses:
-                missed = self._stream_flow_mels([items[hops[position]] for position in misses], n_timesteps)
+                # With a prefix pool, misses mean it is full: up to eight whole
+                # rows per solve keep the GPU busy without graphs, and their
+                # layouts were never recorded at startup, so recording them now
+                # would stall every request in the step.
+                missed = self._stream_flow_mels(
+                    [items[hops[position]] for position in misses],
+                    n_timesteps,
+                    graphs=getattr(self, "_flow_prefix_cache", None) is None,
+                )
                 for position, mel in zip(misses, missed):
                     mels[position] = mel
             queue(hops, mels, flow_states, False)
@@ -780,9 +790,12 @@ class CosyVoice3Code2Wav(nn.Module):
             stream = self._hift_stream = torch.cuda.Stream(device=device)
         return stream
 
-    def _stream_flow_mels(self, items: list[StreamingFlowItem], n_timesteps: int) -> list[torch.Tensor]:
+    def _stream_flow_mels(
+        self, items: list[StreamingFlowItem], n_timesteps: int, *, graphs: bool = True
+    ) -> list[torch.Tensor]:
         """Full-recompute packed Flow for streaming items, in groups of at most
-        eight by length as forward_batch runs them; each item's new mel frames."""
+        eight by length as forward_batch runs them; each item's new mel frames.
+        ``graphs=False`` solves them without the Flow graph runner."""
         if len(items) <= 8:
             groups = [list(range(len(items)))]
         else:
@@ -794,7 +807,7 @@ class CosyVoice3Code2Wav(nn.Module):
         mels: list[torch.Tensor | None] = [None] * len(items)
         for group in groups:
             feat, lengths, prompt_lengths = self._flow_feat(
-                [items[index] for index in group], n_timesteps, stream_items=True
+                [items[index] for index in group], n_timesteps, stream_items=True, graphs=graphs
             )
             for row, index in enumerate(group):
                 offset = max(0, int(items[index].get("token_offset_tokens", 0))) * self.token_mel_ratio
@@ -1052,7 +1065,7 @@ class CosyVoice3Code2Wav(nn.Module):
         return results
 
     def _flow_feat(
-        self, items: list[StreamingFlowItem], n_timesteps: int, *, stream_items: bool
+        self, items: list[StreamingFlowItem], n_timesteps: int, *, stream_items: bool, graphs: bool = True
     ) -> tuple[torch.Tensor, list[int], list[int]]:
         """Flow over each item's prompt and continuation, right padded to the
         widest; returns the mel batch with each row's total and prompt length."""
@@ -1109,6 +1122,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     cfg_rate=cfg_rate,
                     streaming=stream_items and not items[0].get("finalize", False),
                     modulation_key=modulation_key,
+                    graphs=graphs,
                 )
             feat = scatter_rows(packed, rows, width).transpose(1, 2)
 

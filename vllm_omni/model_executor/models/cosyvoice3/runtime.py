@@ -72,6 +72,12 @@ def cosyvoice3_stage1_npu_graph_max() -> int:
     return _positive_env_int("COSYVOICE3_STAGE1_NPU_GRAPH_MAX", 8)
 
 
+def cosyvoice3_flow_graph_max() -> int:
+    """Return how many packed Flow CUDA graphs one cache keeps before it retires
+    them all; startup records 44 per cache with the default row length."""
+    return _positive_env_int("COSYVOICE3_FLOW_GRAPH_MAX", 128)
+
+
 def cosyvoice3_full_response_enabled() -> bool:
     """Opt-in Hopper full-response path; other devices retain the standard path."""
     return (

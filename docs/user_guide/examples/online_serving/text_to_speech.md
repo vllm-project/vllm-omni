@@ -181,7 +181,10 @@ of a copied deploy YAML; `0` disables the prefix cache. The budget is rounded
 down to whole pages, including one reserved scratch page; a positive budget
 must hold at least two pages. Request completion returns pages to this pool,
 not to the device allocator. Pool exhaustion falls back to full Flow
-recomputation and can reduce throughput. Startup logs distinguish the actual
+recomputation without CUDA graphs and can reduce throughput. Layouts that
+startup did not record are recorded on demand; each Flow graph cache keeps at
+most `COSYVOICE3_FLOW_GRAPH_MAX` graphs (default 128) and retires all of them
+when a new layout arrives at that limit. Startup logs distinguish the actual
 pool tensor allocation from the configured budget; neither is total GPU memory.
 Weights, solver temporaries and CUDA graphs require additional headroom.
 

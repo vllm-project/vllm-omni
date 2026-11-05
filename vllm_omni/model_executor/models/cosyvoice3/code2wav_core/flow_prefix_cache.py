@@ -27,7 +27,10 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
+from ..runtime import cosyvoice3_flow_graph_max
 from .packed_dit import (
     _FLOW_GRAPH_MAX_TOTAL,
     _FLOW_GRAPH_SLOTS,
@@ -37,9 +40,12 @@ from .packed_dit import (
     flow_graph_total,
     layer_norm_preserving_eager,
     packed_conv_mish,
+    retire_graph_generation,
     rotate_in_place,
     to_device_async,
 )
+
+logger = init_logger(__name__)
 
 PAGE_FRAMES = 16
 # Page 0 is never handed out: graph padding rows write and read it.
@@ -370,7 +376,8 @@ class FlowPrefixCache:
                 options={"emulate_precision_casts": True},
             )
         self.graphs: dict[tuple, _PrefixGraph] | None = {} if graphs else None
-        self.pool = None
+        self.max_graphs = cosyvoice3_flow_graph_max()
+        self.flushes = 0
         _ACTIVE_CACHE = self
 
     @property
@@ -394,6 +401,12 @@ class FlowPrefixCache:
         for _ in range(missing):
             state.pages.append(self.free_pages.pop())
         return True
+
+    def flush_graphs(self) -> None:
+        """Retire every recorded graph at once (see ``retire_graph_generation``)."""
+        retire_graph_generation(self.graphs)
+        self.flushes += 1
+        logger.info("CosyVoice3 Flow prefix graphs retired: flush %d at %d graphs", self.flushes, self.max_graphs)
 
     def release(self, state: FlowPrefixState | None) -> None:
         """Return a request's pages; idempotent, so every owner of the state may call it."""
@@ -636,6 +649,8 @@ class FlowPrefixCache:
         state = self.graphs.get(key)
         fresh = state is None
         if fresh:
+            if len(self.graphs) >= self.max_graphs:
+                self.flush_graphs()
             channels = noise.shape[-1]
             state = _PrefixGraph(
                 graph=torch.cuda.CUDAGraph(),
@@ -666,10 +681,8 @@ class FlowPrefixCache:
             with torch.cuda.stream(stream):
                 self._euler(*arguments, modulations)
             torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(state.graph, pool=self.pool):
+            with torch.cuda.graph(state.graph, pool=current_platform.get_global_graph_pool()):
                 state.output = self._euler(*arguments, modulations)
-            if self.pool is None:
-                self.pool = state.graph.pool()
             self.graphs[key] = state
         state.graph.replay()
         return state.output

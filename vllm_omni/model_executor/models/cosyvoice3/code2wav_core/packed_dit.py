@@ -16,8 +16,13 @@ from dataclasses import dataclass
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
+from ..runtime import cosyvoice3_flow_graph_max
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
+
+logger = init_logger(__name__)
 
 FA3_PAGE_SIZE = 1
 
@@ -551,10 +556,12 @@ def solve_flow_euler_packed(
     cfg_rate: float,
     streaming: bool,
     modulation_key: tuple | None = None,
+    graphs: bool = True,
 ) -> torch.Tensor:
     """Euler steps over a packed sequence with classifier free guidance: the
-    conditional rows and their unconditional twins share one DiT call."""
-    if estimator.graph_runner is not None and modulation_key is not None:
+    conditional rows and their unconditional twins share one DiT call.
+    ``graphs=False`` keeps the solve off the CUDA graph runner."""
+    if graphs and estimator.graph_runner is not None and modulation_key is not None:
         solved = estimator.graph_runner.run(
             noise, time_span, mu, spks, cond, rows, cfg_rate=cfg_rate, streaming=streaming, key=modulation_key
         )
@@ -687,6 +694,21 @@ class _FlowGraph:
     output: torch.Tensor | None = None
 
 
+def retire_graph_generation(graphs: dict) -> None:
+    """Retire every graph of one cache at once.
+
+    Flow graphs record into the process-wide graph pool, so a graph retired
+    alone would return blocks that its live peers still address in their
+    recorded kernels. Retiring the whole generation never leaves a live graph
+    behind a freed one, as MiniCPM-o 4.5's CFMGraphWrapper does. The sync keeps
+    a replay from being in flight; the pool itself stays with the process.
+    """
+    torch.accelerator.synchronize()
+    for state in graphs.values():
+        state.graph.reset()
+    graphs.clear()
+
+
 class FlowGraphRunner:
     """Replay the whole CFG Euler solve as one CUDA graph per padded layout.
 
@@ -697,15 +719,22 @@ class FlowGraphRunner:
     like the bucketed layouts above: padding rows are isolated by attention
     and by the positional masks of the packed convolution, so real frames only
     see their own row. Metadata lives in static buffers that are rewritten
-    before each replay.
+    before each replay. A layout missing from a full cache retires the whole
+    generation before it records.
     """
 
     def __init__(self, estimator: PackedDiT) -> None:
         self.estimator = estimator
         self.graphs: dict[tuple, _FlowGraph] = {}
-        self.pool = None
+        self.max_graphs = cosyvoice3_flow_graph_max()
+        self.flushes = 0
         attn = estimator.dit.transformer_blocks[0].attn
         self.heads, self.head_dim = attn.heads, attn.inner_dim // attn.heads
+
+    def flush(self) -> None:
+        retire_graph_generation(self.graphs)
+        self.flushes += 1
+        logger.info("CosyVoice3 Flow graphs retired: flush %d at %d graphs", self.flushes, self.max_graphs)
 
     def _layout(self, lengths: tuple[int, ...], streaming: bool):
         n, total = len(lengths), sum(lengths)
@@ -854,20 +883,20 @@ class FlowGraphRunner:
         state = self.graphs.get(graph_key)
         fresh = state is None
         if fresh:
+            if len(self.graphs) >= self.max_graphs:
+                self.flush()
             state = self._allocate(graph_key, noise, spks, time_span)
         self._load(state, twin, seg_rows, seg_ends, offsets, noise, mu, cond, spks, time_span)
         if fresh:
             # Warm up (and compile new dynamic shapes) off the capture, then
-            # record the solve into the shared pool.
+            # record the solve into the process-wide graph pool.
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self._solve(state, cfg_rate, graph_key)
             torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(state.graph, pool=self.pool):
+            with torch.cuda.graph(state.graph, pool=current_platform.get_global_graph_pool()):
                 state.output = self._solve(state, cfg_rate, graph_key)
-            if self.pool is None:
-                self.pool = state.graph.pool()
             self.graphs[graph_key] = state
         state.graph.replay()
         return state.output[:, : noise.shape[1]].float()
