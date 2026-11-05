@@ -17,10 +17,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from PIL import Image
-
-from tests.helpers.serving_chat import build_serving_chat
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+
+from tests.helpers.serving_chat import build_serving_chat
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
