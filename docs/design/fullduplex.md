@@ -423,7 +423,7 @@ for queue updates and the final validity check before delivery.
   and epoch-blind, so a result arriving after a barge-in could otherwise be
   admitted against a call the session had already moved past. The epoch
   consequences hang off the single epoch-advance path: pending calls from older
-  epochs are cancelled (or, with `tool_interrupt_policy: keep`, move to the new
+  epochs are cancelled (or, with `function_call_interrupt_policy: keep`, move to the new
   epoch and stay answerable), and a result the model accepted but never consumed is
   retired from the runtime so the new epoch cannot speak it. A retired or
   already-consumed generation stays *named* in the worker-facing runtime config
@@ -790,12 +790,12 @@ question on the next turn and asks again.
 `model_channel._expose_function_call` refuses a matching call before registering
 it, so a suppressed repeat uses no call budget and arms no timer. A repeat of a
 pending call gets no notice, because its result may still arrive. The ledger takes the session's `user_turn_seq` only when
-`tool_retry_policy` is `user_turn` and the model declares
-`clears_tool_block_on_user_commit`, because a commit is not always a user turn:
+`function_call_retry_policy` is `user_turn` and the model declares
+`clears_function_call_block_on_user_commit`, because a commit is not always a user turn:
 JoyAI commits are camera observations and native models free-run. An entry stays
 blocking until that counter moves past the turn it was abandoned in.
 
-`tool_interrupt_policy: keep` gives each record a mutable `admission_epoch`;
+`function_call_interrupt_policy: keep` gives each record a mutable `admission_epoch`;
 `ToolCallOrigin` stays immutable. An epoch advance moves the epoch forward instead
 of settling the call, and admission and timeouts read it.
 

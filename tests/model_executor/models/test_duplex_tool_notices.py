@@ -124,9 +124,9 @@ def test_qwen_skips_a_suppressed_repeat_and_a_call_outside_the_window():
 
 def test_qwen_capabilities_describe_a_turn_based_client_flow():
     capabilities = qwen().capabilities(max_sessions=1)
-    assert capabilities.tool_call_mode == "declared"
-    assert capabilities.tool_result_continuation == "client_response_create"
-    assert capabilities.clears_tool_block_on_user_commit is True
+    assert capabilities.tool_mode == "declared"
+    assert capabilities.function_call_output_continuation == "client_response_create"
+    assert capabilities.clears_function_call_block_on_user_commit is True
 
 
 # --------------------------------------------------------------------------- #
@@ -167,10 +167,10 @@ def test_nemotron_full_queue_skips_the_notice_instead_of_closing_the_session():
 
 def test_nemotron_capabilities_describe_a_native_flow():
     capabilities = nemotron().capabilities(max_sessions=1)
-    assert capabilities.tool_call_mode == "declared"
-    assert capabilities.tool_result_continuation == "automatic"
+    assert capabilities.tool_mode == "declared"
+    assert capabilities.function_call_output_continuation == "automatic"
     assert capabilities.max_tools == 5
-    assert capabilities.clears_tool_block_on_user_commit is False
+    assert capabilities.clears_function_call_block_on_user_commit is False
 
 
 # --------------------------------------------------------------------------- #
@@ -206,7 +206,7 @@ def test_joyai_skips_a_call_without_a_question():
 
 def test_joyai_capabilities_describe_delegation():
     capabilities = joyai().capabilities(max_sessions=1)
-    assert capabilities.tool_call_mode == "delegate_only"
-    assert capabilities.tool_result_continuation == "next_observation"
+    assert capabilities.tool_mode == "delegate_only"
+    assert capabilities.function_call_output_continuation == "next_observation"
     assert capabilities.max_tools == 1
-    assert capabilities.clears_tool_block_on_user_commit is False
+    assert capabilities.clears_function_call_block_on_user_commit is False

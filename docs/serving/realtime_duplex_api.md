@@ -868,15 +868,15 @@ arguments is not blocked.
 
 A pending call blocks only until it settles, and the model gets no notice, because
 its result may still arrive. For a timed-out or cancelled call,
-`extra_body.tool_retry_policy` sets when the block lifts. It is fixed at session
+`extra_body.function_call_retry_policy` sets when the block lifts. It is fixed at session
 open.
 
 | Value | Meaning |
 | --- | --- |
-| `user_turn` (default) | The next user turn lifts the block, on models with `capabilities.clears_tool_block_on_user_commit`. On other models it lasts for the session, because they have no reliable user-turn boundary. |
+| `user_turn` (default) | The next user turn lifts the block, on models with `capabilities.clears_function_call_block_on_user_commit`. On other models it lasts for the session, because they have no reliable user-turn boundary. |
 | `never` | The block lasts for the session. |
 
-The session object reports the effective value as `tool_retry_policy`, so a client can see when `user_turn` behaves as `never`.
+The session object reports the effective value as `function_call_retry_policy`, so a client can see when `user_turn` behaves as `never`.
 
 **Notices.** The session also shows the model a fixed status saying the call did
 not complete, through the plugin hook `runtime_config_for_abandoned_tool_call`.
@@ -888,7 +888,7 @@ It never contains client text.
 | Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
 | JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
 
-**Interruptions.** `extra_body.tool_interrupt_policy` sets what an epoch advance
+**Interruptions.** `extra_body.function_call_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
 they settle as `cancelled`. With `keep`, they stay pending and can still be
 answered, so only the deadline, `function_call.cancel` or close ends them. A result
@@ -898,10 +898,10 @@ already accepted follows the model's existing retirement rules either way.
 
 | Field | Values |
 | --- | --- |
-| `tool_call_mode` | `none`, `declared` (client-defined tools) or `delegate_only` (only the model's `delegate` function) |
-| `tool_result_continuation` | What turns an accepted result into output: `client_response_create`, `automatic`, `next_observation`, or `none` |
+| `tool_mode` | `none`, `declared` (client-defined tools) or `delegate_only` (only the model's `delegate` function) |
+| `function_call_output_continuation` | What turns an accepted result into output: `client_response_create`, `automatic`, `next_observation`, or `none` |
 | `max_tools` | Most tools one session may declare, or `null` for no model limit. More is refused with `too_many_tools`. |
-| `clears_tool_block_on_user_commit` | Whether `tool_retry_policy: user_turn` can lift a block |
+| `clears_function_call_block_on_user_commit` | Whether `function_call_retry_policy: user_turn` can lift a block |
 
 Non-empty `tools` on a `none` model is refused with `tools_unsupported`.
 `tool_choice` other than `auto` is refused with `unsupported_tool_choice`, because
@@ -909,19 +909,19 @@ no duplex model honours it.
 
 **Client library.** `DuplexClientBase.send_function_call_output` and `cancel_function_call`
 send these events. `vllm_omni.clients.tool_calls.DuplexToolRunner` runs each tool
-in its own task, so audio keeps streaming; reports failures with
-`function_call.cancel`; stops a tool when its call settles; and sends `response.create`
-only when the model needs it. Pass `tool_session_defaults()` as `extra_body` when
+in its own task, so audio keeps streaming. A handler must return a `str`: anything
+else is reported as a failed tool, so serialize structured output yourself. The runner reports failures with `function_call.cancel`, stops a tool when its call settles, and
+sends `response.create` only when the model needs it. Pass `function_call_session_defaults()` as `extra_body` when
 opening the session to keep pending tools across an interruption.
 
 ```python
 from vllm_omni.clients.duplex import DuplexClient, SessionConfig
-from vllm_omni.clients.tool_calls import DuplexToolRunner, tool_session_defaults
+from vllm_omni.clients.tool_calls import DuplexToolRunner, function_call_session_defaults
 
 async def get_weather(arguments: dict[str, object]) -> str:
     return "25C"
 
-config = SessionConfig(extra_body=tool_session_defaults())
+config = SessionConfig(extra_body=function_call_session_defaults())
 async with DuplexClient("ws://127.0.0.1:8099/v1/realtime", model="Qwen/Qwen3-Omni-30B-A3B-Instruct", config=config) as client:
     await DuplexToolRunner(client, {"get_weather": get_weather}).run()
 ```

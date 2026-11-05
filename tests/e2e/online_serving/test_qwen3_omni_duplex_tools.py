@@ -166,8 +166,8 @@ async def in_session(url: str, config: SessionConfig, body) -> None:
             await client.send({"type": "session.update", "session": {"tools": [WEATHER_TOOL]}})
             capabilities = client.session_info.get("capabilities")
             assert isinstance(capabilities, dict)
-            assert capabilities["tool_call_mode"] == "declared"
-            assert capabilities["tool_result_continuation"] == "client_response_create"
+            assert capabilities["tool_mode"] == "declared"
+            assert capabilities["function_call_output_continuation"] == "client_response_create"
             await body(session)
         finally:
             session.report()
@@ -206,7 +206,7 @@ def test_the_client_can_keep_talking_while_a_tool_is_pending(omni_server):
         await session.continue_with_result(call_id, WEATHER_RESULT)
         assert session.error_codes() == []
 
-    run(omni_server, session_config(tool_interrupt_policy="keep"), body)
+    run(omni_server, session_config(function_call_interrupt_policy="keep"), body)
 
 
 @pytest.mark.xfail(
@@ -224,7 +224,7 @@ def test_a_result_after_a_later_turn_reaches_the_answer(omni_server):
 
         assert "17" in answer, answer
 
-    run(omni_server, session_config(tool_interrupt_policy="keep"), body)
+    run(omni_server, session_config(function_call_interrupt_policy="keep"), body)
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
@@ -275,7 +275,7 @@ def test_a_repeated_question_cannot_republish_an_abandoned_call(omni_server):
         for suppressed in session.duplex_events("duplex.function_call.suppressed"):
             assert suppressed["blocked_by_call_id"] == call_id
 
-    config = session_config(tool_result_timeout_s=RESULT_TIMEOUT_S, tool_retry_policy="never")
+    config = session_config(tool_result_timeout_s=RESULT_TIMEOUT_S, function_call_retry_policy="never")
     run(omni_server, config, body)
 
 

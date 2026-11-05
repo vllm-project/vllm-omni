@@ -34,8 +34,8 @@ from vllm_omni.engine.duplex.config import (
     DuplexCapabilities,
     DuplexConfigError,
     DuplexSessionConfig,
-    effective_tool_retry_policy,
-    resolve_tool_policy,
+    effective_function_call_retry_policy,
+    resolve_function_call_policy,
 )
 from vllm_omni.engine.duplex.contracts import ToolCallAbandonReason, abandoned_tool_call_notice
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_session_tools
@@ -271,35 +271,37 @@ def test_a_kept_call_times_out_in_the_current_epoch():
 
 
 def test_policies_default_and_validate():
-    assert resolve_tool_policy({}, "tool_retry_policy") == "user_turn"
-    assert resolve_tool_policy(None, "tool_interrupt_policy") == "cancel"
-    assert resolve_tool_policy({"tool_retry_policy": "never"}, "tool_retry_policy") == "never"
+    assert resolve_function_call_policy({}, "function_call_retry_policy") == "user_turn"
+    assert resolve_function_call_policy(None, "function_call_interrupt_policy") == "cancel"
+    assert (
+        resolve_function_call_policy({"function_call_retry_policy": "never"}, "function_call_retry_policy") == "never"
+    )
     with pytest.raises(DuplexConfigError) as refused:
-        DuplexSessionConfig(model="m", extra_body={"tool_interrupt_policy": "later"})
-    assert refused.value.code == "invalid_tool_policy"
+        DuplexSessionConfig(model="m", extra_body={"function_call_interrupt_policy": "later"})
+    assert refused.value.code == "invalid_function_call_policy"
 
 
 def test_an_invalid_policy_in_an_update_is_refused_as_invalid():
     config = DuplexSessionConfig(model="m")
     with pytest.raises(DuplexConfigError) as refused:
-        config.apply_realtime_update({"extra_body": {"tool_retry_policy": "sometimes"}}, session_id="s")
-    assert refused.value.code == "invalid_tool_policy"
+        config.apply_realtime_update({"extra_body": {"function_call_retry_policy": "sometimes"}}, session_id="s")
+    assert refused.value.code == "invalid_function_call_policy"
 
 
 def test_the_effective_retry_policy_needs_a_user_turn_boundary():
-    with_boundary = DuplexCapabilities(clears_tool_block_on_user_commit=True)
-    assert effective_tool_retry_policy(with_boundary, {}) == "user_turn"
-    assert effective_tool_retry_policy(with_boundary, {"tool_retry_policy": "never"}) == "never"
-    assert effective_tool_retry_policy(DuplexCapabilities(), {}) == "never"
+    with_boundary = DuplexCapabilities(clears_function_call_block_on_user_commit=True)
+    assert effective_function_call_retry_policy(with_boundary, {}) == "user_turn"
+    assert effective_function_call_retry_policy(with_boundary, {"function_call_retry_policy": "never"}) == "never"
+    assert effective_function_call_retry_policy(DuplexCapabilities(), {}) == "never"
 
 
 def test_a_policy_cannot_change_after_the_session_opens():
-    config = DuplexSessionConfig(model="m", extra_body={"tool_interrupt_policy": "keep"})
+    config = DuplexSessionConfig(model="m", extra_body={"function_call_interrupt_policy": "keep"})
     with pytest.raises(DuplexConfigError) as refused:
-        config.apply_realtime_update({"extra_body": {"tool_interrupt_policy": "cancel"}}, session_id="s")
-    assert refused.value.code == "tool_policy_update_unsupported"
+        config.apply_realtime_update({"extra_body": {"function_call_interrupt_policy": "cancel"}}, session_id="s")
+    assert refused.value.code == "function_call_policy_update_unsupported"
     # A client that resends the whole session is not changing anything.
-    config.apply_realtime_update({"extra_body": {"tool_interrupt_policy": "keep"}}, session_id="s")
+    config.apply_realtime_update({"extra_body": {"function_call_interrupt_policy": "keep"}}, session_id="s")
 
 
 def test_tools_are_refused_where_a_model_would_ignore_them():
@@ -314,7 +316,7 @@ def test_tools_are_refused_where_a_model_would_ignore_them():
 
 @pytest.mark.parametrize("tool_choice", ["none", "required", {"type": "function", "name": "f"}])
 def test_tool_choice_other_than_auto_is_refused(tool_choice):
-    capabilities = DuplexCapabilities(tool_call_mode="declared", max_tools=None)
+    capabilities = DuplexCapabilities(tool_mode="declared", max_tools=None)
     extra_body = {"realtime_tools": [{"name": "f"}], "realtime_tool_choice": tool_choice}
     with pytest.raises(DuplexRuntimeConfigError) as refused:
         validate_session_tools(capabilities, extra_body)
@@ -322,32 +324,39 @@ def test_tool_choice_other_than_auto_is_refused(tool_choice):
 
 
 def test_more_tools_than_a_model_supports_are_refused():
-    capabilities = DuplexCapabilities(tool_call_mode="declared", max_tools=1)
+    capabilities = DuplexCapabilities(tool_mode="declared", max_tools=1)
     tools = [{"name": "f"}, {"name": "g"}]
     with pytest.raises(DuplexRuntimeConfigError) as refused:
         validate_session_tools(capabilities, {"realtime_tools": tools})
     assert refused.value.code == "too_many_tools"
     validate_session_tools(capabilities, {"realtime_tools": tools[:1]})
-    unlimited = DuplexCapabilities(tool_call_mode="declared", max_tools=None)
+    unlimited = DuplexCapabilities(tool_mode="declared", max_tools=None)
     validate_session_tools(unlimited, {"realtime_tools": tools})
 
 
+def test_the_tool_limit_covers_any_sequence():
+    capabilities = DuplexCapabilities(tool_mode="declared", max_tools=1)
+    with pytest.raises(DuplexRuntimeConfigError) as refused:
+        validate_session_tools(capabilities, {"realtime_tools": ({"name": "f"}, {"name": "g"})})
+    assert refused.value.code == "too_many_tools"
+
+
 def test_tool_choice_auto_is_accepted():
-    capabilities = DuplexCapabilities(tool_call_mode="declared", max_tools=None)
+    capabilities = DuplexCapabilities(tool_mode="declared", max_tools=None)
     validate_session_tools(capabilities, {"realtime_tools": [{"name": "f"}], "realtime_tool_choice": "auto"})
 
 
 def test_capabilities_reach_the_client_payload():
     payload = DuplexCapabilities(
-        tool_call_mode="declared",
-        tool_result_continuation="automatic",
+        tool_mode="declared",
+        function_call_output_continuation="automatic",
         max_tools=5,
-        clears_tool_block_on_user_commit=True,
+        clears_function_call_block_on_user_commit=True,
     ).as_dict()
-    assert payload["tool_call_mode"] == "declared"
-    assert payload["tool_result_continuation"] == "automatic"
+    assert payload["tool_mode"] == "declared"
+    assert payload["function_call_output_continuation"] == "automatic"
     assert payload["max_tools"] == 5
-    assert payload["clears_tool_block_on_user_commit"] is True
+    assert payload["clears_function_call_block_on_user_commit"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -454,9 +463,28 @@ async def test_a_tool_result_is_not_a_user_turn_and_lifts_no_block(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_config_error_from_a_plugin_check_is_reported_on_update(monkeypatch):
+    async with open_nemotron_harness(monkeypatch) as h:
+        seen: list[object] = []
+
+        def refuse(extra_body):
+            seen.append(extra_body)
+            if isinstance(extra_body, dict) and extra_body.get("realtime_tools"):
+                raise DuplexConfigError("refused", code="unsupported_tool_choice")
+
+        monkeypatch.setattr(h.runner.plugin, "validate_client_extra_body", refuse)
+        events = await h.run(commands.UpdateSession(patch={"tools": [{"type": "function", "name": "f"}]}))
+
+        assert error_codes(events) == ["unsupported_tool_choice"]
+        assert not h.runner.closing
+        # The hook gets the whole extra_body, as it does at session open.
+        assert isinstance(seen[-1], dict) and "auto_response" in seen[-1]
+
+
+@pytest.mark.asyncio
 async def test_the_session_reports_the_policy_it_applies(monkeypatch):
-    async with open_nemotron_harness(monkeypatch, extra_body={"tool_retry_policy": "user_turn"}) as h:
-        assert h.session.as_public_dict()["tool_retry_policy"] == "never"
+    async with open_nemotron_harness(monkeypatch, extra_body={"function_call_retry_policy": "user_turn"}) as h:
+        assert h.session.as_public_dict()["function_call_retry_policy"] == "never"
 
 
 @pytest.mark.asyncio
@@ -485,7 +513,7 @@ async def test_an_effective_cancel_is_reported_and_keeps_nemotron_queue_clean(mo
 
 @pytest.mark.asyncio
 async def test_keep_policy_admits_a_result_after_an_effective_cancel(monkeypatch):
-    async with open_nemotron_harness(monkeypatch, extra_body={"tool_interrupt_policy": "keep"}) as h:
+    async with open_nemotron_harness(monkeypatch, extra_body={"function_call_interrupt_policy": "keep"}) as h:
         call_id = await prepare(h)
         epoch = h.session.epoch
 
@@ -502,7 +530,7 @@ async def test_keep_policy_admits_a_result_after_an_effective_cancel(monkeypatch
 @pytest.mark.asyncio
 async def test_a_tool_declared_on_update_is_refused_on_a_tool_less_model(monkeypatch):
     async with open_nemotron_harness(monkeypatch) as h:
-        monkeypatch.setattr(h.session.capabilities, "tool_call_mode", "none")
+        monkeypatch.setattr(h.session.capabilities, "tool_mode", "none")
         events = await h.run(commands.UpdateSession(patch={"tools": [{"type": "function", "name": "f"}]}))
         assert error_codes(events) == ["tools_unsupported"]
 

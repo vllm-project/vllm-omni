@@ -55,14 +55,14 @@ from vllm_omni.engine.duplex.commands import (
     UpdateSession,
 )
 from vllm_omni.engine.duplex.config import (
-    TOOL_INTERRUPT_POLICY_KEY,
+    FUNCTION_CALL_INTERRUPT_POLICY_KEY,
     DuplexConfigError,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
     ResponseCreateOptions,
-    effective_tool_retry_policy,
-    resolve_tool_policy,
+    effective_function_call_retry_policy,
+    resolve_function_call_policy,
     resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
@@ -257,10 +257,12 @@ class DuplexSessionRunner:
             timeout_s=resolve_tool_result_timeout_s(session.config.extra_body),
             on_expire=self._enqueue_tool_call_expiry,
             on_settle=self._enqueue_tool_call_settlement,
-            keep_on_epoch_advance=(resolve_tool_policy(session.config.extra_body, TOOL_INTERRUPT_POLICY_KEY) == "keep"),
+            keep_on_epoch_advance=(
+                resolve_function_call_policy(session.config.extra_body, FUNCTION_CALL_INTERRUPT_POLICY_KEY) == "keep"
+            ),
             user_turn_seq=(
                 session.user_turn_seq
-                if effective_tool_retry_policy(session.capabilities, session.config.extra_body) == "user_turn"
+                if effective_function_call_retry_policy(session.capabilities, session.config.extra_body) == "user_turn"
                 else None
             ),
         )

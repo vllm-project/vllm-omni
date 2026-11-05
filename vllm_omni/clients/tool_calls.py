@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.clients.duplex import DuplexClientBase, DuplexClientError, DuplexEvent
 
-__all__ = ["DuplexToolRunner", "ToolHandler", "tool_session_defaults"]
+__all__ = ["DuplexToolRunner", "ToolHandler", "function_call_session_defaults"]
 
 logger = init_logger(__name__)
 
@@ -26,13 +26,13 @@ logger = init_logger(__name__)
 ToolHandler = Callable[[dict[str, object]], Awaitable[str]]
 
 
-def tool_session_defaults() -> dict[str, object]:
+def function_call_session_defaults() -> dict[str, object]:
     """``extra_body`` for a session whose pending tools survive an interruption.
 
     Pass it in ``SessionConfig``: the policy is fixed when the session opens, so
     a runner attached later cannot set it.
     """
-    return {"tool_interrupt_policy": "keep"}
+    return {"function_call_interrupt_policy": "keep"}
 
 
 class DuplexToolRunner:
@@ -42,7 +42,7 @@ class DuplexToolRunner:
         self._client = client
         self._handlers = dict(handlers)
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        #: Calls the server ended. A result for one would only be refused.
+        #: Running calls the server ended. Anything sent for one would be refused.
         self._settled: set[str] = set()
 
     async def run(self) -> None:
@@ -68,9 +68,9 @@ class DuplexToolRunner:
             call_id = details.get("call_id") if isinstance(details, dict) else None
             if not isinstance(call_id, str):
                 return
-            self._settled.add(call_id)
             task = self._tasks.pop(call_id, None)
             if task is not None:
+                self._settled.add(call_id)
                 task.cancel()
 
     def _start(self, item: Mapping[str, object]) -> None:
@@ -82,6 +82,7 @@ class DuplexToolRunner:
         task.add_done_callback(lambda done: self._forget(call_id, done))
 
     def _forget(self, call_id: str, task: asyncio.Task[None]) -> None:
+        self._settled.discard(call_id)
         if self._tasks.get(call_id) is task:
             del self._tasks[call_id]
 
@@ -102,7 +103,8 @@ class DuplexToolRunner:
             # Report the failure, not its text: a failed call's output must not
             # reach the model.
             logger.exception("Tool call %s failed", call_id)
-            await self._finish(self._client.cancel_function_call(call_id, reason="failed"))
+            if call_id not in self._settled:
+                await self._finish(self._client.cancel_function_call(call_id, reason="failed"))
             return
         if call_id in self._settled:
             return
@@ -110,7 +112,10 @@ class DuplexToolRunner:
         if call_id in self._settled:
             return
         capabilities = self._client.session_info.get("capabilities")
-        if isinstance(capabilities, dict) and capabilities.get("tool_result_continuation") == "client_response_create":
+        if (
+            isinstance(capabilities, dict)
+            and capabilities.get("function_call_output_continuation") == "client_response_create"
+        ):
             await self._finish(self._client.send({"type": "response.create"}))
 
     @staticmethod

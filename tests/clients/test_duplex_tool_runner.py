@@ -11,7 +11,8 @@ import json
 import pytest
 
 from tests.clients.test_duplex_client import SESSION_CLOSED, SESSION_CREATED, FakeSocket, make_client
-from vllm_omni.clients.tool_calls import DuplexToolRunner, tool_session_defaults
+from vllm_omni.clients.duplex import wrap_event
+from vllm_omni.clients.tool_calls import DuplexToolRunner, function_call_session_defaults
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,7 +38,7 @@ def sent(sock: FakeSocket, event_type: str) -> list[dict[str, object]]:
 
 def session_with(continuation: str) -> dict[str, object]:
     created = json.loads(json.dumps(SESSION_CREATED))
-    created["session"]["capabilities"] = {"tool_result_continuation": continuation}
+    created["session"]["capabilities"] = {"function_call_output_continuation": continuation}
     return created
 
 
@@ -58,7 +59,7 @@ async def run_with(sock: FakeSocket, handlers, body) -> None:
 
 
 def test_defaults_keep_pending_tools_across_an_interruption():
-    assert tool_session_defaults() == {"tool_interrupt_policy": "keep"}
+    assert function_call_session_defaults() == {"function_call_interrupt_policy": "keep"}
 
 
 @pytest.mark.asyncio
@@ -182,6 +183,53 @@ async def test_a_call_that_settles_during_a_tool_gets_no_result_or_follow_up():
     await run_with(sock, {"get_weather": ignores_cancellation}, body)
     assert sent(sock, "conversation.item.create") == []
     assert sent(sock, "response.create") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["raises", "returns_a_dict"])
+async def test_a_call_that_settles_during_a_tool_gets_no_failure_report(outcome):
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    started = asyncio.Event()
+
+    async def ignores_cancellation(arguments):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        if outcome == "raises":
+            raise RuntimeError("late failure")
+        return {"late": True}
+
+    async def body():
+        sock.feed(call_event())
+        await started.wait()
+        sock.feed(settled_event())
+
+    await run_with(sock, {"get_weather": ignores_cancellation}, body)
+    assert sent(sock, "function_call.cancel") == []
+
+
+@pytest.mark.asyncio
+async def test_settled_calls_are_forgotten_once_their_tool_stops():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        runner = DuplexToolRunner(client, {})
+        task = asyncio.create_task(asyncio.Event().wait())
+        runner._tasks["call_a"] = task
+        task.add_done_callback(lambda done: runner._forget("call_a", done))
+
+        runner.handle_event(wrap_event(settled_event()))
+        assert runner._settled == {"call_a"}
+        await settle()
+        assert runner._settled == set()
+
+        runner.handle_event(wrap_event(settled_event("call_with_no_tool")))
+        assert runner._settled == set()
+        sock.feed(SESSION_CLOSED)
 
 
 @pytest.mark.asyncio

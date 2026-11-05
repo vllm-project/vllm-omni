@@ -125,14 +125,14 @@ class DuplexCapabilities:
     supports_audio_truncate: bool = False
     #: ``none`` refuses ``tools``; ``declared`` takes client tools; ``delegate_only``
     #: takes only the model's own delegate function.
-    tool_call_mode: str = "none"
+    tool_mode: str = "none"
     #: What turns an accepted result into model output: ``client_response_create``,
     #: ``automatic``, ``next_observation``, or ``none`` without tools.
-    tool_result_continuation: str = "none"
+    function_call_output_continuation: str = "none"
     #: Most tools one session may declare; ``None`` means no model limit.
     max_tools: int | None = 0
     #: A committed input is a user turn, so it can lift a repeat-call block.
-    clears_tool_block_on_user_commit: bool = False
+    clears_function_call_block_on_user_commit: bool = False
     #: Whether this model can serve ``/v1/chat/completions`` on a duplex
     #: session. That needs one thing the protocol cannot assume: the model
     #: honours ``DuplexSessionConfig.initial_user_text``, so a turn can be
@@ -188,10 +188,10 @@ class DuplexCapabilities:
             "supports_session_resume": self.supports_session_resume,
             "session_admission_mode": self.session_admission_mode,
             "supports_audio_truncate": self.supports_audio_truncate,
-            "tool_call_mode": self.tool_call_mode,
-            "tool_result_continuation": self.tool_result_continuation,
+            "tool_mode": self.tool_mode,
+            "function_call_output_continuation": self.function_call_output_continuation,
             "max_tools": self.max_tools,
-            "clears_tool_block_on_user_commit": self.clears_tool_block_on_user_commit,
+            "clears_function_call_block_on_user_commit": self.clears_function_call_block_on_user_commit,
             "supports_image_input": self.supports_image_input,
             "supports_text_only_turn": self.supports_text_only_turn,
             "requires_model_runner_kv": self.requires_model_runner_kv,
@@ -332,42 +332,44 @@ def resolve_tool_result_timeout_s(extra_body: Mapping[str, object] | None) -> fl
 
 #: ``extra_body`` keys of the tool-call policies. Like the deadline above, they
 #: are set when the session opens, because pending calls were made under them.
-TOOL_RETRY_POLICY_KEY = "tool_retry_policy"
-TOOL_INTERRUPT_POLICY_KEY = "tool_interrupt_policy"
-_TOOL_POLICIES: dict[str, tuple[str, ...]] = {
-    TOOL_RETRY_POLICY_KEY: ("user_turn", "never"),
-    TOOL_INTERRUPT_POLICY_KEY: ("cancel", "keep"),
+FUNCTION_CALL_RETRY_POLICY_KEY = "function_call_retry_policy"
+FUNCTION_CALL_INTERRUPT_POLICY_KEY = "function_call_interrupt_policy"
+_FUNCTION_CALL_POLICIES: dict[str, tuple[str, ...]] = {
+    FUNCTION_CALL_RETRY_POLICY_KEY: ("user_turn", "never"),
+    FUNCTION_CALL_INTERRUPT_POLICY_KEY: ("cancel", "keep"),
 }
 
 
-def resolve_tool_policy(extra_body: Mapping[str, object] | None, key: str) -> str:
+def resolve_function_call_policy(extra_body: Mapping[str, object] | None, key: str) -> str:
     """Read one tool-call policy; the first listed value is its default."""
-    allowed = _TOOL_POLICIES[key]
+    allowed = _FUNCTION_CALL_POLICIES[key]
     value = extra_body.get(key) if extra_body else None
     if value is None:
         return allowed[0]
     if value not in allowed:
         raise DuplexConfigError(
             f"{key} must be one of {', '.join(allowed)}, got {value!r}",
-            code="invalid_tool_policy",
+            code="invalid_function_call_policy",
             param=key,
         )
     return str(value)
 
 
-def effective_tool_retry_policy(capabilities: DuplexCapabilities, extra_body: Mapping[str, object] | None) -> str:
+def effective_function_call_retry_policy(
+    capabilities: DuplexCapabilities, extra_body: Mapping[str, object] | None
+) -> str:
     """The retry policy this session actually applies.
 
     ``user_turn`` needs a user-turn boundary. A model without one keeps a block
     for the session, whatever was requested.
     """
-    policy = resolve_tool_policy(extra_body, TOOL_RETRY_POLICY_KEY)
-    return policy if capabilities.clears_tool_block_on_user_commit else "never"
+    policy = resolve_function_call_policy(extra_body, FUNCTION_CALL_RETRY_POLICY_KEY)
+    return policy if capabilities.clears_function_call_block_on_user_commit else "never"
 
 
-def validate_tool_policies(extra_body: Mapping[str, object] | None) -> None:
-    for key in _TOOL_POLICIES:
-        resolve_tool_policy(extra_body, key)
+def validate_function_call_policies(extra_body: Mapping[str, object] | None) -> None:
+    for key in _FUNCTION_CALL_POLICIES:
+        resolve_function_call_policy(extra_body, key)
 
 
 @dataclass
@@ -400,7 +402,7 @@ class DuplexSessionConfig:
         # validated here; the Realtime path assigns ``extra_body`` after
         # construction and re-validates in ``from_event``.
         resolve_tool_result_timeout_s(self.extra_body)
-        validate_tool_policies(self.extra_body)
+        validate_function_call_policies(self.extra_body)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -493,7 +495,7 @@ class DuplexSessionConfig:
             if isinstance(playback_commit_policy, str):
                 config.playback_commit_policy = cls._normalize_playback_commit_policy(playback_commit_policy)
         resolve_tool_result_timeout_s(config.extra_body)
-        validate_tool_policies(config.extra_body)
+        validate_function_call_policies(config.extra_body)
         return config
 
     @classmethod
@@ -760,13 +762,13 @@ class DuplexSessionConfig:
                     param=TOOL_RESULT_TIMEOUT_KEY,
                 )
         if isinstance(extra_body_patch, dict):
-            for key in _TOOL_POLICIES:
-                if key in extra_body_patch and resolve_tool_policy(extra_body_patch, key) != resolve_tool_policy(
-                    self.extra_body, key
-                ):
+            for key in _FUNCTION_CALL_POLICIES:
+                if key in extra_body_patch and resolve_function_call_policy(
+                    extra_body_patch, key
+                ) != resolve_function_call_policy(self.extra_body, key):
                     raise DuplexConfigError(
                         f"session.update cannot change {key} after the session is open",
-                        code="tool_policy_update_unsupported",
+                        code="function_call_policy_update_unsupported",
                         param=key,
                     )
         if isinstance(payload.get("extra_body"), dict):

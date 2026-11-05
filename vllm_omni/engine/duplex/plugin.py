@@ -55,10 +55,10 @@ def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping
     tools = extra_body.get("realtime_tools")
     if not tools:
         return
-    if capabilities.tool_call_mode == "none":
+    if capabilities.tool_mode == "none":
         raise DuplexRuntimeConfigError("This duplex model does not support tools", code="tools_unsupported")
     max_tools = capabilities.max_tools
-    if max_tools is not None and isinstance(tools, list) and len(tools) > max_tools:
+    if max_tools is not None and isinstance(tools, list | tuple) and len(tools) > max_tools:
         raise DuplexRuntimeConfigError(
             f"This duplex model supports at most {max_tools} tools per session",
             code="too_many_tools",
