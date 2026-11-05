@@ -15,15 +15,18 @@ Requirements:
 import argparse
 import asyncio
 import base64
+import io
 import json
 import mimetypes
 import os
+import tempfile
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import av
 from camera_utils import wasd_to_camera_payload
@@ -432,6 +435,75 @@ class _StreamingFrameCounter:
         return self.count
 
 
+def _fresh_rgb_frame(frame: av.VideoFrame) -> av.VideoFrame:
+    """Copy RGB pixels without carrying decoder color or picture-type metadata."""
+    rgb = frame.reformat(format="rgb24")
+    fresh = av.VideoFrame(rgb.width, rgb.height, "rgb24")
+    source = rgb.planes[0]
+    target = fresh.planes[0]
+    pixels = memoryview(source)
+    if source.line_size == target.line_size:
+        target.update(pixels[: target.buffer_size])
+    else:
+        packed = bytearray(target.buffer_size)
+        row_bytes = rgb.width * 3
+        for row in range(rgb.height):
+            src = row * source.line_size
+            dst = row * target.line_size
+            packed[dst : dst + row_bytes] = pixels[src : src + row_bytes]
+        target.update(packed)
+    return fresh
+
+
+def _finalize_video_bytes(video_bytes: bytes, *, stream_format: str, fps: float) -> bytes:
+    """Build a playback MP4 using only PyAV, retaining input on decode errors.
+
+    Video-only streams are re-encoded at the requested FPS. Streams with audio
+    are remuxed to preserve the compressed tracks and their original timing.
+    """
+    if not video_bytes:
+        return video_bytes
+    if stream_format.lower() != "m4s":
+        raise ValueError(f"Unsupported streaming video format: {stream_format}")
+
+    try:
+        with av.open(io.BytesIO(video_bytes), format="mp4") as source:
+            if source.streams.audio:
+                buffer = io.BytesIO()
+                media_streams = [stream for stream in source.streams if stream.type in ("video", "audio")]
+                with av.open(buffer, mode="w", format="mp4") as output:
+                    streams = {stream.index: output.add_stream_from_template(stream) for stream in media_streams}
+                    for packet in source.demux(*media_streams):
+                        if packet.dts is not None:
+                            packet.stream = streams[packet.stream.index]
+                            output.mux(packet)
+                return buffer.getvalue()
+            if not source.streams.video:
+                return video_bytes
+            frames = [_fresh_rgb_frame(frame) for frame in source.decode(video=0)]
+    except av.FFmpegError:
+        return video_bytes
+
+    if not frames:
+        return video_bytes
+
+    buffer = io.BytesIO()
+    rate = Fraction(fps).limit_denominator(10000)
+    with av.open(buffer, mode="w", format="mp4") as output:
+        video = cast(av.VideoStream, output.add_stream("h264", rate=rate))
+        video.width, video.height = frames[0].width, frames[0].height
+        video.pix_fmt = "yuv420p"
+        video.options = {"crf": "18"}
+        for index, frame in enumerate(frames):
+            frame.pts = index
+            frame.time_base = 1 / rate
+            for packet in video.encode(frame):
+                output.mux(packet)
+        for packet in video.encode():
+            output.mux(packet)
+    return buffer.getvalue()
+
+
 def save_video(
     chunks: list[bytes],
     output_path: Path,
@@ -439,24 +511,26 @@ def save_video(
     fps: float,
     stream_format: str,
 ) -> None:
+    """Finalize received chunks and atomically publish the local video file."""
     if not chunks:
         print("No video chunks received; nothing to save.")
         return
 
-    from vllm_omni.diffusion.utils.media_utils import finalize_streaming_video_bytes
-
     streamed_bytes = b"".join(chunks)
-    playback_bytes = finalize_streaming_video_bytes(
-        streamed_bytes,
-        input_format="m4s",
-        fps=fps,
-    )
+    playback_bytes = _finalize_video_bytes(streamed_bytes, stream_format=stream_format, fps=fps)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    with tmp_path.open("wb") as f:
-        f.write(playback_bytes)
-    os.replace(tmp_path, output_path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(playback_bytes)
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     print(
         f"Saved {len(chunks)} streamed chunk(s), {len(streamed_bytes)} streamed bytes "
         f"-> {len(playback_bytes)} playback bytes at {output_path}"

@@ -482,10 +482,11 @@ def test_decoder_drain_waits_for_background_cleanup(
 
 
 @pytest.mark.parametrize("overflow", [False, True])
+@pytest.mark.parametrize("real_save", [False, True], ids=["capture-bytes", "save-mp4"])
 def test_loopback_websocket_keeps_controls_and_received_media(
-    client, fragments, monkeypatch, tmp_path, capsys, overflow
+    client, fragments, monkeypatch, tmp_path, capsys, overflow, real_save
 ):
-    """Use real WebSocket I/O; only final saving is replaced by byte capture."""
+    """Exercise WebSocket I/O with both byte capture and actual MP4 saving."""
     from websockets.asyncio.server import serve
 
     entered = threading.Event()
@@ -498,8 +499,9 @@ def test_loopback_websocket_keeps_controls_and_received_media(
     real_counter = client._StreamingFrameCounter
 
     def gated_open(*args, **kwargs):
-        entered.set()
-        gate_observations.append(release.wait(5))
+        if isinstance(args[0], real_counter):
+            entered.set()
+            gate_observations.append(release.wait(5))
         return real_open(*args, **kwargs)
 
     def create_counter(**kwargs):
@@ -553,7 +555,8 @@ def test_loopback_websocket_keeps_controls_and_received_media(
         monkeypatch.setattr(real_counter, "_MAX_PENDING_BYTES", 3000)
     monkeypatch.setattr(client.av, "open", gated_open)
     monkeypatch.setattr(client, "_StreamingFrameCounter", create_counter)
-    monkeypatch.setattr(client, "save_video", lambda chunks, *args, **kwargs: saved.append(b"".join(chunks)))
+    if not real_save:
+        monkeypatch.setattr(client, "save_video", lambda chunks, *args, **kwargs: saved.append(b"".join(chunks)))
     monkeypatch.setattr("sys.argv", ["client", "--prompt", "test prompt", "--output", str(tmp_path / "out.mp4")])
     try:
         asyncio.run(run())
@@ -563,7 +566,13 @@ def test_loopback_websocket_keeps_controls_and_received_media(
     assert len(controls) == 2
     assert any(event.get("prompt") == "updated test prompt" for event in controls)
     assert any("camera" in event.get("multi_modal_data", {}) for event in controls)
-    assert saved == [b"".join(fragments)]
+    if real_save:
+        with real_open(str(tmp_path / "out.mp4")) as output:
+            frames = list(output.decode(video=0))
+        assert len(frames) == 33
+        assert [(frame.width, frame.height) for frame in frames] == [(64, 48)] * 33
+    else:
+        assert saved == [b"".join(fragments)]
     assert not counters[0]._thread.is_alive()
     expected = "unknown status=buffer_limit_exceeded" if overflow else "33 status=complete"
     assert f"[decode] total_frames={expected}" in capsys.readouterr().out
