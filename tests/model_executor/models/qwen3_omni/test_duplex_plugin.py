@@ -91,8 +91,8 @@ def test_capabilities_advertise_image_items_not_append_frames():
     """Clients choose how to send frames from these fields; they must match the buffer's refusal."""
     caps = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA").capabilities(max_sessions=1)
     assert caps.supports_image_input
-    assert caps.supports_turn_kv_continuation
-    assert not caps.supports_core_resumable_request
+    assert caps.supports_core_resumable_request
+    assert caps.supports_turn_commit_only
     assert not caps.accepts_input_modality("video")
     assert caps.validate_append_modalities(has_audio=True, has_video=True) == (
         "This duplex model does not accept video_frames"
@@ -106,18 +106,18 @@ async def open_qwen(
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
-    turn_kv_continuation=True,
+    resumable=True,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
     # Exercise both the supported deployment and the per-turn fallback.
-    plugin.supports_turn_kv_continuation = turn_kv_continuation
+    plugin.supports_core_resumable_request = resumable
     if calibrate is not None:
         plugin.history_calibrator = lambda config: HistoryCalibrationPolicy(calibrate, requires_audio=requires_audio)
         plugin.data_plane.retain_history_audio = requires_audio
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
-    if turn_kv_continuation:
+    if resumable:
 
         async def finish_turn(request_id):
             port.cleanups.append(([request_id], False))
@@ -557,9 +557,9 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("turn_kv_continuation", [False, True])
-async def test_two_committed_turns_stream_text_and_audio_and_release_requests(turn_kv_continuation, mocker):
-    h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
+@pytest.mark.parametrize("resumable", [False, True])
+async def test_two_committed_turns_stream_text_and_audio_and_release_requests(resumable, mocker):
+    h = await open_qwen(resumable=resumable)
     bind_request = mocker.spy(h.session, "bind_request")
     try:
         ids = []
@@ -572,8 +572,8 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests(tu
             request_id = h.port.submissions[-1].context.request_id
             assert bind_request.call_args_list[0].args == (request_id,)
             ids.append(request_id)
-            assert h.port.submissions[-1].resume_from_full_prompt is turn_kv_continuation
-            assert h.port.submissions[-1].already_submitted is (turn_kv_continuation and i > 0)
+            assert h.port.submissions[-1].resume_from_full_prompt is resumable
+            assert h.port.submissions[-1].already_submitted is (resumable and i > 0)
             assert h.session.active_request_id == request_id
             assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == i + 1
             text = OmniRequestOutput.from_stage_output(
@@ -590,7 +590,7 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests(tu
             await h.run(AckPlayback(response_id=response_id, played_ms=1000))
             assert h.session.active_response_id is None
             assert h.port.cleanups[-1][0] == [request_id]
-        assert len(set(ids)) == (1 if turn_kv_continuation else 2)
+        assert len(set(ids)) == (1 if resumable else 2)
         assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
     finally:
         await h.manager.shutdown()
@@ -600,7 +600,7 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests(tu
 async def test_default_continuation_releases_idle_thinker_on_close():
     h = await open_qwen()
     try:
-        assert h.session.capabilities.supports_turn_kv_continuation
+        assert h.session.capabilities.supports_core_resumable_request
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))
         request_id = h.port.submissions[-1].context.request_id
@@ -732,9 +732,9 @@ async def test_audio_without_transcript_accepts_playback_ack(cancel_command, nex
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("turn_kv_continuation", [False, True])
-async def test_cancel_drops_old_output_and_accepts_next_turn(turn_kv_continuation):
-    h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
+@pytest.mark.parametrize("resumable", [False, True])
+async def test_cancel_drops_old_output_and_accepts_next_turn(resumable):
+    h = await open_qwen(resumable=resumable)
     try:
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))
@@ -751,9 +751,9 @@ async def test_cancel_drops_old_output_and_accepts_next_turn(turn_kv_continuatio
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("turn_kv_continuation", [False, True])
-async def test_vad_commits_and_speech_interrupts_active_qwen_response(turn_kv_continuation):
-    h = await open_qwen(turn_kv_continuation=turn_kv_continuation)
+@pytest.mark.parametrize("resumable", [False, True])
+async def test_vad_commits_and_speech_interrupts_active_qwen_response(resumable):
+    h = await open_qwen(resumable=resumable)
     try:
         h.runner.control._detector = _speech_then_stop()
         await h.run(append_audio())
@@ -2501,7 +2501,7 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
 
 @pytest.mark.asyncio
 async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker):
-    turn_kv_continuation = True
+    resumable = True
     h = await open_qwen()
 
     async def can_append(request_id, text):
@@ -2530,8 +2530,8 @@ async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker)
             request_id = h.port.submissions[-1].context.request_id
             assert bind_request.call_args_list[0].args == (request_id,)
             ids.append(request_id)
-            assert h.port.submissions[-1].resume_from_full_prompt is turn_kv_continuation
-            assert h.port.submissions[-1].already_submitted is (turn_kv_continuation and i > 0)
+            assert h.port.submissions[-1].resume_from_full_prompt is resumable
+            assert h.port.submissions[-1].already_submitted is (resumable and i > 0)
             assert h.session.active_request_id == request_id
             expected_audio = 1 if i < 4 else 4
             assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == expected_audio
@@ -2558,7 +2558,7 @@ async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker)
             await h.run(AckPlayback(response_id=response_id, played_ms=1000))
             assert h.session.active_response_id is None
             assert h.port.cleanups[-1][0] == [request_id]
-        assert len(set(ids)) == (1 if turn_kv_continuation else 2)
+        assert len(set(ids)) == (1 if resumable else 2)
         assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
     finally:
         await h.manager.shutdown()

@@ -26,7 +26,6 @@ implementation contract; it is not, by itself, a general support claim.
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Runner-to-model Prefill/Decode Phase Contract](feature/preprocess_phase_contract.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
-- [Qwen3-Omni 全双工跨轮 KV 续写](feature/qwen3_omni_turn_kv_continuation.md)
 - [Model-local KV Caches](feature/model_local_kv_caches.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 

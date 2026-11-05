@@ -337,7 +337,7 @@ class QwenDataPlane(DuplexDataPlane):
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
-    supports_turn_kv_continuation = True
+    supports_core_resumable_request = True
 
     def __init__(self, encode_audio):
         self.data_plane = QwenDataPlane(encode_audio)
@@ -384,8 +384,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             supports_replace_latest_chunk=False,
             supports_reencode_context=True,
             supports_turn_commit_only=True,
-            supports_core_resumable_request=False,
-            supports_turn_kv_continuation=self.supports_turn_kv_continuation,
+            supports_core_resumable_request=self.supports_core_resumable_request,
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
             supports_multi_session=max_sessions > 1,

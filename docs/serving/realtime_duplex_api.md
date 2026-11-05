@@ -58,7 +58,7 @@ scheduling also supports continuation. At a turn boundary, only the continued
 request waits for its previous in-flight outputs to drain before resetting
 worker delivery state. Other sessions continue to run. Unsupported combinations
 retain fresh per-turn Thinker requests; startup logs the reason and the session reports
-`supports_turn_kv_continuation: false`. Where enabled, ordinary APC still reuses
+`supports_core_resumable_request: false`. Where enabled, ordinary APC still reuses
 matching blocks in that fallback path. Disabling stage-0 prefix caching also
 disables resident continuation because Talker needs cached hidden-state rows.
 Non-CUDA profile overrides keep prefix caching disabled.
@@ -116,8 +116,9 @@ interface or enable audio input during the same generation.
 Talker and Code2Wav terminate each turn. Their next requests receive the complete
 Thinker conditioning rows, replayed from the stage-output cache where KV was
 retained. They do not inherit the Thinker's resumable lifetime. The session
-advertises `supports_turn_kv_continuation`; the native streaming-input policy
-selected by `supports_core_resumable_request` remains disabled for Qwen.
+advertises `supports_core_resumable_request: true` together with
+`supports_turn_commit_only: true`: request residency does not enable native
+streaming-input turn policy. Unsupported deployments report resumability as false.
 
 Commit, VAD interruption and playback acknowledgement retain their turn-based
 semantics. Cancellation advances the epoch and aborts the resident request;

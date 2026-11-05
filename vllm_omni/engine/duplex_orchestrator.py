@@ -109,7 +109,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         super().__init__(*args, **kwargs)
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
-        if plugin.supports_turn_kv_continuation:
+        capabilities = plugin.capabilities(max_sessions=duplex_session_config.max_sessions)
+        if capabilities.supports_core_resumable_request and capabilities.supports_turn_commit_only:
             config = self.stage_pools[0].stage_vllm_config
             unsupported = [
                 reason
@@ -123,7 +124,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             if unsupported:
                 # Resolve the model's capability once for this deployment.
                 # Session admission and frontend discovery use the same value.
-                plugin.supports_turn_kv_continuation = False
+                plugin.supports_core_resumable_request = False
                 logger.warning(
                     "Thinker KV continuation unavailable (%s); using per-turn requests",
                     ", ".join(unsupported),
@@ -273,6 +274,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if runner is None:
             # Session gone: nothing may forward or reach a client.
             return True
+        capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
         segment = req_state.streaming.segment(stage_id)
         # A codec segment stop is not the utterance. Leave RequestOutput.finished
         # for the real stop (is_segment_finished is false on that poll).
@@ -280,7 +282,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             output.finished = False
         finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
         if (
-            self.plugin.supports_turn_kv_continuation
+            capabilities.supports_core_resumable_request
+            and capabilities.supports_turn_commit_only
             and stage_id > 0
             and stage_id == req_state.final_stage_id
             and finished
@@ -320,7 +323,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
-        if self.plugin.supports_turn_kv_continuation and stage_id == 0 and finished:
+        if (
+            capabilities.supports_core_resumable_request
+            and capabilities.supports_turn_commit_only
+            and stage_id == 0
+            and finished
+        ):
             req_state.turn_entry_finished = True
             pending = req_state.pending_turn_terminal
             req_state.pending_turn_terminal = None
@@ -435,9 +443,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = not duplex_is_auxiliary_request(req_id) and (
-            self.plugin.supports_turn_kv_continuation
-            or self.plugin.capabilities(
+        close_session = (
+            not duplex_is_auxiliary_request(req_id)
+            and self.plugin.capabilities(
                 max_sessions=self.duplex_session_config.max_sessions
             ).supports_core_resumable_request
         )
@@ -636,9 +644,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
     def _upgrade_processed_stage_request(self, request, raw_prompt):
         request = super()._upgrade_processed_stage_request(request, raw_prompt)
-        if not self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request and not isinstance(request, OmniEngineCoreRequest):
+        capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
+        if (
+            not capabilities.supports_core_resumable_request or capabilities.supports_turn_commit_only
+        ) and not isinstance(request, OmniEngineCoreRequest):
             request = OmniEngineCoreRequest.from_request(request)
         return request
 
@@ -656,9 +665,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         prompt = kwargs.get("prompt")
         complete_turn = None
         prefix = None
+        capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
         if (
             stage_id == 0
-            and self.plugin.supports_turn_kv_continuation
+            and capabilities.supports_core_resumable_request
+            and capabilities.supports_turn_commit_only
             and isinstance(state, DuplexOrchestratorRequestState)
             and isinstance(prompt, dict)
             and isinstance(prompt.get("prompt"), str)

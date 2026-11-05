@@ -85,7 +85,10 @@ class DuplexCapabilities:
     model-owned decoder/TTS state must use ``supports_model_internal_state``.
     ``supports_core_resumable_request`` means the scheduler can resume the
     same request id across streaming updates, but it is not a KV lease by
-    itself. Realtime support means this endpoint can speak the native Realtime
+    itself. With ``supports_turn_commit_only``, only the entry request stays
+    resident across commits; downstream stages and response settlement remain
+    turn-based. Resumability alone does not select native streaming turn policy.
+    Realtime support means this endpoint can speak the native Realtime
     event schema for the supported audio duplex paths while keeping model- or
     scheduler-specific limits explicit in the capability payload.
     """
@@ -107,8 +110,6 @@ class DuplexCapabilities:
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
     supports_core_resumable_request: bool = False
-    # Keep only the entry request resident; commit/playback remain turn-based.
-    supports_turn_kv_continuation: bool = False
     # Prior assistant TTS may keep draining while a new user commit is admitted.
     # Not barge-in (which aborts prior TTS).
     supports_concurrent_turn_requests: bool = False
@@ -168,7 +169,6 @@ class DuplexCapabilities:
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
             "supports_core_resumable_request": self.supports_core_resumable_request,
-            "supports_turn_kv_continuation": self.supports_turn_kv_continuation,
             "supports_concurrent_turn_requests": self.supports_concurrent_turn_requests,
             "required_input_modalities": sorted(self.required_input_modalities),
             "optional_input_modalities": sorted(self.optional_input_modalities),
