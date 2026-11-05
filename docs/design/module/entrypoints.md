@@ -96,6 +96,11 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+The Audio Generate request model rejects non-finite `audio_length`,
+`audio_start`, and `frame_rate` values, including a non-finite end time derived
+from finite start and length values, before engine submission. Duration limits
+specific to a model remain the pipeline's responsibility.
+
 The serving composition removes inherited `/tokenize`, `/detokenize`, and
 optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
