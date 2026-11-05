@@ -1019,6 +1019,7 @@ class DiffusionEngine:
                     fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
                 return
 
+        result: object = None
         try:
             state = task.interaction_state
             if state is not None and (
@@ -1031,10 +1032,8 @@ class DiffusionEngine:
                 return
             if task.method == "pause_scheduler":
                 self._run_pause_barrier(remaining)
-                result = None
             elif task.method == "resume_scheduler":
                 self._open_scheduling_gate()
-                result = None
             else:
                 result = self.executor.collective_rpc(
                     method=task.method,
@@ -1693,6 +1692,7 @@ class DiffusionEngine:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         """Start or stop profiling on all diffusion workers.
 
@@ -1701,6 +1701,7 @@ class DiffusionEngine:
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
+            profiler_kwargs: Per-session profiler constructor overrides.
         """
         if is_start:
             if profile_prefix is None:
@@ -1710,11 +1711,13 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            kwargs: dict[str, int] = {}
+            kwargs: dict[str, Any] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
             if max_iterations is not None:
                 kwargs["max_iterations"] = max_iterations
+            if profiler_kwargs is not None:
+                kwargs["profiler_kwargs"] = profiler_kwargs
             if kwargs:
                 self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
             else:
