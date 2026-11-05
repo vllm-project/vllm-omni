@@ -557,46 +557,6 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resumable", [False, True])
-async def test_two_committed_turns_stream_text_and_audio_and_release_requests(resumable, mocker):
-    h = await open_qwen(resumable=resumable)
-    bind_request = mocker.spy(h.session, "bind_request")
-    try:
-        ids = []
-        for i in range(2):
-            bind_request.reset_mock()
-            await h.run(append_audio())
-            assert len(h.port.submissions) == i
-            await h.run(Commit(final=True, create_response=True))
-            assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
-            request_id = h.port.submissions[-1].context.request_id
-            assert bind_request.call_args_list[0].args == (request_id,)
-            ids.append(request_id)
-            assert h.port.submissions[-1].resume_from_full_prompt is resumable
-            assert h.port.submissions[-1].already_submitted is (resumable and i > 0)
-            assert h.session.active_request_id == request_id
-            assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == i + 1
-            text = OmniRequestOutput.from_stage_output(
-                tts_output(request_id, samples=0, text="hello", finished=True),
-                request_id=request_id,
-                stage_id=None,
-            )
-            assert not h.deliver(text, stage_id=0), "Thinker output must still forward to Talker"
-            await h.settle()
-            assert text.finished, "projection must not mutate the output forwarded to Talker"
-            assert h.session.active_response_id is not None, "Thinker finished must not end the response"
-            response_id = h.session.active_response_id
-            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
-            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
-            assert h.session.active_response_id is None
-            assert h.port.cleanups[-1][0] == [request_id]
-        assert len(set(ids)) == (1 if resumable else 2)
-        assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
-    finally:
-        await h.manager.shutdown()
-
-
-@pytest.mark.asyncio
 async def test_default_continuation_releases_idle_thinker_on_close():
     h = await open_qwen()
     try:
@@ -2500,12 +2460,13 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
 
 
 @pytest.mark.asyncio
-async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker):
-    resumable = True
-    h = await open_qwen()
+@pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta"])
+async def test_committed_turns_preserve_lifecycle_and_process_only_required_history(mocker, mode):
+    resumable = mode != "ephemeral"
+    h = await open_qwen(resumable=resumable)
 
     async def can_append(request_id, text):
-        return text == "hello"
+        return mode == "delta" and text == "hello"
 
     h.port.can_append_turn = can_append
     h.manager.plugin.processor.apply_chat_template = (
@@ -2519,7 +2480,7 @@ async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker)
     bind_request = mocker.spy(h.session, "bind_request")
     try:
         ids = []
-        for i in range(5):
+        for i in range(5 if mode == "delta" else 2):
             bind_request.reset_mock()
             snapshot.reset_mock()
             decode.reset_mock()
@@ -2533,10 +2494,11 @@ async def test_native_turn_delta_does_not_snapshot_or_decode_old_history(mocker)
             assert h.port.submissions[-1].resume_from_full_prompt is resumable
             assert h.port.submissions[-1].already_submitted is (resumable and i > 0)
             assert h.session.active_request_id == request_id
-            expected_audio = 1 if i < 4 else 4
+            use_delta = mode == "delta" and 0 < i < 4
+            expected_audio = 1 if use_delta else min(i + 1, 4)
             assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == expected_audio
             assert decode.call_count == expected_audio
-            if 0 < i < 4:
+            if use_delta:
                 assert snapshot.call_count == 0
                 assert h.port.submissions[-1].prompt["_qwen_turn_delta"] is True
                 assert h.port.submissions[-1].history_revision == h.session.history_revision

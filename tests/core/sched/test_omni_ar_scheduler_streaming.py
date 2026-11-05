@@ -91,36 +91,6 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
 
 
 @pytest.mark.parametrize("matching", [True, False])
-def test_full_prompt_continuation_retains_only_valid_resident_kv(matching):
-    sched = _make_scheduler()
-    sched.cache_config = SimpleNamespace(block_size=16)
-    sched.max_model_len = 128
-    session = _make_request()
-    session.prompt_token_ids = list(range(35))
-    session._all_token_ids[:] = session.prompt_token_ids
-    session.num_prompt_tokens = 35
-    session.num_computed_tokens = 35
-    session.block_hashes[:] = [b"first", b"second"]
-    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-    sched.num_waiting_for_streaming_input = 1
-    update = _make_update(list(range(50)))
-    update.resume_from_full_prompt = True
-    # Multimodal content, token IDs and cache salt all participate in these
-    # engine-produced block hashes. A changed historical block must rebuild.
-    update.block_hashes = (b"first", b"second" if matching else b"changed", b"third")
-    sched._update_request_as_session(session, update)
-    assert session.request_id == "req-ar-streaming-test"
-    assert session.num_computed_tokens == (32 if matching else 0)
-    assert session.prompt_token_ids == list(range(50))
-    assert session.max_tokens == update.max_tokens
-    assert session.status == RequestStatus.WAITING
-    assert sched.num_waiting_for_streaming_input == 0
-    assert session._reset_turn_worker_state
-    assert sched._free_request_blocks.call_count == (0 if matching else 1)
-    sched.encoder_cache_manager.free.assert_called_once_with(session)
-
-
-@pytest.mark.parametrize("matching", [True, False])
 @pytest.mark.parametrize("in_flight", [0, 1, 2])
 def test_async_full_prompt_continuation_waits_for_previous_turn(matching, in_flight):
     """Do not reset a resident worker row while its old outputs are pending."""
@@ -208,21 +178,6 @@ def _run_continuation_output(sched, session, *, num_scheduled: int, token: int):
         sampled_token_ids=[[token]],
     )
     return sched.update_from_output(scheduler_output, model_output)
-
-
-def test_full_prompt_continuation_rebuilds_when_history_shrinks():
-    sched = _make_scheduler()
-    sched.cache_config = SimpleNamespace(block_size=16)
-    sched.max_model_len = 128
-    session = _make_request()
-    session.num_computed_tokens = 32
-    session.block_hashes[:] = [b"first", b"second"]
-    update = _make_update(list(range(16)))
-    update.resume_from_full_prompt = True
-    update.block_hashes = (b"first",)
-    sched._update_request_as_session(session, update)
-    assert session.num_computed_tokens == 0
-    sched._free_request_blocks.assert_called_once_with(session)
 
 
 @pytest.mark.parametrize("change", ["append", "delta", "tokens", "audio", "salt", "shrink"])
@@ -315,6 +270,9 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     assert session.prompt_token_ids == tokens
     assert list(session.all_token_ids) == tokens
     assert session.num_output_tokens == 0
+    assert session.max_tokens == update.max_tokens
+    assert session._reset_turn_worker_state
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
     assert session.block_hashes == fresh.block_hashes
     assert session.mm_features == fresh.mm_features
     assert session.cache_salt == fresh.cache_salt
