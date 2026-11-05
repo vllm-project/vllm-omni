@@ -110,6 +110,10 @@ class MiniMaxH3DiTArchConfig:
     timestep_input_dim: int = 256
     time_embed_hidden_size: int = 5376
     time_embed_dim: int = 2688
+    # ComfyUI's AdaLN-pruned checkpoints replace the dense time embedder with
+    # a small shared interpolation table and project its low-rank coordinates.
+    adaln_curve_grid: int | None = None
+    adaln_curve_dim: int = 8
     adaln_out_features: int = 18 * 5376
     final_adaln_out_features: int = 2 * 5376
     rope_inv_freq_len: int = 16
@@ -140,6 +144,10 @@ class MiniMaxH3DiTArchConfig:
         if len(arch.patch_size) != 3:
             raise ValueError(f"patch_size must contain three values, got {arch.patch_size!r}")
         return arch
+
+    @property
+    def adaln_input_dim(self) -> int:
+        return self.adaln_curve_dim if self.adaln_curve_grid is not None else self.time_embed_dim
 
 
 def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
@@ -590,15 +598,17 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        self.apply_silu = arch.adaln_curve_grid is None
+        self.input_dtype = _BF16_DTYPE if self.apply_silu else _FP32_DTYPE
         # Allocate host weights from the start: moving them after construction
         # would still require enough VRAM for the complete resident model.
         with torch.device("cpu") if self._offload_weights else nullcontext():
             self.linear = ColumnParallelLinear(
-                arch.time_embed_dim,
+                arch.adaln_input_dim,
                 out_features,
                 bias=True,
                 gather_output=True,
-                params_dtype=_BF16_DTYPE,
+                params_dtype=self.input_dtype,
                 quant_config=quant_config,
                 prefix=f"{prefix}.linear",
             )
@@ -651,12 +661,12 @@ class MiniMaxH3AdalnProj(nn.Module):
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
-            x = nn.functional.silu(t_emb)
+            x = nn.functional.silu(t_emb) if self.apply_silu else t_emb
             if self._weight_stager is None:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self.linear(x.to(self.input_dtype))[0]
             self._weight_stager.load()
             try:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self.linear(x.to(self.input_dtype))[0]
             finally:
                 self._weight_stager.offload()
 

@@ -67,6 +67,7 @@ nav:
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
       - ConvRot W8A8/W4A4: user_guide/quantization/convrot.md
+      - INT8 ConvRot: user_guide/quantization/int8_convrot.md
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
       - MXFP8 W8A8: user_guide/quantization/mxfp8.md
       - MXFP4 W4A4: user_guide/quantization/mxfp4.md
