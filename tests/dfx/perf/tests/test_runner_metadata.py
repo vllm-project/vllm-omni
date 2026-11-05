@@ -713,29 +713,36 @@ def test_num_warmups_preserves_explicit_zero():
 
 
 @pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
-@pytest.mark.parametrize("sweep_key", ["max_concurrency", "request_rate"])
-def test_qwen3_duplex_sweep_warms_each_concurrency(monkeypatch, dataset, sweep_key):
+def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, dataset):
     from dataclasses import dataclass
     from pathlib import Path
 
     from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
     config_path = Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json")
     config = json.loads(config_path.read_text())[0]
     params = dict(config["benchmark_params"][0])
-    if sweep_key == "request_rate":
-        params["request_rate"] = params.pop("max_concurrency")
+    count = 60 if dataset == "omniinteract" else 120
+    prefix = "omniinteract" if dataset == "omniinteract" else "duplex_eval"
+    assert config["mark"][0]["hardware_marks"]["num_cards"] == 3
+    assert config["judge_server_params"]["device_index"] == "2"
+    assert config["judge_server_params"]["model"] == "Qwen/Qwen2.5-7B-Instruct"
+    assert params[f"{prefix}_judge_model"] == "Qwen2.5-7B-Instruct"
+    assert not params.get("duplex_performance_only")
 
     @dataclass
     class ServerEndpoint:
         host: str = "localhost"
         port: int = 8000
         model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        judge_base_url: str = "http://localhost:8001"
 
     calls = []
 
     def benchmark(**kwargs):
-        calls.append((kwargs["flow"], kwargs["num_prompt"], kwargs["num_warmups"]))
+        calls.append(kwargs)
         assert "--num-warmups" not in kwargs["args"]
         assert "--name" not in kwargs["args"]
         return {"completed": kwargs["num_prompt"]}
@@ -745,7 +752,35 @@ def test_qwen3_duplex_sweep_warms_each_concurrency(monkeypatch, dataset, sweep_k
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
     run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
-    assert calls == [(1, 4, 1), (8, 16, 8), (16, 32, 16)]
+    assert len(calls) == 1
+    call = calls[0]
+    assert (call["flow"], call["num_prompt"], call["num_warmups"]) == (8, count, 8)
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(call["args"])
+    assert args.num_prompts == count and args.max_concurrency == 8
+    assert args.duplex_metric_aggregation == "response"
+    assert args.duplex_sample_pool_size is None
+    assert args.disable_shuffle and args.save_detailed
+    assert args.ready_check_timeout_sec == 0
+    assert getattr(args, f"{prefix}_evaluate")
+    assert getattr(args, f"{prefix}_judge_base_url") == ServerEndpoint.judge_base_url
+    if dataset == "omniinteract":
+        assert args.omniinteract_subsets == ["1q1a_math"]
+        assert args.omniinteract_require_response
+    else:
+        excluded = {1, 6, 19, 30, 37, 47, 71, 73, 83, 88, 89, 91, 105}
+        assert args.duplex_eval_ids == [str(i) for i in range(133) if i not in excluded]
+        assert args.duplex_eval_split == "PR_correction"
+        assert args.duplex_eval_mix == "question"
+
+
+def test_num_warmups_resolves_each_sweep_point():
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    assert [
+        _resolve_num_warmups({"num_warmups": [1, 8, 16]}, default=4, sweep_index=i, sweep_size=3) for i in range(3)
+    ] == [1, 8, 16]
 
 
 @pytest.mark.parametrize("warmups", [[], [1, 8], [1, 8, False], [1, 8, -1], [1, 8, 1.5]])
@@ -942,11 +977,12 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, har
 
 
 @pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
-def test_judge_uses_allocated_second_device(monkeypatch, device_env):
+@pytest.mark.parametrize(("devices", "judge_index", "expected"), [("4,7", "1", "7"), ("4,7,3", "2", "3")])
+def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_index, expected):
     from tests.dfx.perf.scripts import run_benchmark as runner
     from vllm_omni.platforms import current_omni_platform
 
-    monkeypatch.setenv(device_env, "4,7")
+    monkeypatch.setenv(device_env, devices)
     monkeypatch.setattr(current_omni_platform, "device_control_env_var", device_env)
     seen = []
 
@@ -961,13 +997,13 @@ def test_judge_uses_allocated_second_device(monkeypatch, device_env):
         yield Endpoint()
 
     monkeypatch.setattr(runner, "OmniServer", server)
-    with runner._start_judge_server({"model": "judge", "device_index": "1"}):
+    with runner._start_judge_server({"model": "judge", "device_index": judge_index}):
         pass
-    assert seen == [{device_env: "7"}]
+    assert seen == [{device_env: expected}]
     assert runner._resolve_judge_visible_devices("0", device_env) == "4"
-    assert __import__("os").environ[device_env] == "4,7"
+    assert __import__("os").environ[device_env] == devices
     with pytest.raises(ValueError, match="outside"):
-        runner._resolve_judge_visible_devices("2", device_env)
+        runner._resolve_judge_visible_devices(str(len(devices.split(","))), device_env)
 
 
 def test_omniinteract_result_rejects_incomplete_artifacts():
@@ -1303,6 +1339,78 @@ def test_response_performance_requires_measurements_not_accuracy(dataset_name):
     result["num_audio_ttfp_samples"] = 0
     with pytest.raises(AssertionError, match="No measured audio_ttfp"):
         assert_result(result, params, 16)
+
+
+def _qwen3_joint_result(dataset):
+    from pathlib import Path
+
+    config = json.loads(Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json").read_text())[0]
+    params = config["benchmark_params"][0]
+    count = params["num_prompts"][0]
+    result = _response_performance_result(params["dataset_name"])
+    result["completed"] = count
+    if dataset == "omniinteract":
+        summary = result["omniinteract"]
+        summary.update(total=count, success=count)
+        summary["accuracy"] = {
+            "status": "ok",
+            "total": count,
+            "evaluated": count - 1,
+            "skipped": 1,
+            "failed": 0,
+            "summary": {"IA_QTF1": 0.5},
+        }
+    else:
+        summary = result["omni_duplex_eval"]
+        summary.update(published=count, published_with_unfinished_responses=0)
+        summary["accuracy"] = {
+            "status": "completed",
+            "total": count,
+            "evaluated": count,
+            "skipped": 0,
+            "failed": 0,
+            "pr": {"samples": count, "mean_all_success": 0.5},
+        }
+        result["duplex_session_metrics"] = [
+            {"client_ttft_ms": {"count": 1, "mean": 100.0}, "client_ttfp_ms": {"count": 1, "mean": 200.0}}
+            for _ in range(count)
+        ]
+    return result, params, count, summary["accuracy"]
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_joint_run_requires_both_metrics_and_judging(dataset):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result(dataset)
+    assert_result(result, params, count)
+    result["p95_audio_ttfp_ms"] = float("nan")
+    with pytest.raises(AssertionError, match="Missing or invalid P95 audio_ttfp"):
+        assert_result(result, params, count)
+    result["p95_audio_ttfp_ms"] = 1.0
+    accuracy["status"] = "failed"
+    with pytest.raises(AssertionError, match="accuracy did not complete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_joint_run_rejects_incomplete_accuracy_coverage(dataset):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result(dataset)
+    accuracy["evaluated"] -= 1
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, -0.1, 1.1])
+def test_qwen3_correction_run_requires_valid_accuracy_score(value):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    accuracy["pr"]["mean_all_success"] = value
+    with pytest.raises(AssertionError, match="correction score is invalid"):
+        assert_result(result, params, count)
 
 
 @pytest.mark.parametrize(

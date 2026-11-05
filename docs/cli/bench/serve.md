@@ -374,24 +374,31 @@ string uses the server's default instructions. `--duplex-eval-ref-audio` is opti
 for Qwen3 and remains available for models that require a reference voice.
 
 The CUDA nightly configuration
-`tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` uses two GPUs
-for Qwen3-Omni and no judge. It selects a fixed pool of 16 `PR_correction` samples
-and runs 4, 16, and 32 sessions at concurrency 1, 8, and 16 respectively, using dataset revision
-`de63329f76daa5e0c604363ef6a2c383dfba45f6`. The selected IDs are
-`0, 2, 3, 4, 5, 7, 8, 13, 27, 28, 32, 35, 38, 41, 53, 59`.
-These statements concern the current picture; tasks requiring continued visual
-monitoring, future-event reminders, or original-video audio are excluded.
-RTD is not part of this Qwen3-Omni performance workload.
+`tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` measures and
+judges 120 distinct `PR_correction` sessions at concurrency 8. Two GPUs run
+Qwen3-Omni; a third runs the text-only `Qwen/Qwen2.5-7B-Instruct` judge.
+Dataset revision `de63329f76daa5e0c604363ef6a2c383dfba45f6` is pinned. The selected
+IDs are `0–132` excluding `1, 6, 19, 30, 37, 47, 71, 73, 83, 88, 89, 91, 105`:
 
-The `c1_c8_c16_response_v2` workload uses `--duplex-metric-aggregation response` and
-`--metric-percentiles 50,95` to pool individual responses for TTFT, audio TTFP
-and RTF. Missing measurements are excluded, never substituted with zero.
-Transport completion and finite measured distributions are required; answer
-quality, task success rates and judging are outside this performance test.
-No hardware latency baseline is checked in. Establish fresh, separate H100 and
-B200 baselines for this workload; previous session-averaged results are not
-comparable. `--dataset-path repo/id@revision` pins a remote Omni-DuplexEval
-source; local directory and parquet paths retain their existing behavior.
+- `1, 6, 30, 71, 83, 105` require historical visual or event evidence.
+- `19, 47, 73, 88, 89, 91` depend on the original soundtrack.
+- `37` uses a spoken cue to locate the visual correction.
+
+The selected statements concern current visual attributes, objects or actions.
+This is an annotation-based compatibility selection, not a claim that every
+sample has passed model validation. The job streams question audio with video;
+RTD, future-event reminders and continuous monitoring are outside this workload.
+
+The `c8_accuracy_response_v4` workload uses `--duplex-metric-aggregation response`
+and `--metric-percentiles 50,95` to pool responses for TTFT, audio TTFP and RTF.
+Missing measurements are excluded, never substituted with zero. All sessions
+must finish, publish artifacts and provide measured text/audio latency. The
+judge must evaluate all 120 corrections successfully and produce a finite
+correction success rate. Judging runs after the measured replay and does not
+enter its duration. No calibrated score floor or hardware latency baseline is
+checked in for this expanded workload; establish fresh H100 and B200 baselines.
+`--dataset-path repo/id@revision` pins a remote Omni-DuplexEval source; local
+directory and parquet paths retain their existing behavior.
 
 Inputs retain the standalone runner's real-time pacing, question audio, media
 clock and 1 FPS default (`--duplex-eval-fps`). `--duplex-eval-mix` selects the
@@ -764,46 +771,48 @@ All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global
 
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
 using `tests/dfx/perf/configs/qwen3_omni_duplex_perf.yaml`. This overlay inherits
-the normal duplex deployment and raises `duplex_session.max_sessions` to 16.
-Both Qwen3-Omni duplex performance jobs use two GPUs and no answer judge.
+the normal duplex deployment, selects `model_runner: v2` and `async_chunk: true`,
+enables Thinker prefix caching, and sets `duplex_session.max_sessions` to 8.
+Talker and Code2Wav retain prefix caching disabled.
+Both Qwen3-Omni duplex jobs use three GPUs: two for the model stages and one for
+the `Qwen/Qwen2.5-7B-Instruct` text judge, mapped to allocated device index 2.
 
 The pinned OmniInteract revision is
 `e195f75fe2666fcc5fe74f537ae49ca143a79969`. With shuffling disabled, the job
-selects a fixed pool of `1q1a_math/0001` through `0016`. C1 uses the first four
-samples, C8 uses all 16 once, and C16 replays those same 16 samples twice for
-32 measured sessions. Both nightly jobs set `duplex_sample_pool_size: 16`;
-no new source samples are added for C16. Repeated output identities carry a
-`__repeat_1` suffix while the source media and annotations remain unchanged.
-The sample-pool option is limited to these two datasets without answer
-evaluation; ordinary dataset loading remains unchanged when it is omitted.
-Each clip contains two spoken questions about the current screen. Full `1q1a`
-clips mix in proactive tasks, and `1qna` requires continuous monitoring, so
-neither subset belongs to this VAD-triggered workload.
+replays all 60 `1q1a_math/0001` through `0060` clips once at concurrency 8.
+Each clip contains two spoken questions about the current screen, giving
+120 annotated question slots. Full `1q1a` clips mix in proactive tasks, and
+`1qna` requires continuous monitoring, so neither subset belongs to this
+VAD-triggered workload. The Omni-DuplexEval job likewise uses 120 distinct
+correction samples once. Neither job enables `duplex_sample_pool_size`:
+repetition is unnecessary and that option is restricted to performance runs
+without answer evaluation.
 
-Clips remain unmodified: each lasts about five minutes, with two questions
-roughly two and a half minutes apart. This measures intermittent generation
-under concurrent realtime input, not continuously decoding requests.
-The nightly configurations explicitly skip the extra endpoint readiness replay
-(`ready_check_timeout_sec: 0`). The runner pairs `num_warmups: [1, 8, 16]`
-with the C1/C8/C16 sweep: each point first replays the first sample in 1, 8,
-or 16 concurrent, unmeasured full sessions. A scalar `num_warmups` still applies
-the same count to every sweep point; a list must contain one non-negative
-integer per point. Engine startup separately performs kernel warmup and CUDA
-Graph capture for its configured batch sizes. Concurrent session warmup
-exercises the media and concurrent inference paths; it does not establish
-that every input shape or execution path is warm.
+Clips remain unmodified: each math clip lasts about five minutes, with two
+questions roughly two and a half minutes apart. This measures intermittent
+generation under concurrent realtime input. Both jobs skip the extra endpoint
+readiness replay (`ready_check_timeout_sec: 0`) and use `num_warmups: 8`:
+one concurrent wave of eight full sessions replays the first sample before
+measurement. Warmup outputs enter neither performance statistics nor judging.
+Engine startup separately warms kernels and captures configured CUDA Graph
+batch sizes; full-session warmup does not establish that every shape is warm.
+The runner also supports a warmup list with one non-negative integer per sweep
+point; a scalar applies to every point.
 
-Formal replay takes approximately 20, 10, and 10 minutes at concurrency
-1, 8, and 16 respectively. Each warmup wave replays a roughly five-minute clip
-concurrently, adding about 5 minutes per point rather than 5 minutes per session.
-The complete sweep therefore takes about 55 minutes plus startup and response drain, within
-the existing 180-minute job budget. Warmup does not enter metrics. Results and
-hardware baselines are separate for each concurrency. C16 covers two waves of
-sessions; it is not a sustained saturation or long-duration memory test.
-Execution failures, including OOM, continue to fail the nightly job. Local
-memory-limited runs do not replace validation on H100/B200.
-Artifact publication and completeness checks also remain mandatory in
-performance mode; they do not invoke answer judging.
+At C8, 60 math sessions take approximately eight five-minute waves, or 40 minutes
+of formal replay, plus about five minutes of warmup. Startup, response drain,
+artifact publication and judge evaluation add to that estimate. Both jobs retain
+the 180-minute timeout; the full expanded workload still needs hardware validation.
+OOM, request failures, incomplete artifacts and judge failures fail the job.
+
+OmniInteract judging uses the same formal outputs as the performance report and
+records All Global IA-QTF1 plus evaluated/skipped counts. The official eligibility
+rules remain: cancelled, cleared or clipped responses are excluded from accuracy.
+All 60 sessions must be accounted for as evaluated or skipped, at least one must
+be evaluated, and every attempted evaluation must succeed. This is a selected
+math-subset score, not the full OmniInteract score. No new quality floor is
+inferred from the earlier four-case run. Both jobs save detailed response metrics
+and evaluate after the performance measurement window.
 
 The primary percentile rows are P50/P95 TTFT, audio TTFP and RTF over individual
 responses (`--duplex-metric-aggregation response`). The default `session` mode
@@ -821,9 +830,12 @@ The `max_concurrent_requests` statistic counts sessions touching each whole-seco
 bucket. At a wave boundary it can exceed the instantaneous concurrency because
 ending and starting sessions in the same second share a bucket.
 
-The configuration is named `c1_c8_c16_response_v2` to distinguish its baseline from
-older workloads. It has no answer-quality threshold or pre-filled hardware
-latency baseline. Use matching hardware and workload versions for comparisons.
+The configuration is named `c8_accuracy_response_v4` to distinguish its sample
+selection and judging from older workloads. Use matching hardware and workload
+versions for comparisons; previous C1/C8/C16 16-source-pool results are not baselines
+for these expanded jobs. The earlier `c8_accuracy_response_v3` runs used V1
+with Thinker prefix caching disabled; record the runner and cache settings when
+comparing results.
 
 ### Seed-TTS reference speech as real audio input
 

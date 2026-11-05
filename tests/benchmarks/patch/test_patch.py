@@ -404,6 +404,7 @@ async def test_grouped_seed_tts_response_percentiles_without_save_flag(monkeypat
         monkeypatch.setattr(probe, "configure", mocker.AsyncMock())
         monkeypatch.setattr(probe, "stream_silence", stream_silence)
         monkeypatch.setattr(probe, "acknowledge_playback", mocker.AsyncMock())
+        monkeypatch.setattr(probe, "turn_session_stats", mocker.AsyncMock(return_value={}))
         monkeypatch.setattr(probe, "close_session", mocker.AsyncMock())
         yield probe
 

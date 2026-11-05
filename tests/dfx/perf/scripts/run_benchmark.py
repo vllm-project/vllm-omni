@@ -543,13 +543,20 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             0,
             0,
         ), "Omni-DuplexEval accuracy coverage is incomplete"
+        if params.get("duplex_eval_split") == "PR_correction":
+            scores = accuracy.get("pr")
+            assert isinstance(scores, dict) and scores.get("samples") == num_prompt, (
+                "Omni-DuplexEval correction scores are incomplete"
+            )
+            score = scores.get("mean_all_success")
+            assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
-    if params.get("duplex_performance_only"):
+    if params.get("duplex_performance_only") or params.get("duplex_metric_aggregation") == "response":
         assert result.get("duplex_metric_aggregation") == "response", "Wrong duplex measurement unit"
         for metric in ("ttft", "audio_ttfp", "audio_rtf"):
             assert result.get(f"num_{metric}_samples", 0) > 0, f"No measured {metric} samples"
@@ -558,6 +565,7 @@ def assert_result(result, params, num_prompt) -> None:
                 assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
                     f"Missing or invalid P{percentile} {metric}"
                 )
+    if params.get("duplex_performance_only"):
         return
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)
@@ -569,6 +577,15 @@ def assert_result(result, params, num_prompt) -> None:
             assert accuracy.get("status") == "ok", "OmniInteract accuracy did not complete"
             assert accuracy.get("failed") == 0, "OmniInteract accuracy reported failed cases"
             _assert_subset_evaluated(accuracy)
+            if params.get("duplex_metric_aggregation") == "response":
+                evaluated, skipped = accuracy.get("evaluated"), accuracy.get("skipped")
+                assert (
+                    accuracy.get("total") == num_prompt
+                    and isinstance(evaluated, int)
+                    and isinstance(skipped, int)
+                    and skipped >= 0
+                    and evaluated + skipped == num_prompt
+                ), "OmniInteract accuracy coverage is incomplete"
             acc_summary = accuracy.get("summary")
             assert isinstance(acc_summary, dict), "OmniInteract accuracy summary is missing"
             ia_qtf1 = acc_summary.get("IA_QTF1")
