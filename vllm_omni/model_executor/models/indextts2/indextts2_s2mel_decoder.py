@@ -342,6 +342,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 ref_mel,
                 style,
                 ref_lengths_list,
+                s_ref_lengths_list,
             ) = self._build_batched_inputs(
                 request_infos,
                 device=device,
@@ -359,6 +360,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             ref_mel = self._get_tensor(additional_information, "ref_mel", device, model_dtype)
             style = self._get_tensor(additional_information, "style", device, model_dtype)
             ref_lengths_list = self._ref_mel_lengths([ref_mel])
+            s_ref_lengths_list = None
 
         if mel_codes is None or (self.use_gpt_latent and latent is None):
             if not request_infos:
@@ -396,15 +398,17 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 code_lens_list = [int(x) for x in code_lens_raw]
                 code_lens = torch.tensor(code_lens_list, device=device, dtype=torch.long)
         else:
-            # Strip stop token (8193) and compute actual length
+            # Strip stop token (8193) and compute actual length with a single
+            # host transfer instead of per-row GPU nonzero().item() syncs.
             stop_token = self.config.gpt.get("stop_mel_token", 8193)
+            mel_codes_cpu = mel_codes.detach().cpu() if mel_codes.device.type != "cpu" else mel_codes
             code_lens_list = []
-            for i in range(mel_codes.shape[0]):
-                stop_mask = (mel_codes[i] == stop_token).nonzero(as_tuple=False)
+            for i in range(mel_codes_cpu.shape[0]):
+                stop_mask = (mel_codes_cpu[i] == stop_token).nonzero(as_tuple=False)
                 if stop_mask.numel() > 0:
-                    code_lens_list.append(stop_mask[0].item())
+                    code_lens_list.append(int(stop_mask[0].item()))
                 else:
-                    code_lens_list.append(mel_codes.shape[1])
+                    code_lens_list.append(int(mel_codes_cpu.shape[1]))
             code_lens = torch.tensor(code_lens_list, device=device, dtype=torch.long)
         duration_factors = self._duration_factors(request_infos, len(code_lens_list))
 
@@ -451,6 +455,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             mel_codes=mel_codes,
             latent=latent,
             dtype=model_dtype,
+            code_lens=code_lens_list,
         )
         logger.debug(
             "[S2Mel] semantic decode → S_infer=%s dtype=%s codec=%s latent=%s",
@@ -470,12 +475,13 @@ class IndexTTS2S2MelDecoder(nn.Module):
             mel_code_to_frame_ratio=self.mel_code_to_frame_ratio,
             duration_factors=duration_factors,
         )
-        target_lengths = torch.tensor(target_lengths_list, device=device, dtype=torch.long)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[S2Mel] step3 length_regulator target_lengths=%s", target_lengths_list)
-        cond = self.s2mel.models["length_regulator"](S_infer, ylens=target_lengths, n_quantizers=3, f0=None)[
-            0
-        ]  # [B, T_mel, 512]
+        cond = self._regulate_lengths(
+            S_infer,
+            [length * semantic_time_scale for length in code_lens_list],
+            target_lengths_list,
+        )  # [B, T_mel, 512]
         logger.debug("[S2Mel] step3 length_regulator → cond=%s", cond.shape)
 
         # 4. Reference prompt conditioning
@@ -506,7 +512,8 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 if self.semantic_codec_type != "repcodec":
                     raise ValueError("IndexTTS 2.5 expects W2V-BERT reference embeddings, not semantic-code indices")
                 with torch.no_grad():
-                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(1))
+                    # ResidualVQ.vq2emb expects [num_quantizers, B, T].
+                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(0))
                 s_ref_emb = s_ref_emb.transpose(1, 2).to(dtype=model_dtype)
 
             ref_batch_size = int(ref_mel.shape[0])
@@ -517,14 +524,11 @@ class IndexTTS2S2MelDecoder(nn.Module):
                     "IndexTTS reference-mel length/batch mismatch: "
                     f"lengths={len(ref_lengths_list)} batch={ref_batch_size}"
                 )
-            ref_target_lengths = torch.tensor(
+            prompt_condition = self._regulate_lengths(
+                s_ref_emb,
+                s_ref_lengths_list,
                 ref_lengths_list,
-                device=device,
-                dtype=torch.long,
             )
-            prompt_condition = self.s2mel.models["length_regulator"](
-                s_ref_emb, ylens=ref_target_lengths, n_quantizers=3, f0=None
-            )[0]
             cat_condition = torch.cat([prompt_condition, cond], dim=1)
             logger.debug(
                 "[S2Mel] step4 ref conditioning — s_ref_emb=%s prompt_condition=%s cat_condition=%s",
@@ -625,7 +629,17 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 wav.max().item() if isinstance(wav, torch.Tensor) else max(w.max().item() for w in wav),
             )
 
-        audio_cpu = [w.cpu() for w in wav] if isinstance(wav, list) else wav.cpu()
+        if isinstance(wav, list):
+            if len(wav) > 1 and wav[0].device.type != "cpu":
+                sizes = [w.numel() for w in wav]
+                flat_cpu = torch.cat([w.reshape(-1) for w in wav], dim=0).cpu()
+                audio_cpu: torch.Tensor | list[torch.Tensor] = [
+                    chunk.reshape(w.shape) for chunk, w in zip(flat_cpu.split(sizes), wav)
+                ]
+            else:
+                audio_cpu = [w.cpu() for w in wav]
+        else:
+            audio_cpu = wav.cpu()
 
         return OmniOutput(
             text_hidden_states=None,
@@ -678,6 +692,48 @@ class IndexTTS2S2MelDecoder(nn.Module):
         ):
             raise ValueError("IndexTTS duration_factor values must be finite and between 0.5 and 2.0")
         return factors
+
+    def _regulate_lengths(
+        self,
+        x: torch.Tensor,
+        valid_lengths: list[int] | None,
+        target_lengths: list[int],
+    ) -> torch.Tensor:
+        """Run length_regulator per request at its unpadded length so Conv1d/GroupNorm
+        across time is never contaminated by batch padding.
+        """
+        regulator = self.s2mel.models["length_regulator"]
+        batch_size = int(x.shape[0])
+        if valid_lengths is None:
+            valid_lengths = [int(x.shape[1])] * batch_size
+        if not (len(valid_lengths) == len(target_lengths) == batch_size):
+            raise ValueError(
+                "IndexTTS length-regulator batch mismatch: "
+                f"batch={batch_size} valid={len(valid_lengths)} target={len(target_lengths)}"
+            )
+        from vllm_omni.model_executor.models.indextts2.s2mel.modules.length_regulator import (
+            InterpolateRegulator,
+        )
+
+        accepts_max_length = isinstance(regulator, InterpolateRegulator)
+        ylens_all = torch.tensor(target_lengths, device=x.device, dtype=torch.long)
+        if batch_size == 1 or (all(v == int(x.shape[1]) for v in valid_lengths) and len(set(target_lengths)) == 1):
+            extra_kw = {"max_length": int(max(target_lengths)) if target_lengths else 0} if accepts_max_length else {}
+            return regulator(x, ylens=ylens_all, n_quantizers=3, f0=None, **extra_kw)[0]
+        rows = []
+        for row in range(batch_size):
+            extra_kw = {"max_length": int(target_lengths[row])} if accepts_max_length else {}
+            rows.append(
+                regulator(
+                    x[row : row + 1, : valid_lengths[row]],
+                    ylens=ylens_all[row : row + 1],
+                    n_quantizers=3,
+                    f0=None,
+                    **extra_kw,
+                )[0]
+            )
+        max_length = max(int(row.shape[1]) for row in rows)
+        return torch.cat([F.pad(row, (0, 0, 0, max_length - int(row.shape[1]))) for row in rows], dim=0)
 
     @staticmethod
     def _target_lengths(
@@ -913,13 +969,41 @@ class IndexTTS2S2MelDecoder(nn.Module):
         mel_codes: torch.Tensor,
         latent: torch.Tensor | None,
         dtype: torch.dtype,
+        code_lens: list[int] | None = None,
     ) -> torch.Tensor:
+        ragged_enhanced = (
+            self.semantic_codec_type == "enhanced"
+            and code_lens is not None
+            and mel_codes.ndim == 2
+            and mel_codes.shape[0] > 1
+            and len(code_lens) == mel_codes.shape[0]
+            and len(set(code_lens)) > 1
+        )
         if self.semantic_codec_type == "enhanced":
-            semantic = codec.decode(mel_codes)
+            if ragged_enhanced:
+                assert code_lens is not None
+                sem_rows = [
+                    codec.decode(mel_codes[i : i + 1, : max(1, int(code_lens[i]))]).to(
+                        device=mel_codes.device, dtype=dtype
+                    )
+                    for i in range(mel_codes.shape[0])
+                ]
+                max_sem_len = max(int(r.shape[1]) for r in sem_rows)
+                semantic = torch.zeros(
+                    (len(sem_rows), max_sem_len, sem_rows[0].shape[-1]),
+                    device=mel_codes.device,
+                    dtype=dtype,
+                )
+                for i, r in enumerate(sem_rows):
+                    semantic[i, : r.shape[1]] = r[0]
+            else:
+                semantic = codec.decode(mel_codes).to(device=mel_codes.device, dtype=dtype)
         else:
-            semantic = codec.quantizer.vq2emb(mel_codes.unsqueeze(1))
-            semantic = semantic.transpose(1, 2)
-        semantic = semantic.to(device=mel_codes.device, dtype=dtype)
+            # ResidualVQ.vq2emb expects [num_quantizers, B, T]. Official
+            # IndexTTS2 uses unsqueeze(1), which only coincides for B == 1;
+            # with B > 1 it would decode only the first request's codes.
+            semantic = codec.quantizer.vq2emb(mel_codes.unsqueeze(0))
+            semantic = semantic.transpose(1, 2).to(device=mel_codes.device, dtype=dtype)
 
         if not self.use_gpt_latent:
             return semantic
@@ -927,13 +1011,27 @@ class IndexTTS2S2MelDecoder(nn.Module):
             raise ValueError("IndexTTS GPT latent mode requires a latent tensor")
 
         projected = self.s2mel.forward_gpt(latent.to(device=mel_codes.device, dtype=dtype)).to(dtype=dtype)
-        if projected.shape[1] != semantic.shape[1]:
+        if ragged_enhanced:
+            assert code_lens is not None
+            proj_padded = torch.zeros_like(semantic)
+            for i, r in enumerate(sem_rows):
+                valid_c = max(1, int(code_lens[i]))
+                row_proj = projected[i : i + 1, :valid_c]
+                if row_proj.shape[1] != r.shape[1]:
+                    row_proj = F.interpolate(
+                        row_proj.transpose(1, 2),
+                        size=int(r.shape[1]),
+                        mode="nearest",
+                    ).transpose(1, 2)
+                proj_padded[i, : r.shape[1]] = row_proj[0]
+            projected = proj_padded
+        elif projected.shape[1] != semantic.shape[1]:
             # EnhancedCodec restores the encoder's temporal downsampling with
             # nearest-neighbor upsampling. Mirror that time mapping for the
             # optional GPT residual before addition.
             projected = F.interpolate(
                 projected.transpose(1, 2),
-                size=semantic.shape[1],
+                size=int(semantic.shape[1]),
                 mode="nearest",
             ).transpose(1, 2)
         if projected.shape != semantic.shape:
@@ -958,6 +1056,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
         list[int],
+        list[int] | None,
     ]:
         stop_token = self.config.gpt.get("stop_mel_token", 8193)
         mel_items: list[torch.Tensor] = []
@@ -968,6 +1067,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         style_items: list[torch.Tensor | None] = []
 
         for idx, info in enumerate(infos):
+            raw_mel = info.get("mel_codes")
             mel = self._get_tensor(info, "mel_codes", device)
             latent = self._get_tensor(info, "latent", device, model_dtype) if self.use_gpt_latent else None
             if mel is None or (self.use_gpt_latent and latent is None):
@@ -984,11 +1084,16 @@ class IndexTTS2S2MelDecoder(nn.Module):
 
             raw_len = info.get("code_lens")
             if isinstance(raw_len, torch.Tensor) and raw_len.numel() > 0:
-                code_len = int(raw_len.reshape(-1)[0].item())
+                code_len = int(raw_len.detach().cpu().reshape(-1)[0].item())
             elif raw_len is not None:
                 code_len = int(raw_len[0] if isinstance(raw_len, list) else raw_len)
             else:
-                stop_mask = (mel == stop_token).nonzero(as_tuple=False)
+                mel_for_len = (
+                    raw_mel.reshape(-1)
+                    if isinstance(raw_mel, torch.Tensor) and raw_mel.device.type == "cpu"
+                    else mel.detach().cpu()
+                )
+                stop_mask = (mel_for_len == stop_token).nonzero(as_tuple=False)
                 code_len = int(stop_mask[0].item()) if stop_mask.numel() > 0 else int(mel.shape[0])
             code_len = max(0, min(code_len, int(mel.shape[0])))
             if latent is not None:
@@ -1039,6 +1144,11 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 latent_batch[i, : latent.shape[0]] = latent.to(dtype=model_dtype)
 
         s_ref_batch = self._stack_optional_sequence(s_ref_items, device=device, dtype=model_dtype)
+        s_ref_lengths = (
+            [int(item.shape[0]) for item in s_ref_items if item is not None]
+            if s_ref_items and all(item is not None for item in s_ref_items)
+            else None
+        )
         ref_lengths = self._ref_mel_lengths(ref_mel_items)
         ref_mel_batch = self._stack_optional_ref_mel(ref_mel_items, device=device, dtype=model_dtype)
         style_batch = self._stack_optional_style(style_items, device=device, dtype=model_dtype)
@@ -1051,6 +1161,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             ref_mel_batch,
             style_batch,
             ref_lengths,
+            s_ref_lengths,
         )
 
     @staticmethod
