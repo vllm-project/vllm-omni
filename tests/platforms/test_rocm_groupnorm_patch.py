@@ -30,7 +30,7 @@ def aiter_available(monkeypatch):
 
 def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
     model = types.SimpleNamespace(vae=nn.Sequential(nn.GroupNorm(4, 8)))
-    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _: model)
+    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _, **kwargs: model)
     monkeypatch.setattr(
         patch_groupnorm,
         "_replace_groupnorm_with_aiter",
@@ -44,7 +44,7 @@ def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
 
 def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
     model = types.SimpleNamespace(vae=nn.Sequential(nn.GroupNorm(4, 8)))
-    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _: model)
+    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _, **kwargs: model)
 
     replaced = False
 
@@ -57,3 +57,17 @@ def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
     od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
     assert patch_groupnorm._patched_initialize_model(od_config) is model
     assert replaced
+
+
+@pytest.mark.parametrize("model_init_kwargs", [None, {"backbone_meta": True}])
+def test_initialize_model_forwards_kwargs(monkeypatch, model_init_kwargs):
+    model = types.SimpleNamespace()
+    od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
+
+    def initialize_model(config, **kwargs):
+        assert config is od_config
+        assert kwargs == {"model_init_kwargs": model_init_kwargs}
+        return model
+
+    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", initialize_model)
+    assert patch_groupnorm._patched_initialize_model(od_config, model_init_kwargs=model_init_kwargs) is model

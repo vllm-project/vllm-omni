@@ -39,8 +39,8 @@ def _replace_groupnorm_with_aiter(vae: nn.Module) -> bool:
     return len(targets) > 0
 
 
-def _patched_initialize_model(od_config):
-    model = _original_initialize_model(od_config)
+def _patched_initialize_model(od_config, model_init_kwargs: dict | None = None):
+    model = _original_initialize_model(od_config, model_init_kwargs=model_init_kwargs)
 
     if hasattr(model, "vae"):
         # AITER GroupNorm does not preserve the PyTorch autocast behavior required
