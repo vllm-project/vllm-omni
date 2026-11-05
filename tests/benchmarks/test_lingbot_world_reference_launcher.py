@@ -19,7 +19,7 @@ LAUNCHER = ROOT / "tests/dfx/lingbot_world/run_ci.sh"
 
 
 @pytest.fixture
-def launcher(tmp_path):
+def launcher(tmp_path, lingbot_subprocess_env):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     python = bin_dir / "python"
@@ -64,16 +64,13 @@ def launcher(tmp_path):
     )
     output = tmp_path / "output"
     selection = tmp_path / "selection.json"
-    environment = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "PYTHONPATH": str(ROOT)}
-    for name in (
-        "BUILDKITE",
-        "LINGBOT_REFERENCE_ONLY",
-        "LINGBOT_CASE_SHARD",
-        "LINGBOT_QUALITY_CASE_INDEX",
-        "LINGBOT_MEASUREMENT_REPEAT",
-        "LINGBOT_CI_PHASE",
-    ):
-        environment.pop(name, None)
+    environment = {
+        **lingbot_subprocess_env,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "PYTHONPATH": str(ROOT),
+    }
+    # Keep the unset-switch cases distinct from explicit acceptance mode (0).
+    environment.pop("LINGBOT_REFERENCE_ONLY")
     environment.update(
         LINGBOT_EVALUATOR_ROOT=str(tmp_path / "evaluators"),
         CONTRACT_SELECTION=str(selection),

@@ -350,7 +350,9 @@ def test_final_gate_rejects_missing_candidate_start(measurement_campaign):
         runner._finalize_measurements(settings, {}, copy.deepcopy(records))
 
 
-def test_aggregate_launcher_executes_pytest_and_returns_nonzero_for_regression(measurement_campaign):
+def test_aggregate_launcher_executes_pytest_and_returns_nonzero_for_regression(
+    measurement_campaign, lingbot_subprocess_env
+):
     settings = measurement_campaign
     # Source-only CI images intentionally omit .git; use the same checked
     # Buildkite SHA fallback as the real artifact consumer.
@@ -369,9 +371,10 @@ def test_aggregate_launcher_executes_pytest_and_returns_nonzero_for_regression(m
             write_json(path, raw)
             manifest["artifacts"][str(path.relative_to(root))] = sha256(path)
         write_json(manifest_path, manifest)
-    environment = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
-    environment.pop("BUILDKITE", None)
-    environment.pop("LINGBOT_CASE_SHARD", None)
+    environment = {
+        **lingbot_subprocess_env,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+    }
     for regressed in (False, True):
         if regressed:
             root = settings["generation"] / "pair-2"
@@ -403,13 +406,18 @@ def test_aggregate_launcher_executes_pytest_and_returns_nonzero_for_regression(m
             timeout=60,
         )
         assert result.returncode == (1 if regressed else 0), result.stdout + result.stderr
+        configuration = json.loads((output / "ci-configuration.json").read_text())
+        assert configuration["effective_stage"] == "aggregate"
+        assert configuration["phase"] == "acceptance" and not configuration["reference_only"]
         suites = list(ET.parse(output / "pytest.xml").getroot().iter("testsuite"))
         assert len(suites) == 1 and suites[0].get("tests") == "1" and suites[0].get("skipped") == "0"
         assert suites[0].get("failures") == ("1" if regressed else "0")
 
 
 @pytest.mark.parametrize(("selector", "expected_exit"), [("core_model and cpu", 5), ("full_model and cpu", 0)])
-def test_full_campaign_gate_is_selected_only_by_explicit_full_model_launcher(selector, expected_exit, tmp_path):
+def test_full_campaign_gate_is_selected_only_by_explicit_full_model_launcher(
+    selector, expected_exit, tmp_path, lingbot_subprocess_env
+):
     result = subprocess.run(
         [
             sys.executable,
@@ -424,7 +432,7 @@ def test_full_campaign_gate_is_selected_only_by_explicit_full_model_launcher(sel
             str(tmp_path / "output"),
         ],
         cwd=runner.ROOT,
-        env={**os.environ, "BUILDKITE": "true"},
+        env={**lingbot_subprocess_env, "BUILDKITE": "true"},
         capture_output=True,
         text=True,
         timeout=60,

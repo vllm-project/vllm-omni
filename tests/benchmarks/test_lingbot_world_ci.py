@@ -176,7 +176,9 @@ def test_smoke_propagates_device_cleanup_failure_after_valid_inference(smoke_ent
 # AMD coverage lives in test_amd_cpu_timing.py with main's shared CPU runner.
 @pytest.mark.parametrize("shell", ["/bin/sh", "/bin/bash"])
 @pytest.mark.parametrize("status", [0, 1, 2, 134])
-def test_cpu_console_preserves_pytest_exit_and_junit_artifacts(tmp_path: Path, shell: str, status: int):
+def test_cpu_console_preserves_pytest_exit_and_junit_artifacts(
+    tmp_path: Path, shell: str, status: int, lingbot_subprocess_env
+):
     source = ".buildkite/cuda/test-ready.yml"
     pipeline = yaml.safe_load((ROOT / source).read_text())
     label = "Simple · Other Test"
@@ -185,6 +187,8 @@ def test_cpu_console_preserves_pytest_exit_and_junit_artifacts(tmp_path: Path, s
     checkout = tmp_path / "agent-checkout"
     application.mkdir()
     checkout.mkdir()
+    policy = application / "policy.json"
+    policy.write_bytes((ROOT / "tests/dfx/lingbot_world/quality.json").read_bytes())
     wrapper = application / ".buildkite/common/scripts/run-pytest-ci.sh"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text((ROOT / ".buildkite/common/scripts/run-pytest-ci.sh").read_text())
@@ -206,8 +210,9 @@ def test_cpu_console_preserves_pytest_exit_and_junit_artifacts(tmp_path: Path, s
         [shell, "-e", "-c", "\n".join(step["commands"]).replace("$$", "$")],
         cwd=application,
         env={
-            **os.environ,
+            **lingbot_subprocess_env,
             "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+            "CI_POLICY_FILE": str(policy),
             "BUILDKITE_BUILD_CHECKOUT_PATH": str(checkout),
             "BUILDKITE_PARALLEL_JOB": "2",
             "BUILDKITE_PARALLEL_JOB_COUNT": "3",
@@ -222,6 +227,7 @@ def test_cpu_console_preserves_pytest_exit_and_junit_artifacts(tmp_path: Path, s
     assert "pytest stdout" in result.stdout and "pytest stderr" in result.stderr
     assert not (output / (stem + ".log")).exists()
     assert ET.parse(output / (stem + ".xml")).getroot().tag == "testsuite"
+    assert (output / "policy.json").read_bytes() == policy.read_bytes()
 
 
 def test_lifecycle_playhead_blocks_second_admission_before_inference() -> None:
@@ -502,7 +508,7 @@ def test_unavailable_resource_probes_retain_errors_without_raising(tmp_path, mon
     assert "PermissionError" in errors["host_memory"]
 
 
-def test_failed_pytest_retains_original_error_and_resource_evidence(tmp_path):
+def test_failed_pytest_retains_original_error_and_resource_evidence(tmp_path, lingbot_subprocess_env):
     test = tmp_path / "test_model_failure.py"
     test.write_text('def test_model_failure():\n    raise RuntimeError("original model startup failure")\n')
     output = tmp_path / "failure-artifacts"
@@ -515,10 +521,14 @@ def test_failed_pytest_retains_original_error_and_resource_evidence(tmp_path):
             "-p",
             "tests.dfx.lingbot_world.conftest",
             str(test),
+            "--rootdir",
+            str(tmp_path),
+            "--confcutdir",
+            str(tmp_path),
             f"--lingbot-output={output}",
         ],
         cwd=ROOT,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "BUILDKITE": "true", "PYTHONPATH": str(ROOT)},
+        env={**lingbot_subprocess_env, "CUDA_VISIBLE_DEVICES": "", "BUILDKITE": "true", "PYTHONPATH": str(ROOT)},
         capture_output=True,
         text=True,
         timeout=90,
@@ -543,7 +553,9 @@ def test_failed_pytest_retains_original_error_and_resource_evidence(tmp_path):
         ("core_model and xpu and B60", ()),
     ],
 )
-def test_model_and_dfx_packages_collect_together_on_every_platform(reverse, selection, expected_names):
+def test_model_and_dfx_packages_collect_together_on_every_platform(
+    reverse, selection, expected_names, lingbot_subprocess_env
+):
     # Intel collects both trees before applying its XPU expression. DFX must
     # not shadow the existing model package, including for deselected tests.
     paths = ["tests/diffusion/models/lingbot_world/test_offload_lingbot_world.py", "tests/dfx/lingbot_world"]
@@ -553,7 +565,7 @@ def test_model_and_dfx_packages_collect_together_on_every_platform(reverse, sele
         [sys.executable, "-m", "pytest", "--collect-only", "-q", *paths, "-m", selection],
         cwd=ROOT,
         env={
-            **os.environ,
+            **lingbot_subprocess_env,
             "CUDA_VISIBLE_DEVICES": "",
             "BUILDKITE_PARALLEL_JOB": "0",
             "BUILDKITE_PARALLEL_JOB_COUNT": "1",
@@ -1671,7 +1683,7 @@ def test_generation_and_gpu_evaluation_are_blocking_and_connected(platform, leve
         ]["depends_on"]
 
 
-def test_selected_ci_skip_is_a_failed_pytest_job(tmp_path: Path):
+def test_selected_ci_skip_is_a_failed_pytest_job(tmp_path: Path, lingbot_subprocess_env):
     test = tmp_path / "test_missing_device.py"
     test.write_text('import pytest\ndef test_missing_device():\n    pytest.skip("missing device")\n')
     output = tmp_path / "artifacts"
@@ -1692,7 +1704,7 @@ def test_selected_ci_skip_is_a_failed_pytest_job(tmp_path: Path):
             str(output),
         ],
         cwd=tmp_path,
-        env={**os.environ, "BUILDKITE": "true", "PYTHONPATH": str(ROOT)},
+        env={**lingbot_subprocess_env, "BUILDKITE": "true", "PYTHONPATH": str(ROOT)},
         capture_output=True,
         text=True,
         timeout=60,
@@ -1739,7 +1751,7 @@ def test_every_configured_quality_dimension_rejects_a_collapse(platform):
 
 
 @pytest.mark.parametrize("stage", ["aggregate", "evaluate"])
-def test_matrix_artifact_handoff_uses_unique_build_prefix(tmp_path, stage):
+def test_matrix_artifact_handoff_uses_unique_build_prefix(tmp_path, stage, lingbot_subprocess_env):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     generation = "generation/pairs" if stage == "aggregate" else "generation/shard-1"
@@ -1773,12 +1785,11 @@ def test_matrix_artifact_handoff_uses_unique_build_prefix(tmp_path, stage):
     for path in (agent, python):
         path.chmod(0o755)
     env = {
-        **os.environ,
+        **lingbot_subprocess_env,
         "BUILDKITE": "true",
         "PYTHONPATH": str(ROOT),
         "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
     }
-    env.pop("LINGBOT_CASE_SHARD", None)
     output = tmp_path / "output"
     result = subprocess.run(
         [
@@ -1802,7 +1813,7 @@ def test_matrix_artifact_handoff_uses_unique_build_prefix(tmp_path, stage):
 
 
 @pytest.mark.parametrize("case_index", [None, "0", "2"])
-def test_quality_launcher_forwards_case_selection(tmp_path: Path, case_index):
+def test_quality_launcher_forwards_case_selection(tmp_path: Path, case_index, lingbot_subprocess_env):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     arguments = tmp_path / "pytest-arguments.json"
@@ -1821,9 +1832,7 @@ def test_quality_launcher_forwards_case_selection(tmp_path: Path, case_index):
     )
     for executable in (python, pytest_command):
         executable.chmod(0o755)
-    environment = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
-    for name in ("BUILDKITE", "LINGBOT_CASE_SHARD", "LINGBOT_QUALITY_CASE_INDEX"):
-        environment.pop(name, None)
+    environment = {**lingbot_subprocess_env, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
     if case_index is not None:
         environment["LINGBOT_QUALITY_CASE_INDEX"] = case_index
     output = tmp_path / "quality"
@@ -1849,7 +1858,7 @@ def test_quality_launcher_forwards_case_selection(tmp_path: Path, case_index):
 
 
 @pytest.mark.parametrize("stage", ["generate", "aggregate"])
-def test_launcher_setup_failure_retains_nonzero_exit_and_junit(tmp_path: Path, stage):
+def test_launcher_setup_failure_retains_nonzero_exit_and_junit(tmp_path: Path, stage, lingbot_subprocess_env):
     output = tmp_path / "artifacts"
     result = subprocess.run(
         [
@@ -1860,7 +1869,7 @@ def test_launcher_setup_failure_retains_nonzero_exit_and_junit(tmp_path: Path, s
             str(output),
         ],
         cwd=ROOT,
-        env={**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]},
+        env={**lingbot_subprocess_env, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]},
         capture_output=True,
         text=True,
         timeout=60,
@@ -1872,7 +1881,9 @@ def test_launcher_setup_failure_retains_nonzero_exit_and_junit(tmp_path: Path, s
 
 @pytest.mark.parametrize("stage", ["generate", "collect"])
 @pytest.mark.parametrize("preflight_status", [0, 19])
-def test_npu_launcher_limits_visibility_before_model_preparation(tmp_path, stage, preflight_status):
+def test_npu_launcher_limits_visibility_before_model_preparation(
+    tmp_path, stage, preflight_status, lingbot_subprocess_env
+):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     python = bin_dir / "python"
@@ -1894,8 +1905,7 @@ def test_npu_launcher_limits_visibility_before_model_preparation(tmp_path, stage
     )
     python.chmod(0o755)
     output = tmp_path / "artifacts"
-    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
-    env.pop("LINGBOT_CASE_SHARD", None)
+    env = {**lingbot_subprocess_env, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
     result = subprocess.run(
         [
             "bash",
@@ -1920,7 +1930,7 @@ def test_npu_launcher_limits_visibility_before_model_preparation(tmp_path, stage
 
 
 @pytest.mark.parametrize("cancel_signal", [signal.SIGTERM, signal.SIGKILL])
-def test_launcher_cancellation_retains_failure_junit(tmp_path: Path, cancel_signal):
+def test_launcher_cancellation_retains_failure_junit(tmp_path: Path, cancel_signal, lingbot_subprocess_env):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     python = bin_dir / "python"
@@ -1951,7 +1961,7 @@ def test_launcher_cancellation_retains_failure_junit(tmp_path: Path, cancel_sign
     process = subprocess.Popen(
         ["bash", str(ROOT / "tests/dfx/lingbot_world/run_ci.sh"), "generate", str(profile), str(output)],
         cwd=ROOT,
-        env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
+        env={**lingbot_subprocess_env, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,

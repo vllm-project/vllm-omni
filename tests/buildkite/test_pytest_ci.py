@@ -3,6 +3,7 @@
 """The shared CI guard must retain evidence without duplicating console logs."""
 
 import json
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -29,6 +30,8 @@ def test_shared_ci_guard_requires_a_complete_junit_and_preserves_failure(
     tmp_path: Path, command_status: int, report: str | None, expected_status: int
 ) -> None:
     output = tmp_path / "artifacts"
+    policy = tmp_path / "policy.json"
+    policy.write_bytes((ROOT / "tests/dfx/lingbot_world/quality.json").read_bytes())
     command = (
         "import sys\nfrom pathlib import Path\n"
         "print('test stdout', flush=True)\n"
@@ -48,6 +51,7 @@ def test_shared_ci_guard_requires_a_complete_junit_and_preserves_failure(
             str(output / "pytest.xml"),
         ],
         cwd=tmp_path,
+        env={**os.environ, "CI_POLICY_FILE": str(policy)},
         capture_output=True,
         text=True,
         timeout=30,
@@ -55,6 +59,7 @@ def test_shared_ci_guard_requires_a_complete_junit_and_preserves_failure(
     assert result.returncode == expected_status, result.stdout + result.stderr
     assert "test stdout" in result.stdout and "test stderr" in result.stderr
     assert (output / "environment.json").is_file()
+    assert (output / "policy.json").read_bytes() == policy.read_bytes()
     assert not (output / "run.log").exists()
     junit = ET.parse(output / "pytest.xml")
     if expected_status:
