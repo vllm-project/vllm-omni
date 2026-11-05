@@ -8,6 +8,7 @@ to synthesize mel spectrogram, then BigVGAN to produce waveform audio.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -551,61 +552,63 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # 5. Flow matching inference (Euler ODE steps, CFG rate configurable)
         # CFM ODE solver runs in float32 — fp16 Euler steps diverge to noise.
         # The DiT estimator itself may run under bf16 autocast (see below).
-        self._configure_dit_runtime(device)
-        cfm = self.s2mel.models["cfm"]
-        cfm.estimator_autocast_dtype = torch.bfloat16 if self.s2mel_dit_bf16 else None
-        cond = cond.float()
-        if prompt_condition is not None:
-            prompt_condition = prompt_condition.float()
-        cat_condition = cat_condition.float()
-        ref_mel = ref_mel.float()
-        style = style.float()
+        with self._maybe_s2mel_tf32_context(device):
+            self._configure_dit_runtime(device)
+            cfm = self.s2mel.models["cfm"]
+            cfm.estimator_autocast_dtype = torch.bfloat16 if self.s2mel_dit_bf16 else None
+            cond = cond.float()
+            if prompt_condition is not None:
+                prompt_condition = prompt_condition.float()
+            cat_condition = cat_condition.float()
+            ref_mel = ref_mel.float()
+            style = style.float()
 
-        cfm_batch_size = int(cat_condition.shape[0])
-        if prompt_condition is None:
-            ref_lengths_list = [0] * cfm_batch_size
-        elif len(ref_lengths_list) != cfm_batch_size:
-            raise ValueError(
-                f"IndexTTS CFM reference-length/batch mismatch: lengths={len(ref_lengths_list)} batch={cfm_batch_size}"
+            cfm_batch_size = int(cat_condition.shape[0])
+            if prompt_condition is None:
+                ref_lengths_list = [0] * cfm_batch_size
+            elif len(ref_lengths_list) != cfm_batch_size:
+                raise ValueError(
+                    "IndexTTS CFM reference-length/batch mismatch: "
+                    f"lengths={len(ref_lengths_list)} batch={cfm_batch_size}"
+                )
+
+            estimator = cfm.estimator
+            max_cfm_group_size = min(cfm_batch_size, self.s2mel_cfm_batch_size)
+            required_cache_batch = max(2, max_cfm_group_size * (2 if self.inference_cfg_rate > 0 else 1))
+            if (
+                estimator.transformer.freqs_cis is None
+                or getattr(estimator.transformer, "max_batch_size", -1) < required_cache_batch
+            ):
+                estimator.setup_caches(max_batch_size=required_cache_batch, max_seq_length=16384)
+                logger.info("[S2Mel] DiT caches initialized (freqs_cis + causal_mask)")
+            cfm_seeds = self._cfm_request_seeds(
+                request_infos,
+                batch_size=int(cat_condition.shape[0]),
             )
-
-        estimator = cfm.estimator
-        max_cfm_group_size = min(cfm_batch_size, self.s2mel_cfm_batch_size)
-        required_cache_batch = max(2, max_cfm_group_size * (2 if self.inference_cfg_rate > 0 else 1))
-        if (
-            estimator.transformer.freqs_cis is None
-            or getattr(estimator.transformer, "max_batch_size", -1) < required_cache_batch
-        ):
-            estimator.setup_caches(max_batch_size=required_cache_batch, max_seq_length=16384)
-            logger.info("[S2Mel] DiT caches initialized (freqs_cis + causal_mask)")
-        cfm_seeds = self._cfm_request_seeds(
-            request_infos,
-            batch_size=int(cat_condition.shape[0]),
-        )
-        mel = self._run_cfm_groups(
-            cfm=cfm,
-            cond=cond,
-            prompt_condition=prompt_condition,
-            ref_mel=ref_mel,
-            style=style,
-            target_lengths=target_lengths_list,
-            ref_lengths=ref_lengths_list,
-            seeds=cfm_seeds,
-            max_group_size=self.s2mel_cfm_batch_size,
-        )
-        logger.debug("[S2Mel] step5 CFM done → mel=%s", [tuple(item.shape) for item in mel])
-
-        # 6. BigVGAN vocoding
-        vocoder_name = self._get_resolved_vocoder_source()
-        voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
-        bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
-        vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
-        with torch.no_grad():
-            wavs = self._vocode_mels(
-                mels=mel,
-                vocode=vocode,
-                voc_dtype=voc_dtype,
+            mel = self._run_cfm_groups(
+                cfm=cfm,
+                cond=cond,
+                prompt_condition=prompt_condition,
+                ref_mel=ref_mel,
+                style=style,
+                target_lengths=target_lengths_list,
+                ref_lengths=ref_lengths_list,
+                seeds=cfm_seeds,
+                max_group_size=self.s2mel_cfm_batch_size,
             )
+            logger.debug("[S2Mel] step5 CFM done → mel=%s", [tuple(item.shape) for item in mel])
+
+            # 6. BigVGAN vocoding
+            vocoder_name = self._get_resolved_vocoder_source()
+            voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
+            bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
+            vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
+            with torch.no_grad():
+                wavs = self._vocode_mels(
+                    mels=mel,
+                    vocode=vocode,
+                    voc_dtype=voc_dtype,
+                )
         wav: torch.Tensor | list[torch.Tensor] = wavs[0] if len(wavs) == 1 else wavs
 
         # Keep the public vLLM-Omni audio contract as normalized float. This is
@@ -1257,10 +1260,23 @@ class IndexTTS2S2MelDecoder(nn.Module):
             estimator = getattr(cfm, "estimator", None) if cfm is not None else None
             if estimator is not None:
                 self._enable_dit_cuda_graph(estimator)
-        if device.type == "cuda" and bool(getattr(self.config, "s2mel_allow_tf32", False)):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
         self._dit_runtime_configured = True
+
+    @contextlib.contextmanager
+    def _maybe_s2mel_tf32_context(self, device: torch.device):
+        """Scope TF32 enablement to S2Mel execution and restore prior backend flags."""
+        if device.type != "cuda" or not bool(getattr(self.config, "s2mel_allow_tf32", False)):
+            yield
+            return
+        prev_matmul = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            yield
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
 
     def _warmup_external_models(self) -> None:
         """Preload vocoder + semantic codec to eliminate first-request latency."""
