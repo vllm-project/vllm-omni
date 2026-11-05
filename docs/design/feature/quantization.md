@@ -158,6 +158,12 @@ is independent of the BF16 prefix policy and of element rounding. Evaluate
 layer/step clipping, reconstruction error and task quality together; see the
 [MXFP8 guide](../../user_guide/quantization/mxfp8.md#npu-mxfp8-block-scale-selection).
 
+Online and offline NPU weights share a contiguous `(K, N)` GEMM layout and
+`(ceil(K / 64), N, 2)` scale layout. Scale loading explicitly materializes
+canonical strides `(2 * N, 2, 1)`: when the first dimension is one,
+`contiguous()` alone may retain transpose strides that CANN rejects. This
+normalization happens once during weight loading, outside the forward path.
+
 ## NPU online MXFP8 BF16 prefix policy
 
 `DiffusionMXFP8Config` accepts `prefix_bf16_steps` (default `0`) and
@@ -175,8 +181,12 @@ therefore share one precision policy.
 
 Omni owns master residency and DLO lifecycle. A CPU master is transferred as
 needed; a resident master stays on the loading device; `dlo` exposes the CPU
-master to the offloader's phase-aware payload provider. The handle is not a
-registered parameter or buffer, so `state_dict` and `module.to()` do not manage
+master to the offloader's phase-aware payload provider. An active `dlo` prefix requires the resolved
+distributed backend to select each affected quantized component; startup rejects
+missing or excluded components before loading checkpoint weights. Eligible
+streamed blocks use DLO payloads; non-block and resident auxiliary linears retain
+ordinary CPU-master fallback. The handle is not a registered parameter or buffer,
+so `state_dict` and `module.to()` do not manage
 it. See the [MXFP8 guide](../../user_guide/quantization/mxfp8.md) for usage and
 the [DLO contract](offloader/distributed_layerwise_offload.md) for transfer
 boundaries. CPU contract tests do not establish NPU generation quality.

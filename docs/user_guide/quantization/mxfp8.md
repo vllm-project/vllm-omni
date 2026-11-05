@@ -10,7 +10,7 @@ FP8 while keeping the same 8-bit weight footprint.
 This method supports three modes:
 
 | Mode | Description |
-|------|-------------|
+| ------ | ------------- |
 | **Online** | BF16 weights are quantized to MXFP8 at load time — no pre-processing needed |
 | **Offline (Native)** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
 | **Offline (AutoRound)** | AutoRound MXFP8 checkpoints with `data_type="mx_fp"` — auto-detected from `config.json` |
@@ -18,7 +18,7 @@ This method supports three modes:
 ## Hardware Support
 
 | Device | Online | Offline (Native) | Offline (AutoRound) |
-|--------|--------|------------------|---------------------|
+| -------- | -------- | ------------------ | --------------------- |
 | NVIDIA Blackwell GPU (SM 100+) | ⭕ | ⭕ | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ | ⭕ | ⭕ |
 | NVIDIA Ampere GPU (SM 80+) | ⭕ | ⭕ | ⭕ |
@@ -35,7 +35,7 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 ### Diffusion Model (Wan2.2)
 
 | Model | Mode | Notes |
-|-------|------|-------|
+| ------- | ------ | ------- |
 | Wan2.2-T2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
 | Wan2.2-I2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
 | Wan2.2-TI2V-5B | Online + Offline | Single transformer |
@@ -43,14 +43,14 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Status | Notes |
-|-------|--------|-------|
+| ------- | -------- | ------- |
 | Qwen3-Omni | Not validated | — |
 | Qwen3-TTS | Not validated | — |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Status | Notes |
-|-------|--------|-------|
+| ------- | -------- | ------- |
 | BAGEL | Not validated | — |
 | GLM-Image | Not validated | — |
 
@@ -132,7 +132,7 @@ python vllm_omni/quantization/tools/merge_mxfp8_checkpoint.py \
 ```
 
 | Argument | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `--model-type` | Model variant: `Wan2.2-T2V-A14B`, `Wan2.2-I2V-A14B`, or `Wan2.2-TI2V-5B` |
 | `--original-model` | Root directory of the original BF16 diffusers model |
 | `--quant-path` | Root directory of the msModelSlim quantized output |
@@ -199,7 +199,7 @@ omni = Omni(model="<autoround-mxfp8-model>")
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
@@ -277,6 +277,12 @@ significantly increase accelerator memory. `dlo` requires distributed
 layerwise offload and streams the BF16 master through its existing bounded
 double buffers; it retains separate host backing for the standard and BF16
 representations but keeps device residency bounded by the offload block size.
+An active `dlo` prefix requires the distributed backend to select the affected
+quantized component; missing or excluded components fail before checkpoint
+weights are loaded. Both the compact `diffusion_offload_config` and the legacy
+distributed-offload flag are validated against the resolved policy and model
+offload plan. DLO streams eligible blocks. Auxiliary linears outside the streamed
+block lists, including resident blocks, keep the ordinary CPU-master fallback.
 The BF16 master is excluded from `state_dict` and is not moved by
 `module.to()`. Model migration, mixed-step batches, reload, and sleep/wake are
 not supported for `dlo`.

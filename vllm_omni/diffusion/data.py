@@ -36,7 +36,7 @@ from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import ComponentQuantizationConfig, build_quant_config
 
 if TYPE_CHECKING:
     from vllm.config import KVTransferConfig, ProfilerConfig
@@ -48,6 +48,21 @@ logger = init_logger(__name__)
 
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+
+
+def requires_mxfp8_dlo(quant_config: QuantizationConfig | None) -> bool:
+    """Return whether any routed MXFP8 config requests an active DLO prefix."""
+    if isinstance(quant_config, ComponentQuantizationConfig):
+        return any(
+            requires_mxfp8_dlo(config)
+            for config in (*quant_config.component_configs.values(), quant_config.default_config)
+        )
+    return bool(
+        quant_config is not None
+        and quant_config.get_name() == "mxfp8"
+        and getattr(quant_config, "prefix_bf16_steps", 0)
+        and getattr(quant_config, "prefix_bf16_master_mode", "cpu") == "dlo"
+    )
 
 
 def _move_diffusion_alias(
@@ -1452,6 +1467,7 @@ class OmniDiffusionConfig:
                     f"quantization_config must be str, dict, QuantizationConfig, or None, "
                     f"got {type(self.quantization_config)!r}"
                 )
+        self._validate_mxfp8_prefix_offload()
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
@@ -1556,7 +1572,24 @@ class OmniDiffusionConfig:
         """
         self.tf_model_config = tf_config
         self._propagate_quantization_from_tf_config(tf_config)
+        self._validate_mxfp8_prefix_offload()
         self._propagate_skip_softmax_calibration(tf_config)
+
+    def _validate_mxfp8_prefix_offload(self) -> None:
+        """Reject an active DLO master without the distributed transport owner."""
+        from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
+
+        if not isinstance(self.quantization_config, QuantizationConfig):
+            return
+        if resolve_offload(self).strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+            return
+
+        if requires_mxfp8_dlo(self.quantization_config):
+            raise ValueError(
+                "prefix_bf16_master_mode='dlo' requires distributed layerwise offload; "
+                "select a distributed diffusion_offload_config or enable_distributed_layerwise_offload, "
+                "or use prefix_bf16_master_mode='cpu' or 'resident'"
+            )
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
         cfg = getattr(self, "diffusion_attention_config", None)

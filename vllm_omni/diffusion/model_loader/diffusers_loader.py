@@ -18,7 +18,7 @@ from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_files_not_needed_for_inference,
@@ -31,7 +31,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, requires_mxfp8_dlo
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     HSDPShardContext,
@@ -1299,8 +1299,49 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
+        self._validate_mxfp8_prefix_offload_components(model)
         prepare_model_for_weight_reload(model, self.od_config, target_device)
         return model
+
+    def _validate_mxfp8_prefix_offload_components(self, model: nn.Module) -> None:
+        """Check actual quantized components before loading any checkpoint weights."""
+        if not isinstance(self.quant_config, QuantizationConfig) or not requires_mxfp8_dlo(self.quant_config):
+            return
+
+        def uses_dlo_prefix(module: nn.Module) -> bool:
+            return any(
+                requires_mxfp8_dlo(getattr(getattr(layer, "quant_method", None), "quant_config", None))
+                for layer in module.modules()
+            )
+
+        if not uses_dlo_prefix(model):
+            return
+
+        from vllm_omni.diffusion.offloader.base import OffloadConfig
+        from vllm_omni.diffusion.offloader.plan_resolver import resolve_offload_plan
+
+        config = OffloadConfig.from_od_config(self.od_config)
+        if config.strategy is not OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+            raise ValueError("prefix_bf16_master_mode='dlo' requires distributed layerwise offload")
+        resolved = resolve_offload_plan(model, config)
+        for component in resolved.components:
+            if not component.selected and uses_dlo_prefix(component.module):
+                raise ValueError(
+                    f"prefix_bf16_master_mode='dlo' requires distributed layerwise offload "
+                    f"for component {component.path!r}; include this component in diffusion_offload_config "
+                    "or use prefix_bf16_master_mode='cpu' or 'resident'"
+                )
+        selected_modules = {
+            id(layer) for component in resolved.components if component.selected for layer in component.module.modules()
+        }
+        for path, layer in model.named_modules():
+            quant_config = getattr(getattr(layer, "quant_method", None), "quant_config", None)
+            if id(layer) not in selected_modules and requires_mxfp8_dlo(quant_config):
+                raise ValueError(
+                    f"prefix_bf16_master_mode='dlo' for layer {path!r} requires a selected "
+                    "distributed layerwise offload component; declare and select its component, "
+                    "or use prefix_bf16_master_mode='cpu' or 'resident'"
+                )
 
     def _load_model_with_pre_sharded_hsdp(
         self,

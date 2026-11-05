@@ -201,7 +201,13 @@ events protect shared host staging from reuse while a transfer is in flight.
 Disabling the backend restores both standard tensors and auxiliary masters to
 CPU independently of the current request phase.
 
-This mode requires DLO. Model migration, mixed-step batches, reload, and
+This mode requires the resolved distributed backend to select the affected
+quantized component. Startup checks both the compact selector and legacy flags
+against the model offload plan before loading checkpoint weights. Eligible
+streamed blocks use the prefix payload; non-block and resident auxiliary linears
+keep the ordinary CPU-master fallback.
+
+Model migration, mixed-step batches, reload, and
 sleep/wake are outside its supported contract. CPU tests cover ring reuse,
 phase transitions, simulated AllGather and request reset; actual NPU streams,
 distributed execution, memory and generation quality still need device tests.

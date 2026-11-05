@@ -488,7 +488,9 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
         if K_groups % 2 == 1:
             s = torch.cat([s, torch.zeros(N, 1, dtype=s.dtype, device=s.device)], dim=1)
             K_groups += 1
-        s = s.reshape(N, K_groups // 2, 2).transpose(0, 1).contiguous()
+        # CANN inspects strides even when the leading scale dimension is 1.
+        # contiguous() can retain a transpose stride in that singleton case.
+        s = s.reshape(N, K_groups // 2, 2).transpose(0, 1).clone(memory_format=torch.contiguous_format)
 
         replace_parameter(layer, "weight", w)
         replace_parameter(layer, "weight_scale", s)
@@ -614,7 +616,11 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
         )
 
         # Normalize to canonical layout shared with offline path.
-        weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).transpose(0, 1).contiguous()
+        weight_scale = (
+            weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2)
+            .transpose(0, 1)
+            .clone(memory_format=torch.contiguous_format)
+        )
         weight_fp8 = weight_fp8.transpose(0, 1).contiguous()
 
         replace_parameter(layer, "weight", weight_fp8)

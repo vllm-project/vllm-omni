@@ -164,7 +164,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
     """Make an inventory expansion an explicit review decision."""
     category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
     assert category_counts == {
-        EnvironmentVariableCategory.PUBLIC_OMNI: 37,
+        EnvironmentVariableCategory.PUBLIC_OMNI: 38,
         EnvironmentVariableCategory.INHERITED_VLLM: 21,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 34,
         EnvironmentVariableCategory.MODEL_SPECIFIC: 97,
@@ -289,6 +289,7 @@ def test_collect_env_reports_only_safe_public_omni_values(monkeypatch):
     from collect_env import get_env_vars
 
     monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "tea_cache")
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_SCALE_METHOD", "amax_pow2_ceil")
     monkeypatch.setenv("HF_TOKEN", "hf-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("VLLM_OMNI_REPLICA_ID", "internal-replica")
@@ -296,6 +297,7 @@ def test_collect_env_reports_only_safe_public_omni_values(monkeypatch):
     report = get_env_vars()
 
     assert "DIFFUSION_CACHE_BACKEND=tea_cache" in report.splitlines()
+    assert "VLLM_OMNI_MXFP8_SCALE_METHOD=amax_pow2_ceil" in report.splitlines()
     assert "hf-secret" not in report
     assert "openai-secret" not in report
     assert "VLLM_OMNI_REPLICA_ID" not in report
