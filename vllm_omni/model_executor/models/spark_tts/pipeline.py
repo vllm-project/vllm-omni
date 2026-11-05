@@ -3,6 +3,7 @@
 """Spark-TTS: Qwen2 token generator followed by full-utterance BiCodec."""
 
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+from vllm_omni.model_executor.models.spark_tts.tokenizer import STOP_TOKEN_ID
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.spark_tts"
 
@@ -21,7 +22,7 @@ SPARK_TTS_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             custom_process_next_stage_input_func=f"{_PROC}.llm_to_bicodec_full_payload",
-            sampling_constraints={"detokenize": False, "stop_token_ids": [151645]},
+            sampling_constraints={"detokenize": False, "stop_token_ids": [STOP_TOKEN_ID]},
         ),
         StagePipelineConfig(
             stage_id=1,

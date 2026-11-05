@@ -13,8 +13,8 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 ``omni_coordinator_address`` is provided) its own
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
-Liveness monitoring and shutdown are inherited from
-:class:`CoreEngineProcManager` unchanged.
+Liveness monitoring is inherited from :class:`CoreEngineProcManager`.
+Spark's BiCodec stage receives extra exit grace for decoder cleanup.
 """
 
 from __future__ import annotations
@@ -59,14 +59,8 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
       added to every subprocess's kwargs.
     """
 
-    _DEFAULT_SHUTDOWN_GRACE_S = 15.0
-
     def shutdown(self, timeout: float | None = None) -> None:
-        # Stage codecs can spend several seconds in interpreter GC after
-        # EngineCore has released its CUDA resources. Preserve any caller's
-        # explicit deadline, but give the normal exit more time than vLLM's
-        # generic five-second process-manager default.
-        super().shutdown(timeout=self._DEFAULT_SHUTDOWN_GRACE_S if timeout is None else timeout)
+        super().shutdown(timeout=self._codec_shutdown_grace_s if timeout is None else timeout)
 
     def __init__(
         self,
@@ -92,6 +86,13 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         # while reusing the parent's instance methods (shutdown, monitor).
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
+
+        model_config = getattr(vllm_config, "model_config", None)
+        # Spark's decoder can spend extra time in interpreter GC after releasing
+        # CUDA resources. Other stages retain the upstream shutdown policy.
+        self._codec_shutdown_grace_s = (
+            15.0 if getattr(model_config, "model_arch", None) == "SparkBiCodecDecoder" else None
+        )
 
         # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
         # this to bound how long in-flight requests may drain. Omitting it makes

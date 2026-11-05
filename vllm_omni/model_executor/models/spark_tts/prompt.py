@@ -24,7 +24,7 @@ def clone_prompt(text: str, global_codes: list[int], semantic_codes: list[int], 
     if not text.strip() or not global_codes:
         raise ValueError("Spark-TTS clone requires text and reference global codes")
     globals_part = "".join(f"<|bicodec_global_{code}|>" for code in global_codes)
-    if ref_text is None:
+    if not ref_text or not ref_text.strip():
         return (
             "<|task_tts|><|start_content|>"
             + text.strip()
@@ -32,6 +32,8 @@ def clone_prompt(text: str, global_codes: list[int], semantic_codes: list[int], 
             + globals_part
             + "<|end_global_token|>"
         )
+    if not semantic_codes:
+        raise ValueError("Spark-TTS transcript-conditioned cloning requires reference semantic codes")
     semantics_part = "".join(f"<|bicodec_semantic_{code}|>" for code in semantic_codes)
     return (
         "<|task_tts|><|start_content|>"

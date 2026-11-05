@@ -273,13 +273,8 @@ steps:
         source_file_dependencies: tts_spark_tts_function
         commands:
           - |
-            # The official Spark-TTS repo is source-only; pin its importable
-            # sparktts modules without replacing Omni's Torch installation.
-            SPARK_TTS_SOURCE="$(mktemp -d)"
-            git clone --quiet --filter=blob:none https://github.com/SparkAudio/Spark-TTS.git "$SPARK_TTS_SOURCE"
-            git -C "$SPARK_TTS_SOURCE" checkout --quiet 2f1ea9082400547242641f5271b6f941c9f439d1
-            uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-deps \
-              'einops==0.8.2' 'einx==0.4.3' 'omegaconf==2.3.1' 'soxr==1.1.0'
+            # The pinned source and codec dependencies are cached in Dockerfile.ci.
+            test -f "${SPARK_TTS_SOURCE:?Spark-TTS source missing from CI image}/sparktts/models/bicodec.py"
             export PYTHONPATH="$SPARK_TTS_SOURCE:${PYTHONPATH:-}"
             pytest -s -v tests/e2e/offline_inference/test_spark_tts.py \
               -m 'core_model and tts and cuda and L4 and cards_1' --run-level core_model
