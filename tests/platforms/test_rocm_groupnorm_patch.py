@@ -51,6 +51,7 @@ def test_patch_import_does_not_load_runtime_registry(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
+    assert _SPEC is not None and _SPEC.loader is not None
     _SPEC.loader.exec_module(importlib.util.module_from_spec(_SPEC))
 
 
@@ -83,10 +84,9 @@ def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
 
 def test_model_without_vae_needs_no_groupnorm_patch(monkeypatch):
     model = types.SimpleNamespace()
-    od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
     monkeypatch.setattr(
         patch_groupnorm,
         "_replace_groupnorm_with_aiter",
         lambda _: pytest.fail("Models without a VAE need no GroupNorm replacement"),
     )
-    patch_groupnorm.patch_model_groupnorm(model, od_config)
+    patch_groupnorm.apply_aiter_groupnorm(model, "OtherDiffusionModel")
