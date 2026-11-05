@@ -2354,19 +2354,24 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             decode_meta_kwargs["model_intermediate_buffer"] = model_kwargs_extra.get("model_intermediate_buffer")
             update_decode_metadata(**decode_meta_kwargs)
 
-        try:
-            model_output = super()._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-                **model_kwargs_extra,
-            )
-        finally:
-            finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
-            if callable(finish_decode_step):
-                finish_decode_step()
+        super_model_forward = super()._model_forward
+
+        def run_model():
+            try:
+                return super_model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                    **model_kwargs_extra,
+                )
+            finally:
+                finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
+                if callable(finish_decode_step):
+                    finish_decode_step()
+
+        model_output = run_model()
         # CUDAGraphWrapper's weak_ref_tensors preserves the fields but turns
         # NamedTuple outputs into plain tuples. Restore the Omni envelope
         # before a model adapter or extraction discards its multimodal fields.
@@ -2379,6 +2384,17 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             model_output = OmniOutput(*model_output)
         if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+        # MiniCPM-o Talker K-frame step (a no-op for every other step): replays
+        # the forward once per extra frame and stashes the step's sampled ids.
+        from vllm_omni.worker import gpu_talker_multiframe
+
+        model_output = gpu_talker_multiframe.maybe_run(
+            self,
+            model_output,
+            run_model=run_model,
+            inputs_embeds=inputs_embeds,
+            model_kwargs_extra=model_kwargs_extra,
+        )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output
