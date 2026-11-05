@@ -10,7 +10,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from queue import Full, Queue
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -26,6 +26,9 @@ from vllm_omni.worker_v2.delivery import (
     DeliveryTimeoutError,
     OmniDeliveryManager,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniModelRunnerOutput
 
 
 @dataclass
@@ -207,6 +210,20 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 self._record_output_error(error)
             finally:
                 self._native_output_queue.task_done()
+
+    def publish_output(self, output: OmniModelRunnerOutput) -> None:
+        """Enqueue a materialized batch and remove transported output aliases."""
+        inter_stage_outputs = getattr(output, "inter_stage_outputs", None)
+        self.enqueue_outputs(
+            req_ids=list(output.req_ids),
+            inter_stage_outputs=inter_stage_outputs,
+            sampled_token_ids=getattr(output, "sampled_token_ids", None),
+        )
+        # Clear only after enqueueing succeeds: the queue retains the payload.
+        # Keep independent pooling results and inline output without a send path.
+        if inter_stage_outputs is not None and output.pooler_output is inter_stage_outputs and self._can_send:
+            output.pooler_output = None
+        output.inter_stage_outputs = None
 
     def enqueue_outputs(
         self,
