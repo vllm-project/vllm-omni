@@ -42,7 +42,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
-from vllm_ascend.worker.model_runner_v1 import graph_capture
+from vllm_ascend.worker.v1.model_runner import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager

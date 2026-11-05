@@ -1,19 +1,22 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Clean up old nightly builds from DockerHub (vllm/vllm-omni), keeping the
 # newest 14 tags with the nightly- prefix.
 
-set -ex
+# Keep credentials and bearer tokens out of shell traces.
+set +x
+set -eo pipefail
 
 TAG_PREFIX="nightly-"
 REPO="vllm/vllm-omni"
-REPO_API_URL="https://hub.docker.com/v2/repositories/${REPO}/tags"
+REPO_API_URL="https://hub.docker.com/v2/namespaces/${REPO%/*}/repositories/${REPO#*/}/tags"
 
 echo "Cleaning up tags with prefix: $TAG_PREFIX in repository: $REPO"
 
-if [ -z "$DOCKERHUB_TOKEN" ]; then
-  echo "Error: DOCKERHUB_TOKEN environment variable is not set"
+if [ -z "$RELEASE_DOCKERHUB_TOKEN" ]; then
+  echo "Error: RELEASE_DOCKERHUB_TOKEN environment variable is not set"
   exit 1
 fi
 
@@ -23,12 +26,10 @@ if [ -z "$DOCKERHUB_USERNAME" ]; then
 fi
 
 echo "Getting DockerHub bearer token..."
-set +x
 BEARER_TOKEN=$(curl -s -X POST \
   -H "Content-Type: application/json" \
-  -d "{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}" \
-  "https://hub.docker.com/v2/users/login" | jq -r '.token')
-set -x
+  -d "{\"identifier\": \"$DOCKERHUB_USERNAME\", \"secret\": \"$RELEASE_DOCKERHUB_TOKEN\"}" \
+  "https://hub.docker.com/v2/auth/token" | jq -er '.access_token')
 
 if [ -z "$BEARER_TOKEN" ] || [ "$BEARER_TOKEN" = "null" ]; then
   echo "Error: Failed to get DockerHub bearer token"
@@ -45,11 +46,9 @@ get_all_tags() {
   name_query=$(printf '%s' "$TAG_PREFIX" | jq -sRr @uri)
 
   while true; do
-    set +x
     local response
     response=$(curl -s -H "Authorization: Bearer $BEARER_TOKEN" \
       "$REPO_API_URL?page=$page&page_size=100&name=${name_query}")
-    set -x
 
     local page_count
     page_count=$(echo "$response" | jq -r '.results | length')
@@ -74,12 +73,11 @@ delete_tag() {
   local tag_name="$1"
   echo "Deleting tag: $tag_name"
 
-  local delete_url="https://hub.docker.com/v2/repositories/${REPO}/tags/$tag_name"
-  set +x
+  local delete_url="https://hub.docker.com/v2/namespaces/${REPO%/*}/repositories/${REPO#*/}/tags/$tag_name"
   local response http_code body
   response=$(curl -s -w "\n%{http_code}" -X DELETE \
     -H "Authorization: Bearer $BEARER_TOKEN" "$delete_url")
-  set -x
+
   http_code=$(printf '%s\n' "$response" | tail -n1)
   body=$(printf '%s\n' "$response" | sed '$d')
 

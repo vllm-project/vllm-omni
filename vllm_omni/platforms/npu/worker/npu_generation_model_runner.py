@@ -23,7 +23,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
@@ -33,7 +38,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
-from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
+from vllm_ascend.worker.v1.model_runner import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
@@ -104,6 +109,9 @@ class _AsyncNPUGenerationOutput(AsyncModelRunnerOutput):
     def get_output(self) -> OmniModelRunnerOutput:
         self._copies.wait()
         return self._output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self._output.kv_connector_output
 
 
 class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):

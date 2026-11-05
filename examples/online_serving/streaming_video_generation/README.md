@@ -63,7 +63,10 @@ pip install av websockets
 pip install 'vllm-omni[demo]' websockets
 ```
 
-For this 0.33 source checkout, install `.[demo]` with the temporary Gradio wheel
+The command-line client needs only `av` and `websockets`, including when saving
+video; it does not require PyTorch or a local vLLM/vLLM-Omni installation.
+
+For the Gradio demo in this 0.33 source checkout, install `.[demo]` with the temporary Gradio wheel
 using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
 from the repository root, while retaining the `av` and `websockets` client
 dependencies above. The published-package command above applies to released
@@ -87,7 +90,12 @@ python streaming_video_client.py \
 ```
 
 The example client sends one `session.start` message, prints each received binary video chunk with its byte size and elapsed time, and saves the received bytes to `--output` after `session.done`.
-The client remuxes the gathered stream to a regular progressive MP4 file so that local playback knows the video duration.
+Video-only streams are converted to a regular MP4 at the session FPS. Streams
+with audio retain their compressed audio/video tracks and timestamps. Saving
+also runs after interruption using the received chunks. If media cannot be
+decoded or remuxed, the received bytes are retained as a best-effort fallback;
+such a file is not guaranteed to be playable. No file is created when no chunks
+were received, and a failed save does not replace an existing output file.
 
 Schedule midway prompt updates with `--prompt-updates`. None are sent unless you ask for them, and only pipelines that implement midway prompt updates accept them. Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
 
