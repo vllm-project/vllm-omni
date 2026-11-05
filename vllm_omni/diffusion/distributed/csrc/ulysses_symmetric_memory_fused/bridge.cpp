@@ -14,9 +14,9 @@ extern "C" void launch_ulysses_fused_exchange(
 
 namespace {
 uint64_t get_ffts_config() {
-    static void* shmem = dlopen("libshmem.so", RTLD_NOW | RTLD_LOCAL);
-    TORCH_CHECK(shmem, "shmem dlopen: ", dlerror());
-    static auto get_ffts = reinterpret_cast<uint64_t (*)()>(dlsym(shmem, "util_get_ffts_config"));
+    static void* library = dlopen("libshmem.so", RTLD_NOW | RTLD_LOCAL);
+    TORCH_CHECK(library, "Failed to load symmetric memory backend (libshmem.so): ", dlerror());
+    static auto get_ffts = reinterpret_cast<uint64_t (*)()>(dlsym(library, "util_get_ffts_config"));
     TORCH_CHECK(get_ffts, "ffts symbol missing");
     return get_ffts();
 }
@@ -51,11 +51,11 @@ void qkv(const at::Tensor& peers, at::Tensor q, at::Tensor k, at::Tensor v,
 }
 }  // namespace
 
-TORCH_LIBRARY(omni_ulysses_shmem_fused, m) {
+TORCH_LIBRARY(omni_ulysses_symmetric_memory_fused, m) {
     m.def("pull(Tensor peers, Tensor(a!) output, int rank, int world, int batch, int seq, int row_bytes, bool reverse) -> ()");
     m.def("qkv(Tensor peers, Tensor(a!) q, Tensor(b!) k, Tensor(c!) v, int rank, int world, int batch, int seq, int qr, int kr, int vr) -> ()");
 }
-TORCH_LIBRARY_IMPL(omni_ulysses_shmem_fused, PrivateUse1, m) {
+TORCH_LIBRARY_IMPL(omni_ulysses_symmetric_memory_fused, PrivateUse1, m) {
     m.impl("pull", pull);
     m.impl("qkv", qkv);
 }

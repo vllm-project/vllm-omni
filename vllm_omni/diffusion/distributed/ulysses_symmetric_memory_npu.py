@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Eager NPU Ulysses transport using CANN SHMEM and a fused AscendC kernel.
+"""Eager NPU Ulysses transport using symmetric memory and a fused AscendC kernel.
 
 The existing ``--ulysses-a2a-permute`` path uses one kernel per exchange to
 synchronize ranks, pull peer data and relayout it for attention. All WORLD
 ranks must participate in the same order and stream in one HCCS domain.
-Requires TorchNPU NPUSHMEM, CANN AscendC/SHMEM headers, a C++ toolchain
+Requires TorchNPU's NPUSHMEM backend, CANN SHMEM/AscendC headers, a C++ toolchain
 and libshmem.so on LD_LIBRARY_PATH.
 """
 
@@ -45,15 +45,14 @@ def _resolve_soc_version() -> str:
         soc_version = torch.npu.get_device_name(torch.npu.current_device())
     except Exception as exc:
         raise RuntimeError(
-            "Unable to determine the active Ascend SoC; set ASCENDC_SOC_VERSION "
-            "only when intentionally cross-compiling"
+            "Unable to determine the active Ascend SoC; set ASCENDC_SOC_VERSION only when intentionally cross-compiling"
         ) from exc
     if not isinstance(soc_version, str) or not soc_version.strip():
         raise RuntimeError(f"Ascend returned an invalid SoC name: {soc_version!r}")
     return soc_version.strip()
 
 
-def _update_version_metadata(fingerprint: "hashlib._Hash", root: Path) -> None:
+def _update_version_metadata(fingerprint: hashlib._Hash, root: Path) -> None:
     """Include installed toolchain metadata so upgrades cannot reuse a build."""
     for relative in (
         "version.info",
@@ -72,19 +71,19 @@ def ensure_a2a_permute_available() -> None:
     import torch_npu
     from torch.utils.cpp_extension import get_default_build_root, load
 
-    source = Path(__file__).parent / "csrc/ulysses_shmem_fused"
+    source = Path(__file__).parent / "csrc/ulysses_symmetric_memory_fused"
     soc_version = _resolve_soc_version()
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")).resolve()
-    shmem_spec = importlib.util.find_spec("shmem")
-    shmem_path = os.environ.get("SHMEM_ROOT")
-    if shmem_path:
-        shmem = Path(shmem_path).resolve()
-    elif shmem_spec is not None and shmem_spec.submodule_search_locations:
-        shmem = Path(next(iter(shmem_spec.submodule_search_locations))).resolve()
+    backend_spec = importlib.util.find_spec("shmem")
+    backend_path = os.environ.get("SHMEM_ROOT")
+    if backend_path:
+        backend_root = Path(backend_path).resolve()
+    elif backend_spec is not None and backend_spec.submodule_search_locations:
+        backend_root = Path(next(iter(backend_spec.submodule_search_locations))).resolve()
     else:
         raise RuntimeError("Install the CANN SHMEM package or set SHMEM_ROOT to its source/include root")
-    if not (shmem / "include/device/gm2gm/shmem_device_cc.h").is_file():
-        raise RuntimeError(f"CANN SHMEM device headers not found under {shmem}")
+    if not (backend_root / "include/device/gm2gm/shmem_device_cc.h").is_file():
+        raise RuntimeError(f"CANN SHMEM device headers not found under {backend_root}")
     fingerprint = hashlib.sha256()
     for path in sorted(source.iterdir()):
         if path.is_file() and path.suffix in {".cmake", ".cpp", ".h"}:
@@ -92,16 +91,16 @@ def ensure_a2a_permute_available() -> None:
             fingerprint.update(path.read_bytes())
     fingerprint.update(soc_version.encode())
     fingerprint.update(str(cann).encode())
-    fingerprint.update(str(shmem).encode())
+    fingerprint.update(str(backend_root).encode())
     _update_version_metadata(fingerprint, cann)
-    _update_version_metadata(fingerprint, shmem)
+    _update_version_metadata(fingerprint, backend_root)
     fingerprint.update(str(torch.__version__).encode())
     fingerprint.update(str(getattr(torch_npu, "__version__", "unknown")).encode())
     build_fingerprint = fingerprint.hexdigest()[:16]
-    cache_dir = Path(get_default_build_root()) / "omni_ulysses_shmem_fused" / build_fingerprint
+    cache_dir = Path(get_default_build_root()) / "omni_ulysses_symmetric_memory_fused" / build_fingerprint
     cache_dir.mkdir(parents=True, exist_ok=True)
     build = cache_dir / "ascendc"
-    library = build / "lib/libulysses_shmem_fused.so"
+    library = build / "lib/libulysses_symmetric_memory_fused.so"
     with FileLock(str(cache_dir / "build.lock")):
         if not library.is_file():
             # Legacy CANN links device objects in place. Retry failed builds
@@ -120,7 +119,7 @@ def ensure_a2a_permute_available() -> None:
                             "-B",
                             str(build),
                             "-DCMAKE_BUILD_TYPE=Release",
-                            f"-DSHMEM_ROOT={shmem}",
+                            f"-DSHMEM_ROOT={backend_root}",
                             f"-DSOC_VERSION={soc_version}",
                         ],
                         env=env,
@@ -143,7 +142,7 @@ def ensure_a2a_permute_available() -> None:
                 raise RuntimeError(f"AscendC build produced no library; see {log_path}")
     npu = Path(torch_npu.__file__).parent
     load(
-        name=f"omni_ulysses_shmem_fused_bridge_{build_fingerprint}",
+        name=f"omni_ulysses_symmetric_memory_fused_bridge_{build_fingerprint}",
         sources=[str(source / "bridge.cpp")],
         extra_include_paths=[str(npu / "include"), str(npu / "include/third_party/acl/inc"), str(cann / "include")],
         extra_ldflags=[str(library), f"-Wl,-rpath,{library.parent}", f"-L{npu / 'lib'}", "-ltorch_npu", "-ldl"],
@@ -154,7 +153,7 @@ def ensure_a2a_permute_available() -> None:
     )
 
 
-class NPUUlyssesSHMEM:
+class NPUUlyssesSymmetricMemory:
     """Single-stream symmetric workspace using fused AscendC exchanges.
 
     Inference-only, one stream, WORLD group, in one HCCS domain. Head-shard
@@ -164,11 +163,11 @@ class NPUUlyssesSHMEM:
 
     def __init__(self, capacity_bytes: int) -> None:
         if not dist.is_initialized() or dist.get_world_size() < 2:
-            raise RuntimeError("SHMEM exchange requires an initialized WORLD with at least two ranks")
+            raise RuntimeError("Symmetric memory exchange requires an initialized WORLD with at least two ranks")
         if capacity_bytes <= 0:
             raise ValueError("capacity_bytes must be positive")
         if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("NPU SHMEM Ulysses requires eager execution; graph capture is unsupported")
+            raise RuntimeError("NPU symmetric memory Ulysses requires eager execution; graph capture is unsupported")
         self.device = torch.device("npu", torch.npu.current_device())
         if symm_mem.get_backend(self.device) != "NPUSHMEM":
             raise RuntimeError("TorchNPU with the NPUSHMEM symmetric-memory allocator is required")
@@ -189,20 +188,20 @@ class NPUUlyssesSHMEM:
 
     def _check_stream(self) -> None:
         if self._closed:
-            raise RuntimeError("SHMEM workspace is closed")
+            raise RuntimeError("Symmetric memory workspace is closed")
         if torch.npu.current_device() != self.device.index:
-            raise RuntimeError("SHMEM workspace must be used on its original NPU device")
+            raise RuntimeError("Symmetric memory workspace must be used on its original NPU device")
         if torch.npu.current_stream(self.device) != self.stream:
-            raise RuntimeError("SHMEM workspace must be used on a single NPU stream")
+            raise RuntimeError("Symmetric memory workspace must be used on a single NPU stream")
         if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("NPU SHMEM Ulysses requires eager execution; graph capture is unsupported")
+            raise RuntimeError("NPU symmetric memory Ulysses requires eager execution; graph capture is unsupported")
 
     def _row_bytes(self, tensor: torch.Tensor, reverse: bool = False) -> int:
         """Validate inputs and return the bytes copied per head-shard row."""
         if tensor.device != self.device:
             raise ValueError("Input must be on the workspace NPU device")
         if tensor.requires_grad:
-            raise ValueError("NPU SHMEM Ulysses is inference-only")
+            raise ValueError("NPU symmetric memory Ulysses is inference-only")
         if tensor.ndim != 4 or any(tensor.shape[i] <= 0 for i in (0, 2, 3)):
             raise ValueError("Input must be [B, S, H, D] with positive batch, heads and head size")
         if tensor.dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -242,7 +241,7 @@ class NPUUlyssesSHMEM:
         staging = self.allocation[:required_bytes].view(tensor.dtype).view(tensor.shape)
         # copy_ also accepts row-strided Q/K/V views from packed projections.
         staging.copy_(tensor)
-        torch.ops.omni_ulysses_shmem_fused.pull(
+        torch.ops.omni_ulysses_symmetric_memory_fused.pull(
             self.peer_ptrs, output, self.rank, self.world, batch, seq_local, row_bytes, reverse
         )
         return output
@@ -291,13 +290,15 @@ class NPUUlyssesSHMEM:
             self._qkv_staging_views = staging_views
         for tensor, staging_view in zip(tensors, staging_views):
             staging_view.copy_(tensor)
-        torch.ops.omni_ulysses_shmem_fused.qkv(self.peer_ptrs, *outputs, self.rank, self.world, batch, seq, *rows)
+        torch.ops.omni_ulysses_symmetric_memory_fused.qkv(
+            self.peer_ptrs, *outputs, self.rank, self.world, batch, seq, *rows
+        )
         return outputs
 
     def close(self) -> None:
         """Finish queued exchanges before releasing symmetric memory."""
         self._check_stream()
-        # Every fused exchange ends with a device-side SHMEM barrier, which
+        # Every fused exchange ends with a cross-rank device barrier, which
         # guarantees peers have finished reading the staging workspace.
         torch.npu.synchronize(self.device)
         self._qkv_staging_views = None
@@ -308,12 +309,12 @@ class NPUUlyssesSHMEM:
         self._closed = True
 
 
-def _get_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_size: int) -> NPUUlyssesSHMEM:
+def _get_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_size: int) -> NPUUlyssesSymmetricMemory:
     """Share one workspace across layers; grow collectively for larger requests.
 
     Strict Ulysses already requires matching tensor shapes across ranks. The
     resulting byte capacity and growth decisions must consequently match too.
-    The group must contain every WORLD rank in the same order, since SHMEM's
+    The group must contain every WORLD rank in the same order, since the
     device barrier is collective over WORLD.
     """
     global _WORKSPACE, _WORKSPACE_GROUP
@@ -321,10 +322,12 @@ def _get_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_siz
     if tensors[0].device.type != "npu":
         raise ValueError("NPU ulysses_a2a_permute requires NPU tensors")
     if _WORKSPACE_GROUP is not None and group is not _WORKSPACE_GROUP:
-        raise RuntimeError("NPU SHMEM Ulysses supports a single process group; clear it before reinitialization")
+        raise RuntimeError(
+            "NPU symmetric memory Ulysses supports a single process group; clear it before reinitialization"
+        )
     if _WORKSPACE is None:
         if dist.get_process_group_ranks(group) != list(range(dist.get_world_size())):
-            raise ValueError("NPU SHMEM Ulysses requires the Ulysses group to match WORLD rank order")
+            raise ValueError("NPU symmetric memory Ulysses requires the Ulysses group to match WORLD rank order")
     required = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
     if _WORKSPACE is not None:
         if required <= _WORKSPACE.capacity_bytes:
@@ -334,10 +337,10 @@ def _get_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_siz
     # The first exchange may be a joint-only CFG prefill with zero image
     # tokens. Rendezvous still needs a positive symmetric allocation.
     capacity = max(64 << 20, ((required + (64 << 20) - 1) // (64 << 20)) * (64 << 20))
-    _WORKSPACE = NPUUlyssesSHMEM(capacity)
+    _WORKSPACE = NPUUlyssesSymmetricMemory(capacity)
     _WORKSPACE_GROUP = group
     logger.info(
-        "NPU SHMEM Ulysses initialized (rank=%d, world=%d, capacity_bytes=%d)",
+        "NPU symmetric memory Ulysses initialized (rank=%d, world=%d, capacity_bytes=%d)",
         dist.get_rank(),
         dist.get_world_size(),
         capacity,
@@ -352,7 +355,7 @@ def _resolve_group(group_name: str, world_size: int):
     return group
 
 
-def clear_ulysses_shmem_workspace() -> None:
+def clear_ulysses_symmetric_memory_workspace() -> None:
     """Collectively release the workspace before destroying process groups."""
     global _WORKSPACE, _WORKSPACE_GROUP
     if _WORKSPACE is not None:

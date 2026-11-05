@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-// Exact HCCS signal helpers from the installed SHMEM 1.6.0 header.
+// Exact HCCS signal helpers from the installed CANN SHMEM 1.6.0 header.
 // Avoid its unrelated UDMA include, whose internal header is absent in the wheel.
 
 ACLSHMEM_DEVICE void aclshmemi_signal_set(__gm__ int32_t *addr, int32_t val)
