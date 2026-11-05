@@ -49,12 +49,13 @@ from transformers.models.gemma.modeling_gemma import (
     apply_rotary_pos_emb,
 )
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.pi05 import modeling_pi05 as M
 
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "H100"}),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="The fused kernels need a CUDA GPU."),
     pytest.mark.skipif(not M.HAS_TRITON, reason="The fused kernels need Triton."),
 ]
