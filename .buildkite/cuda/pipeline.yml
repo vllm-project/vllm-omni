@@ -24,12 +24,14 @@ steps:
       - |
         set -euo pipefail
         if [[ -n "$${BACKEND_COMPARISON_ONLY:-}" || "$${BUILDKITE_BRANCH}" == "refs/pull/1994/head" ]]; then
-          if [[ "$${BACKEND_COMPARISON_ONLY:-}" != "1" ||
-                "$${BUILDKITE_SOURCE}" != "schedule" ||
-                "$${BUILDKITE_BRANCH}" != "refs/pull/1994/head" ||
+          case "$${BACKEND_COMPARISON_ONLY:-}/$${BUILDKITE_SOURCE}" in
+            1/schedule|smoke/api) ;;
+            *) echo "Invalid backend comparison mode or build source." >&2; exit 1 ;;
+          esac
+          if [[ "$${BUILDKITE_BRANCH}" != "refs/pull/1994/head" ||
                 "$${BUILDKITE_PIPELINE_SLUG}" != "vllm-omni" ||
                 "$${BUILDKITE_REPO}" != "https://github.com/vllm-project/vllm-omni.git" ]]; then
-            echo "Backend comparison requires the configured native schedule and PR 1994 ref." >&2
+            echo "Backend comparison requires the configured pipeline and PR 1994 ref." >&2
             exit 1
           fi
           for flag in NIGHTLY WEEKLY NON_CRITICAL MIRROR_HW; do
@@ -42,6 +44,11 @@ steps:
              [[ "$$(git rev-parse HEAD)" != "$${BUILDKITE_COMMIT}" ]]; then
             echo "Backend comparison requires an immutable commit matching the checkout." >&2
             exit 1
+          fi
+          if [[ "$${BACKEND_COMPARISON_ONLY}" == "smoke" ]]; then
+            smoke_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py "$${BACKEND_COMPARISON_CASES:?Select at least one model}")"
+            printf '%s\n' "$${smoke_steps}" | buildkite-agent pipeline upload
+            exit 0
           fi
         fi
         buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml

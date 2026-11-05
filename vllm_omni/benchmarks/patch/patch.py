@@ -452,6 +452,8 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
         return  # voice comes from --extra-body in config; no ref_audio to merge
     base = dict(rfi.extra_body) if rfi.extra_body else {}
     base.update(ex)
+    if sample.seed_tts_chat_ref_audio_field == "audio.ref_audio":
+        base["audio"] = {**(base.get("audio") or {}), "ref_audio": base.pop("ref_audio")}
     rfi.extra_body = base
 
 
@@ -955,6 +957,11 @@ def get_samples(args, tokenizer, **kwargs):
                 "Seed-TTS requires --dataset-path (HF dataset repo id or local directory) or "
                 "--hf-name for the Hub dataset id."
             )
+        chat_ref_audio_field = getattr(args, "seed_tts_chat_ref_audio_field", "ref_audio")
+        if chat_ref_audio_field == "audio.ref_audio" and (
+            args.dataset_name != "seed-tts" or args.backend != "openai-chat-omni"
+        ):
+            raise ValueError("audio.ref_audio requires seed-tts with --backend openai-chat-omni")
         reference_as_input = bool(getattr(args, "seed_tts_reference_as_input", False))
         if reference_as_input and (args.dataset_name != "seed-tts" or args.backend != "openai-realtime-chat"):
             raise ValueError("--seed-tts-reference-as-input requires seed-tts with --backend openai-realtime-chat")
@@ -999,6 +1006,7 @@ def get_samples(args, tokenizer, **kwargs):
             no_oversample=args.no_oversample,
             turns_per_session=turns_per_session,
             reference_as_input=reference_as_input,
+            chat_ref_audio_field=chat_ref_audio_field,
         )
 
     # Handle random-mm dataset (Omni's synthetic multimodal dataset)

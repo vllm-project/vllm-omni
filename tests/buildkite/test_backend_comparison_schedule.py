@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,11 +26,26 @@ def comparison_runner(tmp_path: Path):
     bindir.mkdir()
     calls = tmp_path / "calls"
     stub = bindir / "buildkite-agent"
-    stub.write_text('#!/bin/bash\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$TEST_CALLS"\n')
+    stub.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"--dry-run"* ]]; then cat "$TEST_TEMPLATE"; exit 0; fi\n'
+        'printf "%s %s\\n" "${0##*/}" "$*" >> "$TEST_CALLS"\n'
+        'if [[ "$*" == "pipeline upload" ]]; then cat > "$TEST_CALLS.json"; fi\n'
+    )
     stub.chmod(0o755)
+    template = tmp_path / "template.json"
+    template.write_text(
+        '{"steps":[{"key":"image-build-sglang-omni"},'
+        '{"key":"nightly-sglang-omni-qwen3-omni","plugins":[{'
+        '"github.com/buildkite-plugins/kubernetes-buildkite-plugin":'
+        '{"podSpec":{"containers":[{"resources":{"limits":{}}}]}}}]}]}'
+    )
     git = bindir / "git"
     git.write_text('#!/bin/bash\nprintf "%s\\n" "$TEST_CHECKOUT"\n')
     git.chmod(0o755)
+    # Set up the checked-out renderer path used by the real upload command.
+    (bindir / "python3").symlink_to(sys.executable)
+    (tmp_path / ".buildkite").symlink_to(ROOT / ".buildkite", target_is_directory=True)
     entry = yaml.safe_load(ENTRY.read_text())
     command = next(step for step in entry["steps"] if step["key"] == "upload-backend-comparison")["commands"][0]
     # Every dollar in the routing command is interpreted at job time, including the regex end anchor.
@@ -37,6 +54,7 @@ def comparison_runner(tmp_path: Path):
     env = {
         "PATH": f"{bindir}:/usr/bin:/bin",
         "TEST_CALLS": str(calls),
+        "TEST_TEMPLATE": str(template),
         "TEST_CHECKOUT": COMMIT,
         "BACKEND_COMPARISON_ONLY": "1",
         "BUILDKITE_SOURCE": "schedule",
@@ -85,6 +103,33 @@ def test_invalid_comparison_stops_without_uploading_any_pipeline(comparison_runn
     result, calls = comparison_runner(overrides)
     assert result.returncode != 0
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "source", "cases", "success"),
+    [
+        ("smoke", "api", "qwen-image,cosmos3-nano", True),
+        ("smoke", "webhook", "qwen-image", False),
+        ("smoke", "schedule", "qwen-image", False),
+        ("smoke", "api", "npu", False),
+        ("smoke", "api", "", False),
+    ],
+)
+def test_manual_smokes_require_explicit_models_and_api_source(
+    comparison_runner, tmp_path, mode, source, cases, success
+):
+    result, calls = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": mode, "BUILDKITE_SOURCE": source, "BACKEND_COMPARISON_CASES": cases}
+    )
+    assert (result.returncode == 0) == success, result.stderr
+    assert calls == (["buildkite-agent pipeline upload"] if success else [])
+    if success:
+        jobs = json.loads((tmp_path / "calls.json").read_text())["steps"]
+        assert [job["key"] for job in jobs] == [
+            "image-build-sglang-omni",
+            "smoke-sglang-qwen-image",
+            "smoke-sglang-cosmos3-nano",
+        ]
 
 
 def test_existing_label_selected_comparison_still_uploads(comparison_runner):

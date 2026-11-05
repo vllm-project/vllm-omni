@@ -62,6 +62,8 @@ class SeedTTSSampleRequest(SampleRequest):
     seed_tts_turns: tuple[SeedTTSTurn, ...] = ()
     #: Base64 WAV used as user input by matched HTTP / Realtime benchmarks.
     seed_tts_input_audio: str | None = None
+    #: Wire field for the speaker reference on chat endpoints.
+    seed_tts_chat_ref_audio_field: str = "ref_audio"
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,7 @@ class SeedTTSDataset(BenchmarkDataset):
     ) -> list[SampleRequest]:
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
+        chat_ref_audio_field = kwargs.pop("chat_ref_audio_field", "ref_audio")
         reference_as_input = bool(kwargs.pop("reference_as_input", False))
         turns_per_session = int(kwargs.pop("turns_per_session", 1))
         if reference_as_input and turns_per_session != 1:
@@ -322,6 +325,7 @@ class SeedTTSDataset(BenchmarkDataset):
                     request_id=f"{request_id_prefix}{session_index}",
                     seed_tts_speech_extra=None if reference_as_input else speech_extra,
                     seed_tts_input_audio=_seed_tts_input_audio(reference_wav_path) if reference_as_input else None,
+                    seed_tts_chat_ref_audio_field=chat_ref_audio_field,
                     seed_tts_utterance_id=turns[0].utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,

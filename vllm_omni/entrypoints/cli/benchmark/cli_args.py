@@ -457,6 +457,12 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         "If set, --dataset-path can still name the HF repo for logging; this path is used for files.",
     )
     group.add_argument(
+        "--seed-tts-chat-ref-audio-field",
+        choices=["ref_audio", "audio.ref_audio"],
+        default="ref_audio",
+        help="Chat request field for the Seed-TTS speaker reference. SGLang-Omni MiniCPM-o uses audio.ref_audio.",
+    )
+    group.add_argument(
         "--seed-tts-file-ref-audio",
         action="store_true",
         default=False,

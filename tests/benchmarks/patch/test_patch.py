@@ -62,7 +62,8 @@ def _seed_tts_request_func_input() -> RequestFuncInput:
     )
 
 
-def test_seed_tts_chat_request_carries_reference_audio_once() -> None:
+@pytest.mark.parametrize("field", ["ref_audio", "audio.ref_audio"])
+def test_seed_tts_chat_request_carries_reference_audio_once(field: str) -> None:
     reference_audio_url = "data:audio/wav;base64,AAAA"
     sample = SeedTTSSampleRequest(
         prompt="target text",
@@ -70,6 +71,7 @@ def test_seed_tts_chat_request_carries_reference_audio_once() -> None:
         expected_output_len=20,
         multi_modal_data=None,
         seed_tts_system_prompt="Clone the supplied voice.",
+        seed_tts_chat_ref_audio_field=field,
         seed_tts_speech_extra={
             "ref_audio": reference_audio_url,
             "ref_text": "reference text",
@@ -87,7 +89,8 @@ def test_seed_tts_chat_request_carries_reference_audio_once() -> None:
         },
         {"role": "user", "content": [{"type": "text", "text": "target text"}]},
     ]
-    assert request_func_input.extra_body["ref_audio"] == reference_audio_url
+    reference_config = request_func_input.extra_body if field == "ref_audio" else request_func_input.extra_body["audio"]
+    assert reference_config["ref_audio"] == reference_audio_url
     serialized_request = json.dumps(
         {"messages": request_func_input.omni_chat_messages, **request_func_input.extra_body},
     )
