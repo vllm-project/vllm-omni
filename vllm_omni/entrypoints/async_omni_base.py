@@ -323,6 +323,8 @@ class AsyncOmniBase(OmniBase):
         if self.final_output_task is not None:
             return
 
+        # generate() registers request state only after this returns, so every
+        # registered waiter has an owning loop for shutdown from another thread.
         self._loop = asyncio.get_running_loop()
         engine = self.engine
 
