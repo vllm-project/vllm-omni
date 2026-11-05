@@ -43,6 +43,14 @@ def campaign(tmp_path, monkeypatch, request):
             "packages": dict(profile["inference_runtime"]["packages"]),
         },
     }
+    snapshot = profile["inference_runtime"].get("source_snapshot_sha256")
+    if snapshot is not None:
+        lock = read_json(builder.ROOT / "tests/dfx/lingbot_world/runtime_sources.lock.json")
+        contract["hardware"]["source_attestations"] = {
+            "schema_version": 1,
+            "source_snapshot_sha256": snapshot,
+            "packages": copy.deepcopy(lock["packages"]),
+        }
     generations, qualities = [], []
     for cohort in range(2):
         generation, quality = tmp_path / f"generation-{cohort}", tmp_path / f"quality-{cohort}"
@@ -554,6 +562,125 @@ def test_reference_cohorts_cannot_mix_internally_consistent_harness_revisions(ca
 
     _rewrite_collection_provenance(campaign, change_harness)
     with pytest.raises(RegressionError, match="different benchmark harness revisions"):
+        _build(campaign)
+    assert campaign["calls"] == []
+    assert not campaign["output"].exists()
+
+
+@pytest.mark.parametrize("campaign", ["npu_nightly"], indirect=True)
+@pytest.mark.parametrize("kind", ["performance", "quality"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        None,
+        "missing_observed",
+        "missing_frozen",
+        "missing_both",
+        "wrong_digest_both",
+        "wrong_head_both",
+        "changed_patch",
+        "changed_flags",
+        "bool_as_integer",
+        "invalid_schema_both",
+        "missing_files_both",
+        "unknown_nested_both",
+        "bool_as_integer_both",
+        "unverified_both",
+        "changed_patch_both",
+    ],
+)
+def test_frozen_npu_records_bind_actual_source_snapshot(campaign, kind, mutation):
+    _build(campaign)
+    profile = campaign["profile"]
+    population = read_json(campaign["output"] / Path(profile["quality_reference_population"]).name)
+    observed = copy.deepcopy(population["contract"])
+    if kind == "performance":
+        frozen = read_json(campaign["output"] / Path(profile["reference_calibration"]).name)
+        expected_hardware = frozen["hardware"]
+    else:
+        frozen = population
+        expected_hardware = frozen["contract"]["hardware"]
+    current_hardware = observed["hardware"]
+    if mutation in {"missing_observed", "missing_both"}:
+        current_hardware.pop("source_attestations")
+    if mutation in {"missing_frozen", "missing_both"}:
+        expected_hardware.pop("source_attestations")
+    if mutation == "wrong_digest_both":
+        for hardware in (current_hardware, expected_hardware):
+            hardware["source_attestations"]["source_snapshot_sha256"] = "f" * 64
+    if mutation == "wrong_head_both":
+        for hardware in (current_hardware, expected_hardware):
+            hardware["source_attestations"]["packages"]["vllm-ascend"]["head"] = "f" * 40
+    if mutation == "changed_patch":
+        current_hardware["source_attestations"]["packages"]["vllm-ascend"]["files"]["Dockerfile"]["worktree"][
+            "sha256"
+        ] = "f" * 64
+    if mutation == "changed_flags":
+        current_hardware["source_attestations"]["packages"]["vllm-ascend"]["index_flags_clean"] = False
+    if mutation == "bool_as_integer":
+        current_hardware["source_attestations"]["packages"]["vllm-ascend"]["index_flags_clean"] = 1
+    if mutation == "invalid_schema_both":
+        for hardware in (current_hardware, expected_hardware):
+            hardware["source_attestations"]["schema_version"] = True
+    for hardware in (current_hardware, expected_hardware):
+        source = hardware.get("source_attestations", {}).get("packages", {}).get("vllm-ascend", {})
+        if mutation == "missing_files_both":
+            source.pop("files")
+        elif mutation == "unknown_nested_both":
+            source["unknown"] = True
+        elif mutation == "bool_as_integer_both":
+            source["index_flags_clean"] = 1
+        elif mutation == "unverified_both":
+            source["exact_snapshot_verified"] = False
+        elif mutation == "changed_patch_both":
+            source["files"]["Dockerfile"]["worktree"]["sha256"] = "f" * 64
+
+    def verify():
+        if kind == "performance":
+            builder.verify_reference_calibration_contract(observed, frozen)
+        else:
+            report = read_json(campaign["qualities"][0] / "quality.json")
+            builder.verify_quality_population_contract(
+                frozen,
+                observed,
+                evaluator_packages=report["evaluator_packages"],
+                evaluator_lock_sha256=frozen["evaluator_lock_sha256"],
+                asset_lock_sha256=frozen["asset_lock_sha256"],
+            )
+
+    if mutation is None:
+        verify()
+    else:
+        with pytest.raises(RegressionError, match="source"):
+            verify()
+
+
+@pytest.mark.parametrize("campaign", ["npu_nightly"], indirect=True)
+@pytest.mark.parametrize("mutation", ["missing", "digest", "patch", "flags", "clean"])
+def test_builder_rejects_forged_npu_source_snapshot_before_fitting(campaign, mutation):
+    generation, quality = campaign["generations"][1], campaign["qualities"][1]
+    path = generation / "generation.json"
+    manifest = read_json(path)
+    hardware = manifest["contract"]["hardware"]
+    if mutation == "missing":
+        hardware.pop("source_attestations")
+    elif mutation == "digest":
+        hardware["source_attestations"]["source_snapshot_sha256"] = "f" * 64
+    else:
+        source = hardware["source_attestations"]["packages"]["vllm-ascend"]
+        if mutation == "patch":
+            source["files"]["Dockerfile"]["worktree"]["sha256"] = "f" * 64
+        elif mutation == "flags":
+            source["index_flags_clean"] = False
+        else:
+            source["clean"] = True
+    write_json(path, manifest)
+    report_path = quality / "quality.json"
+    report = read_json(report_path)
+    report["contract"] = copy.deepcopy(manifest["contract"])
+    report["generation_manifest_sha256"] = sha256(path)
+    write_json(report_path, report)
+    with pytest.raises(RegressionError, match="source"):
         _build(campaign)
     assert campaign["calls"] == []
     assert not campaign["output"].exists()

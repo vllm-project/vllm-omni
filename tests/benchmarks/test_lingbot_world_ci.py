@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-from benchmarks.lingbot_world.regression import RegressionError, check_binary_activity, check_quality
+from benchmarks.lingbot_world.regression import RegressionError, check_binary_activity, check_quality, read_json
 from tests.dfx.lingbot_world.runner import ENGINE_ENVIRONMENT, server_arguments, server_environment
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -2158,3 +2158,52 @@ def test_ready_evaluator_rejects_changed_opencv_without_reinstall(tmp_path, monk
         prepare._prepare_evaluators(root)
     assert not any(command[:2] == ["uv", "pip"] for command in calls)
     assert all(p.read_bytes() == value for p, value in original.items())
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_npu_generation_rechecks_snapshot_before_precision_or_model(tmp_path, monkeypatch, changed):
+    import vllm_omni.platforms
+    from tests.dfx.lingbot_world import prepare, runner
+    from tests.helpers import runtime
+
+    settings = read_json(runner.ROOT / "tests/dfx/lingbot_world/configs/npu_nightly.json")
+    # Synthetic platform fixture only; this test does not load an NPU runtime/model.
+    settings.pop("reserved_cards")
+    settings["output"] = tmp_path / "generation"
+    settings["profile_path"] = runner.ROOT / "tests/dfx/lingbot_world/configs/npu_nightly.json"
+    lock = read_json(runner.ROOT / "tests/dfx/lingbot_world/runtime_sources.lock.json")
+    attestation = {
+        "schema_version": 1,
+        "source_snapshot_sha256": settings["inference_runtime"]["source_snapshot_sha256"],
+        "packages": lock["packages"],
+    }
+    calls = []
+
+    def attest(platform, *, profile_runtime):
+        calls.append((platform, profile_runtime))
+        if changed:
+            raise RegressionError("Runtime source snapshot changed")
+        return {"source_attestations": attestation}
+
+    platform = vllm_omni.platforms.current_omni_platform
+    monkeypatch.setattr(platform, "device_type", "npu")
+    monkeypatch.setattr(platform, "get_device_count", lambda: 4)
+    monkeypatch.setattr(platform, "get_device_name", lambda index: "Ascend910B3")
+    monkeypatch.setattr(platform, "get_device_total_memory", lambda index: 64 * 1024**3)
+    versions = {**settings["inference_runtime"]["packages"], "diffusers": "0.40.0", "transformers": "5.19.0"}
+    monkeypatch.setattr(runner.importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(prepare, "verify_inference_runtime", attest)
+    monkeypatch.setattr(runner, "git_revision", lambda source: "a" * 40)
+    monkeypatch.setattr(runner, "checked_assets", lambda settings: (tmp_path / "model", {}))
+    monkeypatch.setattr(runner, "validate_reference", lambda settings: tmp_path / "reference")
+    monkeypatch.setattr(runner, "_capture", lambda *args: pytest.fail("changed source loaded precision model"))
+    monkeypatch.setattr(runtime, "OmniServer", lambda *args, **kwargs: pytest.fail("changed source started server"))
+    if changed:
+        with pytest.raises(RegressionError, match="source snapshot"):
+            runner.generate(settings, reference_only=True)
+        assert read_json(settings["output"] / "generation.json")["passed"] is False
+        assert not (settings["output"] / "contract.json").exists()
+        assert not (settings["output"] / "reference").exists()
+    else:
+        assert runner.hardware_contract(settings)["source_attestations"] == attestation
+    assert calls == [("npu", settings["inference_runtime"])]

@@ -191,6 +191,14 @@ def hardware_contract(settings: dict[str, Any]) -> dict[str, Any]:
         except importlib.metadata.PackageNotFoundError:
             if package not in {"torch-npu", "vllm-ascend"} or settings["platform"] == "npu":
                 raise
+    source_attestations = None
+    runtime = settings.get("inference_runtime", {})
+    if settings["platform"] == "npu" and "source_snapshot_sha256" in runtime:
+        from tests.dfx.lingbot_world.prepare import verify_inference_runtime
+
+        # Prepare and generation are separate processes. Attest again before
+        # loading a model and carry the actual supplier snapshot into reports.
+        source_attestations = verify_inference_runtime("npu", profile_runtime=runtime)["source_attestations"]
     return {
         "platform": platform.device_type,
         "cards": settings["cards"],
@@ -198,6 +206,7 @@ def hardware_contract(settings: dict[str, Any]) -> dict[str, Any]:
         "devices": devices,
         "packages": packages,
         **({"allocation": allocation} if allocation is not None else {}),
+        **({"source_attestations": source_attestations} if source_attestations is not None else {}),
     }
 
 

@@ -194,6 +194,26 @@ contain a development `vllm-ascend` package and vendor-specific Torch version.
 Source preflight and package metadata do not establish NPU model qualification.
 Do not replace the integrated vendor stack with a CUDA wheel.
 
+The pinned official Ascend image contains an unstaged Dockerfile download-URL
+patch. NPU profiles bind
+[runtime_sources.lock.json](runtime_sources.lock.json), which records the exact
+vendor HEADs, trees, index entries, Git flags, submodule and original file
+status, modes and hashes. The attestor reads this state without modifying the
+vendor checkout. The Ascend checkout remains recorded as dirty; any other
+tracked, staged, untracked, concealed-index or file-content change fails setup.
+Generation verifies this state again before model inference and includes its
+actual attestation in the hardware contract. Both reference cohorts and the
+frozen performance and quality records must carry the same attestation.
+Profiles bind both the lock-file hash and the canonical package-record hash;
+each frozen verifier checks that package hash independently for both records,
+so matching malformed records cannot bypass source validation.
+Supplier source/native file inventories are provenance evidence; they do not
+establish loaded-library, kernel, performance or video-quality qualification.
+The preceding protocol is archived byte-for-byte in
+[the source-snapshot history](calibration/history/v033_reference_protocol_before_vendor_source_snapshot.json).
+No training cohort was collected before this provenance update; fitting rules,
+workloads, numerical allowances and the frozen reference revision are unchanged.
+
 For PR builds, LingBot NPU jobs require `npu-test` together with `nightly-test`
 or `weekly-test`. A shared nightly/weekly label alone must not allocate NPU
 benchmark resources. Scheduled non-PR runs still use `NIGHTLY=1` or `WEEKLY=1`.
