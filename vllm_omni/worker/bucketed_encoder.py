@@ -689,7 +689,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     if not _install_processor_hook(hop):
         logger.warning(
             "Bucketed encoder processor hook is unavailable for hop %d; "
-            "leaving encoders unwrapped so lengths are not mis-bucketed.",
+            "leaving encoders unwrapped so lengths are not bucketed at the wrong frame rate.",
             hop,
         )
         return []
