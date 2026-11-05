@@ -184,8 +184,11 @@ class StreamingCode2Wav:
             for offset in range(0, len(rows), self.max_batch_size):
                 part = rows[offset : offset + self.max_batch_size]
                 records = [self.request_states[request_ids[row]] for row in part]
+                # Every row in this group shares the same prefix length, so one
+                # index_select replaces a per-row slice + cat.
+                selected = index_to_device(part, codes.device)
                 self._run_batch(
-                    torch.cat([codes[row : row + 1, :, :frames] for row in part], dim=0),
+                    codes[:, :, :frames].index_select(0, selected),
                     [record.slot for record in records],
                     [0] * len(part),
                     prefix=True,
