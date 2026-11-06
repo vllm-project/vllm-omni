@@ -614,7 +614,6 @@ def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected
     runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
     runner._init_talker_mtp = mocker.Mock()
     runner._prewarm_attention_capture_workspaces = mocker.Mock()
-    runner._install_bucketed_encoders = mocker.Mock()
     mocker.patch("vllm_omni.worker.gpu_model_runner.GPUModelRunner.load_model")
 
     OmniGPUModelRunner.load_model(runner)
