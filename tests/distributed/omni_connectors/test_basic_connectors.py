@@ -51,11 +51,13 @@ def test_tensor_serialize_into_round_trip():
     import torch
 
     tensor = torch.tensor([[1.0, -2.5], [3.25, 4.5]], dtype=torch.bfloat16)
+    expected = OmniSerializer.serialize({"embeds": tensor})
     buffer = bytearray()
 
     size = OmniSerializer.serialize_into({"embeds": tensor}, buffer)
     deserialized = OmniSerializer.deserialize(buffer[:size])
 
+    assert bytes(buffer) == expected
     assert deserialized["embeds"].dtype == torch.bfloat16
     assert torch.equal(deserialized["embeds"], tensor)
 
