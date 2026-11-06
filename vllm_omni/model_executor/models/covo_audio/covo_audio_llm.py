@@ -92,7 +92,7 @@ class CovoAudioLLMForConditionalGeneration(nn.Module, SupportsPP, SupportsMultiM
         )
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
-        # Length bucketing wraps this model's own encoder and embed_multimodal.
+        # Length bucketing wraps this model's own encoder.
         # The install lives here — inside the model that owns the encoder — not
         # as a runner hook: every runner path (GPU / NPU / worker_v2) is covered
         # and stages without a bucketable encoder never see the installer.
@@ -121,7 +121,11 @@ class CovoAudioLLMForConditionalGeneration(nn.Module, SupportsPP, SupportsMultiM
         # Match encoder dtype (bfloat16) since audio_features from WhisperFeatureExtractor are float32
         encoder_dtype = next(self.encoder.parameters()).dtype
         audio_features = audio_features.to(dtype=encoder_dtype)
-        feats = self.encoder(audio_features).last_hidden_state
+        # Per-item lengths travel as an explicit argument on the encoder call
+        # (the bucketing wrapper's ``lengths`` contract, installed in __init__;
+        # WhisperEncoder's own forward has no length slot and never sees it).
+        # audio_num_tokens is this model's own per-item length field.
+        feats = self.encoder(audio_features, lengths=audio_num_tokens).last_hidden_state
         features = self.audio_adapter(feats)
         # Truncate each audio to its actual length (Whisper pads all to 30s)
         # Return a list of per-item tensors since lengths may differ.

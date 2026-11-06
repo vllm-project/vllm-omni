@@ -6,10 +6,13 @@
 Review feedback (gcanlin): the install belongs inside the model that owns the
 encoder, not as a runner hook. These tests pin that contract:
 
-- constructing a verified model with ``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` set
-  installs the bucketed wrapper on the model's own ``encoder`` and wraps
-  ``embed_multimodal`` (the published-length path);
-- without the env var the constructor leaves the forward untouched;
+- constructing a verified model installs the bucketed wrapper on the model's
+  own ``encoder`` (only ``module.forward`` — ``embed_multimodal`` is never
+  touched) and arms the feature when ``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` is
+  set;
+- without the env var the constructor still installs the pass-through wrapper
+  (the model's ``lengths`` call contract must stay valid) but the feature
+  stays disarmed — the forward's behavior is unchanged;
 - a stage without a bucketable encoder (Token2Wav) never sees the installer,
   whatever the env says — it has no install call by construction.
 """
@@ -59,9 +62,11 @@ def test_covo_llm_construction_installs_bucketed_encoder(monkeypatch):
     assert getattr(model, "_bucketed_installed", False), "model constructor must install the bucketed encoder"
     wrapper = model.encoder.forward  # the installer assigns the _BucketedEncoder here
     assert type(wrapper).__name__ == "_BucketedEncoder", "the model's own encoder must be wrapped"
-    assert wrapper._lengths is None  # nothing published yet (consume-once starts empty)
-    # embed_multimodal is replaced by the wrapper function, not the bound method.
-    assert getattr(model.embed_multimodal, "__self__", None) is not model
+    assert wrapper._active is True, "verified model + env must arm the feature"
+    # No wrapper state: per-item lengths ride the encoder call itself.
+    assert not hasattr(wrapper, "_lengths")
+    # embed_multimodal is the model's own bound method — never wrapped.
+    assert getattr(model.embed_multimodal, "__self__", None) is model
 
 
 def test_step_audio2_thinker_construction_installs_bucketed_encoder(monkeypatch):
@@ -87,11 +92,12 @@ def test_step_audio2_thinker_construction_installs_bucketed_encoder(monkeypatch)
     assert getattr(model, "_bucketed_installed", False), "model constructor must install the bucketed encoder"
     wrapper = model.encoder.forward
     assert type(wrapper).__name__ == "_BucketedEncoder", "the model's own encoder must be wrapped"
-    assert wrapper._lengths is None
-    assert getattr(model.embed_multimodal, "__self__", None) is not model
+    assert wrapper._active is True, "verified model + env must arm the feature"
+    assert not hasattr(wrapper, "_lengths")
+    assert getattr(model.embed_multimodal, "__self__", None) is model
 
 
-def test_construction_without_env_leaves_forward_untouched(monkeypatch):
+def test_construction_without_env_installs_pass_through_only(monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", raising=False)
     monkeypatch.setattr(covo_audio_llm, "init_vllm_registered_model", lambda **kwargs: _stub_lm())
     monkeypatch.setattr(covo_audio_llm, "WhisperEncoder", lambda cfg: torch.nn.Linear(4, 4))
@@ -105,8 +111,12 @@ def test_construction_without_env_leaves_forward_untouched(monkeypatch):
 
     model = covo_audio_llm.CovoAudioLLMForConditionalGeneration(vllm_config=vllm_config)
 
-    assert not getattr(model, "_bucketed_installed", False)
-    assert type(model.encoder.forward).__name__ != "_BucketedEncoder"
+    # The wrapper is installed (the model's ``lengths`` call contract must
+    # stay valid) but the feature is disarmed: the forward is a pass-through.
+    assert getattr(model, "_bucketed_installed", False)
+    wrapper = model.encoder.forward
+    assert type(wrapper).__name__ == "_BucketedEncoder"
+    assert wrapper._active is False, "feature must stay off without the env"
     assert getattr(model.embed_multimodal, "__self__", None) is model
 
 
