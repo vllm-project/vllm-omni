@@ -4,6 +4,7 @@ import hashlib
 import os
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import Future
 from dataclasses import replace
 from functools import partial
 from math import gcd
@@ -70,7 +71,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.transformers_utils.repo_utils import hf_api
-from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache, get_speaker_cache
 
 logger = init_logger(__name__)
 
@@ -99,6 +100,14 @@ def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) 
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
+
+# Processor instances share the cache, so coordinate cold work by cache identity
+# as well as key. Owners unregister before completing the future, so a caller
+# never joins a finished computation and retries after a failure.
+_REFERENCE_CONDITIONING_INFLIGHT: dict[
+    tuple[SpeakerEmbeddingCache, tuple[str, str, int]], Future[dict[str, torch.Tensor]]
+] = {}
+_REFERENCE_CONDITIONING_LOCK = Lock()
 
 
 def _normalize_request_conditioning(payload: dict) -> dict:
@@ -151,8 +160,8 @@ def _audio_conditioning(proc, audio, model_dir: str, config, mm_kwargs: Mapping[
     """Reference-audio conditioning (speech tokens, mel, speaker embedding).
 
     Reuses bounded, process-local artifacts keyed by voice name or by the
-    waveform content, and returns independent tensors so downstream mutation
-    cannot poison a cache hit.
+    waveform content. Concurrent misses share one computation; every caller
+    receives independent tensors so downstream mutation cannot poison a hit.
     """
     device = "cpu"
     voice_name = mm_kwargs.get("voice_name")
@@ -176,7 +185,17 @@ def _audio_conditioning(proc, audio, model_dir: str, config, mm_kwargs: Mapping[
         cache_key = proc._speaker_cache.make_cache_key(
             digest.hexdigest(), model_type=f"cosyvoice3-reference:{model_dir}:{backend}"
         )
-    cached = proc._speaker_cache.get(cache_key)
+    inflight_key = (proc._speaker_cache, cache_key)
+    with _REFERENCE_CONDITIONING_LOCK:
+        cached = proc._speaker_cache.get(cache_key)
+        future = None
+        owner = False
+        if cached is None:
+            future = _REFERENCE_CONDITIONING_INFLIGHT.get(inflight_key)
+            owner = future is None
+            if owner:
+                future = Future()
+                _REFERENCE_CONDITIONING_INFLIGHT[inflight_key] = future
     if os.environ.get("COSYVOICE3_REFERENCE_CACHE_DEBUG") == "1":
         _REFERENCE_CACHE_DEBUG[cached is not None] += 1
         if sum(_REFERENCE_CACHE_DEBUG.values()) % 128 == 0:
@@ -187,25 +206,39 @@ def _audio_conditioning(proc, audio, model_dir: str, config, mm_kwargs: Mapping[
                 model_dir,
             )
     if cached is None:
-        # Speech-token extraction via the S3Tokenizer PyTorch model on GPU
-        # (~30x faster than the bundled ``speech_tokenizer_v3.onnx`` CPU path).
-        speech_token, speech_token_len = proc._extract_speech_token_via_s3(audio, device)
-        speech_feat, speech_feat_len = extract_speech_feat(audio, proc.feat_extractor, device)
-        if config.sample_rate == 24000:
-            token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
-            speech_feat, speech_feat_len[:] = speech_feat[:, : 2 * token_len], 2 * token_len
-            speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
-        if proc.campplus_trt is not None:
-            embedding = extract_spk_embedding_trt(audio, proc.campplus_trt, device)
+        assert future is not None
+        if owner:
+            try:
+                # Speech-token extraction via the S3Tokenizer PyTorch model on GPU
+                # (~30x faster than the bundled ``speech_tokenizer_v3.onnx`` CPU path).
+                speech_token, speech_token_len = proc._extract_speech_token_via_s3(audio, device)
+                speech_feat, speech_feat_len = extract_speech_feat(audio, proc.feat_extractor, device)
+                if config.sample_rate == 24000:
+                    token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
+                    speech_feat, speech_feat_len[:] = speech_feat[:, : 2 * token_len], 2 * token_len
+                    speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
+                if proc.campplus_trt is not None:
+                    embedding = extract_spk_embedding_trt(audio, proc.campplus_trt, device)
+                else:
+                    embedding = extract_spk_embedding(audio, proc.campplus_session, device)
+                cached = {
+                    "speech_feat": speech_feat.detach().cpu().clone(),
+                    "speech_token": speech_token.detach().cpu().clone(),
+                    "speech_token_len": speech_token_len.detach().cpu().clone(),
+                    "embedding": embedding.detach().cpu().clone(),
+                }
+                proc._speaker_cache.put(cache_key, cached)
+            except BaseException as error:
+                # Even an interrupted owner must release every waiting caller.
+                with _REFERENCE_CONDITIONING_LOCK:
+                    _REFERENCE_CONDITIONING_INFLIGHT.pop(inflight_key)
+                future.set_exception(error)
+                raise
+            with _REFERENCE_CONDITIONING_LOCK:
+                _REFERENCE_CONDITIONING_INFLIGHT.pop(inflight_key)
+            future.set_result(cached)
         else:
-            embedding = extract_spk_embedding(audio, proc.campplus_session, device)
-        cached = {
-            "speech_feat": speech_feat.detach().cpu().clone(),
-            "speech_token": speech_token.detach().cpu().clone(),
-            "speech_token_len": speech_token_len.detach().cpu().clone(),
-            "embedding": embedding.detach().cpu().clone(),
-        }
-        proc._speaker_cache.put(cache_key, cached)
+            cached = future.result()
     return {key: value.clone() for key, value in cached.items()}
 
 
@@ -359,8 +392,6 @@ class _SpeechTokenBatcher:
         threading.Thread(target=self._run, name="cosyvoice3-s3-batch", daemon=True).start()
 
     def tokens(self, mel: torch.Tensor) -> torch.Tensor:
-        from concurrent.futures import Future
-
         future: Future = Future()
         self._queue.put((mel, future))
         return future.result()
@@ -842,7 +873,10 @@ class CosyVoice3Model(
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
-            self.code2wav = CosyVoice3Code2Wav(self.config)
+            self.code2wav = CosyVoice3Code2Wav(
+                self.config,
+                enable_npu_graphs=current_omni_platform.is_npu() and not vllm_config.model_config.enforce_eager,
+            )
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.

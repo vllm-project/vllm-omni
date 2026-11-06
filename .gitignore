@@ -242,6 +242,7 @@ data/
 datasets/
 *.csv
 *.json
+!vllm_omni/diffusion/models/hy_nomas/camera_trajectories.json
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json

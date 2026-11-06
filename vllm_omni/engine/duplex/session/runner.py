@@ -24,12 +24,13 @@ import asyncio
 import sys
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypeVar, cast
 
+import pybase64 as base64
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import (
@@ -47,6 +48,7 @@ from vllm_omni.engine.duplex.commands import (
     CreateResponse,
     DeleteItem,
     DuplexCommand,
+    GetSessionStats,
     Heartbeat,
     SignalTurn,
     TruncateItem,
@@ -72,6 +74,7 @@ from vllm_omni.engine.duplex.events import (
     ResponseDone,
     SessionExpired,
     SessionHeartbeatAck,
+    SessionStats,
 )
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
@@ -119,7 +122,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
 from vllm_omni.metrics.stats import StageRequestStats
-from vllm_omni.protocol.duplex import convert_input_audio_with_rate
+from vllm_omni.protocol.duplex import CONVERTIBLE_INPUT_FORMATS, convert_input_audio_with_rate
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -316,6 +319,15 @@ class DuplexSessionRunner:
             self._pending_input_appends += 1
         self._mailbox.put_nowait(command)
 
+    def on_stage_work(self, rows: Sequence[tuple[int, int, int, int, int]]) -> None:
+        """Record ``(stage_id, epoch, seq, start_ns, duration_ns)`` step spans (orchestrator loop).
+
+        Spans arrive with the raw stage output, not with a session output: a step
+        whose output never reaches the session still did work for its chunk.
+        """
+        if self.session.perf is not None:
+            self.session.perf.record_stage_work(rows)
+
     def on_stage_output(
         self,
         stage_id: int,
@@ -328,6 +340,10 @@ class DuplexSessionRunner:
         input_item_id: str | None = None,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
+        perf = self.session.perf
+        if perf is not None and context.perf_chunks:
+            # Marked here, not on the mailbox: forwarded outputs never reach it.
+            perf.mark_handled(context.perf_chunks)
         if self.memory.on_output(request_id, output, finished=context.segment_finished):
             return True
         if self.model.is_input_transcription(request_id):
@@ -644,6 +660,10 @@ class DuplexSessionRunner:
             elif isinstance(item, AppendAudio):
                 admission = len(item.audio) + sum(len(frame) for frame in item.video_frames)
                 session.release_input_bytes(admission, queued=True)
+            elif isinstance(item, GetSessionStats):
+                # Still answered, so the client need not time out: final turns
+                # keep their numbers and the rest read as cancelled.
+                self._on_get_session_stats(item)
             return
         await self._on_command(item)
 
@@ -750,7 +770,7 @@ class DuplexSessionRunner:
             admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
             with ExitStack() as reservation:
                 reservation.callback(session.release_input_bytes, admission, queued=True)
-                await self._on_append_audio(command.payload(), release_queued_input=reservation.close)
+                await self._on_append_audio(command.payload(encode_audio=False), release_queued_input=reservation.close)
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
             self._emit_error(
@@ -830,6 +850,8 @@ class DuplexSessionRunner:
                 self._promote_deferred_overlap_later(pending_observation, precreate_response)
         elif isinstance(command, Heartbeat):
             self._on_heartbeat(command)
+        elif isinstance(command, GetSessionStats):
+            self._on_get_session_stats(command)
         elif isinstance(command, CreateItem):
             previous_user_items = session.unanswered_user_items()
             control = resolve_create_item(projector, command)
@@ -878,6 +900,22 @@ class DuplexSessionRunner:
         self._begin_close(reason)
         await self.close(reason, emit_closed=False)
         self.manager.close_from_runner(self, reason)
+
+    def _on_get_session_stats(self, command: GetSessionStats) -> None:
+        """Answer ``session.stats.get`` with a snapshot of the perf ledger (RFC #8325).
+
+        It rides the same mailbox as appends, so the snapshot reflects every
+        command the client sent before it.
+        """
+        perf = self.session.perf
+        if perf is None:
+            self._emit_error(
+                "session_stats_disabled",
+                "This deployment does not collect session stats (duplex_session.collect_stats)",
+                event_id=command.event_id,
+            )
+            return
+        self._emit_events([SessionStats(request_event_id=command.event_id, stats=perf.snapshot())])
 
     def _on_heartbeat(self, command: Heartbeat) -> None:
         try:
@@ -1250,7 +1288,9 @@ class DuplexSessionRunner:
             if isinstance(video_frames_raw, list)
             else []
         )
-        has_audio = isinstance(audio, str) and bool(audio)
+        # A client append arrives as the decoded bytes (``payload(encode_audio=False)``);
+        # internal payloads carry base64.
+        has_audio = isinstance(audio, str | bytes) and bool(audio)
         has_video = bool(video_frames)
         modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
         if modality_error is not None:
@@ -1265,7 +1305,8 @@ class DuplexSessionRunner:
                 value = event.get(key)
                 if isinstance(value, str) and value.strip().lower() in {"barge_in", "interrupt", "cancel"}:
                     event.pop(key, None)
-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
+        fmt_raw = event.get("format")
+        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm16"
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
@@ -1282,26 +1323,37 @@ class DuplexSessionRunner:
             event["video_frames"] = video_frames
             detected = [(event, None)]
         else:
-            try:
-                converted: tuple[object, object, int | float | None] = await self.offload(
-                    convert_input_audio_with_rate,
-                    audio,
-                    fmt,
-                    sample_rate_hz=sample_rate_hz,
-                )
-            except ValueError as exc:
-                self._emit_error("bad_event", str(exc))
-                return
-            audio, fmt, converted_rate = converted
-            if converted_rate is not None:
-                sample_rate_hz = converted_rate
-            if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-                self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
-                return
+            # The front end already decodes appends to pcm_f32le, where conversion is a
+            # no-op; only pcm16 / G.711 still left as such goes to the pool to convert.
+            if fmt.lower() in CONVERTIBLE_INPUT_FORMATS:
+                if isinstance(audio, bytes):
+                    audio = base64.b64encode(audio).decode("ascii")
+                try:
+                    converted: tuple[object, object, int | float | None] = await self.offload(
+                        convert_input_audio_with_rate,
+                        audio,
+                        fmt,
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                except ValueError as exc:
+                    self._emit_error("bad_event", str(exc))
+                    return
+                audio, converted_fmt, converted_rate = converted
+                fmt = cast("str", converted_fmt)  # a str format comes back as a str
+                if converted_rate is not None:
+                    sample_rate_hz = converted_rate
+                if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+                    self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
+                    return
             event["audio"] = audio
             event["format"] = fmt
             event["sample_rate_hz"] = sample_rate_hz
             detected = await self.control.run_turn_detection(event)
+            for segment, _ in detected:
+                # Turn detection hands back base64 segments; audio it did not split
+                # (no detector) is still the decoded bytes, encoded here for the plugin.
+                if isinstance(segment.get("audio"), bytes):
+                    segment["audio"] = base64.b64encode(segment["audio"]).decode("ascii")
         with ExitStack() as unprocessed:
             releases: list[Callable[[], None] | None] = [None] * len(detected)
             charges = [0] * len(detected)

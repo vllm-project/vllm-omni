@@ -11,8 +11,14 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
-from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniServerParams,
+    dummy_messages_from_mix_data,
+)
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -24,8 +30,8 @@ _MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
-# The production YAML turns the Thinker (stage 0) prefix cache on and the CI
-# overlay inherits it; these args also enable it on the Talker and pin the
+# The production YAML leaves the Thinker prefix cache off with model runner
+# v2. These args turn it back on for the Thinker and Talker and pin the
 # block size. CI overlay pins ``async_chunk: False``; the existing server
 # keeps ``--no-async-chunk``. Production Qwen YAML is ``async_chunk: true``,
 # so a sibling server boots with ``--async-chunk`` and the same cache
@@ -45,6 +51,8 @@ test_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=["--no-async-chunk", *_PREFIX_CACHE_SERVER_ARGS],
+            stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+            init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
         ),
         id="default",
     )
@@ -56,6 +64,8 @@ prefix_cache_async_chunk_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=["--async-chunk", *_PREFIX_CACHE_SERVER_ARGS],
+            stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+            init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
         ),
         id="prefix_cache_async_chunk",
     )

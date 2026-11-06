@@ -29,7 +29,12 @@ class _Manager:
         self.request_payload: dict[str, dict] = {}
         self._pending_streaming_prefills: dict[str, dict] = {}
         self.config = SimpleNamespace(
-            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT))
+            hf_config=SimpleNamespace(
+                im_start_token_id=151644,
+                user_token_id=872,
+                talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT),
+                thinker_config=SimpleNamespace(audio_token_id=151675, image_token_id=151655, video_token_id=151656),
+            )
         )
 
     def process(self, output, request, is_finished=False):
@@ -114,7 +119,8 @@ def test_sampled_stream_sends_each_token_one_step_earlier():
     chunk0 = manager.process(_output(PROMPT, sampled=_embed(11)), _request([11]))
     assert chunk0 is not None  # at the prefill step, not after the next decode step
     assert torch.equal(chunk0.embed.prefill, torch.cat([_embed(t) for t in [*PROMPT, 11]]))
-    assert chunk0.hidden_states.output.shape[0] == len(PROMPT)
+    # Text-only prompt: the merged prefill is all embeddings.
+    assert chunk0.hidden_states is None
     assert chunk0.ids.all == [*PROMPT, 11]
     # Decode step 1 processes 11 and samples 12: it carries 12.
     chunk1 = manager.process(_output([11], sampled=_embed(12)), _request([11, 12], history=False))
