@@ -142,6 +142,10 @@ Traffic / concurrency flags:
 
 ### Video job timeout and failures
 
+`--video-poll-interval` sets the time between video status checks in seconds
+(default: 2). Video request latency runs from job submission through receipt of
+complete video bytes; job deletion is excluded.
+
 `--video-job-timeout` controls how long each `/v1/videos` job may be polled,
 including time queued on the server (default: `900` seconds). For long video
 jobs at high concurrency, use a larger budget, for example
