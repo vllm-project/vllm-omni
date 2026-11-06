@@ -3,7 +3,7 @@
 
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -207,6 +207,42 @@ def test_forward_uses_decoder_audio_contract_without_context():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_streaming_backend_uses_scheduler_ids_and_releases_segment_state(mocker):
+    model = _make_model(async_chunk=True)
+    backend = mocker.Mock()
+    backend.decode.return_value = [torch.ones(1, 4)]
+    model._streaming_codec = backend
+    out = model.forward(
+        input_ids=torch.tensor([1, 2]),
+        request_ids=["scheduler-id"],
+        model_intermediate_buffer=[{"meta": {"request_id": "external-id", "is_segment_finished": True}}],
+    )
+    call = backend.decode.call_args.kwargs
+    assert call["request_ids"] == ["scheduler-id"]
+    assert call["terminal"] == [True]
+    assert len(call["caches"]) == 1
+    backend.release.assert_called_once_with(["scheduler-id"])
+    assert model._decoder_state_cache == {}
+    torch.testing.assert_close(out.multimodal_outputs["model_outputs"][0], torch.ones(4))
+
+
+def test_empty_terminal_chunk_and_abort_release_streaming_slots(mocker):
+    model = _make_model(async_chunk=True)
+    backend = mocker.Mock()
+    model._streaming_codec = backend
+    model._decoder_state_cache["scheduler-id"] = {}
+    out = model.forward(
+        input_ids=torch.tensor([0]),
+        request_ids=["scheduler-id"],
+        model_intermediate_buffer=[{"meta": {"request_id": "external-id", "finished": True}}],
+    )
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 0
+    backend.decode.assert_not_called()
+    backend.release.assert_called_once_with(["scheduler-id"])
+    model.on_requests_finished({"aborted-id"})
+    assert backend.release.call_args.args == ({"aborted-id"},)
 
 
 def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
@@ -777,7 +813,7 @@ def _rho_meta(*, request_id: str = "rid", **meta: object) -> list[dict[str, obje
     return [{"meta": payload}]
 
 
-def _mock_logged_messages(mock_logger: object) -> list[str]:
+def _mock_logged_messages(mock_logger: Mock) -> list[str]:
     """Re-apply %-style formatting to the messages a patched logger recorded."""
     messages: list[str] = []
     for call in mock_logger.info.call_args_list:
@@ -1138,3 +1174,9 @@ def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fai
     assert observed == [(True, 10, *original)]
     assert torch.backends.cudnn.benchmark is False
     assert torch.backends.cudnn.benchmark_limit == 5
+
+
+def test_stage_post_warmup_memory_stats_omits_missing_snapshot():
+    model = _make_model()
+
+    assert model.get_stage_post_warmup_memory_stats() is None

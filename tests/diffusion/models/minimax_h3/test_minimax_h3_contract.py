@@ -177,10 +177,12 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
         def __init__(self, **kwargs):
             self.pushes = []
             self.kwargs = kwargs
+            self.frame_count = 0
             self.__class__.instances.append(self)
 
         def push(self, frames, *, on_consumed=None):
             self.pushes.append(np.array(frames, copy=True))
+            self.frame_count += len(frames)
             if on_consumed is not None:
                 on_consumed()
 
@@ -195,6 +197,15 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
+        owns_chunk_output = True
+
+        def is_distributed_enabled(self):
+            return False
+
         chunk_value_range = (0.0, 1.0)
 
         def __init__(self):
@@ -217,20 +228,86 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
         FakeEncoder,
     )
 
+    frame_counts: list[int] = []
     output = pipeline.decode_to_mp4(
         torch.zeros(1),
         torch.zeros(1),
         height=2,
         width=2,
         batch_frames=4,
+        frame_counts=frame_counts,
     )
 
     assert output == b"mp4"
+    assert frame_counts == [9]
     encoder = FakeEncoder.instances[-1]
     assert [frames.shape[0] for frames in encoder.pushes] == [6, 3]
     assert np.array_equal(encoder.pushes[0][0], np.full((2, 2, 3), 0, dtype=np.uint8))
     assert np.array_equal(encoder.pushes[0][3], np.full((2, 2, 3), 64, dtype=np.uint8))
     assert encoder.pushes[1].shape == (3, 2, 2, 3)
+
+
+@pytest.mark.parametrize("fail_video_load", [False, True])
+def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failure(monkeypatch, fail_video_load):
+    """Ready audio should start muxing even when video loading has not begun."""
+    import threading
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
+
+    events = []
+
+    class AudioVAE:
+        def decode_latent(self, latent):
+            events.append("audio_ready")
+            return torch.zeros(1, 1, 8000)
+
+    class VideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
+        decode_dtype = torch.float16
+        chunk_value_range = (0.0, 1.0)
+        owns_chunk_output = True
+
+        def is_distributed_enabled(self):
+            return False
+
+        def decode_with_chunks(self, latent, *, on_chunk):
+            on_chunk(torch.zeros(1, 3, 4, 16, 32))
+
+    @contextmanager
+    def component_on_device(self, component):
+        if component is self.video_vae:
+            events.append("video_load")
+            if fail_video_load:
+                raise RuntimeError("video load failed")
+        yield
+        if component is self.audio_vae:
+            events.append("audio_offload")
+
+    start = ChunkedVideoMP4Session.start
+
+    def record_start(self, **kwargs):
+        events.append("mux_start")
+        return start(self, **kwargs)
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = AudioVAE()
+    pipeline.video_vae = VideoVAE()
+    pipeline.device = torch.device("cpu")
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_component_on_device", component_on_device)
+    monkeypatch.setattr(ChunkedVideoMP4Session, "start", record_start)
+    before = set(threading.enumerate())
+    if fail_video_load:
+        with pytest.raises(RuntimeError, match="video load failed"):
+            pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=16, width=32)
+    else:
+        assert pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=16, width=32)
+    assert events[:4] == ["audio_ready", "mux_start", "audio_offload", "video_load"]
+    assert not [thread for thread in threading.enumerate() if thread not in before and thread.name == "chunked-mp4"]
 
 
 def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
@@ -260,6 +337,15 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
+        owns_chunk_output = True
+
+        def is_distributed_enabled(self):
+            return False
+
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
 
@@ -921,6 +1007,95 @@ def test_joint_postprocess_is_multiprocessing_picklable():
     assert result["fps"] == 24
 
 
+def test_preencoded_output_survives_process_queue_pickling():
+    from multiprocessing.reduction import ForkingPickler
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+        _MiniMaxH3EncodedOutput,
+    )
+
+    output = _MiniMaxH3EncodedOutput(video=b"encoded-video", frame_counts=[7])
+    restored = ForkingPickler.loads(ForkingPickler.dumps(output))
+    assert restored.video == b"encoded-video"
+    assert restored.frame_counts == [7]
+    assert _minimax_h3_post_process(restored)["metadata"]["video"]["frame_counts"] == [7]
+
+
+def test_preencoded_frame_counts_survive_registered_postprocess():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _MiniMaxH3EncodedOutput,
+        get_minimax_h3_post_process_func,
+    )
+    from vllm_omni.diffusion.output_formatter import (
+        normalize_diffusion_postprocess_output,
+    )
+
+    postprocess = get_minimax_h3_post_process_func(SimpleNamespace())
+    restored = ForkingPickler.loads(ForkingPickler.dumps(postprocess))
+    output = _MiniMaxH3EncodedOutput(video=[b"first-mp4", b"second-mp4"], frame_counts=[7, 9])
+    output = ForkingPickler.loads(ForkingPickler.dumps(output))
+    assert isinstance(output, _MiniMaxH3EncodedOutput)
+    result = restored(output)
+    normalized = normalize_diffusion_postprocess_output(result)
+    assert normalized.outputs["video"] == [b"first-mp4", b"second-mp4"]
+    assert normalized.metadata["video"]["frame_counts"] == [7, 9]
+
+
+@pytest.mark.parametrize("frame_counts", [[], [7, 9], [0], [-1], [True], ["7"], 7])
+def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+        _MiniMaxH3EncodedOutput,
+    )
+
+    result = _minimax_h3_post_process(_MiniMaxH3EncodedOutput(video=[b"encoded-video"], frame_counts=frame_counts))
+
+    assert result["video"] == [b"encoded-video"]
+    assert result["audio"] == [None]
+    assert result["fps"] == 24
+    assert "metadata" not in result
+
+
+def test_untyped_four_tuple_is_not_treated_as_encoded_frame_counts():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_post_process
+
+    output = ([b"encoded-video"], None, None, [7])
+    assert _minimax_h3_post_process(output) is output
+
+
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_outputs):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import MiniMaxH3DecoderPipeline
+
+    def encode(self, video_latent, audio_latent, *, frame_counts, **kwargs):
+        frame_counts.append(7 + 2 * int(video_latent.item()))
+        return b"encoded-video"
+
+    monkeypatch.setattr(MiniMaxH3DecoderPipeline, "decode_to_mp4", encode)
+    decoder = object.__new__(MiniMaxH3DecoderPipeline)
+    nn.Module.__init__(decoder)
+    decoder.device = torch.device("cpu")
+    decoder.od_config = SimpleNamespace()
+    payload = {
+        "video_latents": [torch.tensor([index]) for index in range(num_outputs)],
+        "audio_latents": [torch.zeros(1) for _ in range(num_outputs)],
+        "preencode_mp4": True,
+        "height": 480,
+        "width": 864,
+        "video_codec_options": None,
+        "preencode_batch_frames": 17,
+    }
+    request = SimpleNamespace(prompts=[{"additional_information": {"minimax_h3_decode": payload}}])
+
+    result = decoder.forward(request)
+    assert result.output.frame_counts == [7, 9][:num_outputs]
+    formatted = result.post_process_func(result.output)
+
+    assert formatted["payload"]["video"] == [b"encoded-video"] * num_outputs
+    assert formatted["metadata"]["video"]["frame_counts"] == [7, 9][:num_outputs]
+
+
 def test_joint_video_output_is_quantized_before_transfer():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _minimax_h3_post_process,
@@ -1343,7 +1518,7 @@ def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
 
 
 def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks
 
     class InactiveContext:
         sp_active = False
@@ -1351,13 +1526,13 @@ def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatc
     attention = _fake_packed_attention("CUDNN_ATTN")
     attention.attention.use_ring = True
     monkeypatch.setattr(
-        minimax_h3_transformer,
+        minimax_h3_blocks,
         "is_forward_context_available",
         lambda: True,
         raising=False,
     )
     monkeypatch.setattr(
-        minimax_h3_transformer,
+        minimax_h3_blocks,
         "get_forward_context",
         InactiveContext,
         raising=False,
@@ -2125,6 +2300,88 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     )
 
     assert next(video_vae.parameters()).dtype == torch.float32
+
+
+def test_lightvae_installs_before_device_move_and_stager(monkeypatch, tmp_path):
+    from safetensors.torch import save_file
+
+    from tests.diffusion.models.minimax_h3.test_minimax_h3_vae_lightvae import (
+        _native_checkpoint,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    model, checkpoint, expected = _native_checkpoint()
+    path = tmp_path / "lite.safetensors"
+    save_file(
+        checkpoint.state_dict, path, metadata={"architecture": json.dumps(dict(checkpoint.config, kept_layers=[1, 3]))}
+    )
+    events = []
+
+    class Remote(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model
+
+        def to(self, *args, **kwargs):
+            assert torch.equal(self.model.decoder.x_embedder.weight, expected["decoder.x_embedder.weight"])
+            events.append("move")
+            return super().to(*args, **kwargs)
+
+    def stage(vae, device):
+        assert len(vae.model.decoder.transformer_blocks) == 2
+        assert torch.equal(vae.model.decoder.x_embedder.weight, expected["decoder.x_embedder.weight"])
+        events.append("stager")
+
+    monkeypatch.setattr(vae_module, "_load_component_config", lambda _: checkpoint.config)
+    monkeypatch.setattr(vae_module, "_load_remote_component", lambda *args, **kwargs: Remote())
+    monkeypatch.setattr(vae_module, "install_h3_vae_optimizations", lambda *args, **kwargs: events.append("optimize"))
+    monkeypatch.setattr(vae_module.MiniMaxH3VideoVAE, "_build_residency_stagers", stage)
+    vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cuda"),
+        load_device=torch.device("cpu"),
+        lightvae_decoder_path=str(path),
+    )
+    assert events == ["move", "optimize", "stager"]
+    assert vae.model is model
+
+
+def test_lightvae_rejects_nvfp4_decoder_before_loading(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("Conflicting decoder selections must fail before loading assets")
+
+    monkeypatch.setattr(vae_module, "_load_component_config", unexpected_load)
+    with pytest.raises(ValueError, match="cannot be combined with video_vae_decoder"):
+        vae_module.MiniMaxH3VideoVAE(
+            "unused",
+            device=torch.device("cpu"),
+            decoder_source="decoder-nvfp4.safetensors",
+            lightvae_decoder_path="lite.safetensors",
+        )
+
+
+def test_encode_only_does_not_open_lightvae_checkpoint(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    remote = nn.Module()
+    remote.model = nn.Module()
+    remote.model.encoder = nn.Linear(2, 2)
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _: {"latent_channels": 2, "latents_mean": [0.0, 0.0], "latents_std": [1.0, 1.0]},
+    )
+    monkeypatch.setattr(vae_module, "_load_video_vae_encoder", lambda *args: remote)
+    vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cpu"),
+        encode_only=True,
+        lightvae_decoder_path="does-not-exist.safetensors",
+    )
+    assert vae.remote is remote
+    assert not hasattr(vae.model, "decoder")
 
 
 @pytest.mark.parametrize("fail_encode", [False, True])
@@ -3585,6 +3842,15 @@ def _peer_rank_preencode_pipeline(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class PeerRankVideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
+        owns_chunk_output = False
+
+        def is_distributed_enabled(self):
+            return False
+
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
 
