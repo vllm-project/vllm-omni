@@ -3629,6 +3629,8 @@ class MiniMaxH3Pipeline(
         self._prepare_adaln_adapter(sampling)
         return {
             "continuation": None,
+            "control_rows": None,
+            "control_context_scale": 1.0,
             "regenerate_source": (video_latent, audio_latent),
             "regenerate_output_audio": draft_audio,
             "task": conditioning.task,

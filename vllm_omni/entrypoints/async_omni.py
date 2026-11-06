@@ -1201,6 +1201,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -1211,16 +1212,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             stages: List of stage IDs to profile. If None, profiles all stages.
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
         """
         validate_profile_iteration_bounds(delay_iterations, max_iterations)
         # Mirror upstream ExecutorBase.profile: forward the per-session
         # controls as kwargs only when set, so workers without them keep
         # working with plain (is_start, profile_prefix) args.
-        kwargs: dict[str, int] = {}
+        kwargs: dict[str, Any] = {}
         if delay_iterations is not None:
             kwargs["delay_iterations"] = delay_iterations
         if max_iterations is not None:
             kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
         return await self.collective_rpc(
             method="profile",
             args=(True, profile_prefix),
