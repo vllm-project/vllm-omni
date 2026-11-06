@@ -106,7 +106,7 @@ stages:
       num_speculative_tokens: 7
 ```
 
-vLLM 0.32 resolves a draft config with `architectures: ["DSparkDraftModel"]`
+vLLM 0.33 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
 layers require the Thinker on MRv2; the V1 Thinker rejects them at load.
 Validation covers CUDA turn sessions with greedy text and speech output.

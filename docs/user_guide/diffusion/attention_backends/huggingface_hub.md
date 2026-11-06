@@ -19,6 +19,11 @@ If `kernels` is unavailable, an explicit `FLASH_ATTN_HUB` or
 `FLASH_ATTN_3_HUB` selection raises. Automatic / `FLASH_ATTN` selection in the
 Diffusers adapter may still walk hub then local FlashAttention backends.
 
+For FlashAttention 2, the loader tries Hub API versions 1, 2, then 3.
+Version 3 provides Torch stable-ABI CUDA builds compatible with the Torch 2.14
+runtime used by vLLM 0.33. An explicit Hub selection raises if none of these
+versions has a compatible build.
+
 ## Usage
 
 ```bash

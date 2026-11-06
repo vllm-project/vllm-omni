@@ -34,6 +34,9 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
     # video path plus text prompts and returns a ``video_segmentation`` payload.
     supports_video_segmentation: bool = False
+    # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
+    # and returns a ``video_depth`` payload of per-frame depth maps.
+    supports_video_depth: bool = False
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
@@ -55,6 +58,8 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -62,6 +67,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_segmentation=True,
         supports_video_segmentation=True,
     ),
+    "VideoDepthAnythingPipeline": DiffusionModelMetadata(supports_video_depth=True),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,

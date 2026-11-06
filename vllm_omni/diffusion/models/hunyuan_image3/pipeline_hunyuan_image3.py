@@ -61,6 +61,7 @@ from .request_layout import HunyuanPreparedLayout
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +374,7 @@ class HunyuanImage3Pipeline(
         "final_layer.forward",
     ]
 
-    def __init__(self, od_config: OmniDiffusionConfig) -> None:
+    def __init__(self, od_config: OmniDiffusionConfig, backbone_meta: bool = False) -> None:
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
         self.hf_config.cfg_distilled = _config_flag(self.hf_config, "cfg_distilled")
         self.hf_config.use_meanflow = _config_flag(self.hf_config, "use_meanflow")
@@ -391,7 +392,29 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+        shared_group = getattr(od_config, "weight_sharing", None)
+        # The AR adapter's router contract is FP32; ordinary DiT stays unchanged.
+        shared_router_dtype = torch.float32 if shared_group is not None and shared_group.role == "consumer" else None
+        if backbone_meta:
+            from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
+
+            validate_supported_layout(self.hf_config)
+            # Shared loading currently assumes TP only, with EP disabled.
+            # RoPE caches are private and must be created on the execution device.
+            rope_device = get_local_device()
+            # Only the shared backbone is constructed on meta; private
+            # components below are built on the worker's target device.
+            with torch.device("meta"):
+                self.model = HunyuanImage3Model(
+                    self.hf_config,
+                    quant_config=quant_config,
+                    shared_router_dtype=shared_router_dtype,
+                    rope_device=rope_device,
+                )
+        else:
+            self.model = HunyuanImage3Model(
+                self.hf_config, quant_config=quant_config, shared_router_dtype=shared_router_dtype
+            )
         self.transformer = self.model
         # Lazy import to break circular dependency:
         # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan
@@ -503,6 +526,13 @@ class HunyuanImage3Pipeline(
         return loader.load_weights(
             weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
+
+    @staticmethod
+    def get_weight_sharing_adapter() -> "WeightSharingAdapter":
+        """Return the model-specific shared-weight operations used by the loader."""
+        from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
+
+        return hunyuan_image3
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
