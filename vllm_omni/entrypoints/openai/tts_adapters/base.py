@@ -397,7 +397,9 @@ class TTSModelAdapter(ABC):
         """The serving stage's deploy setting ``name``, or None when it is unset.
 
         A typed stage config keeps the setting in one of its sections; a
-        legacy one keeps every setting flat under ``engine_args``.
+        legacy one keeps every setting flat under ``engine_args``. A section
+        the typed config lacks is a caller bug and raises ``AttributeError``;
+        only an unset setting returns None.
 
         Args:
             section: The typed config's section that holds the setting, such

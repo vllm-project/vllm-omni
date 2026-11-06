@@ -1122,6 +1122,10 @@ Original accepts nonnegative finite `extra_params.exaggeration` and
 Both reject VoiceDesign, free-form instructions and multilingual synthesis.
 `max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
 and defaults to 1000. Admission capacity does not guarantee real-time playback.
+References queued together are encoded as one batch, and a reference evicted from
+the speaker cache is encoded again in whatever batch is current, so cloned-voice
+output can vary slightly with concurrency and cache state; see the
+[H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md#reference-conditioning-batch).
 
 See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original)
 and the [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).

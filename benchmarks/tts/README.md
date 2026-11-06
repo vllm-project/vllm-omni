@@ -24,7 +24,7 @@ on CPU or an explicit CUDA device, times both and checks real-weight
 serial/batch parity: tokens must match exactly and features within 1e-4. On
 real Turbo weights one of the 64 references gets one different decoder
 prompt token in the batch, so that run exits nonzero and the recipe reports
-it. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients)
+it. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-perf-matrix)
 for measured 8- to 64-client results and their capacity and quality limitations.
 
 `chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
@@ -376,7 +376,7 @@ uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 
 Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
 H100 baselines come from the October 15 qualification run documented in the
-[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-latency-and-throughput-baselines-default-profiles).
+[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-perf-matrix).
 B200 is routed as a CI mirror without an assigned performance baseline.
 The job measures the built-in voice over HTTP; cloned-voice load is
 qualified separately in the H100 recipe.
