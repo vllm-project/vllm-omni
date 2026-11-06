@@ -9,7 +9,9 @@ This script tests two main scenarios:
 2. Case 2: Comparing FlashAttention and SDPA backends for batch_size=2 with padding
 """
 
+import functools
 import sys
+import warnings
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -72,6 +74,113 @@ def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
     assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
     assert fa.vllm_varlen_version_kwargs(other_func) == {}
     assert fa.vllm_varlen_version_kwargs(None) == {}
+
+
+def _dynamo_lru_cache_warnings(records: list[warnings.WarningMessage]) -> list[str]:
+    """Return Dynamo's ``functools.lru_cache``-wrapper warnings from ``records``."""
+    return [str(entry.message) for entry in records if "lru_cache" in str(entry.message)]
+
+
+def _reset_dynamo_warn_once_cache() -> None:
+    """Let this test's compiled trace re-emit warnings Dynamo already deduped.
+
+    Dynamo dedups warnings by exact message, so a trace of the same call site
+    in an earlier test of the same process would otherwise hide the warning
+    this test asserts is absent.
+    """
+    import torch._dynamo.utils
+
+    cache = getattr(torch._dynamo.utils, "warn_once_cache", None)
+    if cache is not None:
+        cache.clear()
+
+
+@pytest.mark.cpu
+def test_compiled_vllm_varlen_version_kwargs_avoids_dynamo_cache_warning(monkeypatch):
+    """A compiled varlen caller must not trace the ``@cache``-wrapped resolver.
+
+    Dynamo ignores ``functools`` cache wrappers and warns on every trace, so
+    ``vllm_varlen_version_kwargs`` resolves the default version through a
+    constant-marked accessor. The resolver here stays cache-wrapped (unlike
+    the dispatcher-targeting test above, which swaps in a plain lambda), so
+    this regression can actually fire.
+    """
+
+    @functools.cache
+    def cache_wrapped_resolver(requested=None):
+        return 3
+
+    def vllm_varlen(**_kwargs):
+        return None
+
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", cache_wrapped_resolver)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is vllm_varlen)
+
+    def add_version(x):
+        return x + fa.vllm_varlen_version_kwargs(vllm_varlen).get("fa_version", 0)
+
+    x = torch.zeros(4)
+    eager_output = add_version(x)
+    assert torch.equal(eager_output, x + cache_wrapped_resolver())
+
+    # The warning is emitted while Dynamo traces, so the "eager" backend
+    # exercises it without requiring an inductor toolchain.
+    _reset_dynamo_warn_once_cache()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compiled_output = torch.compile(add_version, backend="eager")(x)
+
+    assert torch.equal(compiled_output, eager_output)
+    assert _dynamo_lru_cache_warnings(caught) == []
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
+def test_compiled_vllm_varlen_wrapper_matches_eager_without_cache_warning():
+    """Compile the real varlen caller with the real ``@cache``-wrapped resolver.
+
+    The compiled call must select the same FlashAttention version as eager
+    (bitwise output parity) without Dynamo warning about the cache wrapper.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 17, 23, 4, 64
+    softmax_scale = head_dim**-0.5
+
+    torch.manual_seed(23)
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device=device, dtype=dtype)
+    value = torch.randn_like(key)
+
+    # The eager kwargs carry the version the compiled path must bake in.
+    assert fa.vllm_varlen_version_kwargs(fa.flash_attn_varlen_func) == {
+        "fa_version": fa.resolve_vllm_flash_attn_version()
+    }
+
+    eager_output = FlashAttentionImpl._flash_varlen_wrapper(
+        query,
+        key,
+        value,
+        attn_func=fa.flash_attn_varlen_func,
+        causal=False,
+        softmax_scale=softmax_scale,
+    )
+
+    _reset_dynamo_warn_once_cache()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compiled_output = torch.compile(FlashAttentionImpl._flash_varlen_wrapper)(
+            query,
+            key,
+            value,
+            attn_func=fa.flash_attn_varlen_func,
+            causal=False,
+            softmax_scale=softmax_scale,
+        )
+
+    assert compiled_output.shape == query.shape
+    assert torch.equal(compiled_output, eager_output)
+    assert _dynamo_lru_cache_warnings(caught) == []
 
 
 @pytest.mark.cpu
