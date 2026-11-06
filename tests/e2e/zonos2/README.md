@@ -62,6 +62,12 @@ jobs, selected through model-specific source dependencies.
 
 ## Assertions and evidence
 
+The offline and HTTP tests use the shipped B1 deployment profile, including
+its memory ratios and 4096-token prefill budget. The offline request omits
+sampling overrides to exercise deployment defaults. Only the concurrency
+stress test opts into B4 with a 128-token prefill budget; it does not replace
+the recommended B1 coverage or establish B4 speech-quality qualification.
+
 The offline test requires nonempty 44.1kHz float32 audio, finite samples,
 reasonable duration, nonzero RMS, aligned EOS, exact `frames * 512` sample
 count and both talker/DAC cleanup notifications. It also checks that its

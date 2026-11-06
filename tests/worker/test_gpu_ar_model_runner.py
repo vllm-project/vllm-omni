@@ -24,7 +24,7 @@ from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
-from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
+from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY, REQUEST_SAMPLING_PARAMS_KEY
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -43,7 +43,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("opt_in", [False, True])
-def test_model_sampling_progress_does_not_copy_lifecycle_history(mocker, opt_in):
+@pytest.mark.parametrize("prepopulated", [False, True])
+def test_model_sampling_progress_does_not_copy_lifecycle_history(mocker, opt_in, prepopulated):
     class NoIteration(list):
         def __iter__(self):
             raise AssertionError("Per-step lifecycle history must not be copied")
@@ -60,7 +61,7 @@ def test_model_sampling_progress_does_not_copy_lifecycle_history(mocker, opt_in)
 
     def preprocess(input_ids, input_embeds, **info):
         seen.update(info)
-        return input_ids, input_embeds, {}
+        return input_ids, input_embeds, {"request_id": info["request_id"], "model_owned": 7}
 
     runner.model.preprocess = preprocess
     params = SamplingParams(max_tokens=128, seed=42)
@@ -73,11 +74,10 @@ def test_model_sampling_progress_does_not_copy_lifecycle_history(mocker, opt_in)
     runner.query_start_loc = CpuGpuBuffer(2, dtype=torch.int32, device=torch.device("cpu"), pin_memory=False)
     runner.query_start_loc.cpu[:] = torch.tensor([0, 1])
     runner.positions = torch.tensor([64])
-    runner.model_intermediate_buffer = {}
+    runner.model_intermediate_buffer = {"r": {"model_owned": 3}} if prepopulated else {}
     for method in (
         "_collect_additional_information_for_prefill",
         "_update_additional_information",
-        "_update_intermediate_buffer",
     ):
         setattr(runner, method, mocker.Mock())
     runner._init_model_kwargs = lambda: {}
@@ -87,11 +87,16 @@ def test_model_sampling_progress_does_not_copy_lifecycle_history(mocker, opt_in)
     scheduler.total_num_scheduled_tokens = 1
     scheduler.num_scheduled_tokens = {"r": 1}
     runner._preprocess(scheduler, 1)
+    stored = runner.model_intermediate_buffer["r"]
+    assert stored["model_owned"] == 7 and stored["request_id"] == "r"
+    assert runner.requests["r"].additional_information_cpu is stored
+    for key in (OUTPUT_TOKEN_COUNT_KEY, LAST_OUTPUT_TOKEN_KEY, REQUEST_SAMPLING_PARAMS_KEY, "_omni_req_id"):
+        assert key not in stored
     assert "_omni_output_token_ids" not in seen
     if opt_in:
         assert seen[OUTPUT_TOKEN_COUNT_KEY] == 64
         assert seen[LAST_OUTPUT_TOKEN_KEY] == 1
-        assert seen["_omni_sampling_params"]["seed"] == 42
+        assert seen[REQUEST_SAMPLING_PARAMS_KEY]["seed"] == 42
         runner.requests["r"].output_token_ids.append(0)
         assert seen[OUTPUT_TOKEN_COUNT_KEY] == 64 and seen[LAST_OUTPUT_TOKEN_KEY] == 1
     else:

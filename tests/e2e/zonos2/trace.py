@@ -13,6 +13,7 @@ from pathlib import Path
 def install_trace() -> None:
     import torch
 
+    from vllm_omni.data_entry_keys import REQUEST_ID_KEY
     from vllm_omni.model_executor.models.zonos2.zonos2_dac_decoder import (
         Zonos2Code2WavForConditionalGeneration as Decoder,
     )
@@ -40,7 +41,7 @@ def install_trace() -> None:
             write(
                 {
                     "kind": "conditioning",
-                    "request": info["_omni_req_id"],
+                    "request": info[REQUEST_ID_KEY],
                     "prompt_sha": digest(frames),
                     "speaker_sha": digest(speaker) if speaker is not None else None,
                 }

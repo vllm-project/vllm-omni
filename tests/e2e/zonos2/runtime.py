@@ -19,17 +19,15 @@ def model_path() -> str:
     return str(path)
 
 
-def deployment(directory: Path, *, streaming: bool = True) -> Path:
+def deployment(directory: Path, *, streaming: bool = True, use_shipped_profile: bool = True) -> Path:
     data = yaml.safe_load((ROOT / "vllm_omni/deploy/zonos2.yaml").read_text())
     data["async_chunk"] = streaming
     data["connectors"]["connector_of_shared_memory"]["extra"]["codec_streaming"] = streaming
-    data["stages"][0].update(
-        devices="0", gpu_memory_utilization=0.72, max_num_seqs=4, max_model_len=6144, max_num_batched_tokens=128
-    )
-    data["stages"][1].update(devices="0", gpu_memory_utilization=0.1, max_num_seqs=4)
-    # Never inherit a dummy setting from a validation override.
-    for stage in data["stages"]:
-        stage["load_format"] = "auto"
+    if not use_shipped_profile:
+        data["stages"][0].update(
+            devices="0", gpu_memory_utilization=0.72, max_num_seqs=4, max_model_len=6144, max_num_batched_tokens=128
+        )
+        data["stages"][1].update(devices="0", gpu_memory_utilization=0.1, max_num_seqs=4)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "deploy.yaml"
     path.write_text(yaml.safe_dump(data, sort_keys=False))

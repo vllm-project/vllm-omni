@@ -93,6 +93,22 @@ use the common serving encoders. Native sample rate is 44,100 Hz.
 
 ## State and validation
 
+The talker requires the V1 GPU runner (`model_runner: v1` in the deployment,
+`use_v2_model_runner=False` in the resolved model configuration). MRv2 is
+rejected at construction because it does not supply this model's lifecycle
+and sampling metadata. Eager execution, synchronous AR scheduling and no
+prefix cache are also required.
+
+For offline generation, omitting `sampling_params_list` selects the shipped
+deployment defaults: temperature 1.15, top-k 106, min-p 0.18, repetition
+penalty 1.2 and seed 42. A supplied vLLM `SamplingParams` is a complete
+override, not a patch of those defaults. For example,
+`SamplingParams(max_tokens=256)` also selects vLLM's temperature 1.0,
+disabled top-k, min-p 0 and repetition penalty 1.0. To change only the budget,
+clone the entries in `engine.default_sampling_params_list` and change the
+talker's `max_tokens`. Values equal to vLLM defaults remain valid explicit
+choices; model-specific options in `extra_args` take precedence.
+
 The producer sends cumulative raw-code snapshots; `meta.num_processed_tokens`
 is the output frame target and `meta.last_chunk` marks the codec terminal.
 These fields survive the framework's runtime metadata rewrite. The decoder

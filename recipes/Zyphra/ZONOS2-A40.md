@@ -16,7 +16,7 @@ uses an AR talker followed by DAC. Integration contributor:
 | Output | Mono 44100Hz PCM; float32 internally, 512 samples per frame |
 | Streaming | Raw PCM/WAV or OpenAI speech SSE; min16 frames, overlap4 OLA |
 | Budget | Default/maximum 1024 frames; budget termination is an incomplete-generation error |
-| Unsupported | CFG except 1, style instructions, prefix cache, async AR scheduling, AR graph, quantization/distributed profiles |
+| Unsupported | CFG except 1, style instructions, MRv2, prefix cache, async AR scheduling, AR graph, quantization/distributed profiles |
 
 ## Hardware and profiles
 
@@ -47,7 +47,8 @@ is independent of unsupported async AR scheduling.
 | --- | --- |
 | OS/Python | Ubuntu 24.04 / Python 3.12.13 |
 | Driver | 580.95.05 |
-| Current runtime | vLLM 0.32.0, Torch 2.13.0+cu130, Transformers 5.16.1, FlashInfer 0.7.0.post1 |
+| Review follow-up runtime (2026-11-06) | vLLM 0.33.0 (`4ba787ec9`), Torch 2.14.0+cu130, Transformers 5.19.0, FlashInfer 0.7.2.post1 |
+| Previous qualification runtime | vLLM 0.32.0, Torch 2.13.0+cu130, Transformers 5.16.1, FlashInfer 0.7.0.post1 |
 | Router replay measurements (2026-10-03) | vLLM 0.30.0, Torch 2.13.0+cu130, FlashInfer 0.6.18.post1 |
 | Historical measurements | Native vLLM 0.29.0/Torch 2.13.0+cu130; official Torch 2.9.1+cu128 |
 | Main synchronization target (2026-10-30) | `cda4a1ef83b295ba332146a7709e6277725edc9f` |
@@ -116,6 +117,15 @@ The public offline contract is `Zonos2Processor.build_prompt(...)` and
 diffusion text-to-audio CLI does not accept this AR frame contract. Use the
 public API or the regression entrypoints; do not reuse another model's prompt
 builder or add a new model-specific Python example.
+
+Omit `sampling_params_list` to use the deployment's qualified defaults.
+Supplying `SamplingParams(max_tokens=256)` replaces the complete talker
+parameter set, including vLLM's default temperature 1.0, disabled top-k/min-p
+and repetition penalty 1.0. To retain the ZONOS2 profile while changing one
+setting, clone the entries in `engine.default_sampling_params_list`, then
+change the talker's budget. The benchmark explicitly supplies its full
+sampling profile. The supported talker runner is V1 (`model_runner: v1`);
+MRv2 is rejected before model allocation.
 
 ```bash
 export ZONOS2_TEST_MODEL_PATH=/owned/zonos2-safetensors

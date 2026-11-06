@@ -49,6 +49,12 @@ class Zonos2SamplingParams:
 
     @classmethod
     def from_runtime(cls, values: dict[str, Any]):
+        """Honor resolved vLLM values, then model-specific ``extra_args``.
+
+        The runner supplies a complete SamplingParams snapshot. Values equal
+        to vLLM defaults are valid caller choices, not missing fields. Deployment
+        defaults apply before this boundary when no request override is supplied.
+        """
         extra = values.get("extra_args") or {}
         args = {
             key: values[key]

@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
+from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY, REQUEST_SAMPLING_PARAMS_KEY
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
 from vllm_omni.model_executor.models.zonos2.zonos2_keys import TERMINAL
 from vllm_omni.model_executor.models.zonos2.zonos2_sampler import Zonos2RequestState, Zonos2SamplingParams
@@ -44,14 +44,13 @@ def info(key, *, prompt_len=3, offset=0, history=None, count=0, max_tokens=20, s
     frames = torch.full((prompt_len, 10), 1025, dtype=torch.int32)
     frames[:, 9] = 2
     return {
-        "_omni_req_id": key,
         "request_id": key,
         "zonos2_frames": frames,
         "_omni_num_computed_tokens": offset,
         "_omni_is_prefill": offset < prompt_len,
         OUTPUT_TOKEN_COUNT_KEY: count,
         LAST_OUTPUT_TOKEN_KEY: 0 if count else None,
-        "_omni_sampling_params": {
+        REQUEST_SAMPLING_PARAMS_KEY: {
             "temperature": 0.0,
             "top_k": -1,
             "top_p": 1.0,
@@ -77,7 +76,7 @@ def test_reprefill_crosses_prompt_and_completion_without_resetting_history(model
     stream = torch.cat((data["zonos2_frames"], torch.cat((history, torch.full((3, 1), 519, dtype=torch.int32)), dim=1)))
     torch.testing.assert_close(embeds, model.multi_embedder(stream[1:6]), rtol=0, atol=0)
     assert len(model._request_states["a"].history) == 3
-    assert update["_omni_req_id"] == "a" and update["_zonos2_scheduled_span"] == 5
+    assert update["request_id"] == "a" and update["_zonos2_scheduled_span"] == 5
 
 
 def test_missing_nine_codebook_history_fails_instead_of_restarting(model):
@@ -109,6 +108,37 @@ def test_empty_lifecycle_history_accepts_explicit_none_last_token(model):
     assert len(model._request_states["a"].history) == 0
 
 
+def test_sampling_metadata_opt_in_uses_shared_runner_interface(mocker):
+    from vllm_omni.model_executor.models import interfaces
+
+    assert "requires_request_sampling_params" in interfaces.__all__
+    assert interfaces.requires_request_sampling_params(Zonos2TalkerForConditionalGeneration)
+    other = mocker.Mock(spec=nn.Module)
+    assert not interfaces.requires_request_sampling_params(other)
+    other.requires_request_sampling_params = False
+    assert not interfaces.requires_request_sampling_params(other)
+
+
+def test_request_id_controls_preprocess_forward_and_postprocess(model):
+    data = info("a")
+    assert "_omni_req_id" not in data
+    _, embeds, update = model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
+    assert update["request_id"] == "a" and "_omni_req_id" not in update
+    model.layers = nn.ModuleList([])
+    model.out_norm = nn.Identity()
+    model.forward(
+        torch.zeros(3, dtype=torch.int64),
+        torch.arange(3),
+        inputs_embeds=embeds,
+        model_intermediate_buffer=[{**data, **update}],
+        request_sample_eligible=[True],
+    )
+    assert [row[0] for row in model._sampling_plan] == ["a"]
+    model._last_fused_logits = logits_for_codes([7])
+    model.sample(torch.zeros(1, 1026), None)
+    assert model.postprocess(torch.empty(0), request_id="a")["codes"]["audio"].tolist() == [[7] * 9]
+
+
 def test_retraction_truncates_stale_extra_frame_before_next_sample(model):
     old = torch.zeros((5, 9), dtype=torch.int32)
     options = Zonos2SamplingParams(temperature=0, max_tokens=20)
@@ -131,8 +161,8 @@ def test_batch_reordering_routes_current_codes_by_request_id(model):
     sampled = model.sample(torch.zeros(2, 1026), None)
     assert sampled.sampled_token_ids.tolist() == [[0], [0]]
     assert output.multimodal_outputs["codes"]["audio"][0].tolist() == [[8] * 9]
-    assert model.postprocess(torch.empty(0), _omni_req_id="a")["codes"]["audio"].tolist() == [[7] * 9]
-    assert model.postprocess(torch.empty(0), _omni_req_id="b")["codes"]["audio"].tolist() == [[8] * 9]
+    assert model.postprocess(torch.empty(0), request_id="a")["codes"]["audio"].tolist() == [[7] * 9]
+    assert model.postprocess(torch.empty(0), request_id="b")["codes"]["audio"].tolist() == [[8] * 9]
 
 
 def test_budget_terminal_frame_is_present_without_fabricating_eos(model):
@@ -147,7 +177,7 @@ def test_budget_terminal_frame_is_present_without_fabricating_eos(model):
     assert sampled.sampled_token_ids.tolist() == [[0]]
     assert output.multimodal_outputs["meta"]["is_final"][0]
     assert output.multimodal_outputs["codes"]["audio"][0].tolist() == [[7] * 9]
-    assert len(model.postprocess(torch.empty(0), _omni_req_id="a")["zonos2"]["history"]) == 1
+    assert len(model.postprocess(torch.empty(0), request_id="a")["zonos2"]["history"]) == 1
 
 
 def test_partial_prefill_does_not_sample_advance_seed_or_emit_codes(model):
@@ -160,7 +190,7 @@ def test_partial_prefill_does_not_sample_advance_seed_or_emit_codes(model):
     model.sample(torch.zeros(1, 1026), None)
     assert len(model._request_states["a"].history) == 0
     assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
-    assert model.postprocess(torch.empty(0), _omni_req_id="a") == {}
+    assert model.postprocess(torch.empty(0), request_id="a") == {}
 
 
 @pytest.mark.parametrize("reason", ["finish", "cancel", "error"])
@@ -241,6 +271,21 @@ def test_unsupported_capture_or_scheduler_modes_fail_before_allocating_model(asy
     )
     with pytest.raises(ValueError, match=message):
         Zonos2TalkerForConditionalGeneration(vllm_config=cfg)
+
+
+def test_mrv2_is_rejected_before_model_allocation(mocker):
+    from vllm.config import VllmConfig
+
+    cfg = mocker.Mock(
+        spec=VllmConfig,
+        scheduler_config=mocker.Mock(async_scheduling=False),
+        cache_config=mocker.Mock(enable_prefix_caching=False),
+        model_config=mocker.Mock(enforce_eager=True, use_v2_model_runner=True),
+    )
+    allocate = mocker.patch("vllm_omni.model_executor.models.zonos2.zonos2_talker.Zonos2MultiEmbedder")
+    with pytest.raises(ValueError, match="ZONOS2.*V1.*use_v2_model_runner=False"):
+        Zonos2TalkerForConditionalGeneration(vllm_config=cfg)
+    allocate.assert_not_called()
 
 
 def test_decode_slices_one_frame_without_rebuilding_prompt_and_history(model, monkeypatch):

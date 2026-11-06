@@ -7,10 +7,25 @@ import json
 
 import numpy as np
 import pytest
+import yaml
 
 from tests.e2e.zonos2.audio_checks import check_audio, check_lifecycle, data_uri, decode_sse, decode_wav, pcm16_wav
+from tests.e2e.zonos2.runtime import ROOT, deployment
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_default_acceptance_deployment_preserves_shipped_b1_profile(tmp_path):
+    shipped = yaml.safe_load((ROOT / "vllm_omni/deploy/zonos2.yaml").read_text())
+    actual = yaml.safe_load(deployment(tmp_path).read_text())
+    assert actual == shipped
+    assert [stage["max_num_seqs"] for stage in actual["stages"]] == [1, 1]
+
+
+def test_explicit_stress_deployment_keeps_chunked_prefill_and_b4(tmp_path):
+    actual = yaml.safe_load(deployment(tmp_path, use_shipped_profile=False).read_text())
+    assert [stage["max_num_seqs"] for stage in actual["stages"]] == [4, 4]
+    assert actual["stages"][0]["max_num_batched_tokens"] == 128
 
 
 @pytest.mark.parametrize(

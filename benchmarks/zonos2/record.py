@@ -13,6 +13,7 @@ from pathlib import Path
 def install():
     import torch
 
+    from vllm_omni.data_entry_keys import REQUEST_ID_KEY
     from vllm_omni.model_executor.models.zonos2.zonos2_dac_decoder import Zonos2Code2WavForConditionalGeneration as Dac
     from vllm_omni.model_executor.models.zonos2.zonos2_talker import Zonos2TalkerForConditionalGeneration as Talker
 
@@ -64,9 +65,9 @@ def install():
 
     def ar_forward(self, *args, **kwargs):
         infos = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
-        if not any(info.get("_omni_req_id") for info in infos):
+        if not any(info.get(REQUEST_ID_KEY) for info in infos):
             return forward(self, *args, **kwargs)
-        if not all(str(info.get("_omni_req_id", "")).startswith("warmup") for info in infos):
+        if not all(str(info.get(REQUEST_ID_KEY, "")).startswith("warmup") for info in infos):
             maybe_profile(self, "ar")
         a, b = cuda.Event(enable_timing=True), cuda.Event(enable_timing=True)
         a.record()

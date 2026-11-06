@@ -27,6 +27,8 @@ def test_real_offline_audio(tmp_path):
     run_offline(directory, concurrent=False)
     report = json.loads((directory / "summary.json").read_text())
     assert report["real_weights"] and report["cases"][0]["sample_rate"] == 44100
+    assert report["deployment_profile"] == "shipped_b1"
+    assert report["sampling_source"] == "deployment_defaults"
 
 
 @pytest.mark.full_model

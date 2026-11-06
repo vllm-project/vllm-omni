@@ -18,6 +18,7 @@ from typing import Any, Protocol, runtime_checkable
 __all__ = [
     "SupportsMultiFrameDecode",
     "requires_request_sample_eligibility",
+    "requires_request_sampling_params",
     "supports_multi_frame_decode",
 ]
 
@@ -91,3 +92,13 @@ def requires_request_sample_eligibility(model: Any) -> bool:
     verify).
     """
     return bool(getattr(model, "requires_request_sample_eligibility", False))
+
+
+def requires_request_sampling_params(model: object) -> bool:
+    """Whether the V1 runner supplies request sampling snapshots to preprocess.
+
+    Off/absent preserves the existing metadata path. Opted-in models receive
+    transient resolved parameters and committed lifecycle progress; model-owned
+    updates remain in the persistent buffer. MRv2 does not implement this hook.
+    """
+    return bool(getattr(model, "requires_request_sampling_params", False))

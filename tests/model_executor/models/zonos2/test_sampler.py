@@ -2,8 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """P3 sampler/state CPU tests with independent small probability/EOS oracles."""
 
+from pathlib import Path
+
+import msgspec
 import pytest
 import torch
+import yaml
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.model_executor.models.zonos2.zonos2_sampler import (
     Zonos2RequestState,
@@ -18,6 +23,43 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def params(**kwargs):
     return Zonos2SamplingParams(**kwargs)
+
+
+def test_partial_vllm_sampling_params_are_a_complete_runtime_override():
+    supplied = SamplingParams(max_tokens=256)
+    actual = Zonos2SamplingParams.from_runtime(msgspec.structs.asdict(supplied))
+    assert (actual.temperature, actual.top_k, actual.top_p, actual.min_p, actual.repetition_penalty) == (
+        1.0,
+        0,
+        1.0,
+        0.0,
+        1.0,
+    )
+    assert actual.max_tokens == 256 and actual.seed is None
+
+
+def test_explicit_values_equal_to_vllm_defaults_are_not_replaced():
+    supplied = SamplingParams(temperature=1.0, top_k=-1, min_p=0.0, repetition_penalty=1.0, seed=7)
+    actual = Zonos2SamplingParams.from_runtime(msgspec.structs.asdict(supplied))
+    assert actual.temperature == 1.0 and actual.top_k == -1
+    assert actual.min_p == 0.0 and actual.repetition_penalty == 1.0 and actual.seed == 7
+
+
+def test_shipped_sampling_defaults_match_qualified_zonos2_profile():
+    root = Path(__file__).resolve().parents[4]
+    config = yaml.safe_load((root / "vllm_omni/deploy/zonos2.yaml").read_text())
+    supplied = SamplingParams(**config["stages"][0]["default_sampling_params"])
+    assert Zonos2SamplingParams.from_runtime(msgspec.structs.asdict(supplied)) == Zonos2SamplingParams()
+
+
+def test_model_specific_sampling_options_override_resolved_runtime_values():
+    supplied = SamplingParams(
+        temperature=1.0,
+        repetition_penalty=1.0,
+        extra_args={"temperature": 1.15, "repetition_penalty": 1.2, "repetition_window": 12},
+    )
+    actual = Zonos2SamplingParams.from_runtime(msgspec.structs.asdict(supplied))
+    assert actual.temperature == 1.15 and actual.repetition_penalty == 1.2 and actual.repetition_window == 12
 
 
 def test_repetition_penalty_is_per_codebook_once_and_excludes_cb8_and_specials():

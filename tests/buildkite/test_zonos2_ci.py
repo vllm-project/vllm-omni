@@ -19,7 +19,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("tier", ["ready", "merge", "nightly"])
 @pytest.mark.parametrize("mirror", ["", "b200"])
 @pytest.mark.parametrize(
-    "changed", ["vllm_omni/model_executor/models/zonos2/zonos2_talker.py", "vllm_omni/worker/gpu_model_runner.py"]
+    "changed",
+    [
+        "vllm_omni/model_executor/models/zonos2/zonos2_talker.py",
+        "vllm_omni/worker/gpu_model_runner.py",
+        "vllm_omni/worker/gpu_ar_model_runner.py",
+        "vllm_omni/model_executor/models/interfaces.py",
+        "vllm_omni/data_entry_keys.py",
+        "requirements/zonos2.txt",
+        "requirements/zonos2-overrides.txt",
+        "tests/buildkite/test_zonos2_ci.py",
+    ],
 )
 def test_zonos2_job_selected_for_model_and_shared_runner_changes(tier, mirror, changed, monkeypatch):
     monkeypatch.setenv("MIRROR_HW", mirror)

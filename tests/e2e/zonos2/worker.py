@@ -58,7 +58,11 @@ async def offline(directory: Path, concurrent: bool):
         processor.build_prompt(case["text"], language=case["language"], speaker_embedding=case.get("speaker_embedding"))
         for case in cases
     ]
-    engine = AsyncOmni(model=model_path(), deploy_config=str(deployment(directory)), stage_init_timeout=900)
+    engine = AsyncOmni(
+        model=model_path(),
+        deploy_config=str(deployment(directory, use_shipped_profile=not concurrent)),
+        stage_init_timeout=900,
+    )
     reports = []
     comparison = []
 
@@ -81,7 +85,9 @@ async def offline(directory: Path, concurrent: bool):
         async for output in engine.generate(
             prompts[index],
             request_id=label,
-            sampling_params_list=[sp, SamplingParams(temperature=0, max_tokens=65536, detokenize=True)],
+            sampling_params_list=(
+                [sp, SamplingParams(temperature=0, max_tokens=65536, detokenize=True)] if concurrent else None
+            ),
         ):
             final = output
             events += 1
@@ -195,6 +201,8 @@ async def offline(directory: Path, concurrent: bool):
                 "status": "pass",
                 "real_weights": True,
                 "concurrency": 4 if concurrent else 1,
+                "deployment_profile": "stress_b4" if concurrent else "shipped_b1",
+                "sampling_source": "request_override" if concurrent else "deployment_defaults",
                 "cases": reports,
                 "solo_vs_batch_diagnostics": comparison,
             },

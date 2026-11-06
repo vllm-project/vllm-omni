@@ -1315,6 +1315,6 @@ Quality order is `lufs`, `estimated_snr`, `max_pause`, `estimated_bandlimit_hz`,
 `clean_speaker_background`, `accurate_mode`. Unknown extras are rejected.
 
 The B1 default avoids the fixed-set C4 Chinese cap failure. Explicit batching
-is experimental. Prefix caching, async AR scheduling and AR CUDA graphs are
-unsupported. A streaming budget error may follow partial audio; clients must
+is experimental. MRv2, prefix caching, async AR scheduling and AR CUDA graphs
+are unsupported; the talker requires the V1 runner. A streaming budget error may follow partial audio; clients must
 handle the error rather than treating it as a successful complete utterance.

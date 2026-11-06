@@ -39,7 +39,12 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.utils import make_layers
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
+from vllm_omni.data_entry_keys import (
+    LAST_OUTPUT_TOKEN_KEY,
+    OUTPUT_TOKEN_COUNT_KEY,
+    REQUEST_ID_KEY,
+    REQUEST_SAMPLING_PARAMS_KEY,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
 from vllm_omni.model_executor.models.zonos2.zonos2_keys import (
@@ -510,6 +515,8 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             raise ValueError("ZONOS2 codec-history replay currently requires enable_prefix_caching=False")
         if not vllm_config.model_config.enforce_eager:
             raise ValueError("ZONOS2 request-local sampling currently requires enforce_eager=True")
+        if getattr(vllm_config.model_config, "use_v2_model_runner", False):
+            raise ValueError("ZONOS2 requires the V1 GPU runner (use_v2_model_runner=False); MRv2 is unsupported")
         hf_config = vllm_config.model_config.hf_config
         if isinstance(hf_config, Zonos2Config):
             self.config = hf_config
@@ -598,8 +605,8 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
                 "The model runner must supply the committed output-token count and last lifecycle token "
                 "(None for an empty history) for requires_request_sampling_params models."
             )
-        key = str(info.get("_omni_req_id") or info["request_id"])
-        params = Zonos2SamplingParams.from_runtime(info["_omni_sampling_params"])
+        key = str(info[REQUEST_ID_KEY])
+        params = Zonos2SamplingParams.from_runtime(info[REQUEST_SAMPLING_PARAMS_KEY])
         offset = int(info["_omni_num_computed_tokens"])
         span = input_ids.shape[0]
         saved = info.get(STATE) or {}
@@ -656,7 +663,7 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             input_ids,
             hidden,
             {
-                "_omni_req_id": key,
+                REQUEST_ID_KEY: key,
                 SCHEDULED_SPAN: span,
                 TERMINAL: terminal,
                 STATE: state.payload(),
@@ -678,11 +685,11 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             return input_ids, self._embed_input_ids(input_ids), {}
         if not isinstance(frames, torch.Tensor) or frames.ndim != 2 or frames.shape[1] != 10:
             raise ValueError("zonos2_frames must have shape [T,10]")
-        if "_omni_sampling_params" in info and ("_omni_req_id" in info or "request_id" in info):
+        if REQUEST_SAMPLING_PARAMS_KEY in info and REQUEST_ID_KEY in info:
             try:
                 return self._managed_preprocess(input_ids, frames, info)
             except Exception:
-                self.on_requests_finished([str(info.get("_omni_req_id") or info["request_id"])])
+                self.on_requests_finished([str(info[REQUEST_ID_KEY])])
                 raise
         offset = int(info["_omni_num_computed_tokens"])
         is_prefill = bool(info["_omni_is_prefill"])
@@ -736,11 +743,11 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         infos = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         eligible = kwargs.get("request_sample_eligible")
-        if infos and any(FRAMES in i for i in infos) and not all("_omni_req_id" in i and FRAMES in i for i in infos):
+        if infos and any(FRAMES in i for i in infos) and not all(REQUEST_ID_KEY in i and FRAMES in i for i in infos):
             raise ValueError("ZONOS2 cannot mix legacy numeric prompts with request-local framed prompts")
-        if infos and all("_omni_req_id" in i and FRAMES in i for i in infos):
+        if infos and all(REQUEST_ID_KEY in i and FRAMES in i for i in infos):
             self._sampling_plan = [
-                (str(info["_omni_req_id"]), bool(eligible[i]) if eligible is not None else True, info)
+                (str(info[REQUEST_ID_KEY]), bool(eligible[i]) if eligible is not None else True, info)
                 for i, info in enumerate(infos)
             ]
         else:
@@ -841,7 +848,7 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             raise
 
     def postprocess(self, hidden_states_slice: torch.Tensor, multimodal_outputs: Any = None, **req_infos: Any) -> dict:
-        key = req_infos.get("_omni_req_id")
+        key = req_infos.get(REQUEST_ID_KEY)
         if key is not None:
             key = str(key)
             state = self._request_states.get(key)
