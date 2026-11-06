@@ -144,12 +144,9 @@ Measured on the real checkpoints, the main numbers are (reference data; the exac
 values depend on the actual audio length distribution):
 
 * Covo-Audio-Chat (lossy): per-row on/off cosine down to ~0.5 on short clips,
-  WER(off) 24.00%, WER(on) 24.58%, WER(on vs off) 11.10% on LibriSpeech
+  WER(off) 22.24%, WER(on) 23.55%, WER(on vs off) 8.01% on LibriSpeech
   test-clean, ~1.85x encoder speedup, and E2E at max-concurrency 16: TTFT P50
-  104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%). These numbers
-  predate the rung-tail fix (the tail was zero-filled then; it is now sliced from
-  the extractor's padding), so the on/off gap is expected to narrow — re-measure
-  before citing.
+  104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%).
 * Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
   bfloat16), and 1.62-3.7x encoder speedup on constructed mixed-length batches. The
   speedup is a function of the intra-batch length mix, not of the model: with the waste
@@ -159,10 +156,9 @@ values depend on the actual audio length distribution):
   32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
   temperature 0, repetition penalty 1.05, seed 42; buckets 2,4,8,16,30 s; same
   checkout with the feature off -> on) on LibriSpeech test-clean clips of <= 29 s
-  (199 clips measured): WER(off) 1.58%, WER(on) 1.54%, WER(on vs off) 0.22% on
-  the 197/199 clips that stay clean in both passes, and WER(off) 9.55% / WER(on)
-  17.45% over all 199 clips, including one clean-to-rambling transition (a clean
-  off transcript becomes over-generated with bucketing on). The clean cohort
+  (199 clips measured): WER(off) 1.52%, WER(on) 1.52%, WER(on vs off) 0.00% on
+  the 197/199 clips that stay clean in both passes, and WER(off) 16.57% / WER(on)
+  16.57% over all 199 clips (off and on agree exactly). The clean cohort
   keeps only clips that neither over- nor under-generate in either pass, using a
   reference-length filter that never looks at which configuration produced the
   clip; it removes task failures, not recognition errors. WER(off) and WER(on)
