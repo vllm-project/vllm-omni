@@ -1016,9 +1016,7 @@ def test_bucketing_stays_off_without_seconds_env(monkeypatch):
     feats = make_features()
     with torch.inference_mode():
         calls_before = len(model.encoder.calls)
-        out = model.embed_multimodal(
-            audio_features=feats, audio_lens=torch.tensor(LENGTHS, dtype=torch.int64)
-        )
+        out = model.embed_multimodal(audio_features=feats, audio_lens=torch.tensor(LENGTHS, dtype=torch.int64))
     assert out.shape == feats.shape
     assert model.encoder.calls[calls_before:] == [(len(LENGTHS), 240, D)]
 
