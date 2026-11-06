@@ -46,8 +46,6 @@ from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     validate_sequence_parallelism,
 )
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasInteractionSession, validate_camera_payload
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import (
     action_conditioning,
     normalize_request,
@@ -110,39 +108,12 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
     return config
 
 
-def build_decoder(config: dict[str, Any], device: torch.device, *, backend: str = "native") -> nn.Module:
-    if backend == "native":
-        # Diffusers metadata such as `_class_name` is not a constructor argument.
-        kwargs = {}
-        for name, value in config.items():
-            if not name.startswith("_"):
-                kwargs[name] = value
-        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
-            vae = PixelUMMDecoder(**kwargs)
-        return vae.eval().requires_grad_(False)
-    arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
-    local_pixels = config["local_attention_tile_pixels"]
-    if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
-        raise ValueError("Hy-Nomas local_attention_tile_pixels must be a nonnegative multiple of 16.")
+def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
+    """Construct the native PixelUMM decoder in BF16, excluding checkpoint metadata."""
+    kwargs = {name: value for name, value in config.items() if not name.startswith("_")}
     with set_default_torch_dtype(torch.bfloat16), torch.device(device):
-        decoder = DCAEVPixelUMMDecoder(arch, local_attention_tile=local_pixels // 16)
-    vae = PixelUMMDCAELatentDecoder(
-        decoder,
-        **{
-            name: config[name]
-            for name in (
-                "denoising_step_list",
-                "num_steps",
-                "seed",
-                "temporal_window_latents",
-                "temporal_overlap_latents",
-                "decoder_tile_pixels",
-                "decoder_tile_overlap_pixels",
-                "tail_hold_latents",
-            )
-        },
-    )
-    return vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+        vae = PixelUMMDecoder(**kwargs)
+    return vae.eval().requires_grad_(False)
 
 
 def validate_config(config: OmniDiffusionConfig) -> None:
@@ -175,7 +146,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    allowed = {"text_encoder", "decoder_backend", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    allowed = {"text_encoder", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
     HyNomasARConfig.from_args(custom)
@@ -186,8 +157,6 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
     ):
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
-    if custom.get("decoder_backend", "native") not in ("reference", "native"):
-        raise ValueError("Hy-Nomas decoder_backend must be reference or native.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
@@ -297,8 +266,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .eval()
             .requires_grad_(False)
         )
-        custom_args = od_config.custom_pipeline_args or {}
-        self.vae = build_decoder(decoder_config, self.device, backend=custom_args.get("decoder_backend", "native"))
+        self.vae = build_decoder(decoder_config, self.device)
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels

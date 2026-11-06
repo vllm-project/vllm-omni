@@ -68,8 +68,7 @@ def pipelines(model_cleanup):
     config.parallelism.sp_size = 1
     config.parallelism.shard_text_encoder = False
     device = get_local_device()
-    # Bitwise parity holds for the in-tree reference decoder, not the native one.
-    custom_args = {"decoder_backend": os.environ.get("HY_NOMAS_DECODER_BACKEND", "reference")}
+    custom_args = {}
     if "HY_NOMAS_TEXT_ENCODER" in os.environ:
         custom_args["text_encoder"] = os.environ["HY_NOMAS_TEXT_ENCODER"]
     omni_config = OmniDiffusionConfig(

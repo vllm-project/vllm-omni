@@ -152,6 +152,19 @@ pass `--custom-pipeline-args '{"text_encoder":"/path/to/Qwen2.5-VL-7B-Instruct"}
 to the server, or `custom_pipeline_args={"text_encoder": "/path/to/Qwen2.5-VL-7B-Instruct"}`
 to the Python API.
 
+## PixelUMM decoder
+
+Production always uses vLLM-Omni's native `PixelUMMDecoder`, including the vLLM
+linear layers, fused QK normalization/RoPE, packed local attention, and rolling
+streaming state. The old reference port lives only under `tests/` as a numerical
+and streaming oracle; it cannot be selected by the pipeline.
+
+Remove `decoder_backend` from existing custom arguments. Both previous values
+(`native` and `reference`) are now rejected as unsupported options. Accuracy tests
+also use the native decoder without `HY_NOMAS_DECODER_BACKEND`. Independent
+upstream comparisons and their existing thresholds remain unchanged; GPU parity
+and performance qualification of the native execution path remain pending.
+
 ## Offline generation
 
 Run commands from the vLLM-Omni repository:

@@ -8,9 +8,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.diffusion.models.hy_nomas.reference import pixelumm, pixelumm_model
 from tests.diffusion.models.hy_nomas.test_hy_nomas import DECODER_CONFIG
 from vllm_omni.diffusion.models.hy_nomas import decoder as decoder_module
-from vllm_omni.diffusion.models.hy_nomas import decoder_kernels, pixelumm, pixelumm_model
+from vllm_omni.diffusion.models.hy_nomas import decoder_kernels
 from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_decoder
 
@@ -223,7 +224,8 @@ def test_local_gqa_matches_reference_visibility():
 
 
 def test_native_factory_keeps_checkpoint_names_and_bf16_placement():
-    model = build_decoder(DECODER_CONFIG, torch.device("meta"), backend="native")
+    model = build_decoder(DECODER_CONFIG, torch.device("meta"))
+    assert isinstance(model, PixelUMMDecoder)
     parameters = dict(model.named_parameters())
     # Each of 36 layers stacks q/k/v and gate/up: 5 checkpoint projections become 2 parameters.
     assert len(parameters) == 476 - 3 * 36

@@ -13,14 +13,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.diffusion.models.hy_nomas.reference.pixelumm import PixelUMMDCAELatentDecoder
+from tests.diffusion.models.hy_nomas.reference.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
 from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import HyNomasTransformer
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import prepare_camera
 from vllm_omni.diffusion.models.hy_nomas.scheduler import EulerSolver
 

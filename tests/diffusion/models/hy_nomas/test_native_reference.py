@@ -12,13 +12,13 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer
 
+from tests.diffusion.models.hy_nomas.reference.pixelumm import PixelUMMDCAELatentDecoder
+from tests.diffusion.models.hy_nomas.reference.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from tests.diffusion.models.hy_nomas.test_hy_nomas import TRANSFORMER_CONFIG
 from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import HyNomasTransformer
 from vllm_omni.diffusion.models.hy_nomas.layers import TimestepEmbedder
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_model_config
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.text_encoder import _VIDEO_SYSTEM, TextEncoder
 
 pytestmark = [pytest.mark.local_model, pytest.mark.cpu, pytest.mark.diffusion]
