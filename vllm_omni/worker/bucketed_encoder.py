@@ -522,10 +522,13 @@ class _BucketedEncoder:
         # training. The waste gate caps the rung at the input's time extent, so
         # the slice never reads past the tensor; an item longer than its rung
         # truncates to the rung (warned above).
+        # Gather each row's window by scalar (int) index — not by a list/tensor
+        # index — so the slice stays a non-synchronizing CUDA op under
+        # torch.cuda.set_sync_debug_mode("error") (advanced indexing would sync).
         if self._axis == 2:
-            batch = features[chunk, :, :rung]
+            batch = torch.stack([features[index, :, :rung] for index in chunk])
         else:
-            batch = features[chunk, :rung]
+            batch = torch.stack([features[index, :rung] for index in chunk])
         if mask is not None:
             return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features)))
         if length_arg is not None:
@@ -537,11 +540,11 @@ class _BucketedEncoder:
         # The waste gate caps every rung at the input's time extent, so the
         # scaled width never exceeds the carried mask's own width.
         rung_mask = max(1, rung * mask.size(1) // total)
-        return mask[chunk, :rung_mask]
+        return torch.stack([mask[index, :rung_mask] for index in chunk])
 
     @staticmethod
     def _lengths_for(length_arg, chunk, rung):
-        return length_arg[chunk].clamp(max=rung)
+        return torch.stack([length_arg[index] for index in chunk]).clamp(max=rung)
 
     def _tensor_forward(self, *inputs):
         # The fixed-window recipe, if any, applies only to the bucketed-window
