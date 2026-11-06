@@ -276,6 +276,9 @@ model_config:
   owned compressed source storage is included in the GPU reservation.
   Each publication packs K/V into one host allocation per dtype, with disjoint
   views for individual layers. Live chunks never share backing storage.
+  Host-bank retrieval transfers only K/V; its metadata remains on the host. Uncompressed
+  publication constructs contiguous frame/token metadata directly on CPU;
+  compressed per-layer selections retain their original metadata.
   Pinned allocations use PyTorch's caching allocator; initial bank filling
   still incurs allocation costs. `bank_bytes` bounds live entries, not allocator
   caches or the temporary replacement chunk needed for transactional publication.

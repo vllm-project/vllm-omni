@@ -97,3 +97,47 @@ def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(monkeypa
     finally:
         gpu.close()
         cpu.close()
+
+
+def test_retrieval_moves_only_kv_and_keeps_metadata_on_cpu():
+    key = raw(2).pin_memory()
+    positions = torch.arange(2, 4).repeat_interleave(2)
+    token_ids = torch.arange(4, 8)
+    source = worldkv.MemoryRows(key, key * 2, positions, token_ids)
+    actual = source.to_kv_device(torch.device("cuda"))
+    assert actual.key.is_cuda and actual.value.is_cuda
+    assert actual.positions is positions and actual.token_ids is token_ids
+    assert torch.equal(actual.key.cpu(), source.key)
+    assert torch.equal(actual.value.cpu(), source.value)
+
+
+def test_uncompressed_publication_does_not_read_back_gpu_metadata(monkeypatch):
+    memory = worldkv.WorldKV(
+        worldkv.WorldKVConfig(window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+    original = torch.Tensor.to
+
+    def checked_to(tensor, *args, **kwargs):
+        if tensor.is_cuda and tensor.dtype == torch.int64:
+            raise AssertionError("publication must not read back GPU metadata")
+        return original(tensor, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "to", checked_to)
+            for start in (0, 2):
+                memory.set_pose(pose(start))
+                with memory.forward(start, 2, commit=True):
+                    for layer in range(2):
+                        key = (raw(start) + layer).to("cuda")
+                        memory.assemble(layer, key, key, key * 2)
+        rows = memory.bank[2].layers
+        assert rows[0].positions is rows[1].positions
+        assert rows[0].token_ids is rows[1].token_ids
+        assert rows[0].positions.device.type == "cpu"
+        assert torch.equal(rows[0].positions, torch.tensor([2, 2, 3, 3]))
+        assert torch.equal(rows[0].token_ids, torch.arange(4, 8))
+    finally:
+        memory.close()

@@ -170,12 +170,13 @@ class MemoryRows:
             self.key[:, indices], self.value[:, indices], self.positions[indices], self.token_ids[indices]
         )
 
-    def to(self, device: torch.device) -> MemoryRows:
+    def to_kv_device(self, device: torch.device) -> MemoryRows:
+        """Move attention payload only; retrieval metadata stays on its source device."""
         return MemoryRows(
             self.key.to(device, non_blocking=True),
             self.value.to(device, non_blocking=True),
-            self.positions.to(device),
-            self.token_ids.to(device),
+            self.positions,
+            self.token_ids,
         )
 
     def slice(self, start: int, end: int | None = None) -> MemoryRows:
@@ -329,7 +330,7 @@ class WorldKV:
                         torch.accelerator.current_stream(device).wait_event(chunk.ready)
                     else:
                         chunk.ready.synchronize()
-                rows.append(chunk.layers[layer].to(device))
+                rows.append(chunk.layers[layer].to_kv_device(device))
             self._device_retrieved[layer] = tuple(rows)
         return self._device_retrieved[layer]
 
@@ -427,12 +428,25 @@ class WorldKV:
             offset = offsets[tensor.dtype]
             targets.append(storage[tensor.dtype].narrow(0, offset, tensor.numel()).view(tensor.shape))
             offsets[tensor.dtype] += tensor.numel()
+        # Uncompressed publication is a contiguous current chunk. Build its
+        # immutable metadata once on CPU instead of synchronously reading it
+        # back from every layer. Compressed selections remain layer-specific.
+        positions = token_ids = None
+        if self.config.world_keep_ratio == 1:
+            positions = torch.arange(self.next_frame, self.next_frame + self._frames, device="cpu").repeat_interleave(
+                self.tokens_per_frame
+            )
+            token_ids = torch.arange(
+                self.next_frame * self.tokens_per_frame,
+                (self.next_frame + self._frames) * self.tokens_per_frame,
+                device="cpu",
+            )
         layers = tuple(
             MemoryRows(
                 targets[2 * layer],
                 targets[2 * layer + 1],
-                rows.positions.to(device="cpu", copy=True),
-                rows.token_ids.to(device="cpu", copy=True),
+                positions if positions is not None else rows.positions.to(device="cpu", copy=True),
+                token_ids if token_ids is not None else rows.token_ids.to(device="cpu", copy=True),
             )
             for layer, rows in enumerate(sources)
         )

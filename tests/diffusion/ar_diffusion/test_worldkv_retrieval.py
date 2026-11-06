@@ -288,13 +288,13 @@ def test_retrieved_rows_transfer_once_per_chunk_and_clear_on_commit(monkeypatch)
     for start in range(0, 8, 2):
         append(memory, start)
     transfers = []
-    original = worldkv.MemoryRows.to
+    original = worldkv.MemoryRows.to_kv_device
 
     def record(rows, device):
         transfers.append(rows.token_ids.tolist())
         return original(rows, device)
 
-    monkeypatch.setattr(worldkv.MemoryRows, "to", record)
+    monkeypatch.setattr(worldkv.MemoryRows, "to_kv_device", record)
     outputs = []
     for commit in (False, False, False, True):
         memory.set_pose(pose(2))
@@ -378,7 +378,7 @@ def test_recent_retrieval_reuses_history_without_host_roundtrip(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("recent retrieved KV is already resident in history")
 
-    monkeypatch.setattr(worldkv.MemoryRows, "to", forbidden)
+    monkeypatch.setattr(worldkv.MemoryRows, "to_kv_device", forbidden)
     with memory.forward(8, 2, commit=False):
         assert [chunk.start for chunk in memory._retrieved] == [4]
         for layer in range(2):
@@ -405,13 +405,13 @@ def test_host_reader_waits_for_publication_before_access(monkeypatch):
     ready = Mock(spec=torch.Event)
     ready.synchronize.side_effect = lambda: completed.append(True)
     memory.bank[2] = replace(memory.bank[2], ready=ready)
-    original = worldkv.MemoryRows.to
+    original = worldkv.MemoryRows.to_kv_device
 
     def checked_copy(rows, device):
         assert completed, "host rows cannot be read while D2H is still pending"
         return original(rows, device)
 
-    monkeypatch.setattr(worldkv.MemoryRows, "to", checked_copy)
+    monkeypatch.setattr(worldkv.MemoryRows, "to_kv_device", checked_copy)
     memory.set_pose(pose(2))
     with memory.forward(8, 2, commit=False):
         for layer in range(2):
