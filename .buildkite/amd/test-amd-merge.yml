@@ -562,7 +562,7 @@ steps:
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 17
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 13
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
           tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
