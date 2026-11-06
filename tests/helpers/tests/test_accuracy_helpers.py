@@ -119,6 +119,23 @@ def test_write_accuracy_result_persists_scores_and_metadata(tmp_path, monkeypatc
     assert saved["label"] == "qwen_image"
 
 
+def test_write_accuracy_result_rejects_unsanitized_nan_in_raw_payload(tmp_path, monkeypatch):
+    """Defense-in-depth: allow_nan=False if a caller somehow skips sanitization."""
+    import tests.helpers.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(helpers, "_json_safe_metric_value", lambda value: value)
+    with pytest.raises(ValueError, match="Out of range float values"):
+        helpers.write_accuracy_result(
+            model_id="Qwen-Image",
+            dataset="image_similarity",
+            metrics={"ssim": float("nan")},
+            baseline={"ssim": 0.99},
+            result_dir=tmp_path,
+            when=datetime(2026, 11, 2, 10, 15, 0),
+        )
+
+
 def test_write_accuracy_result_wraps_flat_baseline_under_hardware(tmp_path, monkeypatch):
     import tests.helpers.hardware as hardware
 

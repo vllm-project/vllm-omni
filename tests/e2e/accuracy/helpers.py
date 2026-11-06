@@ -294,7 +294,11 @@ def write_accuracy_result(
     data["dataset"] = dataset
     data["baseline"] = normalize_accuracy_baseline(baseline, hardware=hardware or None)
     data["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Metrics/extra are sanitized above; allow_nan=False fails closed if a caller skips that.
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     print(f"accuracy_result={path}", flush=True)
     return path
 

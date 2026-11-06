@@ -98,6 +98,7 @@ def _generate_edit(client, *, model, images, prompt, output_path, capfd, **gener
 def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
     from tests.e2e.accuracy.helpers import (
         CLIPScorer,
+        _json_safe_metric_value,
         assert_similarity_metrics,
         download_images,
         measure_image_similarity,
@@ -105,7 +106,6 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
         write_accuracy_result,
         write_json_artifact,
     )
-    from tests.e2e.accuracy.helpers import _json_safe_metric_value
     from tests.helpers.runtime import OmniServer
 
     configs = json.loads(_BENCHMARK_CONFIG.read_text())
