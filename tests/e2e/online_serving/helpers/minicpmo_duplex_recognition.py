@@ -14,6 +14,8 @@ from pathlib import Path
 
 import regex as re
 
+from vllm_omni.clients.duplex import DEFINITIVE_REFUSAL_CODES, ErrorEvent
+
 ASSETS = Path(__file__).resolve().parents[3] / "assets/minicpmo_4_5/duplex_recognition"
 CHINESE_NUMBERS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
 
@@ -71,9 +73,24 @@ def evaluate_session(transcript: str, events: list[dict], scenes: list[dict]) ->
     created: list[str] = []
     done: list[str] = []
     errors = []
-    for event in events:
+    # The fixture streams one turn and commits once, so the last commit is the
+    # forced one and the window matches the driver's committed_index. A
+    # multi-commit session would need this to key off the same commit the
+    # driver's final create answered, not simply the last one.
+    last_commit_index = max(
+        (index for index, event in enumerate(events) if event.get("type") == "input_audio_buffer.committed"),
+        default=-1,
+    )
+    for index, event in enumerate(events):
         kind = event.get("type", "")
         if kind in {"error", "client.timeout", "client.error"}:
+            # A definitive refusal that answered a create after the commit is
+            # the protocol working as intended (the model already answered
+            # every scene and only trailing silence was retained). One that
+            # predates the commit came from another ask and stays a protocol
+            # error.
+            if kind == "error" and index > last_commit_index and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES:
+                continue
             errors.append(event)
         if kind in {"response.created", "response.done"}:
             response = event.get("response", {})
