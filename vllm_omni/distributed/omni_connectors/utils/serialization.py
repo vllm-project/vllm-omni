@@ -45,6 +45,11 @@ class OmniMsgpackEncoder:
         """Encode an object to bytes."""
         return self.encoder.encode(obj)
 
+    def encode_into(self, obj: Any, buffer: bytearray) -> int:
+        """Encode into a caller-owned bytearray and return the written length."""
+        self.encoder.encode_into(obj, buffer)
+        return len(buffer)
+
     def _enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for non-standard types."""
         # torch.Tensor
@@ -97,7 +102,7 @@ class OmniMsgpackEncoder:
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),
             "shape": list(tensor.shape),
-            "data": t.numpy().tobytes(),
+            "data": memoryview(t.numpy()),
         }
 
     def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
@@ -345,6 +350,10 @@ class OmniSerde:
     def serialize(self, obj: Any) -> bytes:
         """Serialize an object to bytes."""
         return self.encoder.encode(obj)
+
+    def serialize_into(self, obj: Any, buffer: bytearray) -> int:
+        """Serialize into a caller-owned bytearray and return the written length."""
+        return self.encoder.encode_into(obj, buffer)
 
     def deserialize(self, data: bytes | bytearray | memoryview) -> Any:
         """Deserialize bytes to an object."""
