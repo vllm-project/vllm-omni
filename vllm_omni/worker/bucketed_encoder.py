@@ -45,6 +45,7 @@ of being zero-filled — zero fill is input the model never saw during training.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from dataclasses import dataclass
 
@@ -296,13 +297,23 @@ class _BucketedEncoder:
     pass-through that only strips ``lengths``.
     """
 
-    def __init__(self, module: nn.Module, name: str, ladder: LengthBucketingConfig | None):
+    def __init__(
+        self,
+        module: nn.Module,
+        name: str,
+        ladder: LengthBucketingConfig | None,
+        *,
+        shim=None,
+        context_margin: int = 0,
+        time_axis: int | None = None,
+        frames_per_length: int = 1,
+    ):
         self.module = module
         self.name = name
         self.ladder = ladder
         self._active = ladder is not None  # feature armed; False = pass-through
         self._original = module.forward
-        self._shim = None  # optional fixed-window recipe; used ONLY for bucketed windows
+        self._shim = shim  # optional fixed-window recipe; used ONLY for bucketed windows
         self._rebuild = None
         self._aux_spec = None  # e.g. ("lengths", dtype, device) for (features, lengths) outputs
         self._disabled = False
@@ -311,16 +322,15 @@ class _BucketedEncoder:
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
         # Verified time axis from the whitelist (the fixed-window shim overrides
         # it to channels-first 2).
-        self._default_time_axis: int | None = None
+        self._default_time_axis = time_axis
         # Feature frames per unit of the model's per-item length field.
-        self._frames_per_length = 1
+        self._frames_per_length = frames_per_length
         # Extra feature frames the encoder's front conv reads beyond the
         # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
         # The rung is chosen at length + margin so the window edge never clips
         # these context reads; the attention mask length is unchanged (it still
-        # uses the reported valid length). Set per encoder
-        # by the installer from the whitelist.
-        self._context_margin = 0
+        # uses the reported valid length).
+        self._context_margin = context_margin
 
     def _resolve_time_axis(self) -> int:
         """1 = time on dim 1 (B, T, D); 2 = time on dim 2 (B, mel, T).
@@ -653,18 +663,12 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
             continue  # skip descendants of an already-wrapped module
         if not pattern.search(name):
             continue
-        encoder = _BucketedEncoder(module, name, ladder)
-        encoder._context_margin = context_margin
-        encoder._default_time_axis = time_axis
-        encoder._frames_per_length = frames_per_length
+        shim_fn = None
         for klass in type(module).__mro__:
-            shim = _FORWARD_SHIMS.get(klass.__name__)
-            if shim is not None:
-                # Keep _original as the untouched forward (fallback + prime);
-                # the shim is only used for bucketed windows via _tensor_forward.
-                encoder._shim = (lambda s, m: lambda *a, **k: s(m, *a, **k))(shim, module)
+            shim_fn = _FORWARD_SHIMS.get(klass.__name__)
+            if shim_fn is not None:
                 break
-        if encoder._shim is not None:
+        if shim_fn is not None:
             global _SHIM_WARNED
             if not _SHIM_WARNED:
                 _SHIM_WARNED = True
@@ -674,6 +678,18 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
                     "(outputs may differ from the un-bucketed forward).",
                     name,
                 )
+        # Keep _original as the untouched forward (fallback + prime); the shim
+        # (the module-bound fixed-window recipe) is used ONLY for bucketed
+        # windows via _tensor_forward.
+        encoder = _BucketedEncoder(
+            module,
+            name,
+            ladder,
+            shim=functools.partial(shim_fn, module) if shim_fn is not None else None,
+            context_margin=context_margin,
+            time_axis=time_axis,
+            frames_per_length=frames_per_length,
+        )
         manifest.append((module, name, encoder._original))
         module.forward = encoder
         wrapped.append(name)
