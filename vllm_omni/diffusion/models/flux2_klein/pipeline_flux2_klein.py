@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     _use_local_single_stream_tp,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -237,13 +238,18 @@ class Flux2KleinPipeline(
         # worker left the cache half-written (missing-shard ``OSError`` or the
         # default-config size-mismatch ``RuntimeError``) instead of crashing
         # the worker - FLUX.2-klein-4B's sharded text_encoder hit this on #1043.
+        # Under model-level CPU offload the encoder and VAE stay in host memory; offload hooks
+        # place them on the accelerator when they run.
+        model_level_offload = resolve_offload_strategy(od_config) is OffloadStrategy.MODEL_LEVEL
         self.text_encoder = from_pretrained_with_prefetch(
             Qwen3ForCausalLM.from_pretrained,
             model,
             subfolder="text_encoder",
             prefetch_list=flux2_subfolders,
             local_files_only=local_files_only,
-        ).to(self._execution_device)
+        )
+        if not model_level_offload:
+            self.text_encoder.to(self._execution_device)
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -260,7 +266,9 @@ class Flux2KleinPipeline(
             subfolder="vae",
             prefetch_list=flux2_subfolders,
             local_files_only=local_files_only,
-        ).to(self._execution_device)
+        )
+        if not model_level_offload:
+            self.vae.to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
         self.transformer = Flux2Transformer2DModel(

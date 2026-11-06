@@ -406,7 +406,10 @@ class Flux2Pipeline(
             prefix="text_encoder",
             quant_config=te_quant_config,
         )
-        if not any(param.is_meta for param in self.text_encoder.parameters()):
+        # Under model-level CPU offload the encoder and VAE stay where the loader built them
+        # (host memory, or the accelerator for online quantization); offload hooks place them on use.
+        model_level_offload = resolve_offload_strategy(od_config) is OffloadStrategy.MODEL_LEVEL
+        if not model_level_offload and not any(param.is_meta for param in self.text_encoder.parameters()):
             self.text_encoder.to(self._execution_device)
         self.tokenizer = PixtralProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
@@ -418,7 +421,9 @@ class Flux2Pipeline(
         )
         self.vae = DistributedAutoencoderKLFlux2.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
-        ).to(self._execution_device)
+        )
+        if not model_level_offload:
+            self.vae.to(self._execution_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
         transformer_quant_config = _resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.transformer = Flux2Transformer2DModel(
