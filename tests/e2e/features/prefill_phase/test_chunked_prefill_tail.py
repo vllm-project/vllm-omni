@@ -22,6 +22,9 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
+_ROCM_MAX_AUDIO_ABS_DIFF = 1e-2
+_ROCM_MIN_AUDIO_SNR_DB = 30.0
+
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
@@ -125,6 +128,8 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
         "chunked_audio_samples": audios[1].numel(),
         "max_audio_difference": max_audio_difference,
         "audio_snr_db": audio_snr_db,
+        "rocm_max_audio_difference_limit": _ROCM_MAX_AUDIO_ABS_DIFF,
+        "rocm_min_audio_snr_db": _ROCM_MIN_AUDIO_SNR_DB,
     }
     evidence_path = tmp_path / "phase_contract.json"
     evidence_path.write_text(json.dumps(evidence, indent=2))
@@ -138,10 +143,18 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
     assert chunked_probe["codes"] == baseline["codes"]
     assert same_audio_shape
     if current_omni_platform.is_rocm():
-        # Exact codes are the prefill contract. Separate ROCm BF16 vocoder
-        # instances can have low-amplitude numeric drift for those same codes,
-        # so bound both localized and aggregate waveform error.
-        assert max_audio_difference is not None and max_audio_difference < 1e-2
-        assert audio_snr_db is not None and audio_snr_db > 30.0
+        # Exact codes are the prefill contract. The separately initialized ROCm
+        # BF16 code2wav engines can have low-amplitude numeric drift for those
+        # same codes, so retain strict localized and aggregate waveform bounds.
+        assert max_audio_difference is not None
+        assert max_audio_difference < _ROCM_MAX_AUDIO_ABS_DIFF, (
+            f"ROCm waveform max difference {max_audio_difference:.8f} exceeds "
+            f"{_ROCM_MAX_AUDIO_ABS_DIFF:.8f} despite exact generated codes"
+        )
+        assert audio_snr_db is not None
+        assert audio_snr_db > _ROCM_MIN_AUDIO_SNR_DB, (
+            f"ROCm waveform SNR {audio_snr_db:.2f} dB is not above "
+            f"{_ROCM_MIN_AUDIO_SNR_DB:.2f} dB despite exact generated codes"
+        )
     else:
         torch.testing.assert_close(audios[1], audios[0], rtol=1e-4, atol=1e-5)
