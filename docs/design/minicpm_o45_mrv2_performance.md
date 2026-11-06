@@ -120,17 +120,21 @@ The MRv2 Talker also accepts a stage-1 `speculative_config` with a DSpark
 drafter that reads Talker layers. Draft codes are verified against the
 Talker's own sampling: each row's 16-code repetition window includes the
 drafts before it, and codec EOS decisions (empty condition, length cap)
-apply per row. Only rows of accepted codes reach Code2Wav.
+apply per row. Only rows of accepted codes reach Code2Wav. The CUDA platform
+block sets stage 1's `speculative_config`, and platform blocks override stage
+fields, so the draft goes there:
 
 ```yaml
 base_config: minicpmo_4_5_turn_mrv2.yaml
-stages:
-  - stage_id: 1
-    speculative_config:
-      method: dspark
-      model: <DSpark draft trained on the MiniCPM-o 4.5 Talker>
-      num_speculative_tokens: 7
-      draft_sample_method: probabilistic
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        speculative_config:
+          method: dspark
+          model: <DSpark draft trained on the MiniCPM-o 4.5 Talker>
+          num_speculative_tokens: 7
+          draft_sample_method: probabilistic
 ```
 
 The Talker samples its codes (temperature, top-k, top-p), so the drafts should
@@ -139,8 +143,8 @@ Rejection sampling keeps the Talker's output distribution either way.
 
 The draft checkpoint must include the codec embedding (`embed_tokens.weight`)
 and head (`lm_head.weight`). The Talker stage's config reports the text
-vocabulary, so vLLM 0.32 does not share the Talker's with a codec-vocabulary
-draft. vLLM 0.32's `Qwen3DSparkModel` also reads `markov_rank` and the
+vocabulary, so vLLM does not share the Talker's with a codec-vocabulary
+draft. vLLM's `Qwen3DSparkModel` also reads `markov_rank` and the
 confidence-head fields from the top level of the draft config. Talker drafters
 cover turn sessions only; duplex sessions and the K-step Talker reject them at
 load.
