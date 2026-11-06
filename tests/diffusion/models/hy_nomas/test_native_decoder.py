@@ -8,7 +8,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.diffusion.models.hy_nomas.reference import pixelumm, pixelumm_model
 from tests.diffusion.models.hy_nomas.test_hy_nomas import DECODER_CONFIG
 from vllm_omni.diffusion.models.hy_nomas import decoder as decoder_module
 from vllm_omni.diffusion.models.hy_nomas import decoder_kernels
@@ -110,7 +109,9 @@ def tiny_decoder(**kwargs):
 
 
 def reference_pair(**kwargs):
-    """The in-tree reference port and a native decoder sharing the same weights."""
+    """Compare native execution with the separately installed upstream implementation."""
+    pixelumm_model = pytest.importorskip("hymm.models.vae.pixelumm_decoder.model")
+    pixelumm = pytest.importorskip("hymm.models.vae.pixelumm_decoder.autoencoder")
     native = tiny_decoder(**kwargs)
     arch = pixelumm_model.GenExpertArch(**vars(native.decoder.arch))
     network = pixelumm_model.DCAEVPixelUMMDecoder(arch, local_attention_tile=native.decoder.local_attention_tile)
@@ -181,9 +182,8 @@ def test_bounded_qk_matches_unsplit_math(monkeypatch):
 @torch.no_grad()
 def test_native_rolling_stream_preserves_output_and_bounds_state():
     """Repeated eviction preserves absolute noise, cropped segments and the final tail."""
-    original, native = reference_pair()
+    native = tiny_decoder()
     sessions = [
-        original.create_streaming_decode_session(to_cpu=True),
         native.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True),
         native.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=False),
     ]
@@ -195,25 +195,32 @@ def test_native_rolling_stream_preserves_output_and_bounds_state():
         for session in sessions:
             session.final_segment = index == len(chunks) - 1
             outputs.append(session.push(latent, pixel_frames=count * 4 - index % 4))
-        torch.testing.assert_close(outputs[1], outputs[0], rtol=2e-5, atol=2e-6)
-        torch.testing.assert_close(outputs[1], outputs[2], rtol=0, atol=0)
-        rolling = sessions[1]
-        assert rolling.available_pixel_frames == sessions[0].available_pixel_frames
-        assert rolling.stable_pixel_frames == sessions[0].stable_pixel_frames
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+        rolling = sessions[0]
+        assert rolling.available_pixel_frames == sessions[1].available_pixel_frames
+        assert rolling.stable_pixel_frames == sessions[1].stable_pixel_frames
         assert rolling.buffer.shape[2] <= 2 * rolling.window
         assert rolling.buffer.untyped_storage().nbytes() == rolling.buffer.numel() * rolling.buffer.element_size()
         assert len(rolling.push_latent_frames) <= 2 * rolling.window
-    assert sessions[1].buffer_latent_start > 0
+    assert sessions[0].buffer_latent_start > 0
     tails = [session.finish() for session in sessions]
-    torch.testing.assert_close(tails[1], tails[0], rtol=2e-5, atol=2e-6)
-    torch.testing.assert_close(tails[1], tails[2], rtol=0, atol=0)
-    assert sessions[1].buffer.numel() == 0 and sessions[1].pending is None
-    assert not sessions[1].push_latent_frames and not sessions[1].push_pixel_frames
+    torch.testing.assert_close(tails[0], tails[1], rtol=0, atol=0)
+    assert sessions[0].buffer.numel() == 0 and sessions[0].pending is None
+    assert not sessions[0].push_latent_frames and not sessions[0].push_pixel_frames
 
 
 @torch.no_grad()
-def test_local_gqa_matches_reference_visibility():
-    # The reference applies its FlexAttention block mask; CPU runs it eagerly.
+def test_local_gqa_matches_reference_visibility(monkeypatch):
+    reference = pytest.importorskip("hymm.models.vae.pixelumm_decoder.model")
+
+    def dense_attention(query, key, value, block_mask):
+        queries = torch.arange(query.shape[2])[:, None]
+        keys = torch.arange(key.shape[2])[None, :]
+        mask = block_mask.mask_mod(0, 0, queries, keys)
+        return F.scaled_dot_product_attention(query, key, value, attn_mask=mask, enable_gqa=True)
+
+    # Exercise the upstream visibility mask without compiling its CUDA FlexAttention.
+    monkeypatch.setattr(reference, "_flex_attention", dense_attention)
     original, native = reference_pair(local_attention_tile_pixels=48)
     # Partial edge tiles exercise neighborhood boundaries as well as GQA.
     latent = torch.randn(1, 32, 1, 2, 5)
@@ -238,8 +245,25 @@ def test_native_factory_keeps_checkpoint_names_and_bf16_placement():
 
 
 def test_native_load_weights_stacks_qkv_and_mlp_projections():
-    original, native = reference_pair()
-    checkpoint = original.state_dict()
+    native = tiny_decoder()
+    checkpoint = {}
+    arch = native.decoder.arch
+    for name, parameter in native.named_parameters():
+        value = torch.randn_like(parameter)
+        if ".qkv_proj." in name:
+            sizes = (
+                arch.num_heads * arch.head_dim,
+                arch.num_kv_heads * arch.head_dim,
+                arch.num_kv_heads * arch.head_dim,
+            )
+            for projection, shard in zip("qkv", value.split(sizes, dim=0)):
+                checkpoint[name.replace(".qkv_proj.", f".{projection}_proj.")] = shard
+        elif ".gate_up_proj." in name:
+            for projection, shard in zip(("gate", "up"), value.chunk(2, dim=0)):
+                checkpoint[name.replace(".gate_up_proj.", f".{projection}_proj.")] = shard
+        else:
+            checkpoint[name] = value
+    native.load_weights(checkpoint.items())
     layer = native.decoder.layers[0]
     prefix = "decoder.layers.0"
     qkv = torch.cat([checkpoint[f"{prefix}.attn.{name}_proj.weight"] for name in "qkv"])
@@ -258,3 +282,20 @@ def test_fused_kernels_leave_cpu_to_eager():
     cos, sin = decoder_module.mrope_tables(decoder_module.PixelUMMArchitecture(), (1, 4, 4), torch.device("cpu"))
     # CPU never reaches Triton or torch.compile; the callers' eager math runs.
     assert decoder_kernels.split_norm_rope(x, cos, sin, weight, weight, 1e-6) is None
+
+
+@torch.no_grad()
+def test_native_stream_matches_full_decode():
+    model = tiny_decoder()
+    latent = torch.randn(1, 32, 7, 1, 1)
+    full = model.decode(latent).sample
+    session = model.create_streaming_decode_session()
+    parts = []
+    for start, end in ((0, 2), (2, 4), (4, 7)):
+        session.final_segment = end == 7
+        part = session.push(latent[:, :, start:end], pixel_frames=4 * (end - start))
+        if part.numel():
+            parts.append(part)
+    parts.append(session.finish())
+    torch.testing.assert_close(torch.cat(parts, dim=2), full, rtol=0, atol=0)
+    assert session.buffer.numel() == 0 and session.pending is None

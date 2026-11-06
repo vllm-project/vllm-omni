@@ -156,8 +156,10 @@ to the Python API.
 
 Production always uses vLLM-Omni's native `PixelUMMDecoder`, including the vLLM
 linear layers, fused QK normalization/RoPE, packed local attention, and rolling
-streaming state. The old reference port lives only under `tests/` as a numerical
-and streaming oracle; it cannot be selected by the pipeline.
+streaming state. No reference decoder implementation is vendored in production
+or tests. Optional parity tests import the separately installed upstream package
+and skip when it is unavailable; native state and weight-loading tests do not
+require that package.
 
 Remove `decoder_backend` from existing custom arguments. Both previous values
 (`native` and `reference`) are now rejected as unsupported options. Accuracy tests
