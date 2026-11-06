@@ -35,9 +35,24 @@ adapter. Startup skips language-model token warmup and retains model-owned
 auxiliary graph capture.
 
 The outer generation forward runs eagerly with exact codec input shapes.
-The worker still invokes model-owned auxiliary graph hooks; this does not
-enable the CUDA-only Qwen3 Code2Wav decoder graphs on NPU. NPU audio uses the synchronous
+The inner NPU decoder captures exact tensor signatures on first use and
+replays them without frame or batch padding. The shared Ascend graph runner
+limits capture to 32 shapes, uses eager execution for additional shapes, and
+returns owned outputs so later replays cannot overwrite earlier audio.
+Capture failures require restarting the stage; `enforce_eager: true` on stage
+2 disables inner graphs. NPU audio uses the synchronous
 host materialization path before the native data plane publishes output and
 releases each chunk slot. CUDA retains its asynchronous output path. This
 adaptation alone does not establish a performance or audio-quality gain.
 The duplex profile remains on MRv1.
+
+## Ascend prefix cache
+
+The default Thinker prefix cache is enabled on CUDA and NPU, including V1
+and V2. Talker and Code2Wav retain disabled prefix caching. The NPU V2 AR
+runner initializes the Omni stage-output cache after native Ascend KV setup;
+KV reuse alone would omit the cached Thinker rows needed by the Talker.
+The shared cache manager restores hidden and multimodal output rows on hits
+using its synchronous non-CUDA copy path. Set `enable_prefix_caching: false`
+on stage 0 to opt out. Duplex and the separate experimental profiles retain
+their explicit settings.

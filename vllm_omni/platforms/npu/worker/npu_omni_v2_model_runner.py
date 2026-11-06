@@ -225,6 +225,15 @@ class NPUOmniV2RunnerMixin:
 class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunner):
     """NPU autoregressive models with Ascend attention metadata."""
 
+    def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
+        super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+        # The Ascend override initializes native KV directly, bypassing the
+        # shared MRv2 mixin. Thinker hits also need cached stage-output rows.
+        is_profiling = bool(kwargs.get("is_profiling", args[0] if args else False))
+        self._init_omni_prefix_cache(is_profiling=is_profiling)
+        if self.omni_prefix_cache is not None:
+            logger.info("NPU MRv2 stage-output prefix cache initialized.")
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         OmniGPUModelRunner.load_model(self, *args, **kwargs)
         if not getattr(self.model_state, "uses_ascend_attn_metadata", False):

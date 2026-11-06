@@ -50,3 +50,26 @@ def test_attention_delegates_to_ascend_without_losing_omni_hooks(monkeypatch):
     assert NPUQwen3OmniModelState.prepare_inputs is OmniModelState.prepare_inputs
     mro = NPUQwen3OmniModelState.__mro__
     assert mro.index(OmniModelState) < mro.index(AscendModelState)
+
+
+@pytest.mark.parametrize("profiling", [False, True])
+def test_npu_v2_initializes_stage_output_cache_after_native_kv(monkeypatch, profiling):
+    from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniARModelRunner, NPUOmniV2RunnerMixin
+
+    runner = object.__new__(NPUOmniARModelRunner)
+    calls = []
+    config = Mock()
+
+    def native_init(self, kv_cache_config, *, is_profiling):
+        assert kv_cache_config is config
+        calls.append("native")
+
+    def omni_init(*, is_profiling):
+        assert calls == ["native"]
+        assert is_profiling is profiling
+        calls.append("omni")
+
+    monkeypatch.setattr(NPUOmniV2RunnerMixin, "initialize_kv_cache", native_init)
+    monkeypatch.setattr(runner, "_init_omni_prefix_cache", omni_init)
+    runner.initialize_kv_cache(config, is_profiling=profiling)
+    assert calls == ["native", "omni"]
