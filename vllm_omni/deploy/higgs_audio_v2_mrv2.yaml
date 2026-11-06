@@ -1,9 +1,9 @@
-# Higgs-audio v2 MRV2 opt-in profile: the talker (stage 0) runs on
+# Higgs-audio v2 explicit MRV2 profile: the talker (stage 0) runs on
 # model_runner v2; the codec stage (stage 1) has no MRV2 path and stays on
-# v1, so the talker's outputs ride the legacy transport. Sampling under v2
-# delegates to the native staged sampler, so the full request surface —
-# penalties included — keeps working. Everything else matches
-# higgs_audio_v2.yaml.
+# v1, so the talker's outputs ride the legacy transport. This pins the same
+# selection the default profile (higgs_audio_v2.yaml) ships. Sampling under
+# v2 delegates to the native staged sampler, so the full request surface —
+# penalties included — keeps working.
 async_chunk: false
 
 connectors:

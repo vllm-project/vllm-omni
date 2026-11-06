@@ -602,6 +602,26 @@ the captured sampling step does not wire in; a non-neutral unsupported value
 in `default_sampling_params` fails at startup, and per-request use raises.
 Remove the parameter or run the stage with `model_runner: v1`.
 
+## Higgs-Audio v2 with Model Runner V2
+
+Higgs-Audio v2 runs the talker (stage 0) on `model_runner: v2` by default;
+the codec stage (stage 1) has no MRV2 path and stays on v1, so the talker's
+outputs ride the legacy transport. Under v2 the talker delegates LM token
+sampling to the native staged sampler, keeping the full request surface —
+penalties and logprobs included — that the V1 engine offers.
+
+Select one of these deployment profiles:
+
+| Profile | Runner | Intended use |
+| --- | --- | --- |
+| `higgs_audio_v2.yaml` | V2 talker (default) | Shipped default; v1 codec stage |
+| `higgs_audio_v2_mrv2.yaml` | V2 talker | Explicit alias of the default selection |
+
+The default's `platforms:` section keeps both stages on V1 for NPU, XPU,
+ROCm and MUSA (XPU rejects v2 stages at deploy load; NPU generation workers
+reject v2 at init). To run the talker on v1 on CUDA, copy the deploy file
+and remove the stage-0 `model_runner` key.
+
 ## Qwen3-TTS with Model Runner V2
 
 Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM

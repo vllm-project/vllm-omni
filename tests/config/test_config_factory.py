@@ -3366,6 +3366,28 @@ class TestPlatformOverrides:
         # Neutral sampling defaults pass the v2 startup validation unchanged.
         assert deploy.stages[0].default_sampling_params["repetition_penalty"] == 1.0
 
+    def test_higgs_audio_v2_default_falls_back_to_v1_off_cuda(self):
+        """The flipped default keeps the v1 runner on non-CUDA platforms.
+
+        The default profile selects v2 for the talker on CUDA; NPU, XPU,
+        ROCm and MUSA pin v1 for both stages through the platforms section
+        (XPU rejects v2 stages at deploy load, and NPU generation workers
+        reject v2 at init), clearing the stage-level v2 opt-in.
+        """
+        deploy_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
+        pipeline = resolve_pipeline_config("higgs_audio_v2")
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        assert cuda.stages[0].model_runner == "v2"
+        assert merge_pipeline_deploy(pipeline, cuda)[0].yaml_engine_args["use_v2_model_runner"] is True
+
+        for platform in ("rocm", "npu", "xpu", "musa"):
+            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+            assert deploy.model_runner == "v1", platform
+            assert all(stage.model_runner is None for stage in deploy.stages), platform
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [False, False], platform
+
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
