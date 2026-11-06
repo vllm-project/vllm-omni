@@ -40,9 +40,13 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # Keep the upstream oneCCL, torch and Triton packages paired. The final
 # vLLM XPU wheel requires triton==3.8.0+xpu; installing the old triton-xpu
 # overlay would replace that runtime with an incompatible version.
+# The uv cache mount is shared by concurrent builds on a host (two Intel CI
+# agents). uv locks each wheel while one build downloads it; the default 300 s
+# lock wait fails the other build when a large wheel downloads slowly, so wait
+# up to 30 min instead.
 RUN --mount=type=cache,target=/root/.cache/uv \
     python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
-    uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
+    UV_LOCK_TIMEOUT=1800 uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
     /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl ".[dev]"
 
 FROM vllm-omni AS vllm-omni-openai
