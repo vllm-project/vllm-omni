@@ -40,8 +40,8 @@ def _codes(frames: int, *, seed: int, device: torch.device, out_of_range: bool =
     if out_of_range:
         # The quantizer clamps in-place on a clone; the graph must keep that
         # off the caller's buffer exactly like eager does.
-        codes[..., 0] = 999999
-        codes[..., 1:, -1] = -7
+        codes[:, 0, :] = 999999  # semantic codebook (card 4096), every frame
+        codes[:, 1:, -1] = -7  # residual codebooks (card 1024), last frame
     return codes.to(device)
 
 
