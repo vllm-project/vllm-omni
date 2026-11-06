@@ -38,7 +38,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 __all__ = [
-    "LengthBucketingConfig",
     "install_bucketed_length_recording",
     "install_bucketed_encoders",
 ]
@@ -104,7 +103,6 @@ class LengthBucketingConfig:
     """A discrete length ladder used to bucket variable-length inputs."""
 
     buckets: tuple[int, ...]
-    max_length: int
 
     def __post_init__(self) -> None:
         if not self.buckets:
@@ -112,11 +110,16 @@ class LengthBucketingConfig:
         if tuple(self.buckets) != tuple(sorted(self.buckets)):
             raise ValueError("LengthBucketingConfig.buckets must be sorted ascending")
 
+    @property
+    def max_length(self) -> int:
+        """The largest rung: the window used when no rung fits."""
+        return self.buckets[-1]
+
     def padded_length(self, length: int) -> int:
-        """Smallest rung ``>=`` ``length``, capped at ``max_length``."""
+        """Smallest rung ``>=`` ``length``, falling back to the largest rung."""
         for rung in self.buckets:
             if rung >= length:
-                return min(rung, self.max_length)
+                return rung
         return self.max_length
 
 
@@ -705,7 +708,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         )
         return []
     rungs = _rungs_from_env(hop)
-    ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
+    ladder = LengthBucketingConfig(buckets=rungs)
     pattern = re.compile(_MODULE_PATTERN)
     wrapped: list[str] = []
     encoders: list[_BucketedEncoder] = []
