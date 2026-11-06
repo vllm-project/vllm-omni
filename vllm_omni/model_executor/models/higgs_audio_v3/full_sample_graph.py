@@ -57,7 +57,7 @@ def _replay_captured(model, hidden, metadata, force_audio_inputs):
         return None
     batch = hidden.shape[0]
     bucket = batch
-    if getattr(model.config, "audio_mrv2_sample_graph_buckets", False):
+    if model.mrv2_options.audio_mrv2_sample_graph_buckets:
         bucket = next((n for n in _BUCKETS if n >= batch), batch)
     model._ensure_decode_state_capacity(bucket, hidden.device)
     key = _graph_key(model, bucket, hidden, force_audio_inputs, metadata)
@@ -101,7 +101,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
     # regular sampler; startup owns capture and its parity checks.
     if not getattr(model, "_warming_sample_graphs", False):
         return None
-    if active_batch is None and getattr(model.config, "audio_mrv2_sample_graph_buckets", False):
+    if active_batch is None and model.mrv2_options.audio_mrv2_sample_graph_buckets:
         bucket = next((n for n in (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128) if n >= batch), batch)
         if bucket != batch:
             # Dummy rows own no request state. The batch-state gather replaces
@@ -269,7 +269,7 @@ def capture_sample_graphs(model, max_num_reqs):
     model._resolve_token_ids()
     buckets = (
         sorted({next((b for b in _BUCKETS if b >= n), n) for n in range(1, max_num_reqs + 1)})
-        if getattr(model.config, "audio_mrv2_sample_graph_buckets", False)
+        if model.mrv2_options.audio_mrv2_sample_graph_buckets
         else range(1, max_num_reqs + 1)
     )
     model._ensure_decode_state_capacity(max(buckets), device)

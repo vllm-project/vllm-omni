@@ -103,7 +103,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
+| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults, an optional `model_runner` fallback, and optional `connectors:` overrides deep-merged into the matching top-level connectors by name. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -570,6 +570,37 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
+
+## Higgs-Audio V3 with Model Runner V2
+
+Higgs-Audio V3 runs `model_runner: v2` by default. The MRV2 feature switches
+(`audio_mrv2_*`, `audio_async_*`) are tri-state fields of `HiggsAudioV3Config`
+that self-enable from the runner selection, so a deploy yaml needs only the
+`model_runner` key — the explicit `hf_overrides` block the old opt-in profile
+carried is now a tuning override, not a requirement. `audio_async_payload` and
+`audio_async_prompt_mode` are structural under v2 and cannot be disabled.
+
+Select one of these deployment profiles:
+
+| Profile | Runner | Intended use |
+| --- | --- | --- |
+| `higgs_multimodal_qwen3.yaml` | V2 (default) | Shipped default; H200-validated shape scaled to 16 sequences |
+| `higgs_multimodal_qwen3_mrv2_h200.yaml` | V2 | Large-card tuning (64-sequence capacities, MPS) |
+| `higgs_multimodal_qwen3_high_throughput.yaml` | V1 | V1 opt-out: eager Stage 0 + local MLP CUDA graph |
+| `higgs_multimodal_qwen3_low_latency.yaml` | V1 | V1 opt-out: `FULL_DECODE_ONLY` external decode graph |
+
+The default's `platforms:` section keeps V1 on NPU, XPU, ROCm and MUSA
+(XPU rejects any v2 stage at deploy load; NPU generation workers — Higgs
+Stage 1 — reject v2 at init). The V2 shape pins the connector streaming
+geometry (25-frame chunks, 8-frame left context, 8-frame first chunk) that
+the Stage-1 codec CUDA graph windows are sized against.
+
+Sampling surface under v2: the talker's self-owned sampler supports
+`temperature`/`top_p`/`top_k`/`seed` only. Penalties, logprobs, min_tokens,
+min_p, allowed/bad token ids, and logit_bias are text-generation machinery
+the captured sampling step does not wire in; a non-neutral unsupported value
+in `default_sampling_params` fails at startup, and per-request use raises.
+Remove the parameter or run the stage with `model_runner: v1`.
 
 ## Qwen3-TTS with Model Runner V2
 
