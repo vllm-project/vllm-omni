@@ -264,6 +264,11 @@ model_config:
   C2W pose. Each chunk ranks bank chunks by translation plus rotation distance
   and fits whole chunks into the budget, in time order with original RoPE.
 - **Compression:** only bank rows; the anchor frame is kept in full.
+- **Assembly:** canonical GPU history contains an uncompressed sink and a
+  contiguous recent suffix. Host-known frame boundaries select views of these
+  regions before concatenation with retrieved and current rows, avoiding
+  per-layer GPU index discovery and scalar synchronization. Bank compression
+  does not change these history boundaries.
 - **Transfers:** CUDA commits copy K/V into pinned host memory on a separate
   stream. Host-bank retrieval waits for that copy; uncompressed chunks still
   resident in GPU history are read directly. At most one publication remains

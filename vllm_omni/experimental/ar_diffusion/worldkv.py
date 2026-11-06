@@ -542,11 +542,11 @@ class WorldKV:
             self.num_layers, self.tokens_per_frame, key.shape[2], key.shape[3], key.element_size(), self._frames
         )
         self._seen.add(layer)
-        positions = torch.arange(self.next_frame, self.next_frame + self._frames, device=key.device)
-        positions = positions.repeat_interleave(self.tokens_per_frame)
         if self._commit:
             # These slices must own storage: QKV projections otherwise keep Q
             # and the unselected tokens alive after a compression/commit.
+            positions = torch.arange(self.next_frame, self.next_frame + self._frames, device=key.device)
+            positions = positions.repeat_interleave(self.tokens_per_frame)
             token_ids = torch.arange(
                 self.next_frame * self.tokens_per_frame,
                 (self.next_frame + self._frames) * self.tokens_per_frame,
@@ -556,7 +556,10 @@ class WorldKV:
         previous = self.history[layer]
         if previous is None:
             return key, value
-        sink = previous.positions < self.config.sink_frames
+        # Canonical history is an uncompressed sink followed by a contiguous
+        # recent suffix. Its boundaries are known on the host, even for short
+        # chunks. Avoid a GPU nonzero/scalar read and a gathered copy per layer.
+        sink_count = min(self.config.sink_frames, self.next_frame) * self.tokens_per_frame
         tail_start = max(
             self.config.sink_frames,
             self.next_frame
@@ -565,15 +568,19 @@ class WorldKV:
             + self.config.sink_frames
             + self.config.retrieval_frames,
         )
-        keep = sink | (previous.positions >= tail_start)
-        rows = previous.select(torch.where(keep)[0])
-        sink_count = int((rows.positions < self.config.sink_frames).sum())
-        keys, values = [rows.key[:, :sink_count]], [rows.value[:, :sink_count]]
+        tail_count = min(
+            previous.positions.numel() - sink_count,
+            max(0, self.next_frame - tail_start) * self.tokens_per_frame,
+        )
+        keys, values = [previous.key[:, :sink_count]], [previous.value[:, :sink_count]]
         for retrieved in self._retrieved_rows(layer, key.device):
             keys.append(retrieved.key)
             values.append(retrieved.value)
-        keys.extend((rows.key[:, sink_count:], key))
-        values.extend((rows.value[:, sink_count:], value))
+        if tail_count:
+            keys.append(previous.key[:, -tail_count:])
+            values.append(previous.value[:, -tail_count:])
+        keys.append(key)
+        values.append(value)
         return torch.cat(keys, 1), torch.cat(values, 1)
 
     def close(self) -> None:

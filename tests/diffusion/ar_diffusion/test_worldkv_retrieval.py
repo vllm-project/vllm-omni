@@ -449,3 +449,59 @@ def test_reservation_accounts_for_compressed_async_sources_only(ratio):
     scratch = 4 * config.window_frames * tokens * (2 * heads * dim * max(4, itemsize) + 16)
     extra = 0 if ratio == 1 else tokens + math.ceil((chunk - 1) * tokens * ratio)
     assert reserve - scratch == layers * (2 * (config.window_frames - config.retrieval_frames) * tokens + extra) * row
+
+
+@pytest.mark.parametrize(
+    "sink_frames,retrieval_frames,ratio",
+    [(0, 0, 1.0), (1, 0, 1.0), (3, 0, 1.0)] + [(sink, 3, ratio) for sink in (0, 6) for ratio in (0.0, 0.5, 1.0)],
+)
+def test_assembly_matches_position_mask_across_sink_and_chunk_boundaries(sink_frames, retrieval_frames, ratio):
+    memory = worldkv.WorldKV(
+        worldkv.WorldKVConfig(
+            window_frames=12,
+            sink_frames=sink_frames,
+            retrieval_frames=retrieval_frames,
+            bank_bytes=1 << 20 if retrieval_frames else 0,
+            world_keep_ratio=ratio,
+        ),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+    start = 0
+    for frames in [1, 3, 2, 1] * 5:
+        memory.set_pose(pose(start // 3))
+        for commit in (False, True):
+            with memory.forward(start, frames, commit=commit):
+                for layer in range(2):
+                    current = raw(start, frames=frames) + layer
+                    previous = memory.history[layer]
+                    expected_k, expected_v = current, current * 2
+                    if previous is not None:
+                        recent_start = max(sink_frames, start + frames - 12 + sink_frames + retrieval_frames)
+                        mask = (previous.positions < sink_frames) | (previous.positions >= recent_start)
+                        visible = previous.select(torch.where(mask)[0])
+                        sink_count = int((visible.positions < sink_frames).sum())
+                        retrieved = [chunk.layers[layer] for chunk in memory._retrieved]
+                        expected_k = torch.cat(
+                            [
+                                visible.key[:, :sink_count],
+                                *(rows.key for rows in retrieved),
+                                visible.key[:, sink_count:],
+                                current,
+                            ],
+                            1,
+                        )
+                        expected_v = torch.cat(
+                            [
+                                visible.value[:, :sink_count],
+                                *(rows.value for rows in retrieved),
+                                visible.value[:, sink_count:],
+                                current * 2,
+                            ],
+                            1,
+                        )
+                    actual_k, actual_v = memory.assemble(layer, current, current, current * 2)
+                    assert torch.equal(actual_k, expected_k)
+                    assert torch.equal(actual_v, expected_v)
+        start += frames
+    memory.close()
