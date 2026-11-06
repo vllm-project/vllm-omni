@@ -17,7 +17,8 @@ fixes.
 * test_cumsum_encoder_runs_bucketed_path_not_fallback
     a position-dependent (cumsum) encoder proves the bucketed path ran and is
     not the eager fallback: per-row prefix equals the solo result, the bucketed
-    tail semantics hold, the output width is the largest rung (not raw T), and
+    tail semantics hold (each rung window keeps the input's own padding tail,
+    never zero-filled), the output width is the largest rung (not raw T), and
     the call computed each rung eagerly with window shapes, not the full batch.
 * test_published_lengths_apply_alongside_positional_mask
     call sites that pass ``(features, mask)`` positionally (no lengths
@@ -78,10 +79,11 @@ class ToyModel(nn.Module):
 
 
 def make_features(lengths=LENGTHS, t: int = T, dim: int = D) -> torch.Tensor:
-    """Rows carry real data before their true length and garbage after."""
+    """Rows carry real data before their true length and a distinctive tail
+    after (the producer's own padding stand-in)."""
     feats = torch.randn(len(lengths), t, dim, device="cuda")
     for row, length in enumerate(lengths):
-        feats[row, length:] += 3.0  # garbage tail: makes fallback outputs differ
+        feats[row, length:] += 3.0  # distinctive tail: preserved by the wrapper, never zero-filled
     return feats
 
 
@@ -93,16 +95,15 @@ def rung_of(length: int) -> int:
 
 
 def expected_bucketed(feats: torch.Tensor, lengths=LENGTHS) -> torch.Tensor:
-    """The wrapper contract: per row cumsum over (true prefix + zero pad to
-    its rung), scattered into a container as wide as the largest rung used;
+    """The wrapper contract: per row cumsum over the row's rung window (true
+    content + the input's own padding tail preserved, never zero-filled),
+    scattered into a container as wide as the largest rung used;
     rows with a shorter rung stay zero beyond it."""
     width = max(rung_of(length) for length in lengths)
     out = torch.zeros(len(lengths), width, D, device="cuda")
     for row, length in enumerate(lengths):
         rung = rung_of(length)
-        window = torch.zeros(rung, D, device="cuda")
-        window[:length] = feats[row, :length]
-        out[row, :rung] = window.cumsum(dim=0)
+        out[row, :rung] = feats[row, :rung].cumsum(dim=0)  # window tail kept as-is
     return out
 
 
@@ -195,14 +196,17 @@ def test_cumsum_encoder_runs_bucketed_path_not_fallback(bucket_env):
         solo_prefix = feats[row, :length].cumsum(dim=0)
         torch.testing.assert_close(out[row, :length], solo_prefix, rtol=0, atol=1e-6)
 
-    # ... and the bucketed tail semantics hold: flat to the row's rung, zeros after.
+    # ... and the bucketed tail semantics hold: each row keeps the input's own
+    # tail up to its rung (the rung window is a slice of the carried input —
+    # producer padding preserved, never zero-filled), zeros after the rung.
     torch.testing.assert_close(out, expected, rtol=0, atol=1e-6)
 
     # (b) Bucketed output is structurally DIFFERENT from the fallback's:
-    #     width = largest rung (200), not the raw T (240).
+    #     width = largest rung (200), not the raw T (240), and a row stops at
+    #     its own rung: row 0's rung is exactly its length (40), so its output
+    #     is zero past the rung while the fallback keeps accumulating the
+    #     carried tail over the full width.
     assert out.shape == (len(LENGTHS), 200, D), out.shape
-    # The fallback computes cumsum over each full garbage tail; its values in
-    # the tail region differ from the bucketed (zero-padded) ones.
     fallback_tail = feats.cumsum(dim=1)[:, 40:200]
     assert not torch.allclose(out[0, 40:200], fallback_tail[0], atol=1e-3)
 
@@ -338,8 +342,9 @@ def test_length_returning_encoder_shim_nontuple_falls_back(bucket_env):
 
 def test_context_margin_preserves_conv_tail(bucket_env, monkeypatch):
     """A conv front that reads ``length + context_margin`` frames must not have
-    its context tail zeroed: the wrapper copies the extra frames, so the bucketed
-    output matches the eager conv over the full real window."""
+    its context tail clipped or zero-filled: the wrapper's rung window covers
+    the extra frames, so the bucketed output matches the eager conv over the
+    full real window."""
     from torch.nn import functional as F
 
     from vllm_omni.worker import bucketed_encoder
@@ -370,7 +375,8 @@ def test_context_margin_preserves_conv_tail(bucket_env, monkeypatch):
     assert install_bucketed_encoders(model) == ["encoder"]
     wrapper = model.encoder.forward
 
-    # Real content is [0, length + margin); garbage tail after the conv context.
+    # Real content is [0, length + margin); producer-style padding after the
+    # conv context (kept as-is by the wrapper, never zero-filled).
     lengths = [40, 120, 150, 75]  # max + margin <= largest rung (200)
     feats = torch.randn(len(lengths), T, D, device="cuda")
     for row, length in enumerate(lengths):
@@ -392,9 +398,10 @@ def test_context_margin_preserves_conv_tail(bucket_env, monkeypatch):
 def test_published_length_margin_3_covers_variable_offset(bucket_env, monkeypatch):
     """The processor-published length (samples//160) is 2..3 frames shorter than
     a model's real mel frame count (e.g. StepAudio2's 479-sample right pad). A
-    context margin of 3 covers the worst case: the bucketed window copies at
-    most one zero-padding frame beyond the real content, which is harmless, so
-    the output stays bit-identical to the full-window eager forward."""
+    context margin of 3 covers the worst case: the rung window always contains
+    the real content with the input's own padding past it (sliced through
+    unchanged, never zero-filled), which the true-length outputs never read, so
+    they stay bit-identical to the full-window eager forward."""
     from torch.nn import functional as F
 
     from vllm_omni.worker import bucketed_encoder
@@ -431,7 +438,7 @@ def test_published_length_margin_3_covers_variable_offset(bucket_env, monkeypatc
     full = [length + 2 for length in lengths]  # real mel frames T
     feats = torch.randn(len(lengths), max(full), D, device="cuda")
     for row, length in enumerate(lengths):
-        feats[row, length + 2 :] += 3.0  # garbage after the real window
+        feats[row, length + 2 :] += 3.0  # producer-style padding after the real window
     lens = torch.tensor(lengths, dtype=torch.long)
     # Published length: offset 2 (== audio_lens) for even rows, offset 3 for odd.
     pub = torch.tensor([length - (row % 2) for row, length in enumerate(lengths)], dtype=torch.int64)
@@ -542,9 +549,12 @@ def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
     wrapper = model.encoder.forward
 
     # All items shorter than the 128 mel bins: a wrong axis-1 guess would hand
-    # the conv the wrong channel count and disable the wrapper.
+    # the conv the wrong channel count and disable the wrapper. No length lands
+    # exactly on a rung: with the whitelist margin 0 a rung edge would clip the
+    # conv's boundary read (covered by
+    # test_missing_context_margin_clips_conv_context_at_rung_edge).
     mel, T_feat = 128, 120
-    lengths = [30, 60, 40, 80]
+    lengths = [30, 60, 45, 80]
     feats = torch.randn(len(lengths), mel, T_feat, device="cuda")
     for row, length in enumerate(lengths):
         feats[row, :, length:] += 3.0
@@ -557,7 +567,11 @@ def test_time_axis_contract_wins_for_all_short_batch(bucket_env, monkeypatch):
     assert wrapper._disabled is False, "an all-short batch must not disable bucketing"
     assert wrapper._axis == 2, "whitelist time_axis=2 must be used"
     for row, length in enumerate(lengths):
-        solo, solo_len = wrapper._original(feats[row : row + 1, :, :length], lens[row : row + 1])
+        # On/off parity: the reference is the un-bucketed forward over the full
+        # carried row (the globally padded input feature-off computes); the rung
+        # window keeps the input's own tail, so the true-length prefix matches
+        # it exactly (the conv's boundary reads land on that tail).
+        solo, solo_len = wrapper._original(feats[row : row + 1], lens[row : row + 1])
         torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
         assert out_lens[row].item() == solo_len.item()
 
@@ -1018,11 +1032,13 @@ def test_seconds_only_enables_with_default_knobs(bucket_env, monkeypatch):
     assert wrapper._context_margin == 0  # the whitelist-provided default margin
 
 
-def test_missing_context_margin_silently_truncates_conv_tail(bucket_env):
-    """Regression: a whitelist context_margin of 0 leaves a conv-context encoder's
-    tail zeroed — the bucketed output silently differs from the full-window eager
-    reference (lossy), rather than crashing or warning. This documents why the
-    whitelist must carry the verified margin for such encoders."""
+def test_missing_context_margin_clips_conv_context_at_rung_edge(bucket_env):
+    """Regression: a whitelist context_margin of 0 lets a rung land exactly on
+    a row's length, so the rung edge clips the front conv's context reads and
+    the boundary output silently diverges from the un-bucketed reference
+    (lossy), rather than crashing or warning. Rows whose rung leaves room past
+    the content keep the input's own tail and stay exact. This documents why
+    the whitelist must carry the verified margin for conv-context encoders."""
     from torch.nn import functional as F
 
     class ConvContextEncoder(nn.Module):
@@ -1045,24 +1061,31 @@ def test_missing_context_margin_silently_truncates_conv_tail(bucket_env):
     wrapper = model.encoder.forward
     assert wrapper._context_margin == 0  # whitelist margin 0 (no conv context)
 
-    lengths = [40, 120, 150, 75]
+    # 40 and 100 land exactly on their rungs; 150 and 75 leave rung headroom.
+    lengths = [40, 100, 150, 75]
     feats = torch.randn(len(lengths), T, D, device="cuda")
     for row, length in enumerate(lengths):
-        feats[row, length + 2 :] += 3.0  # real content in [0, length+2); garbage after
+        feats[row, length + 2 :] += 3.0  # real content in [0, length+2); producer-style padding after
     lens = torch.tensor(lengths, dtype=torch.long)
 
     with torch.inference_mode():
         model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
         out, _ = model.embed_multimodal(audio_features=feats, audio_lens=lens)
 
-    # The full-window reference reads length+2 frames; with margin 0 the wrapper
-    # copies only `length` frames, so the last valid output (which reads the two
-    # context frames) is computed over zeros and diverges.
     for row, length in enumerate(lengths):
-        solo, _ = wrapper._original(feats[row : row + 1, : length + 2], lens[row : row + 1])
-        assert not torch.allclose(out[row, :length], solo[0, :length], rtol=0, atol=1e-6), (
-            f"row {row}: margin=0 must diverge from the full-window reference (silent truncation)"
-        )
+        # The un-bucketed reference is the forward over the full carried row.
+        solo, _ = wrapper._original(feats[row : row + 1], lens[row : row + 1])
+        if rung_of(length) == length:
+            # The window edge lands where the conv still reads context frames
+            # (the content frames past the reported length), so the boundary
+            # output is computed over the window edge and diverges.
+            assert not torch.allclose(out[row, :length], solo[0, :length], rtol=0, atol=1e-6), (
+                f"row {row}: margin=0 must diverge at a rung that clips the conv context"
+            )
+        else:
+            # Ample rung headroom: the window keeps the input's own tail, so the
+            # true-length prefix matches the un-bucketed reference exactly.
+            torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
 
 
 def _mock_vllm_config(model_type: str):

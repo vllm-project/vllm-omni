@@ -25,6 +25,11 @@ input's time extent, and the bucketed path only runs when the capped windows
 are strictly shorter in aggregate, so a batch with no padding waste (single
 item, uniform lengths) is served by the untouched forward and enabling the
 feature there is a no-op.
+
+Tail contract. Each rung window is a slice of the carried input, so the frames
+past an item's real content keep the producer's own pad value (Whisper's
+extractor pads at the log-mel silence floor ``(max - 4) / 4``, not 0) instead
+of being zero-filled — zero fill is input the model never saw during training.
 """
 
 from __future__ import annotations
@@ -153,8 +158,10 @@ def _rungs_from_env(hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
 #   context_margin  — the max extra mel frames the front conv reads beyond the
 #                     published length. For a model whose real frame count is
 #                     (samples + C) // hop + D, it is C // hop + D + 1, so the
-#                     bucketed window copies at most one zero-padding frame past
-#                     the real content and stays bit-identical. StepAudio2
+#                     rung window always covers the real content and the conv's
+#                     context reads, which land on the carried padding inside
+#                     the window (the window tail is sliced through unchanged,
+#                     never zero-filled) and stay bit-identical. StepAudio2
 #                     right-pads 479 (C=479, D=0), so the offset is 2..3 and the
 #                     margin is 3.
 #   time_axis       — which feature axis is time: 1 = (B, T, D) time-major,
@@ -238,8 +245,9 @@ class _BucketedEncoder:
         self._default_time_axis: int | None = None
         # Extra feature frames the encoder's front conv reads beyond the
         # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
-        # Bucketing and copying add this margin; the attention mask length is
-        # unchanged (it still uses the reported valid length). Set per encoder
+        # The rung is chosen at length + margin so the window edge never clips
+        # these context reads; the attention mask length is unchanged (it still
+        # uses the reported valid length). Set per encoder
         # by the installer from the whitelist.
         self._context_margin = 0
 
@@ -426,16 +434,19 @@ class _BucketedEncoder:
         if self._axis == 2:
             batch = features.new_zeros((padded, features.size(1), rung))
             for row, index in enumerate(chunk):
-                # Clamp to the padded input's time dim: the margin may over-copy
-                # past the real content (harmless — those frames are already
-                # zero padding), but must never read past the tensor.
-                take = min(lengths[index] + self._context_margin, rung, features.size(2))
-                batch[row, :, :take] = features[index, :, :take]
+                # Slice the row's rung window from the carried input, tail
+                # included: the frames past the real content are the producer's
+                # own padding (Whisper's extractor pads at the (max - 4) / 4
+                # silence floor, not 0), and zero-filling them would feed the
+                # encoder input it never saw during training. The waste gate
+                # caps the rung at the input's time extent, so the slice never
+                # reads past the tensor; an item longer than its rung truncates
+                # to the rung (warned above).
+                batch[row] = features[index, :, :rung]
         else:
             batch = features.new_zeros((padded, rung, features.size(2)))
             for row, index in enumerate(chunk):
-                take = min(lengths[index] + self._context_margin, rung, features.size(1))
-                batch[row, :take] = features[index, :take]
+                batch[row] = features[index, :rung]
         if mask is not None:
             return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))
         if length_arg is not None:
