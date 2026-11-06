@@ -12,6 +12,7 @@
 #
 # MOSS-TTS-Nano has no multimodal input preprocessing, so skip_mm_profiling
 # bypasses the dummy-MM pass at profile time.
+model_runner: v2
 async_chunk: false
 trust_remote_code: true
 
@@ -31,3 +32,13 @@ stages:
       top_k: 50
       max_tokens: 4096
       seed: 42
+
+platforms:
+  rocm:
+    model_runner: v1
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  musa:
+    model_runner: v1
