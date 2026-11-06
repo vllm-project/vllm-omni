@@ -51,12 +51,13 @@ from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.utils.mm_outputs import DROPPED_PAYLOAD, build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
+from vllm_omni.worker.output.payload_build import unwrap_combined_payload_value
 from vllm_omni.worker.sampling_utils import call_model_sampler, sanitize_min_tokens_stop_ids
 
 
@@ -1367,15 +1368,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         # embed.tts_bos = [tensor]) are unwrapped to bare tensors
                         # at the leaves; downstream flatten_payload then yields a
                         # wire-clean dict[str, torch.Tensor].
-                        def _unwrap_lists(v):
-                            if isinstance(v, list):
-                                return v[idx] if idx < len(v) else v[0]
-                            if isinstance(v, dict):
-                                return {k: _unwrap_lists(sv) for k, sv in v.items()}
-                            return v
-
                         for mm_key in combined_multimodal_outputs.keys():
-                            mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
+                            keep, unwrapped = unwrap_combined_payload_value(
+                                combined_multimodal_outputs[mm_key][rid], rid=rid, list_idx=idx, mm_key=mm_key
+                            )
+                            if keep:
+                                mm_payload[mm_key] = unwrapped
                     else:
                         for mm_key, mm_val in mm_cpu.items():
                             if mm_key in {"meta.req_id", "meta.sparse_audio"}:
@@ -1397,7 +1395,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                                     sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
                                 )
                                 continue
-                            mm_payload[mm_key] = to_payload_element(
+                            value = to_payload_element(
                                 element=mm_val,
                                 idx=idx,
                                 start=start,
@@ -1405,7 +1403,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                                 pass_lists_through=False,
                                 seq_len=hidden_seq_len,
                                 scheduled_seq_len=scheduled_seq_len,
+                                rid=rid,
+                                mm_key=mm_key,
                             )
+                            if value is not DROPPED_PAYLOAD:
+                                mm_payload[mm_key] = value
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
