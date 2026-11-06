@@ -794,7 +794,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        17,
+        13,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
@@ -3188,7 +3188,7 @@ def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
 
     assert blocking_step["agent_pool"] == "mi300_2"
     assert blocking_step["grade"] == "Blocking"
-    assert "assert-pytest-collection.sh 17" in blocking_commands
+    assert "assert-pytest-collection.sh 13" in blocking_commands
     assert shm_path not in blocking_commands
 
     step = _find_step("Qwen3-Omni SHM Leak Test", AMD_MERGE_PIPELINE)
