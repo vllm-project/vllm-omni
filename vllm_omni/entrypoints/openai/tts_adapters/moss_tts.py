@@ -106,6 +106,10 @@ def _code_grid_cache_salt(audio_codes: Any) -> str:
 
 
 class _MossTTSAdapterBase(ARTTSAdapter):
+    # Audio codes are sampled inside the model with fixed per-variant settings
+    # (temperature 0.8 realtime, 1.7 local/delay) or, for Nano, its own
+    # text_/audio_ settings; stage SamplingParams.temperature never reaches them.
+    supports_temperature = False
     accumulate_nonstreaming: bool = False
 
     def __init__(self, ctx) -> None:
