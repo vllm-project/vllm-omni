@@ -8,15 +8,20 @@ One self-contained, deployment-tunable feature. When
 matching encoder so it buckets the batch by length rung and computes each rung
 window eagerly.
 
-Per-item lengths are the model's own published field. The wrapper reads the
-per-item length the model already hands to ``embed_multimodal`` (StepAudio2's
-``audio_lens``, Covo's ``audio_num_tokens`` — see ``_VERIFIED_MODELS``), so no
-processor is patched and nothing re-derives lengths beside the model. The
-length field is read once on the host per ``embed_multimodal`` call — the rung
-decision is host-side math — and the model declares the field ``keep_on_cpu``
-(the repo convention for length fields), so that read is free and no stream
-sync is introduced. The wrapper never reads feature tensors back and never
-performs per-item reads.
+Per-item lengths travel as an argument on the encoder call. The wrapper reads
+the model's own per-item length field where the model already passes it:
+StepAudio2 hands ``audio_lens`` to the encoder as its own forward argument,
+Covo passes its published ``audio_num_tokens`` through the wrapper's explicit
+``lengths`` argument (see ``_VERIFIED_MODELS`` for the unit conversion). There
+is no wrapper state — every call carries its own lengths, so no call can
+consume another call's lengths and nothing outlives the call that passed it.
+The field is read once on the host per call — the rung decision is host-side
+math — and the model declares the field ``keep_on_cpu`` (the repo convention
+for length fields), so that read is free and no stream sync is introduced. The
+wrapper never reads feature tensors back and never performs per-item reads.
+With the feature off the wrapper is a pass-through: it only accepts the
+``lengths`` argument (stripped before the module's own forward) and runs the
+untouched forward.
 
 Scope. This is for encoder call sites that feed one globally padded batch —
 inputs carried at a non-true (batch/global padded) length, so every item is
@@ -41,7 +46,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import regex as re
@@ -53,6 +57,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "install_bucketed_encoders",
+    "uninstall_bucketed_encoders",
 ]
 
 _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
@@ -166,15 +171,16 @@ def _rungs_from_env(hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
 #   hop             — STFT hop length in samples, i.e. the mel frame rate; the
 #                     seconds ladder becomes seconds * 16000 / hop frames.
 #                     e.g. 160 = 10 ms at 16 kHz (100 fps).
-#   lengths_key     — the per-item length field the model itself publishes to
-#                     ``embed_multimodal`` (read, never re-derived): StepAudio2's
-#                     ``audio_lens``, Covo's ``audio_num_tokens``.
-#   frames_per_length — feature frames per published unit. 1 when the field is
-#                     already mel frames (StepAudio2's audio_lens). 16 for Covo:
-#                     its tokens are stride-16 downsampled centiseconds, so
-#                     ``tokens * 16`` is an upper bound on the item's real mel
-#                     frames — the window may carry a little more of the
-#                     producer's own padding, never truncates content.
+#   frames_per_length — feature frames per per-item length unit. The length is
+#                     always the model's own field, read from the encoder call
+#                     (the forward's own argument, or the wrapper's explicit
+#                     ``lengths`` argument): 1 when the field is already mel
+#                     frames (StepAudio2's ``audio_lens``). 16 for Covo: its
+#                     ``audio_num_tokens`` are stride-16 downsampled
+#                     centiseconds, so ``tokens * 16`` is an upper bound on
+#                     the item's real mel frames — the window may carry a
+#                     little more of the producer's own padding, never
+#                     truncates content.
 #   context_margin  — extra frames taken past the published length so the rung
 #                     window never clips anything the encoder reads: the frames
 #                     the model carries beyond its reported length (StepAudio2's
@@ -187,14 +193,12 @@ def _rungs_from_env(hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
 _VERIFIED_MODELS: dict[str, dict[str, object]] = {
     "step_audio_2": {
         "hop": 160,
-        "lengths_key": "audio_lens",
         "frames_per_length": 1,
         "context_margin": 3,
         "time_axis": 2,
     },
     "covo_audio": {
         "hop": 160,
-        "lengths_key": "audio_num_tokens",
         "frames_per_length": 16,
         "context_margin": 0,
         "time_axis": 2,
@@ -255,23 +259,36 @@ def _split_output(output):
 
 
 class _BucketedEncoder:
-    """Wraps one encoder ``forward`` with per-rung length bucketing."""
+    """Wraps one encoder ``forward`` with per-rung length bucketing.
 
-    def __init__(self, module: nn.Module, name: str, ladder: LengthBucketingConfig):
+    The wrap doubles as the call-signature extension: ``forward(*args,
+    lengths=<per-item lengths>, **kwargs)`` is the explicit contract by which a
+    call site whose module forward has no length slot (Covo) passes the model's
+    own per-item length field. ``lengths`` is consumed here and never reaches
+    the module's own forward; call sites whose forward already takes lengths
+    (StepAudio2) pass them as the ordinary positional argument instead. Either
+    way the lengths ride the call itself — the wrapper holds no per-request
+    state. With the feature off (or after a runtime disable) the wrapper is a
+    pass-through that only strips ``lengths``.
+    """
+
+    def __init__(self, module: nn.Module, name: str, ladder: LengthBucketingConfig | None):
         self.module = module
         self.name = name
         self.ladder = ladder
+        self._active = ladder is not None  # feature armed; False = pass-through
         self._original = module.forward
         self._shim = None  # optional fixed-window recipe; used ONLY for bucketed windows
         self._rebuild = None
         self._aux_spec = None  # e.g. ("lengths", dtype, device) for (features, lengths) outputs
-        self._lengths: tuple[int, ...] | None = None
         self._disabled = False
         self._truncation_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
         # Verified time axis from the whitelist (the fixed-window shim overrides
         # it to channels-first 2).
         self._default_time_axis: int | None = None
+        # Feature frames per unit of the model's per-item length field.
+        self._frames_per_length = 1
         # Extra feature frames the encoder's front conv reads beyond the
         # reported length (e.g. StepAudio2's padding_mels reports s.size(1)-2).
         # The rung is chosen at length + margin so the window edge never clips
@@ -279,9 +296,6 @@ class _BucketedEncoder:
         # uses the reported valid length). Set per encoder
         # by the installer from the whitelist.
         self._context_margin = 0
-
-    def publish(self, lengths: tuple[int, ...] | None) -> None:
-        self._lengths = lengths
 
     def _resolve_time_axis(self) -> int:
         """1 = time on dim 1 (B, T, D); 2 = time on dim 2 (B, mel, T).
@@ -301,7 +315,11 @@ class _BucketedEncoder:
         return features.size(1) if self._axis == 1 else features.size(2)
 
     def __call__(self, *args, **kwargs):
-        if self._disabled or kwargs or not args:
+        # The wrapper's explicit ``lengths`` argument (the model's own
+        # per-item length field) is consumed here and never reaches the
+        # module's own forward.
+        carried = kwargs.pop("lengths", None) if kwargs else None
+        if not self._active or self._disabled or kwargs or not args:
             return self._original(*args, **kwargs)
         features = args[0]
         if (
@@ -314,7 +332,7 @@ class _BucketedEncoder:
         if torch.cuda.is_current_stream_capturing():
             return self._original(*args, **kwargs)
 
-        lengths, mask, length_arg = self._host_lengths(features, args[1:])
+        lengths, mask, length_arg = self._host_lengths(features, args[1:], carried)
         if lengths is None or len(lengths) != features.size(0):
             logger.debug(
                 "Bucketed encoder %r: no per-item lengths (got %r); falling back to the original forward",
@@ -375,31 +393,32 @@ class _BucketedEncoder:
             logger.warning("Bucketed encoder %r failed; falling back to eager", self.name, exc_info=True)
             return self._original(*args, **kwargs)
 
-    def _host_lengths(self, features, extra):
+    def _host_lengths(self, features, extra, carried):
         mask = None
         length_arg = None
         if extra and torch.is_tensor(extra[0]):
             second = extra[0]
             if second.dim() == 1:
-                # A positional 1-D tensor is the encoder's own length argument.
-                # It is passed through unchanged to the encoder and serves as
-                # the fallback length source (one batched host read) when no
-                # model-published field is available.
+                # A positional 1-D tensor is the encoder's own length argument
+                # (StepAudio2's audio_lens). It is passed through unchanged to
+                # the encoder and serves as the fallback length source (one
+                # batched host read) when the call carries no explicit
+                # ``lengths``.
                 length_arg = second
             elif second.dim() == 2:
                 # A padding mask is an input, never a length source (its values
-                # live on the device and must not be read back). Published host
-                # lengths still apply alongside the mask, for call sites that
-                # pass (features, mask) positionally and rely on the
-                # embed_multimodal publish for lengths.
+                # live on the device and must not be read back).
                 mask = second
-        published = self._lengths
-        if published is not None and len(published) == features.size(0):
-            return [int(v) for v in published], mask, length_arg
-        # No published length: fall back to the positional length argument,
-        # read once on the host like the published field.
+        # Explicit ``lengths`` on the call wins — it is the model's own
+        # per-item length field, arriving with the very call it describes, so
+        # no cross-call matching is involved. One batched host read.
+        explicit = _published_lengths(carried, self._frames_per_length)
+        if explicit is not None and len(explicit) == features.size(0):
+            return [int(v) for v in explicit], mask, length_arg
+        # No explicit lengths: fall back to the positional length argument,
+        # read once on the host like the explicit one.
         if length_arg is not None:
-            fallback = _published_lengths(length_arg, 1)
+            fallback = _published_lengths(length_arg, self._frames_per_length)
             if fallback is not None and len(fallback) == features.size(0):
                 return list(fallback), mask, length_arg
         return None, mask, None
@@ -563,41 +582,34 @@ def _published_lengths(value, frames_per_length: int) -> tuple[int, ...] | None:
     return tuple(frames)
 
 
-def _wrap_embed_multimodal(
-    model: nn.Module, encoders: Sequence[_BucketedEncoder], lengths_key: str, frames_per_length: int
-) -> None:
-    original = getattr(model, "embed_multimodal", None)
-    if original is None:
-        return
-
-    def embed_multimodal(**kwargs):
-        # The model's own published per-item lengths. Always publish, so a
-        # request without the field clears any stale lengths left over from a
-        # previous request of the same batch size.
-        lengths = _published_lengths(kwargs.get(lengths_key), frames_per_length)
-        for encoder in encoders:
-            encoder.publish(lengths)
-        try:
-            return original(**kwargs)
-        finally:
-            # Consume-once: a request's lengths must not outlive its
-            # embed_multimodal call — a later direct encoder call must not
-            # reuse them.
-            for encoder in encoders:
-                encoder.publish(None)
-
-    model.embed_multimodal = embed_multimodal
-
-
 def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str]:
-    """Wrap matching encoders so they bucket by length rung; returns wrapped names."""
-    if _rungs_from_env() is None:
-        return []
+    """Wrap matching encoders; returns wrapped names.
+
+    The wrap is unconditional for models that call this (the encoder-owning
+    model's constructor): it installs the explicit ``lengths`` call contract
+    those models use at their encoder call sites, so the call stays valid with
+    the feature off. Bucketing itself is opt-in — armed only when
+    ``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` is set and the model is in the verified
+    whitelist; otherwise the wrapper is a pass-through that only strips
+    ``lengths`` and runs the untouched forward.
+    """
     if model is None or getattr(model, "_bucketed_installed", False):
         return []
 
     verified = _verified_knobs(vllm_config)
-    if verified is None:
+    ladder = None
+    frames_per_length = 1
+    context_margin = 0
+    time_axis = None
+    if verified is not None:
+        hop = verified.get("hop") or _DEFAULT_HOP
+        rungs = _rungs_from_env(hop)
+        if rungs is not None:
+            ladder = LengthBucketingConfig(buckets=rungs)
+        frames_per_length = int(verified.get("frames_per_length", 1))
+        context_margin = verified["context_margin"]
+        time_axis = verified["time_axis"]
+    elif _rungs_from_env() is not None:
         model_type = vllm_config.model_config.hf_config.model_type if vllm_config is not None else "<unknown>"
         logger.warning(
             "Bucketed encoder is not verified for model_type %r; disabling the "
@@ -607,27 +619,18 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
             sorted(_VERIFIED_MODELS),
             _ENV_SECONDS,
         )
-        return []
-
-    hop = verified.get("hop") or _DEFAULT_HOP
-    lengths_key = verified.get("lengths_key")
-    if not isinstance(lengths_key, str):
-        # Raise (not assert) so the whitelist-bug signal survives `python -O`.
-        raise RuntimeError("verified model must specify lengths_key (its published per-item length field)")
-    frames_per_length = int(verified.get("frames_per_length", 1))
-    rungs = _rungs_from_env(hop)
-    ladder = LengthBucketingConfig(buckets=rungs)
     pattern = re.compile(_MODULE_PATTERN)
     wrapped: list[str] = []
-    encoders: list[_BucketedEncoder] = []
+    manifest: list[tuple[nn.Module, str, object]] = []
     for name, module in model.named_modules():
         if any(name == p or name.startswith(p + ".") for p in wrapped):
             continue  # skip descendants of an already-wrapped module
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
-        encoder._context_margin = verified["context_margin"]
-        encoder._default_time_axis = verified["time_axis"]
+        encoder._context_margin = context_margin
+        encoder._default_time_axis = time_axis
+        encoder._frames_per_length = frames_per_length
         for klass in type(module).__mro__:
             shim = _FORWARD_SHIMS.get(klass.__name__)
             if shim is not None:
@@ -645,15 +648,38 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
                     "(outputs may differ from the un-bucketed forward).",
                     name,
                 )
+        manifest.append((module, name, encoder._original))
         module.forward = encoder
         wrapped.append(name)
-        encoders.append(encoder)
 
     if not wrapped:
-        logger.warning("Bucketed encoder enabled but no encoder matched %r", _MODULE_PATTERN)
+        logger.warning("Bucketed encoder found no module matching %r in %r", _MODULE_PATTERN, type(model).__name__)
         return []
 
-    _wrap_embed_multimodal(model, encoders, lengths_key, frames_per_length)
+    model._bucketed_wrapped = manifest
     model._bucketed_installed = True
-    logger.info("Bucketed encoder enabled over rungs %s for modules %s", rungs, wrapped)
+    if ladder is not None:
+        logger.info("Bucketed encoder enabled over rungs %s for modules %s", ladder.buckets, wrapped)
+    else:
+        logger.debug("Bucketed encoder pass-through installed for modules %s (feature off)", wrapped)
     return wrapped
+
+
+def uninstall_bucketed_encoders(model: nn.Module) -> list[str]:
+    """Restore every wrapped ``forward``; returns the restored module names.
+
+    Rollback for :func:`install_bucketed_encoders` (test isolation, teardown):
+    each module's own ``forward`` is put back from the installer's patch
+    manifest and the install flags are cleared, so a later install starts from
+    a clean slate.
+    """
+    manifest = getattr(model, "_bucketed_wrapped", None) or []
+    restored: list[str] = []
+    for module, name, original in manifest:
+        module.forward = original
+        restored.append(name)
+    if manifest:
+        del model._bucketed_wrapped
+    if getattr(model, "_bucketed_installed", False):
+        del model._bucketed_installed
+    return restored

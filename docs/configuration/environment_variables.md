@@ -116,7 +116,8 @@ this per batch, not just per call site: each rung window is capped at the batch'
 extent, and the bucketed path runs only when the capped windows are strictly shorter in
 aggregate, so batches with no padding waste to recover (single audio, uniform lengths)
 compute exactly as they do with the feature off. When a wrapped encoder's
-call is ineligible (keyword args, non-CUDA, no published lengths, unsupported output, or
+call is ineligible (keyword args, non-CUDA, no per-item lengths carried on the
+call, unsupported output, or
 no matching fixed-window recipe, or over-long/empty batches), the wrapper returns the untouched forward unchanged.
 
 Numerically, the path is **lossy for unmasked, absolute-positional encoders** (the
@@ -126,7 +127,8 @@ two outputs differ. **Mask-aware encoders keep the encoder output numerically
 unchanged** (e.g. Step-Audio-2-mini, whose `AudioEncoder` masks padding via
 `make_non_pad_mask`): the on/off encoder outputs are identical in fp32 and nearly
 identical in bfloat16. The bucketed copy never drops real frames: the rung is the
-model's own published per-item length (Step-Audio-2's `audio_lens`; Covo's
+model's own per-item length, carried on the encoder call as an argument
+(Step-Audio-2's `audio_lens`; Covo's
 `audio_num_tokens`, scaled by 16 to mel frames) plus a per-model `context_margin`
 covering the frames the model carries past its reported length and the front
 conv's boundary read, so the window never truncates real content and overshoots
@@ -171,7 +173,7 @@ values depend on the actual audio length distribution):
 
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the encoder-owning model installs bucketed encoders at construction | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
 
-> The per-model knobs (`hop`, `lengths_key`, `frames_per_length`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the one knob above is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
+> The per-model knobs (`hop`, `frames_per_length`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the one knob above is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
 
 ### NIXL stage transfer
 
