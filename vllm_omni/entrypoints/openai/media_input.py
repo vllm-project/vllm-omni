@@ -120,23 +120,19 @@ async def download_media_bytes(
                             declared_length = None
                         if declared_length is not None and declared_length > max_bytes:
                             raise MediaInputTooLargeError(
-                                f"Invalid {source}: response exceeds the "
-                                f"{max_bytes // (1024 * 1024)} MiB size limit."
+                                f"Invalid {source}: response exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
                             )
 
                     payload = bytearray()
                     async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
                         if len(payload) + len(chunk) > max_bytes:
                             raise MediaInputTooLargeError(
-                                f"Invalid {source}: response exceeds the "
-                                f"{max_bytes // (1024 * 1024)} MiB size limit."
+                                f"Invalid {source}: response exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
                             )
                         payload.extend(chunk)
                     return bytes(payload)
     except TimeoutError as exc:
-        raise MediaInputTimeoutError(
-            f"Invalid {source}: download exceeded the {timeout_s:g}s time limit."
-        ) from exc
+        raise MediaInputTimeoutError(f"Invalid {source}: download exceeded the {timeout_s:g}s time limit.") from exc
 
 
 __all__ = [
