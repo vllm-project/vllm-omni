@@ -125,6 +125,15 @@ replicas, not logical stages, determine this allowance. Waiting returns as soon
 as the orchestrator exits. If it remains alive after the allowance, runtime
 release stays deferred to avoid concurrent resource teardown. Weak-finalizer
 cleanup keeps its existing short, best-effort wait.
+For example, eight attached replicas reserve a 190-second join allowance
+(30 + 8 * 20); this is a maximum wait for the orchestrator, not a fixed delay
+or an end-to-end shutdown deadline.
+
+Transfer shutdown stops queued work rather than draining it. Send and receive
+loops check the stop signal between operations, let an in-flight operation
+finish, and join before closing the connector. This does not guarantee delivery
+of the last chunk to a downstream stage; callers that need graceful request
+draining must finish those requests before shutting down the stages.
 
 ## Invariant namespace
 

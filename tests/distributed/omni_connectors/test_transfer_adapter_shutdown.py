@@ -13,6 +13,57 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTran
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_shutdown_stops_queued_io_after_inflight_operation(direction):
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    processed = []
+
+    def transfer(request_id):
+        processed.append(request_id)
+        if request_id == "0":
+            entered.set()
+            assert release.wait(timeout=5)
+        return True
+
+    class Adapter(OmniTransferAdapterBase):
+        def _send_single_request(self, task):
+            transfer(task["request"].request_id)
+
+        def _poll_single_request(self, request):
+            return transfer(request.request_id)
+
+    adapter = Adapter(None)
+    adapter.connector = SimpleNamespace(close=closed.set, reap_consumed=lambda: None)
+    requests = [SimpleNamespace(request_id=str(i)) for i in range(64)]
+    condition = adapter._save_cond if direction == "send" else adapter._recv_cond
+    with condition:
+        if direction == "send":
+            adapter._pending_save_reqs.extend({"request": request} for request in requests)
+        else:
+            adapter._pending_load_reqs.extend(requests)
+        condition.notify()
+    stopper = threading.Thread(target=adapter.shutdown)
+    try:
+        assert entered.wait(timeout=5)
+        stopper.start()
+        assert adapter.stop_event.wait(timeout=5)
+        assert not closed.is_set()
+    finally:
+        release.set()
+        if stopper.ident is not None:
+            stopper.join(timeout=5)
+        adapter.shutdown()
+        adapter.recv_thread.join(timeout=5)
+        adapter.save_thread.join(timeout=5)
+    assert not stopper.is_alive()
+    assert not adapter.recv_thread.is_alive()
+    assert not adapter.save_thread.is_alive()
+    assert closed.is_set()
+    assert processed == ["0"]
+
+
 def test_shutdown_waits_for_inflight_put_before_closing_connector():
     entered = threading.Event()
     release = threading.Event()

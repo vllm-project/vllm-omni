@@ -61,7 +61,7 @@ class OmniTransferAdapterBase:
             n = len(self._pending_load_reqs)
             any_success = False
             for _ in range(n):
-                if not self._pending_load_reqs:
+                if self.stop_event.is_set() or not self._pending_load_reqs:
                     break
                 request = self._pending_load_reqs.popleft()
                 request_id = request.request_id
@@ -112,9 +112,9 @@ class OmniTransferAdapterBase:
         return failures
 
     def save_loop(self):
-        """Loop to send outgoing data."""
+        """Send queued data until shutdown, finishing only the in-flight send."""
         while not self.stop_event.is_set():
-            while self._pending_save_reqs:
+            while self._pending_save_reqs and not self.stop_event.is_set():
                 task = self._pending_save_reqs.popleft()
                 try:
                     self._send_single_request(task)
