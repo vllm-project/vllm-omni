@@ -841,20 +841,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return isolation_plan(
             has_running=bool(self.running),
             seeded_running=any(request_is_seeded(getattr(r, "sampling_params", None)) for r in self.running),
-            seeded_waiting=any(request_is_seeded(getattr(r, "sampling_params", None)) for r in self.waiting),
+            seeded_waiting=any(
+                request_is_seeded(getattr(r, "sampling_params", None))
+                for r in (*self.waiting, *self.kv_holding_waiting)
+            ),
         )
 
-    def _promote_seeded_request(self) -> None:
-        """Move the oldest waiting seeded request to the front of the queue."""
-        target = next(
-            (r for r in self.waiting if request_is_seeded(getattr(r, "sampling_params", None))),
-            None,
-        )
-        if target is None:
-            return
-        if self.waiting.peek_request() is not target:
-            self.waiting.remove_request(target)
-            self.waiting.prepend_request(target)
+    def _promote_seeded_request(self) -> str | None:
+        """Move the oldest seeded request to the front of its queue.
+
+        Returns the queue that was promoted (``"waiting"`` or
+        ``"kv_holding"``), or ``None`` when no seeded request is waiting.
+        """
+        for name, queue in (("waiting", self.waiting), ("kv_holding", self.kv_holding_waiting)):
+            target = next(
+                (r for r in queue if request_is_seeded(getattr(r, "sampling_params", None))),
+                None,
+            )
+            if target is None:
+                continue
+            if queue.peek_request() is not target:
+                queue.remove_request(target)
+                queue.prepend_request(target)
+            return name
+        return None
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -873,33 +883,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_talker_drafts_if_prefill_pending()
 
         seeded_defer, seeded_solo = self._seeded_isolation_plan()
-        if seeded_solo:
-            self._promote_seeded_request()
+        solo_queue = self._promote_seeded_request() if seeded_solo else None
 
+        # A solo step admits exactly one request: the promoted seeded one. Empty
+        # the *other* queue for this step so it cannot be admitted alongside.
         original_wait_queues = None
-        if seeded_defer or self._should_defer_waiting_admission():
+        deferred = seeded_defer or self._should_defer_waiting_admission()
+        if deferred or solo_queue is not None:
             original_wait_queues = self.waiting, self.kv_holding_waiting
-            self.waiting = create_request_queue(self.policy)
-            self.kv_holding_waiting = create_request_queue(self.policy)
+            if deferred:
+                self.waiting = create_request_queue(self.policy)
+                self.kv_holding_waiting = create_request_queue(self.policy)
+            elif solo_queue == "waiting":
+                self.kv_holding_waiting = create_request_queue(self.policy)
+            else:
+                self.waiting = create_request_queue(self.policy)
 
         original_max_num_active_reqs = self.max_num_active_reqs
-        if seeded_solo:
-            # Admit exactly the promoted seeded request, nothing else.
-            self.max_num_active_reqs = 1
+        # One limit, computed once: the solo cap must survive the async-chunk
+        # reservation below (review on #9937).
+        limit = 1 if seeded_solo else original_max_num_active_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
         if reserved_running_slots:
-            self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+            limit = min(limit, max(0, original_max_num_active_reqs - reserved_running_slots))
+        self.max_num_active_reqs = limit
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
-                original_waiting.prepend_requests(self.waiting)
-                original_kv_holding.prepend_requests(self.kv_holding_waiting)
+                if self.waiting is not original_waiting:
+                    original_waiting.prepend_requests(self.waiting)
+                if self.kv_holding_waiting is not original_kv_holding:
+                    original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
