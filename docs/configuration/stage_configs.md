@@ -428,70 +428,45 @@ stages:
       audio_bucket_seconds: [2, 4, 8, 16, 30]
 ```
 
-Length bucketing for variable-length encoders. It applies only to
-encoder call sites that feed one globally padded batch (inputs at a non-true, batch/global
-padded length); call sites already feeding true-length or length-packed inputs have no
-padding waste to recover and fall back to the original forward — and the wrapper enforces
-this per batch, not just per call site: each rung window is capped at the batch's time
-extent, and the bucketed path runs only when the capped windows are strictly shorter in
-aggregate, so batches with no padding waste to recover (single audio, uniform lengths)
-compute exactly as they do with the feature off. When a wrapped encoder's
-call is ineligible (keyword args, non-CUDA, no per-item lengths carried on the
-call, unsupported output, or
-no matching fixed-window recipe, or over-long/empty batches), the wrapper returns the untouched forward unchanged.
+It applies only to encoder call sites that feed one globally padded batch
+(inputs at a non-true, batch/global padded length); call sites already feeding
+true-length or length-packed inputs have no padding waste to recover and fall
+back to the original forward — and the wrapper enforces this per batch, not
+just per call site: each rung window is capped at the batch's time extent, and
+the bucketed path runs only when the capped windows are strictly shorter in
+aggregate, so batches with no padding waste to recover (single audio, uniform
+lengths) compute exactly as they do with the feature off. When a wrapped
+encoder's call is ineligible (keyword args, non-CUDA, no per-item lengths
+carried on the call, unsupported output, no matching fixed-window recipe, or
+over-long/empty batches), the wrapper returns the untouched forward unchanged;
+the missing-lengths fallback warns once per encoder, so a feature that never
+engages is visible instead of silent.
 
-Numerically, the path is **lossy for unmasked, absolute-positional encoders** (the
-fixed-window Whisper family, e.g. Covo-Audio-Chat): feature-off attends over the full
-extractor padding while the bucketed path attends over the smaller rung window, so the
-two outputs differ. **Mask-aware encoders keep the encoder output numerically
-unchanged** (e.g. Step-Audio-2-mini, whose `AudioEncoder` masks padding via
-`make_non_pad_mask`): the on/off encoder outputs are identical in fp32 and nearly
-identical in bfloat16. The bucketed copy never drops real frames: the rung is the
-model's own per-item length, carried on the encoder call as an argument
-(Step-Audio-2's `audio_lens`; Covo's
-`audio_num_tokens`, scaled by 16 to mel frames) plus a per-model `context_margin`
-covering the frames the model carries past its reported length and the front
-conv's boundary read, so the window never truncates real content and overshoots
-it by at most one frame (Covo's token-scaled length bounds the frames from
-above, over-copying at most 15 frames of the extractor's own padding);
-property-swept in `tests/worker/test_bucketed_encoder.py`. Each
-rung window is a slice of the carried input: the frames past an item's real content
-keep the extractor's own pad value — Whisper-style extraction pads at the log-mel
-silence floor `(max - 4) / 4`, not 0 — and are never zero-filled, so the window
-frames are exactly the ones the un-bucketed forward would read.
-These are mel-window and encoder-boundary guarantees only; neither establishes
-end-to-end transcript equivalence (see the Step-Audio-2-mini measurement below).
+Numerically, the path is **lossy for unmasked, absolute-positional encoders**
+(the fixed-window Whisper family, e.g. Covo-Audio-Chat): feature-off attends
+over the full extractor padding while the bucketed path attends over the
+smaller rung window, so the two outputs differ. **Mask-aware encoders keep the
+encoder output numerically unchanged** (e.g. Step-Audio-2-mini, whose
+`AudioEncoder` masks padding via `make_non_pad_mask`).
 
-Measured on the real checkpoints, the main numbers are (reference data; the exact
-values depend on the actual audio length distribution):
+The bucketed copy never drops real frames. The rung window is the model's own
+per-item length, carried on the encoder call as an argument (Step-Audio-2's
+`audio_lens`; Covo's `audio_num_tokens`, scaled by 16 to mel frames) plus a
+per-model `context_margin` covering the frames the model carries past its
+reported length and the front conv's boundary read, so the window never
+truncates real content and overshoots it by at most one frame (Covo's
+token-scaled length bounds the frames from above instead, over-copying at most
+15 frames of the extractor's own padding). Each rung window is a slice of the
+carried input: the frames past an item's real content keep the extractor's own
+pad value — Whisper-style extraction pads at the log-mel silence floor
+`(max - 4) / 4`, not 0 — and are never zero-filled, so the window frames are
+exactly the ones the un-bucketed forward would read. Per-model derivations
+live next to `_VERIFIED_MODELS` in `vllm_omni/worker/bucketed_encoder.py`; the
+window properties are swept in `tests/worker/test_bucketed_encoder.py`. These
+are mel-window and encoder-boundary guarantees only; neither establishes
+end-to-end transcript equivalence.
 
-* Covo-Audio-Chat (lossy): per-row on/off cosine down to ~0.5 on short clips,
-  WER(off) 22.24%, WER(on) 23.55%, WER(on vs off) 8.01% on LibriSpeech
-  test-clean, ~1.85x encoder speedup, and E2E at max-concurrency 16: TTFT P50
-  104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%).
-* Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
-  bfloat16), and 1.62-3.7x encoder speedup on constructed mixed-length batches. The
-  speedup is a function of the intra-batch length mix, not of the model: with the waste
-  gate, single-audio and uniform-length calls are no-ops (the untouched forward runs
-  unchanged).
-  End-to-end WER is contributor-reported from a local WER run (single RTX 5090
-  32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
-  temperature 0, repetition penalty 1.05, seed 42; buckets 2,4,8,16,30 s; same
-  checkout with the feature off -> on) on LibriSpeech test-clean clips of <= 29 s
-  (199 clips measured): WER(off) 1.52%, WER(on) 1.52%, WER(on vs off) 0.00% on
-  the 197/199 clips that stay clean in both passes, and WER(off) 16.57% / WER(on)
-  16.57% over all 199 clips (off and on agree exactly). The clean cohort
-  keeps only clips that neither over- nor under-generate in either pass, using a
-  reference-length filter that never looks at which configuration produced the
-  clip; it removes task failures, not recognition errors. WER(off) and WER(on)
-  are absolute, measured against the ground-truth reference; WER(on vs off) is
-  relative, measured against the bucketing-off transcript, so it isolates the
-  text change bucketing introduces from the model's own paraphrase/rewrite
-  baseline (the ~24% absolute Covo WER mostly reflects that baseline, not
-  bucketing damage). These are contributor-reported measurements, not
-  independently reproduced results.
-
-| `additional_config.audio_bucket_seconds` | List of float seconds; unset or `[]` disables bucketing — the feature is off by default | Enables length bucketing for encoders on that stage; each rung is `seconds * frames_per_second` mel frames, where `frames_per_second` is the model's verified mel frame rate (see `_VERIFIED_MODELS`). Read when the encoder-owning model installs bucketed encoders at construction | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). The encoder-owning model declares its encoder to the installer at construction — nothing is discovered by name — and a model not in the whitelist means the feature is a no-op. A malformed value (non-list, or a non-numeric / non-positive entry) raises `ValueError` at model construction. | Experimental |
+| `additional_config.audio_bucket_seconds` | List of float seconds; unset or `[]` disables bucketing — the feature is off by default | Enables length bucketing for encoders on that stage; each rung is `seconds * frames_per_second` mel frames, where `frames_per_second` is the model's verified mel frame rate (see `_VERIFIED_MODELS`). Read when the encoder-owning model installs bucketed encoders at construction | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). The encoder-owning model declares its encoder to the installer at construction — nothing is discovered by name — and a model not in the whitelist means the feature is a no-op with a warning at install. A malformed value (non-list, or a non-numeric / non-positive entry) raises `ValueError` at model construction. | Experimental |
 
 > The per-model knobs (`frames_per_second`, `frames_per_length`, `context_margin`, `time_axis`, `output_kind`) are not user-facing settings — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only `audio_bucket_seconds` is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
 
