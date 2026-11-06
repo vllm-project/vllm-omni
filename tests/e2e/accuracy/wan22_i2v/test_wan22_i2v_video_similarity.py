@@ -26,7 +26,6 @@ from tests.e2e.accuracy.helpers import (
     validate_image_source,
     video_artifact_dir,
     write_accuracy_result,
-    write_json_artifact,
 )
 from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
 from tests.e2e.accuracy.wan22_i2v.wan22_i2v_video_similarity_common import (
@@ -287,22 +286,7 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
         online_path=online_path,
         offline_path=offline_path,
     )
-    score_path = offline_path.with_name("similarity.json")
-    write_json_artifact(
-        score_path,
-        {
-            "label": "wan22_i2v",
-            "device_profile": device_profile,
-            "ssim": ssim,
-            "psnr": psnr,
-            "ssim_threshold": thresholds.ssim,
-            "psnr_threshold": thresholds.psnr,
-            "online_video": str(online_path),
-            "offline_video": str(offline_path),
-            "offline_metadata": str(offline_metadata_path),
-        },
-    )
-    write_accuracy_result(
+    accuracy_result_path = write_accuracy_result(
         model_id=MODEL_NAME,
         dataset="video_similarity",
         metrics={"ssim": ssim, "psnr": psnr},
@@ -310,10 +294,11 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
         extra={
             "label": "wan22_i2v",
             "device_profile": device_profile,
+            "ssim_threshold": thresholds.ssim,
+            "psnr_threshold": thresholds.psnr,
             "online_video": str(online_path),
             "offline_video": str(offline_path),
             "offline_metadata": str(offline_metadata_path),
-            "similarity_json": str(score_path),
         },
     )
     assert_video_similarity_metrics(
@@ -325,4 +310,4 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
         ssim_score=ssim,
         psnr_score=psnr,
     )
-    print(f"similarity_result={score_path}")
+    print(f"accuracy_result={accuracy_result_path}")

@@ -98,13 +98,11 @@ def _generate_edit(client, *, model, images, prompt, output_path, capfd, **gener
 def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
     from tests.e2e.accuracy.helpers import (
         CLIPScorer,
-        _json_safe_metric_value,
         assert_similarity_metrics,
         download_images,
         measure_image_similarity,
         model_output_dir,
         write_accuracy_result,
-        write_json_artifact,
     )
     from tests.helpers.runtime import OmniServer
 
@@ -213,10 +211,6 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
             clip_failures.append(
                 f"{label}: clip_score={clip_score:.6f} does not meet >= {_ACCURACY_THRESHOLDS['clip_score']}"
             )
-    metrics_path = output_dir / "quality_metrics.json"
-    # Sanitize like result_acc_*.json (stringify nan/inf) so the sidecar stays
-    # JSON-standard; keep per-label detail here and flatten aggregates for the dashboard.
-    write_json_artifact(metrics_path, _json_safe_metric_value(metrics))
     clip_scores = [scores["clip_score"] for scores in metrics.values()]
     # Prefer a non-finite CLIP when present so the dashboard top-level mirrors fail-closed gates.
     worst_clip = next((score for score in clip_scores if not math.isfinite(score)), min(clip_scores))
@@ -232,7 +226,6 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
         extra={
             "tp_size": tp_size,
             "sp_size": sp_size,
-            "metrics_json": str(metrics_path),
             "per_label": metrics,
         },
     )
