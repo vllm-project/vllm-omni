@@ -188,6 +188,9 @@ async def test_tool_recovery_through_realtime_asgi_route(monkeypatch, interrupti
                 }
             )
             await wire.expect("session.created")
+            # The open echoes the session as session.updated too; drain it so each
+            # append_frame barrier waits for its own update, not this one.
+            await wire.expect("session.updated")
             assert control.handle is not None
             runner = control.manager.runners[control.handle.session_id]
             timers = FakeTimerScheduler()
