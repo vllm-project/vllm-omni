@@ -476,6 +476,26 @@ def test_model_forward_clears_decode_metadata_when_runtime_info_absent(monkeypat
     assert received["model_intermediate_buffer"] is None
 
 
+def test_prepare_mm_inputs_keeps_input_ids_when_requires_raw_input_tokens():
+    """MammothModa2's flag must keep input_ids on the mm graph path (dummy + live)."""
+    runner = object.__new__(GPUModelRunner)
+    ids_buf = torch.arange(8, dtype=torch.long)
+    emb_buf = torch.zeros(8, 4)
+    runner.input_ids = SimpleNamespace(gpu=ids_buf)
+    runner.inputs_embeds = SimpleNamespace(gpu=emb_buf)
+
+    runner.model = SimpleNamespace(requires_raw_input_tokens=True)
+    input_ids, inputs_embeds = GPUModelRunner._prepare_mm_inputs(runner, 5)
+    assert input_ids is not None
+    assert input_ids.data_ptr() == ids_buf.data_ptr()
+    assert tuple(input_ids.shape) == (5,)
+    assert tuple(inputs_embeds.shape) == (5, 4)
+
+    runner.model = SimpleNamespace(requires_raw_input_tokens=False)
+    input_ids, _ = GPUModelRunner._prepare_mm_inputs(runner, 5)
+    assert input_ids is None
+
+
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
     """Dummy model whose class name must exactly match the production check."""
 
@@ -590,6 +610,7 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
 )
 def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected):
     runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
     runner.model = model
     runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
     runner._init_talker_mtp = mocker.Mock()
