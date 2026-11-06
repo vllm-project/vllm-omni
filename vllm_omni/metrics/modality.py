@@ -3,7 +3,7 @@
 
 """OmniModalityMetrics — per-modality Prometheus families (audio path only).
 
-7 audio business-semantic metric families. Text-path metrics (TTFT / ITL /
+Audio business-semantic metric families. Text-path metrics (TTFT / ITL /
 TPOT / e2e) are NOT here — they come from the upstream
 ``vllm:*{stage="thinker", ...}`` families exposed via the
 ``OmniPrometheusStatLogger`` wrap.
@@ -15,8 +15,8 @@ Contents:
   finalize hook; currently handles the audio path only.
 - ``observe_audio_first_packet``: TTFP emit from the streaming SSE first
   audio packet.
-- ``observe_audio_streaming_finalize``: emits ``audio_underrun_s`` +
-  ``audio_continuity_ok_total`` at SSE close using accumulated per-chunk
+- ``observe_audio_streaming_finalize``: emits maximum/total stalls, event
+  count, ratio, frequency and continuity at streaming close using per-chunk
   arrival timestamps.
 - ``extract_mm_output`` / ``count_audio_frames`` (from ``metrics.utils``):
   shape-tolerant helpers for the heterogeneous multimodal_output payloads
@@ -63,15 +63,44 @@ _audio_frames_family = Counter(
 )
 _audio_underrun_family = Histogram(
     defs.AUDIO_UNDERRUN_S,
-    "Per-request worst-case player-deficit in seconds (max time the player "
-    "ran out of buffered audio). > 0 indicates listener experienced silent gaps.",
+    "Legacy maximum cumulative playback deficit per streaming response, in seconds.",
     labelnames=_stage_labels,
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
+_audio_max_single_underrun_family = Histogram(
+    defs.AUDIO_MAX_SINGLE_UNDERRUN_S,
+    "Largest individual playback stall per streaming response, in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_total_underrun_family = Histogram(
+    defs.TOTAL_UNDERRUN_S,
+    "Cumulative playback stall time per streaming response, in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_audio_underrun_event_count_family = Histogram(
+    defs.AUDIO_UNDERRUN_EVENT_COUNT_METRIC,
+    "Number of new playback stalls per streaming response; sum yields the total event count.",
+    labelnames=_stage_labels,
+    buckets=(0, 1, 2, 3, 5, 10, 20, 50, 100),
+)
+_audio_underrun_ratio_family = Histogram(
+    defs.AUDIO_UNDERRUN_RATIO_METRIC,
+    "Total stall time / (audio content duration + total stall time), per response.",
+    labelnames=_stage_labels,
+    buckets=(0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1),
+)
+_audio_underrun_events_per_minute_family = Histogram(
+    defs.AUDIO_UNDERRUN_EVENTS_PER_MINUTE_METRIC,
+    "Playback stalls per minute of audio content, per response; excludes stalls from the denominator.",
+    labelnames=_stage_labels,
+    buckets=(0, 1, 5, 10, 30, 60, 120, 300, 600, 1200),
+)
 _audio_continuity_ok_family = Counter(
     defs.AUDIO_CONTINUITY_OK_METRIC,
-    "Incremented when the request's worst underrun stayed below threshold_ms. "
-    "Pair with requests_success_total to compute streaming-continuity health rate.",
+    "Incremented when total response stall time stayed within threshold_ms. "
+    "Pair with total_underrun_s_count to compute streaming continuity rate.",
     labelnames=list(defs.AUDIO_CONTINUITY_LABELS),
 )
 _audio_skipped_family = Counter(
@@ -215,6 +244,27 @@ class OmniModalityMetrics:
             replica=replica,
             threshold_ms=str(int(threshold_ms)),
         ).inc()
+
+    def observe_audio_stall_details(
+        self,
+        stage: str,
+        replica: str,
+        *,
+        max_single_underrun_s: float,
+        total_underrun_s: float,
+        event_count: int,
+        underrun_ratio: float,
+        events_per_minute: float,
+    ) -> None:
+        """Observe the remaining reply-local stall measurements once per stream."""
+        if not self._log_stats:
+            return
+        labels = {"model_name": self._model_name, "stage": stage, "replica": replica}
+        _audio_max_single_underrun_family.labels(**labels).observe(max_single_underrun_s)
+        _total_underrun_family.labels(**labels).observe(total_underrun_s)
+        _audio_underrun_event_count_family.labels(**labels).observe(event_count)
+        _audio_underrun_ratio_family.labels(**labels).observe(underrun_ratio)
+        _audio_underrun_events_per_minute_family.labels(**labels).observe(events_per_minute)
 
     def inc_audio_skipped(self, stage: str, replica: str, reason: str) -> None:
         if not self._log_stats:
@@ -362,7 +412,7 @@ def observe_audio_streaming_finalize(
     channels: int = defs.DEFAULT_AUDIO_CHANNELS,
     threshold_s: float = defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
 ) -> None:
-    """Emit audio_underrun_s + audio_continuity_ok_total at request end.
+    """Emit per-response maximum/total stalls, counts, ratios and continuity.
 
     Reuses the math from ``vllm_omni.benchmarks.audio_continuity`` so the
     server-side and bench-side definitions stay aligned. Caller is responsible
@@ -381,8 +431,19 @@ def observe_audio_streaming_finalize(
         channels=channels,
         threshold_s=threshold_s,
     )
+    if stats.audio_duration_s <= 0:
+        return  # Invalid or empty PCM timelines are unmeasured.
     stage_label = str(stage_id)
     replica_label = str(replica_id)
     mod_metrics.observe_audio_underrun(stage_label, replica_label, stats.max_underrun_s)
+    mod_metrics.observe_audio_stall_details(
+        stage_label,
+        replica_label,
+        max_single_underrun_s=stats.max_single_underrun_s,
+        total_underrun_s=stats.total_underrun_s,
+        event_count=stats.underrun_event_count,
+        underrun_ratio=stats.underrun_ratio,
+        events_per_minute=stats.underrun_events_per_minute,
+    )
     if stats.is_continuous:
         mod_metrics.inc_audio_continuity_ok(stage_label, replica_label, int(threshold_s * 1000))
