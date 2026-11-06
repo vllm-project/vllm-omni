@@ -410,14 +410,31 @@ class WorldKV:
         asynchronous = device.type == "cuda"
         # PyTorch's pinned allocator caches freed blocks after FIFO eviction.
         # Never overwrite a live bank entry: publication can still fail below.
+        # One allocation per dtype and publication, rather than two per layer.
+        # Each bank chunk owns its backing storage; views never overlap or reuse
+        # a live entry. Grouping by dtype also permits different layer geometry.
+        tensors = [tensor for rows in sources for tensor in (rows.key, rows.value)]
+        sizes: dict[torch.dtype, int] = {}
+        for tensor in tensors:
+            sizes[tensor.dtype] = sizes.get(tensor.dtype, 0) + tensor.numel()
+        storage = {
+            dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=asynchronous)
+            for dtype, size in sizes.items()
+        }
+        offsets = dict.fromkeys(sizes, 0)
+        targets = []
+        for tensor in tensors:
+            offset = offsets[tensor.dtype]
+            targets.append(storage[tensor.dtype].narrow(0, offset, tensor.numel()).view(tensor.shape))
+            offsets[tensor.dtype] += tensor.numel()
         layers = tuple(
             MemoryRows(
-                torch.empty_like(rows.key, device="cpu", pin_memory=asynchronous),
-                torch.empty_like(rows.value, device="cpu", pin_memory=asynchronous),
+                targets[2 * layer],
+                targets[2 * layer + 1],
                 rows.positions.to(device="cpu", copy=True),
                 rows.token_ids.to(device="cpu", copy=True),
             )
-            for rows in sources
+            for layer, rows in enumerate(sources)
         )
         ready = None
         if asynchronous:

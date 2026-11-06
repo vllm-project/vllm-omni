@@ -51,7 +51,10 @@ def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(monkeypa
             for chunk in gpu.bank.values():
                 assert chunk.ready is not None
                 chunk.ready.synchronize()
+                backing = chunk.layers[0].key.untyped_storage().data_ptr()
                 for actual, expected in zip(chunk.layers, cpu.bank[chunk.start].layers):
+                    assert actual.key.untyped_storage().data_ptr() == backing
+                    assert actual.value.untyped_storage().data_ptr() == backing
                     assert actual.key.is_pinned() and actual.value.is_pinned()
                     for name in ("key", "value", "positions", "token_ids"):
                         assert torch.equal(getattr(actual, name), getattr(expected, name))

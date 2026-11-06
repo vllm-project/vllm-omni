@@ -505,3 +505,82 @@ def test_assembly_matches_position_mask_across_sink_and_chunk_boundaries(sink_fr
                     assert torch.equal(actual_v, expected_v)
         start += frames
     memory.close()
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("mixed_dtype", [False, True])
+def test_bank_storage_is_packed_without_aliasing_across_layers_or_chunks(ratio, mixed_dtype):
+    memory = state(world_keep_ratio=ratio)
+    expected = {}
+    for start in range(0, 12, 2):
+        memory.set_pose(pose(start))
+        with memory.forward(start, 2, commit=True):
+            layers = []
+            for layer in range(2):
+                dtype = torch.float32 if mixed_dtype and layer else torch.float64
+                # Different geometry must not imply equal layer sizes.
+                key = raw(start, dtype=dtype)[:, :, : layer + 1]
+                value = key * 2
+                positions = torch.arange(start, start + 2).repeat_interleave(2)
+                rows = worldkv.MemoryRows(key, value, positions, torch.arange(start * 2, (start + 2) * 2))
+                layers.append(worldkv.world_compress(rows, 2, ratio, "pairwise_mean"))
+                memory.assemble(layer, key, key, value)
+            expected[start] = layers
+        live_storage = set()
+        for chunk in memory.bank.values():
+            by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+            for actual, reference in zip(chunk.layers, expected[chunk.start]):
+                for name in ("key", "value", "positions", "token_ids"):
+                    assert torch.equal(getattr(actual, name), getattr(reference, name))
+                for tensor in (actual.key, actual.value):
+                    by_dtype.setdefault(tensor.dtype, []).append(tensor)
+            for tensors in by_dtype.values():
+                storage = tensors[0].untyped_storage()
+                assert storage.data_ptr() not in live_storage
+                live_storage.add(storage.data_ptr())
+                offset = 0
+                for tensor in tensors:
+                    assert tensor.untyped_storage().data_ptr() == storage.data_ptr()
+                    assert tensor.storage_offset() == offset
+                    assert tensor.is_contiguous()
+                    offset += tensor.numel()
+                assert storage.nbytes() == offset * tensors[0].element_size()
+    memory.close()
+
+
+@pytest.mark.parametrize("fail_allocation", [1, 2])
+def test_packed_bank_allocation_failure_keeps_published_state(monkeypatch, fail_allocation):
+    memory = state()
+
+    def commit(start):
+        memory.set_pose(pose(start))
+        with memory.forward(start, 2, commit=True):
+            for layer, dtype in enumerate((torch.float32, torch.float64)):
+                key = raw(start, dtype=dtype)
+                memory.assemble(layer, key, key, key * 2)
+
+    commit(0)
+    commit(2)
+    history, bank = memory.history, memory.bank
+    saved = [(rows.key.clone(), rows.value.clone()) for chunk in bank.values() for rows in chunk.layers]
+    empty = torch.empty
+    allocations = 0
+
+    def fail(*args, **kwargs):
+        nonlocal allocations
+        if "pin_memory" in kwargs:
+            allocations += 1
+            if allocations == fail_allocation:
+                raise RuntimeError("bank allocation failed")
+        return empty(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", fail)
+        with pytest.raises(RuntimeError, match="bank allocation failed"):
+            commit(4)
+    assert memory.history is history and memory.bank is bank
+    assert memory.next_frame == 4 and not memory._active and memory._publication is None
+    for rows, (key, value) in zip((rows for chunk in bank.values() for rows in chunk.layers), saved):
+        assert torch.equal(rows.key, key) and torch.equal(rows.value, value)
+    commit(4)
+    memory.close()
