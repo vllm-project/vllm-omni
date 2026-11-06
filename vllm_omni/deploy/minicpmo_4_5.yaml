@@ -35,6 +35,9 @@ connectors:
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       enable_hift_graph: true
+      # Merge the ragged K-step CFM shapes into one solve per step, otherwise
+      # every ragged bucket captures its own graph.
+      cfm_cross_bucket_merge: true
       # Capture batch-1 continuation/tail shapes without padding: with the
       # 8-frame mel cache these codec widths cover 16-64 mel frames.
       hift_graph_continuation_frames: [4, 28]
@@ -199,6 +202,27 @@ platforms:
         # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
         # for concurrent Stage 2.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
+        # Multi-frame decode: 8 codec frames per step, mirroring the NPU block.
+        # The CUDA runner intercepts the step and injects the constant continue
+        # drafts; stop_token_ids is the two-wide continue/stop id.
+        #
+        # async_scheduling: false is part of the contract, not a tuning knob:
+        # K-step and async scheduling cannot be used together. Async books the
+        # spec span one step ahead, while the multi-frame loop only executes
+        # steps whose decode spans are uniform and whose booked positions stay
+        # inside the prompt. Measured at c16/256: the booking first outruns the
+        # prompt ("prefill span exceeds condition"), and once those slots are
+        # padded the step still arrives with non-uniform spans ("multi-frame
+        # Talker decode not engaged: request token spans are not uniform"),
+        # which kills the stage-1 replica and fails every in-flight request.
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        default_sampling_params:
+          stop_token_ids: [1]
 
   npu:
     stages:
