@@ -568,11 +568,13 @@ vllm bench omni-duplex-eval --omni generate \
 
 Standalone generation uses a fixed metric selection (`ttft`, `tpot`, `itl`,
 `audio_ttfp`, `audio_duration`) and reports mean, median and P99 where applicable.
-Only samples generated in the current run contribute to this table. Existing
+Only successful samples generated in the current run contribute to this table:
+`response_done` must be true and the result must have no error. Failed sessions
+are excluded from the table and counted in a message on stderr. Existing
 response files are skipped by default; their stage snapshots are not loaded for
 printing. The command reports skipped samples on stderr and suggests
-`--overwrite` to regenerate them. If the server returns no stage snapshots, it
-reports that instead of printing an empty table.
+`--overwrite` to regenerate them. If successful samples return no stage snapshots,
+it reports that instead of printing an empty table.
 
 For both regular and duplex stage tables, missing or null `stage_gen_time_ms`
 and `postprocess_time_ms` values are excluded from timing distributions. Measured

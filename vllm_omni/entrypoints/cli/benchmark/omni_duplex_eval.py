@@ -116,7 +116,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--print-stage",
         action="store_true",
         help=(
-            "Print aggregated per-stage metrics from samples generated in this run "
+            "Print aggregated per-stage metrics from successful samples generated in this run "
             "(mean, median and P99; fixed metric selection)."
         ),
     )
@@ -209,16 +209,23 @@ def run(args: argparse.Namespace) -> int:
                     "use --overwrite to regenerate them.",
                     file=sys.stderr,
                 )
+            successful_results = [
+                result
+                for result in results
+                if result.generated and result.metadata.get("response_done") is True and not result.error
+            ]
+            failed = sum(result.generated for result in results) - len(successful_results)
+            if failed:
+                print(f"Excluded {failed} failed sample(s) from stage metrics.", file=sys.stderr)
             snapshots = [
                 stage_metrics
-                for result in results
-                if result.generated
+                for result in successful_results
                 for metric in result.request_metrics
                 if isinstance((stage_metrics := metric.get("stage_metrics")), dict)
             ]
             stages = build_stage_metrics_from_snapshots(snapshots)
-            if not stages and any(result.generated for result in results):
-                print("No stage metrics were returned for samples generated in this run.", file=sys.stderr)
+            if not stages and successful_results:
+                print("No stage metrics were returned for successful samples generated in this run.", file=sys.stderr)
             for stage in stages:
                 print_stage_metrics(
                     TaskType.GENERATION,

@@ -1178,6 +1178,7 @@ def test_cli_print_stage_aggregates_generated_responses_once(
     }
     result = GenerateSampleResult(
         output=tmp_path / "responses" / split / "sample-1.json",
+        metadata={"response_done": True},
         request_metrics=[
             {
                 "sample_id": "sample-1",
@@ -1216,6 +1217,83 @@ def test_cli_print_stage_aggregates_generated_responses_once(
     assert "50" in captured.out
     assert "Mean Serving TTFT (ms):" in captured.out
     assert "200.00" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error"),
+    [
+        pytest.param({"response_done": False}, "response.done timed out", id="drain-timeout"),
+        pytest.param({"response_done": True}, "session.close timed out", id="close-timeout"),
+        pytest.param({"response_done": True}, "server error", id="server-error"),
+        pytest.param({"response_done": False}, "", id="incomplete"),
+        pytest.param({}, "", id="missing-completion"),
+    ],
+)
+@pytest.mark.parametrize("include_success", [False, True], ids=["all-failed", "mixed"])
+def test_cli_print_stage_excludes_failed_sessions_with_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    metadata: dict[str, object],
+    error: str,
+    include_success: bool,
+):
+    split = "PR_correction"
+
+    def make_result(
+        sample_id: str, tokens: int, ttft_ms: float, *, metadata: dict[str, object], error: str = ""
+    ) -> GenerateSampleResult:
+        return GenerateSampleResult(
+            output=tmp_path / "responses" / split / f"{sample_id}.json",
+            generated=True,
+            request_metrics=[
+                {
+                    "sample_id": sample_id,
+                    "split": split,
+                    "response_id": f"{sample_id}-response",
+                    "stage_metrics": {
+                        "0": {
+                            "stage_name": "thinker",
+                            "final_output_type": "text",
+                            "output_unit_type": "text",
+                            "num_tokens_out": tokens,
+                            "serving_time_to_first_output_ms": ttft_ms,
+                        }
+                    },
+                }
+            ],
+            metadata=metadata,
+            error=error,
+        )
+
+    results: dict[str, GenerateSampleResult | None] = {
+        "failed": make_result("failed", 999, 9000.0, metadata=metadata, error=error)
+    }
+    if include_success:
+        results["success"] = make_result("success", 20, 100.0, metadata={"response_done": True})
+    # Skipped samples must not be counted as failures or contribute snapshots.
+    results["skipped"] = GenerateSampleResult(output=tmp_path / "responses" / split / "skipped.json", generated=False)
+    manifest = _pr_manifest(tmp_path, tuple(results))
+    monkeypatch.setattr(cli, "generate_sample", _fake_generate(results))
+
+    _run_generate_cli(manifest, tmp_path / "responses", "--print-stage")
+
+    captured = capsys.readouterr()
+    assert "Excluded 1 failed sample(s) from stage metrics." in captured.err
+    assert "1 skipped sample(s)" in captured.err
+    assert "No stage metrics were returned" not in captured.err
+    if include_success:
+        assert captured.out.count("Stage 0 (thinker)") == 1
+        for label, expected in (
+            ("Stage generated tokens:", "20"),
+            ("Mean Serving TTFT (ms):", "100.00"),
+            ("Median Serving TTFT (ms):", "100.00"),
+            ("P99 Serving TTFT (ms):", "100.00"),
+        ):
+            line = next(line for line in captured.out.splitlines() if line.startswith(label))
+            assert line.removeprefix(label).strip() == expected
+    else:
+        assert captured.out == ""
 
 
 def test_cli_print_stage_explains_skipped_outputs(
