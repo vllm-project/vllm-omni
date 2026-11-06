@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Compare slot lifecycle with canonical Local hooks, including output ownership."""
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
+import vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker as talker_module
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
@@ -346,9 +348,21 @@ def test_factory_requires_explicit_class_capability_and_valid_state(monkeypatch)
 
 @pytest.mark.cpu
 def test_local_factory_uses_dedicated_state(monkeypatch):
+    monkeypatch.setattr(talker_module, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
     monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
     monkeypatch.setattr(MossLocalModelState, "__init__", lambda *args: None)
     model = _model(torch.device("cpu"))
     model.config = SimpleNamespace()
     state = init_omni_model_state(None, model, None, torch.device("cpu"))
     assert type(state) is MossLocalModelState
+
+
+@pytest.mark.cpu
+def test_local_factory_selects_ascend_state_on_npu(monkeypatch):
+    """The NPU module needs vllm_ascend, so stand in for it and check only the dispatch."""
+    sentinel = object()
+    npu_module = "vllm_omni.platforms.npu.models.moss_tts_local_model_state"
+    monkeypatch.setitem(sys.modules, npu_module, SimpleNamespace(NPUMossLocalModelState=lambda *a, **k: sentinel))
+    monkeypatch.setattr(talker_module, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    model = _model(torch.device("cpu"))
+    assert model.create_mrv2_model_state(None, None, torch.device("cpu")) is sentinel

@@ -810,6 +810,18 @@ capacities, capture sizes, KV budget and `platforms.cuda.cuda_mps`. The
 pipeline no longer changes configuration based on a GPU-memory or MPS probe.
 
 Other platforms use V1 in the same file; NPU keeps its codec graph override.
+On Ascend NPU, `moss_tts_local_npu_mrv2.yaml` is an opt-in profile that runs the
+Talker (Stage0) on MRV2 with Ascend attention metadata and keeps the codec
+(Stage1) on V1 until MRV2 is supported in `NPUGenerationWorker`. The codec runs
+eagerly because its graph capture fails on A2 and A3 (#9812), and the Stage0
+first-frame direct decode is off on NPU because it needs CUDA-only kernels, so
+Stage1 delivers every chunk:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml
+```
+
 The 2/3-NPU files retain their distinct multi-device topology. These changes
 do not enable MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 emits 48 kHz
 stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
