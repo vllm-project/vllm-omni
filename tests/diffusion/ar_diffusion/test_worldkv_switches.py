@@ -63,7 +63,7 @@ def test_retrieval_and_compression_switches_execute_only_when_enabled(retrieval,
     assert not memory.bank and memory.history == [None, None]
 
 
-@pytest.mark.parametrize("name", ["reuse_attention_kv", "prefetch_kv"])
+@pytest.mark.parametrize("name", ["reuse_attention_kv", "prefetch_kv", "prefetch_bank_allocation"])
 @pytest.mark.parametrize("value", [1, "false", None])
 def test_transfer_optimization_flags_require_booleans(name, value):
     with pytest.raises(ValueError, match=name):

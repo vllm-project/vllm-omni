@@ -13,6 +13,7 @@ import math
 import threading
 import weakref
 from collections.abc import Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -33,12 +34,13 @@ class WorldKVConfig:
     world_score: str = "pairwise_mean"
     reuse_attention_kv: bool = False
     prefetch_kv: bool = False
+    prefetch_bank_allocation: bool = False
     # Process-wide cap on the bank_bytes reserved by live memories; None uses
     # the host's physical memory.
     host_bank_limit_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        for name in ("reuse_attention_kv", "prefetch_kv"):
+        for name in ("reuse_attention_kv", "prefetch_kv", "prefetch_bank_allocation"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"worldkv.{name} must be a boolean")
         for name in (
@@ -266,6 +268,13 @@ class _HostBankLedger:
 _HOST_BANKS = _HostBankLedger()
 
 
+def _allocate_pinned_bank(sizes: dict[torch.dtype, int], device: torch.device) -> dict[torch.dtype, torch.Tensor]:
+    # The worker owns no request or GPU tensor references. Select the producer's
+    # device explicitly because accelerator current-device state is thread-local.
+    with torch.accelerator.device_index(device.index):
+        return {dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=True) for dtype, size in sizes.items()}
+
+
 class WorldKV:
     """One request/branch's clean history, published only after all layers succeed.
 
@@ -296,6 +305,10 @@ class WorldKV:
         self._seen: set[int] = set()
         self._copy_stream: torch.Stream | None = None
         self._publication: torch.Event | None = None
+        self._bank_allocator: ThreadPoolExecutor | None = None
+        self._stop_allocator: weakref.finalize | None = None
+        self._bank_allocation: Future[dict[torch.dtype, torch.Tensor]] | None = None
+        self._bank_allocation_sizes: dict[torch.dtype, int] = {}
         self.evicted_chunks = 0
         self._release_bank: weakref.finalize | None = None
         if config.retrieval_frames:
@@ -426,6 +439,47 @@ class WorldKV:
                 budget -= cost
         return tuple(sorted(selected, key=lambda chunk: chunk.start))
 
+    def _discard_bank_allocation(self) -> None:
+        allocation, self._bank_allocation = self._bank_allocation, None
+        self._bank_allocation_sizes = {}
+        if allocation is not None:
+            # Wait for completion without replacing an existing forward error
+            # with a background allocation failure. Publication surfaces failures.
+            allocation.exception()
+
+    def _prefetch_bank_allocation(self, frames: int) -> None:
+        if not self.config.prefetch_bank_allocation:
+            return
+        if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
+            return
+        first = self.history[0]
+        if first is None or first.key.device.type != "cuda":
+            return
+        count = self.tokens_per_frame + math.ceil((frames - 1) * self.tokens_per_frame * self.config.world_keep_ratio)
+        sizes: dict[torch.dtype, int] = {}
+        for rows in self.history:
+            if rows is None:
+                return
+            self.config.validate_bank_capacity(
+                self.num_layers,
+                self.tokens_per_frame,
+                rows.key.shape[2],
+                rows.key.shape[3],
+                rows.key.element_size(),
+                frames,
+            )
+            for tensor in (rows.key, rows.value):
+                sizes[tensor.dtype] = sizes.get(tensor.dtype, 0) + count * tensor.shape[2] * tensor.shape[3]
+        if self._bank_allocation is not None:
+            if sizes == self._bank_allocation_sizes:
+                return
+            self._discard_bank_allocation()
+        if self._bank_allocator is None:
+            self._bank_allocator = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worldkv-bank")
+            self._stop_allocator = weakref.finalize(self, self._bank_allocator.shutdown, wait=True)
+        self._bank_allocation_sizes = sizes
+        self._bank_allocation = self._bank_allocator.submit(_allocate_pinned_bank, sizes, first.key.device)
+
     def _publish_bank(self, replacement: list[MemoryRows | None]) -> tuple[dict[int, BankChunk], int]:
         bank = dict(self.bank)
         if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
@@ -454,10 +508,16 @@ class WorldKV:
         sizes: dict[torch.dtype, int] = {}
         for tensor in tensors:
             sizes[tensor.dtype] = sizes.get(tensor.dtype, 0) + tensor.numel()
-        storage = {
-            dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=asynchronous)
-            for dtype, size in sizes.items()
-        }
+        if asynchronous and self._bank_allocation is not None and sizes == self._bank_allocation_sizes:
+            allocation, self._bank_allocation = self._bank_allocation, None
+            self._bank_allocation_sizes = {}
+            storage = allocation.result()
+        else:
+            self._discard_bank_allocation()
+            storage = {
+                dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=asynchronous)
+                for dtype, size in sizes.items()
+            }
         offsets = dict.fromkeys(sizes, 0)
         targets = []
         for tensor in tensors:
@@ -536,6 +596,7 @@ class WorldKV:
         self._frames = frames
         self._commit = commit
         try:
+            self._prefetch_bank_allocation(frames)
             yield
             if len(self._seen) != self.num_layers:
                 raise RuntimeError("WorldKV forward did not execute all layers")
@@ -564,6 +625,7 @@ class WorldKV:
             success = True
         finally:
             if not success:
+                self._discard_bank_allocation()
                 self._wait_publication()
             self._pending.clear()
             self._seen.clear()
@@ -660,6 +722,10 @@ class WorldKV:
         return assembled
 
     def close(self) -> None:
+        self._discard_bank_allocation()
+        if self._stop_allocator is not None:
+            self._stop_allocator()
+        self._bank_allocator = None
         self._wait_publication()
         self.history = [None] * self.num_layers
         self._pending.clear()
