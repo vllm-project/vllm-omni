@@ -606,3 +606,28 @@ def test_npu_worker_warmup_hook_reaches_the_model(monkeypatch):
     # Models without the hook stay a no-op instead of failing startup.
     worker.model_runner = SimpleNamespace(model=SimpleNamespace())
     worker._capture_auxiliary_graphs()
+
+
+@pytest.mark.parametrize("ups0_fp32", [False, True])
+def test_hift_ups0_fp32_exempts_only_stage0_upsample(monkeypatch, ups0_fp32):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+
+    hift = HiFTGenerator(
+        base_channels=16,
+        sampling_rate=24000,
+        upsample_rates=[8, 5, 3],
+        upsample_kernel_sizes=[16, 11, 7],
+        resblock_kernel_sizes=[3],
+        resblock_dilation_sizes=[[1, 3, 5]],
+        source_resblock_kernel_sizes=[3, 3, 3],
+        source_resblock_dilation_sizes=[[1, 3, 5]] * 3,
+    ).eval()
+    hift.ups0_fp32 = ups0_fp32
+    seen: dict[int, bool] = {}
+    for idx, layer in enumerate(hift.ups):
+        layer.register_forward_pre_hook(lambda _m, _in, i=idx: seen.__setitem__(i, torch.backends.cudnn.allow_tf32))
+
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    hift._decode_pre_istft(torch.randn(1, 80, 4), torch.randn(1, 1, 4 * 480))
+    assert seen == {0: not ups0_fp32, 1: True, 2: True}
+    assert torch.backends.cudnn.allow_tf32 is True
