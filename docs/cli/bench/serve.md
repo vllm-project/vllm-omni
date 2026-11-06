@@ -482,6 +482,12 @@ reply still counts as an evaluated sample. Raw judge replies are saved beside ea
 reply trace. A failed retry leaves no active score; a new score is published only
 after all required judge calls succeed.
 
+Empty or whitespace-only PR responses receive `success_score=0` without a judge
+call, including correction tasks and reminders without event timestamps. This
+matches the handling of empty reminder windows: a reference answer cannot earn
+credit for a model that did not respond. Re-evaluate existing scores to apply
+this rule; summarizing old score files does not correct earlier false positives.
+
 The saved `omni_duplex_eval.published_with_unfinished_responses` counts published
 samples with non-empty `unfinished_response_ids` in their metadata. A nonzero count
 also emits a warning. These samples remain eligible for scoring using their collected
