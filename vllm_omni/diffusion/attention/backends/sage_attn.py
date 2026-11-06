@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     PackingMode,
     ParallelStrategy,
 )
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -148,6 +149,7 @@ def _sage_cuda_kernel_variant(query: torch.Tensor) -> str | None:
 
 
 class SageAttentionBackend(AttentionBackend):
+    strategy_capabilities = MethodCapabilities(local_execution=True)
     accept_output_buffer: bool = True
     # Contiguous K/V tail padding is sliced away (see _slice_valid_kv_prefix).
     supports_prefix_kv_slicing: bool = True

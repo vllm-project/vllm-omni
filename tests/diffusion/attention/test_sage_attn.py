@@ -5,6 +5,7 @@ import importlib
 import sys
 import types
 from dataclasses import replace
+from importlib.machinery import ModuleSpec
 
 import pytest
 import torch
@@ -31,6 +32,7 @@ def isolated_compiler_cache():
 @pytest.fixture
 def sage_backend(monkeypatch):
     package = types.ModuleType("sageattention")
+    package.__spec__ = ModuleSpec("sageattention", loader=None)
     setattr(package, "sageattn", lambda *args, **kwargs: pytest.fail("unexpected Sage kernel call"))
     monkeypatch.setitem(sys.modules, "sageattention", package)
     module_name = "vllm_omni.diffusion.attention.backends.sage_attn"
@@ -345,3 +347,47 @@ def test_sage_rejects_unusable_valid_kv_length(sage_contract, monkeypatch, valid
     for forward in (impl.forward_cuda, impl.forward_xpu):
         with pytest.raises(ValueError, match=match):
             forward(*inputs, metadata)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_sage_strategy_constructs_and_preserves_mask_rejection(sage_backend, monkeypatch, masked):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.attention.strategy import AttentionOperation
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    backend, package = sage_backend
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kw: NoParallelAttention())
+    monkeypatch.setattr(
+        layer_mod,
+        "get_attn_backend_for_role",
+        lambda **kw: (backend.SageAttentionBackend, kw["attention_config"].default),
+    )
+    config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(presets={"sage": "SAGE_ATTN"}, layout={"default": "sage"}),
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype=None,
+    )
+    with set_current_diffusion_config(config):
+        attention = layer_mod.build_attention(
+            num_heads=4,
+            num_kv_heads=4,
+            head_size=64,
+            causal=False,
+            softmax_scale=0.125,
+            role="cosmos3.gen",
+            role_category="self",
+            operation=AttentionOperation("gen.0", 0, "cosmos3.gen", "self", component="transformer"),
+        )
+    impl = attention.for_layout(0).attention
+    assert isinstance(impl, backend.SageAttentionImpl)
+    q = torch.randn(1, 2, 4, 64)
+    if masked:
+        with pytest.raises(ValueError, match="does not support attn_mask"):
+            impl.forward_cuda(q, q, q, AttentionMetadata(attn_mask=torch.ones(1, 2, dtype=torch.bool)))
+    else:
+        package.sageattn = lambda q, k, v, **kwargs: q + k + v
+        torch.testing.assert_close(impl.forward_cuda(q, q, q), 3 * q)
