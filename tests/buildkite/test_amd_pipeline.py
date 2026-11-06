@@ -794,7 +794,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        17,
+        13,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
