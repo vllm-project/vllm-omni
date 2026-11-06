@@ -112,7 +112,7 @@ class _DummyLM(torch.nn.Module):
 def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypatch):
     # Simulate a pipeline that already contains LoRA wrappers where the original
     # LinearBase is nested under ".base_layer".
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -133,7 +133,7 @@ def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypat
 
 
 def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -148,7 +148,7 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
         replace_calls.append(module_name)
         setattr(root, module_name, submodule)
 
-    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer_diffusion)
     monkeypatch.setattr(manager_mod, "replace_submodule", _fake_replace_submodule)
 
     pipeline = torch.nn.Module()
@@ -173,7 +173,7 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
 
 
 def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     class _DLOLoRALayer(DummyBaseLayerWithLoRA):
         lora_buffer_device = None
@@ -184,7 +184,7 @@ def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DLOLoRALayer)
     monkeypatch.setattr(
         manager_mod,
-        "from_layer_diffusion",
+        "from_layer",
         lambda *, layer, **_kwargs: _DLOLoRALayer(layer),
     )
 
@@ -213,7 +213,7 @@ def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
 def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
     import vllm.model_executor.layers.fused_moe as upstream_moe
 
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     class _TargetMoERunner(torch.nn.Module):
         def __init__(self):
@@ -228,7 +228,7 @@ def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
     monkeypatch.setattr(
         manager_mod,
-        "from_layer_diffusion",
+        "from_layer",
         lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
     )
     monkeypatch.setattr(
@@ -322,7 +322,7 @@ def test_moe_lora_context_is_skipped_without_token_capacity(monkeypatch):
 def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
     import vllm.model_executor.layers.fused_moe as upstream_moe
 
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     class _TargetMoERunner(torch.nn.Module):
         def __init__(self):
@@ -334,7 +334,7 @@ def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
     monkeypatch.setattr(
         manager_mod,
-        "from_layer_diffusion",
+        "from_layer",
         lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
     )
     monkeypatch.setattr(
@@ -403,6 +403,186 @@ def test_publish_moe_lora_context_uses_no_lora_mapping_until_adapter_is_active(m
     assert mapping.index_mapping == (0,) * 4
     assert lora_index_to_id == [None]
     assert wrapper.mappings == [punica]
+
+
+def _make_moe_lora_wrapper_classes():
+    """Wrapper doubles for the three MoE LoRA kernels the manager must tell apart."""
+    import vllm.lora.layers.fused_moe as fused_moe
+
+    class _BaseFakeMoELoRA(fused_moe.FusedMoEWithLoRA):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.mappings = []
+            self.base_layer = torch.nn.Module()
+
+        def set_mapping(self, punica_wrapper):
+            self.mappings.append(punica_wrapper)
+
+        def set_lora(self, index, lora_a, lora_b):
+            raise AssertionError("MoE layer has no adapter weights in this test")
+
+        def reset_lora(self, index):
+            pass
+
+    class _AscendLikeMoELoRA(_BaseFakeMoELoRA):
+        """Ascend: the runner owns the context, exposed as an idle hook."""
+
+        def __init__(self):
+            super().__init__()
+            self.idle_calls = 0
+
+        def _set_diffusion_moe_lora_idle(self):
+            self.idle_calls += 1
+
+    class _FakeExperts:
+        """Triton-like experts: context presence is the LoRA switch."""
+
+        def __init__(self):
+            self.contexts = []
+
+        def set_lora_context(self, ctx):
+            self.contexts.append(ctx)
+
+    class _TrtLlmLikeExperts(_FakeExperts):
+        """TRT-LLM experts assert a context and early-return on this flag."""
+
+        @staticmethod
+        def _batch_has_no_lora(lora_context):
+            return True
+
+    class _TritonLikeMoELoRA(_BaseFakeMoELoRA):
+        def __init__(self):
+            super().__init__()
+            self._moe_kernel = SimpleNamespace(fused_experts=_FakeExperts(), prepare_finalize=None)
+
+    class _TrtLlmLikeMoELoRA(_BaseFakeMoELoRA):
+        def __init__(self):
+            super().__init__()
+            self._moe_kernel = SimpleNamespace(fused_experts=_TrtLlmLikeExperts(), prepare_finalize=None)
+
+    return _AscendLikeMoELoRA, _TritonLikeMoELoRA, _TrtLlmLikeMoELoRA
+
+
+def _make_moe_manager(monkeypatch, wrappers):
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._moe_punica_wrapper = None
+    manager._max_lora_rank = 8
+    manager.max_cached_adapters = 1
+    manager.dtype = torch.bfloat16
+    manager.device = torch.device("cpu")
+    manager._max_num_batched_tokens = 4
+    manager._active_adapter_id = None
+    manager._lora_modules = {f"transformer.experts.{i}": w for i, w in enumerate(wrappers)}
+    return manager, punica
+
+
+def test_publish_moe_lora_context_detaches_idle_runner_context(monkeypatch):
+    """Ascend branches on context presence: detach it, publish nothing.
+
+    Its unquantized MoE path runs index recovery, an extra all_to_all and bgmv
+    shrink/expand whenever a context is published, even for a zero delta.
+    """
+    ascend_cls, _, _ = _make_moe_lora_wrapper_classes()
+    wrapper = ascend_cls()
+    manager, punica = _make_moe_manager(monkeypatch, [wrapper])
+
+    manager._publish_moe_lora_context()
+
+    assert wrapper.idle_calls == 1
+    assert wrapper.mappings == []
+    assert punica.update_calls == []
+    assert manager._moe_punica_wrapper is None
+
+
+def test_publish_moe_lora_context_detaches_idle_triton_kernel_context(monkeypatch):
+    """Triton also keys on context presence, so clear it through the kernel.
+
+    ``skip_invalid`` stays off and ``apply_w13_lora`` / ``apply_w2_lora`` still
+    run their config lookup and ``moe_lora_align_block_size`` ahead of the
+    ``no_lora_flag`` return inside ``add_lora_fused_moe``.
+    """
+    _, triton_cls, _ = _make_moe_lora_wrapper_classes()
+    wrapper = triton_cls()
+    manager, punica = _make_moe_manager(monkeypatch, [wrapper])
+
+    manager._publish_moe_lora_context()
+
+    assert wrapper._moe_kernel.fused_experts.contexts == [None]
+    assert wrapper.mappings == []
+    assert punica.update_calls == []
+
+
+def test_publish_moe_lora_context_keeps_no_lora_mapping_for_trtllm(monkeypatch):
+    """TRT-LLM asserts a context and takes its own no-adapter fast path."""
+    _, _, trtllm_cls = _make_moe_lora_wrapper_classes()
+    wrapper = trtllm_cls()
+    manager, punica = _make_moe_manager(monkeypatch, [wrapper])
+
+    manager._publish_moe_lora_context()
+
+    assert wrapper.mappings == [punica]
+    assert wrapper._moe_kernel.fused_experts.contexts == []
+    mapping, lora_index_to_id, _, _ = punica.update_calls[-1]
+    assert mapping.index_mapping == (0,) * 4
+    assert lora_index_to_id == [None]
+
+
+def test_publish_moe_lora_context_decides_per_wrapper(monkeypatch):
+    """Mixed kernels in one process must not force a single decision."""
+    ascend_cls, triton_cls, trtllm_cls = _make_moe_lora_wrapper_classes()
+    ascend, triton, trtllm = ascend_cls(), triton_cls(), trtllm_cls()
+    manager, punica = _make_moe_manager(monkeypatch, [ascend, triton, trtllm])
+
+    manager._publish_moe_lora_context()
+
+    assert ascend.idle_calls == 1 and ascend.mappings == []
+    assert triton._moe_kernel.fused_experts.contexts == [None] and triton.mappings == []
+    assert trtllm.mappings == [punica]
+
+
+def test_publish_moe_lora_context_publishes_to_every_wrapper_when_active(monkeypatch):
+    """An active adapter gets a real slot-1 mapping on all wrappers."""
+    ascend_cls, triton_cls, trtllm_cls = _make_moe_lora_wrapper_classes()
+    ascend, triton, trtllm = ascend_cls(), triton_cls(), trtllm_cls()
+    manager, punica = _make_moe_manager(monkeypatch, [ascend, triton, trtllm])
+    manager._active_adapter_id = 7
+
+    manager._publish_moe_lora_context()
+
+    assert ascend.idle_calls == 0
+    assert triton._moe_kernel.fused_experts.contexts == []
+    assert [w.mappings for w in (ascend, triton, trtllm)] == [[punica]] * 3
+    mapping, lora_index_to_id, _, _ = punica.update_calls[-1]
+    assert mapping.index_mapping == (1,) * 4
+    assert lora_index_to_id == [1]
+
+
+def test_publish_moe_lora_context_keeps_mapping_when_detach_is_unavailable(monkeypatch):
+    """A wrapper we cannot detach keeps the no-adapter mapping rather than none."""
+    _, triton_cls, _ = _make_moe_lora_wrapper_classes()
+    wrapper = triton_cls()
+    # Neither a runner idle hook nor a kernel that accepts a context.
+    wrapper._moe_kernel = None
+    manager, punica = _make_moe_manager(monkeypatch, [wrapper])
+
+    manager._publish_moe_lora_context()
+
+    assert wrapper.mappings == [punica]
+    mapping, lora_index_to_id, _, _ = punica.update_calls[-1]
+    assert mapping.index_mapping == (0,) * 4
+    assert lora_index_to_id == [None]
 
 
 def test_activation_republishes_moe_mapping_after_committing_the_adapter(monkeypatch):
@@ -541,6 +721,7 @@ def test_failed_activation_republishes_no_adapter_moe_mapping(monkeypatch):
 
 def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
     import vllm_omni.diffusion.lora.utils as utils_mod
+    import vllm_omni.lora.binding as binding_mod
 
     class _Runner(torch.nn.Module):
         def __init__(self):
@@ -565,8 +746,8 @@ def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
         def reset_lora(self, *_args, **_kwargs):
             pass
 
-    monkeypatch.setattr(utils_mod, "MoERunner", _Runner)
-    monkeypatch.setattr(utils_mod, "_select_moe_lora_wrapper_cls", lambda: _Wrapper)
+    monkeypatch.setattr(binding_mod, "MoERunner", _Runner)
+    monkeypatch.setattr(binding_mod, "_select_moe_lora_wrapper_cls", lambda: _Wrapper)
 
     wrapper = utils_mod.from_layer_diffusion(
         _Runner(),
@@ -582,7 +763,7 @@ def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
 
 
 def test_move_moe_lora_buffers_keeps_all_stacks_and_views_on_device():
-    from vllm_omni.diffusion.lora.utils import _move_moe_lora_buffers
+    from vllm_omni.lora.binding import _move_moe_lora_buffers
 
     wrapper = SimpleNamespace(
         max_loras=1,
@@ -621,7 +802,7 @@ def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypat
     # Non-DLO deployments used to leave `_resident_lora_device` unset, so
     # buffers created while the base weights were offloaded stayed on CPU
     # after wake, and rank-growth reinit re-stranded them (#8817).
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     class _LoRALayer(DummyBaseLayerWithLoRA):
         lora_buffer_device = None
@@ -633,7 +814,7 @@ def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypat
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _LoRALayer)
     monkeypatch.setattr(
         manager_mod,
-        "from_layer_diffusion",
+        "from_layer",
         lambda *, layer, **_kwargs: _LoRALayer(layer),
     )
 
@@ -658,7 +839,7 @@ def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypat
 
 
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -671,7 +852,7 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
         replace_calls.append(module_name)
         setattr(root, module_name, submodule)
 
-    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer_diffusion)
     monkeypatch.setattr(manager_mod, "replace_submodule", _fake_replace_submodule)
 
     pipeline = torch.nn.Module()
@@ -1255,7 +1436,7 @@ def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
     """Ensure that the LoRA manager applies scales correctly when the
     active adapter receives a different scale, i.e., the rank is unchanged.
     """
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyLoRALayer)
 
@@ -1302,7 +1483,7 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     """Ensure that the LoRA manager correctly handles scaling when the rank
     is changed and the buffers are reset + we reactivate.
     """
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -1444,7 +1625,7 @@ def test_lora_manager_max_rank_validation(monkeypatch, rank):
 
 def test_lora_manager_discovers_bagel_component(monkeypatch):
     """Verify that _replace_layers_with_lora finds layers under 'bagel'."""
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -1455,7 +1636,7 @@ def test_lora_manager_discovers_bagel_component(monkeypatch):
 
     replace_calls: list[str] = []
 
-    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer_diffusion)
     monkeypatch.setattr(
         manager_mod,
         "replace_submodule",
@@ -1488,7 +1669,7 @@ def test_lora_manager_discovers_bagel_component(monkeypatch):
 
 def test_lora_manager_discovers_unet_component(monkeypatch):
     """Verify that _replace_layers_with_lora finds layers under 'unet'."""
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -1499,7 +1680,7 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
 
     replace_calls: list[str] = []
 
-    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer_diffusion)
     monkeypatch.setattr(
         manager_mod,
         "replace_submodule",
@@ -1530,7 +1711,7 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
 
 def _suspend_harness(monkeypatch, adapter_id: int = 7, rank: int = 2):
     """Manager wired to a single dummy layer, ready to activate `adapter_id`."""
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
