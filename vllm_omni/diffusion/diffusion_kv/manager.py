@@ -115,6 +115,7 @@ class DiffusionKVCacheManager:
         requests: Sequence[DiffusionKVRequest],
         computed_blocks: Sequence[KVCacheBlocks],
         cached_prefix_len: int,
+        external_computed_tokens: Sequence[int],
     ) -> int:
         """Return the minimum physical capacity for one public request.
 
@@ -127,13 +128,15 @@ class DiffusionKVCacheManager:
         coordinator = self.native_manager.coordinator
         unique_hit_blocks = len(self._unique_blocks(computed_blocks))
         suffix_blocks = 0
-        for request, hit in zip(requests, computed_blocks, strict=True):
+        for request, hit, external_tokens_for_request in zip(
+            requests, computed_blocks, external_computed_tokens, strict=True
+        ):
             native_required = coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
                 num_tokens=request.num_tokens,
                 new_computed_blocks=hit.blocks,
                 num_encoder_tokens=0,
-                total_computed_tokens=cached_prefix_len,
+                total_computed_tokens=cached_prefix_len + external_tokens_for_request,
                 num_local_computed_tokens=cached_prefix_len,
                 num_tokens_main_model=request.num_tokens,
                 apply_admission_cap=True,
@@ -149,10 +152,26 @@ class DiffusionKVCacheManager:
     def has_request(self, public_request_id: str) -> bool:
         return public_request_id in self._requests
 
+    def get_cached_prefix_len(self, kv_requests: Sequence[DiffusionKVRequest]) -> int:
+        """Return the common local prefix hit for a request's CFG rows.
+
+        Native connectors need this boundary when calculating how many remote
+        tokens remain after local prefix reuse. Keep the lookup in the Manager
+        so token/MM hash preparation and the common CFG boundary stay identical
+        to ``reserve_request``.
+        """
+
+        requests = tuple(kv_requests)
+        if not requests:
+            raise ValueError("Diffusion KV prefix lookup requires at least one sequence")
+        self._prepare_block_hashes(requests)
+        return min(self.native_manager.get_computed_blocks(request)[1] for request in requests)
+
     def reserve_request(
         self,
         public_request_id: str,
         kv_requests: Sequence[DiffusionKVRequest],
+        external_computed_tokens: Sequence[int] | None = None,
     ) -> DiffusionKVMetadata | None:
         """Reserve all CFG sequences or roll back the complete public request."""
 
@@ -163,6 +182,17 @@ class DiffusionKVCacheManager:
         requests = tuple(kv_requests)
         if not requests:
             raise ValueError("Diffusion KV allocation requires at least one sequence")
+        if external_computed_tokens is None:
+            external_tokens = (0,) * len(requests)
+        else:
+            external_tokens = tuple(external_computed_tokens)
+            if len(external_tokens) != len(requests):
+                raise ValueError(
+                    "external_computed_tokens must contain one value per diffusion sequence: "
+                    f"expected={len(requests)}, got={len(external_tokens)}"
+                )
+            if any(type(tokens) is not int or tokens < 0 for tokens in external_tokens):
+                raise ValueError("external_computed_tokens must contain non-negative integers")
 
         sequence_ids = [request.sequence_id for request in requests]
         internal_ids = [request.request_id for request in requests]
@@ -197,6 +227,13 @@ class DiffusionKVCacheManager:
             )
             for result in hit_results
         ]
+        for request, external_tokens_for_request in zip(requests, external_tokens, strict=True):
+            if cached_prefix_len + external_tokens_for_request > request.seq_len:
+                raise DiffusionKVAdmissionError(
+                    "Diffusion KV imported tokens exceed the allocated sequence: "
+                    f"local={cached_prefix_len}, external={external_tokens_for_request}, "
+                    f"seq_len={request.seq_len}"
+                )
         for request, result in zip(requests, hit_results, strict=True):
             request.shared_prefix_boundary = result[2]
 
@@ -204,6 +241,7 @@ class DiffusionKVCacheManager:
             requests,
             computed_blocks,
             cached_prefix_len,
+            external_tokens,
         )
         if required_blocks > self._empty_pool_num_free_blocks:
             raise DiffusionKVAdmissionError(
@@ -222,12 +260,15 @@ class DiffusionKVCacheManager:
             # branch's miss allocation could evict a later branch's hit.
             self.native_manager.block_pool.touch(pinned_blocks)
         try:
-            for request, request_computed_blocks in zip(requests, computed_blocks, strict=True):
+            for request, request_computed_blocks, external_tokens_for_request in zip(
+                requests, computed_blocks, external_tokens, strict=True
+            ):
                 blocks = self.native_manager.allocate_slots(
                     request,
-                    num_new_tokens=request.seq_len - cached_prefix_len,
+                    num_new_tokens=request.seq_len - cached_prefix_len - external_tokens_for_request,
                     num_new_computed_tokens=cached_prefix_len,
                     new_computed_blocks=request_computed_blocks,
+                    num_external_computed_tokens=external_tokens_for_request,
                     delay_cache_blocks=True,
                     full_sequence_must_fit=True,
                 )

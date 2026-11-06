@@ -24,6 +24,8 @@ FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Source preprocessing context carried in native KV handoff metadata.
+SOURCE_MM_PROCESSOR_KWARGS_KEY = "source_mm_processor_kwargs"
 # Routing tag: the stage returns its full payload on its output instead of sending it to the
 # next stage. Set on run requests whose next stage takes a full payload.
 RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"

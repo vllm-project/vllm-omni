@@ -191,14 +191,31 @@ plus model/layout and LoRA context. The same image with different prompts can
 reuse the common leading blocks; it does not imply that every image span or CFG
 branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
 `dense_legacy` remains the default. Enabling prefix caching with a mode other than
-`paged_scheduler`, without a registered model hook, or together with native
-`kv_transfer_config` raises a configuration error.
+`paged_scheduler` or without a registered model hook raises a configuration error.
 Combining it with `enable_sleep_mode: true` is also rejected: sleep discards KV
 pages without invalidating the Scheduler's prefix-cache index. Disable either
 prefix caching or sleep mode.
 
-The current scope is local DiT reuse, not AR-imported KV or missing-page-only
-cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
+With native `kv_transfer_config`, the DiT Scheduler first looks up the common
+local hit across CFG rows, then asks Mooncake for the remote suffix. Native
+`KVCacheManager.allocate_slots` retains local hit blocks and allocates the
+remaining pages; Mooncake receives only the unhashed destination blocks up to
+the source transfer boundary. A full local hit still sends an empty-page
+notification so AR can release its source pages. First-step execution uses each
+row's combined local-plus-imported boundary and the existing AR CFG prefill
+path. Pages are published only after successful execution; cancellation and
+timeout retain pending destinations until receive completion.
+
+Imported KV is isolated from locally computed KV and from other AR engines.
+The Orchestrator carries source `mm_processor_kwargs` in the generic native
+handoff field `kv_transfer_params.source_mm_processor_kwargs`, independently
+of model bridges. Hunyuan reference-image keys include these source options,
+including the explicit `vae_generator_seed`, rather than DiT's sampling RNG.
+Without a source VAE seed, reference-image identities remain request-local; leading text blocks
+can still be reused. Requests without AR import retain the local DiT path;
+the Scheduler keeps imported and local-only requests in separate forward waves.
+
+Prefix-hit accuracy for standalone DiT has been exercised with TP4/SP1 and
 TP2/SP2 (Ulysses), both with EP and CFGP1. Other combinations still require validation. See the
 [diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
 

@@ -64,7 +64,13 @@ class RequestScheduler(BaseScheduler):
         if not super()._can_schedule_waiting(state):
             return False
         manager = self._diffusion_kv_manager
-        if not self._running or manager is None or not manager.has_request(state.request_id):
+        if not self._running or manager is None:
+            return True
+        # Native import and local prefill prepare different model inputs.
+        running = self._request_states[self._running[0]]
+        if (state.req.kv_transfer_params is None) != (running.req.kv_transfer_params is None):
+            return False
+        if not manager.has_request(state.request_id):
             return True
         # The request-level runner uses one first-step query boundary per wave.
         # The Manager already aligns all CFG sequences within each request.

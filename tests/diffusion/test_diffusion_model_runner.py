@@ -259,15 +259,21 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-@pytest.mark.parametrize("imported_tokens", [None, (4, 4), (4, 2)])
-def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, imported_tokens):
+@pytest.mark.parametrize(
+    "native_config,imported_tokens,local_hit",
+    [(False, None, 4), (True, None, 4), (True, (4, 4), 0), (True, (4, 2), 0), (True, (8, 6), 4), (True, (8, 8), 8)],
+)
+def test_request_forward_separates_imported_kv_and_local_hits(
+    monkeypatch, mocker, native_config, imported_tokens, local_hit
+):
     from contextlib import nullcontext
 
     from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata, DiffusionKVSequenceMetadata
 
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
-    runner.od_config.kv_transfer_config = object() if imported_tokens else None
+    runner.od_config.kv_transfer_config = object() if native_config else None
     request = _make_request()
+    request.kv_transfer_params = {"transfer_id": "ar-ticket"} if imported_tokens else None
     metadata = DiffusionKVMetadata(
         request_id=request.request_id,
         allocation_generation=1,
@@ -278,8 +284,8 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
                 target_len=4,
                 seq_len=12,
                 block_ids=([1, 2, 3],),
-                cached_prefix_len=0 if imported_tokens else 4,
-                num_computed_tokens=imported_tokens[i] if imported_tokens else 4,
+                cached_prefix_len=local_hit,
+                num_computed_tokens=imported_tokens[i] if imported_tokens else 0,
             )
             for i in range(2)
         ),
@@ -292,7 +298,7 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
         yield
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", capture_context)
-    runner.diffusion_kv_backend.activate_paged_attention_metadata = Mock(return_value=(object(), nullcontext()))
+    runner.diffusion_kv_backend.activate_paged_attention_metadata = mocker.Mock(return_value=(object(), nullcontext()))
     runner._execute_request_list(
         [request],
         od_config=runner.od_config,
@@ -302,8 +308,10 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
         record_output_peak_memory=False,
         diffusion_kv_metadata=[metadata],
     )
-    assert captured["paged_kv_cached_prefix_len"] == (0 if imported_tokens else 4)
+    assert captured["paged_kv_cached_prefix_len"] == (0 if imported_tokens else local_hit)
     assert getattr(request, "kv_computed_tokens", ()) == (imported_tokens or ())
+    paged_metadata = runner.diffusion_kv_backend.activate_paged_attention_metadata.call_args.args[0]
+    assert tuple(row.kv_start_pos for row in paged_metadata.prefill_rows) == (imported_tokens or (local_hit, local_hit))
 
 
 def _make_compile_runner(

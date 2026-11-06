@@ -27,6 +27,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
     get_current_diffusion_config_or_none,
@@ -39,6 +40,7 @@ from vllm_omni.diffusion.data import (
     build_attention_config,
     parse_attention_config,
 )
+from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -564,92 +566,45 @@ class TestCurrentDiffusionConfig:
 
 
 class TestAttentionInitUsesCurrentDiffusionConfig:
-    @pytest.mark.parametrize("mindiesd_available", [False, True])
-    def test_paged_npu_memory_profile_uses_sdpa_only_without_mindiesd(self, monkeypatch, mindiesd_available):
+    @pytest.mark.parametrize(
+        ("scheduler_paged", "cache_role", "skip_attention"),
+        [(True, "primary", True), (True, None, False), (False, "primary", False)],
+    )
+    def test_memory_profile_skips_only_scheduler_paged_attention(
+        self, mocker, scheduler_paged, cache_role, skip_attention
+    ):
         attention = Attention.__new__(Attention)
+        torch.nn.Module.__init__(attention)
+        attention._explicit_cross_contract = False
         attention.allow_fp32_fallback = False
-        attention._scheduler_paged_kv = True
-        attention.paged_kv_cache_role = "primary"
-        attention.backend_pref = "FLASH_ATTN"
-        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
-        flash_output = torch.ones(1)
-        sdpa_output = torch.zeros(1)
-        dense_flash = Mock(return_value=flash_output)
-        sdpa = Mock(return_value=sdpa_output)
-        attention.attention = SimpleNamespace(forward=dense_flash)
-        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
-        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
-        monkeypatch.setattr(
-            layer_mod,
-            "get_forward_context",
-            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
-        )
-        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: True)
-        monkeypatch.setattr(
-            layer_mod.current_omni_platform,
-            "supports_diffusion_dense_flash_attention",
-            lambda: mindiesd_available,
-        )
+        attention._scheduler_paged_kv = scheduler_paged
+        attention.paged_kv_cache_role = cache_role
+        attention.attn_backend = FlashAttentionBackend
+        attention.use_ring = False
+        attention._no_parallel_strategy = NoParallelAttention()
+        attention._get_active_parallel_strategy = lambda: attention._no_parallel_strategy
+        attention._with_kv_cache_dtype = lambda metadata: metadata
+        query = torch.ones(2, 5, 4, 8, dtype=torch.bfloat16)
+        key = value = torch.ones(2, 5, 2, 8, dtype=torch.bfloat16)
+        attention.attention = mocker.Mock()
+        attention.attention.forward.return_value = query
+        attention.sdpa_fallback = mocker.Mock(side_effect=AssertionError("profile must not use SDPA"))
 
-        result = attention._run_local_attention(
-            torch.zeros(1, dtype=torch.bfloat16),
-            torch.zeros(1, dtype=torch.bfloat16),
-            torch.zeros(1, dtype=torch.bfloat16),
-            AttentionMetadata(),
-        )
+        with set_forward_context(in_diffusion_kv_memory_profile=True):
+            assert attention.is_paged_kv_active() is skip_attention
+            result = attention._forward_impl(query, key, value)
 
-        if mindiesd_available:
-            assert result is flash_output
-            dense_flash.assert_called_once()
-            sdpa.assert_not_called()
+        if skip_attention:
+            assert result.shape == query.shape
+            assert result.dtype == query.dtype
+            assert result.device == query.device
+            assert torch.count_nonzero(result) == 0
+            attention.attention.forward.assert_not_called()
         else:
-            assert result is sdpa_output
-            dense_flash.assert_not_called()
-            sdpa.assert_called_once()
-
-    @pytest.mark.parametrize("fa4_available", [False, True])
-    def test_paged_cuda_memory_profile_uses_sdpa_without_dense_fa4(self, monkeypatch, fa4_available):
-        attention = Attention.__new__(Attention)
-        attention.allow_fp32_fallback = False
-        attention._scheduler_paged_kv = True
-        attention.paged_kv_cache_role = "primary"
-        attention.backend_pref = "FLASH_ATTN"
-        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
-        flash_output = torch.ones(1)
-        sdpa_output = torch.zeros(1)
-        dense_flash = Mock(return_value=flash_output)
-        sdpa = Mock(return_value=sdpa_output)
-        attention.attention = SimpleNamespace(forward=dense_flash)
-        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
-        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
-        monkeypatch.setattr(
-            layer_mod,
-            "get_forward_context",
-            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
-        )
-        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: False)
-        monkeypatch.setattr(layer_mod.current_omni_platform, "is_cuda", lambda: True)
-        monkeypatch.setattr(
-            layer_mod.current_omni_platform,
-            "supports_diffusion_dense_flash_attention",
-            lambda: fa4_available,
-        )
-
-        result = attention._run_local_attention(
-            torch.zeros(1, dtype=torch.bfloat16),
-            torch.zeros(1, dtype=torch.bfloat16),
-            torch.zeros(1, dtype=torch.bfloat16),
-            AttentionMetadata(),
-        )
-
-        if fa4_available:
-            assert result is flash_output
-            dense_flash.assert_called_once()
-            sdpa.assert_not_called()
-        else:
-            assert result is sdpa_output
-            dense_flash.assert_not_called()
-            sdpa.assert_called_once()
+            assert result is query
+            attention.attention.forward.assert_called_once()
+        attention.attention.forward_paged.assert_not_called()
+        attention.sdpa_fallback.forward.assert_not_called()
 
     def test_dense_flash_import_error_is_not_reclassified(self, monkeypatch):
         attention = Attention.__new__(Attention)

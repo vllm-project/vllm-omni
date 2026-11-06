@@ -10,6 +10,7 @@ import torch
 from vllm.config import KVTransferConfig
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
@@ -19,6 +20,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
     shutdown_kv_connector,
     wait_for_kv_load,
 )
+from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 
@@ -147,29 +149,62 @@ def test_shutdown_kv_connector_is_idempotent() -> None:
     scheduler_connector.shutdown.assert_called_once()
 
 
-def test_commit_aligns_cfg_transport_pages_without_extending_computed_prefix() -> None:
+@pytest.mark.parametrize(
+    "local_tokens,remote_tokens,source_end", [(0, [7, 5], 9), (4, [4, 2], 8), (8, [0, 0], 8), (4, [0, 4], 8)]
+)
+def test_commit_aligns_cfg_transport_pages_without_extending_computed_prefix(
+    mocker, local_tokens, remote_tokens, source_end
+) -> None:
     requests = tuple(
-        SimpleNamespace(
+        DiffusionKVRequest(
             request_id=f"req/{sequence_id}",
-            kv_transfer_params={"num_transfer_tokens": 9},
-            num_tokens=16,
-            num_computed_tokens=0,
+            sequence_id=sequence_id,
+            prefix_len=12,
+            target_len=4,
+            seq_len=16,
+            kv_transfer_params={"num_transfer_tokens": source_end},
         )
         for sequence_id in range(2)
     )
+    for request in requests:
+        request.num_computed_tokens = local_tokens
     manager = SimpleNamespace(
         get_blocks=lambda _request_id: KVCacheBlocks(([0, 1, 2, 3],)),
         kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4))]),
     )
-    connector = mock.Mock()
+    connector = mocker.Mock()
 
-    expected = commit_kv_load(connector, manager, requests, [7, 5])
+    expected = commit_kv_load(connector, manager, requests, remote_tokens)
 
-    assert expected == {"req/0", "req/1"}
+    assert expected == {request.request_id for request, remote in zip(requests, remote_tokens) if remote > 0}
     calls = connector.update_state_after_alloc.call_args_list
-    assert [len(call.args[1].blocks[0]) for call in calls] == [3, 3]
-    assert [call.args[2] for call in calls] == [7, 5]
-    assert [request.num_computed_tokens for request in requests] == [7, 5]
+    assert [len(call.args[1].blocks[0]) for call in calls] == [
+        ((source_end if remote else local_tokens) + 3) // 4 for remote in remote_tokens
+    ]
+    assert [call.args[2] for call in calls] == remote_tokens
+    assert [request.num_computed_tokens for request in requests] == [local_tokens + remote for remote in remote_tokens]
+    assert [request.status for request in requests] == [
+        RequestStatus.WAITING_FOR_REMOTE_KVS if remote else RequestStatus.RUNNING for remote in remote_tokens
+    ]
+
+
+@pytest.mark.parametrize("remote_tokens", [-1, True, 1.5, 5])
+def test_commit_rejects_invalid_remote_suffix_before_registration(mocker, remote_tokens) -> None:
+    request = DiffusionKVRequest(
+        request_id="req/0",
+        sequence_id=0,
+        prefix_len=8,
+        target_len=4,
+        seq_len=12,
+        kv_transfer_params={"num_transfer_tokens": 8},
+    )
+    request.num_computed_tokens = 4
+    connector = mocker.Mock()
+
+    with pytest.raises(KVTransferRegistrationError):
+        commit_kv_load(connector, mocker.Mock(), (request,), [remote_tokens])
+
+    connector.update_state_after_alloc.assert_not_called()
 
 
 def test_wait_without_pending_load_uses_vllm_post_forward_once() -> None:
@@ -210,6 +245,7 @@ def cfg_registration():
             request_id=f"cfg{i}",
             status=None,
             num_tokens=8,
+            num_computed_tokens=0,
             kv_transfer_params={"num_transfer_tokens": 4, "transfer_id": "ticket", "do_remote_prefill": True},
         )
         for i in range(2)

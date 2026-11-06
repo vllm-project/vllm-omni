@@ -593,6 +593,95 @@ class TestRequestScheduler:
         assert metadata is not None
         assert metadata.sequences[0].cached_prefix_len == 4
 
+    @pytest.mark.parametrize("finish_error", [None, "generation failed"])
+    @pytest.mark.parametrize("local_hit", [0, 4, 8, 12])
+    @pytest.mark.parametrize("source_end", [8, 9])
+    def test_native_transfer_imports_only_the_suffix_after_local_prefix_hit(
+        self, local_hit, source_end, finish_error
+    ) -> None:
+        from vllm.config import KVTransferConfig
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
+
+        _initialize_paged_scheduler(self.scheduler, enable_prefix_caching=True)
+        if local_hit:
+            warmup = _make_request("local-warmup")
+            _attach_diffusion_kv(warmup, seq_len=local_hit + 4, prefix_len=local_hit, cache_token_ids=range(local_hit))
+            self.scheduler.add_request(warmup)
+            self.scheduler.update_from_output(self.scheduler.schedule(), _make_request_output(warmup.request_id))
+
+        manager = self.scheduler._diffusion_kv_manager
+        connector = MooncakeConnector(
+            SimpleNamespace(
+                cache_config=SimpleNamespace(block_size=4),
+                scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+                kv_transfer_config=KVTransferConfig(
+                    kv_connector="MooncakeConnector", kv_role="kv_consumer", engine_id="dit"
+                ),
+            ),
+            KVConnectorRole.SCHEDULER,
+            manager.native_manager.kv_cache_config,
+        )
+        self.scheduler._kv_connector = connector
+
+        request = _make_request("ar-import")
+        _attach_diffusion_kv(request, seq_len=16, prefix_len=12, cache_token_ids=range(12))
+        request.diffusion_kv_requests[0].prompt_token_ids = list(range(source_end))
+        request.kv_transfer_params = {
+            "num_transfer_tokens": source_end,
+            "do_remote_prefill": True,
+            "transfer_id": "ticket",
+            "remote_engine_id": "ar",
+            "remote_bootstrap_addr": "localhost:8998",
+        }
+        self.scheduler.add_request(request)
+        kv_request = self.scheduler.get_request_state(request.request_id).diffusion_kv_requests[0]
+
+        scheduled = self.scheduler.schedule()
+
+        row = scheduled.scheduled_new_reqs[0].diffusion_kv_metadata.sequences[0]
+        assert row.cached_prefix_len == local_hit
+        assert row.num_computed_tokens == max(local_hit, source_end)
+        received = scheduled.kv_connector_metadata.reqs_to_recv["ar"][kv_request.request_id]
+        assert received.local_block_ids == (
+            [row.block_ids[0][local_hit // 4 : (source_end + 3) // 4]] if local_hit < source_end else []
+        )
+        # Full hits notify AR through metadata but never wait for a receive.
+        expected_loads = {kv_request.request_id} if local_hit < source_end else set()
+        assert scheduled.kv_transfer_request_ids == expected_loads
+        assert self.scheduler._loading_sequence_ids([request.request_id]) == expected_loads
+        self.scheduler.update_kv_connector_output(KVConnectorOutput(finished_recving=expected_loads))
+        assert request.request_id not in self.scheduler._kv_loading_request_ids
+        self.scheduler.update_from_output(scheduled, _make_request_output(request.request_id, error=finish_error))
+        assert not manager.has_request(request.request_id)
+        repeat = DiffusionKVRequest(
+            "repeat/0", sequence_id=0, prefix_len=12, target_len=4, seq_len=16, cache_token_ids=range(12)
+        )
+        assert manager.get_cached_prefix_len((repeat,)) == (12 if finish_error is None else local_hit)
+
+    @pytest.mark.parametrize("import_first", [False, True])
+    def test_native_import_and_local_requests_run_in_separate_waves(self, mocker, import_first) -> None:
+        _initialize_paged_scheduler(self.scheduler, max_num_seqs=2, enable_prefix_caching=True)
+        connector = mocker.Mock()
+        connector.get_num_new_matched_tokens.return_value = (0, False)
+        connector.request_finished.return_value = (False, None)
+        self.scheduler._kv_connector = connector
+        request_ids = ["imported", "local"] if import_first else ["local", "imported"]
+        for request_id in request_ids:
+            request = _make_request(request_id)
+            _attach_diffusion_kv(request)
+            if request_id == "imported":
+                request.kv_transfer_params = {"num_transfer_tokens": 4, "do_remote_prefill": True}
+            self.scheduler.add_request(request)
+
+        first = self.scheduler.schedule()
+
+        assert _new_ids(first) == request_ids[:1]
+        assert self.scheduler.get_request_state(request_ids[1]).status == DiffusionRequestStatus.WAITING
+        self.scheduler.update_kv_connector_output(KVConnectorOutput(finished_recving=first.kv_transfer_request_ids))
+        self.scheduler.update_from_output(first, _make_request_output(request_ids[0]))
+        assert _new_ids(self.scheduler.schedule()) == request_ids[1:]
+
     @pytest.mark.parametrize("boundaries", [(8, 4), (8, 0), (0, 8), (4, 8), (8, 8), (4, 4), (0, 0)])
     @pytest.mark.parametrize("num_branches", [1, 2])
     def test_diffusion_kv_batches_only_matching_prefix_boundaries(self, boundaries, num_branches) -> None:
@@ -672,8 +761,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)

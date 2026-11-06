@@ -25,7 +25,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.data_entry_keys import returns_stage_payload
+from vllm_omni.data_entry_keys import SOURCE_MM_PROCESSOR_KWARGS_KEY, returns_stage_payload
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -2521,11 +2521,16 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
     dispatch.assert_awaited_once()
 
 
-def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
+@pytest.mark.parametrize("processor_kwargs", [None, {}, {"encoder_seed": 0, "crop_size": [224, 224]}])
+@pytest.mark.parametrize("prompt_list", [False, True])
+def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker, processor_kwargs, prompt_list) -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [mocker.Mock()]
     orchestrator.stage_pools[0].get_bound_client.return_value = None
-    req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
+    prompt = {"prompt": "edit", "mm_processor_kwargs": processor_kwargs}
+    req_state = OrchestratorRequestState(
+        request_id="req", prompt=[prompt] if prompt_list else prompt, native_kv_transfer_id="xfer-req"
+    )
     output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
 
     with pytest.raises(NativeKVHandoffError, match="bound AR replica"):
@@ -2545,6 +2550,13 @@ def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -
     assert params["kv_transfer_params"]["remote_engine_id"] == "ar-1"
     assert params["kv_transfer_params"]["remote_bootstrap_addr"] == "http://host:8999"
     assert "remote_engine_id" not in output.kv_transfer_params
+    if processor_kwargs is None:
+        assert SOURCE_MM_PROCESSOR_KWARGS_KEY not in params["kv_transfer_params"]
+    else:
+        forwarded = params["kv_transfer_params"][SOURCE_MM_PROCESSOR_KWARGS_KEY]
+        assert forwarded == processor_kwargs
+        assert forwarded is not processor_kwargs
+    assert SOURCE_MM_PROCESSOR_KWARGS_KEY not in output.kv_transfer_params
 
 
 @pytest.mark.asyncio

@@ -69,7 +69,7 @@ def test_sleep_mode_accepts_disabled_prefix_caching(mode) -> None:
 
 
 @pytest.mark.parametrize("enable_prefix_caching", [False, True])
-def test_native_kv_transfer_requires_prefix_caching_disabled(enable_prefix_caching) -> None:
+def test_native_kv_transfer_can_combine_with_prefix_caching(enable_prefix_caching) -> None:
     kwargs = dict(
         diffusion_kv_mode="paged_scheduler",
         diffusion_kv_max_rows_per_request=2,
@@ -80,12 +80,8 @@ def test_native_kv_transfer_requires_prefix_caching_disabled(enable_prefix_cachi
             "engine_id": "test-diffusion",
         },
     )
-    if enable_prefix_caching:
-        with pytest.raises(ValueError, match="disable enable_prefix_caching for AR KV import"):
-            OmniDiffusionConfig.from_kwargs(**kwargs)
-    else:
-        config = OmniDiffusionConfig.from_kwargs(**kwargs)
-        assert config.kv_transfer_config.kv_role == "kv_consumer"
+    config = OmniDiffusionConfig.from_kwargs(**kwargs)
+    assert config.kv_transfer_config.kv_role == "kv_consumer"
 
 
 @pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])

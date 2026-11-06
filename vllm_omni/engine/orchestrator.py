@@ -19,7 +19,7 @@ import os
 import shutil
 import threading
 import time as _time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -45,6 +45,7 @@ from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     FIRST_AUDIO_KEY,
     FIRST_AUDIO_REQUIRED_KEY,
+    SOURCE_MM_PROCESSOR_KWARGS_KEY,
     RETURN_STAGE_PAYLOAD_KEY,
 )
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
@@ -3611,13 +3612,21 @@ class OrchestratorBase:
         params = getattr(output, "kv_transfer_params", None)
         if not params or "num_transfer_tokens" not in params:
             raise NativeKVHandoffError("AR source completed without native KV transfer metadata")
-        return {
-            "kv_transfer_params": build_target_kv_transfer_params(
-                source_params=params,
-                remote_engine_id=config.engine_id,
-                remote_bootstrap_addr=bootstrap_addr_from_kv_transfer_config(config),
-            )
-        }
+        target_params = build_target_kv_transfer_params(
+            source_params=params,
+            remote_engine_id=config.engine_id,
+            remote_bootstrap_addr=bootstrap_addr_from_kv_transfer_config(config),
+        )
+        # Carry source preprocessing context independently of model bridges.
+        # Consumers decide which options affect their imported KV identity.
+        source_prompt = req_state.prompt
+        if isinstance(source_prompt, list):
+            source_prompt = source_prompt[0] if source_prompt else None
+        if isinstance(source_prompt, Mapping):
+            source_mm_kwargs = source_prompt.get("mm_processor_kwargs")
+            if source_mm_kwargs is not None:
+                target_params[SOURCE_MM_PROCESSOR_KWARGS_KEY] = dict(source_mm_kwargs)
+        return {"kv_transfer_params": target_params}
 
     def _build_kv_sender_info(
         self,

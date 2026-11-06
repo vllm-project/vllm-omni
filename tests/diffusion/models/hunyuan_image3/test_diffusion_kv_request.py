@@ -17,6 +17,7 @@ import vllm_omni.diffusion.diffusion_kv.kv_cache_utils as kv_utils
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as pipeline_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as layout_module
 from tests.helpers.kv_layout import build_kv_cache_tensor
+from vllm_omni.data_entry_keys import SOURCE_MM_PROCESSOR_KWARGS_KEY
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
@@ -322,6 +323,52 @@ def test_reference_prefix_rejects_missing_inputs_with_nested_spans() -> None:
 
     with pytest.raises(ValueError, match="missing its canonical inputs"):
         prepare_hunyuan_prefix_cache(request)
+
+
+@pytest.mark.parametrize("source_seed", [0, 7])
+def test_imported_reference_identity_uses_source_preprocessing_and_isolates_local_kv(source_seed):
+    tokenizer, image_processor = _components([20])
+
+    def build(
+        request_id, *, ar_seed=source_seed, dit_seed=7, source="ar", imported=True, target_w=1024, source_context=True
+    ):
+        request = _request(
+            guidance_scale=1.0,
+            request_id=request_id,
+            seed=dit_seed,
+            prompt={
+                "prompt": "edit",
+                "additional_information": {"batch_cond_image_info": [_reference_image()]},
+            },
+        )
+        if imported:
+            request.kv_transfer_params = {"remote_engine_id": source}
+            if source_context:
+                request.kv_transfer_params[SOURCE_MM_PROCESSOR_KWARGS_KEY] = {
+                    "vae_generator_seed": ar_seed,
+                    "target_w": target_w,
+                }
+        row = _prepare_cached_requests(request, tokenizer, image_processor)[0]
+        row.build_block_hashes(4, get_hash_fn_by_name("sha256"))
+        return row.block_hashes
+
+    first = build("first")
+    assert first == build("different-dit-seed", dit_seed=99)
+    for changed in (build("different-ar-seed", ar_seed=8), build("different-preprocessing", target_w=512)):
+        assert first[:1] == changed[:1]
+        assert all(a != b for a, b in zip(first[1:], changed[1:], strict=True))
+    for isolated in (build("local", imported=False), build("other-producer", source="ar-2")):
+        assert all(a != b for a, b in zip(first, isolated, strict=True))
+
+    # A fixed DiT seed cannot make an unseeded AR VAE encoding reproducible.
+    unseeded = build("unseeded-first", ar_seed=None)
+    other = build("unseeded-second", ar_seed=None)
+    assert unseeded[:1] == other[:1]
+    assert all(a != b for a, b in zip(unseeded[1:], other[1:], strict=True))
+    missing = build("missing-source-first", source_context=False)
+    other_missing = build("missing-source-second", source_context=False)
+    assert missing[:1] == other_missing[:1]
+    assert all(a != b for a, b in zip(missing[1:], other_missing[1:], strict=True))
 
 
 def test_reference_content_is_hashed_once_across_cfg_rows(monkeypatch):

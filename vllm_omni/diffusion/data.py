@@ -1333,11 +1333,6 @@ class OmniDiffusionConfig:
             if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
                 raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
             self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
-            if self.enable_prefix_caching and self.kv_transfer_config is not None:
-                raise ValueError(
-                    "Diffusion prefix caching cannot be combined with native kv_transfer_config; "
-                    "disable enable_prefix_caching for AR KV import or remove kv_transfer_config for local DiT reuse"
-                )
             if self.enable_sleep_mode:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 

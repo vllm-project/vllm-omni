@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
@@ -274,10 +275,14 @@ def shutdown_kv_connector(*, scheduler_connector: KVConnectorBase_V1 | None = No
 
 
 def prepare_kv_requests(requests: tuple[DiffusionKVRequest, ...], params: Mapping[str, Any]) -> None:
+    transfer_tokens = params["num_transfer_tokens"]
+    if type(transfer_tokens) is not int or transfer_tokens < 0:
+        raise ValueError("num_transfer_tokens must be a non-negative integer")
     for request in requests:
         request.kv_transfer_params = dict(params)
-        num_tokens = min(len(request.prompt_token_ids), params["num_transfer_tokens"])
-        request.prompt_token_ids = request.prompt_token_ids[:num_tokens]
+        prompt_token_ids = request.prompt_token_ids or []
+        num_tokens = min(len(prompt_token_ids), transfer_tokens)
+        request.prompt_token_ids = prompt_token_ids[:num_tokens]
         request.num_prompt_tokens = num_tokens
 
 
@@ -326,17 +331,32 @@ def install_mooncake_cfg_fanout(connector: KVConnectorBase_V1) -> None:
     setattr(worker, "_omni_cfg_fanout_installed", True)
 
 
-def validate_kv_transfer_boundaries(requests: tuple[DiffusionKVRequest, ...], matched_tokens: list[int]) -> None:
-    """Validate every CFG row before reserving or registering destination pages."""
+def validate_kv_transfer_boundaries(
+    requests: tuple[DiffusionKVRequest, ...],
+    matched_tokens: list[int],
+    *,
+    local_cached_prefix_len: int | None = None,
+) -> None:
+    """Validate remote suffixes against each row's source transfer boundary."""
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         params = request.kv_transfer_params
-        if num_tokens <= 0 or params is None:
+        if type(num_tokens) is not int or num_tokens < 0:
+            raise KVTransferRegistrationError(f"Remote matched token count must be non-negative, got {num_tokens!r}")
+        if num_tokens == 0 or params is None:
             continue
         transfer_tokens = params.get("num_transfer_tokens")
-        if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
+        local_tokens = request.num_computed_tokens if local_cached_prefix_len is None else local_cached_prefix_len
+        if (
+            type(local_tokens) is not int
+            or local_tokens < 0
+            or type(transfer_tokens) is not int
+            or local_tokens + num_tokens > transfer_tokens
+            or transfer_tokens > request.num_tokens
+        ):
             raise KVTransferRegistrationError(
-                "Diffusion KV transfer boundary must cover the reusable prefix "
-                f"without exceeding the allocated sequence: reusable={num_tokens}, "
+                "Diffusion KV remote suffix must end at the source transfer boundary "
+                "without exceeding the allocated sequence: "
+                f"local={local_tokens!r}, remote={num_tokens}, "
                 f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
             )
 
@@ -351,34 +371,43 @@ def commit_kv_load(
     allocations = []
     # All rows sharing a transfer_id must reach the same connector metadata:
     # the producer uses this complete per-rank row set for fan-out accounting.
-    # Validate every CFG row before mutating any connector state.
+    # Validate every CFG row before mutating any connector state. At this
+    # point num_computed_tokens is the local prefix hit; matched_tokens counts
+    # only the remote suffix after that hit.
     validate_kv_transfer_boundaries(requests, matched_tokens)
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
-        blocks = manager.get_blocks(request.request_id)
-        # Mooncake's producer advertises complete physical blocks. Keep every
-        # CFG receiver on that same block boundary so the native connector can
-        # use its normal one-to-one page mapping even when the branches have
-        # different logical prefix lengths. Bytes beyond ``num_tokens`` are
-        # not marked computed and are overwritten by the DiT prefill.
-        transfer_tokens = num_tokens
+        local_tokens = request.num_computed_tokens
+        computed_end = local_tokens + num_tokens
+        # Transfer complete source pages through the shared ticket boundary.
+        # Mooncake pairs source and destination suffix blocks, so the target
+        # must expose all pages after its local hit even when a CFG row only
+        # consumes a shorter logical prefix. The extra tail stays uncomputed.
+        transfer_end = computed_end
         if num_tokens > 0 and request.kv_transfer_params is not None:
-            transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
+            transfer_end = request.kv_transfer_params["num_transfer_tokens"]
+        blocks = manager.get_blocks(request.request_id)
+        # CFG rows can have different logical prefix lengths, but share one
+        # source ticket and therefore the same physical transfer boundary.
         prefix_blocks = KVCacheBlocks(
             tuple(
-                group[: (transfer_tokens + spec.kv_cache_spec.block_size - 1) // spec.kv_cache_spec.block_size]
+                group[: (transfer_end + spec.kv_cache_spec.block_size - 1) // spec.kv_cache_spec.block_size]
                 for group, spec in zip(blocks.blocks, manager.kv_cache_config.kv_cache_groups, strict=True)
             )
         )
-        allocations.append((request, prefix_blocks, num_tokens))
+        allocations.append((request, prefix_blocks, num_tokens, computed_end))
     try:
-        for request, prefix_blocks, num_tokens in allocations:
+        for request, prefix_blocks, num_tokens, computed_end in allocations:
             connector.update_state_after_alloc(request, prefix_blocks, num_tokens)
-            request.num_computed_tokens = num_tokens
-            if request.kv_transfer_params is not None:
+            request.num_computed_tokens = computed_end
+            # Like the native Scheduler, queue notifications for full hits
+            # but wait only for actual remote loads. Empty pulls do not emit
+            # a consumer finished_recving event.
+            request.status = RequestStatus.RUNNING
+            if num_tokens > 0 and request.kv_transfer_params is not None:
+                request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                 expected.add(request.request_id)
     except Exception as exc:
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
-        from vllm.v1.request import RequestStatus
 
         if not isinstance(connector, MooncakeConnector):
             # Unknown connectors may have started I/O during registration.
@@ -410,7 +439,8 @@ def wait_for_kv_load(
             raise RuntimeError("Diffusion KV connector reported invalid remote pages")
         return output
 
-    received, sent = set(), set()
+    received: set[str] = set()
+    sent: set[str] = set()
     deadline = time.monotonic() + timeout
     while True:
         finished_sending, finished_recving = connector.get_finished(finished_ids)

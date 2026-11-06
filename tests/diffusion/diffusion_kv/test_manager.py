@@ -159,6 +159,33 @@ def test_partial_prefix_hit_recomputes_from_the_first_changed_block() -> None:
     assert len(metadata.sequences[0].block_ids[0]) == 3
 
 
+def test_external_tokens_reserve_pages_after_a_local_prefix_hit() -> None:
+    manager = _manager(8, enable_prefix_caching=True)
+    cold = _request("cold", 0, cache_token_ids=range(4))
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request("warm", 0, prefix_len=8, seq_len=12, cache_token_ids=range(8))
+    metadata = manager.reserve_request("warm", (warm,), external_computed_tokens=(4,))
+
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == 4
+    assert warm.num_computed_tokens == 4
+    # One local hit page, one externally filled page, and one dynamic page.
+    assert len(metadata.sequences[0].block_ids[0]) == 3
+
+    manager.free_request("warm")
+
+
+def test_external_tokens_are_checked_against_the_request_length() -> None:
+    manager = _manager(8, enable_prefix_caching=True)
+    request = _request("invalid", 0, prefix_len=4, seq_len=8, cache_token_ids=range(4))
+
+    with pytest.raises(DiffusionKVAdmissionError, match="imported tokens"):
+        manager.reserve_request("invalid", (request,), external_computed_tokens=(9,))
+
+
 def test_cfg_rows_use_the_minimum_warm_hit_as_one_execution_boundary() -> None:
     manager = _manager(16, enable_prefix_caching=True)
     for public_id, tokens in (("seed-a", range(8)), ("seed-b", (*range(4), 20, 21, 22, 23))):
