@@ -5,21 +5,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import msgspec
-import psutil
+from vllm.utils.system_utils import get_mp_context
 
 from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.distributed.weight_sharing.runtime import (
     CONFIG_KEY,
     CONTROL_METHOD,
     RANK_RESULTS_KEY,
     Bootstrap,
-    RankResult,
+    DeviceBudget,
     SharingPlan,
 )
+from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerStartupError, ConsumerWorkerRegistry
 from vllm_omni.engine.cuda_mps import physical_gpu_uuid
 from vllm_omni.engine.stage_client import StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
@@ -27,6 +32,95 @@ from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan
 
 if TYPE_CHECKING:
     from vllm_omni.engine.stage_runtime import StageRuntime
+
+
+def resolve_sharing_plan(
+    runtime: StageRuntime, config: WeightSharingConfig, stages: list[LogicalStageInitPlan]
+) -> SharingPlan:
+    """Freeze model/layout agreement and budgets before either stage allocates."""
+    from vllm.utils.import_utils import import_pynvml
+
+    by_id = {stage.stage_id: stage for stage in stages}
+    if set(by_id) != {config.provider_stage, config.consumer_stage}:
+        raise ValueError("weight sharing requires exactly the configured AR and DiT stages")
+    provider = by_id[config.provider_stage].replicas[0]
+    consumer = by_id[config.consumer_stage].replicas[0]
+    if (
+        not isinstance(provider.stage_cfg, VllmOmniARStageConfig)
+        or not isinstance(consumer.stage_cfg, VllmOmniDiffusionStageConfig)
+        or provider.stage_vllm_config is None
+    ):
+        raise ValueError("weight sharing requires an AR provider and DiT consumer")
+    ar = provider.stage_vllm_config.model_config
+    dit = consumer.stage_cfg.model_config
+    if provider.stage_cfg.stage_pipeline_config.model_arch != "HunyuanImage3ForCausalMM":
+        raise ValueError("the shared deployment profile currently supports HunyuanImage3 only")
+    model = str(ar.model)
+    if (dit.model or runtime._model) != model or dit.revision != ar.revision:
+        raise ValueError("shared stages must load the same model and checkpoint revision")
+    if Path(model).is_dir():
+        root = Path(model).resolve()
+        # Fingerprint metadata without reading another full model into CPU RAM.
+        # Both workers use this same local snapshot; files must stay immutable.
+        files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix in (".json", ".safetensors", ".bin"))
+        metadata = [(str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns) for p in files]
+        revision = "local-" + hashlib.sha256(json.dumps(metadata).encode()).hexdigest()
+        model = str(root)
+    else:
+        resolved_revision = getattr(ar.hf_config, "_commit_hash", None)
+        if not resolved_revision:
+            raise ValueError("weight sharing requires a resolved HF commit or a local checkpoint directory")
+        revision = str(resolved_revision)
+        # Pin the download performed later by DiT to the commit AR resolved.
+        ar.revision = revision
+        dit.revision = revision
+        consumer.stage_cfg.diffusion_config.revision = revision
+    dtype = str(ar.dtype).removeprefix("torch.")
+    dit_dtype = str(dit.dtype).removeprefix("torch.")
+    if dit_dtype not in ("auto", dtype):
+        raise ValueError("shared stages must use identical weight dtypes")
+    dit.dtype = dtype
+    consumer.stage_cfg.diffusion_config.dtype = dtype
+    moe = provider.stage_cfg.model_config.moe_backend
+    if moe == "auto" or moe != dit.moe_backend:
+        raise ValueError("weight sharing requires the same explicit moe_backend on both stages")
+    devices = runtime._resolve_replica_physical_devices(config.provider_stage, provider.metadata.runtime_cfg)
+    if not devices:
+        raise ValueError("weight sharing requires explicit stage devices")
+    uuids = tuple(physical_gpu_uuid(device.strip()) for device in devices.split(","))
+    ar_kv = provider.stage_vllm_config.cache_config.kv_cache_memory_bytes
+    dit_kv = consumer.stage_cfg.cache_config.kv_cache_memory_bytes
+    if not ar_kv or not dit_kv:
+        raise ValueError("weight sharing requires explicit positive kv_cache_memory_bytes on both stages")
+    nvml = import_pynvml()
+    nvml.nvmlInit()
+    try:
+        budgets = []
+        for uuid in uuids:
+            info = nvml.nvmlDeviceGetMemoryInfo(nvml.nvmlDeviceGetHandleByUUID(uuid))
+            capacity = int(info.total * config.gpu_memory_utilization)
+            budget = DeviceBudget(capacity, info.total - capacity, ar_kv, dit_kv)
+            budget.validate()
+            required = budget.reserve_bytes + ar_kv + dit_kv
+            if info.free < required:
+                raise ValueError(
+                    f"{uuid}: insufficient free GPU memory before shared loading "
+                    f"(free={info.free / 1024**3:.3f}, KV + reserve={required / 1024**3:.3f} GiB)"
+                )
+            budgets.append(budget)
+    finally:
+        nvml.nvmlShutdown()
+    layout = f"hunyuan-image3-v1:{dtype}:tp{len(uuids)}:ep0:moe={moe}"
+    return SharingPlan(
+        config.provider_stage,
+        config.consumer_stage,
+        uuids,
+        tuple(budgets),
+        model,
+        revision,
+        layout,
+        timeout=config.timeout,
+    )
 
 
 class StageSharingHost:
@@ -41,8 +135,8 @@ class StageSharingHost:
         self.plan = plan
         self.stages = {stage.stage_id: stage for stage in stages}
         self.clients: dict[int, StagePoolClient] = {}
-        self.processes: dict[int, dict[int, psutil.Process]] = {}
-        self._consumer_launch_uncertain = False
+        self._consumer_started = False
+        self._consumer_registry: ConsumerWorkerRegistry | None = None
         self._validate()
 
     def _validate(self) -> None:
@@ -68,6 +162,8 @@ class StageSharingHost:
                 if not isinstance(replica.stage_cfg, VllmOmniARStageConfig) or config is None:
                     raise ValueError("sharing provider must be an AR EngineCore stage")
                 parallel = config.parallel_config
+                if not config.model_config.use_v2_model_runner:
+                    raise ValueError("weight sharing requires model_runner: v2")
                 if parallel.distributed_executor_backend != "mp":
                     raise ValueError("sharing requires the AR multiprocessing executor")
                 if (
@@ -75,8 +171,13 @@ class StageSharingHost:
                     or config.lora_config is not None
                     or (replica.engine_args_dict or {}).get("cpu_offload_gb", 0)
                     or parallel.enable_eplb
+                    or config.quant_config is not None
+                    or config.weight_transfer_config is not None
+                    or not config.model_config.enforce_eager
                 ):
-                    raise ValueError("sharing does not support sleep/offload or LoRA")
+                    raise ValueError(
+                        "sharing requires eager, unquantized AR weights without sleep/offload, LoRA or updates"
+                    )
             else:
                 if not isinstance(replica.stage_cfg, VllmOmniDiffusionStageConfig):
                     raise ValueError("sharing requires a typed DiT stage config")
@@ -97,9 +198,15 @@ class StageSharingHost:
                         config.custom_pipeline_args,
                         parallel.use_hsdp,
                         replica.stage_cfg.model_config.enable_sleep_mode,
+                        config.quantization_config,
+                        replica.stage_cfg.weight_transfer_config,
+                        not replica.stage_cfg.model_config.enforce_eager,
                     )
                 ):
-                    raise ValueError("sharing does not support DiT offload, LoRA, HSDP or custom/inline pipelines")
+                    raise ValueError(
+                        "sharing requires eager, unquantized DiT weights without offload, LoRA, "
+                        "HSDP, updates or custom pipelines"
+                    )
             if parallel.tensor_parallel_size != tp or parallel.enable_expert_parallel:
                 raise ValueError("sharing requires equal TP sizes with EP disabled")
             if any(
@@ -114,6 +221,7 @@ class StageSharingHost:
                     "allgather_degree",
                     "vae_patch_parallel_size",
                     "text_encoder_tp_size",
+                    "nnodes_within_dp",
                 )
             ):
                 raise ValueError("sharing supports tensor parallelism only")
@@ -131,11 +239,19 @@ class StageSharingHost:
         else:
             config = replica.stage_cfg.diffusion_config
             config.additional_config = {**config.additional_config, CONFIG_KEY: encoded}
+            replica.stage_cfg.cache_config.kv_cache_memory_bytes = self.plan.budgets[0].consumer_kv_cache_bytes
         # Preserve diffusion's required orchestrator-thread launch and existing
         # per-device locks, spawn cancellation, readiness deadline and rollback.
         if stage == self.plan.consumer_stage:
-            self._consumer_launch_uncertain = True
-        self.clients[stage] = self.runtime._initialize_replica(replica, self.runtime._stage_init_timeout)
+            # Own the registry before configuration or process creation can fail.
+            self._consumer_registry = ConsumerWorkerRegistry(get_mp_context(), len(self.plan.device_uuids))
+            setattr(replica.stage_cfg, "_sharing_worker_registry", self._consumer_registry)
+            self._consumer_started = True
+        try:
+            self.clients[stage] = self.runtime._initialize_replica(replica, self.runtime._stage_init_timeout)
+        except ConsumerStartupError as exc:
+            self._consumer_registry = exc.registry
+            raise
 
     async def rpc(self, stage: int, operation: str, messages: tuple[bytes, ...]) -> object:
         client = self.clients[stage]
@@ -149,26 +265,6 @@ class StageSharingHost:
             if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
                 raise RuntimeError("invalid diffusion sharing RPC envelope")
             result = result[0][RANK_RESULTS_KEY]
-        # Capture process identity (including creation time) for confirmed
-        # teardown. Do not rely on the EngineCore's exit proving worker exit.
-        ranks = msgspec.convert(result, type=list[RankResult])
-        tp = len(self.plan.device_uuids)
-        if (
-            sorted(rank.identity.rank for rank in ranks) != list(range(tp))
-            or len({rank.process_id for rank in ranks}) != tp
-        ):
-            raise RuntimeError("sharing RPC did not identify every worker process")
-        for rank in ranks:
-            owned = self.processes.setdefault(stage, {})
-            if rank.process_id not in owned:
-                if rank.process_id <= 0 or rank.process_id == psutil.Process().pid:
-                    raise RuntimeError("sharing worker is not a separate process")
-                process = psutil.Process(rank.process_id)
-                if not any(parent.pid == psutil.Process().pid for parent in process.parents()):
-                    raise RuntimeError("sharing worker is not owned by this runtime")
-                owned[rank.process_id] = process
-        if stage == self.plan.consumer_stage:
-            self._consumer_launch_uncertain = False
         return result
 
     async def quiesce(self, stage: int) -> None:
@@ -180,42 +276,20 @@ class StageSharingHost:
 
     def check_health(self, stage: int) -> None:
         self.clients[stage].check_health()
-        for process in self.processes.get(stage, {}).values():
-            if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
-                raise RuntimeError(f"stage {stage}: sharing worker {process.pid} exited")
 
     async def terminate(self, stage: int) -> None:
         client = self.clients.get(stage)
-        if client is None:
-            if stage == self.plan.consumer_stage and self._consumer_launch_uncertain:
-                # The existing launcher rolls back the manager, but does not
-                # return an all-worker exit acknowledgement after failed startup.
+        if client is not None:
+            if stage == self.plan.consumer_stage:
+                manager = cast(StageDiffusionClient, client)._proc_manager
+                self._consumer_registry = getattr(manager, "sharing_workers", None)
+            # Reuse existing managers for cooperative/process-tree shutdown.
+            client.shutdown()
+        if stage == self.plan.consumer_stage and self._consumer_started:
+            # The registry predates CUDA init and survives a dead manager. It
+            # seals late workers and confirms exit, including partial startup.
+            # A stage-process exit alone is not permission to free the provider.
+            if self._consumer_registry is None:
                 raise RuntimeError("consumer startup cleanup is unconfirmed; provider must remain alive")
-            return
-        processes = self.processes.setdefault(stage, {})
-        # Also clean up the local DiT process tree. This alone cannot prove all
-        # workers exited: a dead manager's surviving workers may be reparented.
-        if stage == self.plan.consumer_stage:
-            manager = cast(StageDiffusionClient, client)._proc_manager
-            if manager is not None and manager.proc.is_alive():
-                try:
-                    parent = psutil.Process(manager.proc.pid)
-                    for process in [parent, *parent.children(recursive=True)]:
-                        processes[process.pid] = process
-                except psutil.NoSuchProcess:
-                    pass
-        client.shutdown()
-        # Existing process managers handle cooperative termination first.
-        # Terminate remaining local workers before permitting provider teardown.
-        for process in processes.values():
-            try:
-                if process.is_running():
-                    process.kill()
-            except psutil.NoSuchProcess:
-                pass
-        _, alive = await asyncio.to_thread(psutil.wait_procs, list(processes.values()), timeout=self.plan.timeout)
-        if alive:
-            raise RuntimeError(f"stage {stage}: worker exit unconfirmed; retaining provider resources")
-        if stage == self.plan.consumer_stage and self._consumer_launch_uncertain:
-            raise RuntimeError("consumer startup cleanup is unconfirmed; not all worker PIDs were reported")
-        del self.clients[stage]
+            await asyncio.to_thread(self._consumer_registry.terminate, self.plan.timeout)
+        self.clients.pop(stage, None)

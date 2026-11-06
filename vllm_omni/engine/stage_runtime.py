@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, VllmOmniDiffusionStageConfig
 from vllm_omni.config.watermarking import WatermarkConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -31,7 +32,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
-from vllm_omni.distributed.weight_sharing.runtime import SharingPlan, SharingRuntime
+from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.cuda_mps import (
     CudaMPSServer,
@@ -173,14 +174,15 @@ class StageRuntime:
     sharing: SharingRuntime | None = None
     _init_visible_devices_baseline: str | None = None
 
-    async def initialize_shared(self, plan: SharingPlan) -> None:
-        """Internal stage-3 entry; stage-2 loaders consume the bootstrap contract."""
-        from vllm_omni.engine.weight_sharing_runtime import StageSharingHost
+    async def initialize_shared(self, config: WeightSharingConfig) -> None:
+        """Start a sharing group with rank-local loader configuration."""
+        from vllm_omni.engine.weight_sharing_runtime import StageSharingHost, resolve_sharing_plan
 
         if isinstance(self, DistStageRuntime):
             raise ValueError("weight sharing currently requires local stage ownership")
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
         stage_plans = self._prepare_stage_plans()
+        plan = resolve_sharing_plan(self, config, stage_plans)
         host = StageSharingHost(self, plan, stage_plans)
         self.sharing = SharingRuntime(plan, host)
         try:

@@ -4,15 +4,16 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import msgspec
-import psutil
 import pytest
 from vllm.config import VllmConfig
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.distributed.weight_sharing.contracts import SessionState
 from vllm_omni.distributed.weight_sharing.runtime import (
     CONFIG_KEY,
@@ -36,13 +37,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture
 def host(mocker):
     runtime = StageRuntime([], "dummy", None, stage_init_timeout=5, async_chunk=False)
-    plan = SharingPlan(0, 1, ("GPU-0", "GPU-1"), (DeviceBudget(1024, 256, 128, 128, 128, 128),) * 2)
+    plan = SharingPlan(0, 1, ("GPU-0", "GPU-1"), (DeviceBudget(1024, 128, 128, 64),) * 2, "model", "revision", "layout")
     configs = [
-        VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="ar")),
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0, model_stage="ar", model_arch="HunyuanImage3ForCausalMM"
+            )
+        ),
         VllmOmniDiffusionStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=1, model_stage="dit")),
     ]
     stages = []
     for stage, cfg in enumerate(configs):
+        cfg.model_config.use_v2_model_runner = True
+        cfg.model_config.enforce_eager = True
         cfg.parallel_config.tensor_parallel_size = 2
         cfg.parallel_config.distributed_executor_backend = "mp"
         if stage == 1:
@@ -51,6 +58,8 @@ def host(mocker):
         vllm_config.parallel_config = cfg.parallel_config
         vllm_config.model_config = cfg.model_config
         vllm_config.lora_config = None
+        vllm_config.quant_config = None
+        vllm_config.weight_transfer_config = None
         vllm_config.additional_config = {"existing": 1}
         vllm_config.cache_config = cfg.cache_config
         metadata = mocker.Mock(spec=StageMetadata, stage_id=stage, stage_type="llm" if stage == 0 else "diffusion")
@@ -91,8 +100,8 @@ def test_bootstrap_and_kv_budget_arrive_before_model_loading(host, mocker):
     launch = mocker.patch.object(host.runtime, "_initialize_replica", return_value=mocker.Mock(spec=StagePoolClient))
 
     async def run():
-        await host.launch(0, Bootstrap("provider", group.identities, host.plan.budgets))
-        await host.launch(1, Bootstrap("consumer", group.identities, host.plan.budgets, (b"rank0", b"rank1")))
+        await host.launch(0, group.bootstrap("provider"))
+        await host.launch(1, group.bootstrap("consumer", (b"rank0", b"rank1")))
 
     asyncio.run(run())
     provider = host.stages[0].replicas[0].stage_vllm_config
@@ -100,20 +109,48 @@ def test_bootstrap_and_kv_budget_arrive_before_model_loading(host, mocker):
     assert provider.cache_config.kv_cache_memory_bytes == 128
     assert provider.additional_config["existing"] == 1
     restored = msgspec.convert(json.loads(json.dumps(consumer.additional_config[CONFIG_KEY])), type=Bootstrap)
-    assert restored.bundles == (b"rank0", b"rank1")
+    assert tuple(group.payload for group in restored.groups) == (b"rank0", b"rank1")
     assert launch.call_count == 2
+
+
+@pytest.mark.parametrize("free_bytes", [512, 1024])
+def test_resolved_plan_uses_total_memory_ratio_and_checks_physical_free(host, mocker, tmp_path, free_bytes):
+    provider = host.stages[0].replicas[0]
+    consumer = host.stages[1].replicas[0]
+    for replica in (provider, consumer):
+        replica.stage_cfg.model_config.model = str(tmp_path)
+        replica.stage_cfg.model_config.revision = None
+        replica.stage_cfg.model_config.dtype = "bfloat16"
+        replica.stage_cfg.model_config.moe_backend = "triton"
+    provider.stage_vllm_config.cache_config.kv_cache_memory_bytes = 128
+    consumer.stage_cfg.cache_config.kv_cache_memory_bytes = 64
+    (tmp_path / "config.json").write_text("{}")
+    nvml = mocker.Mock()
+    nvml.nvmlDeviceGetMemoryInfo.return_value = SimpleNamespace(free=free_bytes, total=2048)
+    mocker.patch("vllm.utils.import_utils.import_pynvml", return_value=nvml)
+    config = WeightSharingConfig(0, 1, gpu_memory_utilization=0.75)
+    if free_bytes == 512:
+        with pytest.raises(ValueError, match="insufficient free GPU memory"):
+            module.resolve_sharing_plan(host.runtime, config, list(host.stages.values()))
+        nvml.nvmlShutdown.assert_called_once()
+        return
+    resolved = module.resolve_sharing_plan(host.runtime, config, list(host.stages.values()))
+    assert resolved.checkpoint_revision.startswith("local-")
+    assert resolved.layout == "hunyuan-image3-v1:bfloat16:tp2:ep0:moe=triton"
+    assert all(
+        b.capacity_bytes == 1536 and b.reserve_bytes == 512 and b.consumer_kv_cache_bytes == 64
+        for b in resolved.budgets
+    )
+    assert all(b.kv_cache_bytes == 128 for b in resolved.budgets)
+    nvml.nvmlShutdown.assert_called_once()
 
 
 def test_diffusion_rpc_unwraps_all_rank_metadata(host, mocker):
     group = SharingRuntime(host.plan, host)
-    results = [
-        msgspec.to_builtins(RankResult(identity, SessionState.MAPPED, 64, 64, 10 + rank))
-        for rank, identity in enumerate(group.identities)
-    ]
+    results = [msgspec.to_builtins(RankResult(identity, SessionState.MAPPED, 64, 64)) for identity in group.identities]
     client = mocker.Mock(spec=StagePoolClient)
     client.collective_rpc_async = mocker.AsyncMock(return_value=[{RANK_RESULTS_KEY: results}])
     host.clients[1] = client
-    host.processes[1] = {10: mocker.Mock(spec=psutil.Process), 11: mocker.Mock(spec=psutil.Process)}
     assert asyncio.run(host.rpc(1, "status", ())) == results
     client.collective_rpc_async.assert_awaited_once_with(CONTROL_METHOD, timeout=60.0, args=("status", ()))
 
@@ -126,45 +163,6 @@ def test_runtime_shutdown_does_not_bypass_unconfirmed_consumer_exit(host, mocker
     host.runtime.stage_pools = [mocker.Mock(clients=[client])]
     host.runtime.shutdown()
     client.shutdown.assert_not_called()
-
-
-def test_partial_consumer_launch_cannot_confirm_termination(host, mocker):
-    group = SharingRuntime(host.plan, host)
-    mocker.patch.object(host.runtime, "_initialize_replica", side_effect=RuntimeError("startup failed"))
-
-    async def run():
-        with pytest.raises(RuntimeError, match="startup failed"):
-            await host.launch(1, Bootstrap("consumer", group.identities, host.plan.budgets, (b"a", b"b")))
-        with pytest.raises(RuntimeError, match="cleanup is unconfirmed"):
-            await host.terminate(1)
-
-    asyncio.run(run())
-
-
-def test_live_consumer_worker_prevents_termination_acknowledgement(host, mocker):
-    client = mocker.Mock(spec=module.StageDiffusionClient)
-    client._proc_manager = None
-    host.clients[1] = client
-    process = mocker.Mock(spec=psutil.Process)
-    host.processes[1] = {10: process}
-    mocker.patch.object(module.psutil, "wait_procs", return_value=([], [process]))
-    with pytest.raises(RuntimeError, match="worker exit unconfirmed"):
-        asyncio.run(host.terminate(1))
-    client.shutdown.assert_called_once()
-    process.kill.assert_called_once()
-    assert host.clients[1] is client
-
-
-def test_dead_manager_before_rank_report_does_not_prove_worker_exit(host, mocker):
-    client = mocker.Mock(spec=module.StageDiffusionClient)
-    client._proc_manager = mocker.Mock()
-    client._proc_manager.proc.is_alive.return_value = False
-    host.clients[1] = client
-    host._consumer_launch_uncertain = True
-    mocker.patch.object(module.psutil, "wait_procs", return_value=([], []))
-    with pytest.raises(RuntimeError, match="not all worker PIDs"):
-        asyncio.run(host.terminate(1))
-    assert host.clients[1] is client
 
 
 def test_dead_shared_rank_escalates_instead_of_independent_eviction(host, mocker):

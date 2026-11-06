@@ -28,8 +28,13 @@ def load_class_methods(relative_path, class_name, method_names, namespace, *, ba
     namespace["_TestBase"] = base_class
     cls.keywords = []
     cls.decorator_list = []
-    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in method_names]
-    assert {node.name for node in cls.body} == set(method_names)
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in method_names
+    ]
+    assert {node.name for node in methods} == set(method_names)
+    cls.body = [*methods]
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[class_name]

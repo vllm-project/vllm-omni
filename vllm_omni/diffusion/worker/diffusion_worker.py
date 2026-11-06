@@ -444,6 +444,9 @@ class DiffusionWorker:
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size,
                 set_proc_title=self.set_proc_title,
             )
+            from vllm_omni.distributed.weight_sharing.worker_session import configure_worker, sharing_memory_request
+
+            sharing_budget = configure_worker(self.od_config, role="consumer", rank=self.rank)
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                 is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -451,10 +454,15 @@ class DiffusionWorker:
                 gc.collect()
                 current_omni_platform.empty_cache()
                 self.init_snapshot = MemorySnapshot(device=self.device)
-                self.requested_memory = request_memory(
-                    self.init_snapshot,
-                    vllm_config.cache_config,
+                self.requested_memory = sharing_memory_request(
+                    sharing_budget,
+                    role="consumer",
+                    rank=self.rank,
+                    kv_cache_bytes=vllm_config.cache_config.kv_cache_memory_bytes,
+                    free_bytes=self.init_snapshot.free_memory,
                 )
+                if self.requested_memory is None:
+                    self.requested_memory = request_memory(self.init_snapshot, vllm_config.cache_config)
                 logger.debug(
                     "Worker %d: Diffusion KV initial memory snapshot: %r; requested=%s GiB",
                     self.rank,
@@ -483,10 +491,12 @@ class DiffusionWorker:
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
-        from vllm_omni.distributed.weight_sharing.worker_session import require_sharing_loader
+        from vllm_omni.distributed.weight_sharing.worker_session import (
+            detach_diffusion_runner,
+            install_runner_session,
+        )
 
         assert self.model_runner is not None, "Model runner not initialized"
-        require_sharing_loader(self.model_runner, self.od_config.additional_config)
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
         cutlass_fp8_context = (
@@ -518,6 +528,12 @@ class DiffusionWorker:
         # When load_format is "dummy", pipeline will init with custom pipeline later
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
+        install_runner_session(
+            self.model_runner,
+            self.od_config,
+            device_index=current_omni_platform.current_device(),
+            detach=lambda: detach_diffusion_runner(self.model_runner),
+        )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
@@ -1853,6 +1869,9 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
+        registry = getattr(od_config, "_sharing_worker_registry", None)
+        if registry is not None and not registry.register(rank):
+            return  # Parent sealed the sharing group before this worker started.
         from vllm_omni.plugins import load_omni_general_plugins
 
         # Spawned workers do not inherit the API server's logging setup.

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stage-3 control flow with the real backend and CPU codec, not CUDA evidence."""
+"""Sharing lifecycle tests with the real backend and a CPU codec, not CUDA evidence."""
 
 import asyncio
 import importlib
-import threading
+import runpy
 from dataclasses import replace
+from pathlib import Path
 
 import msgspec
 import pytest
@@ -35,7 +36,10 @@ class Host:
             0,
             1,
             tuple(f"GPU-{rank}" for rank in range(tp)),
-            (self.runtime.DeviceBudget(1024, 256, 128, 128, 128, 128),) * tp,
+            (self.runtime.DeviceBudget(1024, 128, 128, 64),) * tp,
+            model_id="model",
+            checkpoint_revision="revision",
+            layout="layout",
             timeout=0.1,
             poll_interval=0.001,
             **kwargs,
@@ -46,20 +50,20 @@ class Host:
         # Exercise exactly the JSON-safe startup representation used by the host.
         bootstrap = msgspec.convert(msgspec.to_builtins(bootstrap), type=self.runtime.Bootstrap)
         self.sessions[stage] = []
-        for rank, identity in enumerate(bootstrap.identities):
-            context = self.api.SessionContext(identity, rank)
+        for group in bootstrap.groups:
+            context = self.worker.build_session_context(group, group.rank)
             bindings, spec = make_weights(self.api, two_storages=True)
             backend = self.package.TorchCudaIpcBackend(codec=self.codec)
-            if bootstrap.role == "provider":
+            if group.role == "provider":
                 handle = backend.prepare_export(bindings, spec, context)
             else:
-                handle = backend.open_import(bootstrap.bundles[rank], spec, context)
+                handle = backend.open_import(group.payload, spec, context)
             self.sessions[stage].append(
                 self.worker.WorkerSharingSession(
                     backend,
                     context,
                     handle,
-                    private_bytes=lambda: 64,
+                    memory_usage=lambda: (64, 64, None),
                     detach=self.detach,
                 )
             )
@@ -101,6 +105,7 @@ def test_tp_start_and_close_use_receipts_before_provider_release(host):
         runtime = host.runtime.SharingRuntime(host.plan(), host)
         await runtime.start()
         assert runtime.state == "READY"
+        assert len({i.session_id for i in runtime.identities}) == 2
         assert host.events == [(0, "launch"), (0, "claim"), (1, "launch"), (1, "status"), (0, "confirm_import")]
         await runtime.close()
         assert runtime.state == "CLOSED" and runtime.termination_complete
@@ -150,7 +155,7 @@ def test_no_ready_with_invalid_rank_response(host, change):
             if change == "generation":
                 results[0]["identity"]["generation"] += 1
             if change == "budget":
-                results[0]["private_bytes"] = 129
+                results[0]["private_bytes"] = 1024
             if change == "poison":
                 results[0]["state"] = "POISONED"
         return results
@@ -272,29 +277,21 @@ def test_invalid_plan_rejected_before_launch(host, kwargs):
     assert not host.events
 
 
-def test_no_threads_created_by_control_plane(host):
-    before = set(threading.enumerate())
-    runtime = host.runtime.SharingRuntime(host.plan(), host)
-    assert set(threading.enumerate()) == before
-    assert not runtime.identities[0].session_id == runtime.identities[1].session_id
-
-
 @pytest.mark.parametrize("role", ["provider", "consumer"])
-def test_bootstrap_routes_by_rank_and_checks_physical_uuid(host, role):
+def test_bootstrap_routes_the_loader_config_by_rank(host, role):
     plan = host.plan()
     runtime = host.runtime.SharingRuntime(plan, host)
     bundles = (b"bundle-0", b"bundle-1") if role == "consumer" else ()
-    data = {
-        host.runtime.CONFIG_KEY: msgspec.to_builtins(
-            host.runtime.Bootstrap(role, runtime.identities, plan.budgets, bundles)
-        )
-    }
-    context, budget, payload = host.worker.rank_bootstrap(data, role=role, rank=1, device_index=0, device_uuid="GPU-1")
+    data = {host.runtime.CONFIG_KEY: msgspec.to_builtins(runtime.bootstrap(role, bundles))}
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(additional_config=data)
+    host.worker.configure_worker(config, role=role, rank=1)
+    context = host.worker.build_session_context(config.weight_sharing, 0)
     assert context.identity == runtime.identities[1] and context.device_index == 0
-    assert budget == plan.budgets[1]
-    assert payload == (b"bundle-1" if role == "consumer" else b"")
-    with pytest.raises(ValueError, match="physical GPU"):
-        host.worker.rank_bootstrap(data, role=role, rank=1, device_index=0, device_uuid="GPU-0")
+    assert config.weight_sharing.payload == (b"bundle-1" if role == "consumer" else None)
+    with pytest.raises(ValueError, match="rank"):
+        host.worker.configure_worker(config, role=role, rank=2)
 
 
 def test_overcommitted_budget_rejected(host):
@@ -302,6 +299,132 @@ def test_overcommitted_budget_rejected(host):
     budget = msgspec.structs.replace(plan.budgets[0], capacity_bytes=1)
     with pytest.raises(ValueError, match="capacity"):
         replace(plan, budgets=(budget, budget))
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_insufficient_free_memory_fails_before_admission(host, stage):
+    def response(current, operation, results):
+        if current == stage:
+            results[0]["free_bytes"] = 0
+        return results
+
+    async def run():
+        host.response = response
+        runtime = host.runtime.SharingRuntime(host.plan(), host)
+        with pytest.raises(RuntimeError, match="insufficient memory"):
+            await runtime.start()
+        assert runtime.state == "FAILED"
+        if stage == 0:
+            assert (1, "launch") not in host.events
+        assert (0, "confirm_import") not in host.events
+
+    asyncio.run(run())
+
+
+def test_dit_kv_is_included_in_capacity_and_private_budget(host):
+    plan = host.plan()
+    budget = msgspec.structs.replace(plan.budgets[0], consumer_kv_cache_bytes=1024)
+    with pytest.raises(ValueError, match="capacity"):
+        replace(plan, budgets=(budget, budget))
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["fits", "group_limit", "physical_free", "simultaneous_peaks", "different_storage_sizes"],
+)
+def test_measured_group_counts_shared_once_and_reserves_both_private_peaks(host, change):
+    # A 1000-byte card at 90%: 500 shared + 200 AR + 150 DiT = 850, not 1350.
+    # Private measurements already include the 128/64-byte KV caches.
+    budget = host.runtime.DeviceBudget(900, 100, 128, 64)
+    plan = replace(host.plan(), budgets=(budget, budget))
+
+    def response(stage, operation, results):
+        for result in results:
+            result.update(
+                shared_bytes=500,
+                private_bytes=200 if stage == 0 else 150,
+                resident_bytes=200 if stage == 0 else 150,
+                free_bytes=400 if stage == 0 else 150,
+            )
+            if stage == 1:
+                if change == "group_limit":
+                    result["private_bytes"] = 250  # Each stage fits alone; combined usage does not.
+                elif change == "physical_free":
+                    result["free_bytes"] = 99  # Another process consumes the safety margin.
+                elif change == "simultaneous_peaks":
+                    result["resident_bytes"] = 90  # Needs 60 + 100 bytes free, only 150 available.
+                elif change == "different_storage_sizes":
+                    result["shared_bytes"] += 1
+        return results
+
+    async def run():
+        host.response = response
+        runtime = host.runtime.SharingRuntime(plan, host)
+        if change == "fits":
+            await runtime.start()
+            assert runtime.state == "READY"
+            host.response = lambda stage, operation, results: results
+            await runtime.close()
+        else:
+            with pytest.raises(RuntimeError):
+                await runtime.start()
+            assert host.events[-2:] == [(1, "terminate"), (0, "terminate")]
+
+    asyncio.run(run())
+
+
+def test_provider_measurements_can_reject_budget_before_consumer_launch(host):
+    def response(stage, operation, results):
+        for result in results:
+            result["shared_bytes"] = 1000
+        return results
+
+    async def run():
+        host.response = response
+        runtime = host.runtime.SharingRuntime(host.plan(), host)
+        with pytest.raises(RuntimeError, match="budget exceeded"):
+            await runtime.start()
+        assert (1, "launch") not in host.events
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def parse_policy():
+    # The public policy has no serving dependencies; exercise it on CPU hosts too.
+    path = Path(__file__).resolve().parents[3] / "vllm_omni/config/weight_sharing.py"
+    return runpy.run_path(str(path))["parse_weight_sharing"]
+
+
+def test_ratio_policy_defaults_and_disabled_path(parse_policy):
+    assert parse_policy(None) is None
+    policy = parse_policy(dict(provider_stage=0, consumer_stage=1))
+    assert policy.gpu_memory_utilization == 0.9 and policy.timeout == 120
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.95, 1])
+def test_ratio_policy_accepts_valid_fraction(parse_policy, ratio):
+    policy = parse_policy(dict(provider_stage=0, consumer_stage=1, gpu_memory_utilization=ratio))
+    assert policy.gpu_memory_utilization == ratio
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"gpu_memory_utilization": value} for value in (0, -0.1, 1.1, float("nan"), float("inf"), True, "0.9")]
+    + [
+        {"consumer_stage": 0},
+        {"provider_stage": True},
+        {"timeout": float("nan")},
+        {"timeout": True},
+    ]
+    + [
+        {key: 1}
+        for key in ("shared_bytes", "provider_bytes", "consumer_bytes", "reserve_bytes", "capacity_bytes", "unknown")
+    ],
+)
+def test_invalid_ratio_policy_rejected(parse_policy, extra):
+    with pytest.raises((TypeError, ValueError)):
+        parse_policy(dict(provider_stage=0, consumer_stage=1) | extra)
 
 
 def test_cancelled_import_confirmation_poisons_without_replay(host):
@@ -326,11 +449,15 @@ def test_cancelled_import_confirmation_poisons_without_replay(host):
     asyncio.run(run())
 
 
-def test_missing_stage2_loader_cannot_fall_back_to_full_weight_loading(host):
-    runner = object()
-    host.worker.require_sharing_loader(runner, {})
-    with pytest.raises(RuntimeError, match="stage-2"):
-        host.worker.require_sharing_loader(runner, {host.runtime.CONFIG_KEY: {}})
+def test_malformed_bootstrap_cannot_fall_back_to_full_loading(host):
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(additional_config={})
+    host.worker.configure_worker(config, role="provider", rank=0)
+    assert not hasattr(config, "weight_sharing")
+    config.additional_config[host.runtime.CONFIG_KEY] = {}
+    with pytest.raises(msgspec.ValidationError):
+        host.worker.configure_worker(config, role="provider", rank=0)
 
 
 def test_hung_rpc_has_a_deadline_and_never_reimports(host):
