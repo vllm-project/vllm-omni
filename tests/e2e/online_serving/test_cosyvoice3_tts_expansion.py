@@ -103,6 +103,29 @@ def test_voice_clone_zh_001(omni_server, online_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_voice_clone_en_001(omni_server, online_client) -> None:
+    """
+    Test voice cloning TTS with English text via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text + ref_audio + ref_text
+    Output Modal: audio
+    Input Setting: stream=False
+    Datasets: single request
+    """
+    request_config = {
+        "model": omni_server.model,
+        "input": get_prompt("en"),
+        "stream": False,
+        "response_format": "wav",
+        "ref_audio": REF_AUDIO_URL,
+        "ref_text": REF_TEXT,
+    }
+    _set_rocm_request_timeout(request_config)
+    online_client.send_audio_speech_request(request_config)
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_002(omni_server, online_client) -> None:
     """
@@ -118,29 +141,6 @@ def test_voice_clone_zh_002(omni_server, online_client) -> None:
         "input": get_prompt("zh"),
         "stream": True,
         "stream_format": "audio",
-        "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
-        "ref_text": REF_TEXT,
-    }
-    _set_rocm_request_timeout(request_config)
-    online_client.send_audio_speech_request(request_config)
-
-
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_clone_en_001(omni_server, online_client) -> None:
-    """
-    Test voice cloning TTS with English text via OpenAI API.
-    Deploy Setting: default yaml
-    Input Modal: text + ref_audio + ref_text
-    Output Modal: audio
-    Input Setting: stream=False
-    Datasets: single request
-    """
-    request_config = {
-        "model": omni_server.model,
-        "input": get_prompt("en"),
-        "stream": False,
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
