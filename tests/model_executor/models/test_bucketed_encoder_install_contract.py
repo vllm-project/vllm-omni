@@ -75,7 +75,7 @@ def test_step_audio2_thinker_construction_installs_bucketed_encoder(monkeypatch)
 
     vllm_config = _FakeVllmConfig("step_audio_2", 0.4, 1, 2)
     # Tiny real AudioEncoder/Adaptor: the contract is the install placement,
-    # but the installer wraps whatever nn.Module is named "encoder".
+    # and the model declares its own encoder module to the installer.
     vllm_config.model_config.hf_config.audio_encoder_config = {
         "n_mels": 4,
         "n_audio_ctx": 8,
