@@ -1095,7 +1095,10 @@ def _launch_omni_core_engines(
                 with scoped_spawn_device_env(
                     stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
                 ):
-                    local_engine_manager = CoreEngineProcManager(
+                    from vllm_omni.engine.stage_engine_core_proc_manager import StageCleanupProcManager
+
+                    local_engine_manager = StageCleanupProcManager(
+                        shutdown_grace_s=getattr(stage_config, "shutdown_grace_s", None),
                         local_engine_count=local_engine_count,
                         start_index=start_index,
                         local_start_index=local_start_index,
@@ -1565,7 +1568,8 @@ def launch_headless_diffusion_replicas(
     )
     if omni_conn_cfg:
         # The resolver returns both endpoints together with a connector config.
-        assert omni_from is not None and omni_to is not None
+        if omni_from is None or omni_to is None:
+            raise ValueError(f"Missing KV connector endpoint for stage {stage_id}")
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the

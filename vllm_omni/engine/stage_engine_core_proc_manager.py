@@ -20,11 +20,11 @@ The stage configuration can supply extra process cleanup grace.
 from __future__ import annotations
 
 import contextlib
-import math
 import threading
 import weakref
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
+from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -35,6 +35,7 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor import Executor, UniProcExecutor
 from vllm.v1.utils import shutdown
 
+from vllm_omni.config.stage_config import validate_shutdown_grace_s
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
 logger = init_logger(__name__)
@@ -46,7 +47,18 @@ logger = init_logger(__name__)
 set_device_control_env_var = None
 
 
-class StageEngineCoreProcManager(CoreEngineProcManager):
+class StageCleanupProcManager(CoreEngineProcManager):
+    """Use vLLM's normal engine-core target and apply the stage cleanup default."""
+
+    def __init__(self, *, shutdown_grace_s: float | None = None, **kwargs: Any) -> None:
+        self._shutdown_grace_s = validate_shutdown_grace_s(shutdown_grace_s)
+        super().__init__(**kwargs)
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        super().shutdown(timeout=self._shutdown_grace_s if timeout is None else timeout)
+
+
+class StageEngineCoreProcManager(StageCleanupProcManager):
     """Spawn :class:`StageEngineCoreProc` subprocesses with omni kwargs.
 
     The body mirrors :class:`CoreEngineProcManager.__init__` because the
@@ -59,9 +71,6 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
     * ``omni_coordinator_address`` (if provided) and ``omni_stage_id`` are
       added to every subprocess's kwargs.
     """
-
-    def shutdown(self, timeout: float | None = None) -> None:
-        super().shutdown(timeout=self._shutdown_grace_s if timeout is None else timeout)
 
     def __init__(
         self,
@@ -89,9 +98,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
-        if shutdown_grace_s is not None and (not math.isfinite(shutdown_grace_s) or shutdown_grace_s < 0):
-            raise ValueError("shutdown_grace_s must be finite and nonnegative, or None")
-        self._shutdown_grace_s = shutdown_grace_s
+        self._shutdown_grace_s = validate_shutdown_grace_s(shutdown_grace_s)
 
         # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
         # this to bound how long in-flight requests may drain. Omitting it makes

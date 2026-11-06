@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import multiprocessing
 import os
+import signal
+import sys
+import time
 from multiprocessing.process import BaseProcess
 
 import pytest
@@ -10,6 +14,7 @@ from vllm.utils import numa_utils
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.engine import stage_engine_core_proc_manager as module
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -47,7 +52,17 @@ def spawn_boundary(mocker, monkeypatch):
     return observed
 
 
-def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, tp_size=1, shutdown_grace_s=None):
+def start_manager(
+    executor_class,
+    *,
+    stage_id,
+    cpus,
+    numa_bind=True,
+    dp_size=1,
+    tp_size=1,
+    shutdown_grace_s=None,
+    detach_finalizer=True,
+):
     # No model is constructed: the manager consumes only these config fields.
     config = VllmConfig.__new__(VllmConfig)
     config.parallel_config = ParallelConfig(
@@ -73,7 +88,8 @@ def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, 
         shutdown_grace_s=shutdown_grace_s,
     )
     # Fake processes need no finalizer; all patches are fixture-scoped.
-    manager._finalizer.detach()
+    if detach_finalizer:
+        manager._finalizer.detach()
     return manager
 
 
@@ -124,8 +140,46 @@ def test_shutdown_uses_configured_grace_unless_caller_supplies_timeout(
     parent_shutdown.assert_called_once_with(timeout=expected)
 
 
-@pytest.mark.parametrize("shutdown_grace_s", [-1.0, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("shutdown_grace_s", [-1.0, float("nan"), float("inf"), -float("inf"), "15", True, False])
 def test_invalid_shutdown_grace_is_rejected_before_spawning(spawn_boundary, shutdown_grace_s):
     with pytest.raises(ValueError, match="shutdown_grace_s must be finite and nonnegative"):
         start_manager(UniProcExecutor, stage_id=0, cpus=None, numa_bind=False, shutdown_grace_s=shutdown_grace_s)
     assert spawn_boundary == []
+    with pytest.raises(ValueError, match="shutdown_grace_s must be finite and nonnegative"):
+        StagePipelineConfig(stage_id=1, model_stage="codec", shutdown_grace_s=shutdown_grace_s)
+
+
+def _slow_cleanup_child(ready):
+    def on_term(*_args):
+        time.sleep(2)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    ready.set()
+    signal.pause()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="checks the POSIX terminate/kill sequence")
+def test_real_shutdown_waits_for_configured_grace(spawn_boundary):
+    # Spawn a CPU child in place of the model worker. Keep the real manager
+    # constructor, finalizer, parent shutdown implementation and OS signals.
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    child = ctx.Process(target=_slow_cleanup_child, args=(ready,))
+    module.get_mp_context().Process.side_effect = lambda **_kwargs: child
+    try:
+        manager = start_manager(
+            UniProcExecutor, stage_id=1, cpus=None, numa_bind=False, shutdown_grace_s=0.25, detach_finalizer=False
+        )
+        assert ready.wait(60)
+        start = time.monotonic()
+        manager.shutdown()
+        assert time.monotonic() - start >= 0.24
+        child.join(5)
+        # vLLM's five-second default would let this two-second cleanup exit 0.
+        assert child.exitcode == -signal.SIGKILL
+    finally:
+        if child.pid is not None:
+            if child.is_alive():
+                child.kill()
+            child.join(5)
