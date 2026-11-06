@@ -161,19 +161,44 @@ def test_manager_eager_without_capture_owns_and_reuses_side_buffers(perception, 
 
 
 @pytest.mark.cpu
-def test_manager_eager_does_not_broadcast_between_batch_sizes(perception):
+@pytest.mark.parametrize("batches", [(2, 1), (1, 2)])
+def test_manager_eager_does_not_broadcast_between_batch_sizes(perception, batches):
     adapter = graphs._PerceptionEncoder(perception, ((1, 0), (3, 1)), _caches())
-    for batch in (2, 1):
+    for index, batch in enumerate(batches):
         inputs = {
             "mel": torch.ones(batch, 2, 1),
             "drop": 0,
             **dict(zip(("channel", "time", "valid"), _caches(batch))),
         }
-        if batch == 2:
+        if index == 0:
             adapter.encoder_eager_forward(inputs)
         else:
             with pytest.raises(ValueError, match="shape"):
                 adapter.encoder_eager_forward(inputs)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("batches", [(1, 2, 1), (2, 1, 2)])
+def test_batch_size_changes_bypass_singleton_manager(perception, monkeypatch, batches):
+    graph = graphs.PerceptionCudaGraph.__new__(graphs.PerceptionCudaGraph)
+    graph.perception = perception
+    graph.device, graph.dtype = torch.device("cpu"), torch.float32
+    graph.adapter = graphs._PerceptionEncoder(perception, ((1, 0), (3, 1)), _caches())
+    graph.manager = _CPUManager(graph.adapter)
+    graph._fallback_reasons = Counter()
+    graph.stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: graph.stream)
+    buffers = graph.adapter.outputs[(1, 0)]
+    with torch.inference_mode():
+        for index, batch in enumerate(batches):
+            mel = torch.full((batch, 2, 1), float(index + 1))
+            caches = _caches(batch)
+            actual = graph.run(mel, caches, 0)
+            expected = graphs.perception_step(perception, mel, caches, 0)
+            assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+            assert all(target is saved for target, saved in zip(graph.adapter.outputs[(1, 0)], buffers))
+    assert graph.manager.calls == batches.count(1)
+    assert graph.get_cumulative_stats()["fallback_reasons"] == {"shape": sum(batch for batch in batches if batch != 1)}
 
 
 @pytest.mark.cpu

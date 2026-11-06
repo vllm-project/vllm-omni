@@ -55,7 +55,7 @@ def _copy_exact(target: torch.Tensor, source: torch.Tensor) -> None:
 
 
 class _PerceptionEncoder(SupportsEncoderCudaGraph):
-    """A ready audio frame is one item; caches remain explicit tensor inputs."""
+    """Singleton manager adapter; larger batches bypass it in PerceptionCudaGraph.run."""
 
     def __init__(self, perception: AudioPerceptionModule, phases: tuple[Phase, ...], caches: Cache) -> None:
         self.perception = perception
@@ -139,6 +139,7 @@ class _PerceptionEncoder(SupportsEncoderCudaGraph):
             # An uncaptured phase needs its own buffers, independent of eager outputs.
             outputs = tuple(torch.empty_like(value) for value in frame[1:])
             self.outputs[phase] = outputs
+        # Manager misses keep B1 geometry; run() routes other batches directly to perception_step.
         # Preserve the buffers that later graph replays write into.
         for target, output in zip(outputs, frame[1:]):
             _copy_exact(target, output)
