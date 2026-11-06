@@ -259,6 +259,7 @@ model_config:
     world_score: pairwise_mean  # or centroid, as in the released code
     reuse_attention_kv: false  # cache assembled windows across denoising forwards
     prefetch_kv: false         # CUDA host-bank retrieval on a dedicated stream
+    prefetch_bank_allocation: false  # allocate the next host chunk during denoising
     # host_bank_limit_bytes: process-wide cap, defaults to physical memory
 ```
 
@@ -289,7 +290,13 @@ model_config:
   dedicated CUDA stream. Each consumer waits for its own layer event and records
   destination storage on the compute stream. Cancellation drains outstanding
   prefetches before releasing cached rows. CPU execution uses ordinary retrieval.
-  Both options default to false and can be enabled independently.
+  These options default to false and can be enabled independently.
+  With `prefetch_bank_allocation`, a worker prepares at most one upcoming
+  publication's pinned allocation once layer geometry is known. Commit consumes
+  it; forward failure and close wait for the worker and discard it. The worker
+  owns allocation sizes and a device index, not request or GPU tensor references.
+  This option does not preallocate the entire bank; its benefit depends on the
+  host allocator and must be measured with the selected process-wide settings.
   Pinned allocations use PyTorch's caching allocator; initial bank filling
   still incurs allocation costs. `bank_bytes` bounds live entries, not allocator
   caches or the temporary replacement chunk needed for transactional publication.

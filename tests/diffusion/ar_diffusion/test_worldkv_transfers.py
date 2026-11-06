@@ -19,15 +19,20 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("reuse,prefetch", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
-def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(monkeypatch, ratio, reuse, prefetch):
+def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(
+    monkeypatch, ratio, reuse, prefetch, background
+):
     config = worldkv.WorldKVConfig(
         window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000, world_keep_ratio=ratio
     )
     cpu = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
     gpu = worldkv.WorldKV(
-        replace(config, reuse_attention_kv=reuse, prefetch_kv=prefetch), num_layers=2, tokens_per_frame=2
+        replace(config, reuse_attention_kv=reuse, prefetch_kv=prefetch, prefetch_bank_allocation=background),
+        num_layers=2,
+        tokens_per_frame=2,
     )
 
     def run(memory, start, commit, device, step=0):
@@ -192,3 +197,83 @@ def test_prefetch_failure_preserves_history_and_allows_retry(monkeypatch):
     finally:
         gpu.close()
         cpu.close()
+
+
+def test_bank_allocation_overlaps_denoise_and_is_consumed_at_commit(monkeypatch):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    allocate = worldkv._allocate_pinned_bank
+
+    def delayed(sizes, device):
+        started.set()
+        assert release.wait(10), "allocation worker was not released"
+        return allocate(sizes, device)
+
+    monkeypatch.setattr(worldkv, "_allocate_pinned_bank", delayed)
+    memory = worldkv.WorldKV(
+        worldkv.WorldKVConfig(
+            window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000, prefetch_bank_allocation=True
+        ),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+
+    def run(start, commit):
+        memory.set_pose(pose(start))
+        with memory.forward(start, 2, commit=commit):
+            for layer in range(2):
+                key = (raw(start) + layer).to("cuda")
+                memory.assemble(layer, key, key, key * 2)
+
+    try:
+        run(0, True)
+        run(2, False)
+        assert started.wait(5)
+        allocation = memory._bank_allocation
+        assert allocation is not None and not allocation.done()
+        assert not memory.bank  # Denoising does not publish the prefetched storage.
+        release.set()
+        run(2, True)
+        assert memory._bank_allocation is None
+        assert memory.bank[2].layers[0].key.is_pinned()
+        memory.bank[2].ready.synchronize()
+        assert torch.equal(memory.bank[2].layers[0].key, raw(2))
+    finally:
+        release.set()
+        memory.close()
+    assert memory._bank_allocator is None
+
+
+def test_background_allocation_failure_rolls_back_and_retry_succeeds(monkeypatch):
+    memory = worldkv.WorldKV(
+        worldkv.WorldKVConfig(
+            window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000, prefetch_bank_allocation=True
+        ),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+
+    def run(start):
+        memory.set_pose(pose(start))
+        with memory.forward(start, 2, commit=True):
+            for layer in range(2):
+                key = (raw(start) + layer).to("cuda")
+                memory.assemble(layer, key, key, key * 2)
+
+    def fail(*args):
+        raise RuntimeError("background allocation failed")
+
+    try:
+        run(0)
+        history, bank = memory.history, memory.bank
+        with monkeypatch.context() as patch:
+            patch.setattr(worldkv, "_allocate_pinned_bank", fail)
+            with pytest.raises(RuntimeError, match="background allocation failed"):
+                run(2)
+        assert memory.history is history and memory.bank is bank
+        assert memory.next_frame == 2 and memory._bank_allocation is None
+        run(2)
+        assert memory.next_frame == 4
+    finally:
+        memory.close()
