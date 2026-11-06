@@ -2,6 +2,8 @@
    Adapted from Qwen/Qwen3-Omni-30B-A3B-Thinking chat_template.json.
    Only change: the tools branch renders system content given as content
    parts, as vLLM wraps string content into parts before rendering.
+   Intended for users as well as tests; see the Qwen3-Omni online serving
+   guide for the --chat-template invocation.
 #}
 {%- if tools %}
     {{- '<|im_start|>system\n' }}
