@@ -664,6 +664,8 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             hidden,
             {
                 REQUEST_ID_KEY: key,
+                # sample() validates the scheduled position after preprocess returns.
+                "_omni_num_computed_tokens": offset,
                 SCHEDULED_SPAN: span,
                 TERMINAL: terminal,
                 STATE: state.payload(),

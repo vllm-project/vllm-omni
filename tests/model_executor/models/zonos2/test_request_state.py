@@ -130,7 +130,7 @@ def test_request_id_controls_preprocess_forward_and_postprocess(model):
         torch.zeros(3, dtype=torch.int64),
         torch.arange(3),
         inputs_embeds=embeds,
-        model_intermediate_buffer=[{**data, **update}],
+        model_intermediate_buffer=[{"zonos2_frames": data["zonos2_frames"], **update}],
         request_sample_eligible=[True],
     )
     assert [row[0] for row in model._sampling_plan] == ["a"]
