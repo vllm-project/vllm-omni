@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Length bucketing for variable-length encoders.
 
-One self-contained, deployment-tunable feature. When
-``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` is set, :func:`install_bucketed_encoders`
-(which the encoder-owning model calls at the end of its constructor) wraps each
-matching encoder so it buckets the batch by length rung and computes each rung
-window eagerly.
+One self-contained, deployment-tunable feature. The encoder-owning model calls
+:func:`install_bucketed_encoders` at the end of its constructor; bucketing
+engages only when the stage's ``additional_config.audio_bucket_seconds`` is
+set — opt-in, off by default — arming each wrapped encoder to bucket the batch
+by length rung and compute each rung window eagerly.
 
 Per-item lengths travel as an argument on the encoder call. The wrapper reads
 the model's own per-item length field where the model already passes it:
@@ -45,7 +45,7 @@ of being zero-filled — zero fill is input the model never saw during training.
 from __future__ import annotations
 
 import dataclasses
-import os
+import math
 from dataclasses import dataclass
 
 import regex as re
@@ -60,7 +60,8 @@ __all__ = [
     "uninstall_bucketed_encoders",
 ]
 
-_ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
+_CONFIG_KEY = "audio_bucket_seconds"
+_CONFIG_PATH = f"additional_config.{_CONFIG_KEY}"
 _DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _EAGER_CHUNK = 8
@@ -150,20 +151,40 @@ class LengthBucketingConfig:
         return self.max_length
 
 
-def _rungs_from_env(hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
-    raw = os.environ.get(_ENV_SECONDS, "").strip()
-    if not raw:
+def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
+    """The requested seconds ladder from the stage's ``additional_config``.
+
+    ``additional_config.audio_bucket_seconds`` is the opt-in switch: missing,
+    ``None`` or empty means the feature is off (the default — read the
+    lossiness classification in the docs before enabling). Malformed values
+    raise ``ValueError`` at model construction so a typo cannot silently
+    mis-arm or disable the feature.
+    """
+    additional = getattr(vllm_config, "additional_config", None) if vllm_config is not None else None
+    raw = additional.get(_CONFIG_KEY) if isinstance(additional, dict) else None
+    if raw is None:
         return None
-    seconds = sorted({float(item) for item in raw.split(",") if item.strip()})
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{_CONFIG_PATH} must be a list of seconds, got {raw!r}")
+    values: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"{_CONFIG_PATH} entries must be numbers (seconds), got {item!r}")
+        value = float(item)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{_CONFIG_PATH} entries must be positive finite seconds, got {item!r}")
+        values.append(value)
+    seconds = sorted(set(values))
     if not seconds:
-        raise ValueError(f"{_ENV_SECONDS} did not contain any numbers: {raw!r}")
+        return None
     return tuple(max(1, int(round(s * 16000 / hop))) for s in seconds)
 
 
 # Verified models: the pipeline ``model_type`` -> the per-encoder knobs that have
 # been validated end-to-end. A model NOT listed here cannot use bucketing —
-# install_bucketed_encoders logs a warning and returns [] (the original forward
-# is served unchanged). ``model_type`` is the same identifier an author writes
+# install_bucketed_encoders logs a warning and leaves the wrapper disarmed (the
+# original forward is served unchanged). ``model_type`` is the same identifier
+# an author writes
 # in the PipelineConfig when registering a model, so the reference table and the
 # whitelist share one name.
 #
@@ -588,10 +609,10 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     The wrap is unconditional for models that call this (the encoder-owning
     model's constructor): it installs the explicit ``lengths`` call contract
     those models use at their encoder call sites, so the call stays valid with
-    the feature off. Bucketing itself is opt-in — armed only when
-    ``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` is set and the model is in the verified
-    whitelist; otherwise the wrapper is a pass-through that only strips
-    ``lengths`` and runs the untouched forward.
+    the feature off. Bucketing itself is opt-in — armed only when the stage's
+    ``additional_config.audio_bucket_seconds`` is set and the model is in the
+    verified whitelist (off by default); otherwise the wrapper is a
+    pass-through that only strips ``lengths`` and runs the untouched forward.
     """
     if model is None or getattr(model, "_bucketed_installed", False):
         return []
@@ -603,21 +624,21 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     time_axis = None
     if verified is not None:
         hop = verified.get("hop") or _DEFAULT_HOP
-        rungs = _rungs_from_env(hop)
+        rungs = _rungs_from_config(vllm_config, hop)
         if rungs is not None:
             ladder = LengthBucketingConfig(buckets=rungs)
         frames_per_length = int(verified.get("frames_per_length", 1))
         context_margin = verified["context_margin"]
         time_axis = verified["time_axis"]
-    elif _rungs_from_env() is not None:
+    elif _rungs_from_config(vllm_config) is not None:
         model_type = vllm_config.model_config.hf_config.model_type if vllm_config is not None else "<unknown>"
         logger.warning(
             "Bucketed encoder is not verified for model_type %r; disabling the "
             "feature and serving the untouched forward. Verified model_type values: "
-            "%s. Remove %s to silence this warning.",
+            "%s. Unset %s to silence this warning.",
             model_type,
             sorted(_VERIFIED_MODELS),
-            _ENV_SECONDS,
+            _CONFIG_PATH,
         )
     pattern = re.compile(_MODULE_PATTERN)
     wrapped: list[str] = []
