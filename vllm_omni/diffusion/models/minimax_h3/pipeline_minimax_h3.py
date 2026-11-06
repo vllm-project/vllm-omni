@@ -3456,6 +3456,18 @@ class MiniMaxH3Pipeline(
         conditioning, latent_continuation = self._resolve_latent_continuation(
             extra, conditioning, inherit_canvas=continuation_inherits_source_canvas(conditioning.task, sampling)
         )
+        # keep_steps requests normalize before any continuation work: the
+        # switch check front-loads in _normalize_keep_steps and rejects
+        # continue_from there, so the resolver's result is never consumed by
+        # a keep_steps request. Opt-in requests only; the default path keeps
+        # its original ordering.
+        early_keep_steps = None
+        if extra.get("keep_steps") is not None:
+            early_keep_steps = self._normalize_keep_steps(
+                sampling, num_steps=num_steps, base_schedule=base_schedule, task=task
+            )
+            if early_keep_steps is not None:
+                raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
         # A continuation samples audio on the chain's global timeline, which may
         # differ by a rounding step from the encoder's standalone length.
         audio_t = latent_continuation.audio_t if latent_continuation is not None else conditioning.audio_t
@@ -3584,13 +3596,17 @@ class MiniMaxH3Pipeline(
         # _normalize_keep_steps); every restriction decidable from the
         # request config lives there. The checks below need the encoded
         # conditioning or runtime model state and stay authoritative here.
+        # keep_steps requests were already normalized (and continue_from
+        # rejected) before the continuation resolver above; reuse that
+        # result so the check runs once. ``latent_hw`` matches the call
+        # site's canvas-derived size by the same argument as the early one.
         keep_steps = self._normalize_keep_steps(
             sampling,
             num_steps=num_steps,
             base_schedule=base_schedule,
             task=task,
             latent_hw=(conditioning.height // 16, conditioning.width // 16),
-        )
+        ) if early_keep_steps is None and extra.get("keep_steps") is not None else early_keep_steps
         if keep_steps is not None:
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support continuation")

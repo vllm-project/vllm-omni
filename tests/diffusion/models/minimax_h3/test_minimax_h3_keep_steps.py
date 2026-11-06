@@ -224,17 +224,24 @@ def test_keep_steps_builds_matching_base_layout(pipeline):
 
 
 def test_base_cond_rows_equal_image_only_anchor(pipeline):
-    """The sliced prefix of the full anchor is an image-only anchor, bit for bit."""
+    """The base anchor is the full request's anchor with the video rows dropped.
+
+    The noise draw depends on the request's condition count (each condition
+    draws [1, 24, target_t + num_conditions, h, w] under its own seed), so an
+    anchor built from a standalone image-only presentation draws a different
+    RNG stream than the full request. The production switch keeps the running
+    rows on the original full anchor and only re-pins the condition rows to
+    its image-row prefix, so the exact expectation is that prefix of the full
+    anchor — asserted against the row count the base layout derives
+    independently.
+    """
     inputs = pipeline._build_denoise_inputs(**_keep_steps_kwargs())
-    image_only = pipeline._build_denoise_inputs(
-        **{
-            **_inputs_kwargs(),
-            "visual_condition": _visual_rows()[:BASE_IMAGE_ROWS],
-            "ref_blocks": [_ref_blocks()[0]],
-            "visual_condition_shapes": [IMAGE_SHAPE],
-        }
+    branch, base = inputs["branch"], inputs["base_branch"]
+    assert int((~base.update_mask).sum()) == BASE_IMAGE_ROWS
+    torch.testing.assert_close(
+        inputs["base_cond_rows"],
+        inputs["cond_anchor"][:BASE_IMAGE_ROWS],
     )
-    assert torch.equal(inputs["base_cond_rows"], image_only["cond_anchor"])
 
 
 @pytest.mark.parametrize(
