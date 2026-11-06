@@ -901,8 +901,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         original_max_num_active_reqs = self.max_num_active_reqs
         # One limit, computed once: the solo cap must survive the async-chunk
-        # reservation below (review on #9937).
-        limit = 1 if seeded_solo else original_max_num_active_reqs
+        # reservation below (review on #9937). Paused streaming sessions are not
+        # in ``running`` but upstream counts them against this limit, so the
+        # solo budget is one executing slot on top of the parked ones -- without
+        # that, an unrelated parked session would consume the slot and the
+        # seeded request would never be admitted (review P2 on #9937).
+        parked_streaming_sessions = int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
+        limit = (
+            1 + parked_streaming_sessions if seeded_solo else original_max_num_active_reqs
+        )
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
