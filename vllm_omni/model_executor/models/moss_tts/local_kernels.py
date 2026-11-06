@@ -11,15 +11,16 @@ import numpy as np
 import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tldevice as libdevice
 
 from .triton_launch import cuda_pdl_launch_kwargs
 
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
-libdevice = tl.extra.cuda.libdevice
 
 # Hopper+ supports programmatic dependent launch. The kernel waits for its
 # predecessor before any global access and lets its successor launch at once; results are unchanged.
+_CUDA_RN_OPS = current_platform.is_cuda()
 _USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
 
 
@@ -44,6 +45,7 @@ def _attend(
     BS: tl.constexpr,
     GROUP: tl.constexpr,
     LATE: tl.constexpr = False,
+    CUDA_RN_OPS: tl.constexpr = _CUDA_RN_OPS,
 ):
     """KV insertion and attention for GROUP heads of one row (shared body).
 
@@ -82,7 +84,11 @@ def _attend(
         # Pin the accumulator's rounding. LLVM SLP can otherwise contract the
         # initial product with the first add differently when this body is
         # inlined into sampling on SM89, breaking fused/unfused bitwise parity.
-        result = libdevice.mul_rn(v, tl.sum(tl.where(s[None, :] == POSITION, probs, 0.0), axis=1)[:, None])
+        current_probability = tl.sum(tl.where(s[None, :] == POSITION, probs, 0.0), axis=1)[:, None]
+        if CUDA_RN_OPS:
+            result = libdevice.mul_rn(v, current_probability)
+        else:
+            result = v * current_probability
         for p in tl.static_range(POSITION):
             vp = tl.load(V + base + p * D, dmask, 0, eviction_policy=CACHE_LOAD).to(tl.float32)
             result = tl.fma(vp, tl.sum(tl.where(s[None, :] == p, probs, 0.0), axis=1)[:, None], result)

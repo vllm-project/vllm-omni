@@ -229,15 +229,19 @@ class ARDiffusionSegmentedKVState:
             raise ValueError("Segmented KV retained token count exceeds the declared bound")
         return retained
 
-    def commit(self, *, retain: Sequence[SegmentHandle]) -> None:
-        """Publish all layers together, then release excluded allocations."""
+    def validate_commit(self, *, retain: Sequence[SegmentHandle]) -> tuple[SegmentHandle, ...]:
+        """Validate publication without mutation so distributed peers can agree first."""
         self._check_open()
         pending = self._pending
         if pending is None:
             raise RuntimeError("No segmented KV commit is active")
         if len(pending.written_layers) != self.cache.num_layers:
             raise RuntimeError("Segmented KV commit is missing transformer layers")
-        retained = self._validate_retention(retain)
+        return self._validate_retention(retain)
+
+    def commit(self, *, retain: Sequence[SegmentHandle]) -> None:
+        """Publish all layers together, then release excluded allocations."""
+        retained = self.validate_commit(retain=retain)
         self._pending = None
         self._publish_retention(retained)
 
