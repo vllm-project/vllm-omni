@@ -64,7 +64,7 @@ _CONFIG_KEY = "audio_bucket_seconds"
 _CONFIG_PATH = f"additional_config.{_CONFIG_KEY}"
 _DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
-_EAGER_CHUNK = 8
+_CHUNK_ROWS = 8  # rows per forward call; bounds transient activation memory
 
 
 # ----------------------------------------------------- fixed-length shims
@@ -478,11 +478,12 @@ class _BucketedEncoder:
         container: torch.Tensor | None = None
         aux_container: torch.Tensor | None = None
         for rung, indices in groups.items():
-            step = _EAGER_CHUNK
-            for start in range(0, len(indices), step):
-                chunk = indices[start : start + step]
-                hidden, aux = self._run_chunk(features, lengths, mask, length_arg, rung, chunk)
-                hidden = hidden[: len(chunk)]
+            # Compute each chunk eagerly, chunked to bound transient activation
+            # memory.
+            for start in range(0, len(indices), _CHUNK_ROWS):
+                chunk = indices[start : start + _CHUNK_ROWS]
+                inputs = self._build_inputs(features, lengths, mask, length_arg, rung, chunk)
+                hidden, aux = self._tensor_forward(*inputs)
                 if container is None or container.size(1) < hidden.size(1):
                     container = self._grow(container, hidden.new_zeros((len(lengths), hidden.size(1), hidden.size(-1))))
                 for row, index in enumerate(chunk):
@@ -505,18 +506,7 @@ class _BucketedEncoder:
         merged[:, : previous.size(1)] = previous
         return merged
 
-    def _run_chunk(self, features, lengths, mask, length_arg, rung, chunk):
-        # Compute each sub-chunk eagerly, chunked to bound transient activation
-        # memory.
-        outs = [
-            self._tensor_forward(*self._build_inputs(features, lengths, mask, length_arg, rung, sub, len(sub)))
-            for sub in self._chunks(chunk, _EAGER_CHUNK)
-        ]
-        feats = torch.cat([o[0] for o in outs], dim=0)
-        aux = torch.cat([o[1] for o in outs], dim=0) if outs[0][1] is not None else None
-        return feats, aux
-
-    def _build_inputs(self, features, lengths, mask, length_arg, rung, chunk, padded):
+    def _build_inputs(self, features, lengths, mask, length_arg, rung, chunk):
         if any(lengths[index] > rung for index in chunk) and not self._truncation_warned:
             self._truncation_warned = True
             logger.warning(
@@ -525,44 +515,33 @@ class _BucketedEncoder:
                 self.name,
                 rung,
             )
+        # Slice each row's rung window from the carried input, tail included:
+        # the frames past the real content are the producer's own padding
+        # (Whisper's extractor pads at the (max - 4) / 4 silence floor, not 0),
+        # and zero-filling them would feed the encoder input it never saw during
+        # training. The waste gate caps the rung at the input's time extent, so
+        # the slice never reads past the tensor; an item longer than its rung
+        # truncates to the rung (warned above).
         if self._axis == 2:
-            batch = features.new_zeros((padded, features.size(1), rung))
-            for row, index in enumerate(chunk):
-                # Slice the row's rung window from the carried input, tail
-                # included: the frames past the real content are the producer's
-                # own padding (Whisper's extractor pads at the (max - 4) / 4
-                # silence floor, not 0), and zero-filling them would feed the
-                # encoder input it never saw during training. The waste gate
-                # caps the rung at the input's time extent, so the slice never
-                # reads past the tensor; an item longer than its rung truncates
-                # to the rung (warned above).
-                batch[row] = features[index, :, :rung]
+            batch = features[chunk, :, :rung]
         else:
-            batch = features.new_zeros((padded, rung, features.size(2)))
-            for row, index in enumerate(chunk):
-                batch[row] = features[index, :rung]
+            batch = features[chunk, :rung]
         if mask is not None:
-            return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))
+            return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features)))
         if length_arg is not None:
-            return (batch, self._lengths_for(length_arg, chunk, rung, padded))
+            return (batch, self._lengths_for(length_arg, chunk, rung))
         return (batch,)
 
     @staticmethod
-    def _mask_for(mask, chunk, rung, total, padded):
+    def _mask_for(mask, chunk, rung, total):
+        # The waste gate caps every rung at the input's time extent, so the
+        # scaled width never exceeds the carried mask's own width.
         rung_mask = max(1, rung * mask.size(1) // total)
-        out = mask.new_ones((padded, rung_mask))  # padded rows stay valid (silence)
-        out[: len(chunk)] = mask[chunk][:, :rung_mask]
-        return out
+        return mask[chunk, :rung_mask]
 
     @staticmethod
-    def _lengths_for(length_arg, chunk, rung, padded):
-        out = torch.full((padded,), rung, dtype=length_arg.dtype, device=length_arg.device)
-        out[: len(chunk)] = length_arg[chunk].clamp(max=rung)
-        return out
-
-    @staticmethod
-    def _chunks(items, size):
-        return [list(items[i : i + size]) for i in range(0, len(items), size)]
+    def _lengths_for(length_arg, chunk, rung):
+        return length_arg[chunk].clamp(max=rung)
 
     def _tensor_forward(self, *inputs):
         # The fixed-window recipe, if any, applies only to the bucketed-window
@@ -584,7 +563,7 @@ class _BucketedEncoder:
                 raise _OutputContractError(
                     f"encoder {self.name!r} returned {type(output).__name__}, expected a (features, lengths) tuple"
                 )
-            aux = output[1][: features.size(0)]
+            aux = output[1]
         return features, aux
 
 
