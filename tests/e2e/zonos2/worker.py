@@ -82,6 +82,7 @@ async def offline(directory: Path, concurrent: bool):
         )
         final = None
         events = 0
+        streamed_audio: list[np.ndarray] = []
         async for output in engine.generate(
             prompts[index],
             request_id=label,
@@ -91,13 +92,25 @@ async def offline(directory: Path, concurrent: bool):
         ):
             final = output
             events += 1
+            if not concurrent:
+                # Omitted params select AsyncOmni DELTA output. Retain every
+                # chunk, owning its CPU samples beyond this yielded event.
+                mm = output.multimodal_output
+                value = mm.get("audio", mm.get("model_outputs"))
+                if value is not None:
+                    parts = value if isinstance(value, list) else [value]
+                    streamed_audio.extend(part.float().cpu().numpy().reshape(-1).copy() for part in parts)
         assert final is not None and final.finished and not final.error
         mm = final.multimodal_output
-        audio = mm.get("audio", mm.get("model_outputs"))
-        assert audio is not None, mm.keys()
-        if isinstance(audio, list):
-            audio = torch.cat([part.reshape(-1) for part in audio])
-        audio = audio.float().cpu().numpy().reshape(-1)
+        if concurrent:
+            audio = mm.get("audio", mm.get("model_outputs"))
+            assert audio is not None, mm.keys()
+            if isinstance(audio, list):
+                audio = torch.cat([part.reshape(-1) for part in audio])
+            audio = audio.float().cpu().numpy().reshape(-1)
+        else:
+            assert streamed_audio, "No delta audio was delivered"
+            audio = np.concatenate(streamed_audio)
         sr = mm.get("sr", 44100)
         if isinstance(sr, list):
             sr = sr[-1]
