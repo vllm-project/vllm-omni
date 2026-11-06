@@ -980,7 +980,7 @@ def test_positional_lengths_clamp_to_rung(bucket_cfg):
     model = ToyModel().cuda()
     install_bucketed_encoders(model, vllm_config=bucket_cfg)
     wrapper = model.encoder.forward
-    out = wrapper._lengths_for(torch.tensor([240, 100]), [0, 1], 200, 2)
+    out = wrapper._lengths_for(torch.tensor([240, 100]), [0, 1], 200)
     assert torch.equal(out, torch.tensor([200, 100]))
 
 
