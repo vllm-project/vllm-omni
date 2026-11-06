@@ -23,6 +23,7 @@ from upload_pipeline import (  # noqa: E402
     _expand_mirror_hardwares,
     _get_mirror_hw_selector,
     _load_bootstrap_steps,
+    _load_mirror_hardwares,
     _load_source_file_dependencies,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
@@ -171,6 +172,7 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
     assert step["retry"] == {
+        "manual": {"permit_on_passed": True},
         "automatic": [
             {"exit_status": -1, "limit": 1},
             {"exit_status": 128, "limit": 1},
@@ -191,6 +193,35 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     ]
 
 
+def test_every_hardware_preset_uses_shared_retry() -> None:
+    presets = _load_mirror_hardwares()
+    assert presets
+    for preset in presets.values():
+        assert preset["retry"]["manual"] == {"permit_on_passed": True}
+        assert preset["retry"]["automatic"] == [
+            {"exit_status": -1, "limit": 1},
+            {"exit_status": 128, "limit": 1},
+            {"signal_reason": "agent_stop", "limit": 1},
+            {"signal_reason": "agent_refused", "limit": 1},
+        ]
+
+
+def test_cpu_step_does_not_gain_hardware_retry() -> None:
+    rendered = _render_test_pipeline(
+        {
+            "steps": [
+                {
+                    "label": "CPU report",
+                    "commands": ["echo ok"],
+                    "agents": {"queue": "medium_cpu_queue_premerge"},
+                },
+            ],
+        },
+        changed_files=None,
+    )
+    assert "retry" not in rendered["steps"][0]
+
+
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
     step = _expand_mirror_hardwares(
         {
@@ -200,6 +231,7 @@ def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
         },
     )
     assert step["retry"] == {"automatic": [{"exit_status": 255, "limit": 2}]}
+    assert "manual" not in step["retry"]
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
@@ -501,10 +533,6 @@ def _iter_steps(doc: dict):
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
         ),
         (
-            Path(".buildkite/cuda/test-weekly.yml"),
-            {"weekly-omni-performance-vllm-text", "weekly-omni-performance-multi-replicas"},
-        ),
-        (
             Path(".buildkite/npu/test-npu-nightly.yml"),
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
         ),
@@ -520,8 +548,6 @@ def _iter_steps(doc: dict):
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
         ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
         ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True),
         ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
         ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
         ("tests/dfx/perf/scripts/run_benchmark.py", True),
@@ -541,8 +567,7 @@ def test_qwen3_perf_pipeline_selection(
     rendered = _render_test_pipeline(doc, changed_files=[changed_file], pipeline_path=pipeline_path)
     surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
-    # Compare the dependency-filtered Qwen perf jobs. The weekly random job has
-    # no source dependencies and remains unconditional under source filtering.
+    # Compare the dependency-filtered Qwen perf jobs.
     expected_keys = set(legacy_keys) if select_legacy else set()
     assert surviving_keys & legacy_keys == expected_keys
 

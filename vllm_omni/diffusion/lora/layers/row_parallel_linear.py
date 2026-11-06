@@ -1,20 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from vllm_omni.lora.layers.row_parallel_linear import DiffusionRowParallelLinearWithLoRA
 
-from __future__ import annotations
-
-from vllm.lora.layers.row_parallel_linear import RowParallelLinearWithLoRA
-
-from .base_linear import DiffusionBaseLinearLayerWithLoRA
-
-
-class DiffusionRowParallelLinearWithLoRA(
-    DiffusionBaseLinearLayerWithLoRA,
-    RowParallelLinearWithLoRA,
-):
-    """
-    Diffusion RowParallelLinear with LoRA.
-    Prioritize apply() in DiffusionBaseLinearLayerWithLoRA
-    """
-
-    pass
+__all__ = ["DiffusionRowParallelLinearWithLoRA"]
