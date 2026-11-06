@@ -9,7 +9,7 @@ from vllm_omni.diffusion.attention.backends import sage_attn as sage
 from vllm_omni.diffusion.attention.capabilities import CompilationMode, ExecutionContext, SupportStatus
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 requires_sage_sm90 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0) or sage.sageattn is None,

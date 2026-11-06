@@ -28,7 +28,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width
+from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Input elements loaded per program iteration; each is stored four times, so a
@@ -126,18 +126,22 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
     """``F.interpolate(x, scale_factor=(2.0, 2.0), mode="nearest-exact")`` for 4D ``x``, or ``None``.
 
     Identical to ``mode="nearest"`` as well (both select input index ``o // 2``
-    for a factor of two). The output takes the memory format ATen would choose:
-    contiguous for channels-first input (including the strided frame-major view
-    ``WanResample`` produces), channels-last for channels-last input.
+    for a factor of two). The output takes the memory format ATen would choose
+    (``x.suggest_memory_format()``): contiguous for channels-first input
+    (including the strided frame-major view ``WanResample`` produces),
+    channels-last for channels-last input. Inputs whose strides are
+    channels-last contiguous but that ATen does not treat as channels-last
+    decline.
     """
-    if not _HAS_INTERLEAVE or x.dim() != 4 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if not _HAS_INTERLEAVE or x.dim() != 4 or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     batch, channels, height, width = x.shape
     if x.numel() == 0:
         return None
     out_shape = (batch, channels, 2 * height, 2 * width)
+    channels_last = suggests_channels_last(x)
 
-    if x.stride(3) == 1 and x.stride(2) == width:
+    if not channels_last and x.stride(3) == 1 and x.stride(2) == width:
         out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
         rows = batch * channels * height
         block_w = _pick_block_width(width)
@@ -161,7 +165,7 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
             )
         return out
 
-    if channels > 1 and x.is_contiguous(memory_format=torch.channels_last):
+    if channels_last and channels > 1 and x.is_contiguous(memory_format=torch.channels_last):
         out = torch.empty(out_shape, device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
         block_c = min(triton.next_power_of_2(channels), _MAX_BLOCK_C)
         block_w = max(1, _TILE_ELEMENTS // block_c)

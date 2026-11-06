@@ -5,8 +5,9 @@
 # AR and codec capacities are 64; tested client concurrencies are 32 and 64.
 # Keep model weights and sampling parameters identical for comparisons.
 # Server flags used in measurements: --disable-log-stats --disable-uvicorn-access-log.
-# Auxiliary graphs are captured after KV sizing and are outside the utilization
-# budget. Leave at least 10 GiB free for codec graph pools on this H200 profile;
+# Stage-0 sampler graphs are measured while profiling and counted in its budget.
+# Stage-1 codec graphs are captured at warmup, outside the utilization budget.
+# Leave at least 10 GiB free for codec graph pools on this H200 profile;
 # inspect both allocated and reserved capture logs before raising stage budgets.
 # Sampler graphs cover tensor-valued temperature/top_k/top_p. Disabling top-k
 # or top-p for an entire batch (None metadata) uses eager sampling.

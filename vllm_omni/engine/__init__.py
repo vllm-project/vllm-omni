@@ -5,7 +5,7 @@
 Engine components for vLLM-Omni.
 """
 
-from typing import Any
+from typing import Any, TypeAlias
 
 import msgspec
 import torch
@@ -14,6 +14,10 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
 )
+
+# Where a receiver gets a request's stage payload: the sender's connector address, or the
+# serialized payload itself for a run request.
+PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -82,7 +86,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
-    payload_sender_info: dict[str, Any] | None = None
+    payload_sender_info: PayloadSenderInfo | None = None
 
     @classmethod
     def from_request(
@@ -92,7 +96,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
-        payload_sender_info: dict[str, Any] | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -143,7 +147,7 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # hidden/codec handoff). vLLM strictly decodes ``pooling_output`` as a
     # ``torch.Tensor``, so a per-request dict payload cannot ride that field. The
     # producer (OmniARScheduler) sets ``pooling_output=None`` and serializes the
-    # dict here; the consumer (StagePool._poll_stage_raw) rehydrates it back into
+    # dict here; the consumer (StagePool.read_llm_raw_output) rehydrates it back into
     # ``pooling_output`` after decode. Tensor pooling outputs are unaffected.
     pooling_output_payload: AdditionalInformationPayload | None = None
     # Finished flag for streaming input segment
@@ -152,6 +156,13 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     new_prompt_len_snapshot: int | None = None
     # Authoritative segment count when the native plane suppresses token IPC.
     num_generation_tokens: int | None = None
+    # Coalesced decode steps have no recoverable per-step ITL samples.
+    is_coalesced: bool = False
+    # A request's serialized stage payload; this is only used for run requests
+    stage_payload: bytes | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
+    # spans of measured duplex chunks, the producing step's chunk last.
+    stage_work: list[list[int]] | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

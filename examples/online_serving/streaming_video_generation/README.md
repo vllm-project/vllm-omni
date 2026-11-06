@@ -26,13 +26,34 @@ The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=Tr
 | Server to client | `video.chunk_metadata` | JSON text: `{"type":"video.chunk_metadata","request_id":"...","kind":"media","transport_chunk_index":0,"generation_chunk_index":0,"num_frames":9,"byte_length":1234,"started_event_ids":[],"active_event_ids":[],"completed_event_ids":[]}` | Precedes each binary frame and describes the immediately following payload. |
 | Server to client | Video chunk | Binary WebSocket frame | Fragmented MP4 (`m4s`) video bytes. |
 | Client to server | `session.stop` | JSON text: `{"type":"session.stop"}` | Requests cancellation of the active session. |
+| Client to server | `session.playback` | JSON text: `{"type":"session.playback","position_seconds":1.25}` | Playback progress for sessions that opt into `streaming_pacing`. Position must be finite and non-negative. |
 | Client to server | `session.ping` | JSON text: `{"type":"session.ping"}` | Optional keepalive; refreshes the server stall clock. |
 | Server to client | `session.interaction.queued` | JSON text: `{"type":"session.interaction.queued","request_id":"...","event_id":"xxx"}` | Confirms the server queued the interaction for the active request. |
-| Server to client | `session.done` | JSON text: `{"type":"session.done","request_id":"...","chunks":3,"stopped":false}` | Ends a completed or stopped session. |
+| Server to client | `session.done` | JSON text: `{"type":"session.done","request_id":"...","chunks":3,"stopped":false}` | Ends a completed or stopped session. Sessions stopped by `session.stop` also carry `stop_latency_s`: seconds from stop receipt to the done frame. |
 | Server to client | `session.pong` | JSON text: `{"type":"session.pong"}` | Reply to `session.ping`. |
 | Server to client | `error` | JSON text: `{"type":"error","message":"..."}` | Reports invalid input, unsupported formats, inactive requests, unsupported prompt updates, generation failures, control-message errors, or stall timeout. |
 
+Backpressure is a request/session option. Set the canonical `streaming_pacing` object in `session.start`; omitting it or setting `enabled` to `false` keeps unpaced generation. The server requires `streaming_output=True`, step execution, `max_num_seqs=1`, and an interactive chunked pipeline. `streaming_buffer_seconds` remains a compatibility alias for existing clients.
+
+After opting in, send `session.playback` repeatedly as the displayed video playhead advances. This message is runtime feedback, not the switch that enables pacing: `position_seconds` updates the generated-versus-played watermark, wakes a paused boundary, and is clamped to generated media. The engine admits a chunk only if generated media plus that chunk, minus reported playback, fits the window. The window must fit one complete chunk; a smaller value fails explicitly. No feedback pauses generation after filling the window. Controls, pings and cancellation still work while paused; releasing playback resumes generation. Backwards positions are ignored. A paced session blocked without consumption progress expires after `streaming_pacing.idle_timeout_s` (default 30 seconds). Pings and repeated playback positions do not reset this timeout. Budget enough lead for chunk generation, encoding and the playback-feedback round trip; a window smaller than this combined delay causes repeated underruns. Report the actual playhead rather than advancing it to hide stalls. A client's startup buffering threshold must stay below the generation window, with room for frames still held by the encoder.
+
+For paced sessions, the engine opens an observation window when a chunk starts, sized by that chunk's actual media duration. The next chunk waits for the window deadline, playback credit, and delivery of reserved controls. The engine supplies both event arrival times and resume-boundary timestamps to workers; clients cannot assign these internal timestamps. This avoids mixing engine and worker clocks. If inference exceeds the media duration, no additional clock wait is imposed. Unpaced sessions keep their original boundary timing.
+
+The generic runtime keeps interaction ingress ordered and reports engine-owned timestamps. Camera velocity events before the window deadline are integrated continuously onto latent control samples, including short presses mixed with targets. Events at or after the deadline remain queued for the next window. Controls deferred across a pause retain their relative intervals, shifted to the next window's start; fresh controls keep their window timestamps, shifted only when a backlog overlaps them. Events that do not fit the media window carry their remaining interval into a following window instead of collapsing press/release pairs. The wall-clock pause does not add camera travel. Consecutive pending targets coalesce, while intervening velocity events retain their intervals. A target arriving after the media deadline but before the resume boundary can affect the resumed chunk's last control sample. It supersedes older deferred controls so they cannot replay after that target.
+
+`session.interaction.queued` confirms ingress, not application. Paced acknowledgements include an engine-clock `received_at`. Chunk metadata reports `started_event_ids`, `active_event_ids`, `completed_event_ids`, and, when non-empty, `coalesced_event_ids` for commands replaced before application. `generation_chunk_index` identifies their reporting/application chunk. Metadata does not establish when the browser displays camera movement. Direct AsyncOmni clients should pass `track_playback=True` to `submit_interaction_async` for paced sessions. Prompt updates reuse their existing revision and cache-invalidation path and report replaced pending IDs.
+
+A pause with no new controls adds no camera travel. Explicit press/release intervals queued during a pause are preserved in media time and can replay across multiple resumed chunks. This keeps brief controls from disappearing; clients wanting to discard or shorten paused input must apply that policy before submitting it. Pending controls and replacement IDs count against the per-modality budget below.
+
+Interactions are queued in order separately from playback feedback and aborts. The pending interaction queue is bounded to 64 messages; overflow reports an error and terminates the affected video request rather than silently dropping a control command. This does not shut down the model engine. Each worker modality retains at most 256 pending control records, including coalesced prompt IDs; overflow rejects the update before changing any modality. Interaction event IDs are limited to 128 characters and the duplicate-ID history to 4096 entries. Start a new session when that history fills.
+
 During generation the client normally sends only `session.start` and then receives binary chunks; silence on the client socket is expected. The server closes the session with a stall error only when there is no engine progress and no `session.ping` for about 60 seconds.
+
+Paced sessions retain at most one generation chunk until its consumer finishes encoding/sending and resumes iteration. `streaming_pacing.max_output_bytes` (default 64 MiB) limits each decoded payload and encoded fragment; an oversized chunk terminates the request. This bounds queued output, not model workspace, transient decode allocations or codec/transport copies. Final chunks retain the same delivery credit. Direct `AsyncOmni.generate` callers return credit by advancing their async iterator; abandoning it requires closing/aborting the request.
+
+Chunk metadata includes `pacing` with `lead_seconds`, cumulative `wait_seconds` and `retained_bytes`. The lead includes the admitted chunk; camera IDs still describe generation-time application rather than browser display time. Cancellation, disconnect and idle expiry retire worker request state even if no new inference follows. Other requests keep the existing single-stream queueing behavior.
+
+The WebSocket control reader uses a bounded response outbox so a blocked media send cannot stop playback/Stop reception. Output send timeouts also apply to the final `session.done`. This preserves metadata/binary ordering and bounds outstanding control replies.
 
 ## Install Client Dependency
 
@@ -41,6 +62,15 @@ pip install av websockets
 # For the Gradio demo:
 pip install 'vllm-omni[demo]' websockets
 ```
+
+The command-line client needs only `av` and `websockets`, including when saving
+video; it does not require PyTorch or a local vLLM/vLLM-Omni installation.
+
+For the Gradio demo in this 0.33 source checkout, install `.[demo]` with the temporary Gradio wheel
+using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+from the repository root, while retaining the `av` and `websockets` client
+dependencies above. The published-package command above applies to released
+versions and does not replace the source setup.
 
 ## Run The Client
 
@@ -60,7 +90,37 @@ python streaming_video_client.py \
 ```
 
 The example client sends one `session.start` message, prints each received binary video chunk with its byte size and elapsed time, and saves the received bytes to `--output` after `session.done`.
-The client remuxes the gathered stream to a regular progressive MP4 file so that local playback knows the video duration.
+Video-only streams are converted to a regular MP4 at the session FPS. Streams
+with audio retain their compressed audio/video tracks and timestamps. Saving
+also runs after interruption using the received chunks. If media cannot be
+decoded or remuxed, the received bytes are retained as a best-effort fallback;
+such a file is not guaranteed to be playable. No file is created when no chunks
+were received, and a failed save does not replace an existing output file.
+
+Frame accounting uses one background decoder for the session, retaining the
+fragmented MP4 context without repeatedly decoding earlier frames. On each chunk
+line, `frames` is the server's declared `num_frames` (`unknown` if absent), while
+`total_frames` is a snapshot of frames actually decoded so far. These snapshots
+can lag reception due to worker scheduling, input buffering (up to a 1 KiB
+read), and codec buffering; differences between snapshots are not per-chunk
+frame counts or instantaneous generation FPS.
+At shutdown, the client signals end-of-input and prints a final `[decode]` total
+and elapsed time after draining the decoder, including any frames in the trailer.
+For interrupted streams, this counts the decodable received media only; it need
+not equal the sum of declared frame counts. The elapsed time includes reception
+and the final drain, not just model inference.
+
+Counting never waits for queued media to be decoded in the receive loop. Its
+pending input is limited to 64 MiB; overflow or a decoder error disables counting
+and reports `total_frames=unknown` with a reason in the final `[decode]` line.
+Shutdown waits up to five seconds for the decoder off the event loop; a timeout
+also reports an unknown total. Cancellation during this drain disables counting,
+preserves the received bytes for saving, and then propagates cancellation. The
+client waits for decoder and scheduled-control cleanup unless cancellation is
+requested again. A native codec call cannot be forcibly interrupted by this
+thread-based helper, so the worker is a daemon. These limits apply to
+accounting only: the client still retains all received chunks for saving, and
+final remuxing is unchanged.
 
 Schedule midway prompt updates with `--prompt-updates`. None are sent unless you ask for them, and only pipelines that implement midway prompt updates accept them. Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
 

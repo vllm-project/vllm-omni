@@ -78,3 +78,10 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # Level Zero cannot record Fast-AR sampling.
+        enforce_eager: true

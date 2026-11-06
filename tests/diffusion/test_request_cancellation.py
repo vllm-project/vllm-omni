@@ -5,7 +5,9 @@
 import multiprocessing as mp
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import patch
 
@@ -197,7 +199,13 @@ def _collective_worker(rank, name, rendezvous, ready, first_check, second_check,
     from vllm_omni.diffusion.distributed import parallel_state
     from vllm_omni.platforms import current_omni_platform
 
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    # Spawned processes do not inherit the parent's torch thread settings.
+    torch.set_num_threads(1)
+    # Bound rendezvous/collectives independently of the parent's readiness wait
+    # so an initialization failure can report its distributed exception.
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
     # Exercise a real CPU collective without constructing GPU model groups.
     group = object.__new__(parallel_state.GroupCoordinator)
     group.world_size = 2
@@ -234,6 +242,24 @@ def _collective_worker(rank, name, rendezvous, ready, first_check, second_check,
         dist.destroy_process_group()
 
 
+def _wait_for_collective_ready(ready, workers, timeout=120):
+    deadline = time.monotonic() + timeout
+    while True:
+        for rank, worker in enumerate(workers):
+            if worker.exitcode is not None:
+                raise AssertionError(
+                    f"Cancellation worker rank {rank} exited before collective readiness: exitcode={worker.exitcode}"
+                )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            states = [(worker.pid, worker.exitcode) for worker in workers]
+            raise AssertionError(
+                f"Timed out waiting for cancellation collective readiness; workers (pid, exitcode)={states}"
+            )
+        if ready.wait(min(0.1, remaining)):
+            return
+
+
 def test_spawned_ranks_agree_before_leaving_collective_wave(registry, tmp_path):
     ctx = mp.get_context("spawn")
     names = [registry.create(str(rank)) for rank in range(2)]
@@ -246,10 +272,10 @@ def test_spawned_ranks_agree_before_leaving_collective_wave(registry, tmp_path):
         )
         for rank in range(2)
     ]
-    for worker in workers:
-        worker.start()
     try:
-        assert ready.wait(120)
+        for worker in workers:
+            worker.start()
+        _wait_for_collective_ready(ready, workers)
         registry.cancel(["0"])
         first_check.set()
         assert {results.get(timeout=120) for _ in range(2 * len(workers))} == {
@@ -269,6 +295,8 @@ def test_spawned_ranks_agree_before_leaving_collective_wave(registry, tmp_path):
             assert worker.exitcode == 0
     finally:
         for worker in workers:
+            if worker.pid is None:
+                continue
             if worker.is_alive():
                 worker.terminate()
             worker.join(timeout=30)

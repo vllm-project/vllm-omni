@@ -21,6 +21,7 @@ import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexOverlapPolicy
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+from vllm_omni.protocol.duplex import base64_decoded_size
 
 
 def decide(
@@ -297,15 +298,29 @@ def input_audio_duration_ms(event: dict[str, object], payload: dict[str, object]
     sample_rate_hz = payload.get("sample_rate_hz")
     audio = payload.get("audio")
     if fmt == "pcm_f32le" and isinstance(sample_rate_hz, int) and sample_rate_hz > 0 and isinstance(audio, str):
-        try:
-            raw = base64.b64decode(audio, validate=True)
-        except (binascii.Error, ValueError):
-            return 0
-        return int((len(raw) // 4) * 1000 / sample_rate_hz)
+        # Measured, not decoded: the runner's segments are base64 this process encoded.
+        size = base64_decoded_size(audio) or 0
+        return int((size // 4) * 1000 / sample_rate_hz)
     return 0
 
 
 def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) -> dict[str, object]:
+    merged_frames = [
+        frame
+        for source in (first.get("video_frames"), second.get("video_frames"))
+        if isinstance(source, list)
+        for frame in source
+        if isinstance(frame, str) and frame
+    ]
+    if (
+        first.get("format") == "pcm_f32le"
+        and first.get("audio")
+        and not second.get("audio")
+        and second.get("video_frames")
+    ):
+        # Keep retained speech and its transcript owner. Frames accumulate in
+        # capture order; each model applies its own visual-window policy.
+        return {**first, "video_frames": merged_frames}
     if first.get("format") != "pcm_f32le" or second.get("format") != "pcm_f32le":
         return second
     first_rate = first.get("sample_rate_hz")
@@ -324,13 +339,20 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
     merged = dict(second)
     merged["audio"] = base64.b64encode(first_raw + second_raw).decode("ascii")
     merged["sample_rate_hz"] = first_rate
-    merged_frames = [
-        frame
-        for source in (first.get("video_frames"), second.get("video_frames"))
-        if isinstance(source, list)
-        for frame in source
-        if isinstance(frame, str) and frame
-    ]
+    merged.pop("committed_audio_segments", None)
+    segments = []
+    for source, raw in ((first, first_raw), (second, second_raw)):
+        source_segments = source.get("committed_audio_segments")
+        if isinstance(source_segments, list):
+            segments.extend(source_segments)
+        elif isinstance(source.get("realtime_item_id"), str):
+            segments.append({"item_id": source["realtime_item_id"], "byte_count": len(raw)})
+        else:
+            break
+    else:
+        # Preserve API commit boundaries even when a model consumes the PCM as
+        # one buffer. ASR-backed plugins can transcribe each item independently.
+        merged["committed_audio_segments"] = segments
     if merged_frames:
         merged["video_frames"] = merged_frames
     else:

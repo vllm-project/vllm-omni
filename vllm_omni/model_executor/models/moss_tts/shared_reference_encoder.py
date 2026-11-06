@@ -4,7 +4,8 @@
 
 Each API process otherwise loads its own copy of the audio tokenizer on the
 GPU and encodes only the clips it receives. When the processes share a
-directory (``VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR``), the first one to take the lock in it
+directory (a multi-API server's own by default, or
+``VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR``), the first one to take the lock in it
 hosts the encoder and serves the others over a Unix socket in that directory.
 Requests from all processes are merged into batches, and only the host keeps
 the tokenizer and its CUDA graphs on the GPU.
@@ -33,6 +34,9 @@ logger = init_logger(__name__)
 
 _LOCK_NAME = "ref-encoder.lock"
 _SOCKET_NAME = "ref-encoder.sock"
+# A Unix socket path must fit in sun_path with its terminator: 108 bytes on
+# Linux, 104 on macOS.
+_MAX_SOCKET_PATH_BYTES = 103
 # Clips one worker merges into an encode, across all API processes. Several
 # workers encode concurrently on their own streams: one serial queue of large
 # batches makes a burst of new references wait behind each other. A free
@@ -54,6 +58,11 @@ _host_lock_handle = None
 
 class SharedReferenceEncoderStartupError(RuntimeError):
     """The shared encoder cannot safely accept requests yet."""
+
+
+def socket_path_fits(shared_dir: str) -> bool:
+    """Whether the host's Unix socket in ``shared_dir`` has a valid address."""
+    return len(os.fsencode(os.path.join(shared_dir, _SOCKET_NAME))) <= _MAX_SOCKET_PATH_BYTES
 
 
 def elect_host(shared_dir: str) -> bool:

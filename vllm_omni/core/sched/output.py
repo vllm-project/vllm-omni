@@ -7,7 +7,7 @@ from typing import Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationPayload, PayloadSenderInfo
 
 
 @dataclass
@@ -31,6 +31,7 @@ class OmniNewRequestData(NewRequestData):
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
+    resumable: bool = False
 
     @classmethod
     def from_base(
@@ -45,6 +46,7 @@ class OmniNewRequestData(NewRequestData):
             external_req_id=getattr(request, "external_req_id", None),
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resumable=bool(getattr(request, "resumable", False)),
         )
 
     @classmethod
@@ -79,6 +81,7 @@ class OmniNewRequestData(NewRequestData):
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resumable=bool(getattr(request, "resumable", False)),
         )
 
 
@@ -90,8 +93,8 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[str, list[int]]
-    additional_information: dict[str, dict | None]
+    prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
+    additional_information: dict[str, dict | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -109,7 +112,7 @@ class OmniChunkRecvHandle:
 
     request_id: str
     external_req_id: str | None = None
-    payload_sender_info: dict[str, object] | None = None
+    payload_sender_info: PayloadSenderInfo | None = None
 
 
 @dataclass
