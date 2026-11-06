@@ -46,11 +46,22 @@ def test_indexed_scale_shift_to_fp32_matches_two_launch_path(device, dtype, rows
     shift, scale = torch.randn(4, hidden_size * 2, device=device, dtype=dtype).chunk(2, dim=-1)
     indices = (torch.arange(rows * 2, device=device) % 4)[::2]
     before = x.clone()
-    expected = indexed_scale_shift_(x.clone(), shift, scale, indices).float()
+    selected_scale = scale.index_select(0, indices)
+    selected_shift = shift.index_select(0, indices)
+    if x.is_cpu:
+        # The CPU fallback rounds each operation in the input dtype.
+        expected = x * (1.0 + selected_scale) + selected_shift
+    else:
+        # Match the CUDA FP32 multiply-add without using the shared kernel.
+        expected = torch.addcmul(selected_shift.float(), x.float(), 1.0 + selected_scale.float())
+    # The final affine is rounded to the input dtype before FP32 promotion.
+    expected = expected.to(x.dtype).float()
+    two_launch = indexed_scale_shift_(x.clone(), shift, scale, indices).float()
     actual = indexed_scale_shift_to_fp32(x, shift, scale, indices)
 
     assert actual.dtype == torch.float32
     assert actual.shape == x.shape
+    assert torch.equal(two_launch, expected)
     assert torch.equal(actual, expected)
     assert torch.equal(x, before)
 
