@@ -173,7 +173,7 @@ values depend on the actual audio length distribution):
   bucketing damage). These are contributor-reported measurements, not
   independently reproduced results.
 
-| `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
+| `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the encoder-owning model installs bucketed encoders at construction | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
 
 > The per-model knobs (`hop`, `lengths_key`, `frames_per_length`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the one knob above is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
 

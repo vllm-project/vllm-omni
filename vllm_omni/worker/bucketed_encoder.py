@@ -4,9 +4,9 @@
 
 One self-contained, deployment-tunable feature. When
 ``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` is set, :func:`install_bucketed_encoders`
-(which the worker calls after the weights are loaded) wraps each matching
-encoder so it buckets the batch by length rung and computes each rung window
-eagerly.
+(which the encoder-owning model calls at the end of its constructor) wraps each
+matching encoder so it buckets the batch by length rung and computes each rung
+window eagerly.
 
 Per-item lengths are the model's own published field. The wrapper reads the
 per-item length the model already hands to ``embed_multimodal`` (StepAudio2's
