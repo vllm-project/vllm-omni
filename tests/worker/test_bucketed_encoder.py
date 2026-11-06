@@ -809,7 +809,9 @@ def test_qwen2audio_keyword_call_keeps_pooling_and_true_fallback(bucket_cfg):
             self.audio_tower = Qwen2AudioEncoder(cfg).cuda().eval()
 
     model = AudexModel()
-    assert install_bucketed_encoders(model, {"audio_tower": model.audio_tower}, vllm_config=bucket_cfg) == ["audio_tower"]
+    assert install_bucketed_encoders(model, {"audio_tower": model.audio_tower}, vllm_config=bucket_cfg) == [
+        "audio_tower"
+    ]
     wrapper = model.audio_tower.forward
     assert wrapper._shim is None, "Qwen2AudioEncoder must not carry the Whisper recipe"
 
@@ -1116,7 +1118,9 @@ def test_bucketing_stays_off_without_seconds_config():
     kwarg would raise TypeError here."""
     model = ToyModel().cuda()
     cfg = _mock_vllm_config()  # additional_config without the knob
-    assert install_bucketed_encoders(model, {"encoder": model.encoder}, vllm_config=cfg) == ["encoder"]  # pass-through wrap
+    assert install_bucketed_encoders(model, {"encoder": model.encoder}, vllm_config=cfg) == [
+        "encoder"
+    ]  # pass-through wrap
     wrapper = model.encoder.forward
     assert wrapper._active is False, "the feature must stay off without the config knob"
     assert getattr(model, "_bucketed_installed", False)
@@ -1253,7 +1257,13 @@ def test_whitelisted_model_gets_verified_knobs(monkeypatch):
     monkeypatch.setitem(
         bucketed_encoder._VERIFIED_MODELS,
         "test_model",
-        {"frames_per_length": 1, "context_margin": 2, "time_axis": 2, "output_kind": "last_hidden_state"},
+        {
+            "frames_per_second": 100,
+            "frames_per_length": 1,
+            "context_margin": 2,
+            "time_axis": 2,
+            "output_kind": "last_hidden_state",
+        },
     )
 
     model = ToyModel().cuda()
@@ -1293,7 +1303,7 @@ def test_install_rejects_missing_or_unknown_output_kind(monkeypatch):
     model = ToyModel()
     cfg = _mock_vllm_config("test_model", 0.4)
     for bad in (None, "bogus"):
-        knobs = {"frames_per_length": 1, "context_margin": 0, "time_axis": 1}
+        knobs = {"frames_per_second": 100, "frames_per_length": 1, "context_margin": 0, "time_axis": 1}
         if bad is not None:
             knobs["output_kind"] = bad
         monkeypatch.setattr(bucketed_encoder, "_verified_knobs", lambda vllm_config, k=knobs: k)

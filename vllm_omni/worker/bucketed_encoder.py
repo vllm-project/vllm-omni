@@ -698,7 +698,9 @@ def install_bucketed_encoders(model: nn.Module, encoders: Mapping[str, nn.Module
             ladder = LengthBucketingConfig(buckets=_rungs_from_seconds(seconds, frames_per_second))
         frames_per_length = verified.get("frames_per_length")
         if not isinstance(frames_per_length, int):
-            raise RuntimeError("verified model must specify frames_per_length (feature frames per per-item length unit)")
+            raise RuntimeError(
+                "verified model must specify frames_per_length (feature frames per per-item length unit)"
+            )
         context_margin = verified["context_margin"]
         time_axis = verified["time_axis"]
         # Raise (not assert) so the whitelist-bug signal survives `python -O`.
