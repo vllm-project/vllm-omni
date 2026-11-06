@@ -54,7 +54,7 @@ def _block_sparse_request_fake(query, key, value, prefix, owner_handle):
 
 
 def validate_block_sparse_parallel(config):
-    """Admit local execution or pure strict Ulysses; kernels consume local heads."""
+    """Admit local execution or strict Ulysses within independent CFG groups."""
     parallel = getattr(config, "parallel_config", None)
     degree = getattr(parallel, "ulysses_degree", 1) or 1
     if (
@@ -68,7 +68,7 @@ def validate_block_sparse_parallel(config):
             raise ValueError("Block-sparse attention requires strict Ulysses mode")
         if any(
             (getattr(parallel, name, 1) or 1) != 1
-            for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size", "cfg_parallel_size")
+            for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")
         ) or getattr(config, "enable_distributed_layerwise_offload", False):
             raise ValueError("Block-sparse Ulysses does not support combined parallel modes")
     return degree
