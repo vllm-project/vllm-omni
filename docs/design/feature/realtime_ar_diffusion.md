@@ -260,6 +260,7 @@ model_config:
     reuse_attention_kv: false  # cache assembled windows across denoising forwards
     prefetch_kv: false         # CUDA host-bank retrieval on a dedicated stream
     prefetch_bank_allocation: false  # allocate the next host chunk during denoising
+    layerwise_bank_copy: false  # overlap uncompressed CUDA publication with later layers
     # host_bank_limit_bytes: process-wide cap, defaults to physical memory
 ```
 
@@ -279,7 +280,7 @@ model_config:
 - **Transfers:** CUDA commits copy K/V into pinned host memory on a separate
   stream. Host-bank retrieval waits for that copy; uncompressed chunks still
   resident in GPU history are read directly. At most one publication remains
-  in flight. Uncompressed publication borrows the new history's tail; separately
+  in flight. By default, uncompressed publication borrows the new history's tail; separately
   owned compressed source storage is included in the GPU reservation.
   Each publication packs K/V into one host allocation per dtype, with disjoint
   views for individual layers. Live chunks never share backing storage.
@@ -297,6 +298,14 @@ model_config:
   owns allocation sizes and a device index, not request or GPU tensor references.
   This option does not preallocate the entire bank; its benefit depends on the
   host allocator and must be measured with the selected process-wide settings.
+  With `layerwise_bank_copy` and uncompressed CUDA banks, each clean layer
+  queues its K/V copy as soon as the layer produces it. Later layers can compute
+  while earlier copies run. Publication remains transactional: all layers,
+  the output head and retention must succeed before the bank changes. Failures
+  drain staged copies before releasing their host storage. GPU admission also
+  reserves the pending chunk's K/V storage while copies remain in flight.
+  CPU, compressed banks and unavailable prior geometry use ordinary publication.
+  This option defaults to false and does not require background allocation.
   Pinned allocations use PyTorch's caching allocator; initial bank filling
   still incurs allocation costs. `bank_bytes` bounds live entries, not allocator
   caches or the temporary replacement chunk needed for transactional publication.

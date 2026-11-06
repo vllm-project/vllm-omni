@@ -19,18 +19,25 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("layerwise", [False, True])
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("reuse,prefetch", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
 def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(
-    monkeypatch, ratio, reuse, prefetch, background
+    monkeypatch, ratio, reuse, prefetch, background, layerwise
 ):
     config = worldkv.WorldKVConfig(
         window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000, world_keep_ratio=ratio
     )
     cpu = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
     gpu = worldkv.WorldKV(
-        replace(config, reuse_attention_kv=reuse, prefetch_kv=prefetch, prefetch_bank_allocation=background),
+        replace(
+            config,
+            reuse_attention_kv=reuse,
+            prefetch_kv=prefetch,
+            prefetch_bank_allocation=background,
+            layerwise_bank_copy=layerwise,
+        ),
         num_layers=2,
         tokens_per_frame=2,
     )
@@ -277,3 +284,99 @@ def test_background_allocation_failure_rolls_back_and_retry_succeeds(monkeypatch
         assert memory.next_frame == 4
     finally:
         memory.close()
+
+
+def test_layerwise_copy_starts_before_last_layer_and_rolls_back():
+    memory = worldkv.WorldKV(
+        worldkv.WorldKVConfig(
+            window_frames=8,
+            sink_frames=2,
+            retrieval_frames=2,
+            bank_bytes=9000,
+            prefetch_bank_allocation=True,
+            layerwise_bank_copy=True,
+        ),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+
+    def layer(index, start):
+        key = (raw(start) + index).to("cuda")
+        memory.assemble(index, key, key, key * 2)
+
+    try:
+        with torch.Stream(device="cuda"):
+            memory.set_pose(pose(0))
+            with memory.forward(0, 2, commit=True):
+                layer(0, 0)
+                layer(1, 0)
+            previous = memory.history
+            memory.set_pose(pose(2))
+            with pytest.raises(RuntimeError, match="later layer failed"):
+                with memory.forward(2, 2, commit=True):
+                    layer(0, 2)
+                    assert memory._publication is not None
+                    memory._publication.synchronize()
+                    assert torch.equal(memory._staged_bank[0].key, raw(2))
+                    assert not memory.bank and memory.history is previous
+                    raise RuntimeError("later layer failed")
+            assert memory._staged_bank is None
+            assert memory._publication is None and memory.history is previous
+            assert memory.next_frame == 2 and not memory.bank
+            memory.set_pose(pose(2))
+            with memory.forward(2, 2, commit=True):
+                layer(0, 2)
+                layer(1, 2)
+                assert memory._publication is not None
+                assert not memory.bank
+            memory.bank[2].ready.synchronize()
+            for index, rows in enumerate(memory.bank[2].layers):
+                assert torch.equal(rows.key, raw(2) + index)
+                assert torch.equal(rows.value, (raw(2) + index) * 2)
+    finally:
+        memory.close()
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_prefetched_bank_handles_short_chunks_and_changed_denoise_geometry(layerwise):
+    config = worldkv.WorldKVConfig(window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000)
+    cpu = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
+    gpu = worldkv.WorldKV(
+        replace(config, prefetch_bank_allocation=True, layerwise_bank_copy=layerwise),
+        num_layers=2,
+        tokens_per_frame=2,
+    )
+
+    def run(memory, start, frames, commit, device):
+        memory.set_pose(pose(2))
+        outputs = []
+        with memory.forward(start, frames, commit=commit):
+            for layer in range(2):
+                key = (raw(start)[:, : frames * 2] + layer).to(device)
+                outputs.append(memory.assemble(layer, key, key, key * 2))
+        return outputs
+
+    try:
+        with torch.Stream(device="cuda"):
+            start = 0
+            for frames in (2, 1, 1, 2, 1, 1):
+                # The short commit must replace a larger allocation prefetched
+                # by the first noisy forward, without publishing either early.
+                for count, commit in ((2, False), (frames, False), (frames, True)):
+                    expected = run(cpu, start, count, commit, "cpu")
+                    actual = run(gpu, start, count, commit, "cuda")
+                    for lhs, rhs in zip(actual, expected):
+                        for tensor, reference in zip(lhs, rhs):
+                            assert torch.equal(tensor.cpu(), reference)
+                assert list(gpu.bank) == list(cpu.bank)
+                if start in gpu.bank:
+                    chunk = gpu.bank[start]
+                    chunk.ready.synchronize()
+                    assert chunk.frames == frames
+                    for rows, reference in zip(chunk.layers, cpu.bank[start].layers):
+                        for name in ("key", "value", "positions", "token_ids"):
+                            assert torch.equal(getattr(rows, name), getattr(reference, name))
+                start += frames
+    finally:
+        gpu.close()
+        cpu.close()
