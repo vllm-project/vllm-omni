@@ -533,6 +533,7 @@ def _prepare_diffusion_quant_config(
 
 def initialize_model(
     od_config: OmniDiffusionConfig,
+    model_init_kwargs: dict | None = None,
 ) -> nn.Module:
     """Initialize a diffusion model from the registry.
 
@@ -555,7 +556,7 @@ def initialize_model(
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
         with set_current_diffusion_config(od_config):
-            model = model_class(od_config=od_config)
+            model = model_class(od_config=od_config, **(model_init_kwargs or {}))
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         vae_mode = od_config.parallel_config.vae_parallel_mode

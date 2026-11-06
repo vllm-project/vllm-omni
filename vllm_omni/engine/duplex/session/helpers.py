@@ -14,15 +14,13 @@ Functions, not a component, because there is nothing here to own.
 from __future__ import annotations
 
 import asyncio
-import binascii
 from typing import TYPE_CHECKING
-
-import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
 from vllm_omni.engine.duplex.plugin import payload_turn_id
+from vllm_omni.protocol.duplex import base64_decoded_size
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -111,10 +109,8 @@ def audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
     audio = payload.get("audio") or payload.get("data")
     if not isinstance(audio, str):
         return 0
-    try:
-        return len(base64.b64decode(audio, validate=True))
-    except (ValueError, binascii.Error):
-        return 0
+    # Measured, not decoded: by here the audio is base64 this process encoded.
+    return base64_decoded_size(audio) or 0
 
 
 # --------------------------------------------------------------------------- #
