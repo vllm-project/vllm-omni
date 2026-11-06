@@ -169,6 +169,41 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - Input field maps to the `ambient_sound` parameter in the upstream processor.
 - Rate: ~12.5 tokens per second; longer descriptions produce longer audio.
 
+### NPU
+
+#### 1x Ascend A3 or A2 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
+
+`moss_tts_local_npu_mrv2.yaml` is an opt-in profile. Stage0 (Talker) runs on
+Model Runner V2 with ACL graphs, and its model state builds Ascend attention
+metadata. Stage1 (codec) stays on V1 and runs eagerly, because its NPUGraph
+capture fails and blocks startup on A2 and A3
+([#9812](https://github.com/vllm-project/vllm-omni/issues/9812)). Stage0 does
+not send the first audio frame itself on NPU; Stage1 delivers every chunk.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml \
+  --stage-init-timeout 1200 --init-timeout 1500
+```
+
+The startup log contains `NPU Model Runner V2 loaded
+MossTTSLocalTalkerForGeneration with Ascend attention metadata`. The speech
+request is the same as for GPU; Local 1.5 returns 48 kHz stereo audio.
+
+Validated on one Atlas A3 (910C) and one Atlas A2 (910B3) card with vLLM
+v0.32.0. On seed-tts English at concurrency 1, the measured profile has
+comparable WER and speaker similarity to V1, with audio RTF about 20% lower
+on A3 and 24% lower on A2. The baseline uses V1 Stage0 PIECEWISE because V1
+FULL graphs produced incorrect, nonterminating audio in this environment
+([#9952](https://github.com/vllm-project/vllm-omni/issues/9952)). V2 uses
+FULL_AND_PIECEWISE. At concurrency 4 and 16, the measurements show no
+consistent end-to-end advantage.
+
+Without this profile, NPU keeps Stage0 on V1. Do not use V1 Stage0 FULL graphs
+(`FULL_DECODE_ONLY` or `FULL_AND_PIECEWISE`) on NPU: they produce wrong audio
+that does not stop. V1 with `cudagraph_mode: PIECEWISE` is correct.
+
 ## Local 1.5 unified deployment and slot attention
 
 `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` uses one single-GPU deploy
@@ -176,8 +211,9 @@ file, `moss_tts_local.yaml`. The CUDA settings use MRV2, 128 stream slots per
 stage, full-quota private MPS, prefix caching and Triton backbone attention.
 These settings replace the former C64, high-concurrency, low-latency and
 optimized presets. Pipeline selection no longer probes GPU memory or MPS.
-Non-CUDA platforms retain V1 through the same file's platform overrides;
-the separate 2/3-NPU files describe different device placements.
+Non-CUDA platforms retain V1 through the same file's platform overrides, and
+NPU has an opt-in MRV2 profile (see the NPU section above); the separate 2/3-NPU
+files describe different device placements.
 
 Both stages share one GPU, with a 32 GiB Talker KV budget. The CUDA settings
 are validated on H200 and require room for codec state and graphs, plus
