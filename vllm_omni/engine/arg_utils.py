@@ -388,6 +388,7 @@ class OmniEngineArgs(EngineArgs):
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
     enable_distributed_layerwise_offload: bool | None = None
+    enable_submodule_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
@@ -815,6 +816,7 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0
@@ -891,6 +893,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "enable_cpu_offload",
         "enable_layerwise_offload",
         "enable_distributed_layerwise_offload",
+        "enable_submodule_offload",
         "dlo_use_allgather",
         "dlo_resident_layers",
         "host_weight_runtime_mode",

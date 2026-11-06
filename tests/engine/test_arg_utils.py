@@ -700,6 +700,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("enable_cpu_offload", True),
     ("enable_layerwise_offload", True),
     ("enable_distributed_layerwise_offload", True),
+    ("enable_submodule_offload", True),
     ("dlo_use_allgather", False),
     ("dlo_resident_layers", 2),
     ("host_weight_runtime_mode", "preferred"),
@@ -749,6 +750,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "num_gpus": 2,
         "enable_cuda_graph_decode": False,
         "vae_encode_fast_path": "off",
+        "enable_submodule_offload": True,
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
     stage_cfg = StageConfigFactory.create_default_diffusion(
@@ -762,6 +764,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["parallel_config"]["data_parallel_size"] == 2
     assert resolved["enable_cuda_graph_decode"] is False
     assert resolved["vae_encode_fast_path"] == "off"
+    assert resolved["enable_submodule_offload"] is True
 
 
 def test_native_mrv2_worker_provides_connector_without_legacy_mixin():

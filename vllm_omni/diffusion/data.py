@@ -954,6 +954,9 @@ class OmniDiffusionConfig:
     enable_layerwise_offload: bool = False
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
+    # Sub-module level offloading: stream attn/mlp/adaln weights independently
+    # within each DiT block, overlapping H2D with sub-module compute.
+    enable_submodule_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
     # concurrent requests in DP mode). If False: each rank streams the standard
     # loader's rank-local tensors (including TP-local shards) via H2D only.
@@ -1391,6 +1394,7 @@ class OmniDiffusionConfig:
                         OffloadStrategy.MODEL_LEVEL: "CPU offload",
                         OffloadStrategy.LAYER_WISE: "layerwise offload",
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
+                        OffloadStrategy.SUBMODULE: "submodule offload",
                     }[offload_strategy]
                 )
             if incompatible_features:
@@ -1490,7 +1494,7 @@ class OmniDiffusionConfig:
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
-            enable_dlo=self.enable_distributed_layerwise_offload,
+            enable_dlo=(self.enable_distributed_layerwise_offload or self.enable_submodule_offload),
             use_allgather=self.dlo_use_allgather,
             hwr_mode=self.host_weight_runtime_mode,
         )

@@ -300,7 +300,7 @@ class VDNCheckpoint:
         parallel = od_config.parallel_config
         if any(int(getattr(parallel, key, 1) or 1) != 1 for key in ("ulysses_degree", "ring_degree")):
             raise ValueError("VDN-H3 does not support sequence parallelism; use --tensor-parallel-size")
-        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+        if resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE):
             # Its host-weight plan installs the DiT without load_weights(), where the fusion lives.
             raise ValueError("VDN-H3 is fused while the weights stream in; use a non-distributed offload mode")
 
