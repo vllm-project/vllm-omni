@@ -293,3 +293,33 @@ def test_pipeline_router_dtype_depends_on_sharing_not_meta(monkeypatch, shared, 
         cls(od_config, backbone_meta=meta)
     assert backbone.call_args.kwargs["shared_router_dtype"] == (torch.float32 if shared else None)
     assert backbone.call_args.kwargs.get("rope_device") == (torch.device("cpu") if meta else None)
+
+
+def test_shared_load_rejects_merged_lora_before_ipc_import():
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+    loader = object.__new__(DiffusersPipelineLoader)
+    loader.od_config = SimpleNamespace(lora_application="merged")
+    loader.quant_config = None
+    loader.parallel_config = SimpleNamespace(use_hsdp=False)
+    loader._init_from_load_format = Mock()
+
+    provider_weight = torch.randn(8)
+    provider_snapshot = provider_weight.clone()
+    provider_ptr = provider_weight.data_ptr()
+    backend = Mock()
+
+    with pytest.raises(ValueError, match="merged LoRA"):
+        loader._load_model_with_shared_backbone(
+            shared_group=SimpleNamespace(role="consumer"),
+            custom_pipeline_name=None,
+            target_device=torch.device("cpu"),
+            backend=backend,
+        )
+
+    # The merged-adapter config must be rejected before any pipeline build or
+    # IPC import, so a provider-backed parameter is never aliased or written.
+    loader._init_from_load_format.assert_not_called()
+    backend.open_import.assert_not_called()
+    assert provider_weight.data_ptr() == provider_ptr
+    assert torch.equal(provider_weight, provider_snapshot)

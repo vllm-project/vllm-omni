@@ -1381,6 +1381,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             raise ValueError("shared-backbone loading does not support quantization in v1")
         if self.parallel_config.use_hsdp:
             raise ValueError("shared-backbone loading does not support HSDP in v1")
+        if getattr(self.od_config, "lora_application", None) == "merged":
+            # Merged adapters copy adapted values into the base parameter in
+            # place, which would write into provider-backed IPC views.
+            raise ValueError("shared-backbone loading does not support merged LoRA adapters")
         resolved_offload = resolve_offload(self.od_config)
         if resolved_offload.strategy is not OffloadStrategy.NONE and resolved_offload.offloads(DIT_COMPONENT):
             raise ValueError("shared-backbone loading does not support DiT offload; imported weights must remain bound")
