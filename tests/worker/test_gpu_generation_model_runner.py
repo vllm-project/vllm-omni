@@ -447,3 +447,33 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
     assert seen["counts"] == [3]
     if exact_shape:
         assert sum(seen["counts"]) == seen["input_ids"].numel()
+
+
+@pytest.mark.parametrize("num_warmups", [0, 3], ids=["zero", "nonzero"])
+def test_generation_runner_warmup_capture_drops_moe_kwarg(monkeypatch, num_warmups):
+    """#9911 P1: the shared ``_warmup_and_capture`` must not pass
+    ``force_moe_routing_key`` to ``GPUGenerationModelRunner._dummy_run``, which
+    accepts neither that keyword nor ``**kwargs``. With specialization disabled
+    the replay key is BLEND, so the kwarg must be dropped instead of raising an
+    unexpected-keyword TypeError on a non-eager V1 generation stage.
+    """
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    runner = object.__new__(GPUGenerationModelRunner)
+    calls: list[tuple[int, dict]] = []
+    dummy_run_signature = inspect.signature(GPUGenerationModelRunner._dummy_run)
+
+    def _dummy_run(num_tokens, **kwargs):
+        # Bind every call against the real generation-runner signature; an
+        # unexpected keyword (e.g. force_moe_routing_key) raises TypeError.
+        dummy_run_signature.bind(runner, num_tokens, **kwargs)
+        calls.append((num_tokens, kwargs))
+        return torch.zeros(1), None
+
+    runner._dummy_run = _dummy_run
+    desc = SimpleNamespace(num_tokens=4, uniform=False, num_active_loras=0)
+
+    GPUGenerationModelRunner._warmup_and_capture(runner, desc, CUDAGraphMode.FULL, num_warmups=num_warmups)
+
+    assert len(calls) == num_warmups + 1
+    for _, kwargs in calls:
+        assert "force_moe_routing_key" not in kwargs

@@ -1119,6 +1119,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
         moe_key = int(getattr(desc, "moe_routing_key", MoERoutingKey.BLEND))
+        # BLEND is the default: pass the specialization kwarg only for real
+        # specialty graphs so subclasses whose ``_dummy_run`` does not accept it
+        # (e.g. GPUGenerationModelRunner) never see an unexpected keyword.
+        moe_kwargs = {"force_moe_routing_key": moe_key} if moe_key != int(MoERoutingKey.BLEND) else {}
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -1130,7 +1134,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
-                force_moe_routing_key=moe_key,
+                **moe_kwargs,
             )
         if num_warmups > 0:
             torch.accelerator.synchronize()
@@ -1149,7 +1153,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 num_active_loras=desc.num_active_loras,
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
-                force_moe_routing_key=moe_key,
+                **moe_kwargs,
             )
 
     @torch.inference_mode()
