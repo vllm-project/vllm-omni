@@ -157,7 +157,7 @@ def _ladder_seconds(vllm_config) -> tuple[float, ...] | None:
     ``None`` or empty means the feature is off (the default — read the
     lossiness classification in the docs before enabling). Malformed values
     raise ``ValueError`` at model construction so a typo cannot silently
-    mis-arm or disable the feature.
+    wrongly arm or disable the feature.
     """
     additional = getattr(vllm_config, "additional_config", None) if vllm_config is not None else None
     raw = additional.get(_CONFIG_KEY) if isinstance(additional, dict) else None

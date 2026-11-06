@@ -122,7 +122,7 @@ def test_construction_without_config_installs_pass_through_only(monkeypatch):
 def test_token2wav_stage_never_installs_bucketed_encoder():
     """A stage without a bucketable encoder must never see the installer —
     the Token2Wav stage carries no install call, so no DAC/tts tokenizer
-    encoder can be mis-wrapped regardless of the config knob."""
+    encoder can be wrongly wrapped regardless of the config knob."""
     try:
         from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
             StepAudio2Token2WavForConditionalGeneration,
@@ -147,7 +147,7 @@ def test_token2wav_stage_never_installs_bucketed_encoder():
 
 def test_construction_with_invalid_seconds_config_raises(monkeypatch):
     """A malformed audio_bucket_seconds fails loudly at model construction
-    (fail fast at startup), never silently disables or mis-arms the feature."""
+    (fail fast at startup), never silently disables or wrongly arms the feature."""
     monkeypatch.setattr(covo_audio_llm, "init_vllm_registered_model", lambda **kwargs: _stub_lm())
     monkeypatch.setattr(covo_audio_llm, "WhisperEncoder", lambda cfg: torch.nn.Linear(4, 4))
     monkeypatch.setattr(covo_audio_llm, "AudioAdapter", lambda *args, **kwargs: torch.nn.Linear(4, 4))
