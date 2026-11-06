@@ -81,8 +81,10 @@ def cuda_vllm_env(monkeypatch, tmp_path):
     )
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
-    monkeypatch.setenv("MASTER_ADDR", "localhost")
-    monkeypatch.setenv("MASTER_PORT", "29617")
+    from tests.helpers.runtime import get_open_port
+
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", str(get_open_port()))
     deploy_path = tmp_path / "diffusion-moe.yaml"
     deploy_path.write_text(
         "dtype: bfloat16\n"
