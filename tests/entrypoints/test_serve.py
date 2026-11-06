@@ -1382,3 +1382,14 @@ def test_tracking_namespace_copy_preserves_tracking(deep):
     restored = copy.deepcopy(namespace) if deep else copy.copy(namespace)
     assert restored.get_explicit_kwargs_dict() == {"api_server_count": 2}
     assert restored.model == "example"
+
+
+def test_serve_parser_accepts_vae_spatial_temporal_chunk_size() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+    assert args.vae_spatial_temporal_chunk_size is None
+    assert "vae_spatial_temporal_chunk_size" not in args.get_explicit_kwargs_dict()
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-spatial-temporal-chunk-size", "2"])
+    assert args.get_explicit_kwargs_dict()["vae_spatial_temporal_chunk_size"] == 2

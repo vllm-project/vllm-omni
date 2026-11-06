@@ -134,7 +134,13 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         return_dict: bool = True,
     ):
         """Decode the non-tiled temporal path, optionally streaming chunks."""
-        if on_chunk is None and is_installed(self) and not torch.is_grad_enabled():
+        spatial = getattr(self, "_vllm_omni_wan_spatial_shard_installed", False)
+        produce_output = True
+        if spatial:
+            dst = self._vllm_omni_wan_spatial_shard_dst
+            group = self._vllm_omni_wan_spatial_shard_group
+            produce_output = dst is None or dist.get_rank(group=group) == dst
+        if on_chunk is None and produce_output and is_installed(self) and not torch.is_grad_enabled():
             try:
                 out = decode_frames(self, z)
             finally:
@@ -164,6 +170,11 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
                         feat_idx=self._conv_idx,
                     )
 
+                # The permanent spatial wrapper returns a 1D placeholder on
+                # non-owner ranks, including below the tiling threshold. Keep
+                # participating in every chunk's collectives without assembling it.
+                if not produce_output:
+                    continue
                 if on_chunk is None:
                     decoded_chunks.append(chunk)
                     continue
@@ -184,6 +195,9 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
                 raise callback_error
             if on_chunk is not None:
                 return None
+            if not produce_output:
+                out = z.new_zeros(0)
+                return DecoderOutput(sample=out) if return_dict else (out,)
 
             out = torch.cat(decoded_chunks, dim=2)
             if self.config.patch_size is not None:
@@ -223,6 +237,10 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
 
 
 class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
+    # Runtime-only spatial decode setting; checkpoint configuration is unchanged.
+    # Values above one trade memory and convolution rounding for fewer launches.
+    spatial_temporal_chunk_size: int | None = None
+
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
         model = super().from_pretrained(*args, **kwargs)
@@ -544,6 +562,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                     group=self.distributed_executor.group,
                     return_dict=return_dict,
                     split_dim=split_dim,
+                    temporal_chunk_size=self.spatial_temporal_chunk_size,
                 )
             # A partial VAE group cannot shard; keep the tile-parallel fallback even without native tiling.
             if self.is_distributed_enabled() and self._exceeds_tile(z):
@@ -565,6 +584,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                 group=self.distributed_executor.group,
                 return_dict=return_dict,
                 split_dim=split_dim,
+                temporal_chunk_size=self.spatial_temporal_chunk_size,
             )
         return self._tile_parallel_decode(z, return_dict=return_dict)
 
@@ -608,6 +628,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return_dict=True,
             split_dim=split_dim,
             on_chunk=on_chunk,
+            temporal_chunk_size=self.spatial_temporal_chunk_size,
         )
 
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:

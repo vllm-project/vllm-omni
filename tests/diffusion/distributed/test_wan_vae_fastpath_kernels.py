@@ -1347,3 +1347,30 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
     mse = (difference**2).mean().item()
     psnr = float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
     assert error <= tolerance and psnr >= 45.0, f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("input_channels_last,output_channels_last", [(False, True), (True, False)])
+def test_cat_pad_reuses_spatial_input_buffer(input_channels_last, output_channels_last):
+    """A halo buffer chooses its layout independently of the local activation."""
+    dtype = torch.bfloat16
+    x = torch.randn(2, 8, 1, 7, 9, device="cuda", dtype=dtype)
+    if input_channels_last:
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    # Exercise narrowed views as emitted by shard boundary trimming.
+    x = x[:, :, :, 1:-1, 1:-1]
+    out = torch.empty(
+        (2, 8, 3, 7, 9),
+        device="cuda",
+        dtype=dtype,
+        memory_format=torch.channels_last_3d if output_channels_last else torch.contiguous_format,
+    )
+    pointer = out.data_ptr()
+    for cache_frames in (0, 2, 1, 0):
+        cache = torch.randn(2, 8, cache_frames, 5, 7, device="cuda", dtype=dtype) if cache_frames else None
+        source = torch.cat([cache, x], dim=2) if cache is not None else x
+        expected = F.pad(source, (1, 1, 1, 1, 2 - cache_frames, 0))
+        out.fill_(float("nan"))
+        actual = dm.cat_pad_5d(x, cache, (1, 1, 1, 1, 2, 0), out=out)
+        assert actual is out and actual.data_ptr() == pointer
+        assert _bits_equal(actual, expected)

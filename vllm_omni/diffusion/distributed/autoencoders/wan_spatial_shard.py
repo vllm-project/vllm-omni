@@ -23,6 +23,7 @@ import math
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from itertools import chain
 from types import MethodType
 from typing import Any, cast
 
@@ -131,13 +132,14 @@ def _local_valid_extent(local_extent: int) -> int:
     return max(0, min(local_extent, full_extent - start))
 
 
-def _zero_invalid_extent(x: torch.Tensor, *, split_dim: str) -> torch.Tensor:
+def _zero_invalid_extent(x: torch.Tensor, *, split_dim: str, inplace: bool = False) -> torch.Tensor:
     dim = _spatial_dim(split_dim)
     dim_size = x.shape[dim]
     valid_extent = _local_valid_extent(dim_size)
     if valid_extent >= dim_size:
         return x
-    x = x.clone()
+    if not inplace:
+        x = x.clone()
     invalid = _narrow_along_dim(x, dim, valid_extent, dim_size - valid_extent)
     invalid.zero_()
     return x
@@ -241,11 +243,14 @@ def gather_and_trim_extent(
     return out
 
 
-def _ensure_recv_buf(recv_buf: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor:
-    # Send and receive buffers are dense in the default order whatever the activation's layout: every
-    # backend accepts that (gloo rejects a channels_last buffer), the halo is a single row or column, and the
-    # copy into the assembled input handles the layout.
-    memory_format = torch.contiguous_format
+def _ensure_recv_buf(
+    recv_buf: torch.Tensor | None,
+    reference: torch.Tensor,
+    *,
+    memory_format: torch.memory_format = torch.contiguous_format,
+) -> torch.Tensor:
+    # CPU/Gloo and the reference path use ordinary contiguous buffers. The
+    # optimized CUDA path can retain the activation's channels-last ordering.
     if (
         recv_buf is None
         or recv_buf.shape != reference.shape
@@ -272,10 +277,25 @@ def _halo_exchange_p2p(
     recv_top_buf: torch.Tensor,
     recv_bottom_buf: torch.Tensor,
 ) -> None:
+    memory_format = _halo_memory_format(recv_top_buf)
+    packed = False
+    if (
+        memory_format != torch.contiguous_format
+        and top_row_ref.is_cuda
+        and top_row_ref.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+    ):
+        from .wan_vae_fastpath.triton_spatial_halo import launch_halo_pair
+
+        top_row = torch.empty_like(recv_top_buf)
+        bottom_row = torch.empty_like(recv_bottom_buf)
+        packed = launch_halo_pair(top_row_ref, bottom_row_ref, top_row, bottom_row)
     p2p_ops = []
     if rank > 0:
         prev_rank = _global_rank(group, rank - 1)
-        top_row = top_row_ref.contiguous()
+        if not packed:
+            top_row = top_row_ref.contiguous(memory_format=memory_format)
         p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
         p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
     else:
@@ -283,7 +303,8 @@ def _halo_exchange_p2p(
 
     if rank < world_size - 1:
         next_rank = _global_rank(group, rank + 1)
-        bottom_row = bottom_row_ref.contiguous()
+        if not packed:
+            bottom_row = bottom_row_ref.contiguous(memory_format=memory_format)
         p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
     else:
@@ -293,6 +314,91 @@ def _halo_exchange_p2p(
         reqs = dist.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
+
+
+def _copy_received_halos(
+    top: torch.Tensor, bottom: torch.Tensor, out_top: torch.Tensor, out_bottom: torch.Tensor
+) -> None:
+    if (
+        top.is_cuda
+        and top.stride(1) == 1
+        and top.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+    ):
+        from .wan_vae_fastpath.triton_spatial_halo import launch_halo_pair
+
+        if launch_halo_pair(top, bottom, out_top, out_bottom):
+            return
+    out_top.copy_(top)
+    out_bottom.copy_(bottom)
+
+
+def _exchange_input_halos(module: nn.Module, buf: torch.Tensor, halo: int, rank: int, world_size: int) -> None:
+    """Exchange the padded interior's boundaries into its reserved halo slots."""
+    dim = module.split_tensor_dim
+    top = _narrow_along_dim(buf, dim, halo, halo)
+    bottom = _narrow_along_dim(buf, dim, buf.shape[dim] - 2 * halo, halo)
+    memory_format = _halo_memory_format(buf) if buf.is_cuda and module._backend == "nccl" else torch.contiguous_format
+    module._halo_recv_top_buf = _ensure_recv_buf(module._halo_recv_top_buf, top, memory_format=memory_format)
+    module._halo_recv_bottom_buf = _ensure_recv_buf(module._halo_recv_bottom_buf, bottom, memory_format=memory_format)
+    _halo_exchange_p2p(
+        rank=rank,
+        world_size=world_size,
+        group=module.group,
+        top_row_ref=top,
+        bottom_row_ref=bottom,
+        recv_top_buf=module._halo_recv_top_buf,
+        recv_bottom_buf=module._halo_recv_bottom_buf,
+    )
+    _copy_received_halos(
+        module._halo_recv_top_buf,
+        module._halo_recv_bottom_buf,
+        _narrow_along_dim(buf, dim, 0, halo),
+        _narrow_along_dim(buf, dim, buf.shape[dim] - halo, halo),
+    )
+
+
+def _spatial_conv_forward(
+    module: nn.Module, x: torch.Tensor, local_extent: int, *, return_bias: bool
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    """Convolve an assembled shard, trim boundaries, and apply its bias contract."""
+    trim = module._trim_cache.get(local_extent)
+    if trim is None:
+        rank, world_size = _rank_world(module.group)
+        trim = _compute_conv_trim_params(
+            local_extent=local_extent,
+            rank=rank,
+            world_size=world_size,
+            halo_size=module.halo_size,
+            pad_before=module.split_pad_left,
+            pad_after=module.split_pad_right,
+            kernel_extent=module.kernel_extent,
+            stride_extent=module.stride_extent,
+        )
+        module._trim_cache[local_extent] = trim
+    shift, start, upper_bound = trim
+    if shift:
+        dim = module.split_tensor_dim
+        x = _narrow_along_dim(x, dim, shift, x.shape[dim] - shift)
+    defer_bias = (
+        return_bias
+        and module.input_memory_format != torch.contiguous_format
+        and module.bias is not None
+        and x.is_cuda
+        and not torch.is_grad_enabled()
+    )
+    out = module._conv_forward(x, module.weight, None if defer_bias else module.bias)
+    out = _trim_local_conv_output(out, module.halo_size, start, upper_bound, split_dim=module.split_dim)
+    bias = module.bias.to(dtype=out.dtype) if defer_bias else None
+    extent = out.shape[module.split_tensor_dim]
+    if bias is not None and _local_valid_extent(extent) < extent:
+        # Invalid positions must stay zero, including after the next epilogue.
+        out = out + bias.view(1, -1, *((1,) * (out.ndim - 2)))
+        bias = None
+    # Fresh convolution outputs do not alias a caller or temporal cache.
+    out = _zero_invalid_extent(out, split_dim=module.split_dim, inplace=not torch.is_grad_enabled())
+    return (out, bias) if return_bias else out
 
 
 def halo_exchange(
@@ -406,14 +512,14 @@ class WanDistConv2d(nn.Conv2d):
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self._trim_cache: dict[int, tuple[int, int, int]] = {}
-        # Opt-in (install_wan_decoder_fast_path): assemble the conv input in one buffer kept across calls
-        # instead of allocating, zero-filling and concatenating a fresh one every call. Same bytes.
-        self.reuse_input_buffer = False
+        self._backend = dist.get_backend(group) if dist.is_initialized() else None
         self.input_memory_format = torch.contiguous_format
         self._input_buf: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.reuse_input_buffer:
+    def forward(
+        self, x: torch.Tensor, *, return_bias: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        if not torch.is_grad_enabled():
             x_padded, local_extent = self._assemble_input(x)
         else:
             x = F.pad(x, self._non_split_padding)
@@ -426,26 +532,43 @@ class WanDistConv2d(nn.Conv2d):
                 recv_bottom_buf=self._halo_recv_bottom_buf,
             )
             local_extent = x.shape[self.split_tensor_dim]
-        shift, start, upper_bound = self._get_trim_params(local_extent)
-        if shift:
-            x_padded = _narrow_along_dim(
-                x_padded,
-                self.split_tensor_dim,
-                shift,
-                x_padded.shape[self.split_tensor_dim] - shift,
-            )
-        out = super().forward(x_padded)
-        out = _trim_local_conv_output(out, self.halo_size, start, upper_bound, split_dim=self.split_dim)
-        return _zero_invalid_extent(out, split_dim=self.split_dim)
+        return _spatial_conv_forward(self, x_padded, local_extent, return_bias=return_bias)
+
+    def forward_upsampled(
+        self, x: torch.Tensor, *, return_bias: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None] | None:
+        """Fuse nearest-2x input assembly, or decline without running convolution."""
+        if (
+            torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or not x.is_cuda
+            or x.ndim != 4
+            or x.dtype != torch.bfloat16
+            or x.numel() == 0
+            or not x.is_contiguous(memory_format=torch.channels_last)
+            or self.input_memory_format != torch.channels_last
+            or self.kernel_size != (3, 3)
+            or self.stride != (1, 1)
+            or self.dilation != (1, 1)
+            or (self.split_pad_left, self.split_pad_right) != (1, 1)
+            or self._non_split_padding != ((0, 0, 1, 1) if self.split_dim == "width" else (1, 1, 0, 0))
+        ):
+            return None
+        rank, world_size = _rank_world(self.group)
+        if world_size < 2:
+            return None
+        from .wan_vae_fastpath.triton_upsample import upsample_nearest_2x_padded
+
+        batch, channels, height, width = x.shape
+        buf = _persistent_input_buffer(self, (batch, channels, 2 * height + 2, 2 * width + 2), x)
+        if not upsample_nearest_2x_padded(x, buf):
+            return None
+        _exchange_input_halos(self, buf, 1, rank, world_size)
+        local_extent = 2 * (width if self.split_dim == "width" else height)
+        return _spatial_conv_forward(self, buf, local_extent, return_bias=return_bias)
 
     def _assemble_input(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
-        """The padded, halo-exchanged conv input built in one buffer that persists across calls.
-
-        Byte for byte what ``F.pad`` followed by ``halo_exchange`` produced -- the non-split zero padding
-        around the activation, the neighbours' halo rows or columns outside it -- without the two
-        allocations and the three copies those took per call. Returns the assembled tensor and the extent
-        along the split dimension before halos (what the trim parameters are keyed by).
-        """
+        """Copy the activation and received halos into one reusable padded input."""
         left, right, top, bottom = self._non_split_padding
         rank, world_size = _rank_world(self.group)
         halo = self.halo_size if world_size > 1 else 0
@@ -459,42 +582,8 @@ class WanDistConv2d(nn.Conv2d):
         buf[:, :, halo_h + top : halo_h + top + height, halo_w + left : halo_w + left + width].copy_(x)
         local_extent = buf.shape[dim] - 2 * halo
         if halo:
-            # What halo_exchange sends: the padded activation's first and last ``halo`` rows along the
-            # split dimension, non-split padding included; the neighbours' rows land in the outer slots.
-            padded = _narrow_along_dim(buf, dim, halo, local_extent)
-            top_row_ref = _narrow_along_dim(padded, dim, 0, halo)
-            bottom_row_ref = _narrow_along_dim(padded, dim, local_extent - halo, halo)
-            self._halo_recv_top_buf = _ensure_recv_buf(self._halo_recv_top_buf, top_row_ref)
-            self._halo_recv_bottom_buf = _ensure_recv_buf(self._halo_recv_bottom_buf, bottom_row_ref)
-            _halo_exchange_p2p(
-                rank=rank,
-                world_size=world_size,
-                group=self.group,
-                top_row_ref=top_row_ref,
-                bottom_row_ref=bottom_row_ref,
-                recv_top_buf=self._halo_recv_top_buf,
-                recv_bottom_buf=self._halo_recv_bottom_buf,
-            )
-            _narrow_along_dim(buf, dim, 0, halo).copy_(self._halo_recv_top_buf)
-            _narrow_along_dim(buf, dim, buf.shape[dim] - halo, halo).copy_(self._halo_recv_bottom_buf)
+            _exchange_input_halos(self, buf, halo, rank, world_size)
         return buf, local_extent
-
-    def _get_trim_params(self, local_extent: int) -> tuple[int, int, int]:
-        trim_params = self._trim_cache.get(local_extent)
-        if trim_params is None:
-            rank, world_size = _rank_world(self.group)
-            trim_params = _compute_conv_trim_params(
-                local_extent=local_extent,
-                rank=rank,
-                world_size=world_size,
-                halo_size=self.halo_size,
-                pad_before=self.split_pad_left,
-                pad_after=self.split_pad_right,
-                kernel_extent=self.kernel_extent,
-                stride_extent=self.stride_extent,
-            )
-            self._trim_cache[local_extent] = trim_params
-        return trim_params
 
 
 class WanDistCausalConv3d(nn.Conv3d):
@@ -557,40 +646,21 @@ class WanDistCausalConv3d(nn.Conv3d):
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self._trim_cache: dict[int, tuple[int, int, int]] = {}
-        # Opt-in (install_wan_decoder_fast_path): assemble the conv input in one buffer kept across calls
-        # instead of allocating, zero-filling and concatenating a fresh one every call. Same bytes.
-        self.reuse_input_buffer = False
+        self._backend = dist.get_backend(group) if dist.is_initialized() else None
         self.input_memory_format = torch.contiguous_format
-        self._input_buf: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cache_x: torch.Tensor | None = None, *, return_bias: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         x_padded, local_extent = self._assemble_input(x, cache_x)
-        shift, start, upper_bound = self._get_trim_params(local_extent)
-        if shift:
-            x_padded = _narrow_along_dim(
-                x_padded,
-                self.split_tensor_dim,
-                shift,
-                x_padded.shape[self.split_tensor_dim] - shift,
-            )
-        out = super().forward(x_padded)
-        out = _trim_local_conv_output(out, self.halo_size, start, upper_bound, split_dim=self.split_dim)
-        return _zero_invalid_extent(out, split_dim=self.split_dim)
+        return _spatial_conv_forward(self, x_padded, local_extent, return_bias=return_bias)
 
     def _assemble_input(self, x: torch.Tensor, cache_x: torch.Tensor | None) -> tuple[torch.Tensor, int]:
-        """Build the conv input -- cached frames, causal/spatial zero padding and the halo columns -- in one pass.
+        """Assemble history, padding, and halo slots in the convolution layout.
 
-        The straightforward version wrote the activation three times per call: ``torch.cat`` of the cached
-        frames, ``F.pad`` for the causal and spatial zeros, then another ``torch.cat`` to attach the halos the
-        neighbours sent. Every causal conv of the decoder runs this on every latent frame, so at 480x832 that
-        was the largest single source of memory traffic in the decode. Here the final tensor is allocated once
-        and the cached frames and the new frames are copied straight into their slots; only the padding slices
-        are zeroed. The halo rows are exchanged through contiguous send and receive buffers (a P2P op needs a
-        contiguous tensor and the halo slot of a 5D tensor is a strided view) and copied into their slots. The
-        conv sees the same tensor as before, byte for byte.
-
-        Returns the assembled tensor and the extent along the split dimension the trim parameters are keyed by
-        (the extent before halos, as ``halo_exchange`` saw it).
+        Reuse the shared causal-input kernel when supported, otherwise copy
+        into the same slots with PyTorch. Conv3d uses transient storage
+        to avoid retaining one large activation per layer.
         """
         pad_w0, pad_w1, pad_h0, pad_h1, pad_t0, pad_t1 = self._padding
         cache_frames = 0
@@ -610,20 +680,17 @@ class WanDistCausalConv3d(nn.Conv3d):
         total_height = top + height + pad_h1 + halo_h
         total_width = left + width + pad_w1 + halo_w
         shape = (batch, channels, total_frames, total_height, total_width)
-        if self.reuse_input_buffer:
-            # The copies below touch only the activation interior and the halo slots, so the spatial padding
-            # stays zero for the buffer's lifetime. The causal front frames alternate between zeros (a
-            # session's first frame) and cached frames, so they are re-zeroed whenever this call needs zeros.
-            buf = _persistent_input_buffer(self, shape, x)
-            if pad_t0:
-                buf[:, :, :pad_t0].zero_()
-            if pad_t1:
-                buf[:, :, total_frames - pad_t1 :].zero_()
-        else:
-            buf = torch.empty(shape, dtype=x.dtype, device=x.device)
-            # Zero only what the conv must read as zeros: the causal frames in
-            # front (and any trailing ones) and the spatial padding rows/columns.
-            # The halo columns are filled below.
+        buf = torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=self.input_memory_format)
+        fused = False
+        if x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            from .wan_vae_fastpath.triton_data_movement import cat_pad_5d
+
+            # The kernel writes every element, including zero padding.
+            padding = (left, pad_w1 + halo_w, top, pad_h1 + halo_h, pad_t0 + cache_frames, pad_t1)
+            fused = cat_pad_5d(x, cache_x if cache_frames else None, padding, out=buf) is not None
+        if not fused:
+            # The CUDA assembly kernel is optional; these copies implement the
+            # same layout for CPU, autograd, and unsupported kernel inputs.
             if pad_t0:
                 buf[:, :, :pad_t0].zero_()
             if pad_t1:
@@ -636,51 +703,17 @@ class WanDistCausalConv3d(nn.Conv3d):
                 buf[:, :, :, :, halo_w:left].zero_()
             if pad_w1:
                 buf[:, :, :, :, total_width - halo_w - pad_w1 : total_width - halo_w].zero_()
-        interior = buf[:, :, pad_t0 : pad_t0 + cache_frames + frames, top : top + height, left : left + width]
-        if cache_frames:
-            interior[:, :, :cache_frames].copy_(cache_x)
-            interior[:, :, cache_frames:].copy_(x)
-        else:
-            interior.copy_(x)
-
+            interior = buf[:, :, pad_t0 : pad_t0 + cache_frames + frames, top : top + height, left : left + width]
+            if cache_frames:
+                interior[:, :, :cache_frames].copy_(cache_x)
+                interior[:, :, cache_frames:].copy_(x)
+            else:
+                interior.copy_(x)
         dim = self.split_tensor_dim
         local_extent = buf.shape[dim] - 2 * halo
         if halo:
-            # What halo_exchange sends: the padded tensor's first and last
-            # ``halo`` rows along the split dimension, padding included.
-            top_row_ref = _narrow_along_dim(buf, dim, halo, halo)
-            bottom_row_ref = _narrow_along_dim(buf, dim, buf.shape[dim] - 2 * halo, halo)
-            self._halo_recv_top_buf = _ensure_recv_buf(self._halo_recv_top_buf, top_row_ref)
-            self._halo_recv_bottom_buf = _ensure_recv_buf(self._halo_recv_bottom_buf, bottom_row_ref)
-            _halo_exchange_p2p(
-                rank=rank,
-                world_size=world_size,
-                group=self.group,
-                top_row_ref=top_row_ref,
-                bottom_row_ref=bottom_row_ref,
-                recv_top_buf=self._halo_recv_top_buf,
-                recv_bottom_buf=self._halo_recv_bottom_buf,
-            )
-            _narrow_along_dim(buf, dim, 0, halo).copy_(self._halo_recv_top_buf)
-            _narrow_along_dim(buf, dim, buf.shape[dim] - halo, halo).copy_(self._halo_recv_bottom_buf)
+            _exchange_input_halos(self, buf, halo, rank, world_size)
         return buf, local_extent
-
-    def _get_trim_params(self, local_extent: int) -> tuple[int, int, int]:
-        trim_params = self._trim_cache.get(local_extent)
-        if trim_params is None:
-            rank, world_size = _rank_world(self.group)
-            trim_params = _compute_conv_trim_params(
-                local_extent=local_extent,
-                rank=rank,
-                world_size=world_size,
-                halo_size=self.halo_size,
-                pad_before=self.split_pad_left,
-                pad_after=self.split_pad_right,
-                kernel_extent=self.kernel_extent,
-                stride_extent=self.stride_extent,
-            )
-            self._trim_cache[local_extent] = trim_params
-        return trim_params
 
 
 def _compute_conv_trim_params(
@@ -726,12 +759,58 @@ def _trim_local_conv_output(
     return out
 
 
+def _attention_local_queries(
+    module: nn.Module, local: torch.Tensor, gathered: torch.Tensor, *, split_dim: str, rank: int
+) -> torch.Tensor:
+    """Use global keys/values, but compute attention outputs only for this shard.
+
+    QKV projection keeps its full-frame shape. The shorter query sequence can
+    change SDPA's reduction schedule, so this belongs to the tolerance-based
+    channels-last level rather than the bit-exact level.
+    """
+    dim = _spatial_dim(split_dim)
+    local_extent = local.shape[dim]
+    valid = min(local_extent, gathered.shape[dim] - rank * local_extent)
+    if valid <= 0:
+        return torch.zeros_like(local)
+    batch, channels, frames, height, width = gathered.shape
+    x = gathered.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width)
+    qkv = module.to_qkv(module.norm(x))
+    qkv = qkv.reshape(batch * frames, 1, channels * 3, -1).permute(0, 1, 3, 2).contiguous()
+    query, key, value = qkv.chunk(3, dim=-1)
+    query = query.reshape(batch * frames, 1, height, width, channels)
+    query = query.narrow(2 if split_dim == "height" else 3, rank * local_extent, valid)
+    query = query.reshape(batch * frames, 1, -1, channels).contiguous()
+    out = F.scaled_dot_product_attention(query, key, value)
+    local_height, local_width = (valid, width) if split_dim == "height" else (height, valid)
+    out = out.squeeze(1).permute(0, 2, 1).reshape(batch * frames, channels, local_height, local_width)
+    out = module.proj(out).view(batch, frames, channels, local_height, local_width).permute(0, 2, 1, 3, 4)
+    out = out + local.narrow(dim, 0, valid)
+    if valid < local_extent:
+        padding = (0, local_extent - valid, 0, 0) if split_dim == "width" else (0, 0, 0, local_extent - valid)
+        out = F.pad(out, padding)
+    return out
+
+
 def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup, split_dim: str) -> None:
     if getattr(module, "_vllm_omni_spatial_shard_attention", False):
         return
     orig_forward = module.forward
+    local_queries_supported = (
+        isinstance(orig_forward, MethodType)
+        and orig_forward.__func__ is type(module).forward
+        and type(getattr(module, "to_qkv", None)) is nn.Conv2d
+        and type(getattr(module, "proj", None)) is nn.Conv2d
+        and all(
+            conv.kernel_size == (1, 1) and conv.stride == (1, 1) and conv.padding == (0, 0)
+            for conv in (module.to_qkv, module.proj)
+        )
+    )
 
     def _forward(self: nn.Module, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        from .wan_vae_fastpath.forwards import CFG_ATTR
+
+        cfg = getattr(self, CFG_ATTR, None)
         _, world_size = _rank_world(group)
         if world_size <= 1:
             return orig_forward(x, *args, **kwargs)
@@ -745,6 +824,17 @@ def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup, split_di
             gathered = _narrow_along_dim(gathered, dim, 0, trim_extent).contiguous()
         else:
             trim_extent = gathered_extent
+        if (
+            local_queries_supported
+            and cfg is not None
+            and cfg.channels_last
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not args
+            and not kwargs
+        ):
+            return _attention_local_queries(self, x, gathered, split_dim=split_dim, rank=_rank_world(group)[0])
         out = orig_forward(gathered, *args, **kwargs)
         if out.shape[dim] != trim_extent:
             raise RuntimeError(
@@ -864,7 +954,7 @@ def install_wan_spatial_shard_decode(
     convolutions/padding for halo-exchanging variants and wrapping
     ``decoder.forward``. The patch is permanent for the lifetime of the VAE
     instance and is applied only once (subsequent calls are no-ops). A given
-    instance is bound to a single ``split_dim`` and ``dst``; switching either
+    instance is bound to a single ``group``, ``split_dim`` and ``dst``; switching any
     requires a fresh VAE instance and raises here otherwise.
 
     With ``dst=0`` (the default) only group-relative rank 0 assembles the
@@ -892,10 +982,30 @@ def install_wan_spatial_shard_decode(
                 "Wan spatial-shard VAE decoder was already patched to assemble on "
                 f"{installed_dst!r}; create a fresh VAE instance to assemble on {dst!r}."
             )
+        if getattr(vae, "_vllm_omni_wan_spatial_shard_group", None) is not group:
+            raise ValueError(
+                "Wan spatial-shard VAE decoder was already patched for a different process group; "
+                "create a fresh VAE instance to change groups."
+            )
         return
     decoder = getattr(vae, "decoder", None)
     if decoder is None:
         raise ValueError("Wan spatial-shard VAE decode requires a decoder module.")
+
+    # Restore any direct/tile fast path before replacing convolution modules:
+    # its undo callbacks refer to those original modules. Reinstall only after
+    # the spatial wrapper exists, so it cannot be bypassed by a decoder forward.
+    from .wan_vae_fastpath.install import (
+        REPORT_ATTR,
+        SPATIAL_LEVEL_ATTR,
+        install_wan_vae_fastpath,
+        uninstall_wan_vae_fastpath,
+    )
+
+    report = getattr(vae, REPORT_ATTR, None)
+    fast_level = report.level if report is not None and report.installed else getattr(vae, SPATIAL_LEVEL_ATTR, None)
+    if report is not None and report.installed:
+        uninstall_wan_vae_fastpath(vae)
 
     _patch_decoder_modules(decoder, group, split_dim)
     upsample_count = _decoder_upsample_count(decoder)
@@ -952,6 +1062,9 @@ def install_wan_spatial_shard_decode(
     vae._vllm_omni_wan_spatial_shard_installed = True
     vae._vllm_omni_wan_spatial_shard_split_dim = split_dim
     vae._vllm_omni_wan_spatial_shard_dst = dst
+    vae._vllm_omni_wan_spatial_shard_group = group
+    if fast_level is not None:
+        install_wan_vae_fastpath(vae, level=fast_level)
     logger.info("Installed Wan VAE %s-sharded decode.", split_dim)
 
 
@@ -963,7 +1076,20 @@ def spatial_shard_decode(
     return_dict: bool = True,
     split_dim: str = "height",
     on_chunk: DecodedChunkConsumer | None = None,
+    temporal_chunk_size: int | None = None,
 ) -> DecoderOutput | tuple[torch.Tensor] | None:
+    """Decode spatial shards, optionally batching subsequent latent frames.
+
+    The first latent frame remains separate to initialize the temporal
+    upsamplers. Larger chunks amortize halo exchanges and kernel launches but
+    increase memory and may change convolution rounding, even with lossless
+    local kernels. None selects min(8, group size) for an installed channels-last
+    path and 1 otherwise. All ranks must use the same setting.
+    """
+    if temporal_chunk_size is not None and (
+        isinstance(temporal_chunk_size, bool) or not isinstance(temporal_chunk_size, int) or temporal_chunk_size < 1
+    ):
+        raise ValueError("temporal_chunk_size must be a positive integer")
     install_wan_spatial_shard_decode(vae, group, split_dim=split_dim)
 
     if z.shape[2] == 0:
@@ -972,6 +1098,12 @@ def spatial_shard_decode(
     # Non-rank-0 ranks must still run the decoder every chunk to stay in lockstep with
     # the halo/all-gather collectives; they just skip keeping/assembling the output.
     rank, world_size = _rank_world(group)
+    if temporal_chunk_size is None:
+        from .wan_vae_fastpath import REPORT_ATTR
+
+        report = getattr(vae, REPORT_ATTR, None)
+        channels_last = report is not None and report.installed and report.level == "channels_last"
+        temporal_chunk_size = min(8, world_size) if channels_last else 1
     produce_output = world_size <= 1 or rank == 0
 
     vae.clear_cache()
@@ -980,11 +1112,15 @@ def spatial_shard_decode(
         context = vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext()
         with context:
             x = vae.post_quant_conv(z)
+            preallocate = on_chunk is None and not torch.is_grad_enabled()
             decoded_chunks = []
-            for i in range(z.shape[2]):
+            out = None
+            offset = 0
+            frames_per_chunk = 2 ** sum(bool(flag) for flag in vae.decoder.temperal_upsample) if preallocate else 0
+            for i in chain((0,), range(1, z.shape[2], temporal_chunk_size)):
                 vae._conv_idx = [0]
                 chunk = vae.decoder(
-                    x[:, :, i : i + 1, :, :],
+                    x[:, :, i : i + (1 if i == 0 else temporal_chunk_size), :, :],
                     feat_cache=vae._feat_map,
                     feat_idx=vae._conv_idx,
                     first_chunk=(i == 0),
@@ -1000,10 +1136,23 @@ def spatial_shard_decode(
                             # surface the callback failure only after decode.
                             callback_error = exc
                     elif on_chunk is None:
-                        decoded_chunks.append(chunk)
+                        if preallocate:
+                            if vae.config.patch_size is not None:
+                                chunk = unpatchify(chunk, patch_size=vae.config.patch_size)
+                            if out is None:
+                                total_frames = chunk.shape[2] + (z.shape[2] - 1) * frames_per_chunk
+                                out = chunk.new_empty((*chunk.shape[:2], total_frames, *chunk.shape[3:]))
+                            end = offset + chunk.shape[2]
+                            torch.clamp(chunk, min=-1.0, max=1.0, out=out[:, :, offset:end])
+                            offset = end
+                        else:
+                            decoded_chunks.append(chunk)
                 del chunk
 
-            if produce_output and on_chunk is None:
+            if produce_output and on_chunk is None and preallocate:
+                if out is None or offset != out.shape[2]:
+                    raise RuntimeError("Wan spatial decoder produced an unexpected number of frames")
+            if produce_output and on_chunk is None and not preallocate:
                 out = torch.cat(decoded_chunks, dim=2)
                 if vae.config.patch_size is not None:
                     out = unpatchify(out, patch_size=vae.config.patch_size)
