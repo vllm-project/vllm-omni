@@ -29,6 +29,28 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
   --output output.mp4
 ```
 
+## Client Frame Diagnostics
+
+The generic streaming client counts decoded frames on a background worker so
+accounting does not hold up reception or scheduled controls. Its chunk log
+fields have distinct meanings:
+
+- `frames` is the server-declared `num_frames`, or `unknown` when absent.
+- `total_frames` is an asynchronous snapshot of frames actually decoded so far.
+  It may lag reception; differences between snapshots are not per-chunk frame
+  counts or instantaneous generation FPS.
+
+The final `[decode]` line follows end-of-input draining and includes decodable
+trailer frames. For interrupted streams it counts only decodable received media.
+Its elapsed time includes reception and draining, rather than model inference
+alone. Accounting failure, a 64 MiB pending-input overflow, cancellation during
+the drain, or a five-second worker shutdown timeout reports
+`total_frames=unknown` with a status reason. These accounting limits do not bound
+the whole-session bytes retained for saving or change the final save path.
+
+See the [streaming video example README](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/streaming_video_generation/README.md#run-the-client)
+for commands, buffering, and cancellation details.
+
 ## Protocol
 
 Control events are JSON text frames. Each `video.chunk_metadata` event is
@@ -37,6 +59,17 @@ bytes. If an encoding call emits no bytes yet, the server still sends its
 metadata followed by an empty binary frame (`byte_length: 0`). This preserves
 source counts and interaction events. Empty binary frames add no media to the
 stream and do not indicate completion; wait for `session.done`.
+
+An append-only decoder can produce a generation chunk with no stable frames
+yet. Its metadata is still sent with `num_frames=0` and `byte_length=0`, followed
+by an empty binary frame. This preserves chunk positions and interaction
+acknowledgements while the decoder holds future-dependent pixels.
+
+Models may also provide `frame_start` (the cumulative visible output position),
+`generated_raw_frames` (decoder positions before segment padding is omitted),
+`generated_frames` (available visible frames), and `withheld_frames` (available
+frames waiting for future context). Normal completion flushes withheld frames;
+cancellation discards them.
 
 | Direction | Event or frame | Purpose |
 | ----------- | ---------------- | --------- |

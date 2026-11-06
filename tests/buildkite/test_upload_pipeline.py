@@ -23,6 +23,7 @@ from upload_pipeline import (  # noqa: E402
     _expand_mirror_hardwares,
     _get_mirror_hw_selector,
     _load_bootstrap_steps,
+    _load_mirror_hardwares,
     _load_source_file_dependencies,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
@@ -171,6 +172,7 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
     assert step["retry"] == {
+        "manual": {"permit_on_passed": True},
         "automatic": [
             {"exit_status": -1, "limit": 1},
             {"exit_status": 128, "limit": 1},
@@ -191,6 +193,35 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     ]
 
 
+def test_every_hardware_preset_uses_shared_retry() -> None:
+    presets = _load_mirror_hardwares()
+    assert presets
+    for preset in presets.values():
+        assert preset["retry"]["manual"] == {"permit_on_passed": True}
+        assert preset["retry"]["automatic"] == [
+            {"exit_status": -1, "limit": 1},
+            {"exit_status": 128, "limit": 1},
+            {"signal_reason": "agent_stop", "limit": 1},
+            {"signal_reason": "agent_refused", "limit": 1},
+        ]
+
+
+def test_cpu_step_does_not_gain_hardware_retry() -> None:
+    rendered = _render_test_pipeline(
+        {
+            "steps": [
+                {
+                    "label": "CPU report",
+                    "commands": ["echo ok"],
+                    "agents": {"queue": "medium_cpu_queue_premerge"},
+                },
+            ],
+        },
+        changed_files=None,
+    )
+    assert "retry" not in rendered["steps"][0]
+
+
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
     step = _expand_mirror_hardwares(
         {
@@ -200,6 +231,7 @@ def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
         },
     )
     assert step["retry"] == {"automatic": [{"exit_status": 255, "limit": 2}]}
+    assert "manual" not in step["retry"]
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
