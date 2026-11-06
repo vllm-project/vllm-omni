@@ -76,11 +76,6 @@ _EAGER_CHUNK = 8
 # submodules/weights — inference-only, no model code changes required.
 
 
-@dataclasses.dataclass
-class _ShimOutput:
-    last_hidden_state: torch.Tensor
-
-
 def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
     """WhisperEncoder compute without the fixed-length assumptions.
 
@@ -101,15 +96,9 @@ def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
         out = layer(x, None)
         x = out[0] if isinstance(out, tuple) else out
     hidden = module.layer_norm(x)
-    try:
-        from transformers.modeling_outputs import BaseModelOutput
+    from transformers.modeling_outputs import BaseModelOutput
 
-        return BaseModelOutput(last_hidden_state=hidden)
-    except ImportError:
-        # Only the missing-import case degrades to the plain dataclass. A
-        # construction failure (e.g. upstream signature drift) is not an
-        # ImportError and must surface.
-        return _ShimOutput(last_hidden_state=hidden)
+    return BaseModelOutput(last_hidden_state=hidden)
 
 
 # Class-name keyed to avoid importing model libraries at module import.
