@@ -12,9 +12,10 @@ import os
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import concat_audio
+from tests.helpers.media import concat_audio, convert_audio_file_to_text, preprocess_text
 from tests.helpers.runtime import get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
@@ -24,7 +25,7 @@ MODEL = os.environ.get("SPARK_TTS_MODEL_PATH") or f"{get_model_prefix()}SparkAud
 DEPLOY_CONFIG = get_deploy_config_path("spark_tts.yaml")
 SAMPLE_RATE = 16_000
 
-pytestmark = pytest.mark.tts
+pytestmark = [pytest.mark.tts, pytest.mark.core_model, pytest.mark.advanced_model]
 
 
 @pytest.fixture(scope="module")
@@ -40,11 +41,8 @@ def spark_omni():
         engine.close()
 
 
-@pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_spark_tts_control_voice_offline(spark_omni: Omni) -> None:
-    """Text -> native Qwen2 stage -> BiCodec stage -> finite 16 kHz audio."""
-    outputs = spark_omni.generate([control_prompt("Hello, this is a Spark-TTS test.")])
+def _synthesize(spark_omni: Omni, text: str) -> np.ndarray:
+    outputs = spark_omni.generate([control_prompt(text)])
 
     assert len(outputs) == 1
     assert len(outputs[0].outputs) == 1
@@ -65,3 +63,30 @@ def test_spark_tts_control_voice_offline(spark_omni: Omni) -> None:
     if hasattr(sample_rate, "item"):
         sample_rate = sample_rate.item()
     assert sample_rate == SAMPLE_RATE
+    return audio
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_spark_tts_control_voice_offline(spark_omni: Omni) -> None:
+    _synthesize(spark_omni, "Hello, this is a Spark-TTS test.")
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_spark_tts_long_paragraph(spark_omni: Omni, run_level: str, tmp_path) -> None:
+    paragraph = (
+        "When we reached the village, the rain had finally stopped. "
+        "We crossed the bridge and waited by the station while the last train rolled out of sight. "
+        "A woman at the ticket window gave us a map and showed us the road that led to the harbor. "
+        "We followed it past the bakery and the old stone school, listening to the sound of the waves. "
+        "By the time we found the boat, every light along the shore was out. "
+        "We stood on the wooden deck until we heard the silver bell ring at midnight."
+    )
+    audio = _synthesize(spark_omni, paragraph)
+    # The old 1024-token cap could emit at most ~20.5 s at 50 codec frames/s.
+    assert audio.size > 21 * SAMPLE_RATE, f"Long paragraph cut short at {audio.size / SAMPLE_RATE:.2f} s"
+    if run_level == "advanced_model":
+        path = tmp_path / "paragraph.wav"
+        sf.write(path, audio, SAMPLE_RATE)
+        transcript = convert_audio_file_to_text(str(path), language="en")
+        tail = preprocess_text(transcript).split()[-12:]
+        assert "midnight" in tail and ("silver" in tail or "bell" in tail), transcript

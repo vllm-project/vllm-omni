@@ -27,7 +27,7 @@ stages:
       temperature: 0.8
       top_k: 50
       top_p: 0.95
-      max_tokens: 1024
+      max_tokens: 3000
       seed: 0
 
   - stage_id: 1

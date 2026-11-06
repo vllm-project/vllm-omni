@@ -274,9 +274,9 @@ steps:
         commands:
           - |
             # The pinned source and codec dependencies are cached in Dockerfile.ci.
-            test -f "${SPARK_TTS_SOURCE:?Spark-TTS source missing from CI image}/sparktts/models/bicodec.py"
-            export PYTHONPATH="$SPARK_TTS_SOURCE:${PYTHONPATH:-}"
-            pytest -s -v tests/e2e/offline_inference/test_spark_tts.py \
+            test -f "$${SPARK_TTS_SOURCE:?Spark-TTS source missing from CI image}/sparktts/models/bicodec.py"
+            export PYTHONPATH="$$SPARK_TTS_SOURCE:$${PYTHONPATH:-}"
+            timeout -k 2m 25m pytest -s -v tests/e2e/offline_inference/test_spark_tts.py \
               -m 'core_model and tts and cuda and L4 and cards_1' --run-level core_model
         mirror_hardwares: l4_1
 

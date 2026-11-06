@@ -58,6 +58,14 @@ def test_clone_with_transcript_preserves_reference_text_and_semantics():
     )
 
 
+@pytest.mark.parametrize(
+    "reference,target,boundary",
+    [("Reference.", "Hello.", "Reference.Hello."), ("参考。", "你好。", "参考。你好。")],
+)
+def test_clone_uses_official_verbatim_transcript_boundary(reference, target, boundary):
+    assert f"<|start_content|>{boundary}<|end_content|>" in clone_prompt(target, [7], [3], reference)
+
+
 def test_clone_rejects_missing_reference_codes():
     with pytest.raises(ValueError, match="reference global codes"):
         clone_prompt("Hello.", [], [7])

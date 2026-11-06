@@ -497,7 +497,7 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # The IndexTTS 2.5 bundle and Spark BiCodec checkpoint lack a HuggingFace config.json.
             # Keep this exception model-scoped so other loader failures retain
             # vLLM's normal error path.
             if model_type not in ("indextts2_5", "spark_bicodec") or not os.path.isdir(self.model):
