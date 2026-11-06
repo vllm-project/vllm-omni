@@ -1307,6 +1307,7 @@ class WholeEulerCFMGraphWrapper:
         # from the arena's so an arena flush never retires them.
         self.att_slots = int(att_slots) if ragged_body is not None and modulation_fn is not None else 0
         self.slot_pool: AttSlotPool | None = None
+        self.npu_mixed_history = False
         self.row_offsets = bool(row_offsets) and self.att_slots > 0
         self._slot_arena = WholeEulerExecutionArena(**arena_args)
         self._slot_graphs: dict[tuple, tuple] = {}
@@ -2077,7 +2078,12 @@ class WholeEulerCFMGraphWrapper:
         # Mixed histories use per-row masks and output slices in either the
         # resident slot pool or the padded arena.
         mixed_offsets = att_rows is not None and len({int(row.shape[4]) for row in att_rows}) != 1
-        if mixed_offsets and x.device.type != "cuda" and not self.row_offsets:
+        if (
+            mixed_offsets
+            and x.device.type != "cuda"
+            and not self.row_offsets
+            and not (x.device.type == "npu" and self.npu_mixed_history)
+        ):
             return None
         if att_rows is not None:
             if len(att_rows) != batch_size or (mixed_offsets and (valid_lengths is None or attn_mask is None)):
@@ -2134,9 +2140,8 @@ class WholeEulerCFMGraphWrapper:
                     for cache, length in zip(slotted[2], prompt_lengths, strict=True):
                         cache.layout = cache.layout[:length]
                 return slotted
-        # Mixed-offset arena replay is currently validated only on CUDA.
-        # Preserve the existing opt-in slot path on other platforms.
-        if mixed_offsets and x.device.type != "cuda":
+        # NPU mixed-offset arena replay is controlled by the NPU batching configuration.
+        if mixed_offsets and x.device.type != "cuda" and not (x.device.type == "npu" and self.npu_mixed_history):
             return None
         if att_rows is not None:
             # A refused slot replay can leave resident rows; the arena path reads tensors.
