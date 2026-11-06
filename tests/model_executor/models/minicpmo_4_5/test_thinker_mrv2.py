@@ -38,6 +38,10 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3
+    assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
+    # The base profile's V1 Talker multi-frame block must not reach the MRv2 Talker.
+    assert stages[1].yaml_engine_args.get("speculative_config") is None
+    assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
 
 
 def _model(mocker, *, v2=True, session="turn", async_chunk=False):
@@ -55,7 +59,18 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False):
             async_chunk=async_chunk,
         )
     )
+    if session is None:
+        del config.model_config.session_mode
     return omni.MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
+
+
+@pytest.mark.parametrize("session", ["turn", "duplex", None])
+def test_mrv2_thinker_output_cache_requires_explicit_turn_mode(mocker, session):
+    model = _model(mocker, session=session)
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner._snapshot_prefix_cache_model_policy(model)
+    assert model.supports_mrv2_prefix_cache_outputs is (session == "turn")
+    assert runner._omni_cache_policy.native_kv_cache_only is (session != "turn")
 
 
 def test_mrv2_thinker_keeps_native_multimodal_embeddings_and_raw_ids(mocker):
@@ -76,6 +91,113 @@ def test_mrv2_thinker_keeps_native_multimodal_embeddings_and_raw_ids(mocker):
     result = model(ids, torch.tensor([5, 6, 7]), inputs_embeds=embeds)
     assert result is hidden
     torch.testing.assert_close(model.thinker.forward.call_args.kwargs["inputs_embeds"], embeddings)
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("shared_tokens", [4, 6, 8])
+def test_turn_prefix_hit_restores_latent_ledger_before_talker(mocker, monkeypatch, async_chunk, shared_tokens):
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    from tests.core.test_prefix_cache_mrv2 import input_batch, sched_output
+    from tests.worker_v2.test_omni_ar_model_runner import _async_output
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+    from vllm_omni.core.prefix_cache.group_view import MRv2FullAttentionGroupView
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+    from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _turn_hidden_rows
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    # Exercise the real cache manager and MRv2 save/rewrite path on CPU.
+    # Only device streams and distributed rank discovery are replaced.
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    mocker.patch("vllm.distributed.parallel_state.get_pp_group", return_value=SimpleNamespace(is_last_rank=True))
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=SimpleNamespace(is_first_rank=True))
+    model = _model(mocker, async_chunk=async_chunk)
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner._snapshot_prefix_cache_model_policy(model)
+    assert not runner._omni_cache_policy.native_kv_cache_only
+    runner.is_pooling_model = False
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="latent"))
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter(track_requests=True)
+    runner._prefix_cache_group_view = MRv2FullAttentionGroupView(runner._prefix_cache_adapter, 4)
+    cache = OmniPrefixCacheManager(PrefixCacheConfig(num_blocks=16, block_size=4), eager=True)
+    cache.register_policy(runner._omni_cache_policy)
+    runner.omni_prefix_cache = cache
+
+    def payload(ids, positions):
+        return torch.stack((ids, positions), dim=1).float()
+
+    def save(rows, ids, positions, **scheduled):
+        runner._prefix_cache_step_begin(sched_output(scheduled={r: n for r, _, n in rows}, **scheduled))
+        batch = input_batch(rows)
+        batch.input_ids = torch.tensor(ids)
+        batch.positions = torch.tensor(positions)
+        batch.num_tokens = len(ids)
+        batch.num_tokens_after_padding = len(ids)
+        batch.query_start_loc_np = np.concatenate(([0], np.cumsum(batch.num_scheduled_tokens)))
+        output = model.make_omni_output_mrv2(
+            payload(batch.input_ids, batch.positions),
+            input_batch=batch,
+            req_states=None,
+            model_intermediate_buffer=None,
+        )
+        rewrite = runner._prefix_cache_save_mrv2(batch, output.text_hidden_states, output.multimodal_outputs)
+        return batch, output, rewrite
+
+    try:
+        # Cache two complete blocks, then finish their original request.
+        _, _, rewrite = save([("seed", 0, 8)], range(10, 18), range(8), new=[("seed", 0, [0, 1])])
+        assert rewrite is None
+        runner._prefix_cache_step_begin(sched_output(finished=["seed"]))
+
+        # Only complete matching blocks are reusable. With six shared tokens,
+        # recompute positions 4/5 and replace the old seed's positions 6/7.
+        # Never report six computed tokens: sub-block hits are unsupported.
+        cached_tokens = shared_tokens // 4 * 4
+        full_ids = torch.tensor([*range(10, 10 + shared_tokens), 90, 91])
+        full_positions = torch.arange(shared_tokens + 2)
+        tail_tokens = len(full_ids) - cached_tokens
+        # Put a miss before the hit so cache restoration must use the batch row.
+        ids = [100, 101, 102, *full_ids[cached_tokens:].tolist()]
+        positions = [0, 1, 2, *full_positions[cached_tokens:].tolist()]
+        # Allocate fresh blocks after the shared full blocks, as the scheduler
+        # does when the rest of the seed's second block no longer matches.
+        hit_blocks = [0, 1, 2] if cached_tokens == 8 else [0, 4, 5]
+        batch, output, rewrite = save(
+            [("miss", 0, 3), ("hit", cached_tokens, tail_tokens)],
+            ids,
+            positions,
+            new=[("hit", cached_tokens, hit_blocks), ("miss", 0, [3])],
+        )
+        assert rewrite is not None
+        assert rewrite.rows == ((1, "hit"),)
+        finalize = runner._prefix_cache_output_finalizer(rewrite, None, mergeable=True)
+        result = _async_output(
+            req_ids=batch.req_ids,
+            sampler_output=SamplerOutput(
+                torch.tensor([[1], [2]]), None, None, torch.tensor([1, 1]), torch.tensor([0, 0])
+            ),
+            text_hidden=output.text_hidden_states,
+            multimodal_outputs=output.multimodal_outputs,
+            input_batch=batch,
+            async_chunk=async_chunk,
+            partition_async_payload=False,  # llm2tts uses the orchestrator bridge.
+            finalize_output=finalize,
+        ).get_output()
+        miss, hit = result.pooler_output
+        expected = payload(full_ids, full_positions)
+        torch.testing.assert_close(hit["latent"], expected)
+        torch.testing.assert_close(hit["latent_input_ids"].flatten(), full_ids)
+        torch.testing.assert_close(hit["latent_positions"].flatten(), full_positions)
+        torch.testing.assert_close(miss["latent"], payload(torch.tensor(ids[:3]), torch.tensor(positions[:3])))
+        torch.testing.assert_close(miss["latent_input_ids"].flatten(), torch.tensor(ids[:3]))
+        torch.testing.assert_close(miss["latent_positions"].flatten(), torch.tensor(positions[:3]))
+        # A reply can start inside a reused block. Its Talker condition must
+        # match a cold forward, including both cached rows and this step's tail.
+        restored = _turn_hidden_rows(hit, hit["latent"], full_ids.tolist(), 2, len(full_ids), "hit")
+        torch.testing.assert_close(restored, expected[2:])
+    finally:
+        cache.shutdown()
 
 
 def test_row_ledger_uses_live_batch_after_replay(mocker):
@@ -104,6 +226,9 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
 
 def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     model = _model(mocker, session="duplex")
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner._snapshot_prefix_cache_model_policy(model)
+    assert runner._omni_cache_policy.native_kv_cache_only
     assert model.has_preprocess is True
     # Row "a" completes its append prefill on this step; row "b" decodes.
     batch = SimpleNamespace(
