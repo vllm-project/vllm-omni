@@ -1446,6 +1446,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         if stage_id != self.joyai_stage_id or not segment_finished:
             return None

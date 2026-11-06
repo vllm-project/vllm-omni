@@ -28,12 +28,5 @@ class ResponseJudgeQwen3ForCausalLM(Qwen3ForCausalLM):
     ) -> torch.Tensor | IntermediateTensors:
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: Any = None,
-    ) -> torch.Tensor | None:
-        return super().compute_logits(hidden_states)
-
 
 __all__ = ["ResponseJudgeQwen3ForCausalLM"]

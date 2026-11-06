@@ -188,6 +188,7 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         # Always-clocked model: what the client hears comes from the final
         # stage data plane, never from a Stage 0 listen/speak decision.

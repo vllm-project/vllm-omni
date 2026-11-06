@@ -177,8 +177,8 @@ stage 1 with the LAYA pooling judge. Serve
 - **Another chat model:** the `aura_omni_judged` pipeline defaults stage 1
   to `model_arch: ResponseJudgeQwen3ForCausalLM`, so a non-Qwen3 judge must
   also set `model_arch`. The omni runner passes extra keyword arguments to
-  `forward` and `compute_logits`; a model class that does not accept them
-  needs a thin subclass like `ResponseJudgeQwen3ForCausalLM`, registered in
+  `forward`; a model class that does not accept them needs a thin subclass
+  like `ResponseJudgeQwen3ForCausalLM`, registered in
   `vllm_omni/model_executor/models/registry.py`:
 
     ```yaml
@@ -201,8 +201,12 @@ stage 1 with the LAYA pooling judge. Serve
 - **Another pipeline:** add a stage with `model_stage="response_judge"` right
   after the ASR stage. Build its input with `judge_input(...)`, and wrap the
   pipeline's original ASR -> main-model bridge with `after_judge(...)`. A
-  duplex plugin that addresses stages by number must account for the extra
-  stage (AURA uses a role-based stage layout).
+  duplex integration handles rejection in the host plugin
+  `decide_output` hook, using `judge_rejects(output, streaming_context)`
+  and its existing listen decision. The plugin and `after_judge` share the
+  request-owned decision cache. The orchestration layer does not interpret
+  judge outputs. AURA resolves stage ids from configured roles at startup;
+  missing required roles or duplicate roles fail configuration validation.
 
 ## Latency
 
