@@ -252,6 +252,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
             )
             self.logits_vocab_size = int(self.talker.logits_vocab_size)
+            # CUDA K-step fused graph hooks live on the Talker; the runner sees
+            # this wrapper (after cudagraph unwrapping), so delegate them here.
+            for hook_name in (
+                "prepare_cuda_kstep",
+                "cuda_kstep_frame",
+                "commit_cuda_kstep",
+                "warmup_kstep_sampling_kernels",
+            ):
+                hook = getattr(self.talker, hook_name, None)
+                if callable(hook):
+                    setattr(self, hook_name, hook)
         else:
             raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts'")
 
@@ -306,6 +317,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
+
+    @property
+    def tts_model(self) -> nn.Module | None:
+        """The Talker's transformer, without registering a duplicate submodule."""
+        talker = getattr(self, "talker", None)
+        return getattr(talker, "tts_model", None) if talker is not None else None
 
     def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""

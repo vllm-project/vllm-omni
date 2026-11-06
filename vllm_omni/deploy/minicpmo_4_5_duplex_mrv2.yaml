@@ -13,6 +13,16 @@ stages:
     async_chunk: false
 
 platforms:
+  cuda:
+    # MR v2 does not implement the Talker K-step re-embed: its decode
+    # preprocess embeds the ids the runner gathered (the placeholder continue
+    # ids under speculation) instead of the real previous codec frame, so the
+    # model refuses to arm multi-frame decode on this runner. Drop the spec
+    # block inherited from the base profile; this profile runs single-frame
+    # Talker decode.
+    stages:
+      - stage_id: 1
+        speculative_config: null
   npu:
     model_runner: v1
   xpu:
