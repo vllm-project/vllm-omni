@@ -14,7 +14,7 @@ import hashlib
 import io
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -23,9 +23,18 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
-from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.plugin import (
+    DuplexAuxiliaryPolicy,
+    DuplexAuxiliaryRequest,
+    DuplexDataPlane,
+    DuplexModelPlugin,
+    DuplexRuntimeConfigError,
+)
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import HistoryWork, Message
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -341,10 +350,59 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.processor = None
         self._processor_lock = asyncio.Lock()
         self._history_calibrator = None
+        self._history_runtime = QwenHistoryRuntime("recent", {})
+        self._history_configuration = None
         # Checkpoint speaker names, loaded once from the stage-0 model config.
         # ``None`` means "not attempted" (no validation); an empty set means the
         # checkpoint declares no speaker_id mapping (names pass through unvalidated).
         self._supported_speakers: set[str] | None = None
+
+    def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Load trusted server history settings before binding the model processor."""
+        options = dict(runtime_config.model_options)
+        name = options.pop("history_policy", "recent")
+        limits = options.pop("history_limits", {})
+        if options or not isinstance(name, str) or not isinstance(limits, dict):
+            raise DuplexRuntimeConfigError("Invalid Qwen server model_options")
+        if self._history_configuration == (name, limits):
+            return
+        self._history_runtime = QwenHistoryRuntime(name, limits)
+        self._history_configuration = (name, dict(limits))
+        self.supports_auxiliary_requests = self._history_runtime.policy is not None
+
+    def auxiliary_policy(
+        self, *, state: QwenDuplexSessionState, history_revision: int, history: Sequence[Message]
+    ) -> DuplexAuxiliaryPolicy | None:
+        """Reconcile changed Session sources; unchanged stream events reuse planning."""
+        if self._history_runtime.policy is None:
+            return None
+        return self._history_runtime.policy_for(state.history_policy_state, history, history_revision)
+
+    async def prepare_auxiliary_request(
+        self,
+        *,
+        history: tuple[tuple[str, str], ...],
+        runtime_config: Mapping[str, object],
+        state: QwenDuplexSessionState,
+    ) -> DuplexAuxiliaryRequest | None:
+        """Build one bounded summary from effective history and still-readable audio."""
+        if self._history_runtime.policy is None:
+            return None
+        return await self._history_runtime.prepare(state.history_policy_state, lambda: state.audio_history)
+
+    def auxiliary_source_matches(
+        self, *, request: DuplexAuxiliaryRequest, state: QwenDuplexSessionState, history: Sequence[Message]
+    ) -> bool:
+        """Check current effective sources before submission or late-result application."""
+        memory = state.history_policy_state
+        memory.reconcile(history)
+        return isinstance(request.model_source, HistoryWork) and memory.matches(request.model_source, history)
+
+    def apply_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object, state: QwenDuplexSessionState
+    ) -> bool:
+        """Apply a valid private summary on the session loop without emitting output."""
+        return self._history_runtime.apply(state.history_policy_state, request, output)
 
     def history_calibrator(self, runtime_config):
         if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
@@ -391,7 +449,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             session_admission_mode="engine_managed",
             supports_audio_truncate=True,
             supports_chat_completions=True,
-            supports_image_input=True,
+            supports_image_input=self._history_runtime.policy is None,
             # Frames arrive as input_image conversation items, never on an
             # audio append (QwenPcmBuffer.prepare_append refuses video_frames).
             optional_input_modalities=frozenset(),
@@ -408,6 +466,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def validate_client_extra_body(self, extra_body):
         if not isinstance(extra_body, Mapping):
             return
+        if self._history_runtime.policy is not None and extra_body.get("realtime_tools"):
+            raise DuplexRuntimeConfigError("Experimental Qwen history policies do not support tools")
         if extra_body.get("auto_response"):
             raise DuplexRuntimeConfigError(
                 "Qwen requires server VAD or explicit commits; native auto_response is unsupported"
@@ -446,6 +506,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                     trust_remote_code=model_config.trust_remote_code,
                     revision=getattr(model_config, "revision", None),
                 )
+        if self._history_runtime.policy is not None:
+            self._history_runtime.bind(self.processor, model_config)
         return self.runtime_config_for_update(config, {})
 
     def runtime_config_for_update(self, config, current):
@@ -865,7 +927,23 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 params[0].max_tokens = runtime_config["max_tokens"]
         return params
 
-    def prepare_prompt_config(self, config, *, state, payload):
+    def prepare_prompt_config(
+        self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
+    ) -> dict[str, object]:
+        """Capture effective input on the session loop before offloading rendering."""
+        if self._history_runtime.policy is None:
+            return self._prepare_recent_prompt_config(config, state=state, payload=payload)
+        self._history_runtime.validate_history(config.get("conversation", ()))
+        previous_audio = list(state.audio_history)
+        prepared = self._prepare_recent_prompt_config(config, state=state, payload=payload)
+        memory = state.history_policy_state
+        memory.reconcile(config.get("conversation", ()))
+        memory.retain([*previous_audio, *state.audio_history], self._history_runtime.limits)
+        prepared[HISTORY_PROMPT] = self._history_runtime.foreground(memory, payload, state.audio_history)
+        logger.debug("Qwen history memory counts=%s retained_audio_bytes=%d", dict(memory.counts), memory.audio_bytes)
+        return prepared
+
+    def _prepare_recent_prompt_config(self, config, *, state, payload):
         history = config.get("conversation", [])
         bind_from = 0
         lengths = []
@@ -1092,6 +1170,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ):
         if not final or not isinstance(payload, dict):
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+        if HISTORY_PROMPT in session_config:
+            output_tokens = getattr(sampling_params, "max_tokens", None) or 2048
+            return DuplexAppendPlan(
+                prompt=self._history_runtime.build_foreground(
+                    session_config[HISTORY_PROMPT], runtime_config, output_tokens
+                )
+            )
         has_audio = bool(payload.get("audio"))
         if not has_audio and payload.get("type") != "conversation":
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")

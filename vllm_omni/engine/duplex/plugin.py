@@ -454,6 +454,11 @@ class DuplexModelPlugin(ABC):
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
 
+    def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Validate server-owned model options before accepting sessions."""
+        if runtime_config.model_options:
+            raise DuplexRuntimeConfigError(f"{self.plugin_id} does not support model_options")
+
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""
         return 0
