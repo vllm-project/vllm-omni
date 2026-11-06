@@ -54,6 +54,7 @@ def get_prompt():
     return "Analyse the audio, image or video provided"
 
 
+@pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -73,6 +74,7 @@ def test_analyse_text_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -92,6 +94,7 @@ def test_analyse_prompt_without_attached_media(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -114,6 +117,7 @@ def test_analyse_audio_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -136,6 +140,7 @@ def test_analyse_long_audio_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -158,6 +163,7 @@ def test_analyse_image_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -182,6 +188,7 @@ def test_analyse_large_image_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -206,6 +213,7 @@ def test_analyse_video_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -228,6 +236,7 @@ def test_analyse_long_video_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
