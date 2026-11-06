@@ -150,12 +150,16 @@ class StreamingVideoDecoder:
         return frame_start, self._to_uint8_device(frames)
 
     def flush(self) -> tuple[int, np.ndarray | None]:
-        """Emit the held five-frame overlap of the last window (end of a session)."""
+        frame_start, frames = self.flush_device()
+        return frame_start, self.to_host(frames)
+
+    def flush_device(self) -> tuple[int, torch.Tensor | np.ndarray | None]:
+        """Emit the held final overlap while keeping output-owner frames on the device."""
         if self.overlap is None:
             return self.frames_emitted, None
         frame_start = self.frames_emitted
         if self.emit_frames:
-            frames = self._to_uint8(self.overlap)
+            frames = self._to_uint8_device(self.overlap)
         else:
             frames = np.zeros((_OVERLAP_FRAMES, 0, 0, 3), dtype=np.uint8)
         self.frames_emitted += _OVERLAP_FRAMES
@@ -187,14 +191,17 @@ class StreamingAudioDecoder:
         self.total += int(latents.shape[2])
 
     def decode_range(self, s0: int, s1: int) -> np.ndarray:
-        """Return samples ``[s0, s1)`` as float32 ``[n, 2]``.
+        return self.decode_range_device(s0, s1).cpu().numpy()
+
+    def decode_range_device(self, s0: int, s1: int) -> torch.Tensor:
+        """Return device samples ``[s0, s1)`` as float32 ``[n, 2]``.
 
         The video timeline may outrun the generated audio by less than one
         latent at the end of a session (audio boundaries are rounded to 40 Hz
         latents); that tail is padded with silence rather than refused.
         """
         if s1 <= s0:
-            return np.zeros((0, 2), dtype=np.float32)
+            return torch.zeros((0, 2), dtype=torch.float32, device=self.device)
         if self.latents is None:
             raise RuntimeError("no audio latents have been appended")
         available = self.total * AUDIO_SAMPLES_PER_LATENT
@@ -203,7 +210,7 @@ class StreamingAudioDecoder:
         requested = s1 - s0
         s1 = min(s1, available)
         if s1 <= s0:
-            return np.zeros((requested, 2), dtype=np.float32)
+            return torch.zeros((requested, 2), dtype=torch.float32, device=self.device)
         l0 = max(self.base, s0 // AUDIO_SAMPLES_PER_LATENT - self.left)
         l1 = min(self.total, -(-s1 // AUDIO_SAMPLES_PER_LATENT) + self.right)
         window = self.latents[:, :, l0 - self.base : l1 - self.base]
@@ -219,10 +226,9 @@ class StreamingAudioDecoder:
         if keep_from > self.base:
             self.latents = self.latents[:, :, keep_from - self.base :].contiguous()
             self.base = keep_from
-        samples = segment.cpu().numpy()
-        if samples.shape[0] < requested:
-            samples = np.concatenate((samples, np.zeros((requested - samples.shape[0], 2), np.float32)), axis=0)
-        return samples
+        if segment.shape[0] < requested:
+            segment = torch.cat((segment, segment.new_zeros((requested - segment.shape[0], 2))), dim=0)
+        return segment
 
     def skip_range(self, s1: int) -> None:
         """Advance the retained-latent window as if samples up to ``s1`` were decoded."""

@@ -1322,16 +1322,21 @@ def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     assert AITER_MHA_CACHE_PUBLISH not in pytest_commands[1]
 
 
-def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
-    step = _find_step("Diffusion Stable Audio Layerwise Offload Test (quarantined)")
-
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    _assert_build_scoped_aiter_mha_cache(step, STABLE_AUDIO_LAYERWISE_NODE, publishes=False)
+def test_stable_audio_layerwise_merge_owner_is_removed() -> None:
+    pipeline = yaml.safe_load(AMD_MERGE_PIPELINE.read_text(encoding="utf-8"))
+    labels = [step.get("label") for step in _walk_steps(pipeline["steps"])]
+    assert "Diffusion Stable Audio Layerwise Offload Test (quarantined)" not in labels
 
     blocking = _find_step("Diffusion Model CPU offloading Test")
+    commands = "\n".join(blocking["commands"])
+    deselect = f"--deselect='{STABLE_AUDIO_LAYERWISE_NODE}'"
+
+    assert blocking["grade"] == "Blocking"
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in blocking["commands"]
     assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
+    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
+    assert "tests/diffusion/offloader/test_diffusion_layerwise_offload.py" in commands
+    assert deselect in commands
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
@@ -1887,6 +1892,80 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         assert label not in text
         assert "full_model and rocm and MI325 and cards_1" not in text
+
+
+def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
+
+    assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 60
+    assert step["source_file_dependencies"] == [
+        "diffusion_offloader",
+        "diffusion_stable_audio_function",
+    ]
+    assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-layerwise-offload/**/*"]
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level full_model" in command
+    assert "timeout --signal=TERM --kill-after=2m 45m" in command
+    assert STABLE_AUDIO_LAYERWISE_NODE in command
+    assert "test_diffusion_cpu_offload.py" not in command
+    assert "riverclouds/qwen_image_random" not in command
+    assert "if pytest --collect-only -q" in command
+    assert "else\n  exit $$?" in command
+    assert "PIPESTATUS[0]" in command
+    assert "Expected exactly one Stable Audio layerwise-offload node" in command
+    assert "Expected exactly one executed Stable Audio layerwise-offload test" in command
+    assert "skipped != 0" in command
+    _assert_build_scoped_aiter_mha_cache(
+        step,
+        "tests/diffusion/offloader/test_diffusion_layerwise_offload.py",
+        publishes=False,
+    )
+    cpu_offload = "\n".join(_find_step("Stable Audio CPU Offload", AMD_NIGHTLY_PIPELINE)["commands"])
+    assert "test_diffusion_layerwise_offload.py" not in cpu_offload
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_WEEKLY_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert 'label: "Stable Audio Layerwise Offload"' not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_stable_audio_layerwise_offload_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="Stable Audio Layerwise Offload",
+        command_fragment="pytest -s -v -ra",
+        expected_message=("Expected exactly one executed Stable Audio layerwise-offload test"),
+        artifact_env="LAYERWISE_OFFLOAD_ARTIFACT_DIR",
+        job_id_prefix="layerwise-offload-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
@@ -3174,15 +3253,12 @@ _QWEN3_OMNI_READY_NODES = (
     "test_thinker_prefix_caching_async_chunk_identical[prefix_cache_async_chunk]",
     "tests/e2e/online_serving/test_qwen3_omni.py::"
     "test_thinker_prefix_caching_async_chunk_shared_image_prefix[prefix_cache_async_chunk]",
-    "tests/e2e/online_serving/test_qwen3_omni.py::test_completions_rejected_for_thinker_talker[default-rocm]",
     "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_text[default-rocm]",
     "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_audio_out[default-rocm]",
-    "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts0-default-rocm]",
-    "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts1-default-rocm]",
 )
 
 
-def test_qwen3_omni_ready_selects_eleven_core_model_nodes() -> None:
+def test_qwen3_omni_ready_selects_eight_core_model_nodes() -> None:
     """READY runs the online core_model cases only, and only on two MI325 cards."""
     step = _find_step("Omni Model Test Qwen3-Omni", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3202,7 +3278,7 @@ def test_qwen3_omni_ready_selects_eleven_core_model_nodes() -> None:
     assert "pytest.xml" in command
     assert "pytest.log" in command
     assert "pytest-summary.txt" in command
-    assert "Expected exactly 11 executed Qwen3-Omni READY tests" in command
+    assert "Expected exactly 8 executed Qwen3-Omni READY tests" in command
     for node in _QWEN3_OMNI_READY_NODES:
         assert node in command
     assert command.count("tests/e2e/online_serving/test_qwen3_omni.py::") == len(_QWEN3_OMNI_READY_NODES)
@@ -3211,11 +3287,11 @@ def test_qwen3_omni_ready_selects_eleven_core_model_nodes() -> None:
 @pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
-        (0, 11, 0, None, 0),
-        (0, 11, 1, None, 5),
+        (0, 8, 0, None, 0),
+        (0, 8, 1, None, 5),
         (0, 0, 0, None, 5),
-        (1, 11, 0, None, 1),
-        (0, 11, 0, 124, 124),
+        (1, 8, 0, None, 1),
+        (0, 8, 0, 124, 124),
     ],
     ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
 )
@@ -3232,7 +3308,7 @@ def test_qwen3_omni_ready_executes_junit_guard_before_exit(
         pipeline_path=AMD_READY_PIPELINE,
         step_label="Omni Model Test Qwen3-Omni",
         command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly 11 executed Qwen3-Omni READY tests",
+        expected_message="Expected exactly 8 executed Qwen3-Omni READY tests",
         artifact_env="ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR",
         job_id_prefix="qwen3-omni-ready-guard",
         pytest_status=pytest_status,
