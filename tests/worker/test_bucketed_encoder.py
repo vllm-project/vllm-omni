@@ -149,17 +149,24 @@ def _cfg_with(raw):
 
 @contextmanager
 def capture_encoder_logs(caplog):
-    """Route the wrapper's logger into ``caplog`` (vllm loggers do not
-    propagate to the root logger, so the handler must be attached directly)."""
+    """Route the wrapper's logger into ``caplog``.
+
+    vLLM loggers propagate to the root logger, so while the capture handler is
+    attached we disable propagation — otherwise every record is captured twice
+    (once here, once via the root) and "exactly once" assertions over-count.
+    """
     target_logger = logging.getLogger("vllm_omni.worker.bucketed_encoder")
     target_logger.addHandler(caplog.handler)
     previous_level = target_logger.level
+    previous_propagate = target_logger.propagate
     target_logger.setLevel(logging.DEBUG)
+    target_logger.propagate = False
     try:
         yield
     finally:
         target_logger.removeHandler(caplog.handler)
         target_logger.setLevel(previous_level)
+        target_logger.propagate = previous_propagate
 
 
 @pytest.fixture()
