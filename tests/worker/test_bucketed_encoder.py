@@ -839,20 +839,26 @@ def test_reads_model_published_length_field_scaled(bucket_cfg, monkeypatch):
     assert sorted(model.encoder.calls[calls_before:]) == sorted([(1, 40, D), (2, 100, D), (1, 200, D)])
 
 
-def test_missing_length_field_falls_back_to_original(bucket_cfg):
+def test_missing_length_field_falls_back_to_original(bucket_cfg, caplog):
     """A request whose mm batch carries no length field runs the untouched
     forward (nothing can leak from an earlier call — the wrapper holds no
-    state; see test_each_call_carries_its_own_lengths)."""
+    state; see test_each_call_carries_its_own_lengths). The silent-death case
+    (bucketing never engages, e.g. a wrong length field) surfaces as exactly
+    one warning, then goes quiet at debug level."""
     model = ToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
 
     feats = make_features()
-    with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats)
-        calls_before = len(model.encoder.calls)
-        out = model.embed_multimodal(audio_features=feats)
+    with capture_encoder_logs(caplog):
+        with torch.inference_mode():
+            model.embed_multimodal(audio_features=feats)  # first fallback: warns once
+            calls_before = len(model.encoder.calls)
+            out = model.embed_multimodal(audio_features=feats)  # later fallbacks: debug
     assert out.shape == feats.shape
     assert model.encoder.calls[calls_before:] == [(len(LENGTHS), 240, D)]
+    missing_logs = [r for r in caplog.records if "no per-item lengths" in r.getMessage()]
+    assert len(missing_logs) == 2, "the fallback must log every time"
+    assert sum(r.levelno == logging.WARNING for r in missing_logs) == 1, "the warning must fire exactly once"
 
 
 def test_positional_host_lengths_fallback_still_buckets(bucket_cfg):
