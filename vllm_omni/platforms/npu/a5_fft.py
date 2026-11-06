@@ -42,6 +42,11 @@ def _warn_fallback(op: str, error: Exception) -> None:
     warnings.warn(f"A5 FFT {op} failed ({error}); falling back to CPU", RuntimeWarning, stacklevel=3)
 
 
+def fallback_counts() -> dict[str, int]:
+    """Return A5 FFT CPU-fallback counts by operation."""
+    return dict(_FALLBACK_COUNTS)
+
+
 @lru_cache(maxsize=16)
 def _hann_numpy(window_length: int, periodic: bool) -> np.ndarray:
     if window_length == 0:

@@ -312,6 +312,14 @@ def test_istft_fft_full_spectrum_real_output_matches_torch() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_istft_fft_rejects_complex_output_with_full_spectrum() -> None:
+    module = _load_module()
+    spec = torch.zeros(1, 4, 1, dtype=torch.complex64)
+    spec[0, 1, 0] = 1
+    with pytest.raises(module._FallbackError):
+        module._istft_fft(spec, 4, 4, 4, torch.ones(4), False, False, False, None, True)
+
+
 def test_istft_envelope_cache_recomputes_after_window_mutation() -> None:
     module = _load_module()
     torch.manual_seed(7)
@@ -338,6 +346,7 @@ def test_istft_fft_handles_inference_window() -> None:
         expected = torch.istft(spec, 16, 4, 16, window=window)
         actual = module._istft_fft(spec, 16, 4, 16, window, True, False, None, None, False)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    assert not module._ENVELOPE_CACHE
 
 
 def test_stft_falls_back_on_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,6 +396,7 @@ def test_fallback_counter_tracks_repeated_fallbacks(monkeypatch: pytest.MonkeyPa
         module._warn_fallback("STFT", RuntimeError("first"))
         module._warn_fallback("STFT", RuntimeError("second"))
     assert module._FALLBACK_COUNTS == {"STFT": 2}
+    assert module.fallback_counts() == {"STFT": 2}
 
 
 def test_istft_propagates_oom(monkeypatch: pytest.MonkeyPatch) -> None:
