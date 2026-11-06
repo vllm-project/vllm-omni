@@ -499,10 +499,16 @@ def append_audio(
     value: float = 0.05,
     is_speech: bool | None = True,
     event_id: str | None = None,
+    audio_format: str = "pcm_f32le",
 ) -> commands.AppendAudio:
+    """A client append. ``audio_format="pcm16"`` is one the runner still converts (off-loop)."""
+    if audio_format == "pcm16":
+        audio = struct.pack(f"<{samples}h", *([round(value * 32767)] * samples))
+    else:
+        audio = pcm_f32(samples, value=value)
     return commands.AppendAudio(
-        audio=pcm_f32(samples, value=value),
-        format="pcm_f32le",
+        audio=audio,
+        format=audio_format,
         sample_rate_hz=16000,
         is_speech=is_speech,
         event_id=event_id,
@@ -1000,6 +1006,11 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
     finished = asyncio.Event()
     owner = h.runner if phase == "decode" else h.runner.control
     method = "offload" if phase == "decode" else "run_turn_detection"
+    # Only a format the runner converts (pcm16) is decoded off-loop; pcm_f32le goes
+    # straight to VAD. Same 32 kB on the wire either way; pcm16 decodes to twice that.
+    audio_format, first, over, decoded = (
+        ("pcm16", 16_000, 20_000, 64_000) if phase == "decode" else ("pcm_f32le", 8000, 10_000, 32_000)
+    )
     original = getattr(owner, method)
     on_command = h.runner._on_command
 
@@ -1019,10 +1030,10 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
     monkeypatch.setattr(owner, method, blocked)
     monkeypatch.setattr(h.runner, "_on_command", track_command)
     try:
-        h.submit(append_audio(samples=8000))
+        h.submit(append_audio(samples=first, audio_format=audio_format))
         await asyncio.wait_for(started.wait(), timeout=2.0)
         assert h.session.pending_input_bytes == 32_000
-        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        h.submit(append_audio(samples=over, event_id="over-limit", audio_format=audio_format))
         events = await h.settle()
         assert any(
             event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
@@ -1032,12 +1043,12 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=2.0)
         events = await h.settle()
-        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        assert h.session.pending_input_bytes == (0 if fails else decoded)
         assert h.session._input.queued_input_bytes == 0
         if fails:
             assert any(event.type == "error" and "preprocessing failed" in event.message for event in events)
         else:
-            assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+            assert h.runner.model_state.audio_buffer.pending_byte_count == decoded
         await h.run(commands.ClearInput())
         assert h.session.pending_input_bytes == 0
     finally:
@@ -1186,11 +1197,16 @@ async def test_admitted_pcm16_append_that_decodes_past_the_limit_is_rejected_cle
 class _SplitDetector:
     """Splits every append into one 1 s segment and its remainder."""
 
+    def segment_steps(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        yield from ()
+        return self.process_segments(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+
     def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
         from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult, TurnDetectionSegment
 
         del fmt, sample_rate_hz
-        audio = base64.b64decode(base64_audio)
+        # A client append reaches turn detection as decoded bytes; internal payloads as base64.
+        audio = base64_audio if isinstance(base64_audio, bytes) else base64.b64decode(base64_audio)
         result = TurnDetectionResult(is_speech=True, speech_active=True)
         return [
             TurnDetectionSegment(base64.b64encode(part).decode(), result) for part in (audio[:64_000], audio[64_000:])
@@ -2141,6 +2157,92 @@ async def _append_turn(h: Harness, *, response: bool = False) -> DuplexStageRequ
         await h.deliver_and_settle(tts_output(context.request_id, turn_id=context.fence.turn_id))
         assert h.session.active_response_id is not None
     return context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("future_turn", [1, 2])
+async def test_future_model_turn_output_without_response_advances_the_append_fence(
+    future_turn: int,
+) -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        session = h.session
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        assert (session.turn_id, session.active_response_id) == (0, None)
+
+        # The model opens a future turn before turn 0 sent a terminal signal.
+        events = await h.deliver_and_settle(tts_output(request_id, text="嗯，", turn_id=future_turn))
+        assert "response.created" in types(events)
+        assert (session.turn_id, session.active_response_turn_id) == (future_turn, future_turn)
+        assert session.fence == session.accepted_fence
+        assert session.perf is not None
+        turns = {turn["turn_id"]: turn for turn in session.perf.snapshot()["turns"]}
+        assert turns[0]["status"] == "listen"
+        # Completing a skipped turn only closes existing timing records.
+        assert set(turns) == {0, future_turn}
+        assert turns[future_turn]["status"] == "open"
+        assert turns[future_turn]["response_ids"] == [session.active_response_id]
+
+        # A delayed terminal for the superseded turn must not close the new one.
+        response_id = session.active_response_id
+        await _send_model_result_and_settle(h, _terminal_listen_result(request_id, 0))
+        assert session.active_response_id == response_id
+        assert session.turn_id == future_turn
+        turns = {turn["turn_id"]: turn for turn in session.perf.snapshot()["turns"]}
+        assert set(turns) == {0, future_turn}
+        assert turns[future_turn]["status"] == "open"
+
+        submissions = len(h.port.submissions)
+        events = await h.run(append_audio())
+        assert "error" not in types(events)
+        assert len(h.port.submissions) == submissions + 1
+        assert session.fence == session.accepted_fence
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_future_model_turn_while_an_older_response_drains_keeps_ownership() -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        session.capabilities = replace(session.capabilities, supports_concurrent_turn_requests=True)
+        first = await _append_turn(h, response=True)
+        old_response = session.active_response_id
+        assert old_response is not None
+        drain_id = h.manager.stage_request_id(session.fence, stage_id=1, resumable=False)
+        session.bind_stage_request(1, drain_id, fence=session.fence)
+        session.bind_draining_request(drain_id, old_response)
+        session.snapshot_active_response_for_drain()
+        session.complete_model_turn(first.fence.turn_id)
+        current_response = session.begin_response(turn_id=1)
+        h.runner.emit({"type": "response.created", "response_id": current_response})
+        second = await _append_turn(h)
+
+        # A draining request is bound to its old response even if its metadata
+        # announces a later model turn; it cannot reserve a new response.
+        events = await _send_model_result_and_settle(
+            h, {"data_plane_request_id": drain_id, "model_turn_id": 2, "text": " tail"}
+        )
+        assert "response.created" not in types(events)
+        assert find(events, "response.output_audio_transcript.delta").response_id == old_response
+        assert session.active_response_id == current_response
+        assert session.turn_id == 1
+        assert session.fence == session.accepted_fence
+
+        # A future-turn output from the live request advances the fence while
+        # leaving the older drain attached to its own response.
+        events = await _send_model_result_and_settle(
+            h, {"data_plane_request_id": second.request_id, "model_turn_id": 2, "text": "new turn"}
+        )
+        assert find(events, "response.created").response_id == session.active_response_id
+        assert session.active_response_id not in (old_response, current_response)
+        assert session.response_id_for_request(drain_id) == old_response
+        assert session.turn_id == 2
+        assert session.fence == session.accepted_fence
+        submissions = len(h.port.submissions)
+        assert "error" not in types(await h.run(append_audio()))
+        assert len(h.port.submissions) == submissions + 1
 
 
 @pytest.mark.asyncio
@@ -3659,6 +3761,10 @@ class _ScriptedDetector:
     def process(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None, audio_end_ms: int | None = None):
         del base64_audio, fmt, sample_rate_hz, audio_end_ms
         return self._results.pop(0)
+
+    def segment_steps(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        yield from ()
+        return self.process_segments(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
 
     def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
         from vllm_omni.engine.duplex.turn_detection import TurnDetectionSegment

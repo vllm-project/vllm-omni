@@ -42,7 +42,7 @@ def runtime(*, device_index=0, rank=0, tp_size=1, session_id="session"):
         consumer_id=f"dit-rank-{rank}",
         session_id=session_id,
     )
-    return api, backend.TorchCudaIpcBackend(), replace(context, device_index=device_index)
+    return api, backend.TorchIpcBackend(), replace(context, device_index=device_index)
 
 
 def assert_export_allocations(bindings):
