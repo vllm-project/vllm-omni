@@ -382,11 +382,11 @@ backlog remains in the session ledger for successive summary requests to process
 
 Standing instructions and the current user query remain explicit in the normal
 interaction prompt. Summary input contains committed conversation text, not
-unplayed generated speech or retained image/audio payloads. With JoyAI's current
-all-sync audio output, the assistant transcript becomes eligible only after the
-complete audio has been acknowledged. Playback corrections and conversation
-edits invalidate summaries derived from the changed text; newer appended turns
-can coexist with consolidation of an unchanged older prefix.
+unplayed generated speech or retained image/audio payloads. A JoyAI assistant
+transcript becomes eligible only after its complete audio has been acknowledged.
+Playback corrections and conversation edits invalidate summaries derived from
+the changed text; newer appended turns can coexist with consolidation of an
+unchanged older prefix.
 
 The text summary and model-input context are bounded; the underlying Session
 conversation ledger retains its source items. Visual facts can also enter the
@@ -518,9 +518,12 @@ record rejection and retry counts when measuring service capacity.
 
 PersonaPlex startup warmup is opt-in: set `duplex_session.warmup_frames` to a
 positive frame count to enable it. Frontends with nonzero admission budgets
-then warm their owned groups locally and gate their own duplex connections
-until warmup completes; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
-before being admitted, as in single-frontend mode.
+then warm their owned groups locally. Native duplex endpoints accept the
+WebSocket transport immediately, then hold session configuration and engine
+admission until warmup completes; clients wait at most
+`DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s) before session admission, as in
+single-frontend mode. The warmup wait does not consume the WebSocket opening
+handshake deadline.
 `/health` retains the engine-health check; it is not an
 all-frontend warmup barrier, and a 200 response does not mean that the accepting
 frontend has free admission slots.

@@ -432,7 +432,15 @@ def client(test_app):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
-async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: MockerFixture, enable_scale_out):
+async def test_server_worker_applies_speech_only_endpoint_restrictions(
+    mocker: MockerFixture, enable_scale_out, request: pytest.FixtureRequest
+):
+    # SageMaker route registration imports a dependency that changes root.level.
+    # Restore it through setLevel so later tests also clear cached log filters.
+    root_logger = logging.getLogger()
+    previous_level = root_logger.level
+    request.addfinalizer(lambda: root_logger.setLevel(previous_level))
+
     class FakeCompletionHandler:
         def __init__(self):
             self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
@@ -5210,7 +5218,8 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     assert response.body.decode("utf-8") == (
-        '{"error":{"message":"engine dead","type":"InternalServerError","param":null,'
+        '{"error":{"message":"The server had an error while processing your request.",'
+        '"type":"InternalServerError","param":null,'
         '"code":500,"request_id":"speech-req-1","error_stage_id":1}}'
     )
     terminate_mock.assert_called_once()

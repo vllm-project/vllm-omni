@@ -1,5 +1,8 @@
+# vLLM-Ascend v0.33.0 runtime matching the vLLM v0.33.0 alignment. CI injects
+# the per-device tag suffix through VLLM_ASCEND_DEVICE_SUFFIX (-a3/-a5/-310p);
+# the unsuffixed tag is the generic image used for A2.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_VERSION=v0.32.0
+ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
