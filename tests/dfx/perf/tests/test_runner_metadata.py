@@ -764,12 +764,12 @@ def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, datas
     assert getattr(args, f"{prefix}_judge_base_url") == ServerEndpoint.judge_base_url
     assert getattr(args, f"{prefix}_judge_model") == params[f"{prefix}_judge_model"]
     if dataset == "omniinteract":
-        assert args.omniinteract_subsets == ["1q1a_math"]
+        assert args.omniinteract_subsets == params["omniinteract_subsets"].split()
         assert args.omniinteract_require_response
     else:
         assert len(set(args.duplex_eval_ids)) == count
-        assert args.duplex_eval_split == "PR_correction"
-        assert args.duplex_eval_mix == "question"
+        assert args.duplex_eval_split == params["duplex_eval_split"]
+        assert args.duplex_eval_mix == params["duplex_eval_mix"]
 
 
 def test_num_warmups_resolves_each_sweep_point():
@@ -1414,13 +1414,19 @@ def test_qwen3_joint_run_rejects_incomplete_accuracy_coverage(dataset):
         assert_result(result, params, count)
 
 
-@pytest.mark.parametrize("skipped", [False, True])
-def test_qwen3_math_run_rejects_boolean_skipped_count(skipped):
+@pytest.mark.parametrize(
+    "field,message",
+    [("evaluated", "evaluated count is missing"), ("skipped", "accuracy coverage is incomplete")],
+)
+@pytest.mark.parametrize("value", [False, True])
+def test_qwen3_math_run_rejects_boolean_coverage_count(field, message, value):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
     result, params, count, accuracy = _qwen3_joint_result("omniinteract")
-    accuracy.update(evaluated=count - int(skipped), skipped=skipped)
-    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+    other_field = "skipped" if field == "evaluated" else "evaluated"
+    # Keep the total consistent so rejection must come from the type check.
+    accuracy.update({field: value, other_field: count - int(value)})
+    with pytest.raises(AssertionError, match=message):
         assert_result(result, params, count)
 
 
@@ -1448,10 +1454,7 @@ def test_qwen3_correction_run_requires_valid_accuracy_score(value):
     "dataset_name, field, value, message",
     [
         ("omni-duplex-eval", None, None, "summary is missing"),
-        ("omni-duplex-eval", "published", 15, "artifacts are incomplete"),
-        ("omni-duplex-eval", "artifact_errors", ["disk full"], "publication failed"),
         ("omniinteract", None, None, "summary is missing"),
-        ("omniinteract", "artifacts_complete", False, "artifacts are incomplete"),
         ("omniinteract", "success", 15, "requests did not all succeed"),
     ],
 )

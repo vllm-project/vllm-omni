@@ -124,7 +124,7 @@ def test_response_latency_counts_every_response_once_across_sessions():
     assert duplex_response_latency_metrics([]) == {}
 
 
-def test_response_latency_flattens_busy_rtf_and_stall_ratio(capsys):
+def test_response_latency_flattens_busy_rtf_and_stall_ratio():
     rows: list[dict[str, object]] = [
         {"busy_rtf": 0.2, "stall_ratio": 0.1},
         {"busy_rtf": 0.2, "stall_ratio": 0.1},
@@ -143,10 +143,6 @@ def test_response_latency_flattens_busy_rtf_and_stall_ratio(capsys):
     assert metrics["mean_duplex_stall_ratio"] == 0.15
     assert metrics["median_duplex_stall_ratio"] == 0.1
     assert metrics["p99_duplex_stall_ratio"] == 0.3
-    print_duplex_response_latency_metrics(metrics)
-    printed = capsys.readouterr().out
-    assert "Mean busy RTF:" in printed and "0.250000" in printed
-    assert "Mean stall ratio:" in printed and "0.150000" in printed
 
 
 def test_report_and_console_expose_the_flat_latency_keys(capsys):
@@ -321,5 +317,6 @@ def test_collect_attaches_session_stats_and_flattens_busy_rtf(capsys) -> None:
     assert report["mean_duplex_stall_ratio"] == 0.0
     print_duplex_response_latency_metrics(duplex_response_latency_metrics(bundle.request_metrics))
     printed = capsys.readouterr().out
-    assert "Mean busy RTF:" in printed
-    assert "Mean stall ratio:" in printed
+    lines = [" ".join(line.split()) for line in printed.splitlines()]
+    assert "Mean busy RTF: 0.200000" in lines
+    assert "Mean stall ratio: 0.000000" in lines
