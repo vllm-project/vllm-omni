@@ -46,7 +46,11 @@ test_params = [
     OmniServerParams(
         model=MODEL,
         stage_config_path=STAGE_CONFIGS_PATH,
-        stage_init_timeout=300,
+        # Cold ROCm AITER MHA builds have varied from 551 seconds on a passing
+        # run to more than 1039 seconds under CI load. Keep this weekly lane
+        # bounded while leaving startup headroom after model loading.
+        stage_init_timeout=1800,
+        init_timeout=2100,
     ),
 ]
 

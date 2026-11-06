@@ -33,8 +33,14 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     # Stage 0 duplex preprocessing stays on the synchronous path while the
     # downstream stages keep streaming chunk transfer.
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
-    # Preserve asynchronous AR scheduling, including the Talker.
-    assert all(s.yaml_engine_args["async_scheduling"] for s in stages[:2])
+    # Stage 0 keeps asynchronous AR scheduling; stage 1 is single-frame on this
+    # profile. MR v2 cannot run the K-step re-embed (its decode preprocess
+    # embeds the runner's gathered ids), so the base profile's speculative
+    # block must not survive the merge; stage 1 still books its span with the
+    # synchronous runner contract.
+    assert stages[0].yaml_engine_args["async_scheduling"] is True
+    assert stages[1].yaml_engine_args.get("speculative_config") is None
+    assert stages[1].yaml_engine_args["async_scheduling"] is False
     assert stages[2].yaml_engine_args.get("async_scheduling") is not False
     # Retain the base profile capacity and Talker KV budget.
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 16]
