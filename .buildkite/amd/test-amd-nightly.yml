@@ -1570,6 +1570,35 @@ steps:
               --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json \
               -m "full_model and omni and rocm and MI325 and cards_2" --run-level full_model
 
+  - group: ":full_moon: Qwen-Image Performance MI300 Nightly"
+    steps:
+      # Preserve the CUDA workload sizes and concurrency. Initial AMD coverage
+      # measures performance; H100 baselines do not gate ROCm results.
+      - label: "Qwen-Image Single-GPU Performance (measurement-only)"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_perf
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          DIFFUSION_BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-perf/benchmark-results"
+        artifact_paths:
+          - artifacts/rocm-qwen-image-perf/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 5 165m rocm-qwen-image-perf
+            tests/dfx/perf/scripts/run_diffusion_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+          - >-
+            python3 .buildkite/amd/scripts/validate-qwen-image-perf.py
+            "$$DIFFUSION_BENCHMARK_DIR"
+            tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+            "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-perf/measurement-summary.json"
+
   - group: ":full_moon: Qwen-Image Backend Similarity MI300 Nightly"
     steps:
       - label: "Qwen-Image Diffusers Backend Similarity"
