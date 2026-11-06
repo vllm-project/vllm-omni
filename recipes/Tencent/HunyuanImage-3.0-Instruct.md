@@ -116,10 +116,10 @@ Communication used the defaults, with encoder TP mode `weights`, one
 concurrent request, prefix caching disabled,
 `gpu_memory_utilization: 0.75`, and `max_num_batched_tokens: 32768`.
 
-With these settings, SigLIP2 graphs saved about 8.5 ms in median single image
-encoding time in both runs (rank 0, including eager VAE). Two image inputs
-showed no consistent benefit, and a repeatable end-to-end speedup was not
-established.
+With these settings, SigLIP2 graphs saved 7.55 ms and 4.69 ms (about 1–1.5%)
+in median single image encoding time across two OFF/ON comparisons (rank 0,
+including eager VAE). Two image inputs showed no consistent benefit, and
+a repeatable end-to-end speedup was not established.
 
 | Encoder graph configuration | Encoder graphs | Total graph reserve per GPU | Available KV cache per GPU |
 | --- | ---: | ---: | ---: |
@@ -128,8 +128,8 @@ established.
 
 The extra graph reserve is 102 MiB per GPU. The total reserve includes decoder
 graphs and is used for automatic KV cache sizing; it is not peak process
-memory. Each startup captured the encoder graphs twice, taking about 0.07 s
-per pass on rank 0 in this setup.
+memory. Each startup with encoder graphs enabled captured them twice,
+taking 0.047–0.063 s per pass on rank 0 in this setup.
 
 Full measurements and validation limits are in
 [#8437](https://github.com/vllm-project/vllm-omni/pull/8437).
