@@ -34,6 +34,7 @@ both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashI
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 On CUDA and NPU the same file selects model runner v2. The Thinker prefix cache is enabled on CUDA and disabled on NPU.
+The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling.
 XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
 
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
