@@ -106,7 +106,9 @@ def _stream(model: CosyVoice3Code2Wav, chunks: list[torch.Tensor], *, host_cache
 def test_streaming_state_stays_on_hift_device(config: dict) -> None:
     hift = _make_hift(config)
     assert isinstance(hift.m_source.l_sin_gen, SineGen2 if config is REAL_CONFIG else SineGen)
-    device = torch.device("cuda")
+    # Resolve with an explicit index: tensors report ``cuda:0``, and
+    # ``torch.device("cuda") != torch.device("cuda:0")`` under ``==``.
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     model = _make_model(hift.to(device))
 
     cache = None
@@ -127,7 +129,9 @@ def test_streaming_state_stays_on_hift_device(config: dict) -> None:
 @pytest.mark.parametrize("config", CONFIGS)
 def test_gpu_resident_state_matches_host_round_trip_bit_exactly(config: dict) -> None:
     """Device-resident cache must reproduce the host round-trip bit-for-bit."""
-    device = torch.device("cuda")
+    # Resolve with an explicit index: tensors report ``cuda:0``, and
+    # ``torch.device("cuda") != torch.device("cuda:0")`` under ``==``.
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     model = _make_model(_make_hift(config).to(device))
     chunks = [c.to(device) for c in _chunks()]
 
@@ -146,7 +150,9 @@ def test_gpu_resident_state_matches_host_round_trip_bit_exactly(config: dict) ->
 @pytest.mark.parametrize("config", CONFIGS)
 def test_mixed_residency_caches_are_equivalent(config: dict) -> None:
     """A cache created device-resident then bounced to host must still work."""
-    device = torch.device("cuda")
+    # Resolve with an explicit index: tensors report ``cuda:0``, and
+    # ``torch.device("cuda") != torch.device("cuda:0")`` under ``==``.
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     model = _make_model(_make_hift(config).to(device))
     chunks = [c.to(device) for c in _chunks()]
 
