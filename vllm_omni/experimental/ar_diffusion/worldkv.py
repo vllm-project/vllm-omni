@@ -31,11 +31,16 @@ class WorldKVConfig:
     bank_bytes: int = 0
     world_keep_ratio: float = 1.0
     world_score: str = "pairwise_mean"
+    reuse_attention_kv: bool = False
+    prefetch_kv: bool = False
     # Process-wide cap on the bank_bytes reserved by live memories; None uses
     # the host's physical memory.
     host_bank_limit_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        for name in ("reuse_attention_kv", "prefetch_kv"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"worldkv.{name} must be a boolean")
         for name in (
             "window_frames",
             "sink_frames",
@@ -155,6 +160,8 @@ class WorldKVConfig:
         # rows, scoring intermediates and concatenated attention view.
         # Model activations/backend workspace are charged by the runner.
         scratch = 4 * self.window_frames * tokens_per_frame * (2 * heads * dim * max(4, itemsize) + 16)
+        if self.reuse_attention_kv:
+            resident += layers * self.window_frames * tokens_per_frame * kv
         return resident + scratch
 
 
@@ -280,6 +287,9 @@ class WorldKV:
         self._retrieved: tuple[BankChunk, ...] = ()
         self._retrieval_frames = 0
         self._device_retrieved: dict[int, tuple[MemoryRows, ...]] = {}
+        self._assembly: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._prefetch_stream: torch.Stream | None = None
+        self._prefetch_ready: dict[int, torch.Event] = {}
         self._active = False
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
@@ -315,7 +325,11 @@ class WorldKV:
     def _clear_retrieval(self) -> None:
         self._retrieved = ()
         self._retrieval_frames = 0
+        if self._prefetch_stream is not None and self._prefetch_ready:
+            self._prefetch_stream.synchronize()
+        self._prefetch_ready.clear()
         self._device_retrieved.clear()
+        self._assembly.clear()
 
     def _retrieved_rows(self, layer: int, device: torch.device) -> tuple[MemoryRows, ...]:
         if layer not in self._device_retrieved:
@@ -332,7 +346,29 @@ class WorldKV:
                         chunk.ready.synchronize()
                 rows.append(chunk.layers[layer].to_kv_device(device))
             self._device_retrieved[layer] = tuple(rows)
+        if layer in self._prefetch_ready:
+            stream = torch.accelerator.current_stream(device)
+            stream.wait_event(self._prefetch_ready.pop(layer))
+            for retrieved in self._device_retrieved[layer]:
+                retrieved.key.record_stream(stream)
+                retrieved.value.record_stream(stream)
         return self._device_retrieved[layer]
+
+    def _prefetch(self, device: torch.device) -> None:
+        if not self.config.prefetch_kv or device.type != "cuda" or not self._retrieved or self._device_retrieved:
+            return
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.Stream(device=device)
+        stream = self._prefetch_stream
+        stream.wait_stream(torch.accelerator.current_stream(device))
+        try:
+            with stream:
+                for layer in range(self.num_layers):
+                    self._retrieved_rows(layer, device)
+                    self._prefetch_ready[layer] = stream.record_event()
+        except BaseException:
+            stream.synchronize()
+            raise
 
     def _resident_rows(self, layer: int, chunk: BankChunk) -> MemoryRows | None:
         # History keeps a full window until commit; attention excludes the
@@ -587,6 +623,12 @@ class WorldKV:
         previous = self.history[layer]
         if previous is None:
             return key, value
+        self._prefetch(key.device)
+        if layer in self._assembly:
+            assembled_key, assembled_value = self._assembly[layer]
+            assembled_key[:, -key.shape[1] :].copy_(key)
+            assembled_value[:, -value.shape[1] :].copy_(value)
+            return assembled_key, assembled_value
         # Canonical history is an uncompressed sink followed by a contiguous
         # recent suffix. Its boundaries are known on the host, even for short
         # chunks. Avoid a GPU nonzero/scalar read and a gathered copy per layer.
@@ -612,7 +654,10 @@ class WorldKV:
             values.append(previous.value[:, -tail_count:])
         keys.append(key)
         values.append(value)
-        return torch.cat(keys, 1), torch.cat(values, 1)
+        assembled = torch.cat(keys, 1), torch.cat(values, 1)
+        if self.config.reuse_attention_kv:
+            self._assembly[layer] = assembled
+        return assembled
 
     def close(self) -> None:
         self._wait_publication()
@@ -624,5 +669,6 @@ class WorldKV:
         self._clear_retrieval()
         self._closed = True
         self._copy_stream = None
+        self._prefetch_stream = None
         if self._release_bank is not None:
             self._release_bank()

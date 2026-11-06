@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA bank transfer ordering, retention rollback and CPU numerical oracle."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -17,21 +19,24 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("reuse,prefetch", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
-def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(monkeypatch, ratio):
+def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(monkeypatch, ratio, reuse, prefetch):
     config = worldkv.WorldKVConfig(
         window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000, world_keep_ratio=ratio
     )
     cpu = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
-    gpu = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
+    gpu = worldkv.WorldKV(
+        replace(config, reuse_attention_kv=reuse, prefetch_kv=prefetch), num_layers=2, tokens_per_frame=2
+    )
 
-    def run(memory, start, commit, device):
+    def run(memory, start, commit, device, step=0):
         outputs = []
         # Alternate nearest-history hits and older host-bank hits.
         memory.set_pose(pose(start - 4 if start % 4 else 2))
         with memory.forward(start, 2, commit=commit):
             for layer in range(2):
-                x = (raw(start) + layer).to(device)
+                x = (raw(start) + layer + step / 8).to(device)
                 outputs.append(memory.assemble(layer, x, x, x * 2))
         return outputs
 
@@ -39,9 +44,9 @@ def test_async_bank_matches_cpu_through_retrieval_eviction_and_rollback(monkeypa
         # Exercise producer/consumer ordering on a non-default compute stream.
         with torch.Stream(device="cuda"):
             for start in range(0, 24, 2):
-                for commit in (False, True):
-                    expected = run(cpu, start, commit, "cpu")
-                    actual = run(gpu, start, commit, "cuda")
+                for step, commit in enumerate((False, False, False, True)):
+                    expected = run(cpu, start, commit, "cpu", step)
+                    actual = run(gpu, start, commit, "cuda", step)
                     for lhs, rhs in zip(actual, expected):
                         for tensor, reference in zip(lhs, rhs):
                             assert torch.equal(tensor.cpu(), reference)
@@ -141,3 +146,49 @@ def test_uncompressed_publication_does_not_read_back_gpu_metadata(monkeypatch):
         assert torch.equal(rows[0].token_ids, torch.arange(4, 8))
     finally:
         memory.close()
+
+
+def test_prefetch_failure_preserves_history_and_allows_retry(monkeypatch):
+    config = worldkv.WorldKVConfig(window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=9000)
+    cpu = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
+    gpu = worldkv.WorldKV(replace(config, prefetch_kv=True, reuse_attention_kv=True), num_layers=2, tokens_per_frame=2)
+
+    def run(memory, start, commit, device):
+        memory.set_pose(pose(2))
+        outputs = []
+        with memory.forward(start, 2, commit=commit):
+            for layer in range(2):
+                key = (raw(start) + layer).to(device)
+                outputs.append(memory.assemble(layer, key, key, key * 2))
+        return outputs
+
+    original = worldkv.MemoryRows.to_kv_device
+    calls = 0
+
+    def fail_second(rows, device):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("prefetch interrupted after first layer")
+        return original(rows, device)
+
+    try:
+        with torch.Stream(device="cuda"):
+            for start in range(0, 8, 2):
+                run(cpu, start, True, "cpu")
+                run(gpu, start, True, "cuda")
+            history, bank = gpu.history, gpu.bank
+            with monkeypatch.context() as patch:
+                patch.setattr(worldkv.MemoryRows, "to_kv_device", fail_second)
+                with pytest.raises(RuntimeError, match="prefetch interrupted"):
+                    run(gpu, 8, False, "cuda")
+            assert calls == 2
+            assert gpu.history is history and gpu.bank is bank and gpu.next_frame == 8
+            assert not gpu._active and not gpu._device_retrieved and not gpu._prefetch_ready and not gpu._assembly
+            actual, expected = run(gpu, 8, False, "cuda"), run(cpu, 8, False, "cpu")
+            for lhs, rhs in zip(actual, expected):
+                for tensor, reference in zip(lhs, rhs):
+                    assert torch.equal(tensor.cpu(), reference)
+    finally:
+        gpu.close()
+        cpu.close()

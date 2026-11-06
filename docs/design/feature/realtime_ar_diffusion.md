@@ -257,6 +257,8 @@ model_config:
     bank_bytes: 51539607552   # per-memory CPU bank, FIFO eviction
     world_keep_ratio: 0.25    # 1.0 disables compression; needs retrieval
     world_score: pairwise_mean  # or centroid, as in the released code
+    reuse_attention_kv: false  # cache assembled windows across denoising forwards
+    prefetch_kv: false         # CUDA host-bank retrieval on a dedicated stream
     # host_bank_limit_bytes: process-wide cap, defaults to physical memory
 ```
 
@@ -268,7 +270,11 @@ model_config:
   contiguous recent suffix. Host-known frame boundaries select views of these
   regions before concatenation with retrieved and current rows, avoiding
   per-layer GPU index discovery and scalar synchronization. Bank compression
-  does not change these history boundaries.
+  does not change these history boundaries. With `reuse_attention_kv`, each layer
+  assembles its window once per chunk and overwrites only the current K/V tail
+  on later forwards. These borrowed attention views are consumed before the next
+  forward on the same compute stream. Pose/geometry changes, commit, failure and
+  close invalidate them. GPU admission includes one extra full window per layer.
 - **Transfers:** CUDA commits copy K/V into pinned host memory on a separate
   stream. Host-bank retrieval waits for that copy; uncompressed chunks still
   resident in GPU history are read directly. At most one publication remains
@@ -279,6 +285,11 @@ model_config:
   Host-bank retrieval transfers only K/V; its metadata remains on the host. Uncompressed
   publication constructs contiguous frame/token metadata directly on CPU;
   compressed per-layer selections retain their original metadata.
+  With `prefetch_kv`, the first layer queues selected K/V for all layers on a
+  dedicated CUDA stream. Each consumer waits for its own layer event and records
+  destination storage on the compute stream. Cancellation drains outstanding
+  prefetches before releasing cached rows. CPU execution uses ordinary retrieval.
+  Both options default to false and can be enabled independently.
   Pinned allocations use PyTorch's caching allocator; initial bank filling
   still incurs allocation costs. `bank_bytes` bounds live entries, not allocator
   caches or the temporary replacement chunk needed for transactional publication.

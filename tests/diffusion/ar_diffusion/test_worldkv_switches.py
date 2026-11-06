@@ -61,3 +61,18 @@ def test_retrieval_and_compression_switches_execute_only_when_enabled(retrieval,
     assert bool(memory.bank) == bool(retrieval)
     memory.close()
     assert not memory.bank and memory.history == [None, None]
+
+
+@pytest.mark.parametrize("name", ["reuse_attention_kv", "prefetch_kv"])
+@pytest.mark.parametrize("value", [1, "false", None])
+def test_transfer_optimization_flags_require_booleans(name, value):
+    with pytest.raises(ValueError, match=name):
+        worldkv.WorldKVConfig(**{name: value})
+
+
+def test_attention_window_cache_is_charged_to_gpu_reservation():
+    baseline = worldkv.WorldKVConfig(window_frames=8, sink_frames=2)
+    cached = worldkv.WorldKVConfig(window_frames=8, sink_frames=2, reuse_attention_kv=True)
+    geometry = (2, 4, 2, 8, 2)
+    extra = cached.reservation_bytes(*geometry, chunk_frames=2) - baseline.reservation_bytes(*geometry, chunk_frames=2)
+    assert extra == 2 * 8 * 4 * 2 * 2 * 8 * 2
