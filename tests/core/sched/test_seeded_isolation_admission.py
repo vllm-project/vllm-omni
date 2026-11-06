@@ -164,6 +164,20 @@ def test_async_reservation_can_still_block_the_solo_step(monkeypatch) -> None:
     assert seen["admitted"] is None
 
 
+def test_parked_sessions_at_capacity_keep_the_solo_step_blocked(monkeypatch) -> None:
+    """A full parked set must not let the solo budget exceed the worker capacity."""
+    seeded = _StubRequest("seeded", seed=42)
+    scheduler = _make_scheduler(parked=8, waiting=[seeded])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # 8 parked sessions fill the configured 8 active requests: the parked-aware
+    # budget is capped at the original limit and nothing else is admitted.
+    assert seen["limit"] == 8
+    assert seen["admitted"] is None
+    assert scheduler.running == []
+
+
 def test_unseeded_traffic_keeps_the_original_limit(monkeypatch) -> None:
     plain = _StubRequest("plain")
     scheduler = _make_scheduler(parked=2, waiting=[plain])
