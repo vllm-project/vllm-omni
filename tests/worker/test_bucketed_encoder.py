@@ -1189,7 +1189,7 @@ def test_uninstall_restores_the_module_forward(bucket_cfg):
     model = ToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
 
-    assert uninstall_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
+    assert uninstall_bucketed_encoders(model) == ["encoder"]
     assert model.encoder.forward.__self__ is model.encoder
     assert model.encoder.forward.__func__ is RecordingEncoder.forward
     assert not getattr(model, "_bucketed_installed", False)
