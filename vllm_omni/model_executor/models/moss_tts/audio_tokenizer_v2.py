@@ -1144,6 +1144,14 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                     pre_tockens=pre_tockens,
                     next_tockens=next_tockens,
                     sparse_mode=0,
+                    # op-plugin's legacy FlashAttention forward leaves an event
+                    # tail on a secondary stream whenever sync=False, even with
+                    # keep_prob=1.0, which aborts NPUGraph capture with error
+                    # 107025 ("a stream that was not joined to the original
+                    # stream"). sync=True keeps the op inline and capture-safe;
+                    # the Qwen3-TTS code predictor NPU path has used the same
+                    # setting since it gained graph support (#2695).
+                    sync=True,
                 )[0]
             else:
                 x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)

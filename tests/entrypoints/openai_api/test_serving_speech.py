@@ -167,7 +167,7 @@ class TestAudioMixin:
         audio_obj = CreateAudio(audio_tensor=stereo_tensor)
 
         mock_speed = mocker.patch.object(
-            audio_mixin, "_apply_speed_adjustment", side_effect=lambda tensor, speed, sr: (tensor, sr)
+            audio_mixin, "apply_speed_adjustment", side_effect=lambda tensor, speed: tensor
         )
         mocker.patch("soundfile.write")
 
@@ -181,7 +181,7 @@ class TestAudioMixin:
     def test_speed_adjustment(self, audio_mixin):
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        adjusted_audio, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=2.0, sample_rate=24000)
+        adjusted_audio = audio_mixin.apply_speed_adjustment(audio_tensor, speed=2.0)
 
         assert adjusted_audio.shape == (12000,)
 
@@ -234,7 +234,7 @@ class TestAudioMixin:
 
         mock_time_stretch = mocker.patch("torchaudio.transforms.TimeStretch")
         # speed=1.0 should return immediately without calling torchaudio
-        result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
+        result = audio_mixin.apply_speed_adjustment(audio_tensor, speed=1.0)
 
         mock_time_stretch.assert_not_called()
         assert np.array_equal(result, audio_tensor)
@@ -243,7 +243,7 @@ class TestAudioMixin:
         """Test that speed adjustment handles stereo (channels-last) input."""
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
 
-        result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
+        result = audio_mixin.apply_speed_adjustment(stereo_tensor, speed=2.0)
 
         assert result.shape == (12000, 2)
 

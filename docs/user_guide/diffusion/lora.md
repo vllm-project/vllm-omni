@@ -94,6 +94,7 @@ Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded int
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 lora_path = "/path/to/lora_adapter"
@@ -111,9 +112,11 @@ lora_request = LoRARequest(
 )
 
 outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    "A piece of cheesecake",
+    OmniDiffusionSamplingParams(
+        lora_request=lora_request,
+        lora_scale=2.0,  # optional arg, default 1.0
+    ),
 )
 ```
 
@@ -144,7 +147,7 @@ omni = Omni(
     lora_backend="distill",
 )
 
-outputs = omni.generate(prompt="A piece of cheesecake")
+outputs = omni.generate("A piece of cheesecake")
 ```
 
 Multi-file example (Wan2.2 MoE, high + low noise):

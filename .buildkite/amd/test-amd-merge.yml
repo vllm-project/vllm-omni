@@ -562,7 +562,7 @@ steps:
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 17
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 13
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
           tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
@@ -857,7 +857,7 @@ steps:
             "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-merge-expected.txt
-          pytest -q tests/e2e/online_serving/test_drama_3.py \
+          pytest -q 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
             -m "advanced_model and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --collect-only \
@@ -867,7 +867,7 @@ steps:
             echo "Drama 3 MERGE collection drifted from test_text_to_audio_001[drama_3-rocm]" >&2
             exit 1
           fi
-          pytest -s -v tests/e2e/online_serving/test_drama_3.py \
+          pytest -s -v 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
             -m "advanced_model and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --junitxml="$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
@@ -885,6 +885,82 @@ steps:
               raise SystemExit(5)
           ' "$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
           DRAMA3_MERGE
+
+
+- group: ":test_tube: ROCm drama3-voice-clone MERGE"
+  steps:
+    - label: "MERGE · Drama 3 Voice Clone"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 75
+      source_file_dependencies:
+        - tts_drama_3_function
+        - tests/helpers/
+        - tests/assets/qwen3_tts/clone_2.wav
+      artifact_paths:
+        - "artifacts/rocm-merge-drama3-voice-clone/**/*"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-drama3-voice-clone"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]"
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]"
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]"
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          pytest -s -v -ra \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]' \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]' \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]' \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]' \
+            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-voice-clone" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/voice-clone.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-voice-clone.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 4 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 4 executed drama3-voice-clone voice-clone tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/voice-clone.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
 
 - group: ":full_moon: MiniCPM-o 4.5 MERGE"
   steps:
