@@ -791,7 +791,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     request_state.input_history_revision = None
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
-            self._validate_turn_history(request_state, submission.history_revision)
             if submission.resume_from_full_prompt:
                 # A rejected delta leaves the completed turn retryable.
                 request_state.turn_entry_finished = False

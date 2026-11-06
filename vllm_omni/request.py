@@ -152,7 +152,6 @@ class OmniStreamingUpdate:
     resume_from_full_prompt: bool = False
     append_prefix_length: int | None = None
     append_prefix_digest: bytes | None = None
-    block_hashes: "tuple[BlockHash, ...]" = ()
     cache_salt: str | None = None
 
     @classmethod
@@ -170,6 +169,5 @@ class OmniStreamingUpdate:
             resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
             append_prefix_length=getattr(request, "append_prefix_length", None),
             append_prefix_digest=getattr(request, "append_prefix_digest", None),
-            block_hashes=tuple(request.block_hashes) if getattr(request, "resume_from_full_prompt", False) else (),
             cache_salt=request.cache_salt,
         )

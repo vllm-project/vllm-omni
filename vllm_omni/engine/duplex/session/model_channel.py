@@ -34,6 +34,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
+    DUPLEX_TURN_DELTA_KEY,
     DuplexAppendPlan,
     DuplexFence,
     DuplexOutputContext,
@@ -458,7 +459,7 @@ class ModelChannel:
                 "conversation": list(conversation),
                 "conversation_item_ids": conversation_item_ids,
                 "modalities": list(session.response_config.modalities),
-                "_duplex_turn_delta": use_delta,
+                DUPLEX_TURN_DELTA_KEY: use_delta,
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params

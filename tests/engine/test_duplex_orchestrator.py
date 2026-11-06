@@ -1366,7 +1366,6 @@ async def test_turn_delta_transport_keeps_full_frontend_context():
     assert wire.append_prefix_length == 2
     # The suffix-only wire request still lets EngineCore verify prefix content.
     assert wire.append_prefix_digest == token_prefix_digest([10, 11])
-    assert not wire.resume_from_full_prompt
     assert pool.output_processor.add_request_calls[0][1]["request"].prompt_token_ids == [10, 11, 12, 13]
     assert request.prompt_token_ids == [10, 11, 12, 13]
 
@@ -1498,11 +1497,9 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
 async def test_turn_delta_history_fence_covers_input_processing(mocker, phase, delete_history):
     from dataclasses import replace
 
+    from vllm_omni.engine.duplex.contracts import DUPLEX_TURN_DELTA_KEY
     from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
-    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import (
-        DELTA_KEY,
-        QwenIncrementalPrompt,
-    )
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
 
     entered = threading.Event()
     release = threading.Event()
@@ -1574,7 +1571,7 @@ async def test_turn_delta_history_fence_covers_input_processing(mocker, phase, d
         old_output = list(ledger._output_ids)
         delta = replace(
             first,
-            prompt={"prompt": "delta", DELTA_KEY: True},
+            prompt={"prompt": "delta", DUPLEX_TURN_DELTA_KEY: True},
             already_submitted=True,
             history_revision=session.history_revision,
         )

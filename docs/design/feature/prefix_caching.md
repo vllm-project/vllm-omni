@@ -64,8 +64,8 @@ length, token-content digest and salt, without comparing history block hashes. O
 remain in the resident request; only new media touch the sender/receiver caches.
 APC stays enabled and upstream maintains hashes for newly completed blocks.
 History changes and incompatible boundaries use the full-snapshot fallback,
-which validates all completed block hashes before retaining their allocation.
-The partial block is recomputed in both paths.
+which releases the resident allocation and lets ordinary APC re-match unchanged
+blocks. The partial block is recomputed in both paths.
 Stage-output caching remains required to replay complete conditioning rows to
 each fresh downstream speech pipeline. A worker retirement/arrival pair resets
 per-turn delivery state without releasing scheduler-owned matching KV.
@@ -75,8 +75,8 @@ to drain before worker retirement and arrival. The existing stale-output fence
 discards those results without appending tokens or forwarding conditioning rows.
 Other requests and decode steps within a turn remain asynchronous.
 
-The full-snapshot adapter delegates token extension to vLLM's
-`Scheduler._update_request_as_session`. After prefix validation it normalizes
+The continuation adapter delegates token extension to vLLM's
+`Scheduler._update_request_as_session`. After delta validation it normalizes
 the resident request to the retained prefix plus one uncomputed lookahead token
 (discarded by upstream), and passes only the remaining prompt as a
 `StreamingUpdate`. Upstream owns token folding, block-hash generation, feature

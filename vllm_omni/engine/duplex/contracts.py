@@ -75,6 +75,10 @@ class DuplexStageRequestContext:
         return self.sampling_params[self.stage_id]
 
 
+#: Private session-config and prompt key marking a resident turn delta.
+DUPLEX_TURN_DELTA_KEY = "_duplex_turn_delta"
+
+
 @dataclass(frozen=True)
 class DuplexStageSubmission:
     context: DuplexStageRequestContext
@@ -268,6 +272,7 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 
 
 __all__ = [
+    "DUPLEX_TURN_DELTA_KEY",
     "DuplexFence",
     "DuplexAppendPlan",
     "DuplexOutputAction",

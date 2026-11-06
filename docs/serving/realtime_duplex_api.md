@@ -101,18 +101,14 @@ Changed/pruned history, playback-truncated text, or an unsupported completion
 boundary falls back to full-snapshot processing. Tool turns, changed prompt
 settings and the existing message/audio window limits also use that fallback.
 Fallback snapshots are tokenized in full without a rendered-text prefix cache.
-For this fallback, the scheduler compares block
-hashes against the resident request: when all
-completed blocks match and the new prompt extends them, it retains those KV
-blocks and computes only the partial-block tail and new suffix. Otherwise it
-releases the old allocation and rebuilds from the current prompt. Block hashes
+The scheduler releases the resident allocation and rebuilds from the current
+prompt; ordinary prefix caching re-matches every unchanged block. Block hashes
 include multimodal identities and cache salt, so equal audio placeholder tokens
 alone do not authorize reuse.
 
-Internally, both paths become a suffix-only streaming update to
-vLLM's upstream resumable scheduler. It folds the retained token history and
-recomputes new block hashes, rebasing new multimodal features without modifying
-the original snapshot. This does not change the commit-triggered generation
+Internally, both paths become a streaming update to vLLM's upstream resumable
+scheduler. It folds the retained token history and recomputes new block hashes,
+rebasing new multimodal features without modifying the original snapshot. This does not change the commit-triggered generation
 interface or enable audio input during the same generation.
 
 Talker and Code2Wav terminate each turn. Their next requests receive the complete

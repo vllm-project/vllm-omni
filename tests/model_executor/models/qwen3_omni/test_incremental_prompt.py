@@ -58,7 +58,7 @@ def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
     from vllm.sampling_params import SamplingParams
 
     from vllm_omni.engine import OmniEngineCoreRequest
-    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import DELTA_KEY
+    from vllm_omni.engine.duplex.contracts import DUPLEX_TURN_DELTA_KEY
 
     class UnlistedStartTokenizer:
         all_special_tokens = [token for token in tokenizer.all_special_tokens if token != "<|im_start|>"]
@@ -92,7 +92,7 @@ def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
         assert cache.prepare_turn(first) == (first, None)
         return
     delta = {
-        DELTA_KEY: True,
+        DUPLEX_TURN_DELTA_KEY: True,
         "prompt": "<|im_end|>\n<|im_start|>user\nnew",
         "multi_modal_data": {"audio": ["new audio"]},
         "multi_modal_uuids": {"audio": ["rep0:new"]},

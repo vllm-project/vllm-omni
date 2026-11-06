@@ -9,8 +9,7 @@ must observe the same media accesses as the EngineCore receiver cache.
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.engine import OmniEngineCoreRequest
-
-DELTA_KEY = "_qwen_turn_delta"
+from vllm_omni.engine.duplex.contracts import DUPLEX_TURN_DELTA_KEY
 
 
 class QwenIncrementalPrompt:
@@ -41,7 +40,7 @@ class QwenIncrementalPrompt:
 
     def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]:
         """Use the session-authorized delta, or process a replacement snapshot."""
-        if prompt.get(DELTA_KEY):
+        if prompt.get(DUPLEX_TURN_DELTA_KEY):
             if not self._finished or not self._output_ids or not self._append_safe:
                 raise ValueError("Turn delta has no completed resident token ledger")
             return prompt, self._prompt_ids + self._output_ids[:-1]

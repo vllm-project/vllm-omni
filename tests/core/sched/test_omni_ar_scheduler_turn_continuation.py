@@ -117,7 +117,8 @@ def test_async_continuation_drains_then_reinstalls_worker(change, native):
     if change == "edit":
         tokens[0] = 123
     scheduler.add_request(_request(tokens))
-    assert request.num_computed_tokens == (32 if change == "append" else 0)
+    # A snapshot releases resident KV; prefix caching re-matches it on arrival.
+    assert request.num_computed_tokens == 0
 
     # A different session can prefill while the continued one is fenced.
     other = _request([101, 102, 103], request_id="other")
@@ -167,8 +168,6 @@ def test_direct_turn_delta_reuses_resident_blocks_without_snapshot_hashes():
     update = _request([999, 100, 101])
     update.append_prefix_length = 34
     update.append_prefix_digest = token_prefix_digest(list(range(34)))
-    # These are hashes of the suffix alone and cannot match the resident prefix.
-    update.block_hashes.clear()
     scheduler.add_request(update)
     assert request.prompt_token_ids == list(range(33)) + [33, 999, 100, 101]
     assert request.num_computed_tokens == 32

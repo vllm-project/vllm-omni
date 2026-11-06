@@ -1870,36 +1870,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _resume_from_full_prompt(
         self, session: Request, update: StreamingUpdate, *, retained_prefix: int | None = None
     ) -> None:
-        """Continue a committed turn on resident KV, or rebuild a changed history.
+        """Continue a validated turn delta on resident KV, or rebuild a snapshot.
 
-        Full block hashes include multimodal identities and cache salt. Only
-        retain KV when every completed block matches the new prompt; otherwise
-        release the old allocation before writing a different continuation.
-        This avoids overwriting a cached/shared suffix block.
+        A full snapshot releases the resident allocation and restarts from no
+        computed tokens, so upstream prefix caching re-matches every unchanged
+        block, including multimodal identities and cache salt.
         """
         if self._streaming_update_overflows(session, update, projected_len=len(update.prompt_token_ids)):
             return
-        block_size = self.cache_config.block_size
-        confirmed = self._get_confirmed_num_computed_tokens(session)
-        retained = confirmed // block_size * block_size if retained_prefix is None else retained_prefix
-        hash_count = retained // self.hash_block_size
-        # A validated delta keeps resident hashes directly; only a replacement
-        # snapshot supplies hashes that must be compared with the resident.
-        hashes = session.block_hashes if retained_prefix is not None else getattr(update, "block_hashes", ())
-        can_continue = retained_prefix is not None or (
-            retained > 0
-            and len(update.prompt_token_ids) > retained
-            and len(session.block_hashes) >= hash_count
-            and len(hashes) >= hash_count
-            and tuple(session.block_hashes[:hash_count]) == tuple(hashes[:hash_count])
-        )
-        if not can_continue:
+        if retained_prefix is None:
             self._release_replaced_streaming_prompt_cache(session)
             retained = 0
         else:
+            retained = retained_prefix
             # Encoder-cache entries are indexed by feature within the request.
-            # A new full snapshot can change features after the retained KV;
-            # do not let those indices reuse the previous turn's encoder state.
+            # The delta re-indexes features after the retained KV; do not let
+            # those indices reuse the previous turn's encoder state.
             self.encoder_cache_manager.free(session)
         self._reset_streaming_session_replacement_state(session)
 
@@ -1912,14 +1898,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         session.prompt_token_ids = list(session._all_token_ids[:retained])
         session.num_prompt_tokens = retained
         session.num_computed_tokens = retained
-        session.block_hashes[:] = hashes[: retained // self.hash_block_size]
+        del session.block_hashes[retained // self.hash_block_size :]
         session.cache_salt = update.cache_salt
         session.mm_features = []
         delta_features = []
         for feature in update.mm_features or ():
             if feature.mm_position.offset < retained:
-                # This includes a feature spanning the block boundary. Its
-                # identity was validated by the retained prefix's hashes.
+                # This includes a feature spanning the block boundary; it is
+                # the resident's own feature, not a new delta feature.
                 session.mm_features.append(feature)
             else:
                 # Upstream rebases delta features in place; clone descriptors
