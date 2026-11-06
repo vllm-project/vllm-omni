@@ -174,24 +174,123 @@ description and `text2text` the expected answer.
 pytest -q tests/diffusion/models/sensenova_u1/
 ```
 
-### Ascend A3: BF16 text-to-image (validation pending)
+### Ascend A3: BF16 text-to-image
 
 The A3 path targets BF16, TP=1 and TP=2, with either the base checkpoint or
 startup fusion of the **original** `SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors`.
 The V2 adapter is a different checkpoint and is not used by these commands.
 
-These configurations have **not been executed on A3** for this change: the
-available development host has neither an NPU nor the model weights. CPU
-regression tests cannot establish NPU kernel accuracy, image quality, memory
-capacity, HCCL behavior, or performance. The commands below are reproducible
-validation instructions, not measured results.
+The 2026-10-26 A3 experiment used PR #9197 commit
+`7d0eb181ceaa6dd311e91c8547faa705f6c37e9b`. Its base-model TP1 smoke and original
+LoRA TP1/TP2 generation checks completed. The repeated performance run covered
+TP1/TP2 with profiling on/off, all using the original LoRA; it did not cover
+four different base/LoRA configurations. These are generation and performance
+observations, not a full regression suite or dataset-quality evaluation.
 
 | Configuration | Generation settings | A3 validation |
 | --- | --- | --- |
-| BF16, TP=1, no LoRA | 50 steps, CFG 4.0 | Not run |
+| BF16, TP=1, no LoRA | 50 steps, CFG 4.0 | 512×512 smoke passed |
 | BF16, TP=2, no LoRA | 50 steps, CFG 4.0 | Not run |
-| BF16, TP=1, original LoRA | 8 steps, CFG 1.0 | Not run |
-| BF16, TP=2, original LoRA | 8 steps, CFG 1.0 | Not run |
+| BF16, TP=1, original LoRA | 8 steps, CFG 1.0 | 2720×1536, 20 measured requests per profiling setting |
+| BF16, TP=2, original LoRA | 8 steps, CFG 1.0 | 1024×1024 and 2560×1760 smoke; 2720×1536 repeated run |
+
+#### Recorded image and runtime
+
+The Pod used the private container tag
+`vllm:nightly-a3-20261018170400_aarch64`, with 16 CPU cores, 200 GiB host memory,
+200 GiB persistent storage and two allocated A3 compute devices. Each device
+reported 64 GiB HBM. TP1 used one logical device; TP2 used both. This device
+count is not a statement about the number of physical boards.
+
+The container additionally used an existing isolated `runtime032` Python
+environment copied from the reference installation. **The container tag alone
+does not recreate the measured environment.** No immutable container digest
+was recorded. The actual service environment was:
+
+| Component | Recorded version |
+| --- | --- |
+| OS / architecture | Linux, aarch64 |
+| Python | 3.12.13 |
+| CANN / driver | 9.1.0 / 25.5.1.1 |
+| PyTorch / torch-npu | 2.10.0+cpu / 2.10.0.post4 |
+| vLLM | 0.32.0+empty |
+| vLLM-Ascend | 0.19.1rc2.dev2959+g450e55698 |
+| vLLM-Omni installation label | 0.32.0.dev0+g7d0eb181.npu |
+| Transformers / Diffusers | 5.19.0 / 0.40.0 |
+| MindIE-SD | 3.1.0 |
+
+These are the recorded package labels, including `+cpu` and `+empty`; the
+service executed on NPU through `torch_npu`. The Omni installation label was
+set with `VLLM_OMNI_VERSION_OVERRIDE` for the pinned archive source, not an
+official release. The deployment audit compared 5,320 archive files and
+reported zero source changes; installation metadata was tracked separately.
+
+The backend was `FLASH_ATTN`, with BF16, eager execution and CFG parallel size 1.
+Runtime settings included:
+
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+export HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
+export VLLM_OMNI_SENSENOVA_PAGED_DECODE=0
+export LD_PRELOAD=/lib/aarch64-linux-gnu/libjemalloc.so.2
+```
+
+The model was `sensenova/SenseNova-U1.5-8B-MoT`, with the original adapter
+SHA-256 `3ef32180cdf1e30a870a83f4f136e897ea50b7ee467f863d75633464ebb25708`.
+Resolved public checkpoint revisions were not recorded; the evidence records
+the mounted model config and adapter hashes.
+
+After provisioning that runtime, the unprofiled TP2 service used the following
+launch configuration. Set `MODEL` and `LORA_PATH` to the local checkpoint and
+original adapter; use one logical device and TP1 for the single-device arm.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+vllm serve "$MODEL" --omni --served-model-name SenseNova-U1.5-8B-MoT \
+    --host 0.0.0.0 --port 8091 --trust-remote-code --dtype bfloat16 \
+    --tensor-parallel-size 2 --cfg-parallel-size 1 --enforce-eager \
+    --lora-path "$LORA_PATH" --lora-backend distill
+```
+
+#### Measured generation and performance
+
+Initial smoke requests used a mountain-lake prompt, seed 42 and `think=false`:
+
+| Configuration | Width×height | Steps / CFG | HTTP | Single-request client time |
+| --- | --- | --- | --- | --- |
+| TP1, base | 512×512 | 50 / 4.0 | 200 | 6.975 s |
+| TP2, original LoRA | 1024×1024 | 8 / 1.0 | 200 | 2.179 s |
+| TP2, original LoRA | 2560×1760 | 8 / 1.0 | 200 | 8.256 s |
+
+These are single-request smoke observations, not steady-state medians.
+
+The subsequent fixed-prompt performance run used **width 2720, height 1536**,
+the original 8-step LoRA, CFG 1.0, `think=false`, `cfg_norm=none`,
+`timestep_shift=3.0`, `t_eps=0.02`, seed 42 and batch/concurrency 1. Each of
+TP1/TP2 with profiling on/off ran three warmups followed by 20 measurements:
+92 requests total, 80 measured, all returning images.
+
+| TP | Profiled text mean | Profiled 8-step denoise mean | Profiled generation mean | Plain E2E mean | Plain E2E median | Plain E2E P95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.2726 s | 3.6148 s | 3.6979 s | 6.2191 s | 6.2193 s | 6.2251 s |
+| 2 | 0.1962 s | 2.3250 s | 2.4113 s | 4.8812 s | 4.8795 s | 4.8892 s |
+
+Stage columns come from a separate profiling copy with a
+[timing-only patch](validation/u15-a3-20261026-timing.patch); plain E2E comes
+from unchanged PR production code with profiling disabled. Pure denoising is
+included in generation, so the columns must not be added. Stage boundaries
+synchronize NPU execution and reduce complete intervals by MAX over TP ranks.
+E2E includes the complete HTTP body and JSON parsing, but excludes service
+startup, loading, image decoding and saving. P95 uses linear interpolation
+over 20 measurements. The same-TP first measured PNG images with profiling on/off
+were byte-identical; this does not establish TP1-versus-TP2 equivalence.
+
+The [recorded workload and request timings](validation/u15-a3-20261026.json)
+contain the exact prompt, settings, all 92 request records, package versions,
+source checks and saved image hashes. The final health/model endpoints
+returned 200 at experiment completion; this is not a current service-status
+claim. Native NPU/CUDA regression completion and base-only TP2 remain pending.
 
 #### Dependencies and checkpoints
 
@@ -325,8 +424,9 @@ synchronize the remote workers and is deliberately unnecessary here.
 Missing stage metrics, failed warmups and failed requests abort the benchmark
 instead of producing zero timing values. Completed measurements are preserved
 if a later request fails. JSON contains raw stage durations and run settings;
-CSV contains one row per measured request. No A3 timings or speedup claims are
-provided until these commands have actually run.
+CSV contains one row per measured request. The results above came from the
+recorded workload, which used 2720×1536 and a separate benchmark-only timing
+copy; this helper defaults to 2560×1760 and does not export pure-loop timing.
 
 #### Current scope and limitations
 
@@ -337,7 +437,9 @@ validated on A3 by this change. CUDA paged decode remains a CUDA-specific
 optimization; NPU uses the ordinary cache path. Unsupported optimized-kernel
 conditions use the existing correct fallback; runtime kernel failures are
 surfaced rather than retried silently. CPU mathematical checks do not replace
-the four A3 generation checks or numerical parity checks on real NPU kernels.
+the remaining A3 configuration checks or numerical parity checks on real NPU
+kernels. The recorded generation/performance results do not establish
+dataset-quality equivalence or validate untested feature combinations.
 
 ## Notes
 
