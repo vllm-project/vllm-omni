@@ -907,9 +907,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # that, an unrelated parked session would consume the slot and the
         # seeded request would never be admitted (review P2 on #9937).
         parked_streaming_sessions = int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
-        limit = (
-            1 + parked_streaming_sessions if seeded_solo else original_max_num_active_reqs
-        )
+        limit = 1 + parked_streaming_sessions if seeded_solo else original_max_num_active_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
