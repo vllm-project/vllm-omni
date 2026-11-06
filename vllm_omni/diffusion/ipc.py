@@ -239,7 +239,21 @@ def _tensor_to_shm(
         torch.accelerator.set_stream(d2h_stream)
         try:
             t = tensor.detach()
-            cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            try:
+                cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            except RuntimeError as exc:
+                # Some Ascend hosts cannot grant pinned host pages when free
+                # (non-reclaimable) memory runs low. The copy is still correct
+                # through pageable memory; only the transfer may be slower.
+                message = str(exc)
+                if "MallocHost" not in message and "out of memory" not in message.lower():
+                    raise
+                logger.warning(
+                    "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
+                    tuple(t.shape),
+                    t.dtype,
+                )
+                cpu = torch.empty(t.shape, dtype=t.dtype)
             cpu.copy_(t, non_blocking=True)
         finally:
             torch.accelerator.set_stream(old_stream)
