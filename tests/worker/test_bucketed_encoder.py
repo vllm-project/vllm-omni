@@ -295,7 +295,9 @@ def test_explicit_lengths_apply_alongside_positional_mask(bucket_cfg, monkeypatc
     for row, length in enumerate(LENGTHS):
         # The un-bucketed reference is the encoder's own forward on the same
         # weights over the row's true window.
-        solo = MaskConsumingEncoder.forward(model.encoder, feats[row : row + 1, :length], mask[row : row + 1, :length])[0]
+        solo = MaskConsumingEncoder.forward(model.encoder, feats[row : row + 1, :length], mask[row : row + 1, :length])[
+            0
+        ]
         torch.testing.assert_close(out[row, :length], solo, rtol=0, atol=1e-6)
 
 
@@ -342,7 +344,9 @@ def test_length_returning_encoder_buckets_losslessly(bucket_cfg, monkeypatch):
     for row, length in enumerate(LENGTHS):
         # The un-bucketed reference is the encoder's own forward on the same
         # weights over the row's true window.
-        solo_features, solo_len = LengthReturningEncoder.forward(model.encoder, feats[row : row + 1, :length], lens[row : row + 1])
+        solo_features, solo_len = LengthReturningEncoder.forward(
+            model.encoder, feats[row : row + 1, :length], lens[row : row + 1]
+        )
         torch.testing.assert_close(out_features[row, :length], solo_features[0], rtol=0, atol=1e-6)
         assert out_lens[row].item() == solo_len.item()
 
@@ -434,7 +438,9 @@ def test_context_margin_preserves_conv_tail(bucket_cfg, monkeypatch):
     assert out.shape[0] == len(lengths)
     for row, length in enumerate(lengths):
         # The eager reference feeds the full real window (length + context margin).
-        solo, solo_len = ConvContextEncoder.forward(model.encoder, feats[row : row + 1, : length + 2], lens[row : row + 1])
+        solo, solo_len = ConvContextEncoder.forward(
+            model.encoder, feats[row : row + 1, : length + 2], lens[row : row + 1]
+        )
         torch.testing.assert_close(out[row, :length], solo[0, :length], rtol=0, atol=1e-6)
         assert out_lens[row].item() == solo_len.item()
 
@@ -543,17 +549,16 @@ def test_whisper_fixed_window_recipe_matches_reference(bucket_cfg, monkeypatch):
     assert hidden.shape == (2, 1500, 64), hidden.shape
     assert torch.count_nonzero(hidden[1, 150:]) == 0
 
-    # The recipe reproduces the reference forward on the same weights: row 0 at
-    # the full fixed window (the only window the untouched forward accepts) and
-    # row 1 over its short rung window. Upstream ``transformers`` forward drift
-    # fails here, not in production audio output.
+    # The recipe reproduces the reference forward on the same weights at the full
+    # fixed window — the only window the untouched forward accepts (its
+    # fixed-window check rejects anything shorter, which is exactly why the shim
+    # exists). Upstream ``transformers`` forward drift fails here, not in
+    # production audio output.
     pristine = WhisperEncoder(whisper_cfg).cuda().eval()
     pristine.load_state_dict(model.encoder.state_dict())
     with torch.inference_mode():
         full = original_forward(pristine, feats[0:1]).last_hidden_state
-        short = original_forward(pristine, feats[1:2, :, :300]).last_hidden_state
     torch.testing.assert_close(hidden[0], full[0], rtol=0, atol=1e-5)
-    torch.testing.assert_close(hidden[1, :150], short[0], rtol=0, atol=1e-5)
 
 
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_cfg):
@@ -647,7 +652,9 @@ def test_positional_host_lengths_fallback_still_buckets(bucket_cfg, monkeypatch)
     # Bucketed container: width = largest rung used (200), not the raw T (240).
     assert out_features.shape == (len(LENGTHS), 200, D), out_features.shape
     for row, length in enumerate(LENGTHS):
-        solo_features, solo_len = LengthReturningEncoder.forward(model.encoder, feats[row : row + 1, :length], lens[row : row + 1])
+        solo_features, solo_len = LengthReturningEncoder.forward(
+            model.encoder, feats[row : row + 1, :length], lens[row : row + 1]
+        )
         torch.testing.assert_close(out_features[row, :length], solo_features[0], rtol=0, atol=1e-6)
         assert out_lens[row].item() == solo_len.item()
 
