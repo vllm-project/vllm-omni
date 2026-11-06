@@ -90,8 +90,8 @@ per GPU.
 | ≥141 GB (H200, B200, B300) | 1 | (none) | 107.4 GiB | This page |
 | | 4 | `--cfg-parallel-size 2 --usp 2` | 110.7 GiB | This page |
 | | 8 | `--cfg-parallel-size 2 --usp 4` | 110.4 GiB | This page |
-| 96 GB (RTX PRO 6000) | 1 | `--enable-distributed-layerwise-offload --dlo-resident-layers 44`, `offload_guardrail_models` | 87.0 GiB | [PAN2-RTX-PRO-6000](PAN2-RTX-PRO-6000.md) |
-| | 2 | `--tensor-parallel-size 2` | 87.0 GiB | [PAN2-RTX-PRO-6000](PAN2-RTX-PRO-6000.md) |
+| 96 GB (RTX PRO 6000) | 1 | `--enable-distributed-layerwise-offload --dlo-resident-layers 48`, `offload_guardrail_models` | 84.4 GiB | [PAN2-RTX-PRO-6000](PAN2-RTX-PRO-6000.md) |
+| | 2 | `--tensor-parallel-size 2` | 84.5 GiB | [PAN2-RTX-PRO-6000](PAN2-RTX-PRO-6000.md) |
 | 32 GB (RTX 5090) | 2 | `--tensor-parallel-size 2 --enable-distributed-layerwise-offload --dlo-resident-layers 6`, `offload_guardrail_models` | 29.7 GiB | [PAN2-RTX-5090](PAN2-RTX-5090.md) |
 
 `offload_guardrail_models` is set with
