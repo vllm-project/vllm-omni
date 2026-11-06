@@ -1715,7 +1715,11 @@ stages:
         stages = merge_pipeline_deploy(pipeline, deploy)
         expect_v2 = platform in {"cuda", "npu"}
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            expect_v2,
+            expect_v2,
+            platform == "cuda",
+        ]
         assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
 
         duplex = _apply_platform_overrides(

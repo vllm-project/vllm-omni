@@ -33,7 +33,7 @@ The bundled Qwen3-Omni setup explicitly sets `moe_backend: triton` for the Think
 both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashInfer CUTLASS unquantized MoE path on
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
-On CUDA and NPU the same file selects model runner v2. The Thinker prefix cache is enabled on CUDA and disabled on NPU.
+On CUDA the same file selects model runner v2 for all stages. On NPU, Thinker and Talker use v2; Code2Wav keeps v1 because the NPU generation worker does not support v2. The Thinker prefix cache is enabled on CUDA and disabled on NPU.
 The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling.
 XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
 
