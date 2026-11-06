@@ -318,6 +318,7 @@ class _BucketedEncoder:
         self._aux_spec = None  # e.g. ("lengths", dtype, device) for (features, lengths) outputs
         self._disabled = False
         self._truncation_warned = False
+        self._missing_lengths_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
         # Verified time axis from the whitelist (the fixed-window shim overrides
         # it to channels-first 2).
@@ -369,11 +370,23 @@ class _BucketedEncoder:
 
         lengths, mask, length_arg = self._host_lengths(features, args[1:], carried)
         if lengths is None or len(lengths) != features.size(0):
-            logger.debug(
-                "Bucketed encoder %r: no per-item lengths (got %r); falling back to the original forward",
-                self.name,
-                None if lengths is None else len(lengths),
-            )
+            if not self._missing_lengths_warned:
+                # A permanently silent fallback here hides "the feature never
+                # engaged" (e.g. a wrong length field): surface it once.
+                self._missing_lengths_warned = True
+                logger.warning(
+                    "Bucketed encoder %r: no per-item lengths (got %r); serving the "
+                    "original forward. If this persists, bucketing is not engaging "
+                    "for this encoder (further occurrences log at debug level).",
+                    self.name,
+                    None if lengths is None else len(lengths),
+                )
+            else:
+                logger.debug(
+                    "Bucketed encoder %r: no per-item lengths (got %r); falling back to the original forward",
+                    self.name,
+                    None if lengths is None else len(lengths),
+                )
             return self._original(*args, **kwargs)
 
         # Route empty batches and batches containing an item longer than the
