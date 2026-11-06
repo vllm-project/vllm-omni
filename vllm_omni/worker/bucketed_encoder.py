@@ -19,7 +19,12 @@ computed over the padded length regardless of how short its real content is.
 The wrapper re-groups items by their published true lengths and computes per
 length-rung windows instead, so short items stop paying for long ones. Call
 sites that already feed true-length or length-packed inputs have no padding
-waste to recover and should stay on the original forward.
+waste to recover and should stay on the original forward — and the wrapper
+enforces that per batch, not per call site: each rung window is capped at the
+input's time extent, and the bucketed path only runs when the capped windows
+are strictly shorter in aggregate, so a batch with no padding waste (single
+item, uniform lengths) is served by the untouched forward and enabling the
+feature there is a no-op.
 """
 
 from __future__ import annotations
@@ -297,6 +302,18 @@ class _BucketedEncoder:
         if max(lengths) + self._context_margin > self.ladder.max_length:
             return self._original(*args, **kwargs)
 
+        # Waste gate: never compute more frames than the untouched forward.
+        # Each rung window is capped at the input's time extent (a window equal
+        # to the extent IS the original computation for those rows), and the
+        # bucketed path only runs when the capped windows are strictly shorter
+        # in aggregate. Single items, uniform batches, and batches no rung can
+        # shrink all fall through untouched — so the feature is a no-op wherever
+        # there is no padding waste to recover. All host-side integer math.
+        time_extent = self._time_dim(features)
+        windows = [min(self.ladder.padded_length(length + self._context_margin), time_extent) for length in lengths]
+        if sum(windows) >= len(lengths) * time_extent:
+            return self._original(*args, **kwargs)
+
         try:
             if self._rebuild is None:
                 # First eligible call: serve it eagerly, learning how to rebuild
@@ -314,7 +331,7 @@ class _BucketedEncoder:
                 self._rebuild = split[1]
                 self._aux_spec = split[2]
                 return output
-            bucketed, aux = self._bucketed(features, lengths, mask, length_arg)
+            bucketed, aux = self._bucketed(features, lengths, mask, length_arg, windows)
             return self._rebuild(bucketed, aux)
         except Exception:
             self._disabled = True
@@ -348,10 +365,13 @@ class _BucketedEncoder:
             return [int(v) for v in length_arg.tolist()], mask, length_arg
         return None, mask, None
 
-    def _bucketed(self, features, lengths, mask, length_arg):
+    def _bucketed(self, features, lengths, mask, length_arg, windows):
+        # ``windows`` are the waste-gate windows (rung capped at the input's
+        # time extent), so every window is <= what the untouched forward would
+        # compute for these rows.
         groups: dict[int, list[int]] = {}
-        for index, length in enumerate(lengths):
-            groups.setdefault(self.ladder.padded_length(length + self._context_margin), []).append(index)
+        for index, window in enumerate(windows):
+            groups.setdefault(window, []).append(index)
 
         container: torch.Tensor | None = None
         aux_container: torch.Tensor | None = None

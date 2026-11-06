@@ -920,6 +920,49 @@ def test_empty_batch_falls_back_to_original(bucket_env):
     assert out.shape == (0, 240, D), out.shape
 
 
+def test_no_waste_batch_serves_original_untouched(bucket_env):
+    """Waste gate: when the rung windows cannot compute fewer frames than the
+    untouched forward — a single item whose carried length is already the true
+    length (B=1), or a uniform batch — the wrapper serves the original forward
+    unchanged. Enabling the feature outside mixed-length batches is a no-op,
+    never a regression, and the wrapper stays armed for later batches."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    for lengths in ([50], [50, 50, 50]):
+        feats = make_features(lengths, t=50)  # carried extent == true length
+        with torch.inference_mode():
+            model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
+            calls_before = len(model.encoder.calls)
+            out = model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
+        assert wrapper._disabled is False, "a no-waste batch must not disable the wrapper"
+        # The untouched forward ran once at the full extent — no rung windows.
+        assert model.encoder.calls[calls_before:] == [(len(lengths), 50, D)], model.encoder.calls[calls_before:]
+        torch.testing.assert_close(out, feats.cumsum(dim=1), rtol=0, atol=0)
+
+
+def test_rung_windows_are_capped_at_input_extent(bucket_env):
+    """A rung larger than the batch's carried time extent is capped to it: the
+    wrapper never computes more frames per row than the untouched forward, and
+    the batch still buckets down wherever a rung can shrink it."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+
+    lengths = [30, 120, 140]
+    feats = make_features(lengths, t=150)  # extent 150 < rung 200
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
+        calls_before = len(model.encoder.calls)
+        out = model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
+    shapes = model.encoder.calls[calls_before:]
+    # 30 -> rung 40; 120/140 -> rung 200 capped to the 150-frame extent.
+    assert sorted(shapes) == sorted([(1, 40, D), (2, 150, D)]), shapes
+    assert all(shape[1] <= 150 for shape in shapes), shapes
+    for row, length in enumerate(lengths):
+        torch.testing.assert_close(out[row, :length], feats[row, :length].cumsum(dim=0), rtol=0, atol=1e-6)
+
+
 def test_encoder_bucket_frames_d2h_sync(bucket_env):
     """The bucketed wrapper reads encoder_bucket_frames on the host without a
     D2H sync. The keep_on_cpu field config is declared by the length recording
