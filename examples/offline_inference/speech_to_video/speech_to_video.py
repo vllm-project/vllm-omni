@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Speech-to-Video generation example using Wan2.2 S2V.
@@ -221,6 +221,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
+    quantization_group = parser.add_mutually_exclusive_group()
+    quantization_group.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
+        help="Online quantization method for the S2V transformer blocks (e.g. mxfp8 on XPU/NPU, fp8 on GPU).",
+    )
+    quantization_group.add_argument(
+        "--quantization-config",
+        type=json.loads,
+        default=None,
+        help='Quantization JSON, e.g. \'{"method":"mxfp8"}\'.',
+    )
     return parser.parse_args()
 
 
@@ -276,6 +290,10 @@ def main():
     )
     if args.boundary_ratio is not None:
         omni_kwargs["boundary_ratio"] = args.boundary_ratio
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    if args.quantization_config is not None:
+        omni_kwargs["quantization_config"] = args.quantization_config
 
     omni = Omni(**omni_kwargs)
 

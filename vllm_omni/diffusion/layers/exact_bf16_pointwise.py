@@ -70,7 +70,9 @@ if HAS_TRITON:
 def residual(
     hidden: torch.Tensor, update: torch.Tensor, gate: torch.Tensor, *, _validated: bool = False
 ) -> torch.Tensor:
-    if not _validated and not eligible(hidden, update, gate):
+    # Inductor cannot inline these user kernels, even when the caller
+    # validated the inputs outside a compiled region.
+    if torch.compiler.is_compiling() or (not _validated and not eligible(hidden, update, gate)):
         return hidden + gate * update
     output = torch.empty_like(hidden)
     _residual_kernel[(triton.cdiv(hidden.numel(), 1024),)](
@@ -80,7 +82,7 @@ def residual(
 
 
 def silu_mul(gate: torch.Tensor, up: torch.Tensor, *, _validated: bool = False) -> torch.Tensor:
-    if not _validated and not eligible(gate, up):
+    if torch.compiler.is_compiling() or (not _validated and not eligible(gate, up)):
         return torch.nn.functional.silu(gate) * up
     output = torch.empty_like(gate)
     _silu_mul_kernel[(triton.cdiv(gate.numel(), 1024),)](gate, up, output, gate.numel(), 1024, enable_fp_fusion=False)

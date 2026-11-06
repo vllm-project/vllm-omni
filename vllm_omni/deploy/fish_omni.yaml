@@ -98,3 +98,46 @@ stages:
 platforms:
   cuda:
     cuda_mps: true
+  # Stage 0 stays on Model Runner V2. The NPU AR worker builds Ascend input
+  # state and attention metadata. Tensor parallel shards the backbone; expert
+  # parallel puts 128 of the 256 routed experts on each card. vLLM-Ascend
+  # expands those block-FP8 experts to bf16: 256 x 40 x (2 x 512 x 2048 +
+  # 512 x 2048) = 32.2B params, 64.4 GiB in all, 32.2 GiB on each rank, plus
+  # a few GiB of sharded non-expert weights. 0.72 of a 64 GB card is 46 GiB,
+  # so each rank still has KV and activation headroom. The DAC stage shares
+  # the second card; its 0.10 budget (6.4 GiB) fits in the 18 GiB that 0.72
+  # leaves there. Stage 0 replays piecewise ACL graphs. V2 must see the
+  # MoE communication method that set_ascend_forward_context stores on the
+  # forward context, or expert-parallel capture asserts. No MPS on NPU.
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.72
+        enforce_eager: false
+        tensor_parallel_size: 2
+        enable_expert_parallel: true
+        max_num_seqs: 64
+        max_num_batched_tokens: 4096
+        # Decode steps replay one FULL graph per captured batch size; mixed
+        # steps (a new request's prompt rows) replay PIECEWISE backbone graphs.
+        # A pure decode step is the steady state of a stream: sampling one
+        # whole frame is 40 backbone layers plus 13 tower layers of small
+        # per-layer kernels, so the eager launch cost dominates the arithmetic.
+        # FULL capture is what makes it a single replay: measured on 2x910B1
+        # (TP2 + EP, 64 streams max), decode-only RTF at one stream went
+        # 1.24 -> 0.95 and TTFA p50 0.91 s -> 0.80 s, with p95 RTF 1.30 ->
+        # 1.14. Batching scales it further: 133 frames/s at 16 streams and
+        # 305 at 64 in the best of three runs. The graph captures the sample
+        # rows of its batch size, which is why the sizes below stop at
+        # max_num_seqs. Mamba/GDN state, the tower KV pages and the per-step
+        # frame buffers live at fixed addresses outside the replayed region.
+        compilation_config:
+          cudagraph_mode: FULL_AND_PIECEWISE
+          max_cudagraph_capture_size: 64
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+        devices: "0,1"
+      - stage_id: 1
+        gpu_memory_utilization: 0.10
+        enforce_eager: true
+        max_num_seqs: 64
+        devices: "1"

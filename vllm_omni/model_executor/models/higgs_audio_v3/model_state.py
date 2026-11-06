@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -72,7 +73,7 @@ class HiggsModelState(OmniModelState):
 
     def add_request(self, req_index, new_req_data):
         params = new_req_data.sampling_params
-        is_warmup = str(new_req_data.req_id).startswith("_warmup_")
+        is_warmup = is_warmup_request(new_req_data.req_id)
         if not is_warmup and (
             params.frequency_penalty != 0
             or params.presence_penalty != 0
@@ -288,7 +289,7 @@ class HiggsSampler(OmniSampler):
     def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
         # Upstream warmup exercises its text sampler, including grammar and
         # penalties, with synthetic non-audio prompts. Keep that path intact.
-        if all(str(r).startswith("_warmup_") for r in input_batch.req_ids):
+        if all(is_warmup_request(r) for r in input_batch.req_ids):
             return super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
         if grammar_output is not None or input_batch.num_draft_tokens:
             raise ValueError("Higgs MRV2 does not support grammar or speculative sampling")

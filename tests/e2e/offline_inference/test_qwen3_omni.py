@@ -17,6 +17,7 @@ from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_video
+from tests.helpers.runtime import QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
     VllmOmniARStageConfig,
@@ -50,13 +51,18 @@ if current_omni_platform.is_xpu():
 else:
     stage_configs = [get_cuda_graph_config()]
 
-# Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
-production_test_params = [(model, _PRODUCTION_DEPLOY) for model in models]
+# Create parameter combinations for model and stage config.
+# The third item is OmniRunner kwargs. Only ROCm receives the bounded per-stage
+# cold-NFS allowance; the runner's existing 1800s overall deadline is retained.
+_STAGE_INIT = {"stage_init_timeout": QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S} if current_omni_platform.is_rocm() else {}
+test_params = [(model, stage_config, _STAGE_INIT) for model in models for stage_config in stage_configs]
+production_test_params = [(model, _PRODUCTION_DEPLOY, _STAGE_INIT) for model in models]
 # we can use the same config for a model that only has thinker (i.e., does not
 # enable audio output) because the resolver should figure out that it doesn't
 # need the full pipeline based on the HF config.
-thinker_test_params = [(model, stage_config) for model in thinker_only_models for stage_config in stage_configs]
+thinker_test_params = [
+    (model, stage_config, _STAGE_INIT) for model in thinker_only_models for stage_config in stage_configs
+]
 
 
 def get_question(prompt_type="video"):
@@ -106,7 +112,12 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
     assert thinker_vllm.cache_config.gpu_memory_utilization == 0.9
     assert talker_vllm.cache_config.gpu_memory_utilization == 0.6
     assert code2wav_vllm.cache_config.gpu_memory_utilization == 0.1
-    assert all(config.cache_config.enable_prefix_caching is False for config in engine.stage_vllm_configs)
+    # Platform overrides are already reflected in the resolved stage config.
+    # Verify that startup projection preserves that value in vLLM's runtime
+    # config instead of restating each platform's policy here.
+    assert thinker_vllm.cache_config.enable_prefix_caching is thinker.cache_config.enable_prefix_caching
+    assert talker_vllm.cache_config.enable_prefix_caching is False
+    assert code2wav_vllm.cache_config.enable_prefix_caching is False
     assert all(config.model_config.trust_remote_code is True for config in engine.stage_vllm_configs)
     assert code2wav_vllm.scheduler_config.enable_chunked_prefill is False
     assert code2wav_vllm.scheduler_config.async_scheduling is False

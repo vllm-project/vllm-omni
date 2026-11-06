@@ -20,6 +20,7 @@ def _equal(actual, expected):
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @pytest.mark.parametrize("batch", [1, 37, 128])
 @pytest.mark.parametrize("top_k,top_p", [(25, 0.8), (32, 1.0), (1, 0.8)])
 @torch.inference_mode()
@@ -77,6 +78,7 @@ def test_sample_attend_matches_sample_then_attention(batch, top_k, top_p):
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @pytest.mark.parametrize("temperature", [1.0, 1.7, 0.6])
 @pytest.mark.parametrize("top_k,top_p", [(50, 1.0), (0, 1.0), (2, 1.5)])
 @torch.inference_mode()
@@ -124,7 +126,7 @@ def _talker_stub(fused_depth, n_vq, vocab, hidden, codes, should_continue, dtype
 
 
 @cuda_only
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("batch", [1, 128])
 @torch.inference_mode()
 def test_mtp_epilogue_matches_talker_reference(batch):
@@ -150,12 +152,12 @@ def _cuda_models():
 
     model, embeddings, heads, stop_head = _models(12, "cuda", torch.bfloat16)
     model.prepare_qkv_lookup(embeddings, 12)
-    model.setup_compile()
     return model, embeddings, heads, stop_head
 
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @pytest.mark.parametrize("per_row", [False, True])
 @torch.inference_mode()
 def test_generate_frame_fused_depth_is_bit_identical(per_row):
@@ -191,6 +193,7 @@ def test_generate_frame_fused_depth_is_bit_identical(per_row):
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @torch.inference_mode()
 def test_generate_frame_fused_depth_graph_replay_matches_eager():
     model, embeddings, heads, stop_head = _cuda_models()

@@ -371,7 +371,7 @@ def test_initialize_builds_native_block_tables_from_rank_local_config(monkeypatc
         "max_num_batched_tokens": 32,
         "max_num_blocks_per_group": [5, 3],
         "device": "cuda:1",
-        "kernel_block_sizes": [4, 8],
+        # 02e55d2af3 (#57169) removed kernel_block_sizes from BlockTables.
         "cp_size": 1,
         "cp_rank": 0,
         "cp_interleave": 1,
