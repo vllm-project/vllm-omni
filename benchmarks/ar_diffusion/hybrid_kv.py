@@ -36,7 +36,12 @@ class HybridNoisyKVState:
         # Admission is single-request; all transfers come from its native plan.
         pass
 
-    def begin_request(self, req, plan, *, chunk_tokens, t0=0):
+    def begin_request(self, req, plan, *, chunk_tokens, t0=0, retain=()):
+        # The merged executor passes retain= through on every admission. The
+        # hybrid ring carries only the benchmark's own request — no retained
+        # history — so any non-empty retain is a contract violation.
+        if retain:
+            raise ValueError("the hybrid benchmark supports no retained history")
         if self.pages is not None or t0 != 0:
             raise ValueError("hybrid benchmark supports one request at a time")
         spec = self.spec
@@ -132,7 +137,17 @@ class HybridNoisyKVState:
     def drain(self):
         pass
 
-    def end_request(self, req):
+    def exchange_and_await_prior_handoffs(self, slot):
+        # Prior-history handoffs move cells between the native pool's rings.
+        # This adapter owns only the benchmark's own request ring, so there is
+        # nothing to hand off before the first prepare.
+        pass
+
+    def end_request(self, req, retain=()):
+        # Mirror the executor's drop signature; retained history is never
+        # valid here (see begin_request).
+        if retain:
+            raise ValueError("the hybrid benchmark supports no retained history")
         if self.pages is not None:
             self.bytes_sent = self.pages.sent_bytes
             self.bytes_received = self.pages.received_bytes

@@ -40,6 +40,55 @@ def test_hybrid_kv_surface_tracks_upstream_schedule_and_cache_kwargs():
     assert "step_replicas" in inspect.getsource(HybridNoisyKVState.begin_request)
 
 
+def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
+    """The merged executor passes retain= on admit/drop and calls the
+    prior-handoff hook after admission; the adapter must accept all three and
+    fail fast on non-empty retain (the benchmark owns no retained history).
+    Allocation is stubbed so this runs on CPU ( Bounty-hunter's P1)."""
+    from types import SimpleNamespace
+
+    import benchmarks.ar_diffusion.hybrid_kv as hybrid_kv_module
+
+    spec = ARDiffusionNoisyKVSpec(15, 12, 128, 8, 8, 6)
+    model = SimpleNamespace(local_num_layers=2, start_layer=0)
+    state = HybridNoisyKVState(spec, model, None, torch.device("cpu"), torch.bfloat16)
+    native = build_cell_plan(CellSchedule(7, 3, 4, 2, Ordering.LATEST_KV, 6, blocks=30, blocks_per_rank=15))
+    plan = BlockPlan(native)
+
+    class FakePages:
+        capacity = 4
+        device = torch.device("cpu")
+        sent_bytes = 0
+        received_bytes = 0
+        buffers = torch.zeros(2, 2, 64)
+        flags = torch.zeros(2)
+
+        def close(self, abort=False):
+            pass
+
+    monkeypatch.setattr(hybrid_kv_module, "LayerMajorPages", FakePages)
+    # Allocation stubbed: the CPU CI host cannot pin memory.
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+
+    # Executor admission (cell_executor.admit) passes retain=, empty for
+    # ordinary requests.
+    state.begin_request("req", plan, chunk_tokens=6, t0=0, retain=frozenset())
+    assert state._chunk_tokens["req"] == 6
+    # The pre-forward prior-handoff hook (cell_executor line 402) must exist
+    # and be callable after admission.
+    state.exchange_and_await_prior_handoffs(0)
+    # Executor drop (cell_executor.drop) passes retain=() and expects the
+    # per-request state gone.
+    state.end_request("req", retain=())
+    assert state.pages is None and "req" not in state._chunk_tokens
+
+    # The benchmark owns no retained history: non-empty retain fails fast.
+    with pytest.raises(ValueError, match="retained history"):
+        state.begin_request("req2", plan, chunk_tokens=6, t0=0, retain=frozenset({1}))
+    with pytest.raises(ValueError, match="retained history"):
+        state.end_request("req2", retain=(1,))
+
+
 @pytest.mark.parametrize("groups", [1, 2])
 @pytest.mark.parametrize("steps", [3, 4])
 @pytest.mark.parametrize("chunks", [1, 7, 128])
