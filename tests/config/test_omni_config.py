@@ -526,6 +526,16 @@ def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_ove
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
+def test_from_pipeline_config_accepts_frontend_consumed_reasoning_parser():
+    """The API worker consumes --reasoning-parser, so stages must not claim it."""
+    omni_config = _from_pipeline_key(
+        "qwen3_omni_moe_thinker_only",
+        cli_overrides={"reasoning_parser": "qwen3"},
+    )
+
+    assert omni_config.stage_by_id(0) is not None
+
+
 @pytest.mark.parametrize(
     ("engine_extras", "unowned_field"),
     [
@@ -1026,19 +1036,15 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-def test_mrv2_fails_fast_on_xpu():
-    with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
-
-
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
 @pytest.mark.parametrize("stage_override", [False, True])
-def test_mrv2_config_is_allowed_on_npu(stage_override):
+def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
     deploy = (
         DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
         if stage_override
         else DeployConfig(model_runner="v2")
     )
-    deploy = _apply_platform_overrides(deploy, platform="npu")
+    deploy = _apply_platform_overrides(deploy, platform=platform)
     if stage_override:
         assert deploy.stages[0].model_runner == "v2"
     else:
