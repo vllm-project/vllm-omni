@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable
+from statistics import median_low
 from typing import Any
 
 import regex as re
@@ -81,6 +82,14 @@ def parse_judge_json(text: str, *, required: tuple[str, ...] = ()) -> dict[str, 
             raise ValueError(f"Judge {key} is outside its allowed range: {score}")
         value[key] = round(score, 2) if key == "content_score" else int(score)
     return value
+
+
+def aggregate_judge_votes(votes: list[dict[str, Any]], fields: tuple[str, ...]) -> dict[str, int | float]:
+    """Per field, the lower median of the draws: the strict-majority value when one exists,
+    otherwise the middle draw, with even-count ties resolved to the lower score."""
+    if not votes:
+        raise ValueError("at least one judge vote is required")
+    return {field: median_low([vote[field] for vote in votes]) for field in fields}
 
 
 def summarize_temporal_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
