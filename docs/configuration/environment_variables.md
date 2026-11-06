@@ -127,8 +127,12 @@ unchanged** (e.g. Step-Audio-2-mini, whose `AudioEncoder` masks padding via
 `make_non_pad_mask`): the on/off encoder outputs are identical in fp32 and nearly
 identical in bfloat16. The bucketed copy never drops real frames: the rung is the
 published length (`samples // hop`) plus a per-model `context_margin` set one past
-the worst-case offset to the real frame count, so it overshoots by at most one
-frame of zero padding (property-swept in `tests/worker/test_bucketed_encoder.py`).
+the worst-case offset to the real frame count, so it overshoots the real content by
+at most one frame (property-swept in `tests/worker/test_bucketed_encoder.py`). Each
+rung window is a slice of the carried input: the frames past an item's real content
+keep the extractor's own pad value — Whisper-style extraction pads at the log-mel
+silence floor `(max - 4) / 4`, not 0 — and are never zero-filled, so the window
+frames are exactly the ones the un-bucketed forward would read.
 These are mel-window and encoder-boundary guarantees only; neither establishes
 end-to-end transcript equivalence (see the Step-Audio-2-mini measurement below).
 
@@ -138,7 +142,10 @@ values depend on the actual audio length distribution):
 * Covo-Audio-Chat (lossy): per-row on/off cosine down to ~0.5 on short clips,
   WER(off) 24.00%, WER(on) 24.58%, WER(on vs off) 11.10% on LibriSpeech
   test-clean, ~1.85x encoder speedup, and E2E at max-concurrency 16: TTFT P50
-  104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%).
+  104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%). These numbers
+  predate the rung-tail fix (the tail was zero-filled then; it is now sliced from
+  the extractor's padding), so the on/off gap is expected to narrow — re-measure
+  before citing.
 * Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
   bfloat16), and 1.62-3.7x encoder speedup on constructed mixed-length batches. The
   speedup is a function of the intra-batch length mix, not of the model: with the waste
