@@ -1154,6 +1154,47 @@ class TestPipelineRegistration:
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
 
+    @pytest.mark.parametrize(
+        ("checkpoint", "expected_output_type"),
+        [
+            ("Lance", "image"),
+            ("Lance_3B", "image"),
+            ("Lance_3B_Video", "video"),
+        ],
+    )
+    @pytest.mark.parametrize("explicit_deploy", [False, True])
+    def test_lance_checkpoint_output_type(self, checkpoint, expected_output_type, explicit_deploy):
+        from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline
+
+        model = f"/models/{checkpoint}"
+        deploy_path = get_deploy_config_path("lance.yaml") if explicit_deploy else None
+        # Lance's config.json has no model_type. Exercise the real basename
+        # fallback and the explicit deployment override without a remote lookup.
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch("vllm_omni.config.config_factory.get_hf_file_to_dict", return_value=None),
+        ):
+            omni_config = StageConfigFactory.create_from_model(
+                model,
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=deploy_path,
+            )
+            legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+                model,
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=deploy_path,
+            )
+
+        assert omni_config is not None
+        assert legacy_configs is not None
+        assert omni_config.pipeline_config.model_type == "lance"
+        assert omni_config.stage_by_id(0).final_output_type == expected_output_type
+        assert legacy_configs[0].final_output_type == expected_output_type
+        assert is_video_generation_pipeline(omni_config.stage_configs) is (expected_output_type == "video")
+        assert OMNI_PIPELINES["lance"].stages[0].final_output_type == "image"
+
     def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
         snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
         snapshot.mkdir(parents=True)
@@ -1530,16 +1571,14 @@ class TestDeployConfigLoading:
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
-    def test_minicpmo_talker_multi_frame_is_npu_scoped(self, platform: str):
-        """Stage 1's K-frame decode needs the NPU worker to inject constant
-        continue drafts, so the deploy block that arms it must not sit in the
-        platform-shared stage.
+    def test_minicpmo_talker_multi_frame_is_platform_scoped(self, platform: str):
+        """Both platforms arm stage 1's K-frame decode in their own block.
 
-        On NPU the ``speculative_config`` is a fingerprint: the worker replays
-        the decode graph and vLLM's n-gram proposer is never consulted. On CUDA
-        the same block hands the Talker to the real proposer plus the rejection
-        sampler, which asserts on its codec ids (device-side assert out of
-        ``get_token_bin_counts_and_mask``).
+        The deploy block sits under each platform's stage 1, not in the
+        platform-shared stage, because the two use it differently: NPU replays
+        the decode graph and never consults vLLM's n-gram proposer, while CUDA
+        books the span and overrides the drafts from the runner. Both need the
+        synchronous runner contract, hence ``async_scheduling: false``.
 
         This base profile also leaves stage-0 prefix caching off on CUDA; the
         CUDA turn profile enables it (see test_thinker_prefix_cache_defaults).
@@ -1571,16 +1610,22 @@ class TestDeployConfigLoading:
             assert stages[1].yaml_engine_args["async_scheduling"] is False
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
         else:
-            assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
-            # Without the block the head is the full codec vocabulary, so the
-            # codec EOS is the only stop id -- the marker would end a request
-            # on an ordinary codec id.
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+            # CUDA arms the same block: the runner injects the constant
+            # continue drafts, so the deploy stop id is the two-wide
+            # continue/stop marker and the head stays collapsed.
+            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
             # Either absent (falls back to the top-level false) or explicitly
             # false; the regression this guards against is true.
             assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert "speculative_config" not in stages[1].yaml_engine_args
-            assert stages[1].yaml_engine_args["async_scheduling"] is True
+            assert stages[1].yaml_engine_args["speculative_config"] == {
+                "method": "ngram",
+                "num_speculative_tokens": 7,
+                "prompt_lookup_min": 1,
+                "prompt_lookup_max": 1,
+            }
+            # K-step books its span with the synchronous runner contract.
+            assert stages[1].yaml_engine_args["async_scheduling"] is False
             # Base concurrency stays 16; only the NPU overlay lowers it to 8,
             # so a CUDA deployment keeps the pipeline default.
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
@@ -1654,6 +1699,29 @@ stages:
         connector = deploy.connectors["connector_of_shared_memory"]
         assert "async_chunk_batch_min_size" not in connector["extra"]
         assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
+        assert deploy.model_runner == "v2"
+
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_qwen3_omni_default_runner_is_v2_on_cuda_only(self, platform):
+        pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))),
+            platform=platform,
+        )
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        expect_v2 = platform == "cuda"
+        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is expect_v2
+
+        duplex = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
+            platform=platform,
+        )
+        duplex_stages = merge_pipeline_deploy(pipeline, duplex)
+        assert duplex.model_runner == "v1"
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in duplex_stages] == [False, False, False]
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -2040,7 +2108,7 @@ stages:
         ],
     )
     def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
-        """Stage-0 prefix caching ships on only for the validated V1 turn profiles.
+        """Stage-0 prefix caching ships on only for the validated CUDA turn profiles.
 
         Checked on the final engine args: the stage value rides in
         ``engine_extras`` and must keep winning over the pipeline-wide flag.
@@ -3282,7 +3350,6 @@ class TestPlatformOverrides:
         if is_cuda:
             args = stages[0].yaml_engine_args
             assert args["enable_prefix_caching"] is True
-            assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
             assert "local_compile_audio_sampler" not in args["hf_overrides"]
@@ -3305,7 +3372,6 @@ class TestPlatformOverrides:
         assert args["max_num_seqs"] == 128
         assert args["max_num_batched_tokens"] == 512
         assert args["hf_overrides"] == {
-            "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
             "mrv2_eager_mtp": True,

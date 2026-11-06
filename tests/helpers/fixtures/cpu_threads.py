@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Generator
 from typing import Protocol
@@ -27,12 +28,21 @@ def _single_threaded_cpu(
 
     torch = load_torch()
     previous_threads = torch.get_num_threads()
+    thread_env = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+    previous_env = {name: os.environ.get(name) for name in thread_env}
     started = time.perf_counter()
     try:
+        for name in thread_env:
+            os.environ[name] = "1"
         torch.set_num_threads(1)
         print(f"{request.node.nodeid}: CPU reference threads {previous_threads} -> {torch.get_num_threads()}")
         yield
     finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         torch.set_num_threads(previous_threads)
         print(
             f"{request.node.nodeid}: CPU reference elapsed {time.perf_counter() - started:.3f}s; "

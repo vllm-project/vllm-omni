@@ -15,7 +15,9 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     DEFAULT_SYSTEM_PROMPT,
+    QA_HISTORY_HEADER,
     USER_QUERY_HEADER,
+    VIDEO_HISTORY_HEADER,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -47,6 +49,25 @@ def _clean_qwen3_asr_transcript(raw_text: str) -> str:
     return " ".join(raw_text.rsplit(_ASR_TEXT_TAG, 1)[-1].replace("</asr_text>", "").split())
 
 
+def render_joyai_memory_prefix(
+    summary: str | None,
+    visual_summaries: Sequence[str],
+    *,
+    archived_qa: str = "",
+    active_query: str = "",
+) -> str:
+    """Render model-owned memory with the same headings for text and speech."""
+    prefix = []
+    if visual_summaries:
+        prefix.append(VIDEO_HISTORY_HEADER + "\n\n".join(visual_summaries))
+    qa_memory = [text for text in (summary, archived_qa) if text]
+    if qa_memory:
+        prefix.append(QA_HISTORY_HEADER + "\n\n".join(qa_memory))
+    if active_query:
+        prefix.append(USER_QUERY_HEADER + "\n" + active_query)
+    return "\n\n".join(prefix)
+
+
 def render_joyai_session_prompt(
     processor: Any,
     *,
@@ -56,16 +77,22 @@ def render_joyai_session_prompt(
     images: list[Any],
     image_token_counts: list[int],
     budget: int,
+    instruction: str = "",
+    summary: str = "",
+    visual_summaries: Sequence[str] = (),
     context_blocks: Sequence[str] = (),
 ) -> tuple[str, list[Any]]:
-    """Fit the actual query, keeping system policy and the latest observation.
+    """Fit ASR's query, preserving the standing instruction and current input.
 
-    ``context_blocks`` are model-specific context sections (today: accepted
-    delegated results). They are not history and are never evicted, so they are
-    validated against the budget before this call keeps trimming history.
+    Evict history, then the text summary, then oldest visual blocks, as on the
+    text path. The standing instruction, actual transcript and delegated
+    results stay pinned.
     """
     blocks = [block for block in context_blocks if block]
     history, images, image_token_counts = list(history), list(images), list(image_token_counts)
+    recent_history = history.copy()
+    visual_summaries = list(visual_summaries)
+    rebudget_history = False
     while True:
         content = [{"type": "image"} for _ in images]
         content.extend({"type": "text", "text": block} for block in blocks)
@@ -77,15 +104,27 @@ def render_joyai_session_prompt(
                 else "Observe the current scene and choose whether to speak or stay silent.",
             }
         )
-        messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+        memory = render_joyai_memory_prefix(summary, visual_summaries)
+        prefix = [{"role": "user", "content": value} for value in (memory, instruction) if value]
+        messages = [{"role": "system", "content": system}, *prefix, *history, {"role": "user", "content": content}]
         rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
         if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
+            if rebudget_history:
+                history = recent_history.copy()
+                rebudget_history = False
+                continue
             return rendered, images
         if history:
             history.pop(0)
             while history and history[0]["role"] == "assistant":
                 history.pop(0)
+        elif summary:
+            summary = ""
+            rebudget_history = True
+        elif visual_summaries:
+            visual_summaries.pop(0)
+            rebudget_history = True
         elif len(images) > 1:
             images.pop(0)
             image_token_counts.pop(0)
@@ -133,6 +172,9 @@ def asr_to_joyai(
                 not isinstance(context, dict)
                 or not isinstance(context.get("system"), str)
                 or not isinstance(context.get("history"), list)
+                or any(not isinstance(context.get(key, ""), str) for key in ("instruction", "summary"))
+                or not isinstance(context.get("visual_summaries", []), list)
+                or any(not isinstance(text, str) for text in context.get("visual_summaries", []))
                 or any(
                     not isinstance(message, dict)
                     or message.get("role") not in ("user", "assistant")
@@ -165,6 +207,9 @@ def asr_to_joyai(
                 images=images,
                 image_token_counts=image_token_counts,
                 budget=budget,
+                instruction=context.get("instruction", ""),
+                summary=context.get("summary", ""),
+                visual_summaries=context.get("visual_summaries", []),
                 context_blocks=(delegation_context,) if delegation_context else (),
             )
             visual_inputs = {"image": images} if images else {}

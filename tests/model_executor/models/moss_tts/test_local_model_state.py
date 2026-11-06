@@ -15,10 +15,9 @@ from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
-from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states import init_omni_model_state
-from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = pytest.mark.core_model
@@ -70,24 +69,55 @@ def _model(device):
 def _state(cls, device):
     state = object.__new__(cls)
     state.model = _model(device)
+    if cls is OmniModelState:
+        # Reference uses the model-owned preprocess escape hatch. Generic
+        # OmniModelState no longer schedules deferred MTP.
+        preprocess = state.model.preprocess
+        run_preprocess = state.run_preprocess
+        pending = []
+
+        def reference_preprocess(input_ids, input_embeds, **info):
+            ids, embeds, updates = preprocess(input_ids, input_embeds, **info)
+            mtp_inputs = updates.pop("mtp_inputs", None)
+            if mtp_inputs is not None:
+                pending.append((info["req_id"], ids, embeds, mtp_inputs))
+            return ids, embeds, updates
+
+        def reference_run_preprocess(batch, inputs, req_states, dispatcher=None):
+            pending.clear()
+            run_preprocess(batch, inputs, req_states, dispatcher)
+            if not pending:
+                return
+            slots = [state.intermediate_buffer.req_id_to_index[req_id] for req_id, *_ in pending]
+            ids = torch.cat([ids.reshape(-1) for _, ids, _, _ in pending])
+            embeds = torch.cat([embeds for _, _, embeds, _ in pending])
+            hidden = torch.cat([mtp[0] for _, _, _, mtp in pending])
+            control = torch.cat([mtp[1] for _, _, _, mtp in pending])
+            new_embeds, codes = state._mtp_state._mtp_forward(slots, ids, embeds, hidden, control, dispatcher)
+            for row, (slot, (req_id, _, _, _)) in enumerate(zip(slots, pending, strict=True)):
+                batch_row = int(np.flatnonzero(batch.idx_mapping_np == slot)[0])
+                offset = int(batch.query_start_loc_np[batch_row])
+                inputs["inputs_embeds"][offset : offset + 1].copy_(new_embeds[row : row + 1])
+                state.intermediate_buffer.update(
+                    slot, {"audio_codes": {"current": codes[row : row + 1]}}, state.model.gpu_resident_buffer_keys
+                )
+
+        state.model.preprocess = reference_preprocess
+        state.run_preprocess = reference_run_preprocess
+        state._decode_preprocess = None
     state.device, state.dtype = device, state.model.model.embed_tokens.weight.dtype
     state.has_preprocess = state.has_postprocess = state.have_multimodal_outputs = True
     state.scheduler_config = SimpleNamespace(max_num_seqs=5)
     state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096, logits_processors=None))
     state.intermediate_buffer = OmniIntermediateBuffer(5)
+    state._embed_dim = 0
+    state.model.has_talker_mtp = False
+    state._mtp_state = MTPState(state)
     state._static_inputs_embeds = torch.zeros(16, 4, device=device, dtype=state.dtype)
-    state._mtp_input_ids = torch.zeros(5, device=device, dtype=torch.long)
-    state._mtp_offsets = torch.zeros(5, device=device, dtype=torch.long)
+    state._mtp_state._mtp_input_ids = torch.zeros(5, device=device, dtype=torch.long)
+    state._mtp_state._mtp_offsets = torch.zeros(5, device=device, dtype=torch.long)
     for name in ("_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step"):
-        setattr(state, name, torch.zeros(5, 4, device=device, dtype=state.dtype))
-    state._mtp_runner = state._mtp_sample_uniforms = None
-    state._mtp_generators = {}
-    state._mtp_seeded = set()
-    state._mtp_replays = {}
-    state._stage_offsets = DeviceStager()
-    state._stream_pos = {}
-    state._stream_decode_event = None
-    state._eager_state = EagerMTPState(state)
+        setattr(state._mtp_state, name, torch.zeros(5, 4, device=device, dtype=state.dtype))
     if cls is MossLocalModelState:
         state._init_slot_buffers(5, 4, device, state.dtype)
         state._uva, state._pending_resets, state._partitioned_rows = None, [], False
@@ -168,7 +198,7 @@ def test_slot_matches_canonical_mixed_prefill_reorder_stop_and_reuse(device, see
             # reference offset, control, or the old request's RNG stream.
             for state in (reference, candidate):
                 state.remove_request("short")
-                assert "short" not in state._mtp_generators
+                assert "short" not in state._mtp_state._mtp_generators
                 _admit(state, 0, "replacement", seed)
             computed[0], prompt[0] = 0, 1
         outputs = []
@@ -212,15 +242,16 @@ def test_slot_honors_external_stopping_control(device):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("state_cls", [OmniModelState, MossLocalModelState])
-def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch(state_cls):
-    state = _state(state_cls, torch.device("cpu"))
+def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch():
+    state = _state(MossLocalModelState, torch.device("cpu"))
     generators = [torch.Generator().manual_seed(seed) for seed in (17, 29)]
     inputs = [torch.zeros(2, dtype=torch.long), *[torch.ones(2, 4) for _ in range(3)]]
     frame = MagicMock(wraps=state.model.local_transformer.generate_frame)
     state.model.local_transformer.generate_frame = frame
 
-    state._call_mtp_with_sampling(*inputs, buffers=[{}, {}], req_ids=["first", "second"], generators=generators)
+    state._mtp_state._call_mtp_with_sampling(
+        *inputs, buffers=[{}, {}], req_ids=["first", "second"], generators=generators
+    )
 
     frame.assert_called_once()
     assert frame.call_args.args[0].shape[0] == 2
@@ -243,10 +274,10 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
             _admit(state, slot, f"req{slot}", None)
     candidate = states[1]
     buffers = [
-        candidate._mtp_input_ids[:4],
-        candidate._mtp_input_embeds[:4],
-        candidate._mtp_hidden[:4],
-        candidate._mtp_text_step[:4],
+        candidate._mtp_state._mtp_input_ids[:4],
+        candidate._mtp_state._mtp_input_embeds[:4],
+        candidate._mtp_state._mtp_hidden[:4],
+        candidate._mtp_state._mtp_text_step[:4],
     ]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -264,8 +295,8 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
         graph.replay()
         return graph_output
 
-    candidate._mtp_runner = replay
-    candidate._is_mtp_graph_runner = lambda: True
+    candidate._mtp_state._mtp_runner = replay
+    candidate._mtp_state._is_mtp_graph_runner = lambda: True
     from vllm.config import CUDAGraphMode
 
     def dispatcher(bsz):
@@ -314,11 +345,10 @@ def test_factory_requires_explicit_class_capability_and_valid_state(monkeypatch)
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("enabled", [False, True])
-def test_local_factory_default_and_option(monkeypatch, enabled):
+def test_local_factory_uses_dedicated_state(monkeypatch):
     monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
     monkeypatch.setattr(MossLocalModelState, "__init__", lambda *args: None)
     model = _model(torch.device("cpu"))
-    model.config = SimpleNamespace(mrv2_gpu_slot_state=enabled)
+    model.config = SimpleNamespace()
     state = init_omni_model_state(None, model, None, torch.device("cpu"))
-    assert type(state) is (MossLocalModelState if enabled else OmniModelState)
+    assert type(state) is MossLocalModelState
