@@ -96,6 +96,10 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # No common tiny builder for the native Qwen/PixelUMM layout yet; covered by
+    # tests/diffusion/models/hy_nomas and real-checkpoint offline/accuracy/serving E2E.
+    "HyNomasPipeline",
+    "HyNomasModularPipeline",
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated CPU contract tests and manual real-checkpoint smoke tests instead.
     "ABotWorldCausalPipeline",

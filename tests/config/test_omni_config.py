@@ -406,7 +406,7 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
     ],
 )
 @pytest.mark.parametrize("cli_prefix", [None, "", "stage_0_"], ids=["defaults", "global-cli", "stage-cli"])
-def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_prefix, monkeypatch):
+def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_prefix, monkeypatch, tmp_path):
     from vllm_omni import platforms
     from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
@@ -427,7 +427,9 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
             },
         }
     config = _from_pipeline_key("minicpmo_4_5", deploy_config_path=str(_DEPLOY_DIR / filename), cli_overrides=cli)
-    args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+    # EngineArgs resolves model paths during construction. Keep this config-only
+    # test local instead of attempting to download a fictitious Hub repository.
+    args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model=str(tmp_path))
     resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
 
     if cli_prefix is not None:
@@ -443,7 +445,7 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
         assert resolved.compilation_config.pass_config.fuse_norm_quant is False
         assert resolved.compilation_config.pass_config.fuse_act_quant is False
     else:
-        defaults = OmniEngineArgs(model="test-model")
+        defaults = OmniEngineArgs(model=str(tmp_path))
         assert asdict(resolved.kernel_config) == asdict(defaults.kernel_config)
         assert asdict(resolved.compilation_config) == asdict(defaults.compilation_config)
 
@@ -615,7 +617,7 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
-        # 32-entry pool covers the shape space.
+        # bounded pool can reuse captures across nearby batch sizes.
         expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
@@ -1174,6 +1176,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "kernel_config",
         "profiler_config",
         "quantization_config",
+        "weight_transfer_config",
         # Stage-level speculative_config is passed straight through to the
         # engine: the Talker K-step block is read by the engine, not unpacked
         # structurally like the other stage configs.

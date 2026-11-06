@@ -15,18 +15,22 @@ Requirements:
 import argparse
 import asyncio
 import base64
-import contextlib
 import io
 import json
 import mimetypes
 import os
+import tempfile
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import av
 from camera_utils import wasd_to_camera_payload
+from websockets.exceptions import ConnectionClosed
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -274,18 +278,230 @@ async def _run_camera_update_scheduler(
         print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
 
 
-def _count_decoded_frames(video_bytes: bytes, *, stream_format: str) -> int | None:
-    """Return the number of decodable video frames in a streamed byte sequence, if known."""
-    if not video_bytes:
-        return 0
+class _StreamingFrameCounter:
+    """Count frames once on a worker, retaining fMP4 context between messages.
 
-    av_format = "mp4" if stream_format == "m4s" else None
+    PyAV reads from this non-seekable input on a daemon thread. Reads wait
+    for bytes until finish() or a failure closes the input. Feed and snapshots
+    never wait for decoding; accounting failures make the count unknown.
+    """
+
+    _MAX_PENDING_BYTES = 64 * 1024 * 1024
+    _JOIN_TIMEOUT = 5.0
+
+    def __init__(self, *, stream_format: str) -> None:
+        """Initialize an empty counter; start decoding on the first nonempty feed.
+
+        ``stream_format='m4s'`` selects the MP4 demuxer; other values let PyAV
+        detect the container format from the input bytes.
+        """
+        self._format = "mp4" if stream_format == "m4s" else None
+        self._condition = threading.Condition()
+        self._pending: deque[memoryview] = deque()
+        self._pending_bytes = 0
+        self._eof = False
+        self._count = 0
+        self._error: str | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def count(self) -> int | None:
+        """Return a decoded-frame snapshot, or None after any accounting failure.
+
+        The snapshot can lag received input. Use finish() to drain the stream
+        before reading its final count, including any decodable trailer frames.
+        """
+        with self._condition:
+            return self._count if self._error is None else None
+
+    @property
+    def error(self) -> str | None:
+        """Return the first accounting failure code, or None if none was recorded."""
+        with self._condition:
+            return self._error
+
+    def _fail(self, reason: str) -> None:
+        """Latch the first failure reason, discard queued bytes, and wake readers at EOF."""
+        with self._condition:
+            self._error = self._error or reason
+            self._pending.clear()
+            self._pending_bytes = 0
+            self._eof = True
+            self._condition.notify_all()
+
+    def feed(self, data: bytes) -> None:
+        """Queue immutable media bytes without waiting for them to be decoded.
+
+        The first nonempty input starts the worker. Empty input and input after
+        a failure are ignored. Exceeding the pending-byte limit or feeding a
+        closed input disables accounting, clears the queue, and makes count
+        return None; it does not raise an accounting error in the receive loop.
+        """
+        with self._condition:
+            if not data or self._error is not None:
+                return
+            if self._eof:
+                self._fail("decoder_stopped")
+                return
+            if self._pending_bytes + len(data) > self._MAX_PENDING_BYTES:
+                self._fail("buffer_limit_exceeded")
+                return
+            self._pending.append(memoryview(data))
+            self._pending_bytes += len(data)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._decode, name="video-frame-counter", daemon=True)
+                self._thread.start()
+            self._condition.notify_all()
+
+    def read(self, size: int) -> bytes:
+        """Block the decoder worker until size bytes are available or input closes.
+
+        Positive reads coalesce message boundaries so a short queued piece is
+        not interpreted as EOF inside an MP4 box. At EOF, return remaining
+        bytes, then b"". Failures discard queued bytes and also signal EOF.
+        A nonpositive size returns b"" immediately.
+        """
+        if size <= 0:
+            return b""
+        with self._condition:
+            # Short reads inside an MP4 box can be treated as EOF by FFmpeg.
+            # Transport messages need not coincide with either boxes or reads.
+            self._condition.wait_for(lambda: self._pending_bytes >= size or self._eof)
+            remaining = min(size, self._pending_bytes)
+            self._pending_bytes -= remaining
+            pieces = []
+            while remaining:
+                data = self._pending.popleft()
+                pieces.append(data[:remaining])
+                if len(data) > remaining:
+                    self._pending.appendleft(data[remaining:])
+                remaining -= len(pieces[-1])
+            return b"".join(pieces)
+
+    def _decode(self) -> None:
+        """Decode one stream on the worker and publish frame counts under the lock.
+
+        Decoder exceptions latch decode_failed instead of exposing a partial
+        count as a successful total. Worker exit closes the input to new feeds.
+        """
+        try:
+            with av.open(
+                self,
+                format=self._format,
+                mode="r",
+                # Keep the full-read requirement small enough for live progress.
+                buffer_size=1024,
+                options={"probesize": "32", "analyzeduration": "0"},
+            ) as container:
+                for _ in container.decode(container.streams.video[0]):
+                    with self._condition:
+                        if self._error is not None:
+                            break
+                        self._count += 1
+        except Exception:
+            # Accounting is optional: expose failure rather than losing the
+            # receive loop or presenting a partial count as a successful total.
+            self._fail("decode_failed")
+        finally:
+            with self._condition:
+                self._eof = True
+
+    async def finish(self) -> int | None:
+        """Signal EOF and drain the worker without blocking the event loop.
+
+        Return the decoded count (zero for no input), or None after a failure.
+        Interrupted input counts only decodable received frames. The worker
+        join is bounded by _JOIN_TIMEOUT; expiry latches shutdown_timeout.
+
+        Cancellation latches shutdown_cancelled, waits for the same bounded
+        join, then re-raises CancelledError. Further cancellation may interrupt
+        that wait. A native codec call cannot be forcibly stopped, so the daemon
+        worker may outlive this method after timeout or repeated cancellation.
+        """
+        with self._condition:
+            self._eof = True
+            self._condition.notify_all()
+        if self._thread is not None:
+            join_task = asyncio.create_task(asyncio.to_thread(self._thread.join, self._JOIN_TIMEOUT))
+            try:
+                await asyncio.shield(join_task)
+            except asyncio.CancelledError:
+                self._fail("shutdown_cancelled")
+                await asyncio.shield(join_task)
+                raise
+            finally:
+                if self._thread.is_alive():
+                    self._fail("shutdown_timeout")
+        return self.count
+
+
+def _fresh_rgb_frame(frame: av.VideoFrame) -> av.VideoFrame:
+    """Copy RGB pixels without carrying decoder color or picture-type metadata."""
+    rgb = frame.reformat(format="rgb24")
+    fresh = av.VideoFrame(rgb.width, rgb.height, "rgb24")
+    source = rgb.planes[0]
+    target = fresh.planes[0]
+    pixels = memoryview(source)
+    if source.line_size == target.line_size:
+        target.update(pixels[: target.buffer_size])
+    else:
+        packed = bytearray(target.buffer_size)
+        row_bytes = rgb.width * 3
+        for row in range(rgb.height):
+            src = row * source.line_size
+            dst = row * target.line_size
+            packed[dst : dst + row_bytes] = pixels[src : src + row_bytes]
+        target.update(packed)
+    return fresh
+
+
+def _finalize_video_bytes(video_bytes: bytes, *, stream_format: str, fps: float) -> bytes:
+    """Build a playback MP4 using only PyAV, retaining input on decode errors.
+
+    Video-only streams are re-encoded at the requested FPS. Streams with audio
+    are remuxed to preserve the compressed tracks and their original timing.
+    """
+    if not video_bytes:
+        return video_bytes
+    if stream_format.lower() != "m4s":
+        raise ValueError(f"Unsupported streaming video format: {stream_format}")
+
     try:
-        with av.open(io.BytesIO(video_bytes), format=av_format, mode="r") as container:
-            stream = container.streams.video[0]
-            return sum(1 for _ in container.decode(stream))
-    except Exception:
-        return None
+        with av.open(io.BytesIO(video_bytes), format="mp4") as source:
+            if source.streams.audio:
+                buffer = io.BytesIO()
+                media_streams = [stream for stream in source.streams if stream.type in ("video", "audio")]
+                with av.open(buffer, mode="w", format="mp4") as output:
+                    streams = {stream.index: output.add_stream_from_template(stream) for stream in media_streams}
+                    for packet in source.demux(*media_streams):
+                        if packet.dts is not None:
+                            packet.stream = streams[packet.stream.index]
+                            output.mux(packet)
+                return buffer.getvalue()
+            if not source.streams.video:
+                return video_bytes
+            frames = [_fresh_rgb_frame(frame) for frame in source.decode(video=0)]
+    except av.FFmpegError:
+        return video_bytes
+
+    if not frames:
+        return video_bytes
+
+    buffer = io.BytesIO()
+    rate = Fraction(fps).limit_denominator(10000)
+    with av.open(buffer, mode="w", format="mp4") as output:
+        video = cast(av.VideoStream, output.add_stream("h264", rate=rate))
+        video.width, video.height = frames[0].width, frames[0].height
+        video.pix_fmt = "yuv420p"
+        video.options = {"crf": "18"}
+        for index, frame in enumerate(frames):
+            frame.pts = index
+            frame.time_base = 1 / rate
+            for packet in video.encode(frame):
+                output.mux(packet)
+        for packet in video.encode():
+            output.mux(packet)
+    return buffer.getvalue()
 
 
 def save_video(
@@ -295,28 +511,40 @@ def save_video(
     fps: float,
     stream_format: str,
 ) -> None:
+    """Finalize received chunks and atomically publish the local video file."""
     if not chunks:
         print("No video chunks received; nothing to save.")
         return
 
-    from vllm_omni.diffusion.utils.media_utils import finalize_streaming_video_bytes
-
     streamed_bytes = b"".join(chunks)
-    playback_bytes = finalize_streaming_video_bytes(
-        streamed_bytes,
-        input_format="m4s",
-        fps=fps,
-    )
+    playback_bytes = _finalize_video_bytes(streamed_bytes, stream_format=stream_format, fps=fps)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    with tmp_path.open("wb") as f:
-        f.write(playback_bytes)
-    os.replace(tmp_path, output_path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(playback_bytes)
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     print(
         f"Saved {len(chunks)} streamed chunk(s), {len(streamed_bytes)} streamed bytes "
         f"-> {len(playback_bytes)} playback bytes at {output_path}"
     )
+
+
+async def _send_heartbeats(websocket: Any, send_lock: asyncio.Lock) -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            async with send_lock:
+                await websocket.send(json.dumps({"type": "session.ping"}))
+        except ConnectionClosed:
+            return
 
 
 async def stream_video(args: argparse.Namespace) -> None:
@@ -325,19 +553,20 @@ async def stream_video(args: argparse.Namespace) -> None:
     url = f"ws://{args.host}:{args.port}/v1/realtime/video"
     chunks: list[bytes] = []
     total_bytes = 0
-    total_frames = 0
-    accumulated_stream = bytearray()
+    frame_counter: _StreamingFrameCounter | None = None
     stream_format = "m4s"
     done = False
     ws = None
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
     camera_update_task: asyncio.Task[None] | None = None
+    heartbeat_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
         async with connect(url, max_size=None) as websocket:
             ws = websocket
+            heartbeat_task = asyncio.create_task(_send_heartbeats(websocket, send_lock))
             async with send_lock:
                 await websocket.send(json.dumps(payload))
             print(f"Connected: {url}")
@@ -359,25 +588,22 @@ async def stream_video(args: argparse.Namespace) -> None:
                     last_chunk_at = now
 
                     total_bytes += chunk_bytes
-                    accumulated_stream.extend(message)
-                    decoded_total = _count_decoded_frames(bytes(accumulated_stream), stream_format=stream_format)
-                    if decoded_total is not None:
-                        chunk_frames = max(decoded_total - total_frames, 0)
-                        total_frames = decoded_total
-                    else:
-                        chunk_frames = 0
+                    if frame_counter is None:
+                        frame_counter = _StreamingFrameCounter(stream_format=stream_format)
+                    frame_counter.feed(message)
+                    decoded_total = frame_counter.count
 
                     total_elapsed = now - started_at
                     print(
                         f"[chunk {len(chunks):03d}] "
                         f"kind={metadata.get('kind', 'media')} "
                         f"bytes={chunk_bytes} "
-                        f"frames={metadata.get('num_frames', chunk_frames)} "
+                        f"frames={metadata.get('num_frames', 'unknown')} "
                         f"generation_chunk={metadata.get('generation_chunk_index')} "
                         f"active_interactions={metadata.get('active_event_ids', [])} "
                         f"elapsed={chunk_elapsed:.2f}s "
                         f"total_bytes={total_bytes} "
-                        f"total_frames={total_frames} "
+                        f"total_frames={decoded_total if decoded_total is not None else 'unknown'} "
                         f"total_elapsed={total_elapsed:.2f}s"
                     )
                     continue
@@ -434,25 +660,37 @@ async def stream_video(args: argparse.Namespace) -> None:
                 pass
         raise
     finally:
-        if prompt_update_task is not None:
-            prompt_update_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await prompt_update_task
-        if camera_update_task is not None:
-            camera_update_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await camera_update_task
-        print(
-            "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"
-        )
-        save_video(
-            chunks,
-            output_path,
-            fps=float(payload.get("fps") or args.fps),
-            stream_format=stream_format,
-        )
-        if not done:
-            print("Saved partial output because the stream did not finish normally.")
+        tasks = [task for task in (heartbeat_task, prompt_update_task, camera_update_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        try:
+            try:
+                if frame_counter is not None:
+                    await frame_counter.finish()
+            finally:
+                if frame_counter is not None:
+                    decoded_total = frame_counter.count
+                    print(
+                        f"[decode] total_frames={decoded_total if decoded_total is not None else 'unknown'} "
+                        f"status={frame_counter.error or 'complete'} "
+                        f"total_elapsed={time.perf_counter() - started_at:.2f}s"
+                    )
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                        raise result
+        finally:
+            print(
+                "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"
+            )
+            save_video(
+                chunks,
+                output_path,
+                fps=float(payload.get("fps") or args.fps),
+                stream_format=stream_format,
+            )
+            if not done:
+                print("Saved partial output because the stream did not finish normally.")
 
 
 def parse_args() -> argparse.Namespace:
