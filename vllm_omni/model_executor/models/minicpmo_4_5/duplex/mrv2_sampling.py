@@ -10,33 +10,13 @@ import torch
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import duplex_sampling_rows
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 
 def _keep_thinker_payload(payload: dict[str, Any], num_sampled: list[int]) -> dict[str, Any]:
     return payload
-
-
-def _v1_shaped_runner(input_batch: Any, infos: dict[str, Any]) -> SimpleNamespace:
-    """Present MRv2 request params in the V1 runner shape DuplexSamplingHelper reads."""
-    params = [
-        (infos.get(str(request_id)) or {}).get("sampling_params") or SimpleNamespace()
-        for request_id in input_batch.req_ids
-    ]
-    return SimpleNamespace(
-        input_batch=SimpleNamespace(
-            req_ids=input_batch.req_ids,
-            temperature_cpu=[getattr(sp, "temperature", None) for sp in params],
-            top_k_cpu=[getattr(sp, "top_k", None) for sp in params],
-            top_p_cpu=[getattr(sp, "top_p", None) for sp in params],
-        ),
-        model_intermediate_buffer=infos,
-        requests={
-            str(request_id): SimpleNamespace(sampling_params=sp) for request_id, sp in zip(input_batch.req_ids, params)
-        },
-    )
 
 
 class MiniCPMO45DuplexSampler(OmniSampler):
@@ -46,7 +26,6 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         super().__init__(base_sampler)
         self.model = model
         self.generators: dict[str, torch.Generator] = {}
-        self._helper = DuplexSamplingHelper()
         self._histories: dict[str, tuple[tuple[int, int, int | None], list[int]]] = {}
         self._pending_history: Any = None
         model._mrv2_duplex_sampler = self
@@ -55,7 +34,6 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         for request_id in request_ids:
             self.generators.pop(request_id, None)
             self._histories.pop(request_id, None)
-            self._helper.active_request_ids.discard(request_id)
             getattr(self.model, "_mrv2_sampling_infos", {}).pop(request_id, None)
 
     def _commit_history(self):
@@ -141,11 +119,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:
         infos = getattr(self.model, "_mrv2_sampling_infos", {})
-        helper = self._helper
-        runner = _v1_shaped_runner(input_batch, infos)
-        for request_id in input_batch.req_ids:
-            helper.refresh_active_request(runner, request_id)
-        rows = helper.rows(runner)
+        rows = duplex_sampling_rows(input_batch.req_ids, infos)
         if rows and input_batch.num_draft_tokens:
             raise NotImplementedError("MiniCPM-o MRv2 duplex sampling does not support speculative decoding")
         # Partial prefills are discarded by the runner and must not mutate the

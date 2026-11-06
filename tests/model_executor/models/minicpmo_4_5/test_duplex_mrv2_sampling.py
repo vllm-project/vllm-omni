@@ -8,10 +8,9 @@ import torch
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
     MiniCPMO45DuplexSampler,
-    _v1_shaped_runner,
+    duplex_sampling_rows,
 )
 
 pytestmark = [pytest.mark.core_model]
@@ -19,15 +18,11 @@ pytestmark = [pytest.mark.core_model]
 
 @pytest.mark.cpu
 def test_mrv2_rows_read_sampling_params_from_intermediate_buffers():
-    helper = DuplexSamplingHelper()
     infos = {
         "a": {"duplex": {"data_plane": True}, "sampling_params": SamplingParams(temperature=0.2, top_k=7, top_p=0.5)},
         "b": {"duplex": {"data_plane": True}, "sampling_params": SamplingParams(temperature=0.8, top_k=15, top_p=0.9)},
     }
-    runner = _v1_shaped_runner(SimpleNamespace(req_ids=["b", "a"]), infos)
-    for request_id in infos:
-        helper.refresh_active_request(runner, request_id)
-    rows = helper.rows(runner)
+    rows = duplex_sampling_rows(["b", "a"], infos)
     assert [(row.request_id, row.temperature, row.top_k, row.top_p) for row in rows] == [
         ("b", 0.8, 15, 0.9),
         ("a", 0.2, 7, 0.5),

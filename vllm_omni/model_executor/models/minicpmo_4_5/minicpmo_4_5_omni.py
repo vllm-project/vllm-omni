@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cached_property
@@ -50,6 +50,62 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
+
+
+def _optional_sampling_param(sampling_params: Any, name: str, cast: type) -> Any:
+    value = getattr(sampling_params, name, None)
+    if value is None:
+        return None
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def duplex_sampling_rows(
+    req_ids: Iterable[Any],
+    infos: Mapping[str, Any] | None,
+) -> tuple[DuplexSamplingRow, ...]:
+    """Build ``DuplexSamplingRow`` entries directly from request IDs and intermediate info dicts."""
+    if not isinstance(infos, Mapping):
+        return ()
+    rows: list[DuplexSamplingRow] = []
+    for row_idx, raw_req_id in enumerate(req_ids):
+        req_id = str(raw_req_id)
+        info = infos.get(req_id)
+        duplex = info.get("duplex") if isinstance(info, Mapping) else None
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            continue
+        session_id = duplex.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            session_id = None
+        try:
+            seq_raw = duplex.get("seq")
+            seq = int(seq_raw) if seq_raw is not None else None
+        except (TypeError, ValueError):
+            seq = None
+        payload = duplex.get("payload")
+        if not isinstance(payload, dict):
+            payload = None
+        sampling_params = info.get("sampling_params") if isinstance(info, Mapping) else None
+        try:
+            max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            max_tokens = 0
+        rows.append(
+            DuplexSamplingRow(
+                row_idx=row_idx,
+                request_id=req_id,
+                session_id=session_id,
+                seq=seq,
+                payload=payload,
+                max_tokens=max_tokens if max_tokens > 0 else None,
+                temperature=_optional_sampling_param(sampling_params, "temperature", float),
+                top_k=_optional_sampling_param(sampling_params, "top_k", int),
+                top_p=_optional_sampling_param(sampling_params, "top_p", float),
+            )
+        )
+    return tuple(rows)
 
 
 def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
@@ -1413,6 +1469,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     samples[local_idx] = draws[i : i + 1]
         return torch.cat(samples)  # type: ignore[arg-type]
 
+    def _minicpmo45_duplex_step_plan(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        row_idxs: list[int],
+        token_ids: dict[str, int],
+    ) -> tuple[int, bool, dict[int, list[int]], set[int], list[int]]:
+        """Shared per-step duplex row partitioning for deferred and synchronous sampling."""
+        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
+        has_chunk_eos = 0 <= chunk_eos_id < logits.shape[-1]
+        recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
+        capped = self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids) if has_chunk_eos else set()
+        stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in capped]
+        return chunk_eos_id, has_chunk_eos, recent, capped, stage2_rows
+
     def _sample_minicpmo45_native_duplex_rows(
         self,
         logits: torch.Tensor,
@@ -1429,16 +1500,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row's own generator draws as it would one row at a time; rows sharing
         the process-wide generator draw every boundary before any stage-2 token.
         """
-        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
-        recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
-        resolved: dict[int, int] = {}
-        if 0 <= chunk_eos_id < logits.shape[-1]:
-            resolved = dict.fromkeys(self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids), chunk_eos_id)
-            boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
-            if boundary:
-                hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
-                resolved.update((row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist()) if hit)
-        stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
+        chunk_eos_id, has_chunk_eos, recent, capped, boundary = self._minicpmo45_duplex_step_plan(
+            logits, sampling_metadata, row_idxs, token_ids
+        )
+        resolved: dict[int, int] = dict.fromkeys(capped, chunk_eos_id)
+        if has_chunk_eos and boundary:
+            hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
+            resolved.update((row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist()) if hit)
+        stage2_rows = [row_idx for row_idx in boundary if row_idx not in resolved]
         if stage2_rows:
             draws = self._minicpmo45_duplex_stage2_draws(
                 logits, stage2_rows, recent, token_ids, row_params, sampling_metadata
@@ -1464,14 +1533,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         commit, so generators advance as on the synchronous path. Process-wide generator rows can not
         be rewound alone and keep the step synchronous.
         """
-        device, vocab = logits.device, logits.shape[-1]
-        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
-        has_chunk_eos = 0 <= chunk_eos_id < vocab
+        device = logits.device
         all_greedy = bool(getattr(sampling_metadata, "all_greedy", False))
         generators = getattr(sampling_metadata, "generators", {}) or {}
-        recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
-        capped = self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids) if has_chunk_eos else set()
-        stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in capped]
+        chunk_eos_id, has_chunk_eos, recent, capped, stage2_rows = self._minicpmo45_duplex_step_plan(
+            logits, sampling_metadata, row_idxs, token_ids
+        )
         drawn_rows = [row_idx for row_idx in stage2_rows if not (all_greedy or float(row_params[row_idx][0]) <= 0)]
         if any(generators.get(row_idx) is None for row_idx in drawn_rows):
             return None
