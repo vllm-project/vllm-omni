@@ -462,7 +462,9 @@ class PersonaPlexCode2Wav(nn.Module):
             codes[:frames, row] = c[:k].to(device=self._mimi_device, dtype=torch.long).T
             active[:frames, row] = True
         pcm = torch.stack([codec.decode_frame(codes[f], active[f]) for f in range(num_frames)])
-        pcm = pcm.to(device="cpu", dtype=torch.float32)  # [F, rows, samples]
+        # [F, rows, samples] back to the host in one pinned, event-synchronized
+        # copy instead of a blocking pageable D2H.
+        pcm = self._pcm_to_host(pcm)
         if any(row == self._scratch_row for _, row, _ in cleaned_items):
             codec.reset_slot(self._scratch_row)
         # Clone so each request's PCM owns its storage instead of viewing the whole pass.
