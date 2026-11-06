@@ -2041,7 +2041,7 @@ def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
     assert "exit 5" in two_commands
     similarity = Path(WAN22_SIMILARITY).read_text(encoding="utf-8")
     assert "require_similarity_artifacts" in similarity
-    assert "similarity.json" in similarity
+    assert "write_accuracy_result" in similarity
     assert "Missing offline artifacts" not in similarity
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
@@ -2355,7 +2355,8 @@ def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
     assert "test_qwen_image_21_matches_reference[t2i]" in commands
     assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
     accuracy_test = Path("tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py").read_text(encoding="utf-8")
-    assert 'os.environ.get("BUILDKITE_COMMIT")' in accuracy_test
+    assert "write_accuracy_result" in accuracy_test
+    assert "write_json_artifact" not in accuracy_test
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image 2.1 Accuracy" not in text
