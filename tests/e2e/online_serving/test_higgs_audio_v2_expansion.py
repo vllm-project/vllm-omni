@@ -21,7 +21,6 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 
 import pytest
-from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -38,10 +37,12 @@ SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 # test driver; the engine subprocesses inherit through env_dict).
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
-# The mrv2 opt-in profile runs the talker on model_runner v2 with the codec
-# stage on v1. Under v2 the talker delegates LM token sampling to the native
-# staged sampler, so penalties and logprobs stay in the request surface —
-# unlike Higgs v3, whose owned sampler narrows it.
+# The default profile runs the talker on model_runner v2 with the codec
+# stage on v1; non-CUDA platforms fall back to the v1 runner through the
+# deploy file's platforms section, so this one param guards both runners.
+# Under v2 the talker delegates LM token sampling to the native staged
+# sampler, so penalties and logprobs stay in the request surface — unlike
+# Higgs v3, whose owned sampler narrows it.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -51,16 +52,6 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v2_plain_text",
-    ),
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=get_deploy_config_path("higgs_audio_v2_mrv2.yaml"),
-            server_args=SERVER_ARGS,
-            env_dict=SERVER_ENV,
-        ),
-        id="higgs_audio_v2_mrv2",
-        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
     ),
 ]
 
@@ -93,6 +84,65 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_pcm_streaming_client_abort(self, omni_server, online_client) -> None:
+        """A client aborting mid-stream must not wedge the server.
+
+        Exiting the streaming context mid-iteration closes the connection
+        (client-side cancel). Guards request cleanup on the v1 runner and on
+        the MRV2 sampling hook alike. A follow-up request proves the server
+        survived.
+        """
+        long_text = (
+            "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20
+        )
+        with online_client.client.audio.speech.with_streaming_response.create(
+            model=omni_server.model,
+            input=long_text,
+            voice=None,
+            response_format="pcm",
+            extra_body={"stream_format": "audio"},
+            timeout=DEFAULT_SPEECH_TIMEOUT_S,
+        ) as resp:
+            chunks = resp.iter_bytes()
+            first = next(chunks)
+            assert first, "stream produced no audio before abort"
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Server still healthy after abort.",
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_long_input_text(self, omni_server, online_client) -> None:
+        """A long prompt near the stage-0 context budget must synthesize fully.
+
+        Stage 0 caps generation at 1024 audio frames (~41 s at 25 fps) under
+        a 4096-token context; the two-sentence pair repeated 40 times lands
+        the prompt near that budget while the synthesized speech stays under
+        the frame cap.
+        """
+        long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 40
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": long_input,
+                "stream": False,
+                "response_format": "wav",
+                "timeout": 300.0,
+                # The byte floor stays generous-under-dummy weights:
+                # audio-eos timing is weight-dependent, so only require
+                # ~20 s of synthesized audio to prove the long input
+                # completes rather than truncating.
+                "min_audio_bytes": 1_000_000,
             }
         )
 
