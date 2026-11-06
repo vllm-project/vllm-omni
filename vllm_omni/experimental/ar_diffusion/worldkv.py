@@ -35,12 +35,13 @@ class WorldKVConfig:
     reuse_attention_kv: bool = False
     prefetch_kv: bool = False
     prefetch_bank_allocation: bool = False
+    layerwise_bank_copy: bool = False
     # Process-wide cap on the bank_bytes reserved by live memories; None uses
     # the host's physical memory.
     host_bank_limit_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        for name in ("reuse_attention_kv", "prefetch_kv", "prefetch_bank_allocation"):
+        for name in ("reuse_attention_kv", "prefetch_kv", "prefetch_bank_allocation", "layerwise_bank_copy"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"worldkv.{name} must be a boolean")
         for name in (
@@ -151,6 +152,10 @@ class WorldKVConfig:
         row = kv + 16
         noisy_or_clean = layers * tokens_per_frame * (history + chunk + self.retrieval_frames) * row
         publishing = layers * tokens_per_frame * publication * row
+        if self.layerwise_bank_copy and self.retrieval_frames and self.world_keep_ratio == 1:
+            # Early D2H borrows pending clones rather than the replacement tail.
+            # Their storage may remain in flight while both histories are live.
+            publishing += layers * tokens_per_frame * chunk * kv
         if self.retrieval_frames and self.world_keep_ratio != 1:
             # Uncompressed D2H borrows canonical history. Compressed rows own
             # separate storage until the single in-flight copy completes.
@@ -309,6 +314,7 @@ class WorldKV:
         self._stop_allocator: weakref.finalize | None = None
         self._bank_allocation: Future[dict[torch.dtype, torch.Tensor]] | None = None
         self._bank_allocation_sizes: dict[torch.dtype, int] = {}
+        self._staged_bank: tuple[MemoryRows, ...] | None = None
         self.evicted_chunks = 0
         self._release_bank: weakref.finalize | None = None
         if config.retrieval_frames:
@@ -480,11 +486,112 @@ class WorldKV:
         self._bank_allocation_sizes = sizes
         self._bank_allocation = self._bank_allocator.submit(_allocate_pinned_bank, sizes, first.key.device)
 
-    def _publish_bank(self, replacement: list[MemoryRows | None]) -> tuple[dict[int, BankChunk], int]:
-        bank = dict(self.bank)
+    def _bank_storage(self, sizes: dict[torch.dtype, int], asynchronous: bool) -> dict[torch.dtype, torch.Tensor]:
+        if asynchronous and self._bank_allocation is not None and sizes == self._bank_allocation_sizes:
+            allocation, self._bank_allocation = self._bank_allocation, None
+            self._bank_allocation_sizes = {}
+            storage = allocation.result()
+        else:
+            self._discard_bank_allocation()
+            storage = {
+                dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=asynchronous)
+                for dtype, size in sizes.items()
+            }
+        return storage
+
+    def _prepare_staged_bank(self) -> None:
+        if not self._commit or not self.config.layerwise_bank_copy or self.config.world_keep_ratio != 1:
+            return
         if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
-            return bank, 0
+            return
+        if any(rows is None or rows.key.device.type != "cuda" for rows in self.history):
+            return
+        self._wait_publication()
+        shapes = []
+        sizes: dict[torch.dtype, int] = {}
+        for rows in self.history:
+            assert rows is not None
+            self.config.validate_bank_capacity(
+                self.num_layers,
+                self.tokens_per_frame,
+                rows.key.shape[2],
+                rows.key.shape[3],
+                rows.key.element_size(),
+                self._frames,
+            )
+            for tensor in (rows.key, rows.value):
+                shape = (1, self._frames * self.tokens_per_frame, *tensor.shape[2:])
+                shapes.append((tensor.dtype, shape))
+                sizes[tensor.dtype] = sizes.get(tensor.dtype, 0) + math.prod(shape)
+        storage = self._bank_storage(sizes, True)
+        offsets = dict.fromkeys(sizes, 0)
+        targets = []
+        for dtype, shape in shapes:
+            count = math.prod(shape)
+            targets.append(storage[dtype].narrow(0, offsets[dtype], count).view(shape))
+            offsets[dtype] += count
+        positions = torch.arange(self.next_frame, self.next_frame + self._frames, device="cpu").repeat_interleave(
+            self.tokens_per_frame
+        )
+        token_ids = torch.arange(
+            self.next_frame * self.tokens_per_frame,
+            (self.next_frame + self._frames) * self.tokens_per_frame,
+            device="cpu",
+        )
+        self._staged_bank = tuple(
+            MemoryRows(targets[2 * layer], targets[2 * layer + 1], positions, token_ids)
+            for layer in range(self.num_layers)
+        )
+
+    def _stage_bank_layer(self, layer: int, source: MemoryRows) -> None:
+        if self._staged_bank is None:
+            return
+        target = self._staged_bank[layer]
+        if any(
+            a.shape != b.shape or a.dtype != b.dtype
+            for a, b in ((source.key, target.key), (source.value, target.value))
+        ):
+            # Geometry can change between chunks. Drain partial copies before
+            # releasing their storage, then use the ordinary publication path.
+            self._wait_publication()
+            self._staged_bank = None
+            return
+        if self._copy_stream is None:
+            self._copy_stream = torch.Stream(device=source.key.device)
+        stream = self._copy_stream
+        stream.wait_stream(torch.accelerator.current_stream(source.key.device))
+        try:
+            with stream:
+                source.key.record_stream(stream)
+                source.value.record_stream(stream)
+                target.key.copy_(source.key, non_blocking=True)
+                target.value.copy_(source.value, non_blocking=True)
+                self._publication = stream.record_event()
+        except BaseException:
+            stream.synchronize()
+            raise
+
+    def _bank_with_chunk(self, chunk: BankChunk) -> tuple[dict[int, BankChunk], int]:
+        bank = dict(self.bank)
+        bank[chunk.start] = chunk
+        size = sum(entry.nbytes for entry in bank.values())
+        evicted = 0
+        while size > self.config.bank_bytes:
+            oldest = next(iter(bank))
+            size -= bank.pop(oldest).nbytes
+            evicted += 1
+        return bank, evicted
+
+    def _publish_bank(self, replacement: list[MemoryRows | None]) -> tuple[dict[int, BankChunk], int]:
+        if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
+            return dict(self.bank), 0
         assert self.pose is not None
+        # forward checks that all layers succeeded before publication. A shape
+        # fallback discards staged storage, and copy failures abort the forward.
+        if self._staged_bank is not None:
+            return self._bank_with_chunk(
+                BankChunk(self.next_frame, self._frames, self.pose.clone(), self._staged_bank, self._publication)
+            )
         self._wait_publication()
         sources = []
         for rows in replacement:
@@ -508,16 +615,7 @@ class WorldKV:
         sizes: dict[torch.dtype, int] = {}
         for tensor in tensors:
             sizes[tensor.dtype] = sizes.get(tensor.dtype, 0) + tensor.numel()
-        if asynchronous and self._bank_allocation is not None and sizes == self._bank_allocation_sizes:
-            allocation, self._bank_allocation = self._bank_allocation, None
-            self._bank_allocation_sizes = {}
-            storage = allocation.result()
-        else:
-            self._discard_bank_allocation()
-            storage = {
-                dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=asynchronous)
-                for dtype, size in sizes.items()
-            }
+        storage = self._bank_storage(sizes, asynchronous)
         offsets = dict.fromkeys(sizes, 0)
         targets = []
         for tensor in tensors:
@@ -571,14 +669,7 @@ class WorldKV:
                 target.key.copy_(source.key)
                 target.value.copy_(source.value)
         chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers, ready)
-        bank[chunk.start] = chunk
-        size = sum(entry.nbytes for entry in bank.values())
-        evicted = 0
-        while size > self.config.bank_bytes:
-            oldest = next(iter(bank))
-            size -= bank.pop(oldest).nbytes
-            evicted += 1
-        return bank, evicted
+        return self._bank_with_chunk(chunk)
 
     @contextmanager
     def forward(self, start_frame: int, frames: int, *, commit: bool) -> Iterator[None]:
@@ -597,13 +688,14 @@ class WorldKV:
         self._commit = commit
         try:
             self._prefetch_bank_allocation(frames)
+            self._prepare_staged_bank()
             yield
             if len(self._seen) != self.num_layers:
                 raise RuntimeError("WorldKV forward did not execute all layers")
             if commit:
                 # No attention consumer remains after the output head succeeds.
-                # Copy from the replacement's tail so uncompressed async D2H
-                # borrows canonical storage rather than retaining pending KV.
+                # Ordinary uncompressed D2H borrows the replacement's tail;
+                # layerwise D2H has already queued copies from pending KV.
                 # Canonical history/bank are assigned only after both succeed.
                 self._clear_retrieval()
                 replacement: list[MemoryRows | None] = [
@@ -627,6 +719,7 @@ class WorldKV:
             if not success:
                 self._discard_bank_allocation()
                 self._wait_publication()
+            self._staged_bank = None
             self._pending.clear()
             self._seen.clear()
             self._active = False
@@ -682,6 +775,7 @@ class WorldKV:
                 device=key.device,
             )
             self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone(), positions, token_ids)
+            self._stage_bank_layer(layer, self._pending[layer])
         previous = self.history[layer]
         if previous is None:
             return key, value
@@ -727,6 +821,7 @@ class WorldKV:
             self._stop_allocator()
         self._bank_allocator = None
         self._wait_publication()
+        self._staged_bank = None
         self.history = [None] * self.num_layers
         self._pending.clear()
         self._seen.clear()
