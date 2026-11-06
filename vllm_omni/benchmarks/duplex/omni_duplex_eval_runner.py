@@ -100,6 +100,7 @@ _INPUT_SLACK_S = 120.0
 _COMPLETION_ACTIVITY = frozenset(
     {
         "input_audio_buffer.committed",
+        "duplex.input.processed",
         "response.created",
         "response.done",
         "response.listen",
@@ -109,12 +110,11 @@ _COMPLETION_ACTIVITY = frozenset(
         "response.text.delta",
     }
 )
-# After the commit the client sends nothing but silence padding (the padded
-# path is only taken when the server does not drive turns), so a
-# `response.listen` from then on is the server acknowledging that padding
-# rather than the reply moving forward. Counting it lets every padded step
-# reset the quiet window and leaves each drain to end at its timeout
-# (measured against the real MiniCPM-o server: one listen per padded unit).
+# Padding produces one listen per unit, so counting every listen would keep
+# resetting the quiet window. A delayed listen may also belong to pre-commit
+# input: it cannot identify consumption of the committed unit. Servers that
+# advertise processing_required provide an item-correlated input.processed
+# event instead; that event does reset the quiet window.
 # No runtime mode check is needed here: `responses_finished` is only reachable
 # through the padding path, which is selected when `server_turns` is false.
 _DRAIN_ACTIVITY = _COMPLETION_ACTIVITY - {"response.listen"}
@@ -384,12 +384,21 @@ def _completion_diagnostics(
             event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
         if event_type not in {
             "input_audio_buffer.committed",
+            "duplex.input.processed",
             "response.created",
             "response.done",
             "response.listen",
         }:
             continue
         row: dict[str, object] = {"type": event_type}
+        if event_type in {"input_audio_buffer.committed", "duplex.input.processed"}:
+            details = event.get("event")
+            if isinstance(details, dict):
+                for key in ("epoch", "item_id", "processing_required", "model_listen"):
+                    if key in details:
+                        row[key] = details[key]
+            if "item_id" in event:
+                row["item_id"] = event["item_id"]
         if response_id is not None:
             row["response_id"] = response_id
         status = _response_status(event)
@@ -425,6 +434,11 @@ def _residual_unit_decided(
 ) -> bool:
     """Whether the unit flushed by the commit has decided.
 
+    A processing_required commit must receive an item- and epoch-matched
+    input.processed event. Earlier listens or replies can belong to queued
+    input, even when they reach the client after the commit acknowledgement.
+    Legacy servers retain the event-order fallback below.
+
     A response created before ``input_audio_buffer.committed`` is the in-flight
     reply. Ending it normally promotes the residual unit, so that ``response.done``
     is not the decision; the residual then emits ``response.listen`` or opens a
@@ -442,6 +456,33 @@ def _residual_unit_decided(
     )
     if committed_at is None:
         return False
+    committed = events[committed_at]
+    commit_details = committed.get("event")
+    processed_at = committed_at
+    processed_listen = False
+    if isinstance(commit_details, dict) and commit_details.get("processing_required") is True:
+        item_id = committed.get("item_id")
+        processed = next(
+            (
+                (index, details)
+                for index, event in enumerate(events[committed_at + 1 :], committed_at + 1)
+                if event.get("type") == "duplex.input.processed"
+                and isinstance(details := event.get("event"), dict)
+                and isinstance(item_id, str)
+                and details.get("item_id") == item_id
+                and details.get("epoch") == commit_details.get("epoch")
+            ),
+            None,
+        )
+        if processed is None:
+            # A listen delivered after the commit can still belong to an old
+            # queued unit, especially while cold compilation blocks Stage0.
+            return any(
+                event.get("type") == "response.done" and _response_status(event) == "failed"
+                for event in events[committed_at + 1 :]
+            )
+        processed_at, processed_details = processed
+        processed_listen = processed_details.get("model_listen") is True
     created: set[str] = set()
     finished: set[str] = set()
     for event in events[:committed_at]:
@@ -460,7 +501,7 @@ def _residual_unit_decided(
     cancelled_after: set[str] = set()
     failed_open = False
     promotes_residual = False
-    for event in events[committed_at + 1 :]:
+    for index, event in enumerate(events[committed_at + 1 :], committed_at + 1):
         event_type = event.get("type")
         if event_type == "response.created":
             response_id = _event_response_id(event)
@@ -485,11 +526,18 @@ def _residual_unit_decided(
             if response_id in created_after:
                 if status == "cancelled":
                     cancelled_after.add(response_id)
-                else:
+                elif index >= processed_at:
                     return True
             continue
-        if event_type == "response.listen" and finished_open >= open_at_commit and _is_model_listen_decision(event):
+        if (
+            index >= processed_at
+            and event_type == "response.listen"
+            and finished_open >= open_at_commit
+            and _is_model_listen_decision(event)
+        ):
             return True
+    if processed_listen and finished_open >= open_at_commit:
+        return True
     if settled_silence_is_terminal:
         if created_after and cancelled_after >= created_after:
             return True
@@ -578,8 +626,8 @@ async def _bounded_ack_join(task: asyncio.Task) -> None:
     if pending:
         task.add_done_callback(_consume_task_exception)
         logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
-    elif not task.cancelled() and task.exception() is not None:
-        raise task.exception()
+    elif not task.cancelled() and (error := task.exception()) is not None:
+        raise error
 
 
 async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:

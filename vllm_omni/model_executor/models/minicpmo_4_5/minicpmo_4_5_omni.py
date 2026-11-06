@@ -60,6 +60,20 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
         duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
 
     outputs: dict[str, Any] = {}
+    # Wire multimodal metadata accepts tensors only. Publish the host identity
+    # with prefill; the orchestrator retains it until this unit finishes.
+    if any(info.get("data_plane") is True for info in duplex_rows):
+        outputs["meta"] = {
+            "duplex_input_item_id_utf8": [
+                torch.tensor(
+                    list(str(payload.get("realtime_item_id") or "").encode("utf-8"))
+                    if isinstance(payload := duplex_info.get("payload"), dict)
+                    else [],
+                    dtype=torch.uint8,
+                )
+                for duplex_info in duplex_rows
+            ]
+        }
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
@@ -85,13 +99,15 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
         # accumulated metadata over the values later appends publish.
         # Host tensors: every consumer reads them on the host, and a pageable
         # host->device copy per row and key would wait for the whole forward.
-        outputs["meta"] = {
-            key: [
-                torch.tensor([value if isinstance(value, int) and value >= 0 else constant], dtype=torch.long)
-                for value in (special.get(key) for special in special_rows)
-            ]
-            for key, constant in sorted(special_values.items())
-        }
+        outputs.setdefault("meta", {}).update(
+            {
+                key: [
+                    torch.tensor([value if isinstance(value, int) and value >= 0 else constant], dtype=torch.long)
+                    for value in (special.get(key) for special in special_rows)
+                ]
+                for key, constant in sorted(special_values.items())
+            }
+        )
     return outputs
 
 

@@ -14,6 +14,32 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_native_input_item_identity_is_per_row_and_cleared_by_next_unit():
+    from vllm_omni.utils.mm_outputs import partition_flat_payload, to_payload_element
+    from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
+
+    first = omni._duplex_row_outputs(
+        [
+            {"duplex": {"data_plane": True, "payload": {"realtime_item_id": "first"}}},
+            {"duplex": {"data_plane": True, "payload": {"realtime_item_id": "second"}}},
+        ],
+    )
+    for index, expected in enumerate(["first", "second"]):
+        payload = to_payload_element(first["meta"], idx=index, start=index, end=index + 1)
+        _, client = partition_flat_payload({f"meta.{key}": value for key, value in payload.items()})
+        wire = _ensure_tensor_values(client)
+        encoded = wire["meta.duplex_input_item_id_utf8"]
+        assert encoded.device.type == "cpu"
+        assert bytes(encoded.tolist()).decode("utf-8") == expected
+    following = omni._duplex_row_outputs(
+        [
+            {"duplex": {"data_plane": True, "payload": {}}},
+            {"duplex": {"data_plane": True, "payload": {}}},
+        ],
+    )
+    assert [value.numel() for value in following["meta"]["duplex_input_item_id_utf8"]] == [0, 0]
+
+
 @pytest.mark.parametrize(
     "profile,capacities,kv_gib,runners",
     [

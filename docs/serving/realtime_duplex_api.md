@@ -1206,6 +1206,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input_audio_buffer.speech_started` | 1 | Speech onset detected (server VAD, client hint, or RMS heuristic). |
 | `input_audio_buffer.speech_stopped` | 1 | Speech end detected. |
 | `input_audio_buffer.committed` | 2 | Commit accepted. OpenAI name; wraps the native `input.committed` payload under `event` (`turn_id`, `epoch`, `response_create_deferred`, ...). |
+| `duplex.input.processed` | 3 | The committed model unit has finished Stage0. Raw `input.processed` under `event` carries `session_id`, `epoch`, `item_id`, and `model_listen`. Emitted by models with `supports_input_processing_ack`; match it to commits advertising `event.processing_required: true`. |
 | `input_audio_buffer.cleared` | 1 | Input buffer cleared (after `input_audio_buffer.clear` or `input.cancel`). |
 | `conversation.item.added` | 2 | Item entered history (GA spelling). OpenAI name; carries `previous_item_id` and echoes the originating event. |
 | `conversation.item.created` | 2 | Same as `conversation.item.added` in the beta spelling; both are emitted. |
@@ -1553,7 +1554,18 @@ silence/noise declaration (no runtime append; answered with `response.listen`)
 {"type": "conversation.item.done", "previous_item_id": null, "item": {"id": "item_9b2d…", "status": "completed", "…": "…"}}
 ```
 
-deferred commit during an active response (`event.response_create_deferred`)
+Queue acceptance does not prove the model has consumed the audio. When
+`capabilities.supports_input_processing_ack` is true and the commit submits a
+distinct model unit, `input_audio_buffer.committed.event.processing_required`
+is true. Wait for `duplex.input.processed.event.item_id` and `.epoch` matching
+the commit's top-level `item_id` and `event.epoch` before considering that input
+processed. A delayed `response.listen` may belong to earlier queued audio.
+`model_listen: true` means the committed unit chose silence; it is a valid
+decision and does not require a generated response. Any open response must
+still finish before a client closes the session. A response failure terminates
+the request without promising a processing event.
+
+Deferred commit during an active response (`event.response_create_deferred`):
 
 ```json
 {
