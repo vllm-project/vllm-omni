@@ -491,9 +491,9 @@ The high-level flow is:
 
 **A. `ManagedBuffer`**
 
-If the buffer belongs to the same pool, the connector can use it directly without copying. This is the most efficient path.
-
-If the buffer comes from a different pool, the connector falls back to a copy path.
+The connector copies the buffer into its own allocation, including same-pool
+inputs. This keeps the source valid if the caller releases its original buffer
+while a native write remains active or its completion is unknown.
 
 **B. `torch.Tensor` or `bytes`**
 
@@ -599,8 +599,11 @@ This tells the sender exactly where to write the incoming data.
 
 The receiver then sends the pull request over ZMQ and waits for:
 
-- `TRANS_DONE`
-- or `TRANS_ERROR`
+- `TRANS_DONE`: the synchronous native write returned success.
+- `TRANS_NOT_SUBMITTED`: the handler did not invoke the native write.
+- `TRANS_UNKNOWN`, legacy `TRANS_ERROR`, or an invalid reply: completion is unknown.
+
+Only the first two permit destination reclamation. See the ownership rules below.
 
 If the transfer succeeds:
 
@@ -645,7 +648,8 @@ For a transfer request, the sender:
 1. locates the source addresses in `_local_buffers`
 2. constructs the remote session identifier
 3. calls `batch_transfer_sync_write(...)`
-4. replies `TRANS_DONE` or `TRANS_ERROR`
+4. replies `TRANS_DONE` on success, `TRANS_UNKNOWN` on native error/exception, or
+   `TRANS_NOT_SUBMITTED` when rejected before calling the SDK
 
 On success, the sender immediately calls `cleanup(meta.request_id)` and frees the producer-side buffer if it owns it.
 
@@ -686,7 +690,10 @@ This preserves a uniform object-oriented API while still allowing optimized raw-
 
 #### 11.1 Timeouts and Socket Recovery
 
-The receiver caches ZMQ REQ sockets per thread, but invalidates them after failures. This avoids reusing sockets that may be stuck in a bad state after timeout or receive errors.
+Metadata queries use thread-local REQ sockets. Each transfer uses a dedicated
+socket, retained by a completion waiter if the caller times out.
+`get_with_deadline()` shares one budget across metadata and completion waits;
+it does not cancel the sender's `batch_transfer_sync_write()` call.
 
 Timeout is scaled based on payload size:
 
@@ -699,21 +706,28 @@ This is intended to reduce false timeouts for large remote writes.
 
 The sender periodically reclaims old entries from `_local_buffers` using a TTL policy. This protects the memory pool from permanent leaks if a receiver crashes or never consumes a prepared payload.
 
-This is a practical recovery mechanism, although the code notes that TTL cleanup can still race with very long-running in-flight transfers.
+Active or ambiguous native writes pin both endpoints' buffers and registrations.
+TTL, explicit cleanup, duplicate put and close cannot recycle a pinned source.
+A nonzero SDK result does not prove the remote write has stopped. Ambiguous
+results retain memory until process exit; late safe ACKs release timed-out
+receiver allocations. There is no bounded reclamation guarantee after every failure.
+
+`max_inflight_receives` and `max_inflight_sends` default to 64. The sender limit
+bounds queued/active handlers and ambiguous writes. Capacity exhaustion rejects
+new requests before native submission.
+
+Both peers must use connector protocol v2: `put()` metadata, metadata-query
+responses and transfer requests carry `protocol_version=2`. Old metadata is
+rejected before publishing a destination; unversioned requests are rejected
+before a write. Upgrade both endpoints together. Successful TCP writes require
+acknowledged SDK completion; legacy `MC_TCP_PROTO=1` is rejected.
 
 #### 11.3 Connector Shutdown
 
-`close()` is a full resource teardown routine. It:
-
-- stops the listener thread
-- shuts down the worker executor
-- releases all pending buffers
-- closes cached sockets
-- unregisters memory from the engine when supported
-- terminates the ZMQ context
-- drops the pool reference
-
-This makes `MooncakeTransferEngineConnector` the most lifecycle-aware connector in the current connector family.
+`close()` rejects new work and defers teardown while receives, native writes,
+handlers or puts may still own memory. Once safe, it drains sender work and
+replies, joins the listener, releases idle buffers, closes sockets and unregisters
+the pool. Unknown native operations keep their memory registered until process exit.
 
 ### 12. Current Implementation Constraints
 
@@ -729,7 +743,9 @@ The receiver only stores one `(sender_host, sender_zmq_port)` pair through `upda
 
 #### 12.3 Explicit Buffer Ownership Matters
 
-When the connector allocates a pool slice internally, it is responsible for releasing it. When a caller passes an externally owned `ManagedBuffer`, the connector keeps it alive for transfer but does not assume ownership of its eventual release.
+The connector owns its send-side copies. The caller still owns the original
+`ManagedBuffer` passed to `put()` and successful fast-path receive results.
+Pending receive allocations remain connector-owned until a safe completion reply.
 
 These constraints are consistent with the current implementation and should be treated as design assumptions rather than incidental behavior.
 
