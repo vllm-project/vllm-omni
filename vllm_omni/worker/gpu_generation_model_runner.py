@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, cast
 
@@ -26,7 +27,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -69,6 +75,11 @@ class _AsyncGenerationOutput(AsyncModelRunnerOutput):
     def get_output(self) -> OmniModelRunnerOutput:
         self._snapshot.wait()
         return self._output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # Salvage does not wait on the payload copy. The connector output is
+        # already stored on the model-runner output before that copy starts.
+        return self._output.kv_connector_output
 
 
 def _copy_owned_generation_payload_to_cpu_async(
@@ -207,6 +218,31 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             self._failed_optional_model_hooks.add(name)
             log("Optional model hook %s failed; continuing without it.", name, exc_info=True)
 
+    def _is_unchanged_idle_step(self, scheduler_output: SchedulerOutput) -> bool:
+        # The first idle step still removes the previous batch and drains its
+        # input-copy event. Only subsequent empty polls can omit input updates.
+        # Connector receive/flush, lifecycle hooks, and idle prefetch still run.
+        return (
+            self.model_config.async_chunk
+            and self._prev_step_idle
+            and scheduler_output.total_num_scheduled_tokens == 0
+            and self.input_batch.num_reqs == 0
+            and self.speculative_config is None
+            and self.parallel_config.data_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not has_kv_transfer_group()
+            and not has_ec_transfer()
+            and not scheduler_output.num_scheduled_tokens
+            and not scheduler_output.scheduled_new_reqs
+            and not scheduler_output.scheduled_cached_reqs.req_ids
+            and not scheduler_output.finished_req_ids
+            and not scheduler_output.free_encoder_mm_hashes
+            and not getattr(scheduler_output, "kv_cache_block_copies", None)
+            and not scheduler_output.new_block_ids_to_zero
+            and not scheduler_output.scheduled_encoder_inputs
+            and not scheduler_output.scheduled_spec_decode_tokens
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -244,16 +280,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        unchanged_idle_step = self._is_unchanged_idle_step(scheduler_output)
         # Recorded before any return below, so every path updates it.
         prev_step_idle = self._prev_step_idle
         self._prev_step_idle = num_scheduled_tokens <= 0
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
-            self.synchronize_input_prep(),
+            nullcontext() if unchanged_idle_step else self.synchronize_input_prep(),
         ):
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
-            deferred_state_corrections_fn = self._update_states(scheduler_output)
+            deferred_state_corrections_fn = None if unchanged_idle_step else self._update_states(scheduler_output)
 
             # Notify stateful models of finished requests before the
             # zero-token early return. Request cleanup is a model lifecycle

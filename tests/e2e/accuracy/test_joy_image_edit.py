@@ -15,7 +15,12 @@ from PIL import Image
 from vllm.config.load import LoadConfig
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
-from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import (
+    assert_similarity,
+    measure_image_similarity,
+    model_output_dir,
+    write_accuracy_result,
+)
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
@@ -385,6 +390,19 @@ def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
     print(f"  vllm_omni: {vllm_output_path}")
     print(f"  diffusers: {diffusers_output_path}")
 
+    ssim, psnr = measure_image_similarity(
+        model_name=MODEL_ID,
+        vllm_image=vllm_image,
+        diffusers_image=diffusers_image,
+        width=WIDTH,
+        height=HEIGHT,
+    )
+    write_accuracy_result(
+        model_id=MODEL_ID,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+    )
     assert_similarity(
         model_name=MODEL_ID,
         vllm_image=vllm_image,
@@ -393,6 +411,8 @@ def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
         height=HEIGHT,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
     _print_latent_metrics(
         _run_latent_parity_comparison(

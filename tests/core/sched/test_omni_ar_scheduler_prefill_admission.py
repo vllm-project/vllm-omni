@@ -71,3 +71,25 @@ def test_a_stage_without_connector_knobs_reads_additional_config():
     config.model_config.stage_connector_config["extra"]["ar_prefill_admission_min_batch"] = 6
     OmniARScheduler._init_prefill_admission_policy(scheduler)
     assert scheduler._prefill_admission_min_batch == 6
+
+
+@pytest.mark.parametrize("connector_batch", [None, 3])
+def test_single_stage_admission_settings_and_connector_precedence(connector_batch):
+    scheduler = _scheduler(waiting=3, running=32)
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={
+            "ar_prefill_admission_min_batch": 8,
+            "ar_prefill_admission_max_wait_ms": 150,
+            "ar_prefill_admission_min_running": 32,
+        },
+        model_config=SimpleNamespace(
+            stage_connector_config=(
+                None if connector_batch is None else {"extra": {"ar_prefill_admission_min_batch": connector_batch}}
+            )
+        ),
+    )
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert defer(scheduler) is (connector_batch is None)
+    # The wait bound applies even if the single-stage batch has not filled.
+    scheduler.waiting[0].arrival_time = time.time() - 1.0
+    assert not defer(scheduler)

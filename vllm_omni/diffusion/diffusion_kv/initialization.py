@@ -7,9 +7,12 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
+    get_kv_cache_configs,
+)
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
-    get_kv_cache_configs,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -55,7 +58,16 @@ def build_native_kv_cache_configs(
         required_layout=get_connector_required_kv_cache_layout(vllm_config),
     )
     single_type_kv_cache_manager.register_all_kvcache_specs(vllm_config)
-    worker_configs = get_kv_cache_configs(vllm_config, worker_specs, available_memory)
+    # Planning now takes the merged groups, and NIXL DCP interleave is finalized
+    # from those groups before the configs are built.
+    global_kv_cache_groups = get_global_kv_cache_groups(vllm_config, worker_specs)
+    vllm_config.adjust_dcp_kv_cache_interleave_size(global_kv_cache_groups)
+    worker_configs = get_kv_cache_configs(
+        vllm_config,
+        worker_specs,
+        available_memory,
+        global_kv_cache_groups,
+    )
     scheduler_config = generate_scheduler_kv_cache_config(worker_configs)
     # Workers only receive a KVCacheConfig, so the resolved layout travels on it
     # and is adopted into each worker's own CacheConfig before allocation.
