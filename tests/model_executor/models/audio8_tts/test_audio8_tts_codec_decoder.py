@@ -43,6 +43,7 @@ def _make_decoder(codec: _FakeCodec, num_codebooks: int = NUM_CODEBOOKS, splits=
     decoder._sample_rate = 44100
     decoder._frame_size = 2048
     decoder._logged_stats = True
+    decoder._decode_graph = None
     decoder._ensure_codec_loaded = lambda: None
     if splits is not None:
         decoder._split_request_ids = lambda ids, seq_token_counts=None: splits
