@@ -101,6 +101,9 @@ def _run_schedule(scheduler: OmniARScheduler, monkeypatch: pytest.MonkeyPatch) -
 
     def upstream_schedule(_self, _throttle_prefills: bool = False):
         seen["limit"] = scheduler.max_num_active_reqs
+        # The ``not len(scheduler.waiting)`` guard is a test-only divergence: the
+        # real upstream breaks out of its admission loop when the queue is empty,
+        # while this stub has to return before popping. Keep it when editing.
         num_running = len(scheduler.running) + scheduler.num_waiting_for_streaming_input
         if num_running >= scheduler.max_num_active_reqs or not len(scheduler.waiting):
             seen["admitted"] = None
@@ -215,6 +218,35 @@ def test_seeded_request_parked_in_the_adapter_keeps_isolation(monkeypatch) -> No
     # step, and admitting the plain request now would co-batch them.
     assert seen["admitted"] is None
     assert scheduler.running == []
+
+
+def test_unseeded_adapter_park_still_counts_as_busy(monkeypatch) -> None:
+    """An unseeded runner parked for the step must block the seeded solo admission."""
+    parked_plain = _StubRequest("parked-plain", status=RequestStatus.RUNNING)
+    seeded = _StubRequest("seeded", seed=42)
+    scheduler = _make_scheduler(parked=0, waiting=[seeded], adapter_parked_running=[parked_plain])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # The engine is busy: solo-admitting now would co-batch the seeded request
+    # with the parked one once the step restores it.
+    assert seen["admitted"] is None
+    assert seen["limit"] == 8
+
+
+def test_seeded_request_parked_in_the_coordinator_keeps_isolation(monkeypatch) -> None:
+    """The native-coordinator park has the same contract as the adapter park."""
+    from types import SimpleNamespace
+
+    seeded = _StubRequest("seeded", seed=42, status=RequestStatus.RUNNING)
+    plain = _StubRequest("plain")
+    scheduler = _make_scheduler(parked=0, waiting=[plain])
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = SimpleNamespace(_waiting_for_chunk_running=[seeded])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    assert seen["admitted"] is None
 
 
 def test_resumed_seeded_session_waits_for_running_work(monkeypatch) -> None:
