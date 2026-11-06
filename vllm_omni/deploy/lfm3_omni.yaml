@@ -1,4 +1,5 @@
-# LFM3-Omni bring-up profile. Eager execution owns per-request convolution state.
+# LFM3-Omni bring-up profile, verified on 1x Ascend 910B1 64 GiB and 1x RTX 4090 24 GB.
+# Eager execution owns per-request convolution state.
 async_chunk: false
 model_runner: v1
 dtype: bfloat16

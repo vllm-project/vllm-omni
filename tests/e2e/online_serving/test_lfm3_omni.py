@@ -25,7 +25,7 @@ SERVER = OmniServerParams(
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [SERVER], indirect=True)
 @pytest.mark.parametrize("stream", [False, True])
 def test_speech_response_and_concurrent_streaming(omni_server, openai_client, stream):
