@@ -173,7 +173,7 @@ def test_bank_is_transactional_and_copies_camera(monkeypatch):
     assert memory.bank[2].pose[0, 3] == 2
     old_bank, old_history = memory.bank, memory.history
 
-    def fail():
+    def fail(replacement):
         raise RuntimeError("CPU bank copy failed")
 
     monkeypatch.setattr(memory, "_publish_bank", fail)
@@ -341,14 +341,14 @@ def test_clean_publication_releases_device_views_and_consumes_pending_transactio
     publish, retain = memory._publish_bank, memory._retained
     calls = []
 
-    def checked_publish():
-        assert not memory._device_retrieved
-        assert len(memory._pending) == 2
+    def checked_publish(replacement):
+        assert not memory._device_retrieved and not memory._pending
+        assert memory.history is old_history and memory.bank is old_bank
         calls.append("bank")
-        return publish()
+        return publish(replacement)
 
     def checked_retain(layer, current):
-        assert calls[0] == "bank"
+        assert "bank" not in calls
         assert layer not in memory._pending
         assert len(memory._pending) == 1 - layer
         assert memory.history is old_history and memory.bank is old_bank
@@ -363,6 +363,89 @@ def test_clean_publication_releases_device_views_and_consumes_pending_transactio
         append(memory, 8)
     assert memory.history is old_history and memory.bank is old_bank and memory.next_frame == 8
     assert not memory._pending and not memory._device_retrieved
+    assert calls == [0, 1]
     monkeypatch.setattr(memory, "_retained", retain)
     append(memory, 8)
-    assert memory.next_frame == 10
+    assert memory.next_frame == 10 and calls[-1] == "bank"
+
+
+def test_recent_retrieval_reuses_history_without_host_roundtrip(monkeypatch):
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    memory.set_pose(pose(4))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("recent retrieved KV is already resident in history")
+
+    monkeypatch.setattr(worldkv.MemoryRows, "to", forbidden)
+    with memory.forward(8, 2, commit=False):
+        assert [chunk.start for chunk in memory._retrieved] == [4]
+        for layer in range(2):
+            retrieved = memory._retrieved_rows(layer, torch.device("cpu"))[0]
+            expected = memory.bank[4].layers[layer]
+            for name in ("key", "value", "positions", "token_ids"):
+                actual = getattr(retrieved, name)
+                assert torch.equal(actual, getattr(expected, name))
+                assert (
+                    actual.untyped_storage().data_ptr()
+                    == getattr(memory.history[layer], name).untyped_storage().data_ptr()
+                )
+            memory.assemble(layer, raw(8), raw(8), raw(8))
+
+
+def test_host_reader_waits_for_publication_before_access(monkeypatch):
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    completed = []
+    ready = Mock(spec=torch.Event)
+    ready.synchronize.side_effect = lambda: completed.append(True)
+    memory.bank[2] = replace(memory.bank[2], ready=ready)
+    original = worldkv.MemoryRows.to
+
+    def checked_copy(rows, device):
+        assert completed, "host rows cannot be read while D2H is still pending"
+        return original(rows, device)
+
+    monkeypatch.setattr(worldkv.MemoryRows, "to", checked_copy)
+    memory.set_pose(pose(2))
+    with memory.forward(8, 2, commit=False):
+        for layer in range(2):
+            memory.assemble(layer, raw(8), raw(8), raw(8))
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+def test_resident_shortcut_preserves_long_rollout_and_variable_chunk_sizes(monkeypatch, ratio):
+    fast, reference = state(world_keep_ratio=ratio), state(world_keep_ratio=ratio)
+    monkeypatch.setattr(reference, "_resident_rows", lambda *args: None)
+    start = 0
+    for frames in [2, 1, 2, 1] * 5:
+        for memory in (fast, reference):
+            memory.set_pose(pose(start - 3 if start % 2 else 2))
+        for commit in (False, True):
+            outputs = []
+            for memory in (fast, reference):
+                with memory.forward(start, frames, commit=commit):
+                    for layer in range(2):
+                        x = raw(start, frames=frames) + layer
+                        outputs.append(memory.assemble(layer, x, x, x * 2))
+            for lhs, rhs in zip(outputs[:2], outputs[2:]):
+                assert all(torch.equal(a, b) for a, b in zip(lhs, rhs))
+        start += frames
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+def test_reservation_accounts_for_compressed_async_sources_only(ratio):
+    config = worldkv.WorldKVConfig(
+        window_frames=18, sink_frames=9, retrieval_frames=3, bank_bytes=48 << 30, world_keep_ratio=ratio
+    )
+    layers, tokens, heads, dim, itemsize, chunk = 40, 960, 40, 128, 2, 3
+    reserve = config.reservation_bytes(layers, tokens, heads, dim, itemsize, chunk_frames=chunk)
+    row = 2 * heads * dim * itemsize + 16
+    scratch = 4 * config.window_frames * tokens * (2 * heads * dim * max(4, itemsize) + 16)
+    extra = 0 if ratio == 1 else tokens + math.ceil((chunk - 1) * tokens * ratio)
+    assert reserve - scratch == layers * (2 * (config.window_frames - config.retrieval_frames) * tokens + extra) * row

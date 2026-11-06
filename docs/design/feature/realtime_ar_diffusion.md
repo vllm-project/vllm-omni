@@ -264,6 +264,14 @@ model_config:
   C2W pose. Each chunk ranks bank chunks by translation plus rotation distance
   and fits whole chunks into the budget, in time order with original RoPE.
 - **Compression:** only bank rows; the anchor frame is kept in full.
+- **Transfers:** CUDA commits copy K/V into pinned host memory on a separate
+  stream. Host-bank retrieval waits for that copy; uncompressed chunks still
+  resident in GPU history are read directly. At most one publication remains
+  in flight. Uncompressed publication borrows the new history's tail; separately
+  owned compressed source storage is included in the GPU reservation.
+  Pinned allocations use PyTorch's caching allocator; initial bank filling
+  still incurs allocation costs. `bank_bytes` bounds live entries, not allocator
+  caches or the temporary replacement chunk needed for transactional publication.
 - **Bank size:** about 1.79 GiB per chunk at 480x832, bf16, ratio 0.25. A
   revisit is recalled only while its chunk is still in the bank; the first
   eviction logs a warning.

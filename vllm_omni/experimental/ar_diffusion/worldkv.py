@@ -144,6 +144,12 @@ class WorldKVConfig:
         row = kv + 16
         noisy_or_clean = layers * tokens_per_frame * (history + chunk + self.retrieval_frames) * row
         publishing = layers * tokens_per_frame * publication * row
+        if self.retrieval_frames and self.world_keep_ratio != 1:
+            # Uncompressed D2H borrows canonical history. Compressed rows own
+            # separate storage until the single in-flight copy completes.
+            compressed = tokens_per_frame + math.ceil((chunk - 1) * tokens_per_frame * self.world_keep_ratio)
+            noisy_or_clean += layers * compressed * row
+            publishing += layers * compressed * row
         resident = max(noisy_or_clean, publishing)
         # Four full-width fp32/fp64 K/V windows bound one layer's gathered
         # rows, scoring intermediates and concatenated attention view.
@@ -166,7 +172,15 @@ class MemoryRows:
 
     def to(self, device: torch.device) -> MemoryRows:
         return MemoryRows(
-            self.key.to(device), self.value.to(device), self.positions.to(device), self.token_ids.to(device)
+            self.key.to(device, non_blocking=True),
+            self.value.to(device, non_blocking=True),
+            self.positions.to(device),
+            self.token_ids.to(device),
+        )
+
+    def slice(self, start: int, end: int | None = None) -> MemoryRows:
+        return MemoryRows(
+            self.key[:, start:end], self.value[:, start:end], self.positions[start:end], self.token_ids[start:end]
         )
 
 
@@ -201,6 +215,7 @@ class BankChunk:
     frames: int
     pose: torch.Tensor
     layers: tuple[MemoryRows, ...]
+    ready: torch.Event | None = None
 
     @property
     def nbytes(self) -> int:
@@ -268,6 +283,8 @@ class WorldKV:
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
         self._seen: set[int] = set()
+        self._copy_stream: torch.Stream | None = None
+        self._publication: torch.Event | None = None
         self.evicted_chunks = 0
         self._release_bank: weakref.finalize | None = None
         if config.retrieval_frames:
@@ -301,8 +318,40 @@ class WorldKV:
 
     def _retrieved_rows(self, layer: int, device: torch.device) -> tuple[MemoryRows, ...]:
         if layer not in self._device_retrieved:
-            self._device_retrieved[layer] = tuple(chunk.layers[layer].to(device) for chunk in self._retrieved)
+            rows = []
+            for chunk in self._retrieved:
+                resident = self._resident_rows(layer, chunk)
+                if resident is not None and resident.key.device == device:
+                    rows.append(resident)
+                    continue
+                if chunk.ready is not None:
+                    if device.type == "cuda":
+                        torch.accelerator.current_stream(device).wait_event(chunk.ready)
+                    else:
+                        chunk.ready.synchronize()
+                rows.append(chunk.layers[layer].to(device))
+            self._device_retrieved[layer] = tuple(rows)
         return self._device_retrieved[layer]
+
+    def _resident_rows(self, layer: int, chunk: BankChunk) -> MemoryRows | None:
+        # History keeps a full window until commit; attention excludes the
+        # oldest current-chunk-sized prefix *before* that. Reuse this prefix
+        # when pose retrieval selects it, without another GPU cache or copy.
+        previous = self.history[layer]
+        if previous is None or self.config.world_keep_ratio != 1:
+            return None
+        sink = min(self.config.sink_frames, self.next_frame) * self.tokens_per_frame
+        tail_start = self.next_frame - (previous.positions.numel() - sink) // self.tokens_per_frame
+        if chunk.start < tail_start or chunk.start + chunk.frames > self.next_frame:
+            return None
+        start = sink + (chunk.start - tail_start) * self.tokens_per_frame
+        end = start + chunk.frames * self.tokens_per_frame
+        return previous.slice(start, end)
+
+    def _wait_publication(self) -> None:
+        if self._publication is not None:
+            self._publication.synchronize()
+            self._publication = None
 
     @property
     def bank_nbytes(self) -> int:
@@ -340,26 +389,61 @@ class WorldKV:
                 budget -= cost
         return tuple(sorted(selected, key=lambda chunk: chunk.start))
 
-    def _publish_bank(self) -> tuple[dict[int, BankChunk], int]:
+    def _publish_bank(self, replacement: list[MemoryRows | None]) -> tuple[dict[int, BankChunk], int]:
         bank = dict(self.bank)
         if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
             return bank, 0
         assert self.pose is not None
+        self._wait_publication()
+        sources = []
+        for rows in replacement:
+            assert rows is not None
+            sources.append(
+                world_compress(
+                    rows.slice(-self._frames * self.tokens_per_frame),
+                    self.tokens_per_frame,
+                    self.config.world_keep_ratio,
+                    self.config.world_score,
+                )
+            )
+        device = sources[0].key.device
+        asynchronous = device.type == "cuda"
+        # PyTorch's pinned allocator caches freed blocks after FIFO eviction.
+        # Never overwrite a live bank entry: publication can still fail below.
         layers = tuple(
             MemoryRows(
-                rows.key.to(device="cpu", copy=True),
-                rows.value.to(device="cpu", copy=True),
+                torch.empty_like(rows.key, device="cpu", pin_memory=asynchronous),
+                torch.empty_like(rows.value, device="cpu", pin_memory=asynchronous),
                 rows.positions.to(device="cpu", copy=True),
                 rows.token_ids.to(device="cpu", copy=True),
             )
-            for rows in (
-                world_compress(
-                    self._pending[i], self.tokens_per_frame, self.config.world_keep_ratio, self.config.world_score
-                )
-                for i in range(self.num_layers)
-            )
+            for rows in sources
         )
-        chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers)
+        ready = None
+        if asynchronous:
+            if self._copy_stream is None:
+                self._copy_stream = torch.Stream(device=device)
+            stream = self._copy_stream
+            stream.wait_stream(torch.accelerator.current_stream(device))
+            try:
+                with stream:
+                    for source, target in zip(sources, layers):
+                        # Mark before enqueueing, including the partial-copy
+                        # failure path and compressed temporary rows.
+                        source.key.record_stream(stream)
+                        source.value.record_stream(stream)
+                        target.key.copy_(source.key, non_blocking=True)
+                        target.value.copy_(source.value, non_blocking=True)
+                    ready = stream.record_event()
+                self._publication = ready
+            except BaseException:
+                stream.synchronize()
+                raise
+        else:
+            for source, target in zip(sources, layers):
+                target.key.copy_(source.key)
+                target.value.copy_(source.value)
+        chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers, ready)
         bank[chunk.start] = chunk
         size = sum(entry.nbytes for entry in bank.values())
         evicted = 0
@@ -390,13 +474,14 @@ class WorldKV:
                 raise RuntimeError("WorldKV forward did not execute all layers")
             if commit:
                 # No attention consumer remains after the output head succeeds.
-                # Publish CPU rows before consuming pending GPU rows, preserving
-                # rollback: canonical history/bank are assigned only at the end.
+                # Copy from the replacement's tail so uncompressed async D2H
+                # borrows canonical storage rather than retaining pending KV.
+                # Canonical history/bank are assigned only after both succeed.
                 self._clear_retrieval()
-                bank, evicted = self._publish_bank()
                 replacement: list[MemoryRows | None] = [
                     self._retained(i, self._pending.pop(i)) for i in range(self.num_layers)
                 ]
+                bank, evicted = self._publish_bank(replacement)
                 self.history, self.bank = replacement, bank
                 self.next_frame += frames
                 self.pose = None
@@ -411,6 +496,8 @@ class WorldKV:
                 self.evicted_chunks += evicted
             success = True
         finally:
+            if not success:
+                self._wait_publication()
             self._pending.clear()
             self._seen.clear()
             self._active = False
@@ -490,6 +577,7 @@ class WorldKV:
         return torch.cat(keys, 1), torch.cat(values, 1)
 
     def close(self) -> None:
+        self._wait_publication()
         self.history = [None] * self.num_layers
         self._pending.clear()
         self._seen.clear()
@@ -497,5 +585,6 @@ class WorldKV:
         self.pose = None
         self._clear_retrieval()
         self._closed = True
+        self._copy_stream = None
         if self._release_bank is not None:
             self._release_bank()
