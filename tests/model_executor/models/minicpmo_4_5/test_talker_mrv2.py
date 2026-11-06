@@ -82,6 +82,18 @@ def _req_states(prompt_lens: dict[int, int], max_reqs: int = 8, token_ids: dict[
     return SimpleNamespace(prompt_len=SimpleNamespace(gpu=prompt_len), all_token_ids=SimpleNamespace(gpu=all_token_ids))
 
 
+def _spec_config(num_speculative_tokens: int):
+    """The SpeculativeConfig fields upstream RejectionSampler reads, at their defaults."""
+    return SimpleNamespace(
+        num_speculative_tokens=num_speculative_tokens,
+        enable_adaptive_verification=False,
+        rejection_sample_method="standard",
+        fly_window_size=None,
+        fly_entropy_threshold=0.3,
+        fly_entropy_top_k=3,
+    )
+
+
 def test_mrv2_output_emits_decode_input_codes_with_validity_and_forced_eos() -> None:
     talker = _talker()
     rows = [
@@ -535,7 +547,9 @@ def test_codec_penalty_reads_draft_rows_only_when_a_request_has_them(mocker, dra
     state.window_size = 16
     state.base = SimpleNamespace(apply=lambda logits, ctx: logits)
     state.req_states = SimpleNamespace(
-        all_token_ids=SimpleNamespace(gpu=None), total_len=SimpleNamespace(gpu=None), prompt_len=SimpleNamespace(gpu=None)
+        all_token_ids=SimpleNamespace(gpu=None),
+        total_len=SimpleNamespace(gpu=None),
+        prompt_len=SimpleNamespace(gpu=None),
     )
     state.repetition_penalty = SimpleNamespace(gpu=None)
     state.use_window = np.ones(2, dtype=bool)
@@ -575,9 +589,7 @@ def test_draft_verification_forces_codec_eos_after_processing(mocker):
     sampler = SimpleNamespace(
         req_states=SimpleNamespace(device="cpu", max_num_reqs=4), apply_sampling_params=apply_sampling_params
     )
-    spec_config = SimpleNamespace(
-        num_speculative_tokens=1, enable_adaptive_verification=False, rejection_sample_method="standard"
-    )
+    spec_config = _spec_config(1)
     forced = torch.tensor([False, True, True])
     talker = SimpleNamespace(
         _codec_eos_id=7, _mrv2_masked_eos=None, take_mrv2_forced_eos=mocker.Mock(return_value=forced)
@@ -664,9 +676,7 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
         use_fp64_gumbel=False,
         return_sampling_mask=False,
     )
-    spec_config = SimpleNamespace(
-        num_speculative_tokens=2, enable_adaptive_verification=False, rejection_sample_method="standard"
-    )
+    spec_config = _spec_config(2)
     logits = torch.zeros(4, _EOS + 1, device=dev)
     # Row 0's greedy pick is draft 6. Row 1's is code 0 unless EOS stays forced
     # through the masking above, which would accept draft 0.
@@ -693,9 +703,7 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     mocker.patch.object(module, "_install_mrv2_talker_sampler", return_value="talker-sampler")
     sampler = SimpleNamespace(req_states=SimpleNamespace(device="cpu", max_num_reqs=4))
     assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
-    spec_config = SimpleNamespace(
-        num_speculative_tokens=7, enable_adaptive_verification=False, rejection_sample_method="standard"
-    )
+    spec_config = _spec_config(7)
     talker.vllm_config = SimpleNamespace(
         speculative_config=spec_config, model_config=SimpleNamespace(session_mode="turn")
     )
