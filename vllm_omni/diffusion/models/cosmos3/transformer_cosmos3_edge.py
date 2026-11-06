@@ -18,6 +18,7 @@ from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 
 from .transformer_cosmos3 import (
+    Cosmos3NativeRotaryEmbedding,
     Cosmos3VFMTransformer,
     Qwen3VLTextRotaryEmbedding,
     RMSNorm,
@@ -308,6 +309,9 @@ class Cosmos3EdgeVFMTransformer(Cosmos3VFMTransformer):
 
     _language_model_cls = Cosmos3EdgeLanguageModel
     _gen_mlp_cls = Cosmos3Relu2MLP
+
+    def _create_rotary_embedding(self) -> nn.Module:
+        return Cosmos3NativeRotaryEmbedding()
 
     @staticmethod
     def _validate_supported_config(model_config: Any) -> None:
