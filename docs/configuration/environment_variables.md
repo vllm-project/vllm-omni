@@ -111,7 +111,11 @@ environment variables.
 Length bucketing for variable-length encoders. It applies only to
 encoder call sites that feed one globally padded batch (inputs at a non-true, batch/global
 padded length); call sites already feeding true-length or length-packed inputs have no
-padding waste to recover and fall back to the original forward. When a wrapped encoder's
+padding waste to recover and fall back to the original forward — and the wrapper enforces
+this per batch, not just per call site: each rung window is capped at the batch's time
+extent, and the bucketed path runs only when the capped windows are strictly shorter in
+aggregate, so batches with no padding waste to recover (single audio, uniform lengths)
+compute exactly as they do with the feature off. When a wrapped encoder's
 call is ineligible (keyword args, non-CUDA, no published lengths, unsupported output, or
 no matching fixed-window recipe, or over-long/empty batches), the wrapper returns the untouched forward unchanged.
 
@@ -136,7 +140,10 @@ values depend on the actual audio length distribution):
   test-clean, ~1.85x encoder speedup, and E2E at max-concurrency 16: TTFT P50
   104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2 req/s (+21.7%).
 * Step-Audio-2-mini (mask-aware): encoder-output on/off cosine 1.0 in fp32 (~0.997 in
-  bfloat16), and 1.62-3.7x encoder speedup depending on the batch length mix.
+  bfloat16), and 1.62-3.7x encoder speedup on constructed mixed-length batches. The
+  speedup is a function of the intra-batch length mix, not of the model: with the waste
+  gate, single-audio and uniform-length calls are no-ops (the untouched forward runs
+  unchanged).
   End-to-end WER is contributor-reported from a local WER run (single RTX 5090
   32 GB, bf16; Step-Audio-2-mini ASR; greedy decoding,
   temperature 0, repetition penalty 1.05, seed 42; buckets 2,4,8,16,30 s; same
