@@ -668,7 +668,8 @@ def install_bucketed_encoders(model: nn.Module, encoders: Mapping[str, nn.Module
     for label, module in encoders.items():
         if not isinstance(module, nn.Module):
             raise ValueError(
-                f"install_bucketed_encoders: declared encoder {label!r} is not an nn.Module, got {type(module).__name__}"
+                "install_bucketed_encoders: declared encoder "
+                f"{label!r} is not an nn.Module, got {type(module).__name__}"
             )
     for (label_a, module_a), (label_b, module_b) in itertools.combinations(encoders.items(), 2):
         if any(sub is module_b for sub in module_a.modules()) or any(sub is module_a for sub in module_b.modules()):
