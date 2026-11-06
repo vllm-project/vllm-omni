@@ -1779,16 +1779,13 @@ class BatchedToken2Wav(nn.Module):
         self,
         states: list[BatchedToken2WavState],
         *,
-        include_estimator_att: bool = True,
         include_conformer: bool = True,
     ) -> dict[str, torch.Tensor | None]:
-        """Stack per-request flow caches for one batched call.
+        """Stack estimator CNN caches and, when needed, conformer caches.
 
-        The estimator attention cache is by far the largest (~0.5 GiB per
-        request in fp32). The Whole-Euler path reads it per request, so it
-        skips stacking it (``include_estimator_att=False``). A caller that
-        already ran the encoder skips the conformer caches
-        (``include_conformer=False``).
+        Estimator attention history stays per request; eager CFM stacks only
+        the current timestep. Callers that already ran the encoder skip the
+        conformer caches with ``include_conformer=False``.
         """
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
@@ -1801,11 +1798,6 @@ class BatchedToken2Wav(nn.Module):
                 torch.cat([flow["conformer_att_cache"] for flow in flows], dim=1) if include_conformer else None
             ),
             "estimator_cnn_cache": torch.cat((*conditional_cnn, *unconditional_cnn), dim=2),
-            "estimator_att_cache": (
-                self._stack_estimator_att([flow["estimator_att_cache"] for flow in flows])
-                if include_estimator_att
-                else None
-            ),
         }
 
     def _whole_euler_active(self) -> bool:
@@ -2101,7 +2093,7 @@ class BatchedToken2Wav(nn.Module):
             # Replay must use the same autocast context as startup capture.
             # A captured encoder graph stacks the conformer caches into its own inputs.
             graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
-            flow_cache = self._stack_flow_cache(states, include_estimator_att=False, include_conformer=graphed is None)
+            flow_cache = self._stack_flow_cache(states, include_conformer=graphed is None)
             # A graph's shared results are read below and copied per row by _split_flow_cache.
             hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
                 tokens,
@@ -2282,7 +2274,7 @@ class BatchedToken2Wav(nn.Module):
                     None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
                 )
                 # The encoder reads only the conformer caches.
-                group_cache = {} if graphed else self._stack_flow_cache(group_states, include_estimator_att=False)
+                group_cache = {} if graphed else self._stack_flow_cache(group_states)
                 hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
                     group_tokens,
                     last_chunk=last_chunk,
@@ -2307,7 +2299,7 @@ class BatchedToken2Wav(nn.Module):
         for row, hidden in enumerate(resolved_hidden):
             padded_hidden[row, : int(hidden.shape[1])].copy_(hidden[0])
 
-        flow_cache = self._stack_flow_cache(states, include_estimator_att=False, include_conformer=False)
+        flow_cache = self._stack_flow_cache(states, include_conformer=False)
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
         with self._autocast(padded_hidden.device):
             cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()

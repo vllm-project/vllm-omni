@@ -1312,6 +1312,9 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
     )
 
     stacked = adapter._stack_flow_cache(states)
+    stacked["estimator_att_cache"] = adapter._stack_estimator_att(
+        [state.flow_cache["estimator_att_cache"] for state in states]
+    )
     assert stacked["estimator_cnn_cache"].shape[2] == 4
     assert stacked["estimator_att_cache"].shape[2] == 4
     restored = adapter._split_flow_cache(stacked, 2)
@@ -1375,6 +1378,9 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     assert states[0] is states[1]
 
     stacked = adapter._stack_flow_cache(states)
+    stacked["estimator_att_cache"] = adapter._stack_estimator_att(
+        [state.flow_cache["estimator_att_cache"] for state in states]
+    )
     assert stacked["estimator_att_cache"].dtype == torch.bfloat16
     restored = adapter._split_flow_cache(stacked, 2)
     for original, round_tripped in zip(states, restored, strict=True):
