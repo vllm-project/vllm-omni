@@ -682,10 +682,12 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Length bucketing wraps this model's own encoder and embed_multimodal.
         # The install lives here — inside the model that owns the encoder — not
         # as a runner hook: every runner path (GPU / NPU / worker_v2) is covered
-        # and stages without a bucketable encoder never see the installer.
+        # and stages without a bucketable encoder never see the installer. The
+        # model declares its encoder by passing the module by reference; nothing
+        # is discovered by name.
         from vllm_omni.worker.bucketed_encoder import install_bucketed_encoders
 
-        install_bucketed_encoders(self, vllm_config=vllm_config)
+        install_bucketed_encoders(self, {"encoder": self.encoder}, vllm_config=vllm_config)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

@@ -3,10 +3,12 @@
 """Length bucketing for variable-length encoders.
 
 One self-contained, deployment-tunable feature. The encoder-owning model calls
-:func:`install_bucketed_encoders` at the end of its constructor; bucketing
-engages only when the stage's ``additional_config.audio_bucket_seconds`` is
-set — opt-in, off by default — arming each wrapped encoder to bucket the batch
-by length rung and compute each rung window eagerly.
+:func:`install_bucketed_encoders` at the end of its constructor and passes its
+own encoder by reference — the model declares its encoder, nothing is
+discovered by name. Bucketing engages only when the stage's
+``additional_config.audio_bucket_seconds`` is set — opt-in, off by default —
+arming each wrapped encoder to bucket the batch by length rung and compute
+each rung window eagerly.
 
 Per-item lengths travel as an argument on the encoder call. The wrapper reads
 the model's own per-item length field where the model already passes it:
@@ -46,10 +48,11 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import itertools
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-import regex as re
 import torch
 from torch import nn
 from vllm.logger import init_logger
@@ -64,7 +67,6 @@ __all__ = [
 _CONFIG_KEY = "audio_bucket_seconds"
 _CONFIG_PATH = f"additional_config.{_CONFIG_KEY}"
 _DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
-_MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _CHUNK_ROWS = 8  # rows per forward call; bounds transient activation memory
 
 
@@ -102,7 +104,12 @@ def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
     return BaseModelOutput(last_hidden_state=hidden)
 
 
-# Class-name keyed to avoid importing model libraries at module import.
+# Class-name keyed to avoid importing model libraries at module import, and
+# matched against the wrapped class EXACTLY — no MRO walk. A subclass that
+# changes forward semantics (``WhisperVQEncoder`` adds a VQ codebook and
+# pooling, ``MiniCPMWhisperEncoder`` adds use_cache streaming) must not
+# inherit the base class's recipe; a verified subclass that genuinely ports
+# the same forward gets its own entry after a per-class semantic review.
 # NOTE: Qwen2AudioEncoder is intentionally NOT here — its forward applies an
 # avg_pooler before layer normalization, so the Whisper recipe would produce
 # twice as many embeddings per clip. Fixed-window classes without a correct
@@ -180,6 +187,10 @@ def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] 
 # an author writes
 # in the PipelineConfig when registering a model, so the reference table and the
 # whitelist share one name.
+#
+# Which module to wrap is NOT part of this table: the model declares its
+# encoder by passing the module itself to install_bucketed_encoders from its
+# constructor. This table carries only the per-model knobs below.
 #
 # Per-model fields (determined by reading the model's own code):
 #   hop             — STFT hop length in samples, i.e. the mel frame rate; the
@@ -625,8 +636,21 @@ def _published_lengths(value, frames_per_length: int) -> tuple[int, ...] | None:
     return tuple(frames)
 
 
-def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str]:
-    """Wrap matching encoders; returns wrapped names.
+def install_bucketed_encoders(model: nn.Module, encoders: Mapping[str, nn.Module], *, vllm_config=None) -> list[str]:
+    """Wrap the encoders the model declares; returns the declared labels.
+
+    The encoder-owning model's constructor passes its own encoder (or
+    encoders) as a ``label -> module`` mapping — the model declares what to
+    wrap, so nothing is discovered by name and a same-named module elsewhere
+    in the tree can never be wrapped by mistake. Labels are log/return names
+    only; they do not have to match the module's name in the model tree.
+
+    The declaration is validated up front and fails loudly: an empty mapping,
+    a non-module value, or overlapping declarations (the same module twice,
+    or one declared module inside another) raise ``ValueError`` — a
+    declaration bug is a programming error, not a runtime condition to
+    degrade around, and it is checked on every install (even with the feature
+    off) so it cannot hide until bucketing is enabled.
 
     The wrap is unconditional for models that call this (the encoder-owning
     model's constructor): it installs the explicit ``lengths`` call contract
@@ -638,6 +662,20 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     """
     if model is None or getattr(model, "_bucketed_installed", False):
         return []
+
+    if not encoders:
+        raise ValueError("install_bucketed_encoders: the model must declare at least one encoder (label -> module)")
+    for label, module in encoders.items():
+        if not isinstance(module, nn.Module):
+            raise ValueError(
+                f"install_bucketed_encoders: declared encoder {label!r} is not an nn.Module, got {type(module).__name__}"
+            )
+    for (label_a, module_a), (label_b, module_b) in itertools.combinations(encoders.items(), 2):
+        if any(sub is module_b for sub in module_a.modules()) or any(sub is module_a for sub in module_b.modules()):
+            raise ValueError(
+                f"install_bucketed_encoders: declared encoders {label_a!r} and {label_b!r} overlap "
+                "(the same module, or one inside the other); declare the outer encoder only"
+            )
 
     verified = _verified_knobs(vllm_config)
     ladder = None
@@ -669,19 +707,10 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
             sorted(_VERIFIED_MODELS),
             _CONFIG_PATH,
         )
-    pattern = re.compile(_MODULE_PATTERN)
     wrapped: list[str] = []
     manifest: list[tuple[nn.Module, str, object]] = []
-    for name, module in model.named_modules():
-        if any(name == p or name.startswith(p + ".") for p in wrapped):
-            continue  # skip descendants of an already-wrapped module
-        if not pattern.search(name):
-            continue
-        shim_fn = None
-        for klass in type(module).__mro__:
-            shim_fn = _FORWARD_SHIMS.get(klass.__name__)
-            if shim_fn is not None:
-                break
+    for label, module in encoders.items():
+        shim_fn = _FORWARD_SHIMS.get(type(module).__name__)
         if shim_fn is not None:
             global _SHIM_WARNED
             if not _SHIM_WARNED:
@@ -690,14 +719,14 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
                     "Bucketed encoder %r is a fixed-window class: bucketed windows "
                     "use the built-in variable-length recipe, which is lossy "
                     "(outputs may differ from the un-bucketed forward).",
-                    name,
+                    label,
                 )
         # Keep _original as the untouched forward (the fallback); the shim
         # (the module-bound fixed-window recipe) is used ONLY for bucketed
         # windows via _tensor_forward.
         encoder = _BucketedEncoder(
             module,
-            name,
+            label,
             ladder,
             shim=functools.partial(shim_fn, module) if shim_fn is not None else None,
             rebuild=rebuild,
@@ -706,13 +735,9 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
             time_axis=time_axis,
             frames_per_length=frames_per_length,
         )
-        manifest.append((module, name, encoder._original))
+        manifest.append((module, label, encoder._original))
         module.forward = encoder
-        wrapped.append(name)
-
-    if not wrapped:
-        logger.warning("Bucketed encoder found no module matching %r in %r", _MODULE_PATTERN, type(model).__name__)
-        return []
+        wrapped.append(label)
 
     model._bucketed_wrapped = manifest
     model._bucketed_installed = True
