@@ -151,6 +151,25 @@ went from 4768 s to 1836 s (2.60×). That pair has no quality comparison.
 When frames look soft, move toward the sharper row before lowering
 `sparsity`.
 
+#### 4×: RainFusion plus Cache-DiT
+
+Same USP4 + MXFP8 stack, with a shorter dense tail and Cache-DiT. Five
+interleaved repeats on vLLM-Omni 0.32.0: in-run dense median 701.95 s,
+candidate median 166.17 s, 4.22× (76.3% lower). Against the frozen TP4 bf16
+baseline of 722.2 s that is 4.35×. Wall-clock medians were 717.4 s and
+181.5 s (3.95×). 31 of 50 denoise steps were cached. Sharpness / flicker /
+luma versus the USP4+MXFP8 dense run were 0.924 / 0.950 / 0.984. The same
+command passed that check at seeds 2202 (165.1 s) and 2303 (165.9 s).
+
+```bash
+  --task-type ref2va \
+  --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix","start_step":4,"end_step":2,"skip_layers":"0-2,47-49"}}}' \
+  --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}' \
+  --cache-backend cache_dit \
+  --enable-cache-dit-summary \
+  --cache-config '{"Fn_compute_blocks":2,"Bn_compute_blocks":1,"max_warmup_steps":4,"residual_diff_threshold":0.07,"max_continuous_cached_steps":3,"enable_taylorseer":true,"taylorseer_order":1}'
+```
+
 ### Optional optimizations
 
 The following sections list only the **increment or replacement** relative to
