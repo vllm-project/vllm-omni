@@ -1119,10 +1119,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
         moe_key = int(getattr(desc, "moe_routing_key", MoERoutingKey.BLEND))
-        # BLEND is the default: pass the specialization kwarg only for real
-        # specialty graphs so subclasses whose ``_dummy_run`` does not accept it
-        # (e.g. GPUGenerationModelRunner) never see an unexpected keyword.
-        moe_kwargs = {"force_moe_routing_key": moe_key} if moe_key != int(MoERoutingKey.BLEND) else {}
+        # Only the MoE-specializing runner takes the capture key: pass it for
+        # every captured key — BLEND included, so the resolver cannot reclassify
+        # a uniform dummy buffer as ALL_UND/ALL_GEN — and keep it off subclasses
+        # whose ``_dummy_run`` lacks the keyword (e.g. GPUGenerationModelRunner).
+        moe_kwargs = {"force_moe_routing_key": moe_key} if self._moe_routing_specialize_enabled() else {}
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,

@@ -13,6 +13,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import MoERoutingKey
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
@@ -2311,3 +2312,35 @@ def test_decode_only_batch_hook_keeps_admission_and_resume_on_generic_path(monke
     else:
         assert model.calls == ["live-a", "live-b"]
         assert "inputs_embeds" not in model.batch_kwargs
+
+
+@pytest.mark.parametrize(
+    "key",
+    [MoERoutingKey.BLEND, MoERoutingKey.ALL_UND, MoERoutingKey.ALL_GEN],
+    ids=["blend", "all_und", "all_gen"],
+)
+def test_warmup_capture_forces_moe_routing_key_when_specializing(monkeypatch, key):
+    """#9911 follow-up P1: with MoE routing specialization enabled, the shared
+    ``_warmup_and_capture`` must forward ``force_moe_routing_key`` for every
+    captured key — BLEND included. Dropping BLEND lets ``_resolve_moe_routing_key``
+    reclassify a uniform dummy buffer as ALL_UND/ALL_GEN and store the BLEND
+    graph under the wrong cache key.
+    """
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
+    calls: list[tuple[int, dict]] = []
+
+    def _dummy_run(num_tokens, **kwargs):
+        calls.append((num_tokens, kwargs))
+        return torch.zeros(1), None
+
+    runner._dummy_run = _dummy_run
+    desc = SimpleNamespace(num_tokens=4, uniform=False, num_active_loras=0, moe_routing_key=int(key))
+
+    OmniGPUModelRunner._warmup_and_capture(runner, desc, CUDAGraphMode.FULL, num_warmups=1)
+
+    assert len(calls) == 2  # one warmup + one capture
+    for _, kwargs in calls:
+        assert kwargs["force_moe_routing_key"] == int(key)
+

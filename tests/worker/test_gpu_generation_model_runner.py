@@ -453,12 +453,13 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
 def test_generation_runner_warmup_capture_drops_moe_kwarg(monkeypatch, num_warmups):
     """#9911 P1: the shared ``_warmup_and_capture`` must not pass
     ``force_moe_routing_key`` to ``GPUGenerationModelRunner._dummy_run``, which
-    accepts neither that keyword nor ``**kwargs``. With specialization disabled
-    the replay key is BLEND, so the kwarg must be dropped instead of raising an
+    accepts neither that keyword nor ``**kwargs``. MoE routing specialization is
+    disabled on this runner, so the kwarg is dropped instead of raising an
     unexpected-keyword TypeError on a non-eager V1 generation stage.
     """
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     runner = object.__new__(GPUGenerationModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=False)
     calls: list[tuple[int, dict]] = []
     dummy_run_signature = inspect.signature(GPUGenerationModelRunner._dummy_run)
 
