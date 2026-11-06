@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.utils import (
     record_kv_cache_layout,
     resolve_kv_cache_layout,
 )
-from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -82,7 +82,9 @@ def runners(model_dir: str) -> Iterator[Callable[[str], Runner]]:
                 # cache. The lazy registration is skipped once any spec is registered,
                 # as a model module's own spec is when another test imports it.
                 register_all_kvcache_specs(config)
-                (kv_cache_config,) = get_kv_cache_configs(config, [specs], [KV_CACHE_BYTES])
+                (kv_cache_config,) = get_kv_cache_configs(
+                    config, [specs], [KV_CACHE_BYTES], get_global_kv_cache_groups(config, [specs])
+                )
                 model_runner.initialize_kv_cache(kv_cache_config)
             built[variant] = model_runner, config
         return built[variant]
