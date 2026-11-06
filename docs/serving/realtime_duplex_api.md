@@ -603,6 +603,10 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
+In `"basic"` and `"context"` mode the window is kept across a barge-in or a
+`response.cancel`: the next reply still sees the earlier units. With `"off"`,
+the next reply starts again from the system turn and the reference audio.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
