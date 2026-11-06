@@ -310,9 +310,7 @@ async def decode_image_url(image_url: str) -> Image.Image:
                 f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
             ) from exc
         except httpx.RequestError as exc:
-            raise InvalidInputReferenceError(
-                "Invalid image_reference.image_url: failed to download image."
-            ) from exc
+            raise InvalidInputReferenceError("Invalid image_reference.image_url: failed to download image.") from exc
         return _decode_image_bytes(image_bytes, source="image_reference.image_url")
 
     raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
@@ -375,9 +373,7 @@ async def decode_video_url(
                 source="video_reference.video_url",
             )
         except httpx.HTTPError as exc:
-            raise InvalidInputReferenceError(
-                "Invalid video_reference.video_url: failed to download video."
-            ) from exc
+            raise InvalidInputReferenceError("Invalid video_reference.video_url: failed to download video.") from exc
         path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         try:
             with open(path, "wb") as output:
@@ -425,9 +421,7 @@ async def decode_audio_url(audio_url: str) -> str:
                 source="audio_reference.audio_url",
             )
         except httpx.HTTPError as exc:
-            raise InvalidInputReferenceError(
-                "Invalid audio_reference.audio_url: failed to download audio."
-            ) from exc
+            raise InvalidInputReferenceError("Invalid audio_reference.audio_url: failed to download audio.") from exc
     else:
         raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
 
