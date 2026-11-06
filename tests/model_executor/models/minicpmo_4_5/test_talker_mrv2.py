@@ -526,6 +526,35 @@ def test_codec_penalty_window_includes_the_steps_earlier_drafts(device, output_c
     torch.testing.assert_close(state.apply(logits, ctx).cpu(), expected)
 
 
+@pytest.mark.parametrize("drafts", [0, 2])
+def test_codec_penalty_reads_draft_rows_only_when_a_request_has_them(mocker, drafts):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_tts as module
+
+    penalty = mocker.patch.object(module, "_apply_codec_window_penalty_gpu")
+    state = object.__new__(module._CodecWindowPenaltiesState)
+    state.window_size = 16
+    state.base = SimpleNamespace(apply=lambda logits, ctx: logits)
+    state.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=None), total_len=SimpleNamespace(gpu=None), prompt_len=SimpleNamespace(gpu=None)
+    )
+    state.repetition_penalty = SimpleNamespace(gpu=None)
+    state.use_window = np.ones(2, dtype=bool)
+    state.history_prefix = None
+    rows = 2 + drafts
+    ctx = SimpleNamespace(
+        idx_mapping_np=np.array([1, 0]),
+        expanded_idx_mapping=torch.tensor([1] * (drafts + 1) + [0]),
+        expanded_local_pos=torch.tensor([*range(drafts + 1), 0], dtype=torch.int32),
+        input_ids=torch.arange(rows),
+    )
+    state.apply(torch.zeros(rows, 8), ctx)
+    kwargs = penalty.call_args.kwargs
+    if drafts:
+        assert kwargs["draft_ids"] is ctx.input_ids and kwargs["local_pos"] is ctx.expanded_local_pos
+    else:
+        assert kwargs["draft_ids"] is None and kwargs["local_pos"] is None
+
+
 def test_draft_verification_forces_codec_eos_after_processing(mocker):
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 

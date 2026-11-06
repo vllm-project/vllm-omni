@@ -768,6 +768,8 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
         if np.any(self.use_window[ctx.idx_mapping_np]):
+            # One logits row per request means no draft rows: every window ends at total_len.
+            drafts = logits.shape[0] != len(ctx.idx_mapping_np)
             _apply_codec_window_penalty_gpu(
                 logits,
                 ctx.expanded_idx_mapping,
@@ -777,8 +779,8 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
                 self.repetition_penalty.gpu,
                 window_size=self.window_size,
                 history_prefix=self.history_prefix,
-                draft_ids=ctx.input_ids,
-                local_pos=ctx.expanded_local_pos,
+                draft_ids=ctx.input_ids if drafts else None,
+                local_pos=ctx.expanded_local_pos if drafts else None,
             )
         return self.base.apply(logits, ctx)
 
@@ -1822,18 +1824,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         last_rows = input_batch.logits_indices.long()
         num_rows = int(last_rows.shape[0])
         slot_ids = input_batch.expanded_idx_mapping[:num_rows].long()
-        local_pos = input_batch.expanded_local_pos[:num_rows].long()
         prompt_len = req_states.prompt_len.gpu.index_select(0, slot_ids).long()
         # Codes emitted up to and including this row's input (V1's ``state["step"]``).
         step = input_batch.positions.index_select(0, last_rows).long() + 1 - prompt_len
         last_ids = token_ids.index_select(0, last_rows)
         empty = empty_speech.index_select(0, slot_ids)
         decode = step > 0
-        # A request's codes end at its first EOS input, drafts included.
-        eos_seen = (decode & (last_ids == int(self._codec_eos_id))).long().cumsum(0)
-        first_row = torch.arange(num_rows, device=device) - local_pos
-        eos_before = torch.where(first_row > 0, eos_seen.index_select(0, (first_row - 1).clamp_min(0)), 0)
-        eos_input = eos_seen > eos_before
+        eos_input = decode & (last_ids == int(self._codec_eos_id))
+        if num_rows != num_reqs:
+            # A request's codes end at its first EOS input, drafts included.
+            eos_seen = eos_input.long().cumsum(0)
+            local_pos = input_batch.expanded_local_pos[:num_rows].long()
+            first_row = torch.arange(num_rows, device=device) - local_pos
+            eos_before = torch.where(first_row > 0, eos_seen.index_select(0, (first_row - 1).clamp_min(0)), 0)
+            eos_input = eos_seen > eos_before
         valid = decode & ~eos_input & ~empty
         # MiniCPMTTS.generate's max_new_token, clamped to the Talker context
         # (see ``preprocess``); the sample after the last allowed code is EOS.
