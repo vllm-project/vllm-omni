@@ -36,7 +36,7 @@ def test_spark_declares_cleanup_grace_only_on_its_codec(config_kind):
 
 @pytest.mark.parametrize("config_kind", ["structured", "legacy"])
 @pytest.mark.parametrize("shutdown_grace_s", [None, 0.0, 12.5])
-@pytest.mark.parametrize("launch", ["colocated", "coordinator", "headless"])
+@pytest.mark.parametrize("launch", ["colocated", "coordinator", "without_coordinator", "headless"])
 def test_pipeline_cleanup_grace_reaches_process_manager(mocker, config_kind, shutdown_grace_s, launch):
     pipeline = PipelineConfig(
         model_type="test_cleanup",
@@ -58,7 +58,8 @@ def test_pipeline_cleanup_grace_reaches_process_manager(mocker, config_kind, shu
         cache_config=CacheConfig(),
         needs_dp_coordinator=False,
     )
-    manager_factory = mocker.patch.object(stage_engine_core_proc_manager, "StageEngineCoreProcManager")
+    factory_name = "StageCleanupProcManager" if launch == "without_coordinator" else "StageEngineCoreProcManager"
+    manager_factory = mocker.patch.object(stage_engine_core_proc_manager, factory_name)
     mocker.patch.object(stage_engine_startup, "scoped_spawn_device_env", side_effect=lambda *a, **kw: nullcontext())
     mocker.patch.object(stage_engine_startup, "zmq_socket_ctx", side_effect=lambda *a, **kw: nullcontext())
     mocker.patch.object(stage_engine_startup, "wait_for_engine_startup_with_deadline")
@@ -90,7 +91,7 @@ def test_pipeline_cleanup_grace_reaches_process_manager(mocker, config_kind, shu
         )
     else:
         master = None
-        if launch == "coordinator":
+        if launch in ("coordinator", "without_coordinator"):
             master = mocker.Mock(spec=stage_engine_startup.OmniMasterServer)
             master.get_zmq_addresses.return_value = EngineZmqAddresses(
                 inputs=["ipc://unused-in"], outputs=["ipc://unused-out"]
@@ -102,7 +103,7 @@ def test_pipeline_cleanup_grace_reaches_process_manager(mocker, config_kind, shu
             stage_id=0,
             stage_config=stage,
             omni_master_server=master,
-            omni_coordinator_address="ipc://unused-coordinator",
+            omni_coordinator_address=None if launch == "without_coordinator" else "ipc://unused-coordinator",
         ):
             pass
     manager_factory.assert_called_once()

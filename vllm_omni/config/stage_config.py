@@ -350,6 +350,14 @@ def _scheduler_path(cls: type[VLLMScheduler] | None) -> str | None:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+def validate_shutdown_grace_s(value: float | None) -> float | None:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+    ):
+        raise ValueError("shutdown_grace_s must be finite and nonnegative, or None")
+    return value
+
+
 @dataclass(frozen=True)
 class StagePipelineConfig:
     """Fixed topology and lifecycle defaults for one stage (frozen)."""
@@ -442,6 +450,9 @@ class StagePipelineConfig:
     # scheduling. The scheduler only receives its typed effects.
     scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        validate_shutdown_grace_s(self.shutdown_grace_s)
 
 
 @dataclass(frozen=True)
