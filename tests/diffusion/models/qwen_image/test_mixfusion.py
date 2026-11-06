@@ -14,9 +14,9 @@ pins what is Qwen-specific:
   equal-area images differ in aspect ratio;
 * the real ``ImageRopePrepare`` boundary under the plan: per-request RoPE
   identical to individual execution, chunk-stacked;
-* the packed cross-attention through ``Attention.forward_streams``: one
-  ``forward_packed`` call over mixed requests that keeps the eager RoPE dtype
-  contract (#7494), and the mask-capable dense route matching it.
+* the packed cross-attention: the model checks for an armed MixFusion step,
+  constructs metadata with ``MIXFUSION_PLAN_KEY``, and the attention layer
+  dispatches to ``run_mixfusion_packed_attention``.
 """
 
 from __future__ import annotations
@@ -40,6 +40,10 @@ from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_ho
 from vllm_omni.diffusion.mixfusion.chunked import JOINT_TEXT_IMAGE_LAYOUT, ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.execution_plan import build_execution_plan
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    run_mixfusion_packed_attention,
+)
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
@@ -417,16 +421,15 @@ class _PackedAttentionStub:
         self.attn_backend = None if varlen else _MaskCapableBackend
         self.attn_spec = None
 
-    # The real joint entry: under the armed step it routes to the packed path.
-    forward_streams = Attention.forward_streams
-
-    def __call__(self, *args, **kwargs):
-        raise AssertionError("an armed step must not take the ordinary joint forward")
+    def __call__(self, query, key, value, attn_metadata):
+        # Mirror the metadata-keyed dispatch at the top of ``Attention.forward``.
+        assert attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None
+        return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
 
     def supports_multi_doc_packed_varlen(self, kv_cache_dtype=None):
         return self.varlen
 
-    def _forward_kernel(self, query, key, value, attn_metadata):
+    def forward(self, query, key, value, attn_metadata):
         self.dense_calls.append({"shape": tuple(query.shape), "mask": attn_metadata.attn_mask})
         return _doc_semantics(query, key, value, attn_metadata.attn_mask)
 

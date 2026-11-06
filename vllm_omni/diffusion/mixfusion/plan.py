@@ -25,9 +25,9 @@ Example (Qwen-Image)::
         "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
 
-The model's joint attention hands its named streams to
-``Attention.forward_streams``; nothing else in ``forward`` branches on
-MixFusion.
+Joint attention is the one place a model branches on MixFusion: under an armed
+step it passes the plan in ``AttentionMetadata.extra[MIXFUSION_PLAN_KEY]`` and
+``Attention.forward`` runs the packed path.
 """
 
 from __future__ import annotations

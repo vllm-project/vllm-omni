@@ -46,8 +46,8 @@ class StreamSpec:
 class AttentionLayout:
     """The model's attention streams, in per-request token order.
 
-    Exactly one stream is ``"chunked"``. The adapter stores the layout on the
-    plan; ``Attention.forward_streams`` receives the streams by name.
+    Exactly one stream is ``"chunked"``: it is the positional Q/K/V of the
+    packed attention call. The adapter stores the layout on the plan.
     """
 
     streams: tuple[StreamSpec, ...]

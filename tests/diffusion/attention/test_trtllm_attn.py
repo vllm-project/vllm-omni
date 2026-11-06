@@ -318,7 +318,7 @@ def test_forward_packed_serves_trtllm_with_the_row_layout(monkeypatch):
 
     layer = Attention.__new__(Attention)
     object.__setattr__(layer, "attn_backend", tg.TrtllmAttentionBackend)
-    object.__setattr__(layer, "_forward_kernel", _impl().forward_cuda)
+    object.__setattr__(layer, "forward", _impl().forward_cuda)
     object.__setattr__(layer, "_kv_cache_dtype", None)
     object.__setattr__(layer, "_disable_kv_quant", False)
     object.__setattr__(layer, "_kv_cache_skip_steps", None)

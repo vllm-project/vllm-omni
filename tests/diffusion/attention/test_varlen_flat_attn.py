@@ -122,10 +122,7 @@ class _DenseBackend:
 def _layer(backend, forward, kv_cache_dtype=None, disable_kv_quant=False):
     layer = Attention.__new__(Attention)
     object.__setattr__(layer, "attn_backend", backend)
-    # ``forward_packed`` and its fallbacks call the terminal kernel dispatch;
-    # the public ``forward`` must never be re-entered from a packed path.
-    object.__setattr__(layer, "_forward_kernel", forward)
-    object.__setattr__(layer, "forward", _forbidden_reentry)
+    object.__setattr__(layer, "forward", forward)
     # Quantization-policy attributes consulted by _effective_kv_cache_dtype.
     object.__setattr__(layer, "_kv_cache_dtype", kv_cache_dtype)
     object.__setattr__(layer, "_disable_kv_quant", disable_kv_quant)
@@ -133,10 +130,6 @@ def _layer(backend, forward, kv_cache_dtype=None, disable_kv_quant=False):
     object.__setattr__(layer, "_kv_cache_skip_layers", None)
     object.__setattr__(layer, "layer_idx", None)
     return layer
-
-
-def _forbidden_reentry(*args, **kwargs):
-    raise AssertionError("packed attention re-entered Attention.forward")
 
 
 def test_layer_capability_delegates_to_the_backend_class():
@@ -265,64 +258,70 @@ def test_disabled_quant_policy_keeps_the_varlen_path():
 
 
 # ---------------------------------------------------------------------------
-# Attention layer: forward_streams joint entry
+# Attention layer: MixFusion plan-key dispatch and its re-entry guard
 # ---------------------------------------------------------------------------
 
 
-def test_forward_streams_concatenates_in_order_and_splits_back(monkeypatch):
+def _plan_metadata():
+    from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY, MIXFUSION_STREAMS_KEY
+
+    return AttentionMetadata(extra={MIXFUSION_PLAN_KEY: object(), MIXFUSION_STREAMS_KEY: {}})
+
+
+def test_plan_key_routes_forward_to_the_packed_path(monkeypatch):
     import vllm_omni.diffusion.attention.layer as layer_module
 
-    calls: list = []
-    layer = Attention.__new__(Attention)
-    monkeypatch.setattr(Attention, "__call__", lambda self, q, k, v, md=None: calls.append((q, md)) or q * 2)
-    monkeypatch.setattr(layer_module, "_armed_mixfusion_plan", lambda: None)
-    gen = torch.Generator().manual_seed(0)
-    text = tuple(torch.randn(2, 3, HEADS, HEAD_DIM, generator=gen) for _ in range(3))
-    image = tuple(torch.randn(2, 5, HEADS, HEAD_DIM, generator=gen) for _ in range(3))
-    text_mask = torch.tensor([[True, True, False], [True, True, True]])
-
-    out = layer.forward_streams(
-        {"text": text, "image": image}, order=("text", "image"), masks={"text": text_mask, "image": None}
-    )
-
-    assert len(calls) == 1
-    joint_query, metadata = calls[0]
-    assert torch.equal(joint_query, torch.cat([text[0], image[0]], dim=1))
-    # A missing stream mask counts as all-valid in the joint key mask.
-    assert torch.equal(metadata.attn_mask, torch.cat([text_mask, torch.ones(2, 5, dtype=torch.bool)], dim=1))
-    assert torch.equal(out["text"], text[0] * 2)
-    assert torch.equal(out["image"], image[0] * 2)
-
-
-def test_forward_streams_without_masks_passes_no_metadata(monkeypatch):
-    import vllm_omni.diffusion.attention.layer as layer_module
-
-    calls: list = []
-    layer = Attention.__new__(Attention)
-    monkeypatch.setattr(Attention, "__call__", lambda self, q, k, v, md=None: calls.append(md) or q)
-    monkeypatch.setattr(layer_module, "_armed_mixfusion_plan", lambda: None)
-    qkv = tuple(torch.zeros(1, 2, HEADS, HEAD_DIM) for _ in range(3))
-
-    layer.forward_streams({"a": qkv, "b": qkv}, order=("a", "b"), masks={"a": None, "b": None})
-
-    assert calls == [None]
-
-
-def test_forward_streams_under_an_armed_step_runs_the_packed_path(monkeypatch):
-    import vllm_omni.diffusion.attention.layer as layer_module
-    import vllm_omni.diffusion.mixfusion.packed_attention as packed_module
-
-    plan = object()
     seen: list = []
     layer = Attention.__new__(Attention)
-    monkeypatch.setattr(Attention, "__call__", _forbidden_reentry)
-    monkeypatch.setattr(layer_module, "_armed_mixfusion_plan", lambda: plan)
+    metadata = _plan_metadata()
     monkeypatch.setattr(
-        packed_module,
+        layer_module,
         "run_mixfusion_packed_attention",
-        lambda attn, streams, active_plan: seen.append((attn, streams, active_plan)) or {"a": "packed"},
+        lambda attn, q, k, v, md: seen.append((attn, md)) or {"image": q},
     )
-    streams = {"a": (torch.zeros(1), torch.zeros(1), torch.zeros(1))}
+    query = torch.zeros(1, 2, HEADS, HEAD_DIM)
 
-    assert layer.forward_streams(streams, order=("a",)) == {"a": "packed"}
-    assert seen == [(layer, streams, plan)]
+    assert layer.forward(query, query, query, metadata) == {"image": query}
+    assert seen == [(layer, metadata)]
+    assert layer._mixfusion_packed_active is False
+
+
+def test_nested_plan_keyed_forward_raises_instead_of_recursing(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer_module
+
+    layer = Attention.__new__(Attention)
+    calls: list = []
+
+    def leaky_packed_path(attn, q, k, v, md):
+        # A fallback that wrongly forwards the plan-keyed metadata again.
+        calls.append(md)
+        return attn.forward(q, k, v, md)
+
+    monkeypatch.setattr(layer_module, "run_mixfusion_packed_attention", leaky_packed_path)
+    query = torch.zeros(1, 2, HEADS, HEAD_DIM)
+
+    with pytest.raises(RuntimeError, match="re-entered with MIXFUSION_PLAN_KEY"):
+        layer.forward(query, query, query, _plan_metadata())
+    assert len(calls) == 1
+    # The guard resets on the way out, so the next packed call still works.
+    assert layer._mixfusion_packed_active is False
+
+
+def test_fallback_forward_without_the_plan_key_is_allowed(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer_module
+
+    layer = Attention.__new__(Attention)
+    inner: list = []
+    monkeypatch.setattr(Attention, "_forward_impl", lambda self, q, k, v, md: inner.append(md) or q)
+    monkeypatch.setattr(Attention, "_uses_hsdp_compile_boundary", lambda self: False)
+    monkeypatch.setattr(
+        layer_module,
+        "run_mixfusion_packed_attention",
+        lambda attn, q, k, v, md: {"image": attn.forward(q, k, v, AttentionMetadata())},
+    )
+    query = torch.ones(1, 2, HEADS, HEAD_DIM)
+
+    out = layer.forward(query, query, query, _plan_metadata())
+
+    assert torch.equal(out["image"], query)
+    assert len(inner) == 1 and inner[0].extra == {}

@@ -29,7 +29,8 @@ from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
 
 #: Joint attention streams of a packed call, in per-request token order: the
 #: request-level text stream opens each request, the chunk-stacked image
-#: stream follows. Models name their ``forward_streams`` streams accordingly.
+#: stream follows. The model passes image Q/K/V positionally and text through
+#: ``extra[MIXFUSION_STREAMS_KEY]``, keyed ``"text"``.
 JOINT_TEXT_IMAGE_LAYOUT = AttentionLayout((StreamSpec("text", "request"), StreamSpec("image", "chunked")))
 
 

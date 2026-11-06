@@ -275,7 +275,7 @@ implements *how*.
 | Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Step dispatch, admission, chunk-policy aggregation, arming/restoring `MixFusionStep`, serial-ragged fallback grouped by geometry |
 | Hooks + plan types | `hooks/mixfusion.py`, `mixfusion/plan.py` | Applying `_mixfusion_plan` at module boundaries |
 | Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Building the `PackedExecutionPlan` from the root declaration, per-request RoPE through the model's own boundary module, chunk split/reassembly |
-| Joint attention | `Attention.forward_streams`, `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
+| Joint attention | `Attention.forward` (plan-key dispatch), `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
 | Startup wiring | `mixfusion/setup.py`, `mixfusion/request.py` | Config validation, mounting, request opt-in and batch-key relaxation |
 
 A model opts in with a declaration and two small hooks into existing code:
@@ -307,9 +307,10 @@ def mixfusion_can_pack(self, input_batch) -> tuple[bool, str]:
   request's call sees its own geometry, so positional tables match
   individual execution by construction. A model that already has an
   `_sp_plan` `split_output` boundary declares the same module here.
-- Joint attention calls `Attention.forward_streams` with `"text"` and
-  `"image"` streams; RoPE application must accept per-row tables (the
-  chunk-stacked layout has one table row per chunk).
+- Under an armed step, joint attention passes the image Q/K/V positionally
+  and the text stream in `extra[MIXFUSION_STREAMS_KEY]`, with the step's plan
+  in `extra[MIXFUSION_PLAN_KEY]`; RoPE application must accept per-row tables
+  (the chunk-stacked layout has one table row per chunk).
 - The pipeline declares `supports_mixfusion: ClassVar[bool] = True` and its
   keyword builder accepts a per-request latent list.
 
@@ -324,10 +325,10 @@ image rows (per-chunk) cannot share one table.
 
 Attention is the one layout-aware boundary and the framework owns it: the
 packed layout has image-batch = num-chunks versus text-batch = num-requests,
-so `Attention.forward_streams` reassembles the per-request logical domain from
-the armed step's plan. The packed path and its dense fallbacks call the
-terminal kernel dispatch (`_forward_kernel`), never the public `forward`, so
-they cannot re-enter a layout-rewriting entry.
+so `Attention.forward` reassembles the per-request logical domain when its
+metadata carries `MIXFUSION_PLAN_KEY`. The packed path and its dense fallbacks
+call `forward` again with fresh metadata that has no plan key. A nested
+plan-keyed call while a packed call is running raises instead of recursing.
 
 A layout the declarative plan cannot express (a different stream structure,
 e.g. single-stream blocks that concatenate text and image, or an LLM-style

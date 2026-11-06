@@ -43,7 +43,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     QK_NORM_ROPE_TABLE_KEY,
@@ -60,6 +63,10 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    MIXFUSION_STREAMS_KEY,
+)
 from vllm_omni.diffusion.mixfusion.plan import (
     ChunkedOutput,
     MixFusionChunkOutputs,
@@ -792,6 +799,16 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states_mask: torch.Tensor | None = None,
         qk_norm_rope_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The packed MixFusion plan travels on the forward context (the
+        # MixFusionDriver arms the step, the root hook fills it in) so this
+        # signature stays free of MixFusion threading. No context / no armed
+        # step (serial forwards, unit tests) means the packed branch below
+        # stays dormant.
+        mixfusion_plan = None
+        if is_forward_context_available():
+            step = get_forward_context().mixfusion_step
+            if step is not None:
+                mixfusion_plan = step.plan
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -859,17 +876,25 @@ class QwenImageCrossAttention(nn.Module):
                 self.rope,
                 self.eps,
             )
-            if not use_sp_joint_attention:
-                # Named streams let the attention layer own the joint layout:
-                # a plain text+image cat here, or, under an armed MixFusion
-                # step, per-request text with chunk-stacked image rows.
-                outputs = self.attn.forward_streams(
-                    {"text": (txt_query, txt_key, txt_value), "image": (img_query, img_key, img_value)},
-                    order=("text", "image"),
-                    masks={"text": encoder_hidden_states_mask, "image": hidden_states_mask},
+            if mixfusion_plan is not None:
+                # MixFusion chunked layout: image chunks stay stacked on the
+                # local batch dimension while text stays request-level, so
+                # the joint cat below cannot apply. The model declares its
+                # streams on the adapter; here the text stream rides the
+                # extra channel and image chunks stay positional, and the
+                # attention layer recovers each request to ``text + image``
+                # at its pre/post boundary (the all-to-all position).
+                attn_metadata = AttentionMetadata(
+                    extra={
+                        MIXFUSION_PLAN_KEY: mixfusion_plan,
+                        MIXFUSION_STREAMS_KEY: {"text": (txt_query, txt_key, txt_value)},
+                    },
                 )
-                txt_attn_output = self.to_add_out(outputs["text"].flatten(2, 3).to(txt_query.dtype))
-                img_attn_output = self.to_out(outputs["image"].flatten(2, 3).to(img_query.dtype))
+                packed_outputs = self.attn(img_query, img_key, img_value, attn_metadata)
+                img_attn_output = packed_outputs["image"].flatten(2, 3).to(img_query.dtype)
+                txt_attn_output = packed_outputs["text"].flatten(2, 3).to(txt_query.dtype)
+                img_attn_output = self.to_out(img_attn_output)
+                txt_attn_output = self.to_add_out(txt_attn_output)
                 return img_attn_output, txt_attn_output
             joint_query = torch.cat([txt_query, img_query], dim=1)
             joint_key = torch.cat([txt_key, img_key], dim=1)

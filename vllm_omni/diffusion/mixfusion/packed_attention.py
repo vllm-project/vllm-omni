@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Packed attention for MixFusion chunked layouts.
+"""Packed attention entry for MixFusion chunked layouts.
 
 Image chunks are stacked on a local batch dimension while text stays
-request-level, so the model cannot concatenate them before attention.
-:meth:`Attention.forward_streams` hands the named streams here when a step is
-armed: each request is gathered into its logical ``text + image`` order, one
-packed forward runs, and the output is scattered back to every stream's
-layout. The plan (carrying the model's ``AttentionLayout``) comes from the
-armed step, so models never read it.
+request-level, so the model cannot concatenate them before attention. This
+attention-layer boundary gathers each request into its logical ``text +
+image`` order, runs one packed forward, and scatters back to every stream
+layout.
+
+The per-step plan (carrying the model's ``AttentionLayout``) travels in
+``extra[MIXFUSION_PLAN_KEY]`` and ``"request"``-kind streams pass Q/K/V
+through ``extra[MIXFUSION_STREAMS_KEY]``. The positional
+``query``/``key``/``value`` belong to the single ``"chunked"`` stream. The
+output is a ``dict`` keyed by stream name.
 """
 
 from __future__ import annotations
@@ -18,6 +22,9 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
 from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
+
+MIXFUSION_PLAN_KEY = "mixfusion_plan"
+MIXFUSION_STREAMS_KEY = "mixfusion_streams"
 
 
 def _backend_supports_attention_mask(attn) -> bool:
@@ -133,11 +140,13 @@ def _packed_dense_with_text_mask(
                 target_offset += width
             positions.append(torch.tensor(real_positions, dtype=torch.long, device=group_query.device))
 
+        # Fresh metadata without the plan key: Attention.forward runs the
+        # ordinary kernel and its re-entry guard stays quiet.
         if mask is None:
-            group_out = attn._forward_kernel(group_query, group_key, group_value, AttentionMetadata())
+            group_out = attn.forward(group_query, group_key, group_value, AttentionMetadata())
         else:
             metadata = AttentionMetadata(attn_mask=mask, extra={"attention_mask_mode": "padding"})
-            group_out = attn._forward_kernel(group_query, group_key, group_value, metadata)
+            group_out = attn.forward(group_query, group_key, group_value, metadata)
         for group_row, req_idx in enumerate(indices):
             per_request[req_idx] = group_out[group_row].index_select(0, positions[group_row])
 
@@ -148,22 +157,24 @@ def _packed_dense_with_text_mask(
 
 def run_mixfusion_packed_attention(
     attn,
-    streams: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    plan: PackedExecutionPlan,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata,
 ) -> dict[str, torch.Tensor]:
-    """Run joint attention over the streams declared by the plan's layout.
+    """Run joint attention over the streams declared by the model's layout.
 
-    ``streams`` maps each stream name to its Q/K/V: the ``"chunked"`` stream
-    as ``[num_chunks, chunk_size, heads, head_dim]``, ``"request"`` streams
-    as ``[num_requests, padded_len, heads, head_dim]``. Each request is
-    recovered to its logical stream order before the kernel, so attention
-    matches independent dense execution. Returns outputs keyed by stream
-    name in each stream's input layout.
+    ``query``/``key``/``value`` hold the single ``"chunked"`` stream as
+    ``[num_chunks, chunk_size, heads, head_dim]``; other streams ride
+    ``attn_metadata.extra[MIXFUSION_STREAMS_KEY]`` as ``{name: (q, k, v)}``.
+    Each request is recovered to its logical stream order before the kernel,
+    so attention matches independent dense execution. Returns outputs keyed by
+    stream name in each stream's input layout.
     """
+    plan: PackedExecutionPlan = attn_metadata.extra[MIXFUSION_PLAN_KEY]
     layout = plan.layout
     chunked_name = next(spec.name for spec in layout.streams if spec.kind == "chunked")
-    all_streams = streams
-    query, key, _ = streams[chunked_name]
+    all_streams = {**attn_metadata.extra[MIXFUSION_STREAMS_KEY], chunked_name: (query, key, value)}
 
     num_query_heads = query.shape[2]
     num_kv_heads = key.shape[2]
