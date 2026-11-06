@@ -39,9 +39,14 @@ class _Params:
 class _StubRequest:
     """Request stub carrying the fields the scheduler and the queues read."""
 
-    def __init__(self, request_id: str, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        request_id: str,
+        seed: int | None = None,
+        status: RequestStatus = RequestStatus.WAITING,
+    ) -> None:
         self.request_id = request_id
-        self.status = RequestStatus.WAITING
+        self.status = status
         self.priority = 0
         self.arrival_time = 0.0
         self.sampling_params = _Params(seed)
@@ -50,7 +55,7 @@ class _StubRequest:
         return (self.priority, self.arrival_time) < (other.priority, other.arrival_time)
 
 
-def _make_scheduler(*, parked: int, waiting, reserved_slots: int = 0) -> OmniARScheduler:
+def _make_scheduler(*, parked: int, waiting, reserved_slots: int = 0, adapter_parked_running=()) -> OmniARScheduler:
     """Real scheduler wrapper with the surface ``schedule()`` reads."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.policy = SchedulingPolicy.FCFS
@@ -65,7 +70,12 @@ def _make_scheduler(*, parked: int, waiting, reserved_slots: int = 0) -> OmniARS
     scheduler.max_num_active_reqs = 8
     scheduler.max_num_running_reqs = 8
     scheduler.input_coordinator = None
-    scheduler.chunk_transfer_adapter = None
+    from types import SimpleNamespace
+
+    scheduler.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=list(adapter_parked_running),
+        _held_non_active=[],
+    )
     scheduler.use_v2_model_runner = reserved_slots > 0
     for name in (
         "_drop_aborted_queued_requests",
@@ -92,7 +102,7 @@ def _run_schedule(scheduler: OmniARScheduler, monkeypatch: pytest.MonkeyPatch) -
     def upstream_schedule(_self, _throttle_prefills: bool = False):
         seen["limit"] = scheduler.max_num_active_reqs
         num_running = len(scheduler.running) + scheduler.num_waiting_for_streaming_input
-        if num_running >= scheduler.max_num_active_reqs:
+        if num_running >= scheduler.max_num_active_reqs or not len(scheduler.waiting):
             seen["admitted"] = None
             return seen
         request = scheduler.waiting.pop_request()
@@ -176,6 +186,48 @@ def test_parked_sessions_at_capacity_keep_the_solo_step_blocked(monkeypatch) -> 
     assert seen["limit"] == 8
     assert seen["admitted"] is None
     assert scheduler.running == []
+
+
+def test_idle_seeded_session_does_not_block_unrelated_work(monkeypatch) -> None:
+    """A parked seeded session awaits client input; it must not hide the waiting queue."""
+    idle_seeded = _StubRequest("seeded-session", seed=42, status=RequestStatus.WAITING_FOR_STREAMING_REQ)
+    plain = _StubRequest("plain")
+    scheduler = _make_scheduler(parked=1, waiting=[plain])
+    scheduler.kv_holding_waiting.add_request(idle_seeded)
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # The idle session is not runnable, so the step is a normal admission and
+    # the unrelated request runs while the seeded client stays idle.
+    assert seen["admitted"] == "plain"
+    assert seen["limit"] == 8
+
+
+def test_seeded_request_parked_in_the_adapter_keeps_isolation(monkeypatch) -> None:
+    """A seeded running request parked for chunk processing still owns the step."""
+    seeded = _StubRequest("seeded", seed=42, status=RequestStatus.RUNNING)
+    plain = _StubRequest("plain")
+    scheduler = _make_scheduler(parked=0, waiting=[plain], adapter_parked_running=[seeded])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # Admission is deferred: the seeded request is restored at the end of the
+    # step, and admitting the plain request now would co-batch them.
+    assert seen["admitted"] is None
+    assert scheduler.running == []
+
+
+def test_resumed_seeded_session_waits_for_running_work(monkeypatch) -> None:
+    """Once the session resumes it is runnable again and waits for the engine to drain."""
+    running_plain = _StubRequest("plain", status=RequestStatus.RUNNING)
+    resumed_seeded = _StubRequest("seeded-session", seed=42)
+    scheduler = _make_scheduler(parked=0, waiting=[resumed_seeded])
+    scheduler.running.append(running_plain)
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    assert seen["admitted"] is None
+    assert [request.request_id for request in scheduler.running] == ["plain"]
 
 
 def test_unseeded_traffic_keeps_the_original_limit(monkeypatch) -> None:
