@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM-Omni Omni Perf Opt"
+  short_description: "Profile and optimize multi-stage omni model serving."
+  default_prompt: "Use $omni-perf-opt to baseline this vLLM-Omni omni deployment, attribute latency to a stage or connector, and propose prioritized, quality-gated optimizations."

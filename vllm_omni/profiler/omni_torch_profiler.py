@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Mapping
 from datetime import datetime
+from inspect import signature
 from typing import Any, Literal
 
 import torch
-from typing_extensions import override
 from vllm.config import ProfilerConfig
 from vllm.config.profiler import _is_uri_path
 from vllm.logger import init_logger
@@ -63,6 +64,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._table_path: str | None = None
 
         self._activities = activities
+        self._profiler_kwargs: dict[str, Any] = {}
         self._session_dir: str | None = None
         self._artifact_paths: dict[str, str | None] = {}
         self._memory_history_enabled = False
@@ -98,14 +100,45 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         Override in subclasses for platform-specific profiler creation.
         """
-        return torch.profiler.profile(
-            activities=[TorchProfilerActivityMap[a] for a in activities],
-            record_shapes=profiler_config.torch_profiler_record_shapes,
-            profile_memory=profiler_config.torch_profiler_with_memory,
-            with_stack=profiler_config.torch_profiler_with_stack,
-            with_flops=profiler_config.torch_profiler_with_flops,
-            on_trace_ready=self._on_trace_ready,
-        )
+        kwargs = {
+            "activities": [TorchProfilerActivityMap[a] for a in activities],
+            "record_shapes": profiler_config.torch_profiler_record_shapes,
+            "profile_memory": profiler_config.torch_profiler_with_memory,
+            "with_stack": profiler_config.torch_profiler_with_stack,
+            "with_flops": profiler_config.torch_profiler_with_flops,
+            "on_trace_ready": self._on_trace_ready,
+        }
+        kwargs.update(self._profiler_kwargs)
+        try:
+            signature(torch.profiler.profile).bind(**kwargs)
+        except TypeError as exc:
+            raise TypeError(f"Invalid profiler_kwargs: {exc}") from exc
+        return torch.profiler.profile(**kwargs)
+
+    def set_profiler_kwargs(self, profiler_kwargs: dict | None) -> None:
+        """Apply constructor overrides to the next inactive profiling session."""
+        if profiler_kwargs is not None and not isinstance(profiler_kwargs, Mapping):
+            raise TypeError("profiler_kwargs must be a mapping or None")
+        kwargs = dict(profiler_kwargs or {})
+        if self._active:
+            if kwargs:
+                logger.warning("Ignoring profiler_kwargs because profiling is active")
+            return
+        # Mutable or opaque options may have changed in place since construction.
+        if (
+            all(value is None or type(value) in (bool, int, float, str, bytes) for value in kwargs.values())
+            and kwargs == self._profiler_kwargs
+            and not kwargs.get("acc_events", False)
+        ):
+            return
+        previous_kwargs = self._profiler_kwargs
+        self._profiler_kwargs = kwargs
+        try:
+            profiler = self._create_profiler(self.profiler_config, self._activities)
+        except Exception:
+            self._profiler_kwargs = previous_kwargs
+            raise
+        self.profiler = profiler
 
     def set_trace_filename(self, filename: str) -> None:
         """Set the trace filename before starting profiling.
@@ -383,13 +416,11 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._artifact_paths[name] = path
         return path
 
-    @override
     def _start(self) -> None:
         self._ensure_session_dir()
         self._try_enable_memory_history()
         self.profiler.start()
 
-    @override
     def _stop(self) -> None:
         """Stop profiler, export trace via on_trace_ready, and dump table."""
         self.profiler.stop()
@@ -488,7 +519,6 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         if self.dump_cpu_time_total and rank == 0:
             logger.info(self.profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=50))
 
-    @override
     def annotate_context_manager(self, name: str):
         return torch.profiler.record_function(name)
 

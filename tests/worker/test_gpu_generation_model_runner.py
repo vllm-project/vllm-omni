@@ -246,6 +246,7 @@ def test_terminal_requests_clear_soprano_failures_before_idle_return(monkeypatch
     scheduler._kv_fetch_stages = None
     scheduler.connector = scheduler.ec_connector = scheduler.aux_output_connector = None
     scheduler.encoder_cache_manager = Mock(spec=["free"])
+    scheduler._pending_encoder_input_ids = {}
     scheduler.kv_cache_manager = Mock(spec=["free"])
     scheduler.defer_block_free = False
     scheduler.finished_req_ids = set()
