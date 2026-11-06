@@ -1034,9 +1034,30 @@ class MiniMaxH3DiTModel(nn.Module):
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith(".attn.qkv_proj.weight"):
-                # Transform checkpoint layout before entering vLLM's loader so
-                # online FP8 can keep ``online_process_loader`` outermost.
+            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
+                # The native checkpoint groups Q/K/V per head for both the
+                # weight and its scale. Transform both before entering vLLM's
+                # loader so each scale stays aligned with its weight rows.
+                if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
+                    weight_loader(param, loaded_weight)
+                else:
+                    loaded_weight = _reorder_grouped_qkv_to_qkv(
+                        loaded_weight,
+                        num_query_groups=self.arch.num_attention_heads,
+                        heads_per_group=1,
+                        head_dim=self.arch.attention_head_dim,
+                    )
+                    weight_loader(param, loaded_weight)
+            elif name.endswith(
+                (
+                    ".attn.qkv_proj.qweight",
+                    ".attn.qkv_proj.proj_up",
+                    ".attn.qkv_proj.wcscales",
+                )
+            ):
+                # Serialized quantization checkpoints keep the same grouped
+                # Q/K/V row order as the BF16 checkpoint. Reorder every tensor
+                # with an output dimension before the QKV loader shards it.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
                     loaded_weight,
                     num_query_groups=self.arch.num_attention_heads,
@@ -1044,16 +1065,29 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 )
                 weight_loader(param, loaded_weight)
+            elif name.endswith(".attn.qkv_proj.wscales"):
+                # E8M0 scales are stored [K // block, N], so reorder their N
+                # axis through the same grouped-QKV permutation.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight.T,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                ).T.contiguous()
+                weight_loader(param, loaded_weight)
             elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
-                if loaded_weight.shape[0] % 2:
-                    raise ValueError(
-                        "MiniMax H3 fc1 checkpoint rows must split evenly into "
-                        f"gate/up matrices, got {tuple(loaded_weight.shape)}"
-                    )
-                first, second = loaded_weight.chunk(2, dim=0)
-                gate, up = (second, first) if layout == "swap_halves" else (first, second)
-                weight_loader(param, gate, 0)
-                weight_loader(param, up, 1)
+                if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
+                    weight_loader(param, loaded_weight)
+                else:
+                    if loaded_weight.shape[0] % 2:
+                        raise ValueError(
+                            "MiniMax H3 fc1 checkpoint rows must split evenly into "
+                            f"gate/up matrices, got {tuple(loaded_weight.shape)}"
+                        )
+                    first, second = loaded_weight.chunk(2, dim=0)
+                    gate, up = (second, first) if layout == "swap_halves" else (first, second)
+                    weight_loader(param, gate, 0)
+                    weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
             loaded.add(name)
