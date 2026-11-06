@@ -65,6 +65,43 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             use_parallel_embedding=False,
             prefix="model",
         )
+        self._kv_buf: torch.Tensor | None = None
+        self._kv_steps: dict[tuple[torch.device, int], list[tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    def _ensure_kv_state(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        bsz: int,
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]:
+        cfg = self.config
+        rvq = int(cfg.rvq)
+        head_dim = int(getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads)
+        if (
+            self._kv_buf is None
+            or self._kv_buf.device != device
+            or self._kv_buf.dtype != dtype
+            or self._kv_buf.shape[2] < bsz
+        ):
+            self._kv_buf = torch.zeros(
+                (int(cfg.num_hidden_layers), 2, bsz, int(cfg.num_key_value_heads), rvq + 1, head_dim),
+                dtype=dtype,
+                device=device,
+            )
+        kv_views = [(self._kv_buf[i, 0, :bsz], self._kv_buf[i, 1, :bsz]) for i in range(self._kv_buf.shape[0])]
+        step_key = (device, rvq + 1)
+        steps = self._kv_steps.get(step_key)
+        if steps is None:
+            keys = torch.arange(rvq + 1, device=device)
+            steps = [
+                (
+                    torch.tensor([step], device=device, dtype=torch.long),
+                    (keys[None, :] <= step).view(1, 1, 1, rvq + 1),
+                )
+                for step in range(rvq)
+            ]
+            self._kv_steps[step_key] = steps
+        return kv_views, steps
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Delegate ``model.*`` tensors to ``CodePredictorBaseModel.load_weights``.
@@ -109,6 +146,32 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         hidden_size = self.config.hidden_size
 
         codec_embeds = self.model.codec_embedding
+        codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
+        use_kv_cache = hasattr(self.model, "forward_cached") and backbone_last_hidden.dtype != torch.float16
+
+        if use_kv_cache:
+            kv_views, kv_steps = self._ensure_kv_state(device, backbone_last_hidden.dtype, B)
+            cur_embed = backbone_last_hidden.unsqueeze(1)
+            for step in range(rvq):
+                write_pos, key_mask = kv_steps[step]
+                pos_ids = write_pos.unsqueeze(0).expand(B, 1)
+                hidden = self.model.forward_cached(cur_embed, pos_ids, kv_views, write_pos, key_mask)
+                logits = lm_heads[step](hidden[:, 0, :]).float()
+
+                if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
+                    hist = history_per_codebook[step]
+                    if hist:
+                        hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
+                        sel = logits.index_select(-1, hist_t)
+                        pos = sel > 0
+                        sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
+                        logits.index_copy_(-1, hist_t, sel)
+
+                codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
+
+                if step + 1 < rvq:
+                    cur_embed = codec_embeds[step](codes[:, step].view(B, 1))
+            return codes
 
         # Re-prefill buffer: position 0 = backbone hidden, position s = embed of
         # code_{s-1}. At step s we forward positions [0..s] and read the last.
@@ -116,8 +179,6 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         embeds[:, 0, :] = backbone_last_hidden.to(embeds.dtype)
 
         pos_ids_full = torch.arange(rvq, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
-
-        codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
 
         for step in range(rvq):
             seq_len = step + 1
