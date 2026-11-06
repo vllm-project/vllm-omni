@@ -312,10 +312,20 @@ def _rejects(pending: _PendingTurn | None, output: Any) -> bool:
 def judge_rejects(output: Any, streaming_context: Any) -> bool:
     """True only when the judge clearly said this turn needs no reply.
 
-    Called by the engine with the output's request-owned streaming state.
+    The plugin and forwarding bridge share the request-owned cached decision.
     """
     request_id = getattr(output, "request_id", None)
-    return _rejects(_owned_turn(request_id, streaming_context) if isinstance(request_id, str) else None, output)
+    pending = _owned_turn(request_id, streaming_context) if isinstance(request_id, str) else None
+    return _cached_rejects(pending, output)
+
+
+def _cached_rejects(pending: _PendingTurn | None, output: Any) -> bool:
+    if pending is None:
+        return False
+    if pending.decided_for is not output:
+        pending.rejected = _rejects(pending, output)
+        pending.decided_for = output
+    return pending.rejected
 
 
 def judge_input(
@@ -380,10 +390,7 @@ def after_judge(bridge: Callable[..., list[Any]]) -> Callable[..., list[Any]]:
             pending = _owned_turn(request_id, streaming_context)
             if pending is None:
                 raise RuntimeError(f"response judge has no ASR output for request {request_id}")
-            if pending.decided_for is not judge_output:
-                pending.rejected = _rejects(pending, judge_output)
-                pending.decided_for = judge_output
-            if pending.rejected:
+            if _cached_rejects(pending, judge_output):
                 continue
             asr_outputs.append(pending.source_output)
             asr_decoder = asr_decoder or pending.source_token_decoder

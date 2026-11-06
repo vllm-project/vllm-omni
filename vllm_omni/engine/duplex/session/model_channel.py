@@ -662,14 +662,14 @@ class ModelChannel:
     # ------------------------------------------------------------------ #
 
     def decide_output(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+        self,
+        stage_id: int,
+        output: RequestOutput,
+        context: DuplexOutputContext,
+        *,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         """Pure plugin decision (no session mutation: this runs inline on the orchestrator loop)."""
-        if context.response_judge_rejected:
-            decision = self._ctx.plugin.response_judge_decision()
-            if not isinstance(decision, DuplexOutputDecision):
-                raise TypeError("duplex plugin response_judge_decision() must return DuplexOutputDecision")
-            return decision
         decision = self._ctx.plugin.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,
@@ -677,6 +677,7 @@ class ModelChannel:
             segment_token_ids=context.segment_token_ids,
             segment_output_metadata=dict(context.segment_output_metadata),
             output=output,
+            streaming_context=streaming_context,
         )
         if decision is not None and not isinstance(decision, DuplexOutputDecision):
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
@@ -691,17 +692,20 @@ class ModelChannel:
         )
 
     def release_concurrent_turn_requests(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+        self,
+        stage_id: int,
+        output: RequestOutput,
+        context: DuplexOutputContext,
+        *,
+        streaming_context: object | None = None,
     ) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
-        if context.response_judge_rejected:
-            # A rejected turn never reaches the main model or TTS.
-            return True
         return self._ctx.plugin.release_concurrent_turn_requests(
             stage_id=stage_id,
             segment_finished=context.segment_finished,
             output=output,
             context=context,
+            streaming_context=streaming_context,
         )
 
     def stage_metrics_snapshot(

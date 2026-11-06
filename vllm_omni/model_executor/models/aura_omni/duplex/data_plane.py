@@ -193,6 +193,11 @@ class AuraDataPlaneSession(DuplexDataPlane):
         self._requests: dict[str, _RequestState] = {}
         self._closed: set[str] = set()
 
+    def configure_stages(self, stages: AuraStageLayout) -> None:
+        if self._requests or self._closed:
+            raise RuntimeError("AURA stage layout must be configured before serving requests")
+        self._stages = stages
+
     def begin_request(self, request_id: str) -> None:
         self._closed.discard(request_id)
         state = self._requests.setdefault(request_id, _RequestState())

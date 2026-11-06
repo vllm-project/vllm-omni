@@ -19,7 +19,6 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
-from vllm_omni.model_executor.stage_input_processors.response_judge import RESPONSE_JUDGE_STAGE
 
 _AURA_PROC = "vllm_omni.model_executor.stage_input_processors.aura_omni"
 _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
@@ -102,12 +101,12 @@ AURA_OMNI_JUDGED_PIPELINE = PipelineConfig(
     model_type="aura_omni_judged",
     default_deploy_config_name="aura_omni_judged.yaml",
     model_arch="Qwen3ASRForConditionalGeneration",
-    duplex_plugin="vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraJudgedDuplexPlugin",
+    duplex_plugin="vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
     stages=(
         _ASR,
         StagePipelineConfig(
             stage_id=1,
-            model_stage=RESPONSE_JUDGE_STAGE,
+            model_stage="response_judge",
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
             owns_tokenizer=True,

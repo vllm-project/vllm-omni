@@ -7,18 +7,25 @@ from __future__ import annotations
 
 import importlib
 import weakref
+from dataclasses import replace
+from io import BytesIO
 from types import SimpleNamespace
 
+import pybase64
 import pytest
+from PIL import Image
 
 from tests.engine.test_duplex_orchestrator import (
     SESSION_ID,
+    _append_audio,
     _build,
     _close,
     _encode_audio,
     _open,
+    _open_message,
     _settle,
     _submit,
+    _tts_output,
 )
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
@@ -28,12 +35,16 @@ from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.contracts import DuplexOutputAction, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
 from vllm_omni.model_executor.models.aura_omni.duplex.plugin import (
     AURA_SILENT_TOKEN_ID,
     AuraDuplexPlugin,
-    AuraJudgedDuplexPlugin,
 )
-from vllm_omni.model_executor.models.aura_omni.duplex.stages import AURA_JUDGED_STAGE_LAYOUT, AURA_STAGE_LAYOUT
+from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
+    AURA_JUDGED_STAGE_LAYOUT,
+    AURA_STAGE_LAYOUT,
+    AuraStageLayout,
+)
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_JUDGED_PIPELINE, AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.stage_input_processors import response_judge as rj
@@ -49,18 +60,24 @@ def _resolve(path: str):
     return getattr(importlib.import_module(module_name), name)
 
 
+def _judged_plugin():
+    plugin = AuraDuplexPlugin(_encode_audio)
+    plugin.configure_pipeline(AURA_OMNI_JUDGED_PIPELINE)
+    return plugin
+
+
 def _judged_orchestrator(**kwargs):
-    orchestrator, clients, rpc_q, output_q = _build(stages=5, plugin=AuraJudgedDuplexPlugin(_encode_audio))
-    orchestrator.stage_pools[_JUDGE].stage_vllm_config.model_config.model_stage = rj.RESPONSE_JUDGE_STAGE
+    plugin = _judged_plugin()
+    orchestrator, clients, rpc_q, output_q = _build(stages=5, plugin=plugin)
     return orchestrator, clients, rpc_q, output_q
 
 
-async def _pending_judge(orchestrator):
+async def _pending_judge(orchestrator, transcript="嗯嗯"):
     request_id = next(iter(orchestrator.request_states))
     assert duplex_resource_request_belongs_to_session(request_id, SESSION_ID)
     state = orchestrator.request_states[request_id]
-    asr = SimpleNamespace(request_id=request_id, outputs=[SimpleNamespace(text="嗯嗯")])
-    rj._owned(state.streaming)[request_id] = rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), "嗯嗯", asr)
+    asr = SimpleNamespace(request_id=request_id, outputs=[SimpleNamespace(text=transcript)])
+    rj._owned(state.streaming)[request_id] = rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), transcript, asr)
     request = SimpleNamespace(request_id=request_id, prompt_token_ids=[1], resumable=False)
     replica_id = await orchestrator.stage_pools[_JUDGE].submit_initial(request_id, state, request)
     orchestrator._on_stage_submitted(_JUDGE, request_id, replica_id, state)
@@ -95,6 +112,8 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
         session.bind_request(request_id)
         session.bind_response_turn(session.turn_id)
         response_id = session.begin_response(turn_id=session.turn_id)
+        runner = orchestrator.session_manager.runners[SESSION_ID]
+        runner.emit(runner.model.response_created_payload(response_id, epoch=session.epoch))
         consumed = await orchestrator._intercept_stage_output(
             _JUDGE, 0, _judge_output(request_id, "NO"), orchestrator.request_states[request_id], None, None
         )
@@ -114,6 +133,85 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
         done = [event for event in events if event.type == "response.done"]
         assert [event.response_id for event in done] == [response_id]
         assert session.active_response_id is None
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_judge_rejection_allows_the_next_question_in_the_same_session(monkeypatch):
+    orchestrator, clients, rpc_q, _ = _judged_orchestrator()
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+
+    def process_inputs(**kwargs):
+        return build_engine_core_request_from_tokens(
+            request_id=kwargs["request_id"],
+            prompt={"prompt_token_ids": [1, 2]},
+            params=kwargs["params"],
+            model_config=orchestrator.stage_pools[0].stage_vllm_config.model_config,
+            resumable=kwargs["resumable"],
+        )
+
+    # Model outputs and tokenization are faked; commits, judge interception
+    # and session output projection use the same paths for both turns.
+    monkeypatch.setattr(
+        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
+    )
+    message = _open_message(output_buffer=output_buffer)
+    message.session_config.modalities = ["text", "audio"]
+    frame = BytesIO()
+    Image.new("RGB", (8, 8)).save(frame, format="PNG")
+    append = replace(_append_audio(), video_frames=(pybase64.b64encode(frame.getvalue()).decode("ascii"),))
+    try:
+        await orchestrator._dispatch_message(message)
+        assert (await rpc_q.get()).ok
+        session = orchestrator.session_manager.get(SESSION_ID)
+        request_ids = []
+        for transcript, decision in [("嗯嗯", "NO"), ("上海明天天气怎么样？", "YES")]:
+            await _submit(orchestrator, append)
+            await _submit(orchestrator, commands.Commit(final=True, create_response=True))
+            request_id = await _pending_judge(orchestrator, transcript)
+            request_ids.append(request_id)
+            state = orchestrator.request_states[request_id]
+            consumed = await orchestrator._intercept_stage_output(
+                _JUDGE, 0, _judge_output(request_id, decision), state, None, None
+            )
+            await _settle(orchestrator)
+            if decision == "NO":
+                assert consumed
+                assert request_id not in orchestrator.request_states
+                assert all(not client.add_request_calls for client in clients[2:])
+                events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+                listen = next(event for event in events if event.type == "response.listen").to_realtime()
+                assert listen["response"]["metadata"]["vllm_omni"]["listen_source"] == "response_judge"
+                assert not any(
+                    event.type in {"response.output_audio_transcript.delta", "response.output_audio.delta", "error"}
+                    for event in events
+                ), [event.to_realtime() for event in events if event.type == "error"]
+                assert session.active_response_id is None
+                continue
+
+            assert not consumed
+            assert request_ids[0] != request_id
+            answer = _judge_output(request_id, "上海明天多云。")
+            answer.finished = False
+            assert not await orchestrator._intercept_stage_output(
+                AURA_JUDGED_STAGE_LAYOUT.aura, 0, answer, state, None, None
+            )
+            await _settle(orchestrator)
+            audio = _tts_output(request_id, text="上海明天多云。")
+            audio.finished = True
+            await orchestrator._intercept_stage_output(AURA_JUDGED_STAGE_LAYOUT.code2wav, 0, audio, state, None, None)
+            await _settle(orchestrator)
+            events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+            types = [event.type for event in events]
+            assert "response.listen" not in types and "error" not in types
+            assert any(
+                event.type == "response.output_audio_transcript.delta" and event.delta == "上海明天多云。"
+                for event in events
+            )
+            assert any(event.type == "response.output_audio.delta" and event.delta for event in events)
+            assert "response.done" in types
+            assert session.active_response_id is None
     finally:
         await orchestrator.session_manager.shutdown()
 
@@ -175,12 +273,17 @@ async def test_judge_yes_is_not_consumed_by_the_session():
 
 @pytest.mark.asyncio
 async def test_no_from_a_stage_that_is_not_a_judge_is_ignored():
-    orchestrator, clients, rpc_q, _ = _build(stages=5, plugin=AuraJudgedDuplexPlugin(_encode_audio))
+    orchestrator, clients, rpc_q, _ = _judged_orchestrator()
     try:
         assert (await _open(orchestrator, rpc_q)).ok
         request_id = await _pending_judge(orchestrator)
         consumed = await orchestrator._intercept_stage_output(
-            _JUDGE, 0, _judge_output(request_id, "NO"), orchestrator.request_states[request_id], None, None
+            AURA_JUDGED_STAGE_LAYOUT.asr,
+            0,
+            _judge_output(request_id, "NO"),
+            orchestrator.request_states[request_id],
+            None,
+            None,
         )
         assert not consumed
     finally:
@@ -211,7 +314,19 @@ async def test_native_terminal_paths_release_the_pending_turn(terminal):
 
 
 def test_default_plugin_decision_for_a_rejected_turn_is_a_model_listen():
-    decision = AuraJudgedDuplexPlugin(_encode_audio).response_judge_decision()
+    owner = SimpleNamespace(bridge_states={})
+    output = _judge_output("r1", "NO")
+    rj._owned(owner)["r1"] = rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), "嗯嗯", output)
+    decision = _judged_plugin().decide_output(
+        stage_id=_JUDGE,
+        final_stage_id=AURA_JUDGED_STAGE_LAYOUT.code2wav,
+        segment_finished=True,
+        segment_token_ids=(),
+        segment_output_metadata={},
+        output=output,
+        streaming_context=owner,
+    )
+    assert decision is not None
     assert decision.action == DuplexOutputAction.DIRECT_RESPONSE
     assert decision.metadata["model_listen"] is True
     assert decision.metadata["listen_source"] == "response_judge"
@@ -225,7 +340,7 @@ def test_default_aura_keeps_its_stage_ids():
 
 
 def test_judged_aura_shifts_the_stages_after_the_judge():
-    plugin = AuraJudgedDuplexPlugin(_encode_audio)
+    plugin = _judged_plugin()
     assert plugin.draining_stage_ids(stage_count=5) == frozenset({3, 4})
     assert plugin.project_intermediate_output(stage_id=2, output=None, context=None) is True
     assert plugin.project_intermediate_output(stage_id=1, output=None, context=None) is False
@@ -321,7 +436,120 @@ def test_partial_sentence_planning_passes_the_aura_stage_id(monkeypatch):
         _stage_receives_async_chunks=lambda stage_id: False,
     )
     req_state = SimpleNamespace(session_owned=True, final_stage_id=4, streaming=SimpleNamespace(bridge_states={}))
-    plugin = AuraJudgedDuplexPlugin(_encode_audio)
+    plugin = _judged_plugin()
     output = SimpleNamespace(finished=False, outputs=[SimpleNamespace(text="")])
     plugin.plan_partial_stage_output(orchestrator, AURA_JUDGED_STAGE_LAYOUT.aura, 0, output, req_state)
     assert seen == [AURA_JUDGED_STAGE_LAYOUT.aura]
+
+
+@pytest.mark.parametrize("pipeline", [AURA_OMNI_PIPELINE, AURA_OMNI_JUDGED_PIPELINE])
+def test_layout_uses_configured_roles_independent_of_tuple_order(pipeline):
+    reordered = replace(pipeline, stages=tuple(reversed(pipeline.stages)))
+    assert AuraStageLayout.from_pipeline(reordered) == AuraStageLayout.from_pipeline(pipeline)
+
+
+@pytest.mark.parametrize("role", ["asr", "aura", "qwen3_tts", "code2wav"])
+def test_layout_rejects_missing_roles(role):
+    pipeline = replace(
+        AURA_OMNI_PIPELINE,
+        stages=tuple(
+            replace(s, model_stage="other") if s.model_stage == role else s for s in AURA_OMNI_PIPELINE.stages
+        ),
+    )
+    with pytest.raises(ValueError, match="missing required roles"):
+        AuraStageLayout.from_pipeline(pipeline)
+
+
+@pytest.mark.parametrize("role", ["asr", "aura", "qwen3_tts", "code2wav", "response_judge"])
+def test_layout_rejects_duplicate_roles(role):
+    duplicate = replace(next(s for s in AURA_OMNI_JUDGED_PIPELINE.stages if s.model_stage == role), stage_id=5)
+    pipeline = replace(AURA_OMNI_JUDGED_PIPELINE, stages=(*AURA_OMNI_JUDGED_PIPELINE.stages, duplicate))
+    with pytest.raises(ValueError, match="duplicate role"):
+        AuraStageLayout.from_pipeline(pipeline)
+
+
+def test_layout_rejects_duplicate_stage_ids():
+    stages = AURA_OMNI_PIPELINE.stages
+    pipeline = SimpleNamespace(stages=(*stages[:-1], replace(stages[-1], stage_id=0)))
+    with pytest.raises(ValueError, match="duplicate stage id"):
+        AuraStageLayout.from_pipeline(pipeline)
+
+
+def test_configure_pipeline_binds_plugin_and_data_plane_roles():
+    plugin = AuraDuplexPlugin(_encode_audio)
+    pipeline = replace(
+        AURA_OMNI_JUDGED_PIPELINE,
+        stages=tuple(
+            replace(s, stage_id=s.stage_id + 2, input_sources=tuple(i + 2 for i in s.input_sources))
+            for s in AURA_OMNI_JUDGED_PIPELINE.stages
+        ),
+    )
+    plugin.configure_pipeline(pipeline)
+    assert plugin.stages == AuraStageLayout(asr=2, judge=3, aura=4, talker=5, code2wav=6)
+    assert plugin.data_plane._stages is plugin.stages
+    assert plugin.input_stage_id({}) == 2
+    assert plugin.draining_stage_ids(stage_count=7) == frozenset({5, 6})
+    assert plugin.project_intermediate_output(stage_id=4, output=None, context=None)
+
+
+def test_nonjudge_configuration_has_no_judge_policy():
+    plugin = _judged_plugin()
+    plugin.configure_pipeline(AURA_OMNI_PIPELINE)
+    assert plugin.stages.judge is None
+    assert (
+        plugin.decide_output(
+            stage_id=0,
+            final_stage_id=3,
+            segment_finished=True,
+            segment_token_ids=(),
+            segment_output_metadata={},
+            output=_judge_output("r1", "NO"),
+        )
+        is None
+    )
+
+
+def test_layout_cannot_change_after_admission():
+    plugin = AuraDuplexPlugin(_encode_audio)
+    plugin.data_plane.begin_request("r1")
+    with pytest.raises(RuntimeError, match="before serving requests"):
+        plugin.configure_pipeline(AURA_OMNI_JUDGED_PIPELINE)
+    assert plugin.stages is AURA_STAGE_LAYOUT
+    assert plugin.data_plane._stages is AURA_STAGE_LAYOUT
+
+
+@pytest.mark.parametrize("answer", ["NO", "YES"])
+def test_judge_releases_only_rejected_concurrent_turns(monkeypatch, answer):
+    plugin = _judged_plugin()
+    owner = SimpleNamespace(bridge_states={})
+    output = _judge_output("r1", answer)
+    source = _judge_output("r1", "hello")
+    rj._owned(owner)["r1"] = rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), "hello", source)
+    calls = []
+    original = rj._rejects
+
+    def decide(pending, candidate):
+        calls.append(candidate)
+        return original(pending, candidate)
+
+    monkeypatch.setattr(rj, "_rejects", decide)
+    decision = plugin.decide_output(
+        stage_id=_JUDGE,
+        final_stage_id=plugin.stages.code2wav,
+        segment_finished=True,
+        segment_token_ids=(),
+        segment_output_metadata={},
+        output=output,
+        streaming_context=owner,
+    )
+    assert (decision is not None) == (answer == "NO")
+    assert plugin.release_concurrent_turn_requests(
+        stage_id=_JUDGE,
+        segment_finished=True,
+        output=output,
+        context=None,
+        streaming_context=owner,
+    ) == (answer == "NO")
+    bridge = rj.after_judge(lambda outputs, prompt=None, requires_multimodal_data=False: outputs)
+    assert bridge([output], None, False, owner) == ([] if answer == "NO" else [source])
+    assert calls == [output]

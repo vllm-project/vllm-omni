@@ -505,3 +505,26 @@ def test_yaml_boolean_option_keys_explain_quoting_at_startup(monkeypatch):
 def test_invalid_laya_question_type_fails_at_startup(monkeypatch, qtype):
     with pytest.raises(ValueError, match="question_type"):
         _startup_model_config({"format": "laya", "question_type": qtype}, monkeypatch)
+
+
+@pytest.mark.parametrize("rejected", [True, False])
+def test_plugin_and_bridge_reuse_one_decision_per_output(monkeypatch, rejected):
+    owner = _owner()
+    asr = _asr("r1", "hello")
+    rj._owned(owner)["r1"] = rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), "hello", asr)
+    output = _judge_text("r1", "NO" if rejected else "YES")
+    calls = []
+
+    def decide(pending, candidate):
+        calls.append(candidate)
+        return rejected
+
+    monkeypatch.setattr(rj, "_rejects", decide)
+    bridge = rj.after_judge(lambda source_outputs, prompt=None, requires_multimodal_data=False: source_outputs)
+    assert rj.judge_rejects(output, owner) is rejected
+    assert bridge([output], None, False, owner) == ([] if rejected else [asr])
+    assert rj.judge_rejects(output, owner) is rejected
+    assert calls == [output]
+    other = _judge_text("r1", "YES")
+    assert rj.judge_rejects(other, owner) is rejected
+    assert calls == [output, other]

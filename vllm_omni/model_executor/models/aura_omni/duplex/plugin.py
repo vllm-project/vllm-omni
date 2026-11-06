@@ -14,6 +14,7 @@ import pybase64 as base64
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
@@ -29,7 +30,6 @@ from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
 )
 from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
 from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
-    AURA_JUDGED_STAGE_LAYOUT,
     AURA_STAGE_LAYOUT,
     AuraStageLayout,
 )
@@ -38,6 +38,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     is_effectively_silent,
 )
+from vllm_omni.model_executor.stage_input_processors.response_judge import judge_rejects
 
 # AURA v1 (Qwen3-VL) silent / ChatML turn-end ids.
 AURA_SILENT_TOKEN_ID = 151669
@@ -143,12 +144,19 @@ class AuraDuplexPlugin(DuplexModelPlugin):
 
     plugin_id = "aura"
     private_runtime_config_keys = _PRIVATE_KEYS
-    # Stage ids by role; a pipeline variant with extra stages overrides this.
     stages: AuraStageLayout = AURA_STAGE_LAYOUT
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = AuraDataPlaneSession(encode_audio, stages=self.stages)
+
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        stages = AuraStageLayout.from_pipeline(pipeline_config)
+        self.data_plane.configure_stages(stages)
+        self.stages = stages
+
+    def input_stage_id(self, payload: object) -> int:
+        return self.stages.asr
 
     def configure_sampling_params(
         self,
@@ -387,9 +395,12 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """After AURA text/silent final, next commit may start while TTS drains."""
         del context
+        if stage_id == self.stages.judge:
+            return segment_finished and judge_rejects(output, streaming_context)
         if stage_id != self.stages.aura:
             return False
         if segment_finished:
@@ -405,8 +416,20 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_output_metadata
+        if stage_id == self.stages.judge:
+            if not segment_finished or not judge_rejects(output, streaming_context):
+                return None
+            return DuplexOutputDecision(
+                action=DuplexOutputAction.DIRECT_RESPONSE,
+                metadata={
+                    "duplex_direct_response": True,
+                    "model_listen": True,
+                    "listen_source": "response_judge",
+                },
+            )
         # AURA silent → short-circuit TTS/Code2Wav.
         if stage_id != self.stages.aura or not segment_finished:
             return None
@@ -541,14 +564,4 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         )
 
 
-class AuraJudgedDuplexPlugin(AuraDuplexPlugin):
-    """AURA with a response-judge stage after ASR (``aura_omni_judged``).
-
-    Only the stage layout differs; the judge decision itself is handled by
-    the engine for any pipeline with a ``response_judge`` stage.
-    """
-
-    stages = AURA_JUDGED_STAGE_LAYOUT
-
-
-__all__ = ["AURA_SILENT_TOKEN_ID", "AuraDuplexPlugin", "AuraJudgedDuplexPlugin"]
+__all__ = ["AURA_SILENT_TOKEN_ID", "AuraDuplexPlugin"]

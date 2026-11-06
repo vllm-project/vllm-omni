@@ -27,7 +27,6 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextView
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
-    DuplexOutputAction,
     DuplexOutputDecision,
 )
 
@@ -588,24 +587,8 @@ class DuplexModelPlugin(ABC):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None: ...
-
-    def response_judge_decision(self) -> DuplexOutputDecision:
-        """Decision for a turn the ``response_judge`` stage rejected.
-
-        The default is the listen decision models use when they choose not to
-        speak, so the session ends the turn through its existing listen,
-        abort and release path. A plugin whose data plane expects extra
-        listen metadata overrides this.
-        """
-        return DuplexOutputDecision(
-            action=DuplexOutputAction.DIRECT_RESPONSE,
-            metadata={
-                "duplex_direct_response": True,
-                "model_listen": True,
-                "listen_source": "response_judge",
-            },
-        )
 
     def project_intermediate_output(
         self,
@@ -680,6 +663,7 @@ class DuplexModelPlugin(ABC):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """Return True when the next user commit may start while prior TTS drains.
 
