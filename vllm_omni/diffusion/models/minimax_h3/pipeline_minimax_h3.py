@@ -1355,7 +1355,10 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
         needs_component_cache = legacy_manual_components or offloads_text_encoder
-        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
+        if (
+            resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+            and needs_component_cache
+        ):
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
             if legacy_manual_components:
                 _register_dlo_component_cache(

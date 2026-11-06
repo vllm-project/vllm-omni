@@ -86,4 +86,14 @@ def get_blocks_from_dit(
         )
         return [], []
 
-    return blocks_attr_names, blocks
+    # Cache-DiT replaces a block list with a wrapper. Discover physical layers
+    # while leaving the wrapper forward in control of execution and cache hits.
+    def physical_layers(items):
+        for block in items:
+            wrapped = getattr(block, "transformer_blocks", None)
+            if isinstance(wrapped, (nn.ModuleList, list, tuple)):
+                yield from physical_layers(wrapped)
+            else:
+                yield block
+
+    return blocks_attr_names, list(physical_layers(blocks))

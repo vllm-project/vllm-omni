@@ -33,6 +33,7 @@ from .sequential_backend import (
     sequential_offload_component,
 )
 from .startup import OffloadStartupState, take_offload_startup_state
+from .submodule_offload_backend import SubmoduleOffloadBackend, SubmoduleOffloadHook
 from .tensor_utils import (
     dtype_size,
     is_dtensor,
@@ -56,6 +57,8 @@ __all__ = [
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
+    "SubmoduleOffloadBackend",
+    "SubmoduleOffloadHook",
     "ModelLevelOffloadBackend",
     "BoundedAllocatorCache",
     "PinnedModuleStager",
@@ -104,7 +107,10 @@ def get_offload_backend(
     # Extract and validate configuration
     config = OffloadConfig.from_od_config(od_config)
 
-    if host_weight_plan is not None and config.strategy != OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+    if host_weight_plan is not None and config.strategy not in (
+        OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+        OffloadStrategy.SUBMODULE,
+    ):
         raise RuntimeError(
             "A loader-owned DLO host-weight plan was produced, but distributed layerwise offload is not selected"
         )
@@ -150,6 +156,8 @@ def get_offload_backend(
             device,
             host_weight_plan=host_weight_plan,
         )
+    elif config.strategy == OffloadStrategy.SUBMODULE:
+        return SubmoduleOffloadBackend(config, device, host_weight_plan=host_weight_plan)
     else:
         logger.error("Unknown offload strategy: %s", config.strategy)
         return None
