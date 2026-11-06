@@ -160,3 +160,35 @@ def test_worker_row_limit_must_be_a_positive_integer(invalid_limit: object) -> N
         OmniDiffusionConfig.from_kwargs(diffusion_kv_max_rows_per_request=invalid_limit)
     with pytest.raises((TypeError, ValueError)):
         _DiffusionConfigProjection.from_kwargs(diffusion_kv_max_rows_per_request=invalid_limit)
+
+
+@pytest.mark.parametrize("dtype", ["fp8", "fp8_e4m3"])
+def test_dense_legacy_allows_attention_quantization(dtype) -> None:
+    config = OmniDiffusionConfig.from_kwargs(diffusion_kv_cache_dtype=dtype)
+    assert config.diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_unified_knob_conflicts_with_explicit_quant_spec(config_cls) -> None:
+    with pytest.raises(ValueError, match="conflicts with a diffusion_attention_config quant spec"):
+        config_cls.from_kwargs(
+            diffusion_kv_cache_dtype="fp8",
+            diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+        )
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_unified_knob_allows_backend_pin_without_dtypes(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_kv_cache_dtype="fp8",
+        diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"flashinfer_backend": "fa2"}}},
+    )
+    assert config.diffusion_kv_cache_dtype == "fp8"
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_explicit_quant_spec_without_knob_is_allowed(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+    )
+    assert config.diffusion_kv_cache_dtype is None

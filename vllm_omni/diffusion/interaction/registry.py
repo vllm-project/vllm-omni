@@ -13,8 +13,21 @@ from __future__ import annotations
 from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHandler
 from vllm_omni.diffusion.interaction.modality_handlers.camera import SE3DeltaCameraHandler
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler
+from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import TaoMateH3PromptInteractionHandler
+from vllm_omni.diffusion.models.hy_nomas.interaction import (
+    HyNomasCameraInteractionHandler,
+    HyNomasPromptInteractionHandler,
+)
 
 STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
+    "HyNomasPipeline": {
+        "prompt": HyNomasPromptInteractionHandler,
+        "camera": HyNomasCameraInteractionHandler,
+    },
+    "HyNomasModularPipeline": {
+        "prompt": HyNomasPromptInteractionHandler,
+        "camera": HyNomasCameraInteractionHandler,
+    },
     # Pipeline class name -> modality -> handler class.
     "HeliosPipeline": {
         "prompt": PromptInteractionHandler,
@@ -24,5 +37,10 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     },
     "LingBotWorldCausalDMDPipeline": {
         "camera": SE3DeltaCameraHandler,
+    },
+    # TaoMate-H3 re-reads the prompt at every five-second request boundary; the
+    # handler switches embeddings immediately (no cross-length interpolation).
+    "TaoMateH3Pipeline": {
+        "prompt": TaoMateH3PromptInteractionHandler,
     },
 }

@@ -128,3 +128,38 @@ class DeviceStager:
             assert view is not None
             out = self._shaped[key] = view[:n].view(arr.shape)
         return out
+
+
+class HostCopyBatch:
+    """Device-to-host copies of one step's outputs behind one host wait.
+
+    ``wait`` waits on an event recorded after the copies, and is free when a
+    later sync already covered them. Off CUDA, or without pinned memory,
+    :meth:`copy` is the blocking ``tensor.to("cpu")``. A contiguous host tensor
+    passes through.
+    """
+
+    def __init__(self, pin_memory: bool) -> None:
+        self._pin_memory = bool(pin_memory)
+        self._event: torch.cuda.Event | None = None
+
+    def copy(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu" and not tensor.requires_grad and tensor.is_contiguous():
+            return tensor
+        tensor = tensor.detach()
+        if tensor.device.type != "cuda" or not self._pin_memory:
+            return tensor.to("cpu").contiguous()
+        host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+        host.copy_(tensor, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._event = event
+        return host
+
+    def wait(self) -> None:
+        event = self._event
+        if event is None:
+            return
+        self._event = None
+        if not event.query():
+            event.synchronize()

@@ -12,6 +12,29 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def reject_outer_full_cudagraph(vllm_config: Any) -> None:
+    """Refuse vLLM's outer full CUDA graph capture on the MRV1 runner.
+
+    The talker walks its pending requests and keeps its own CUDA graphs. A full
+    outer graph replays the model over a padded batch, which breaks that
+    per-request bookkeeping, so the engine dies on the first request. The
+    shipped eager default and PIECEWISE are unaffected. The check covers only
+    the default MRV1 runner, where the failure was reported.
+    """
+    if getattr(vllm_config.model_config, "use_v2_model_runner", False):
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    if mode is None or not mode.has_full_cudagraphs():
+        return
+    raise ValueError(
+        f"VoxCPM2 does not support cudagraph_mode={mode.name}. The talker owns its own CUDA graphs "
+        "and cannot also run inside vLLM's outer full-graph capture. Use "
+        '--compilation-config \'{"cudagraph_mode": "PIECEWISE"}\', or drop --no-enforce-eager to use '
+        "the shipped default, which is the fastest configuration for this model."
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _VoxCPM2RuntimeConfig:
     startup_lora_path: str | None = None
@@ -55,7 +78,12 @@ class _VoxCPM2RuntimeConfig:
         model_config = vllm_config.model_config
         values: dict[str, Any] = {}
         if getattr(model_config, "use_v2_model_runner", False):
-            values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
+            from vllm_omni.platforms import current_omni_platform
+
+            # Incremental VAE decoding is a per-patch unified-graph feature and
+            # only exists on CUDA. Other platforms keep the v1 audio profile.
+            if current_omni_platform.is_cuda():
+                values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
         raw = getattr(model_config, "voxcpm2_runtime_config", None)
         if raw is None:
             raw = getattr(getattr(model_config, "hf_config", None), "voxcpm2_runtime_config", None)

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ascend hardware validation for MiniCPM-o Code2Wav NPUGraph replay."""
 
+from functools import partial
 from math import prod
 from types import SimpleNamespace
 
@@ -37,7 +38,8 @@ class _Flow(nn.Module):
     def __init__(self, estimator: nn.Module):
         super().__init__()
         self.encoder = nn.Identity()
-        self.decoder = SimpleNamespace(estimator=estimator)
+        self.decoder = nn.Module()
+        self.decoder.estimator = estimator
 
 
 class _Token2Wav:
@@ -68,6 +70,20 @@ def test_npu_runner_inherits_runtime_snapshot_replacement():
 
     assert runner.model_intermediate_buffer["req"] == {"meta": {"is_segment_finished": True}}
     assert request.additional_information_cpu == runner.model_intermediate_buffer["req"]
+
+
+@torch.inference_mode()
+def test_npu_whole_euler_precomputes_modulation_without_fused_body():
+    decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+    prepare_code2wav_graph_runtime()
+    estimator = (
+        decoder_dit.DiT(in_channels=7, out_channels=2, depth=2, num_heads=2, head_dim=8, hidden_size=16, mlp_ratio=2.0)
+        .npu()
+        .eval()
+    )
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={"enabled": True, "fused_body": False})
+    assert not adapter._ragged_fused_body
+    assert adapter._whole_euler_graph_wrapper.modulation_fn is not None
 
 
 def test_minicpmo_cfm_estimator_npugraph_matches_eager():
@@ -168,11 +184,18 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
 
 
 @pytest.mark.parametrize("bucket_frames", [0, 8])
+@pytest.mark.parametrize("precompute_modulation", [False, True])
+@pytest.mark.parametrize("fused_body", [False, True])
 @torch.inference_mode()
-def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames):
+def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames, precompute_modulation, fused_body):
     """A whole solve, including masked padding and cached replay, uses one graph."""
     from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import WholeEulerCFMGraphWrapper
+    from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import dit_modulation
 
+    # The fused tap-GEMM convolution has a different FP32 reduction order
+    # from upstream Conv1d. Keep the original tolerance for the ragged body;
+    # this small-model check does not establish full-checkpoint audio quality.
+    rtol, atol = (1e-3, 1e-4) if fused_body else (1e-4, 1e-5)
     decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     prepare_code2wav_graph_runtime()
     torch.manual_seed(19)
@@ -181,6 +204,10 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames):
         .npu()
         .eval()
     )
+    # DiT uses adaLN-Zero initialization; nonzero weights exercise every
+    # block and make modulation/output parity meaningful.
+    for parameter in estimator.parameters():
+        parameter.normal_(0.0, 0.08)
     adapter = BatchedToken2Wav(_Token2Wav(estimator))
     adapter.flow.decoder.rand_noise = torch.randn(1, 2, 128, device="npu")
     adapter.flow.decoder.inference_cfg_rate = 0.7
@@ -191,6 +218,7 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames):
         max_graph_batch=2,
         query_bucket_frames=bucket_frames,
         ragged_body=adapter._ragged_body,
+        modulation_fn=partial(dit_modulation, estimator) if precompute_modulation else None,
     )
     assert wrapper.enabled
     caches = (None, None)
@@ -200,12 +228,14 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames):
             mu = torch.randn(2, 2, 6, device="npu")
             speakers = torch.randn(2, 1, device="npu")
             cond = torch.randn(2, 2, 6, device="npu")
+            adapter._ragged_fused_body = False
             adapter._whole_euler_graph_wrapper = None
             expected = adapter._decode_cfm(mu, speakers, cond, cnn_cache=caches[0], att_cache=caches[1])
+            adapter._ragged_fused_body = fused_body
             adapter._whole_euler_graph_wrapper = wrapper
             actual = adapter._decode_cfm(mu, speakers, cond, cnn_cache=caches[0], att_cache=caches[1])
             for value, reference in zip(actual, expected, strict=True):
-                torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+                torch.testing.assert_close(value, reference, rtol=rtol, atol=atol)
             if index == 0:
                 saved = tuple(value.clone() for value in actual)
                 first = actual
@@ -218,13 +248,15 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames):
     # Unequal query lengths exercise the mask/length inputs that the old NPU
     # estimator patch excluded from graph replay.
     with npu_token2wav_sdpa_context(require_math=True):
+        adapter._ragged_fused_body = False
         adapter._whole_euler_graph_wrapper = None
         expected = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None, valid_lengths=[6, 4])
+        adapter._ragged_fused_body = fused_body
         adapter._whole_euler_graph_wrapper = wrapper
         actual = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None, valid_lengths=[6, 4])
         for row, length in enumerate((6, 4)):
-            torch.testing.assert_close(actual[0][row, :, :length], expected[0][row, :, :length], rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(actual[1:], expected[1:], rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(actual[0][row, :, :length], expected[0][row, :, :length], rtol=rtol, atol=atol)
+        torch.testing.assert_close(actual[1:], expected[1:], rtol=rtol, atol=atol)
 
 
 @torch.inference_mode()
@@ -362,3 +394,145 @@ def test_hift_npu_istft_matches_cpu_without_repeated_host_copies(monkeypatch, dt
     hift._istft(magnitude * 0.5, phase)
     torch.testing.assert_close(actual, retained, rtol=0, atol=0)
     assert next(iter(hift._npu_istft_envelopes.values())) is envelope
+
+
+@torch.inference_mode()
+def test_fused_body_npugraph_matches_its_eager_path_with_inference_weights():
+    from vllm_omni.platforms.npu.models.minicpmo_fused import blocks_forward_chunk_fused_npu, prepare_estimator
+
+    decoder = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+    prepare_code2wav_graph_runtime()
+    torch.manual_seed(71)
+    estimator = (
+        decoder.DiT(in_channels=7, out_channels=2, depth=2, num_heads=2, head_dim=8, hidden_size=16, mlp_ratio=2.0)
+        .npu()
+        .eval()
+    )
+    for parameter in estimator.parameters():
+        parameter.normal_(0.0, 0.08)
+    prepare_estimator(estimator)
+    x = torch.randn(2, 7, 6, device="npu")
+    embedding = torch.randn(2, 1, 16, device="npu")
+    embedding[1].copy_(embedding[0])
+    lengths = torch.tensor([6, 4], device="npu")
+    cnn = torch.randn(2, 2, 32, 2, device="npu")
+    att = torch.randn(2, 2, 2, 5, 16, device="npu")
+    mask = torch.ones(2, 6, 11, dtype=torch.bool, device="npu")
+    static_cnn = torch.empty_like(cnn)
+    static_att = torch.empty(2, 2, 2, 11, 16, device="npu")
+
+    def run(cnn_out, att_out, body=blocks_forward_chunk_fused_npu):
+        return body(estimator, x, embedding, mask, cnn, att, cnn_out, att_out, lengths)
+
+    with npu_token2wav_sdpa_context(require_math=True):
+        run(static_cnn, static_att)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            output = run(static_cnn, static_att)
+        for _ in range(2):
+            x.normal_()
+            cnn.normal_()
+            att.normal_()
+            mask[..., -2:] = False
+            expected_cnn, expected_att = torch.empty_like(static_cnn), torch.empty_like(static_att)
+            expected = run(expected_cnn, expected_att)
+            ragged_cnn, ragged_att = torch.empty_like(static_cnn), torch.empty_like(static_att)
+            ragged = run(ragged_cnn, ragged_att, BatchedToken2Wav._blocks_forward_chunk_ragged)
+            graph.replay()
+            torch.npu.synchronize()
+            for value, reference, unfused in zip(
+                (output, static_cnn, static_att),
+                (expected, expected_cnn, expected_att),
+                (ragged, ragged_cnn, ragged_att),
+                strict=True,
+            ):
+                torch.testing.assert_close(value, reference, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(value, unfused, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+@torch.inference_mode()
+def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
+    from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import _undecorate_dynamo
+    from vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph import FlowEncoderGraphs
+
+    prepare_code2wav_graph_runtime()
+    backend = BatchedToken2Wav.__new__(BatchedToken2Wav)
+    nn.Module.__init__(backend)
+    backend.flow = nn.Module()
+    backend.flow.input_embedding = nn.Embedding(64, 32).npu()
+    backend.flow.encoder = UpsampleConformerEncoderV2(
+        input_size=32,
+        output_size=32,
+        num_blocks=1,
+        num_up_blocks=1,
+        attention_heads=4,
+        linear_units=64,
+        dropout_rate=0.0,
+        positional_dropout_rate=0.0,
+        attention_dropout_rate=0.0,
+    ).npu()
+    backend.flow.encoder_proj = nn.Linear(32, 16).npu()
+    backend.flow.eval()
+    _undecorate_dynamo(backend.flow.encoder, "forward_chunk")
+    graph = FlowEncoderGraphs(
+        partial(backend._encode_chunk_eager, last_chunk=False),
+        chunk_forward=backend._encode_chunk_eager,
+        max_graphs=2,
+        lookahead=3,
+        capture_after_precapture=True,
+    )
+    backend._chunk_encoder_graph = graph
+    prompt = torch.randint(0, 64, (rows, 8), device="npu")
+    _, cnn, att = backend._encode_chunk_eager(prompt, last_chunk=False, cnn_cache=None, att_cache=None)
+    graph.capture(
+        [(rows, 8, int(att.shape[3]))],
+        cnn_shape=tuple(cnn.shape[1:]),
+        att_layout=(att.shape[0], att.shape[2], att.shape[4]),
+        hidden_dim=16,
+        dtype=att.dtype,
+        device=att.device,
+        cnn_dtype=cnn.dtype,
+    )
+    # Exercise the policy on an already populated startup arena.
+    assert backend.precapture_chunk_encoder(None) == 0
+    assert graph.capture_on_request
+    retained = []
+    for width, last, cache_cnn, cache_att in [(5, True, cnn, att), (11, False, None, None)]:
+        tokens = torch.randint(0, 64, (rows, width), device="npu")
+        for _ in range(4):
+            tokens = (tokens + 1) % 64
+            expected = backend._encode_chunk_eager(
+                tokens,
+                last_chunk=last,
+                cnn_cache=cache_cnn,
+                att_cache=cache_att,
+            )
+            actual = backend._encode_chunk(
+                tokens,
+                last_chunk=last,
+                cnn_cache=cache_cnn,
+                att_cache=cache_att,
+            )
+            for a, b in zip(actual, expected, strict=True):
+                torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+            retained.append((actual, tuple(x.clone() for x in actual)))
+    assert graph.stats["captures"] == 2
+    assert graph.stats["hits"] == 4
+    # Another tail shape must fall back at capacity without evicting live graphs.
+    tokens = torch.randint(0, 64, (rows, 6), device="npu")
+    actual = backend._encode_chunk(tokens, last_chunk=True, cnn_cache=cnn, att_cache=att)
+    expected = backend._encode_chunk_eager(tokens, last_chunk=True, cnn_cache=cnn, att_cache=att)
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+    assert graph.stats["capacity"] == 1
+    # Replay a startup graph after dynamic graphs: neither pool may corrupt saved caches.
+    result = graph.run(prompt, cnn.split(1, dim=0), att.split(1, dim=1))
+    expected = backend._encode_chunk_eager(prompt, last_chunk=False, cnn_cache=cnn, att_cache=att)
+    for a, b in zip(result, expected, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+    for actual, saved in retained:
+        for a, b in zip(actual, saved, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)

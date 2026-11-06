@@ -14,9 +14,11 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     PackedBlockHashes,
 )
+from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.fused_moe import routed_experts_capturer
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from tests.helpers.omni_scheduler import make_kv_cache_manager
 from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -46,7 +48,13 @@ def runner(monkeypatch):
     # Exercise the real capturer, block store, worker and scheduler connectors
     # with CPU tensors; importing vllm-ascend or owning NPU hardware is unnecessary.
     monkeypatch.setattr(routed_experts_capturer, "current_platform", SimpleNamespace(device_type="cpu"))
-    monkeypatch.setattr(routed_experts_capturer, "get_forward_context", lambda: SimpleNamespace(dp_metadata=None))
+    # Upstream RoutedExpertsCapturer reads batch_descriptor when dp_metadata
+    # is absent. ForwardContext.batch_descriptor defaults to None.
+    monkeypatch.setattr(
+        routed_experts_capturer,
+        "get_forward_context",
+        lambda: ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={}),
+    )
     monkeypatch.setattr(worker, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True))
     runner = _Runner()
     runner.model = torch.nn.Sequential(_AscendMoE())
@@ -105,7 +113,7 @@ def test_routing_reaches_scheduler_and_owns_legacy_batch_snapshot(runner):
     _capture(runner, [[7, 8]] * 4)
     output = runner._finish_omni_aux_output(pending, step, torch.tensor([[5]]))
     request = SimpleNamespace(request_id="r", num_tokens=5)
-    rows = AuxOutputSchedulerConnector().take_output(request, output)
+    rows = AuxOutputSchedulerConnector(make_kv_cache_manager(block_size=4)).take_output(request, output)
     np.testing.assert_array_equal(rows, expected)
     assert output["r"].token_start == 0
     assert runner.synchronized == 1
