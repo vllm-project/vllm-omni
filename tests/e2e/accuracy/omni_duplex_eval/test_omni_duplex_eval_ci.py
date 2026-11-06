@@ -174,8 +174,8 @@ def test_invalid_quality_fails(result, config, section, field, value):
         ("missing", "score files"),
         ("id", "sample IDs"),
         ("pin", "protocol_pin"),
-        ("mix", "mix 'question'"),
-        ("no_mix", "mix 'question'"),
+        ("mix", "mix 'soundtrack'"),
+        ("no_mix", None),
     ],
 )
 def test_score_file_integrity(result, config, mutation, message):
@@ -189,13 +189,16 @@ def test_score_file_integrity(result, config, mutation, message):
         if mutation == "pin":
             row["protocol_pin"] = "old"
         elif mutation == "mix":
-            row["response_meta"]["mix"] = "question"
+            row["response_meta"]["mix"] = "soundtrack"
         else:
             # Metadata written before mix was recorded counts as question.
             del row["response_meta"]["mix"]
         path.write_text(json.dumps(row))
-    with pytest.raises(AssertionError, match=message):
+    if message is None:
         assert_accuracy_result(result, config)
+    else:
+        with pytest.raises(AssertionError, match=message):
+            assert_accuracy_result(result, config)
 
 
 def test_config_pin_must_match_runtime(result, config):
@@ -243,8 +246,10 @@ def test_nightly_workload_matches_ci_config():
     test_root = Path(__file__).resolve().parents[3]
     dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     params = dfx["benchmark_params"][0]
-    assert params["duplex_eval_mix"] == "soundtrack"
-    assert load_accuracy_config(str(_CONFIG_PATH), params)["mix"] == "soundtrack"
+    assert params["duplex_eval_mix"] == "question"
+    assert load_accuracy_config(str(_CONFIG_PATH), params)["mix"] == "question"
+    del params["duplex_eval_mix"]
+    assert load_accuracy_config(str(_CONFIG_PATH), params)["mix"] == "question"
 
 
 @pytest.mark.parametrize(
@@ -253,18 +258,14 @@ def test_nightly_workload_matches_ci_config():
         ("duplex_eval_ids", ["0"]),
         ("num_prompts", [3]),
         ("duplex_eval_evaluate", False),
-        ("duplex_eval_mix", "question"),
-        ("duplex_eval_mix", None),
+        ("duplex_eval_mix", "soundtrack"),
     ],
 )
 def test_wrong_workload_is_rejected(field, value):
     test_root = Path(__file__).resolve().parents[3]
     dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     params = dfx["benchmark_params"][0]
-    if value is None:
-        del params[field]
-    else:
-        params[field] = value
+    params[field] = value
     with pytest.raises(AssertionError):
         load_accuracy_config(str(_CONFIG_PATH), params)
 

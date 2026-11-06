@@ -399,7 +399,7 @@ or heard in the clip, such as the word-repetition prompts in
 `PR_post_event_reminder` and `RTD_Omni`; a clip without an audio track keeps the
 instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
 The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
-runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
+runs with `question`, as does the Qwen3-Omni `server_vad` nightly.
 Its DFX config uses `duplex_eval_score_floor_hardware` to enforce calibrated
 quality floors on H100, B200 and A3 while ROCm burn-in still requires complete
 generation, publication and judging but records scores without a quality floor.
@@ -521,7 +521,7 @@ The standalone `generate` command remains available. It still skips an existing
 sample unless `--overwrite` is set, and it reuses that sample only when the
 recorded mix matches (metadata without a mix counts as `question`). A different
 mix is rejected instead of returning the other artifact. This integration does
-not add nightly jobs. The MiniCPM-o job above selects `soundtrack`.
+not add nightly jobs. The MiniCPM-o job above selects `question`.
 
 For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
 instead of `--limit`. Failed sessions have no judge input; do not silently drop
