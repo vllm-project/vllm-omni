@@ -192,12 +192,30 @@ async def test_native_replay_maps_metrics_and_publishes_artifacts(tmp_path: Path
         request_id=sample.request_id,
     )
     adapter.attach_full_duplex_bench(sample, request)
+    continuity = {
+        "response_id": "response-1",
+        "audio_underrun_s": 0.4,
+        "audio_max_single_underrun_s": 0.3,
+        "total_underrun_s": 0.4,
+        "audio_continuity_ok": False,
+        "audio_underrun_event_count": 2,
+        "audio_duration_s": 0.6,
+        "audio_underrun_ratio": 0.4,
+        "audio_underrun_events_per_minute": 200.0,
+        "audio_chunk_count": 3,
+        "audio_continuity_threshold_s": 0.1,
+    }
 
     async def generate_sample(dataset_sample, **kwargs):
         assert kwargs["prepared"].frames == ()
         return runner.GenerateSampleResult(
             output=sample.response_root / dataset_sample.split / f"{dataset_sample.id}.json",
-            request_metrics=[{"stage0_tokens": {"output_token_count": 2, "itls_ms": [10.0]}}],
+            request_metrics=[
+                {
+                    "stage0_tokens": {"output_token_count": 2, "itls_ms": [10.0]},
+                    "audio_continuity": continuity,
+                }
+            ],
             session_metrics={"ttft_ms": {"mean": 125.0}, "ttfp_ms": {"mean": 250.0}, "rtf": {"mean": 0.5}},
             timed_sentences=[{"sentence": "Hello", "start": 0.1, "end": 0.2}],
             metadata={"response_done": True},
@@ -211,6 +229,22 @@ async def test_native_replay_maps_metrics_and_publishes_artifacts(tmp_path: Path
     assert output.ttft == pytest.approx(0.125)
     assert output.audio_ttfp == pytest.approx(0.25)
     assert output.audio_rtf == pytest.approx(0.5)
+    assert output.audio_continuity_samples == [continuity]
+    metrics, _ = patch.calculate_metrics(
+        input_requests=[sample],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50, 99],
+        goodput_config_dict={},
+        task_type=patch.TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=1,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    assert metrics.num_audio_continuity_samples == 1
+    assert metrics.total_audio_underrun_events == 2
     result = output.duplex_eval_result
     assert result.metadata["dataset"] == "full-duplex-bench"
     assert result.metadata["source_id"] == "talking_to_other/1"
