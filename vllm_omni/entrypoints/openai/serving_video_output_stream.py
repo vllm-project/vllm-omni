@@ -1171,6 +1171,11 @@ class OmniStreamingVideoOutputHandler:
             "active_event_ids": stream_metadata.get("active_event_ids", []),
             "completed_event_ids": stream_metadata.get("completed_event_ids", []),
             **{key: stream_metadata[key] for key in ("pacing", "output_chunk_index") if key in stream_metadata},
+            **{
+                key: stream_metadata[key]
+                for key in ("frame_start", "generated_raw_frames", "generated_frames", "withheld_frames")
+                if key in stream_metadata
+            },
             **(
                 {"coalesced_event_ids": stream_metadata["coalesced_event_ids"]}
                 if stream_metadata.get("coalesced_event_ids")
