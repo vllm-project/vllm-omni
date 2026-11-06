@@ -29,12 +29,20 @@ leak across calls and no call can consume another call's lengths.
     call sites that pass ``(features, mask)`` positionally must still bucket
     via the explicit ``lengths`` argument, and stay exact for a
     mask-consuming encoder.
+* test_model_forward_error_surfaces_and_keeps_bucketing_armed /
+  test_bucketed_path_programming_error_surfaces
+    errors surface instead of silently degrading to the eager fallback: a
+    model-side forward failure runs exactly once and never disables bucketing,
+    a bucketed-path bug raises — only the deterministic output-contract
+    mismatch falls back and disables (and says so).
 
 All encoder calls run under ``torch.inference_mode()`` (the production
 context); the bucketed path is eager — no CUDA graphs.
 """
 
 import dataclasses
+import logging
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -137,6 +145,21 @@ def _cfg_with(raw):
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="toy")),
         additional_config={"audio_bucket_seconds": raw},
     )
+
+
+@contextmanager
+def capture_encoder_logs(caplog):
+    """Route the wrapper's logger into ``caplog`` (vllm loggers do not
+    propagate to the root logger, so the handler must be attached directly)."""
+    target_logger = logging.getLogger("vllm_omni.worker.bucketed_encoder")
+    target_logger.addHandler(caplog.handler)
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(previous_level)
 
 
 @pytest.fixture()
@@ -334,10 +357,11 @@ def test_length_returning_encoder_buckets_losslessly(bucket_cfg):
         assert out_lens[row].item() == solo_len.item()
 
 
-def test_length_returning_encoder_shim_nontuple_falls_back(bucket_cfg):
+def test_length_returning_encoder_shim_nontuple_falls_back(bucket_cfg, caplog):
     """A length-carrying ``_aux_spec`` (learned from a ``(features, lengths)``
     prime call) must not silently slice a bare-tensor shim output: the wrapper
-    disables and returns the eager (original) result instead."""
+    disables and returns the eager (original) result instead — and says so
+    (the disable is observable, not silent)."""
     model = LengthReturningToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
     wrapper = model.encoder.forward
@@ -345,22 +369,71 @@ def test_length_returning_encoder_shim_nontuple_falls_back(bucket_cfg):
     feats = make_features()
     lens = torch.tensor(LENGTHS, dtype=torch.long)
 
-    with torch.inference_mode():
-        # Prime call: the real (features, lengths) output teaches _aux_spec.
-        model.embed_multimodal(audio_features=feats, audio_lens=lens)
-        assert wrapper._aux_spec is not None and wrapper._aux_spec[0] == "lengths"
+    with capture_encoder_logs(caplog):
+        with torch.inference_mode():
+            # Prime call: the real (features, lengths) output teaches _aux_spec.
+            model.embed_multimodal(audio_features=feats, audio_lens=lens)
+            assert wrapper._aux_spec is not None and wrapper._aux_spec[0] == "lengths"
 
-        eager_features, eager_lens = wrapper._original(feats, lens)
+            eager_features, eager_lens = wrapper._original(feats, lens)
 
-        # A shim that returns a bare tensor (not a (features, lengths) tuple),
-        # which the guarded _tensor_forward must reject rather than slice.
-        wrapper._shim = lambda *args, **kwargs: args[0]
+            # A shim that returns a bare tensor (not a (features, lengths) tuple),
+            # which the guarded _tensor_forward must reject rather than slice.
+            wrapper._shim = lambda *args, **kwargs: args[0]
 
-        out = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+            out = model.embed_multimodal(audio_features=feats, audio_lens=lens)
 
     assert wrapper._disabled is True
+    assert "disabled" in caplog.text, "the contract-mismatch disable must be logged"
     torch.testing.assert_close(out[0], eager_features, rtol=0, atol=1e-6)
     torch.testing.assert_close(out[1], eager_lens, rtol=0, atol=1e-6)
+
+
+def test_model_forward_error_surfaces_and_keeps_bucketing_armed(bucket_cfg):
+    """A model-side forward error must surface as-is: it is not swallowed into
+    a silent eager fallback, not blamed on bucketing (no disable), and the
+    forward is NOT re-run a second time by a fallback handler."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    def raising_forward(*args, **kwargs):
+        raising_forward.calls += 1
+        raise RuntimeError("model-side failure")
+
+    raising_forward.calls = 0
+    wrapper._original = raising_forward  # the model's own forward now fails
+
+    feats = make_features()
+    lens = torch.tensor(LENGTHS, dtype=torch.long)
+    with torch.inference_mode(), pytest.raises(RuntimeError, match="model-side failure"):
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert raising_forward.calls == 1, "the failing forward must run exactly once (no fallback re-run)"
+    assert wrapper._disabled is False, "a model-side error must not disable bucketing"
+
+
+def test_bucketed_path_programming_error_surfaces(bucket_cfg):
+    """A programming error inside the bucketed path must surface, not degrade
+    into a silent eager fallback: only _OutputContractError is caught."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    feats = make_features()
+    lens = torch.tensor(LENGTHS, dtype=torch.long)
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime call learns the output type
+
+        def broken_bucketed(*args, **kwargs):
+            raise ValueError("bucketing bug")
+
+        wrapper._bucketed = broken_bucketed  # a bug in the bucketed math
+
+        with pytest.raises(ValueError, match="bucketing bug"):
+            model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert wrapper._disabled is False, "a bucketed-path bug must surface, not disable bucketing"
 
 
 def test_context_margin_preserves_conv_tail(bucket_cfg, monkeypatch):

@@ -105,7 +105,10 @@ def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
         from transformers.modeling_outputs import BaseModelOutput
 
         return BaseModelOutput(last_hidden_state=hidden)
-    except Exception:
+    except ImportError:
+        # Only the missing-import case degrades to the plain dataclass. A
+        # construction failure (e.g. upstream signature drift) is not an
+        # ImportError and must surface.
         return _ShimOutput(last_hidden_state=hidden)
 
 
@@ -246,6 +249,17 @@ def _as_tensor(output):
 
 
 # ------------------------------------------------------------- generic wrapper
+
+
+class _OutputContractError(TypeError):
+    """The compute output does not match the output contract learned at the
+    prime call (e.g. a bare tensor where a ``(features, lengths)`` tuple was
+    expected).
+
+    This is a deterministic structural mismatch, not a bug in the bucketed
+    math: the same (encoder, shim) pairing fails the same way on every batch.
+    It is the ONLY exception the wrapper catches; programming errors surface.
+    """
 
 
 def _split_output(output):
@@ -390,28 +404,35 @@ class _BucketedEncoder:
         if sum(windows) >= len(lengths) * time_extent:
             return self._original(*args, **kwargs)
 
-        try:
-            if self._rebuild is None:
-                # First eligible call: serve it eagerly, learning how to rebuild
-                # the output type; later eligible calls take the bucketed path.
-                output = self._original(*args, **kwargs)
-                split = _split_output(output)
-                if split is None:
-                    self._disabled = True
-                    logger.warning(
-                        "Bucketed encoder %r disabled: unsupported output type %r",
-                        self.name,
-                        type(output).__name__,
-                    )
-                    return output
-                self._rebuild = split[1]
-                self._aux_spec = split[2]
+        if self._rebuild is None:
+            # First eligible call: serve it eagerly, learning how to rebuild
+            # the output type; later eligible calls take the bucketed path.
+            # This call is the model's own forward and runs OUTSIDE the
+            # contract fallback below: its errors are the model's, must
+            # surface as-is (never re-run through the original a second time),
+            # and never disable bucketing.
+            output = self._original(*args, **kwargs)
+            split = _split_output(output)
+            if split is None:
+                self._disabled = True
+                logger.warning(
+                    "Bucketed encoder %r disabled: unsupported output type %r",
+                    self.name,
+                    type(output).__name__,
+                )
                 return output
+            self._rebuild = split[1]
+            self._aux_spec = split[2]
+            return output
+        try:
             bucketed, aux = self._bucketed(features, lengths, mask, length_arg, windows)
             return self._rebuild(bucketed, aux)
-        except Exception:
+        except _OutputContractError as exc:
+            # Deterministic output-contract mismatch (same pairing fails the
+            # same way every batch): disable once and serve eager. Everything
+            # else — programming errors, CUDA faults — surfaces untouched.
             self._disabled = True
-            logger.warning("Bucketed encoder %r failed; falling back to eager", self.name, exc_info=True)
+            logger.warning("Bucketed encoder %r disabled: %s; falling back to eager", self.name, exc, exc_info=True)
             return self._original(*args, **kwargs)
 
     def _host_lengths(self, features, extra, carried):
@@ -549,7 +570,7 @@ class _BucketedEncoder:
         output = target(*inputs)
         features = _as_tensor(output)
         if features is None:
-            raise TypeError(f"encoder {self.name!r} returned an unsupported output type")
+            raise _OutputContractError(f"encoder {self.name!r} returned an unsupported output type")
         aux = None
         if self._aux_spec is not None and self._aux_spec[0] == "lengths":
             # The encoder returned (features, per-item lengths); carry the
@@ -558,7 +579,7 @@ class _BucketedEncoder:
             # tuple, so a length-carrying _aux_spec learned from the prime call
             # would otherwise make output[1] raise on the bucketed path.
             if not (isinstance(output, tuple) and len(output) == 2):
-                raise TypeError(
+                raise _OutputContractError(
                     f"encoder {self.name!r} returned {type(output).__name__}, expected a (features, lengths) tuple"
                 )
             aux = output[1][: features.size(0)]
