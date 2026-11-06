@@ -1771,9 +1771,16 @@ class OmniDiffusionConfig:
                     "ming_flash_omni_thinker",
                 ):
                     # Shared Bailing metadata also appears on Ming-Image checkpoints.
-                    self.model_class_name = resolve_model_class_name(self.model, revision=self.revision)
-                    if self.model_class_name == "MingImageDiffusionPipeline":
-                        self._load_component_transformer_config()
+                    if self.model_class_name is None:
+                        self.model_class_name = resolve_model_class_name(self.model, revision=self.revision)
+                    from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
+
+                    if self.model_class_name in (
+                        MING_IMAGE_PIPELINE.diffusers_class_name,
+                        *MING_IMAGE_PIPELINE.diffusers_class_aliases,
+                    ):
+                        if not self._load_component_transformer_config():
+                            self.set_tf_model_config(TransformerConfig())
                     else:
                         self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()

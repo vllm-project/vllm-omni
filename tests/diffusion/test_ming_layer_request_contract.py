@@ -124,3 +124,20 @@ def test_legacy_checkpoint_without_root_keeps_explicit_class(ming_checkpoint_con
     config.enrich_config()
     assert config.model_class_name == "MingImageDiffusionPipeline"
     assert config.tf_model_config.multi_frame_output is True
+
+
+def test_worker_keeps_explicit_registered_alias(ming_checkpoint_configs):
+    config = OmniDiffusionConfig(
+        model=ming_checkpoint_configs["design"], model_class_name="MingImageLayeredDiffusionPipeline"
+    )
+    config.enrich_config()
+    assert config.model_class_name == "MingImageLayeredDiffusionPipeline"
+    assert config.tf_model_config.multi_frame_output is True
+
+
+def test_missing_component_clears_root_transformer_config(ming_checkpoint_configs):
+    root = Path(ming_checkpoint_configs["design"])
+    (root / "transformer/config.json").unlink()
+    config = OmniDiffusionConfig(model=str(root), model_class_name="MingImageDiffusionPipeline")
+    config.enrich_config()
+    assert not hasattr(config.tf_model_config, "architectures")
