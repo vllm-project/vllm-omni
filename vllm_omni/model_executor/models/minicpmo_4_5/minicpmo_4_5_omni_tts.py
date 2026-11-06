@@ -2426,6 +2426,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}
+        # Every codec row this step emits is a real output row, so the
+        # validity mask is all-True with one entry per emitted row. The
+        # full-payload accumulator pairs ``codes.audio`` with this mask;
+        # without it a prefill step's first frame would accumulate as audio
+        # only and leave the consumer with one row more than the mask.
+        meta_outputs["codec_frame_valid"] = [
+            torch.ones(int(delta.shape[0]), dtype=torch.bool) if delta.numel() else torch.empty(0, dtype=torch.bool)
+            for delta in codec_deltas
+        ]
         if emit_duplex_metadata:
             meta_outputs.update(
                 {
