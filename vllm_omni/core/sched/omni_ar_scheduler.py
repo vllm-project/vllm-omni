@@ -848,13 +848,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         return getattr(request, "status", None) != RequestStatus.WAITING_FOR_STREAMING_REQ
 
-    def _seeded_parked_running(self) -> tuple[Any, ...]:
-        """Running requests parked in the chunk-transfer adapter for this step.
+    def _parked_running_requests(self) -> tuple[Any, ...]:
+        """Running requests parked in the chunk-transfer layer for this step.
 
         ``_process_pending_omni_inputs`` runs before the isolation scan and can
-        move a running request into the adapter's chunk-waiting deques until the
-        step ends. Missing it there would admit another request, and the restore
-        would put the seeded request back next to it (review P2 on #9937).
+        move a running request into the adapter's (or native coordinator's)
+        chunk-waiting deques until the step ends. Those rows are still running
+        for admission purposes: the engine has no free capacity, and a request
+        admitted now would be co-batched once the step restores them (review
+        P2 on #9937).
         """
         parked: tuple[Any, ...] = ()
         adapter = getattr(self, "chunk_transfer_adapter", None)
@@ -871,9 +873,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _seeded_isolation_plan(self) -> tuple[bool, bool]:
         """Whether to defer admission and/or admit only a waiting seeded request."""
-        parked_running = self._seeded_parked_running()
+        parked_running = self._parked_running_requests()
         return isolation_plan(
-            has_running=bool(self.running),
+            # Adapter/coordinator-parked runners still occupy the engine this
+            # step; counting only ``self.running`` would solo-admit a seeded
+            # request and then co-batch it on restore (review P2 on #9937).
+            has_running=bool(self.running) or bool(parked_running),
             seeded_running=any(
                 request_is_seeded(getattr(r, "sampling_params", None)) for r in (*self.running, *parked_running)
             ),
