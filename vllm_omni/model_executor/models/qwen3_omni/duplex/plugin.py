@@ -25,9 +25,13 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.contracts import (
+    DUPLEX_TURN_DELTA_KEY,
+    DuplexAppendPlan,
+    duplex_resource_request_belongs_to_session,
+)
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
-from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import DELTA_KEY, QwenIncrementalPrompt
+from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -1125,7 +1129,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if not has_audio and payload.get("type") != "conversation":
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
         messages = []
-        is_delta = bool(session_config.get("_duplex_turn_delta"))
+        is_delta = bool(session_config.get(DUPLEX_TURN_DELTA_KEY))
         if runtime_config.get("instructions") and not is_delta:
             messages.append({"role": "system", "content": runtime_config["instructions"]})
         history = session_config.get("qwen_messages")
@@ -1224,7 +1228,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 logger.exception("Failed to capture Qwen visual input request=%s", request_id)
         prompt_payload: dict[str, object] = {"prompt": prompt, "multi_modal_data": mm}
         if is_delta:
-            prompt_payload[DELTA_KEY] = True
+            prompt_payload[DUPLEX_TURN_DELTA_KEY] = True
         if remaining_tool_turns is not None:
             # Private write-back for the session after a successful submit.
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns

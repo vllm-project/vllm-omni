@@ -110,7 +110,6 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         request = self.from_request(self)
         request.prompt_token_ids = self.prompt_token_ids[self.append_prefix_length :]
         request.append_prefix_digest = token_prefix_digest(self.prompt_token_ids[: self.append_prefix_length])
-        request.resume_from_full_prompt = False
         return request
 
     @classmethod

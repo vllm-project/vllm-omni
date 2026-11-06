@@ -1642,7 +1642,7 @@ async def test_resident_image_replacement_rebuilds_after_admission_limit(mocker)
         second = h.port.submissions[-1]
         assert second.context.request_id == request_id
         assert second.already_submitted and second.resume_from_full_prompt
-        assert "_qwen_turn_delta" not in second.prompt
+        assert "_duplex_turn_delta" not in second.prompt
         assert snapshot.call_count == 1
         can_append.assert_not_awaited()
         images = second.prompt["multi_modal_data"]["image"]
@@ -2500,11 +2500,11 @@ async def test_committed_turns_preserve_lifecycle_and_process_only_required_hist
             assert decode.call_count == expected_audio
             if use_delta:
                 assert snapshot.call_count == 0
-                assert h.port.submissions[-1].prompt["_qwen_turn_delta"] is True
+                assert h.port.submissions[-1].prompt["_duplex_turn_delta"] is True
                 assert h.port.submissions[-1].history_revision == h.session.history_revision
             else:
                 assert snapshot.call_count == 1
-                assert "_qwen_turn_delta" not in h.port.submissions[-1].prompt
+                assert "_duplex_turn_delta" not in h.port.submissions[-1].prompt
                 assert h.port.submissions[-1].history_revision is None
             text = OmniRequestOutput.from_stage_output(
                 tts_output(request_id, samples=0, text="hello", finished=True),

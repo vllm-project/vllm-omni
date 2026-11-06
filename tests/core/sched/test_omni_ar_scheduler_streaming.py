@@ -91,9 +91,9 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
-@pytest.mark.parametrize("matching", [True, False])
+@pytest.mark.parametrize("delta", [True, False])
 @pytest.mark.parametrize("in_flight", [0, 1, 2])
-def test_async_full_prompt_continuation_waits_for_previous_turn(matching, in_flight):
+def test_async_full_prompt_continuation_waits_for_previous_turn(delta, in_flight):
     """Do not reset a resident worker row while its old outputs are pending."""
     sched = _make_live_session_scheduler(max_model_len=128, scheduler_cls=OmniARAsyncScheduler)
     sched.cache_config = SimpleNamespace(block_size=16)
@@ -119,12 +119,16 @@ def test_async_full_prompt_continuation_waits_for_previous_turn(matching, in_fli
     assert session.num_output_placeholders == 0
     assert sched.num_waiting_for_streaming_input == 1
 
-    update = _make_update(list(range(50)))
+    update = _make_update(list(range(34, 50)) if delta else list(range(50)))
     update.resume_from_full_prompt = True
-    update.block_hashes = (b"first", b"second" if matching else b"changed", b"third")
+    update.cache_salt = None
+    if delta:
+        update.append_prefix_length = 34
+        update.append_prefix_digest = token_prefix_digest(list(range(34)))
     sched._update_request_as_session(session, update)
 
-    assert session.num_computed_tokens == (32 if matching else 0)
+    assert session.num_computed_tokens == (32 if delta else 0)
+    assert session.prompt_token_ids == list(range(50))
     assert session.num_stale_output_tokens == in_flight
     assert session.num_output_tokens == 0
     assert sched.num_waiting_for_streaming_input == 0
@@ -141,15 +145,16 @@ def test_async_full_prompt_continuation_waits_for_previous_turn(matching, in_fli
         assert session.num_output_placeholders == 0
         assert session.num_output_tokens == 0
     assert sched._handle_blocked_waiting_request(session)
-    assert session.num_computed_tokens == (32 if matching else 0)
-    if matching:
+    assert session.num_computed_tokens == (32 if delta else 0)
+    if delta:
         sched._free_request_blocks.assert_not_called()
     else:
+        # Upstream prefix caching re-matches unchanged snapshot blocks.
         sched._free_request_blocks.assert_called_once_with(session)
 
     # The first new-turn result must go through the real AsyncScheduler
     # placeholder accounting, cache update and EngineCore output emission.
-    num_scheduled = len(update.prompt_token_ids) - session.num_computed_tokens
+    num_scheduled = len(session.prompt_token_ids) - session.num_computed_tokens
     session.status = RequestStatus.RUNNING
     session.num_computed_tokens += num_scheduled
     session.num_in_flight_tokens = num_scheduled
@@ -240,7 +245,6 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
         update.append_prefix_digest = token_prefix_digest(tokens[:35])
         update.prompt_token_ids = tokens[35:]
         update.mm_features = [replace(features[-1], mm_position=replace(features[-1].mm_position, offset=5))]
-        update.block_hashes = ()
     original_offsets = [f.mm_position.offset for f in update.mm_features]
     upstream_update = VLLMScheduler._update_request_as_session
 
@@ -264,7 +268,9 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     sched.log_stats = True
     sched._update_request_as_session(session, update)
 
-    retained = 32 if change in {"append", "delta"} else 0
+    # Only a validated delta keeps resident KV; every snapshot is rebuilt
+    # through upstream prefix caching.
+    retained = 32 if change == "delta" else 0
     upstream.assert_called_once()
     delta = upstream.call_args.args[2]
     assert delta.prompt_token_ids == tokens[retained:]
