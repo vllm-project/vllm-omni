@@ -386,6 +386,7 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, moc
     """
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
+    derenderer_ctor = mocker.patch.object(api_server, "OnlineDerenderer")
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", lambda **kwargs: SimpleNamespace(**kwargs))
     engine = _FakeDuplexOmni()
     state = State()
@@ -401,7 +402,9 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, moc
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
     assert state.openai_serving_chat is not None
     renderer_ctor.assert_called_once()
+    derenderer_ctor.assert_called_once()
     assert renderer_ctor.call_args.kwargs["log_error_stack"] is log_error_stack
+    assert derenderer_ctor.call_args.kwargs["log_error_stack"] is log_error_stack
     assert state.openai_serving_chat.online_renderer is state.online_renderer is renderer_ctor.return_value
     state.online_renderer.warmup.assert_called_once_with()
     assert state.engine_client is engine
@@ -583,6 +586,7 @@ async def test_duplex_chat_initialization_respects_model_gates(
     """Neither gate may construct or warm up a chat renderer."""
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
+    derenderer_ctor = mocker.patch.object(api_server, "OnlineDerenderer")
     chat_ctor = mocker.patch.object(api_server, "OmniOpenAIServingChat")
     engine = _FakeDuplexOmni()
     engine._capabilities = DuplexCapabilities(supports_chat_completions=supports_chat)
@@ -594,6 +598,7 @@ async def test_duplex_chat_initialization_respects_model_gates(
     assert state.openai_serving_chat is None
     assert state.openai_serving_chat_batch is None
     renderer_ctor.assert_not_called()
+    derenderer_ctor.assert_not_called()
     chat_ctor.assert_not_called()
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
 

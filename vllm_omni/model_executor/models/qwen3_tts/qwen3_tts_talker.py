@@ -854,6 +854,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             runtime["input_stream"] = stream = dict(runtime.get("input_stream", {}))
             stream["token_ids"] = list(update["token_ids"])
         else:
+            # MRv2 re-admits preempted requests through scheduled_new_reqs;
+            # add_requests installs a full snapshot before any cached delta.
+            # Covered by test_text_input_preemption_resends_latest_input and
+            # test_async_real_preemption_drains_inflight_output_before_readmission.
             if "input_stream" not in runtime:
                 raise RuntimeError("Cannot apply a text input delta without an installed input_stream snapshot")
             stream = runtime["input_stream"]

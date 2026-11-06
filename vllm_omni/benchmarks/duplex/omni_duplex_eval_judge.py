@@ -35,8 +35,21 @@ class DuplexJudge:
     def __init__(self, base_url: str, model: str, *, api_key: str = "EMPTY", timeout: float = 600.0) -> None:
         self.base_url, self.model, self.api_key, self.timeout = base_url, model, api_key, timeout
 
-    def chat(self, content: Any, *, system: str | None = None, max_tokens: int = 1200) -> str:
+    def chat(
+        self,
+        content: Any,
+        *,
+        system: str | None = None,
+        max_tokens: int = 1200,
+        followup: tuple[str, str] | None = None,
+    ) -> str:
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
+        if followup is not None:
+            assistant_reply, correction = followup
+            messages += [
+                {"role": "assistant", "content": assistant_reply},
+                {"role": "user", "content": correction},
+            ]
         response = requests.post(
             _build_openai_url(self.base_url, "/chat/completions"),
             json={
@@ -60,13 +73,17 @@ class DuplexJudge:
             raise JudgeResponseError(content, choice.get("finish_reason"))
         return content
 
-    def temporal(self, prompt: str, frames: list[bytes]) -> str:
+    def temporal(self, prompt: str, frames: list[bytes], *, followup: tuple[str, str] | None = None) -> str:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         content.extend(
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(frame).decode()}}
             for frame in frames
         )
-        return self.chat(content, system="You are a careful evaluator for real-time multimodal systems.")
+        return self.chat(
+            content,
+            system="You are a careful evaluator for real-time multimodal systems.",
+            followup=followup,
+        )
 
     def content(
         self,
@@ -75,6 +92,7 @@ class DuplexJudge:
         frames: list[bytes] | None = None,
         *,
         mode: str = "video_url",
+        followup: tuple[str, str] | None = None,
     ) -> str:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if mode == "video_url" and video is not None:
@@ -87,4 +105,4 @@ class DuplexJudge:
                 }
                 for frame in (frames or [])
             )
-        return self.chat(content)
+        return self.chat(content, followup=followup)

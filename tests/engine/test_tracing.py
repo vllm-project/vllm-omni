@@ -20,6 +20,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from vllm.outputs import RequestError
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -33,7 +34,7 @@ from tests.engine.test_orchestrator import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.messages import StageSubmissionMessage
+from vllm_omni.engine.messages import ErrorMessage, StageSubmissionMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import StageRuntimeInfo
@@ -172,6 +173,54 @@ async def test_orchestrator_closes_diffusion_request_and_stage(recording, outcom
         assert all(s.attributes["error.type"] == "engine_dead" for s in spans)
     assert not orch.request_states
     assert all("private" not in str(s.attributes) for s in spans)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_miss", [False, True], ids=["engine-paused", "mm-cache-miss"])
+async def test_raw_stage_error_trace_matches_frontend_classification(recording, mocker, cache_miss):
+    tracer, exporter = recording
+    pools = _build_stage_pools([[FakeStageClient(final_output=True)]])
+    mocker.patch.object(pools[0], "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[])
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
+    orch = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+        tracer=tracer,
+    )
+    request_trace = RequestTrace(tracer, "failed", HEADERS)
+    request_trace.start_stage(0, 0, "llm")
+    orch.request_states["failed"] = OrchestratorRequestState(
+        request_id="failed", final_stage_id=0, sampling_params_list=[_sampling_params()], trace=request_trace
+    )
+    mocker.patch.object(orch, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    raw = EngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(
+                request_id="failed",
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                error=RequestError(code="engine_paused", message="Generation is paused.", retryable=True),
+                mm_cache_miss_hashes=["missing"] if cache_miss else None,
+            )
+        ]
+    )
+
+    await orch._process_llm_stage_outputs(0, 0, raw, set())
+
+    error = output_queue.get_nowait()
+    expected_type = "ServiceUnavailableError" if cache_miss else "engine_paused"
+    assert error.error_type == expected_type
+    assert error.status_code == (503 if cache_miss else None)
+    assert error.mm_cache_miss_hashes == (["missing"] if cache_miss else None)
+    assert output_queue.empty()
+    assert not orch.request_states
+    spans = exporter.get_finished_spans()
+    assert {span.name for span in spans} == {"omni.pipeline", "omni.stage"}
+    assert len(spans) == 2
+    assert all(span.attributes["error.type"] == expected_type for span in spans)
+    assert all(span.status.status_code == trace.StatusCode.ERROR for span in spans)
 
 
 @pytest.mark.asyncio
