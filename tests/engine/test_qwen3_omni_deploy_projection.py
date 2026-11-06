@@ -84,6 +84,8 @@ _ENGINE_VALUE_ATTRS = {
     "async_scheduling": ("scheduler_config", "async_scheduling"),
 }
 _DEPLOY_ENGINE_KEYS = tuple(_ENGINE_VALUE_ATTRS)
+# Only keys the assertions read. Other stage YAML stays out of ``explicit``.
+_EXPLICIT_STAGE_KEYS = frozenset(_DEPLOY_ENGINE_KEYS) | {"default_sampling_params"}
 
 
 def _production_resolution(monkeypatch: pytest.MonkeyPatch):
@@ -105,26 +107,29 @@ def _production_resolution(monkeypatch: pytest.MonkeyPatch):
 
 
 def _explicit_stage_settings(raw_deploy: dict, stage_id: int, platform: str = "cuda") -> dict:
-    """Settings the YAML wrote for one stage. Omitted keys are absent.
+    """YAML values the projection asserts read. Omitted keys are absent.
 
-    Includes that platform's stage overlay and pipeline-wide keys the file
-    actually sets. Dataclass defaults never appear here.
+    Stage entries, that platform's overlay, and pipeline-wide keys are
+    consulted, but only ``_EXPLICIT_STAGE_KEYS`` are kept. Dataclass
+    defaults never appear here.
     """
     by_id = {stage["stage_id"]: stage for stage in raw_deploy.get("stages") or []}
     explicit: dict = {}
 
+    def _keep(source: dict) -> None:
+        for key, value in source.items():
+            if key in _EXPLICIT_STAGE_KEYS:
+                explicit[key] = value
+
     def _take(mapping: dict) -> None:
-        for key, value in mapping.items():
-            if key in {"stage_id", "runtime", "engine_args", "engine_extras"}:
-                continue
-            explicit[key] = value
+        _keep(mapping)
         runtime = mapping.get("runtime") or {}
         if isinstance(runtime, dict):
-            explicit.update(runtime)
+            _keep(runtime)
         for nested_name in ("engine_args", "engine_extras"):
             nested = mapping.get(nested_name) or {}
             if isinstance(nested, dict):
-                explicit.update(nested)
+                _keep(nested)
 
     _take(by_id[stage_id])
     platform_section = (raw_deploy.get("platforms") or {}).get(platform) or {}
@@ -132,7 +137,7 @@ def _explicit_stage_settings(raw_deploy: dict, stage_id: int, platform: str = "c
         if overlay.get("stage_id") == stage_id:
             _take(overlay)
     for name in PIPELINE_WIDE_ENGINE_FIELDS:
-        if name in raw_deploy and name not in explicit:
+        if name in _EXPLICIT_STAGE_KEYS and name in raw_deploy and name not in explicit:
             explicit[name] = raw_deploy[name]
     return explicit
 
