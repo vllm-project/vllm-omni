@@ -301,5 +301,14 @@ model_config:
 - **State:** history and bank publish only after an all-layer clean forward;
   failures, reset and close leave canonical state unchanged.
 
+For large CUDA host banks, PyTorch's host-registration allocator can reduce
+cold pinned-allocation cost. Before starting the process, add
+`pinned_use_cuda_host_register:True,pinned_num_register_threads:8` to
+`PYTORCH_ALLOC_CONF`, preserving any existing allocator options. This is a
+process-wide PyTorch setting, not a WorldKV configuration field; benchmark it
+with the actual workload and host CPU resources. It changes how pages are
+allocated and registered rather than preallocating the entire bank. See
+[PyTorch CUDA memory management](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf).
+
 This is a method transfer, not a reproduction of the paper's benchmark.
 Quality and performance claims need E2E results for the exact revision.
