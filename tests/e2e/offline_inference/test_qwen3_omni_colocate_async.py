@@ -29,13 +29,26 @@ from vllm.inputs import TokensPrompt
 
 from tests.helpers.clean import wait_for_gpu_memory_to_clear
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import AsyncOmniParams
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    AsyncOmniParams,
+)
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.platforms import current_omni_platform
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 # Same order of magnitude as the #8678 sleep and parked-generate waits.
 _ENGINE_CONTROL_TIMEOUT_S = 180
+# Only ROCm gets the bounded cold-NFS init allowance. CUDA keeps runner defaults.
+_COLD_START_KWARGS = (
+    {
+        "stage_init_timeout": QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+        "init_timeout": QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    }
+    if current_omni_platform.is_rocm()
+    else {}
+)
 
 
 def _output_token_ids(output) -> list[int]:
@@ -69,7 +82,7 @@ _COLOCATE_ASYNC_PARAMS = [
         AsyncOmniParams(
             model=MODEL,
             deploy_config=_colocate_async_deploy(),
-            extra_omni_kwargs={"enable_sleep_mode": True},
+            extra_omni_kwargs={"enable_sleep_mode": True, **_COLD_START_KWARGS},
         ),
         id="colocate_async",
     )
