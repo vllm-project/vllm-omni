@@ -1148,7 +1148,7 @@ def test_bucketing_stays_off_without_vllm_config():
 )
 def test_invalid_seconds_config_raises(bad):
     """A malformed audio_bucket_seconds must fail loudly at model construction
-    (ValueError), never silently disable or mis-arm the feature."""
+    (ValueError), never silently disable or wrongly arm the feature."""
     from vllm_omni.worker.bucketed_encoder import _ladder_seconds
 
     with pytest.raises(ValueError):
