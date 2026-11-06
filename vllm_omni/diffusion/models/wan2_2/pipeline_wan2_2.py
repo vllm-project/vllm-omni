@@ -104,6 +104,19 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     )
 
 
+def refresh_cache_for_denoise_schedule(pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None) -> None:
+    """Size an active Cache-DiT context to the schedule forward() resolved for this request.
+
+    The model runner refreshes cache state before forward() starts, when the
+    request's sample solver, flow shift and boundary are not resolved yet. Call
+    this once they are, so each expert's step budget is counted from the exact
+    timesteps diffuse() will route to it.
+    """
+    refresh = getattr(pipeline, "_cache_dit_refresh_for_schedule", None)
+    if refresh is not None:
+        refresh(pipeline, timesteps, boundary_timestep)
+
+
 def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
     gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
@@ -147,6 +160,21 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         return float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+
+
+def resolve_wan_boundary_ratio(
+    engine_boundary_ratio: float | None,
+    sampling_params: OmniDiffusionSamplingParams,
+    warn_context: str | None = None,
+) -> float:
+    """Return the effective MoE boundary: engine override, then request, then 0.875."""
+    if engine_boundary_ratio is not None:
+        return engine_boundary_ratio
+    if sampling_params.boundary_ratio is not None:
+        return sampling_params.boundary_ratio
+    if warn_context is not None:
+        logger.warning("boundary_ratio is required for %s generation. using default value 0.875", warn_context)
+    return 0.875
 
 
 def resolve_wan_guidance_scales(
@@ -416,6 +444,10 @@ class Wan22Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts. The
+    # DMD checkpoint overrides it in __init__ with its fixed three transitions.
+    default_num_inference_steps: int = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -602,6 +634,8 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
+        if self.is_dmd:
+            self.default_num_inference_steps = len(FASTWAN_DMD_TIMESTEPS)
         self._sample_solver = "euler" if self.is_dmd else "unipc"
         self._flow_shift = (
             FASTWAN_DMD_SCHEDULER_SHIFT
@@ -1157,7 +1191,6 @@ class Wan22Pipeline(
         settings = []
         for request in batch.requests:
             sampling = request.sampling_params
-            boundary = self.boundary_ratio if self.boundary_ratio is not None else sampling.boundary_ratio
             current = {
                 "height, width and num_frames": effective_wan_dimensions(
                     sampling,
@@ -1169,7 +1202,7 @@ class Wan22Pipeline(
                     sampling, default_guidance_scale=1.0 if self.is_dmd else 4.0
                 ),
                 "num_outputs_per_prompt": sampling.num_outputs_per_prompt or 1,
-                "boundary_ratio": 0.875 if boundary is None else boundary,
+                "boundary_ratio": resolve_wan_boundary_ratio(self.boundary_ratio, sampling),
             }
             if uses_text_encoder:
                 current["max_sequence_length"] = sampling.max_sequence_length or 512
@@ -1239,7 +1272,9 @@ class Wan22Pipeline(
             # request-level step counts, including the engine's 1-step warmup.
             num_steps = len(FASTWAN_DMD_TIMESTEPS)
         else:
-            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+            num_steps = (
+                self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+            )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
@@ -1256,11 +1291,7 @@ class Wan22Pipeline(
         self._guidance_scale_2 = guidance_high
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="T2V")
 
         # validate shapes
         self.check_inputs(
@@ -1346,6 +1377,7 @@ class Wan22Pipeline(
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()

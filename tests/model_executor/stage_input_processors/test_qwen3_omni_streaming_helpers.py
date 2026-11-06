@@ -353,6 +353,20 @@ def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
     }
 
 
+def test_thinker2talker_token_only_accepts_plain_text_prompt() -> None:
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-plain-text",
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(cumulative_token_ids=[3])],
+        )
+    ]
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs, prompt="What is the capital of China?")
+
+    assert talker_prompt["additional_information"] is None
+
+
 def test_accumulator_replaces_keys_in_replace_set() -> None:
     """REPLACE-key semantics: subsequent emissions of the same key replace, not append."""
     from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -811,6 +825,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
     model._batch_stats_decoded_frames = 0
     model._batch_stats_actual_frames = Counter()
     model._batch_stats_bucket_groups = Counter()
+    model._streaming_codec = None
 
     payload_codes = torch.tensor([1, 3, 2, 4], dtype=torch.long)
     out = model.forward(
@@ -986,6 +1001,7 @@ def test_cosyvoice3_full_payload_replace_keys_present() -> None:
 
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
     """Smoke: ming_flash_omni token-only carries voice metadata."""
+    from vllm_omni.inputs.data import OmniTokensPrompt
     from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
         thinker2talker_token_only,
     )
@@ -998,12 +1014,11 @@ def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
         def __init__(self, text):
             self.outputs = [_Out(text)]
 
-    class _Prompt:
-        def __init__(self, info):
-            self.additional_information = info
-
     src = [_Wrap("hello world")]
-    prompt = _Prompt({"voice_name": "ZH_FEMALE", "prompt_text": "ref text"})
+    prompt = OmniTokensPrompt(
+        prompt_token_ids=[1],
+        additional_information={"voice_name": "ZH_FEMALE", "prompt_text": "ref text"},
+    )
     out = thinker2talker_token_only(src, prompt=prompt)
     assert len(out) == 1
     assert out[0]["prompt_token_ids"] == [0]

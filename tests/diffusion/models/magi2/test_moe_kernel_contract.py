@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-import vllm_omni.diffusion.models.magi2.fused_moe_kernels as kernels
+import vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels as kernels
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 

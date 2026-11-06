@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import itertools
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -32,6 +34,114 @@ except Exception as e:
         "FlashInfer is unavailable; FLASHINFER_ATTN backend will not work. Reason: %s",
         e,
     )
+
+
+# --- Unified fullgraph boundary --------------------------------------------
+#
+# torch.compile(fullgraph=True) cannot trace FlashInfer's wrapper path: the
+# plan/run helpers are @torch.compiler.disable'd (a hard error under
+# fullgraph) and they reach functools.cache'd module loaders that open cubin
+# files. The single boundary op below makes every configuration opaque:
+# Dynamo sees one custom op, while the data-dependent all-keep mask elision,
+# the mask reject/SDPA-fallback decisions, the wrapper plan/run and the fp8
+# scale extraction all execute eagerly inside its body.
+#
+# Per-instance state travels as a CPU int64 token TENSOR, not an int: a
+# Python int argument would be baked into each compiled graph as a literal
+# guard (one graph per attention instance, until Dynamo's recompile limit
+# aborts), while a tensor is an ordinary graph input that equivalent
+# instances share. The token is read back to a handle only inside the op.
+_IMPL_REGISTRY: weakref.WeakValueDictionary[int, FlashInferAttentionImpl] = weakref.WeakValueDictionary()
+_IMPL_HANDLE_COUNTER = itertools.count(1)
+
+
+def _register_impl_for_boundary_op(impl: FlashInferAttentionImpl) -> int:
+    handle = next(_IMPL_HANDLE_COUNTER)
+    _IMPL_REGISTRY[handle] = impl
+    return handle
+
+
+def _lookup_impl_for_boundary_op(handle: int) -> FlashInferAttentionImpl:
+    try:
+        return _IMPL_REGISTRY[handle]
+    except KeyError:
+        raise RuntimeError(
+            f"FLASHINFER_ATTN impl handle {handle} is no longer alive; the "
+            "attention impl was garbage-collected while its handle was still "
+            "reachable from a compiled graph"
+        ) from None
+
+
+if not hasattr(torch.ops.vllm_omni, "flashinfer_attention"):
+
+    @torch.library.custom_op(
+        "vllm_omni::flashinfer_attention",
+        mutates_args=(),
+    )
+    def _flashinfer_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        impl_token: torch.Tensor,
+    ) -> torch.Tensor:
+        impl = _lookup_impl_for_boundary_op(int(impl_token))
+        # Exact pre-boundary-op semantics: the all-keep elision runs first,
+        # then the causal/cute-dsl rejections inspect the *elided* mask, so an
+        # all-keep mask behaves exactly like no mask at all.
+        custom_mask = None
+        sdpa_reason: str | None = None
+        if attn_mask is not None:
+            try:
+                custom_mask = impl._pack_mask_for_flashinfer(
+                    attn_mask,
+                    batch_size=query.shape[0],
+                    qo_len=query.shape[1],
+                    kv_len=key.shape[1],
+                )
+            except ValueError:
+                if impl.backend_explicit:
+                    raise
+                sdpa_reason = "attn_mask is not a FlashInfer boolean custom_mask"
+            if custom_mask is not None and impl.causal:
+                if impl.backend_explicit:
+                    raise ValueError(
+                        "FLASHINFER_ATTN does not support causal=True together with an explicit custom mask."
+                    )
+                sdpa_reason = "causal=True with a custom mask"
+            if custom_mask is not None and impl.flashinfer_backend == "cute-dsl":
+                if impl.backend_explicit:
+                    raise ValueError(
+                        "FLASHINFER_ATTN cute-dsl backend does not support custom masks. "
+                        "Select TORCH_SDPA or a FlashInfer backend that accepts custom_mask."
+                    )
+                sdpa_reason = "cute-dsl does not support custom masks"
+        if sdpa_reason is not None:
+            # SDPAImpl only consumes metadata.attn_mask, so reconstructing the
+            # metadata from the raw mask is equivalent to the pre-boundary
+            # fallback, which passed the caller's metadata through.
+            return impl._sdpa_for_unsupported_mask(
+                query,
+                key,
+                value,
+                AttentionMetadata(attn_mask=attn_mask),
+                sdpa_reason,
+            ).contiguous()
+        return impl._run_batch_prefill(query, key, value, custom_mask)
+
+    @_flashinfer_attention_op.register_fake
+    def _flashinfer_attention_fake(
+        query,
+        key,
+        value,
+        attn_mask,
+        impl_token,
+    ):
+        # Shape-only: never reads the mask contents or the impl registry.
+        return query.new_empty(query.shape[0], query.shape[1], query.shape[2], value.shape[-1])
+
+
+_flashinfer_attention_op = torch.ops.vllm_omni.flashinfer_attention
 
 
 class FlashInferAttentionBackend(AttentionBackend):
@@ -120,6 +230,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         self._check_flashinfer_version()
 
         self.flashinfer_backend = self._select_backend(requested_backend, device=self.device)
+
         workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
         self._workspace = torch.empty(
             workspace_size,
@@ -131,6 +242,11 @@ class FlashInferAttentionImpl(AttentionImpl):
             kv_layout="NHD",
             backend=self.flashinfer_backend,
         )
+        self._op_handle = _register_impl_for_boundary_op(self)
+        # Tensor form of _op_handle for the boundary-op call site: an int would
+        # become a per-instance literal guard in compiled graphs. CPU on
+        # purpose — the op reads it back with a cheap host-side item().
+        self._op_token = torch.tensor(self._op_handle, dtype=torch.int64, device="cpu")
         self._qo_indptr: torch.Tensor | None = None
         self._kv_indptr: torch.Tensor | None = None
         self._plan_key: FlashInferAttentionImpl._WrapperPlanKey | None = None
@@ -211,6 +327,42 @@ class FlashInferAttentionImpl(AttentionImpl):
         return tensor.to(to_dtype), 1.0
 
     @staticmethod
+    def _validated_mask_view(
+        attn_mask: torch.Tensor,
+        batch_size: int,
+        qo_len: int,
+        kv_len: int,
+    ) -> torch.Tensor:
+        """Validate a diffusion attn_mask against the target shape and return
+        its broadcastable (collapsed) view without reading its contents.
+
+        Called by ``_pack_mask_for_flashinfer`` inside the boundary op (the
+        reject/fallback decisions share the packed result).
+        """
+        if attn_mask.dtype != torch.bool:
+            # Additive masks (0 / -inf / -1e4 / finfo.min) cannot be faithfully
+            # reduced to a boolean keep-mask here; SDPA handles them correctly.
+            raise ValueError(f"non-boolean attn_mask (dtype={attn_mask.dtype}); FlashInfer custom_mask is boolean-only")
+        # Diffusion masks arrive as (qo,kv), (1,1,kv), (B,1,1,kv), (B,1,qo,kv)
+        # or (B,H,qo,kv). The mask is identical across heads, so collapse the
+        # head dim, but keep a real batch dim — indexing mask[0] would reuse
+        # sample 0's padding for every sample (wrong under CFG / mixed lengths).
+        mask = attn_mask
+        if mask.dim() == 4:
+            mask = mask[:, 0]  # (B, qo|1, kv)
+        if mask.dim() == 3 and mask.shape[0] == 1:
+            mask = mask[0]  # (qo|1, kv) — shared across the batch
+        try:
+            if mask.dim() >= 3:
+                return mask.broadcast_to((batch_size, qo_len, kv_len))
+            return mask.broadcast_to((qo_len, kv_len))
+        except RuntimeError as e:
+            raise ValueError(
+                f"attn_mask shape {tuple(attn_mask.shape)} cannot broadcast to "
+                f"(batch={batch_size}, qo_len={qo_len}, kv_len={kv_len})"
+            ) from e
+
+    @staticmethod
     def _pack_mask_for_flashinfer(
         attn_mask: torch.Tensor, batch_size: int, qo_len: int, kv_len: int
     ) -> torch.Tensor | None:
@@ -223,29 +375,9 @@ class FlashInferAttentionImpl(AttentionImpl):
         additive/float masks and shape mismatches raise ``ValueError`` because
         an explicitly selected backend must not silently switch to SDPA.
         """
-        mask = attn_mask
-        if mask.dtype != torch.bool:
-            # Additive masks (0 / -inf / -1e4 / finfo.min) cannot be faithfully
-            # reduced to a boolean keep-mask here; SDPA handles them correctly.
-            raise ValueError(f"non-boolean attn_mask (dtype={mask.dtype}); FlashInfer custom_mask is boolean-only")
-        # Diffusion masks arrive as (qo,kv), (1,1,kv), (B,1,1,kv), (B,1,qo,kv)
-        # or (B,H,qo,kv). The mask is identical across heads, so collapse the
-        # head dim, but keep a real batch dim — indexing mask[0] would reuse
-        # sample 0's padding for every sample (wrong under CFG / mixed lengths).
-        if mask.dim() == 4:
-            mask = mask[:, 0]  # (B, qo|1, kv)
-        if mask.dim() == 3 and mask.shape[0] == 1:
-            mask = mask[0]  # (qo|1, kv) — shared across the batch
-        try:
-            if mask.dim() >= 3:
-                mask = mask.broadcast_to((batch_size, qo_len, kv_len))
-            else:
-                mask = mask.broadcast_to((qo_len, kv_len))
-        except RuntimeError as e:
-            raise ValueError(
-                f"attn_mask shape {tuple(attn_mask.shape)} cannot broadcast to "
-                f"(batch={batch_size}, qo_len={qo_len}, kv_len={kv_len})"
-            ) from e
+        # ``mask.all()`` below is content-dependent: this must only run inside
+        # the boundary op or in eager code, never under Dynamo.
+        mask = FlashInferAttentionImpl._validated_mask_view(attn_mask, batch_size, qo_len, kv_len)
         if mask.all():
             return None
         # ``broadcast_to`` returns a non-contiguous view; materialize for the
@@ -400,7 +532,10 @@ class FlashInferAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
-        logger.warning_once("FLASHINFER_ATTN falling back to SDPA: %s", reason)
+        # Dynamo cannot trace logging calls; skip them inside compiled code so
+        # the fallback stays fullgraph-transparent.
+        if not torch.compiler.is_compiling():
+            logger.warning_once("FLASHINFER_ATTN falling back to SDPA: %s", reason)
         fallback = self._sdpa_fallback
         if fallback is None:
             fallback = SDPAImpl(
@@ -409,7 +544,11 @@ class FlashInferAttentionImpl(AttentionImpl):
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
             )
-            self._sdpa_fallback = fallback
+            # Cache only outside compilation: under Dynamo the impl is a
+            # closed-over constant and eager-side caching already covers the
+            # repeated-call win.
+            if not torch.compiler.is_compiling():
+                self._sdpa_fallback = fallback
         return fallback.forward_cuda(query, key, value, attn_metadata)
 
     def forward_cuda(
@@ -428,54 +567,16 @@ class FlashInferAttentionImpl(AttentionImpl):
         # Explicit FLASHINFER_ATTN must not silently switch away from the
         # requested kernel. Automatic platform selection (Blackwell cute-dsl)
         # may use SDPA for masks that this FlashInfer variant cannot run.
-        batch_size = query.shape[0]
-        custom_mask = None
-        if attn_metadata is not None and attn_metadata.attn_mask is not None:
-            try:
-                custom_mask = self._pack_mask_for_flashinfer(
-                    attn_metadata.attn_mask,
-                    batch_size=batch_size,
-                    qo_len=query.shape[1],
-                    kv_len=key.shape[1],
-                )
-            except ValueError:
-                if self.backend_explicit:
-                    raise
-                return self._sdpa_for_unsupported_mask(
-                    query,
-                    key,
-                    value,
-                    attn_metadata,
-                    "attn_mask is not a FlashInfer boolean custom_mask",
-                )
-            # FlashInfer cannot combine causal masking with a custom_mask; rather
-            # than silently dropping the explicit mask (diverging from SDPA),
-            # require an explicit caller to select a compatible backend.
-            if custom_mask is not None and self.causal:
-                if self.backend_explicit:
-                    raise ValueError(
-                        "FLASHINFER_ATTN does not support causal=True together with an explicit custom mask."
-                    )
-                return self._sdpa_for_unsupported_mask(
-                    query,
-                    key,
-                    value,
-                    attn_metadata,
-                    "causal=True with a custom mask",
-                )
-
-        if custom_mask is not None and self.flashinfer_backend == "cute-dsl":
-            if self.backend_explicit:
-                raise ValueError(
-                    "FLASHINFER_ATTN cute-dsl backend does not support custom masks. "
-                    "Select TORCH_SDPA or a FlashInfer backend that accepts custom_mask."
-                )
-            return self._sdpa_for_unsupported_mask(
-                query,
-                key,
-                value,
-                attn_metadata,
-                "cute-dsl does not support custom masks",
-            )
-
-        return self._run_batch_prefill(query, key, value, custom_mask)
+        #
+        # The mask's *contents* (the all-keep elision and the dependent
+        # causal/cute-dsl reject-or-fallback decisions) and the wrapper
+        # plan/run execute inside the opaque boundary op, preserving the
+        # pre-compile eager semantics.
+        raw_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        return _flashinfer_attention_op(
+            query,
+            key,
+            value,
+            raw_mask,
+            self._op_token,
+        )

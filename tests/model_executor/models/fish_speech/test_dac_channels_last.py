@@ -7,7 +7,7 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "H100"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)]
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

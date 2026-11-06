@@ -531,6 +531,7 @@ def test_stale_continue_does_not_close_the_new_response() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
+            history_calibration=None,
             plugin=SimpleNamespace(data_plane=SimpleNamespace()),
             stage_port=SimpleNamespace(),
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
@@ -620,6 +621,7 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
+            history_calibration=None,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=port,
             model_state=SimpleNamespace(

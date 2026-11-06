@@ -17,21 +17,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _generator_exponential_kernel(
-    out_ptr,
-    rows_ptr,
-    seed_ptr,
-    offset_ptr,
-    numel,
-    threads,
-    HAS_ROWS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    request = tl.program_id(0)
-    elements = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = elements < numel
-    seed = tl.load(seed_ptr + request).to(tl.uint64)
-    offset = tl.load(offset_ptr + request).to(tl.uint64)
+def torch_exponential_noise(seed, offset, elements, threads):
     # torch's grid-stride kernel: thread t draws curand_uniform4 once per grid
     # stride and element j = t + threads * (4 * call + component).
     thread = (elements % threads).to(tl.uint64)
@@ -52,8 +38,28 @@ def _generator_exponential_kernel(
         -5.960464477539063e-08,
         tl.extra.cuda.libdevice.fast_logf(uniform),
     )
+    return -log
+
+
+@triton.jit
+def _generator_exponential_kernel(
+    out_ptr,
+    rows_ptr,
+    seed_ptr,
+    offset_ptr,
+    numel,
+    threads,
+    HAS_ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    elements = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = elements < numel
+    seed = tl.load(seed_ptr + request).to(tl.uint64)
+    offset = tl.load(offset_ptr + request).to(tl.uint64)
+    noise = torch_exponential_noise(seed, offset, elements, threads)
     row = tl.load(rows_ptr + request).to(tl.int64) if HAS_ROWS else request.to(tl.int64)
-    tl.store(out_ptr + row * numel + elements, -log, mask=mask)
+    tl.store(out_ptr + row * numel + elements, noise, mask=mask)
 
 
 _POLICY_CACHE: dict[tuple[int, int], tuple[int, int]] = {}

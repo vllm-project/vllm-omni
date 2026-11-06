@@ -2,18 +2,22 @@
   'use strict';
   const profiles = root.OmniRealtimeProfiles;
   profiles['qwen3-turn'] = (config) => {
-    const vad = config.turnMode === 'vad';
+    const semantic = config.turnMode === 'semantic_vad';
+    const vad = config.turnMode === 'vad' || semantic;
     let interruptOnSpeech = vad;
     let imageSeq = 0;
     let imageItems = [];
     // The engine refuses a ninth image (or 4 MiB of them) for the whole
     // session, so the camera track retires its own oldest frame instead.
     const MAX_IMAGE_ITEMS = 8;
-    const hint = 'This Qwen deployment needs session_mode: duplex with Server VAD enabled.';
+    const hint = 'This Qwen deployment needs session_mode: duplex with Server VAD enabled.' +
+      (semantic ? ' Semantic VAD also requires the pre-downloaded Smart Turn artifact.' : '');
     return {
       title: 'Qwen3-Omni Voice', eyebrow: vad ? 'Engine-owned duplex call' : 'Turn-based Realtime call',
-      policy: vad ? 'Server VAD • interruptible responses' : 'Send turn • one response at a time',
-      description: vad
+      policy: vad ? `${semantic ? 'Semantic' : 'Server'} VAD • interruptible responses` : 'Send turn • one response at a time',
+      description: semantic
+        ? 'Pause to send your turn; speak again to interrupt. Complete turns wait about 1.2 s before the semantic check; incomplete turns may wait up to 4 s. Requires the Qwen duplex plugin, Silero and the pre-downloaded Smart Turn model. Microphone upload continues during playback; optional camera frames accompany each turn.'
+        : vad
         ? 'Pause to send your turn; speak again to interrupt. Microphone upload continues during playback. Requires the Qwen duplex plugin and Silero. Optional camera frames accompany each spoken turn.'
         : 'Speak, then press Send turn. Microphone upload pauses while the model answers. Conversation history stays on the Realtime session. No barge-in or camera input.',
       waiting: 'Waiting for you', camera: vad, cameraMaxDimension: 448, playbackAck: vad, clientCommit: !vad,
@@ -35,7 +39,9 @@
         interruptOnSpeech = vad;
         const session = { model: config.model, audio: { input: {
           format: { type: 'audio/pcm', rate: 24000 },
-          turn_detection: vad ? { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
+          turn_detection: semantic ? { type: 'semantic_vad', eagerness: 'auto',
+            create_response: true, interrupt_response: true } : vad ? {
+            type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
             silence_duration_ms: 500, create_response: true, interrupt_response: true } : null,
         } } };
         if (vad) session.overlap_policy = 'barge_in_on_speech';
@@ -75,7 +81,7 @@
           const turnDetection = input && 'turn_detection' in input
             ? input.turn_detection : event.session?.turn_detection;
           if (turnDetection !== undefined) {
-            interruptOnSpeech = vad && turnDetection?.type === 'server_vad'
+            interruptOnSpeech = vad && ['server_vad', 'semantic_vad'].includes(turnDetection?.type)
               && turnDetection.interrupt_response !== false;
           }
         }
@@ -102,6 +108,8 @@
         if (action.kind === 'error') {
           if (action.code === 'input_backpressure') return { ...action, kind: 'backpressure', message: 'Input buffer is full; please repeat dropped speech after the response.' };
           if (action.code === 'server_vad_initialization_failed') action.message = 'Server VAD could not load Silero. Configure the server artifact and restart the UI.';
+          else if (action.code === 'semantic_vad_unavailable') return { ...action, fatal: true,
+            message: 'Semantic VAD could not load Smart Turn. Pre-download the model or configure semantic_vad_model_path and restart the backend; alternatively restart this UI with --vad for Silero-only turns. ' + action.message };
           else if (vad && action.code === 'unsupported') action.message += ` ${hint}`;
         }
         return action;

@@ -84,7 +84,12 @@ def _make_server(engine_client=None):
 
 
 @pytest.fixture
-def test_app():
+def test_app(monkeypatch):
+    # Exercise seeded request wiring with a CPU generator in this CPU API test.
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        SimpleNamespace(device_type="cpu"),
+    )
     server = _make_server()
 
     original_fn = server.create_audio_generate
@@ -95,7 +100,7 @@ def test_app():
     async def patched_create_audio_generate(*args, **kwargs):
         return await original_fn(*args, **kwargs)
 
-    patched_create_audio_generate.__signature__ = new_sig
+    setattr(patched_create_audio_generate, "__signature__", new_sig)
     server.create_audio_generate = patched_create_audio_generate
 
     app = FastAPI()
@@ -276,6 +281,13 @@ class TestParameterWiring:
         call_kwargs = engine.generate.call_args[1]
         assert call_kwargs["prompt"]["prompt"] == "birds chirping"
         assert call_kwargs["output_modalities"] == ["audio"]
+
+    @pytest.mark.asyncio
+    async def test_watermarking_opt_out_wiring(self, server_and_engine):
+        server, engine = server_and_engine
+        await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="rain", watermarking=False))
+
+        assert engine.generate.call_args[1]["watermarking"] is False
 
     @pytest.mark.asyncio
     async def test_negative_prompt_wiring(self, server_and_engine):
@@ -634,7 +646,11 @@ class TestErrorHandling:
     @pytest.mark.parametrize(
         ("exc", "expected_message", "expected_stage_id"),
         [
-            (OmniEngineDeadError("engine dead", error_stage_id=2), "engine dead", 2),
+            (
+                OmniEngineDeadError("engine dead", error_stage_id=2),
+                OmniEngineDeadError.CLIENT_MESSAGE,
+                2,
+            ),
             (EngineGenerateError("engine generate failed"), "engine generate failed", None),
         ],
     )
@@ -686,7 +702,7 @@ class TestAudioGenerateAPI:
         assert response.headers["content-type"] == "audio/wav"
 
     def test_missing_input_rejected(self, client):
-        payload = {}
+        payload: dict[str, object] = {}
         response = client.post("/v1/audio/generate", json=payload)
         assert response.status_code == 422
 

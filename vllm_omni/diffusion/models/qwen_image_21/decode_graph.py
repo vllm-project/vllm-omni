@@ -155,9 +155,17 @@ class QwenImage21DecodeGraphEntry:
         # the tree; entries only keep their *output* alive, whose tiny size
         # makes reuse safe because the caller clones it before any other graph
         # on the pool replays.
-        with torch.inference_mode(False), torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                self.output = body()
+        # Pooled streams recycle, so warm-up may run on the capture stream and
+        # leave its cuBLAS workspace outside the graph pool, where evicting
+        # another graph frees it under survivors. Clear around capture, as
+        # torch cudagraph trees do, so captured workspaces live in the pool.
+        torch._C._cuda_clearCublasWorkspaces()
+        try:
+            with torch.inference_mode(False), torch.no_grad():
+                with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                    self.output = body()
+        finally:
+            torch._C._cuda_clearCublasWorkspaces()
         self.graph = graph
         self.captures += 1
 
@@ -450,6 +458,34 @@ class QwenImage21DecodeGraphManager:
         # Clone before returning: the output lives in the shared graph pool and
         # the next replay (of this or another graph on the pool) overwrites it.
         return entry.output.clone()
+
+    def release_idle_entries(self) -> None:
+        """Drop static prefix K/V left by finished requests.
+
+        Each entry keeps a full clone of the text+condition prefix. A finished
+        request's owner weakref is already dead, but the entry used to stay
+        until the LRU filled (default 8). The key also includes batch size and
+        prefix length, so keeping a dead entry for one field (image layout)
+        still stacked copies across the others (#8831).
+
+        Every dead owner is dropped. The next request recaptures that key
+        once. An in-flight owner stays, so a concurrent request can keep
+        replaying.
+        """
+        released = False
+        for key in list(self.entries):
+            owner = self._owners.get(key)
+            if owner is not None and owner() is not None:
+                continue
+            self.entries.pop(key, None)
+            self._owners.pop(key, None)
+            released = True
+        if released:
+            logger.info(
+                "Released idle Qwen-Image-2.1 decode-graph prefix copies (remaining=%d).",
+                len(self.entries),
+            )
+            current_omni_platform.empty_cache()
 
     def clear(self) -> None:
         """Drop all entries, freeing buffers and captured graphs."""
