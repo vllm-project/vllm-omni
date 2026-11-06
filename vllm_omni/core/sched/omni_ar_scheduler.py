@@ -836,13 +836,49 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    @staticmethod
+    def _request_is_runnable(request: Any) -> bool:
+        """Whether upstream would consider this request runnable now.
+
+        A resumable session parked in ``WAITING_FOR_STREAMING_REQ`` is skipped by
+        upstream until its client sends the next segment, so it must not drive
+        the solo decision: an idle seeded session would otherwise hide every
+        other queue while the engine has free capacity (review P2 on #9937).
+        It is counted again as soon as the update lands and makes it runnable.
+        """
+        return getattr(request, "status", None) != RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def _seeded_parked_running(self) -> tuple[Any, ...]:
+        """Running requests parked in the chunk-transfer adapter for this step.
+
+        ``_process_pending_omni_inputs`` runs before the isolation scan and can
+        move a running request into the adapter's chunk-waiting deques until the
+        step ends. Missing it there would admit another request, and the restore
+        would put the seeded request back next to it (review P2 on #9937).
+        """
+        parked: tuple[Any, ...] = ()
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            parked += (
+                *getattr(adapter, "waiting_for_chunk_running_requests", ()),
+                *getattr(adapter, "_held_non_active", ()),
+            )
+        coordinator = getattr(self, "input_coordinator", None)
+        if coordinator is not None:
+            # Native-coordinator path: same park/restore contract as the adapter.
+            parked += tuple(getattr(coordinator, "_waiting_for_chunk_running", ()))
+        return parked
+
     def _seeded_isolation_plan(self) -> tuple[bool, bool]:
         """Whether to defer admission and/or admit only a waiting seeded request."""
+        parked_running = self._seeded_parked_running()
         return isolation_plan(
             has_running=bool(self.running),
-            seeded_running=any(request_is_seeded(getattr(r, "sampling_params", None)) for r in self.running),
+            seeded_running=any(
+                request_is_seeded(getattr(r, "sampling_params", None)) for r in (*self.running, *parked_running)
+            ),
             seeded_waiting=any(
-                request_is_seeded(getattr(r, "sampling_params", None))
+                request_is_seeded(getattr(r, "sampling_params", None)) and self._request_is_runnable(r)
                 for r in (*self.waiting, *self.kv_holding_waiting)
             ),
         )
@@ -855,7 +891,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         for name, queue in (("waiting", self.waiting), ("kv_holding", self.kv_holding_waiting)):
             target = next(
-                (r for r in queue if request_is_seeded(getattr(r, "sampling_params", None))),
+                (
+                    r
+                    for r in queue
+                    if request_is_seeded(getattr(r, "sampling_params", None)) and self._request_is_runnable(r)
+                ),
                 None,
             )
             if target is None:
