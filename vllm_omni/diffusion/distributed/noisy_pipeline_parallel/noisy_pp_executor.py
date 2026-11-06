@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     Cell,
     CellPlan,
     Inflight,
@@ -23,7 +23,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     rank_of_block,
     rank_work,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import NoisyKVState
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)

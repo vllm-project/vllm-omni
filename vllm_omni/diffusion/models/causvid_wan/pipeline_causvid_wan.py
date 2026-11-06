@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CausVid Wan 2.1 1.3B on the Cell / Noisy KV path.
+"""CausVid Wan 2.1 1.3B on the Cell / Noisy PP path.
 
 Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
 CausVid defaults (shift=8, D=3, S=D+1) and optional student ``model.pt`` overlay.
@@ -41,12 +41,12 @@ from vllm_omni.diffusion.models.causvid_wan.weights import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.experimental.ar_diffusion.cell_executor import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     resolve_pp_rank_and_group,
     run_cell_pipeline,
 )
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellSchedule,
     Ordering,
     build_cell_plan,
@@ -55,7 +55,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     rank_of_block,
 )
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import (
     ARDiffusionNoisyKVSpec,
     clean_history_cells,
 )
@@ -519,137 +519,148 @@ class CausVidWanPipeline(nn.Module):
         kv_id = str(raw_session) if explicit_session else req_id
         return kv_id, persist, reset, close_session
 
-    def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def admit_cell_request(self, req: OmniDiffusionRequest) -> tuple[Any, str, bool, Any | None]:
+        """Admit CellPlan and build WanCell under the bound context.
+
+        Returns ``(adapter, kv_id, persist, stream_job)``.
+        """
         ctx = self._chunk_ctx
         if ctx is None:
             raise RuntimeError("CausVidWanPipeline requires bind_ar_diffusion_cell_context")
-        requests = _as_request_list(req)
         pp_rank, pp_group = resolve_pp_rank_and_group()
-
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
-        outputs: list[DiffusionOutput] = []
-        for item in requests:
-            req_id = str(getattr(item, "request_id", None) or "")
-            kv_id, persist, reset, close_session = self._noisy_request_lifecycle(item)
-            del close_session  # encoded in persist; kept for Runner parity
-            if not kv_id:
-                raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
-            if reset:
-                ctx.kv.release_session(kv_id)
-            sp = item.sampling_params
-            extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
-            chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
-            if chunk_base < 0:
-                raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
-            plan, extra, denoise = self._plan_for(item, chunk_base=chunk_base)
-            schedule = plan.schedule
-            if persist:
-                ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
-                # Fail-closed only for cells this rank owns; remotes arrive via prep handoff.
-                logical = expected_prior_cells(schedule)
-                missing_owned = [
-                    cell
-                    for cell in logical
-                    if rank_of_block(cell[1], cell[2], schedule) == pp_rank
-                    and not ctx.kv.cache.pool.has((kv_id, cell[0], cell[1], cell[2]))
-                ]
-                if missing_owned:
-                    raise ValueError(
-                        f"session continuation chunk_base={chunk_base} for {kv_id!r} missing owned "
-                        f"prior cells {sorted(missing_owned)!r} on rank {pp_rank}; "
-                        "restart with chunk_base=0 or fix retain/release"
-                    )
-            if not req_id:
-                req_id = kv_id
-            shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
-            if len(shape) != 5:
-                raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
-            shift = float(extra.get("shift", self._default_shift))
-            seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
-            chunk_tokens = self.transformer.seq_len_for_latent(shape)
-            # The KV pool is fixed at load time; requests cannot resize it by changing pipeline fields.
-            spec = ctx.kv.cache.spec
-            if chunk_tokens != spec.max_chunk_tokens:
+
+        kv_id, persist, reset, close_session = self._noisy_request_lifecycle(req)
+        del close_session  # encoded in persist; kept for Runner parity
+        if not kv_id:
+            raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
+        if reset:
+            ctx.kv.release_session(kv_id)
+        sp = req.sampling_params
+        extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
+        chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
+        if chunk_base < 0:
+            raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
+        plan, extra, denoise = self._plan_for(req, chunk_base=chunk_base)
+        schedule = plan.schedule
+        if persist:
+            ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
+            # Fail-closed only for cells this rank owns; remotes arrive via prep handoff.
+            logical = expected_prior_cells(schedule)
+            missing_owned = [
+                cell
+                for cell in logical
+                if rank_of_block(cell[1], cell[2], schedule) == pp_rank
+                and not ctx.kv.cache.pool.has((kv_id, cell[0], cell[1], cell[2]))
+            ]
+            if missing_owned:
                 raise ValueError(
-                    f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
-                    f"max_chunk_tokens={spec.max_chunk_tokens}"
+                    f"session continuation chunk_base={chunk_base} for {kv_id!r} missing owned "
+                    f"prior cells {sorted(missing_owned)!r} on rank {pp_rank}; "
+                    "restart with chunk_base=0 or fix retain/release"
                 )
-            num_blocks = int(schedule.num_blocks)
-            # Protect only the post-request keep set. Prior sources still needed mid-request
-            # are covered by plan last-use and are reclaimed after their last consume.
-            retain = clean_history_cells(schedule, num_blocks=num_blocks) if persist else set()
-            ctx.enqueue(kv_id, plan, chunk_tokens=chunk_tokens, retain=retain)
-
-            prompt = self._prompt_text(item.prompt)
-            prompt_embeds = self._encode_prompt(prompt, device, dtype)
-            sampler = FlowEuler(denoise, shift=shift)
-            stream_decode = bool(extra.get("stream_decode", False))
-            # Rank that finishes the last noisy step (WanCell on_finished).
-            # S=1: one layer-PP replica → trailing group G-1.
-            # Vertical S∈{D,D+1}: last noisy step replica → D·G-1.
-            if self.step_replicas > 1 and self.step_replicas in (denoise, denoise + 1):
-                finish_rank = denoise * self.layer_groups - 1
-            else:
-                finish_rank = self.layer_groups - 1
-            # Remote stream_decode only for vertical; S=1 stays local (_start_local).
-            source_rank = finish_rank if self.step_replicas > 1 else None
-            stream_job = None
-            on_finished = None
-            if stream_decode:
-                stream_group = None
-                if source_rank is not None and source_rank != 0 and pp_group is not None:
-                    stream_group = self._ensure_stream_decode_group(pp_group, source_rank)
-                stream_job = start_async_stream_decode(
-                    vae=self.vae,
-                    decoder=self._get_streaming_decoder(),
-                    session_id=kv_id,
-                    n_chunks=plan.schedule.chunks,
-                    latent_shape=shape,
-                    dtype=dtype,
-                    pp_rank=pp_rank,
-                    source_rank=source_rank,
-                    pp_group=pp_group,
-                    stream_group=stream_group,
-                )
-                on_finished = stream_job.on_finished
-            on_finished = self._maybe_timeline(
-                on_finished, extra.get("chunk_timeline_file"), finish_rank=finish_rank, pp_rank=pp_rank
+        shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
+        if len(shape) != 5:
+            raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
+        shift = float(extra.get("shift", self._default_shift))
+        seed = int(extra.get("seed", getattr(req.sampling_params, "seed", 0) or 0))
+        chunk_tokens = self.transformer.seq_len_for_latent(shape)
+        # The KV pool is fixed at load time; requests cannot resize it by changing pipeline fields.
+        spec = ctx.kv.cache.spec
+        if chunk_tokens != spec.max_chunk_tokens:
+            raise ValueError(
+                f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
+                f"max_chunk_tokens={spec.max_chunk_tokens}"
             )
+        num_blocks = int(schedule.num_blocks)
+        # Protect only the post-request keep set. Prior sources still needed mid-request
+        # are covered by plan last-use and are reclaimed after their last consume.
+        retain = clean_history_cells(schedule, num_blocks=num_blocks) if persist else set()
+        ctx.enqueue(kv_id, plan, chunk_tokens=chunk_tokens, retain=retain)
 
-            adapter = WanCell(
-                self.transformer,
-                sampler=sampler,
-                prompt_embeds=prompt_embeds,
-                latent_shape=shape,  # type: ignore[arg-type]
-                seed=seed,
-                device=device,
+        prompt = self._prompt_text(req.prompt)
+        prompt_embeds = self._encode_prompt(prompt, device, dtype)
+        sampler = FlowEuler(denoise, shift=shift)
+        stream_decode = bool(extra.get("stream_decode", False))
+        # Rank that finishes the last noisy step (WanCell on_finished).
+        # S=1: one layer-PP replica → trailing group G-1.
+        # Vertical S∈{D,D+1}: last noisy step replica → D·G-1.
+        if self.step_replicas > 1 and self.step_replicas in (denoise, denoise + 1):
+            finish_rank = denoise * self.layer_groups - 1
+        else:
+            finish_rank = self.layer_groups - 1
+        # Remote stream_decode only for vertical; S=1 stays local (_start_local).
+        source_rank = finish_rank if self.step_replicas > 1 else None
+        stream_job = None
+        on_finished = None
+        if stream_decode:
+            stream_group = None
+            if source_rank is not None and source_rank != 0 and pp_group is not None:
+                stream_group = self._ensure_stream_decode_group(pp_group, source_rank)
+            stream_job = start_async_stream_decode(
+                vae=self.vae,
+                decoder=self._get_streaming_decoder(),
+                session_id=kv_id,
+                n_chunks=plan.schedule.chunks,
+                latent_shape=shape,
                 dtype=dtype,
-                on_finished=on_finished,
+                pp_rank=pp_rank,
+                source_rank=source_rank,
+                pp_group=pp_group,
+                stream_group=stream_group,
             )
-            # DiT tick loop; stream_job decode/send threads overlap on the side.
-            run_cell_pipeline(ctx=ctx, adapter=adapter)
-            if persist:
-                # Keep only the trailing clean window; outer session owns when to release.
-                kept = clean_history_cells(schedule, num_blocks=num_blocks)
-                ctx.kv.end_request(kv_id, retain=kept)
-            else:
-                # Ephemeral request_id or explicit close_session — same as Runner path.
+            on_finished = stream_job.on_finished
+        on_finished = self._maybe_timeline(
+            on_finished, extra.get("chunk_timeline_file"), finish_rank=finish_rank, pp_rank=pp_rank
+        )
+
+        adapter = WanCell(
+            self.transformer,
+            sampler=sampler,
+            prompt_embeds=prompt_embeds,
+            latent_shape=shape,  # type: ignore[arg-type]
+            seed=seed,
+            device=device,
+            dtype=dtype,
+            on_finished=on_finished,
+        )
+        return adapter, kv_id, persist, stream_job
+
+    def emit_cell_output(self, adapter: Any, kv_id: str, stream_job: Any | None = None) -> DiffusionOutput:
+        """Decode / gather after Cell plans finished."""
+        param = next(self.transformer.parameters())
+        device, dtype = param.device, param.dtype
+        pp_rank, pp_group = resolve_pp_rank_and_group()
+        if stream_job is not None:
+            video = stream_job.join()
+            if video is not None:
+                return self._video_output(video)
+            return self._placeholder_output(device, dtype)
+        finished = self._gather_finished(adapter.finished, pp_group)
+        chunk_map = finished.get(kv_id, {})
+        if pp_rank == 0 and chunk_map:
+            ordered = [chunk_map[c] for c in sorted(chunk_map)]
+            latents = torch.cat(ordered, dim=2)
+            video = self._decode_latents(latents)
+            return self._video_output(video)
+        return self._placeholder_output(device, dtype)
+
+    def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Request-path entry: admit → run_cell_pipeline → emit."""
+        ctx = self._chunk_ctx
+        if ctx is None:
+            raise RuntimeError("CausVidWanPipeline requires bind_ar_diffusion_cell_context")
+        outputs: list[DiffusionOutput] = []
+        for item in _as_request_list(req):
+            adapter, kv_id, persist, stream_job = self.admit_cell_request(item)
+            try:
+                run_cell_pipeline(ctx=ctx, adapter=adapter)
+            except Exception:
+                if stream_job is not None:
+                    stream_job.cancel()
+                raise
+            if not persist:
                 ctx.kv.release_session(kv_id)
-            if stream_job is not None:
-                video = stream_job.join()
-                if video is not None:
-                    outputs.append(self._video_output(video))
-                else:
-                    outputs.append(self._placeholder_output(device, dtype))
-                continue
-            finished = self._gather_finished(adapter.finished, pp_group)
-            chunk_map = finished.get(kv_id, {})
-            if pp_rank == 0 and chunk_map:
-                ordered = [chunk_map[c] for c in sorted(chunk_map)]
-                latents = torch.cat(ordered, dim=2)
-                video = self._decode_latents(latents)
-                outputs.append(self._video_output(video))
-            else:
-                outputs.append(self._placeholder_output(device, dtype))
+            outputs.append(self.emit_cell_output(adapter, kv_id, stream_job))
         return outputs

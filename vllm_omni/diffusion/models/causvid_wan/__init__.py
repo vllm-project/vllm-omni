@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CausVid Wan model package (DiT, weights, pipeline).
 
-Shared Noisy KV engine pieces (schedule, executor, FlowEuler, KV cache) live in
+Shared Noisy PP engine pieces (schedule, executor, FlowEuler, KV cache) live in
 ``vllm_omni.experimental.ar_diffusion``.
 """
 

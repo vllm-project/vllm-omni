@@ -26,10 +26,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
-from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
@@ -359,7 +359,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     capability.close_ar_diffusion_session(session_id)
             except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
                 errors.append(exc)
-        # Noisy KV sessions share the same outer session_id; reset/close must drop them too.
+        # Noisy PP sessions share the same outer session_id; reset/close must drop them too.
         try:
             self.release_noisy_kv(session_id)
         except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
@@ -491,14 +491,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return kv_id, persist, reset, close_session
 
     def release_noisy_kv(self, kv_id: str) -> None:
-        """Drop retained Noisy KV versions for ``kv_id`` (outer session reset/close)."""
+        """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close)."""
         if self.noisy_kv_cache is None:
             return
         NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
     def _make_chunk_context(self):
-        from vllm_omni.experimental.ar_diffusion.cell_executor import (
+        from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
             ARDiffusionCellContext,
             CellRunSpec,
             CellTopology,
@@ -579,7 +579,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
+        """Noisy PP chunk path may micro-batch requests; paged timeline KV stays single-seq."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             # Fail-closed only for this wave's pool keys — never wipe unrelated sessions.
             batch_kv_ids: list[str] = []

@@ -9,7 +9,7 @@
 # Overlay CausVid student DiT via model_config.causvid_ckpt:
 #   tianweiy/CausVid autoregressive_checkpoint/model.pt
 #
-# Design: docs/design/feature/noisy_kv.md
+# Design: docs/design/feature/noisy_pp.md
 
 pipeline: causvid_wan
 async_chunk: false

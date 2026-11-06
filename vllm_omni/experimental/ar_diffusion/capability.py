@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext
-    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import ARDiffusionCellContext
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import ARDiffusionNoisyKVSpec
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 
