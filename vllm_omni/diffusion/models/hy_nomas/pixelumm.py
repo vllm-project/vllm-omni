@@ -138,6 +138,7 @@ class PixelUMMDCAELatentDecoder(nn.Module):
         )
         self._noise_cache: tuple[tuple, torch.Tensor] | None = None
         self._decode_group = None
+        self._decode_error_status: torch.Tensor | None = None
         self._decode_output_rank = 0
         self._validate_tiling()
 
@@ -145,7 +146,11 @@ class PixelUMMDCAELatentDecoder(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def configure_distributed_decode(self, process_group, *, output_rank: int = 0) -> None:
+    def configure_distributed_decode(self, process_group: dist.ProcessGroup, *, output_rank: int = 0) -> None:
+        """Configure collective decoding; every group member must participate.
+
+        ``output_rank`` is the rank within ``process_group`` that merges the output.
+        """
         if not dist.is_initialized():
             raise RuntimeError("PixelUMM window decoding requires torch.distributed")
         if process_group is None:
@@ -155,6 +160,8 @@ class PixelUMMDCAELatentDecoder(nn.Module):
             raise ValueError("PixelUMM window decoding requires more than one rank")
         if not 0 <= output_rank < size:
             raise ValueError(f"PixelUMM output rank {output_rank} is outside group size {size}")
+        # Retain the status on the decode device even when model weights are offloaded.
+        self._decode_error_status = torch.empty(1, dtype=torch.int32, device=next(self.parameters()).device)
         self._decode_group = process_group
         self._decode_output_rank = output_rank
 
@@ -171,7 +178,10 @@ class PixelUMMDCAELatentDecoder(nn.Module):
             yield
         except Exception as exc:
             error = exc
-        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=next(self.parameters()).device)
+        failed = self._decode_error_status
+        if failed is None:
+            raise RuntimeError("PixelUMM distributed error status is not initialized")
+        failed.fill_(int(error is not None))
         dist.all_reduce(failed, group=self._decode_group)
         if error is not None:
             raise error
@@ -213,6 +223,7 @@ class PixelUMMDCAELatentDecoder(nn.Module):
             )
         self._validate_decode_metadata(signature)
         with self._decode_guard("latent allocation"):
+            # Keep the in-place broadcast buffer separate from the caller's latent.
             reference = (
                 latent.contiguous().clone()
                 if self._is_output_rank()

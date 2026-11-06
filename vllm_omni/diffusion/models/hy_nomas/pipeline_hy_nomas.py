@@ -297,6 +297,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .requires_grad_(False)
         )
         self.vae = build_decoder(decoder_config, self.device)
+        # Error propagation must not allocate device memory after an OOM.
+        self._sp_error_status = (
+            torch.empty(1, dtype=torch.int32, device=next(self.vae.parameters()).device) if self.sp_size > 1 else None
+        )
         if self.decoder_parallel_mode == "window":
             group = get_sp_group().ulysses_group
             if dist.get_global_rank(group, 0) != 0:
@@ -451,7 +455,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         )
         model_bytes += config.height * config.width * 3 * 4 * (4 * decoder_frames)
         if self.decoder_parallel_mode == "window":
-            # 预留汇集张量以及跨轮尚未合并的 tile。
+            # Reserve space for gathered tensors and tiles awaiting merging.
             ys, xs, tile_h, tile_w = self.vae._tile_grid(config.height // self.s_ratio, config.width // self.s_ratio)
             tile_bytes = 3 * (4 * window) * (tile_h * self.s_ratio) * (tile_w * self.s_ratio) * 2
             model_bytes += (self.sp_size + len(ys) * len(xs)) * tile_bytes
@@ -860,7 +864,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
 
     def _check_sp_error(self, error: Exception | None, operation: str) -> None:
         if self.sp_size > 1:
-            failed = torch.tensor([error is not None], dtype=torch.int32, device=self.device)
+            failed = self._sp_error_status
+            if failed is None:
+                raise RuntimeError("Hy-Nomas SP error status is not initialized")
+            failed.fill_(int(error is not None))
             if get_sp_group().all_reduce(failed).item() and error is None:
                 error = RuntimeError(f"Hy-Nomas {operation} failed on another SP rank.")
         if error is not None:

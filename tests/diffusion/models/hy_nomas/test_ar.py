@@ -104,6 +104,7 @@ class PipelineWithCPUComponents(HyNomasPipeline):
         self.fail_clean = False
         self.device = torch.device("cpu")
         self.sp_size = 1
+        self._sp_error_status = torch.empty(1, dtype=torch.int32)
         self.decoder_parallel_mode = "none"
         self._cpu_offload = False
 

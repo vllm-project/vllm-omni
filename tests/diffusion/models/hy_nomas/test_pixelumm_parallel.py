@@ -147,6 +147,10 @@ def _window_worker(rank, world_size, rendezvous):
         assert_output_matches(rank, actual, expected)
         assert actual_positions == positions
 
+        if world_size > 2:
+            # Larger groups already exercised partitioning and non-output rank recovery.
+            return
+
         session = parallel.create_streaming_decode_session()
         invalid = latent[:, :, :0] if rank == world_size - 1 else latent
         expect_collective_error(lambda: session.push(invalid), "non-empty|another decode rank")

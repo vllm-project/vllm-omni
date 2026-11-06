@@ -118,6 +118,42 @@ def _pipeline_worker(rank, world_size, rendezvous):
                     assert len(recovered.output["payload"]["video"]) == (25 if rank == 0 else 0)
                     runner.close_session("failed")
 
+                    if world_size == 2:
+                        for failure_rank in (0, 1):
+                            oom_triggered = False
+                            original_tensor = torch.tensor
+
+                            def fail_decoder(*args, **kwargs):
+                                nonlocal oom_triggered
+                                oom_triggered = True
+                                raise torch.OutOfMemoryError("injected decoder OOM")
+
+                            def fail_status_allocation(*args, **kwargs):
+                                if oom_triggered and kwargs.get("dtype") == torch.int32:
+                                    raise torch.OutOfMemoryError("injected status allocation OOM")
+                                return original_tensor(*args, **kwargs)
+
+                            session_id = f"oom-{failure_rank}"
+                            oom_request = make_request(0, frames=25, session=session_id, close=True)
+                            oom_request.requests[0].sampling_params.extra_args = {
+                                "session_id": session_id,
+                                "close_session": True,
+                            }
+                            with pytest.MonkeyPatch.context() as oom_patch:
+                                if rank == failure_rank:
+                                    oom_patch.setattr(pipeline.vae.decoder, "forward", fail_decoder)
+                                    oom_patch.setattr(torch, "tensor", fail_status_allocation)
+                                with pytest.raises(
+                                    RuntimeError, match="decoder OOM|another decode rank|another SP rank"
+                                ):
+                                    with runner._bound_ar_session(session_id, description="window OOM"):
+                                        pipeline.forward(oom_request)
+                            assert session_id not in runner._sessions and session_id not in pipeline._ar_sessions
+                            with runner._bound_ar_session(session_id, description="window OOM recovery"):
+                                recovered = pipeline.forward(oom_request)
+                            assert len(recovered.output["payload"]["video"]) == (25 if rank == 0 else 0)
+                            runner.close_session(session_id)
+
                     @contextmanager
                     def failing_context(component):
                         yield

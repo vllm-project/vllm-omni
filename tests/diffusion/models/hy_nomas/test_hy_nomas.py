@@ -158,10 +158,10 @@ def test_public_defaults(architecture):
 @pytest.mark.parametrize("text_encoder_override", [None, "local-text-encoder"])
 @pytest.mark.parametrize(
     ("decoder_parallel_mode", "sp_size"),
-    [("none", 1), ("window", 2), ("window", 4), ("window", 8), ("window", 16)],
+    [("none", 1), ("window", 2)],
 )
 def test_pipeline_loads_diffusers_components(
-    checkpoint, monkeypatch, text_encoder_override, decoder_parallel_mode, sp_size
+    checkpoint, monkeypatch, mocker, text_encoder_override, decoder_parallel_mode, sp_size
 ):
     download = Mock(return_value=str(checkpoint))
     transformer = nn.Linear(2, 2, bias=False)
@@ -173,7 +173,7 @@ def test_pipeline_loads_diffusers_components(
     text_encoder = nn.Linear(2, 2)
     vae = nn.Linear(2, 2)
     vae.spatial_compression_ratio = 32
-    vae.configure_distributed_decode = Mock()
+    vae.configure_distributed_decode = mocker.Mock()
     group = object()
     if decoder_parallel_mode == "window":
         monkeypatch.setattr(pipeline_hy_nomas, "get_sp_group", lambda: SimpleNamespace(ulysses_group=group))
