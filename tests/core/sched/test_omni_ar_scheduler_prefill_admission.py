@@ -93,3 +93,50 @@ def test_single_stage_admission_settings_and_connector_precedence(connector_batc
     # The wait bound applies even if the single-stage batch has not filled.
     scheduler.waiting[0].arrival_time = time.time() - 1.0
     assert not defer(scheduler)
+
+
+def test_deferred_waiting_prefill_keeps_talker_kstep_drafts(monkeypatch):
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+    from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+
+    sched = object.__new__(OmniARScheduler)
+    sched.policy = SchedulingPolicy.FCFS
+    decode = SimpleNamespace(
+        request_id="d0",
+        spec_token_ids=[1, 2, 3],
+        num_computed_tokens=10,
+        prompt_token_ids=[0] * 10,
+        status=None,
+    )
+    prefill = SimpleNamespace(request_id="p0", arrival_time=time.time(), status=None)
+    sched.running = [decode]
+    sched.waiting = create_request_queue(sched.policy)
+    sched.waiting.add_request(prefill)
+    sched.kv_holding_waiting = create_request_queue(sched.policy)
+    sched.deferred_waiting = set()
+    sched.max_num_running_reqs = sched.max_num_active_reqs = 8
+    sched.max_model_len = 4096
+    sched.num_spec_tokens = 3
+    sched._prefill_admission_min_batch = 4
+    sched._prefill_admission_max_wait_s = 5.0
+    sched._prefill_admission_min_running = 1
+    sched._talker_kstep_armed = lambda: True
+    sched.use_v2_model_runner = False
+    sched.chunk_transfer_adapter = sched.input_coordinator = None
+    sched._process_pending_omni_inputs = lambda **kw: None
+    sched._postprocess_omni_schedule_output = lambda *a, **kw: None
+    sched.get_finished_requests_needing_kv_transfer = lambda: {}
+    sched._wrap_omni_scheduler_output = lambda out, **kw: out
+    monkeypatch.setattr(
+        VLLMScheduler,
+        "schedule",
+        lambda self, *a: SimpleNamespace(
+            num_scheduled_tokens={"d0": 1 + len(decode.spec_token_ids)},
+            scheduled_spec_decode_tokens={"d0": list(decode.spec_token_ids)} if decode.spec_token_ids else {},
+        ),
+    )
+
+    out = sched.schedule()
+    assert decode.spec_token_ids == [1, 2, 3]
+    assert out.num_scheduled_tokens == {"d0": 4}
+    assert list(sched.waiting) == [prefill]

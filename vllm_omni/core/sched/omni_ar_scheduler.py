@@ -844,12 +844,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-        # Talker K-frame guard: a step whose decode spans would be uneven
-        # (mixed prefill+decode rows, or a first-step decode joining a
-        # steady-state K-step request) must not carry the K-step drafts --
-        # the multi-frame loop requires uniform decode spans and the runner
-        # refuses the rest.
-        self._drop_talker_drafts_if_prefill_pending()
 
         original_wait_queues = None
         if self._should_defer_waiting_admission():
@@ -865,6 +859,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
+            # Talker K-frame guard: a step whose decode spans would be uneven
+            # (mixed prefill+decode rows, or a first-step decode joining a
+            # steady-state K-step request) must not carry the K-step drafts --
+            # the multi-frame loop requires uniform decode spans and the runner
+            # refuses the rest.
+            self._drop_talker_drafts_if_prefill_pending()
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
