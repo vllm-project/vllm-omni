@@ -54,6 +54,46 @@ def test_krea2_text_to_image_001(offline_client: OfflineOmniClient) -> None:
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
+def _generate(handler: OfflineOmniClient, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> np.ndarray:
+    sp = _sampling()
+    sp.lora_request = lora_request
+    sp.lora_scale = lora_scale
+    resp = handler.send_diffusion_request({"model": MODEL, "prompt": LORA_PROMPT, "sampling_params": sp})
+    images = resp.images
+    assert images is not None
+    return np.asarray(images[0].convert("RGB"), dtype=np.int16)
+
+
+@hardware_test(res={"cuda": "H100"})
+@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
+def test_krea2_lora(offline_client: OfflineOmniClient) -> None:
+    """Validate diffusion LoRA on Krea 2: visible effect, scale sensitivity, clean deactivation.
+
+    Uses ``LORA`` (a vLLM-Omni-compatible PEFT repackaging of ``krea/Krea-2-LoRA-darkbrush``,
+    264 modules matched via the ReplicatedLinear projections) passed per-request through
+    ``OmniDiffusionSamplingParams.lora_request`` / ``lora_scale`` — the same fields the
+    diffusion LoRA manager reads to activate/deactivate the adapter.
+    """
+    lora_request = LoRARequest(lora_name="darkbrush", lora_int_id=stable_lora_int_id(LORA), lora_path=LORA)
+
+    baseline = _generate(offline_client, None)
+    img_1x = _generate(offline_client, lora_request, lora_scale=1.0)
+    img_2x = _generate(offline_client, lora_request, lora_scale=2.0)
+    restored = _generate(offline_client, None)
+
+    diff_1x = np.abs(baseline - img_1x).mean()
+    diff_2x = np.abs(baseline - img_2x).mean()
+    diff_restored = np.abs(baseline - restored).mean()
+
+    # (a) Adapter has a visible effect at both scales.
+    assert diff_1x > 0.5, f"LoRA scale=1.0 had no visible effect: diff={diff_1x}"
+    assert diff_2x > 0.5, f"LoRA scale=2.0 had no visible effect: diff={diff_2x}"
+    # (b) Scale changes the output (stronger adapter -> larger perturbation).
+    assert not np.isclose(diff_1x, diff_2x, atol=1.0), f"LoRA scale had no effect: 1x={diff_1x:.2f}, 2x={diff_2x:.2f}"
+    # (c) Passing lora_request=None cleanly deactivates: same seed -> back to baseline (modulo fp drift).
+    assert diff_restored < 5.0, f"LoRA did not deactivate cleanly: diff_restored={diff_restored:.2f}"
+
+
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize(
     "omni_runner",
@@ -115,43 +155,3 @@ def test_krea2_vae_patch_parallel(offline_client: OfflineOmniClient) -> None:
     fewer than 2 CUDA devices.
     """
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
-
-
-def _generate(handler: OfflineOmniClient, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> np.ndarray:
-    sp = _sampling()
-    sp.lora_request = lora_request
-    sp.lora_scale = lora_scale
-    resp = handler.send_diffusion_request({"model": MODEL, "prompt": LORA_PROMPT, "sampling_params": sp})
-    images = resp.images
-    assert images is not None
-    return np.asarray(images[0].convert("RGB"), dtype=np.int16)
-
-
-@hardware_test(res={"cuda": "H100"})
-@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
-def test_krea2_lora(offline_client: OfflineOmniClient) -> None:
-    """Validate diffusion LoRA on Krea 2: visible effect, scale sensitivity, clean deactivation.
-
-    Uses ``LORA`` (a vLLM-Omni-compatible PEFT repackaging of ``krea/Krea-2-LoRA-darkbrush``,
-    264 modules matched via the ReplicatedLinear projections) passed per-request through
-    ``OmniDiffusionSamplingParams.lora_request`` / ``lora_scale`` — the same fields the
-    diffusion LoRA manager reads to activate/deactivate the adapter.
-    """
-    lora_request = LoRARequest(lora_name="darkbrush", lora_int_id=stable_lora_int_id(LORA), lora_path=LORA)
-
-    baseline = _generate(offline_client, None)
-    img_1x = _generate(offline_client, lora_request, lora_scale=1.0)
-    img_2x = _generate(offline_client, lora_request, lora_scale=2.0)
-    restored = _generate(offline_client, None)
-
-    diff_1x = np.abs(baseline - img_1x).mean()
-    diff_2x = np.abs(baseline - img_2x).mean()
-    diff_restored = np.abs(baseline - restored).mean()
-
-    # (a) Adapter has a visible effect at both scales.
-    assert diff_1x > 0.5, f"LoRA scale=1.0 had no visible effect: diff={diff_1x}"
-    assert diff_2x > 0.5, f"LoRA scale=2.0 had no visible effect: diff={diff_2x}"
-    # (b) Scale changes the output (stronger adapter -> larger perturbation).
-    assert not np.isclose(diff_1x, diff_2x, atol=1.0), f"LoRA scale had no effect: 1x={diff_1x:.2f}, 2x={diff_2x:.2f}"
-    # (c) Passing lora_request=None cleanly deactivates: same seed -> back to baseline (modulo fp drift).
-    assert diff_restored < 5.0, f"LoRA did not deactivate cleanly: diff_restored={diff_restored:.2f}"
