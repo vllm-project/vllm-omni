@@ -122,21 +122,30 @@ async def _reopen_colocate_engine(engine) -> None:
 @asynccontextmanager
 async def _release_colocate_engine(engine, request_ids: tuple[str, ...]):
     """Abort this case's requests and leave the shared engine awake."""
+    body_error: Exception | None = None
     try:
         yield
+    except Exception as exc:
+        body_error = exc
+        raise
     finally:
-        # Wake before abort. Abort against a sleeping engine can sit in the
-        # admission gate; the next test needs the same process-wide engine.
-        # TimeoutError must surface; other wake failures stay best-effort.
+        # Wake before abort: abort on a sleeping engine waits at the admission
+        # gate and would hang the shared module. A wake timeout must not skip
+        # that abort, and must not replace a failure already raised by the test.
+        wake_timeout: TimeoutError | None = None
         try:
             await _reopen_colocate_engine(engine)
-        except TimeoutError:
-            raise
+        except TimeoutError as exc:
+            wake_timeout = exc
         except Exception:  # noqa: BLE001 - best-effort wake so the next test can reuse the engine
             pass
         for request_id in request_ids:
             with suppress(Exception):  # noqa: BLE001 - in-flight generate may already be gone
                 await engine.abort(request_id)
+        if wake_timeout is not None:
+            if body_error is None:
+                raise wake_timeout
+            body_error.add_note(f"colocate wake/resume timed out after {_ENGINE_CONTROL_TIMEOUT_S}s; abort still ran")
 
 
 @pytest_asyncio.fixture(loop_scope="module")

@@ -23,7 +23,11 @@ from vllm_omni.config.omni_config import (
     VllmOmniGenerationStageConfig,
 )
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
-from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.config.stage_config import (
+    PIPELINE_WIDE_ENGINE_FIELDS,
+    load_deploy_config,
+    resolve_deploy_yaml,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
@@ -67,71 +71,76 @@ _STAND_IN_DROPPED_ARGS = (
 _NON_ENGINE_ARGS = ("scheduler_cls",)
 _ALLOWED_DROPPED_ARGS = frozenset(_STAND_IN_DROPPED_ARGS) | frozenset(_NON_ENGINE_ARGS)
 
-# Scheduler, cache, and model fields projected into ``VllmConfig``. Values come
-# from the loaded deploy stage, not from the resolved stage, so a resolver that
-# drops a YAML key cannot agree with itself.
-_DEPLOY_ENGINE_KEYS = (
-    "max_num_seqs",
-    "max_num_batched_tokens",
-    "gpu_memory_utilization",
-    "enforce_eager",
-    "enable_prefix_caching",
-    "trust_remote_code",
-    "enable_chunked_prefill",
-    "async_scheduling",
-)
-
-_MISSING = object()
+# Scheduler, cache, and model fields projected into ``VllmConfig``. The tuple
+# is the table order, so a new key is added in one place.
+_ENGINE_VALUE_ATTRS = {
+    "max_num_seqs": ("scheduler_config", "max_num_seqs"),
+    "max_num_batched_tokens": ("scheduler_config", "max_num_batched_tokens"),
+    "gpu_memory_utilization": ("cache_config", "gpu_memory_utilization"),
+    "enforce_eager": ("model_config", "enforce_eager"),
+    "enable_prefix_caching": ("cache_config", "enable_prefix_caching"),
+    "trust_remote_code": ("model_config", "trust_remote_code"),
+    "enable_chunked_prefill": ("scheduler_config", "enable_chunked_prefill"),
+    "async_scheduling": ("scheduler_config", "async_scheduling"),
+}
+_DEPLOY_ENGINE_KEYS = tuple(_ENGINE_VALUE_ATTRS)
 
 
 def _production_resolution(monkeypatch: pytest.MonkeyPatch):
     """Resolve the packaged production deploy as CUDA would, with no checkpoint.
 
-    The returned deploy object is the ``load_deploy_config`` result, before
-    ``from_pipeline_config`` copies and applies it.
+    ``raw`` is the deploy dict before dataclass defaults are applied.
     """
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     pipeline = resolve_pipeline_config("qwen3_omni_moe", Qwen3OmniMoeConfig(enable_audio_output=True))
     assert pipeline is not None
-    deploy = load_deploy_config(get_deploy_config_path("qwen3_omni_moe.yaml"))
+    deploy_path = get_deploy_config_path("qwen3_omni_moe.yaml")
+    raw = resolve_deploy_yaml(deploy_path)
+    deploy = load_deploy_config(deploy_path)
     config = VllmOmniConfig.from_pipeline_config(
         pipeline,
         user_deploy_config=copy.deepcopy(deploy),
     )
-    return deploy, config.stage_configs
+    return raw, config.stage_configs
 
 
-def _deploy_engine_value(stage_deploy, name: str):
-    """Return one deploy-stage setting, or ``_MISSING`` when the YAML omits it."""
-    field_names = {field.name for field in fields(stage_deploy)}
-    if name in field_names:
-        value = getattr(stage_deploy, name)
-        if value is not None:
-            return value
-    extras = stage_deploy.engine_extras or {}
-    if name in extras:
-        return extras[name]
-    return _MISSING
+def _explicit_stage_settings(raw_deploy: dict, stage_id: int, platform: str = "cuda") -> dict:
+    """Settings the YAML wrote for one stage. Omitted keys are absent.
+
+    Includes that platform's stage overlay and pipeline-wide keys the file
+    actually sets. Dataclass defaults never appear here.
+    """
+    by_id = {stage["stage_id"]: stage for stage in raw_deploy.get("stages") or []}
+    explicit: dict = {}
+
+    def _take(mapping: dict) -> None:
+        for key, value in mapping.items():
+            if key in {"stage_id", "runtime", "engine_args", "engine_extras"}:
+                continue
+            explicit[key] = value
+        runtime = mapping.get("runtime") or {}
+        if isinstance(runtime, dict):
+            explicit.update(runtime)
+        for nested_name in ("engine_args", "engine_extras"):
+            nested = mapping.get(nested_name) or {}
+            if isinstance(nested, dict):
+                explicit.update(nested)
+
+    _take(by_id[stage_id])
+    platform_section = (raw_deploy.get("platforms") or {}).get(platform) or {}
+    for overlay in platform_section.get("stages") or []:
+        if overlay.get("stage_id") == stage_id:
+            _take(overlay)
+    for name in PIPELINE_WIDE_ENGINE_FIELDS:
+        if name in raw_deploy and name not in explicit:
+            explicit[name] = raw_deploy[name]
+    return explicit
 
 
-def _stage_engine_value(stage, name: str):
-    if name in {"max_num_seqs", "max_num_batched_tokens", "enable_chunked_prefill", "async_scheduling"}:
-        return getattr(stage.scheduler_config, name)
-    if name in {"gpu_memory_utilization", "enable_prefix_caching"}:
-        return getattr(stage.cache_config, name)
-    if name in {"enforce_eager", "trust_remote_code"}:
-        return getattr(stage.model_config, name)
-    raise KeyError(name)
-
-
-def _vllm_engine_value(vllm_config, name: str):
-    if name in {"max_num_seqs", "max_num_batched_tokens", "enable_chunked_prefill", "async_scheduling"}:
-        return getattr(vllm_config.scheduler_config, name)
-    if name in {"gpu_memory_utilization", "enable_prefix_caching"}:
-        return getattr(vllm_config.cache_config, name)
-    if name in {"enforce_eager", "trust_remote_code"}:
-        return getattr(vllm_config.model_config, name)
-    raise KeyError(name)
+def _engine_value(config, name: str):
+    """Read one projected field from a resolved stage or a ``VllmConfig``."""
+    group, attr = _ENGINE_VALUE_ATTRS[name]
+    return getattr(getattr(config, group), attr)
 
 
 def _stand_in_model_dir(tmp_path, stage) -> str:
@@ -179,8 +188,7 @@ def test_production_deploy_projects_into_vllm_config_and_sampling(
     tmp_path,
 ) -> None:
     """Resolved stage settings reach ``VllmConfig`` and normalized sampling params."""
-    deploy, resolved_stages = _production_resolution(monkeypatch)
-    deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+    raw_deploy, resolved_stages = _production_resolution(monkeypatch)
     assert len(resolved_stages) == 3
     thinker, talker, code2wav = resolved_stages
     assert isinstance(thinker, VllmOmniARStageConfig)
@@ -195,20 +203,20 @@ def test_production_deploy_projects_into_vllm_config_and_sampling(
     assert code2wav.connector_config.input_connectors == {"from_stage_1": "connector_of_shared_memory"}
 
     for stage in resolved_stages:
-        deploy_stage = deploy_by_id[stage.stage_id]
+        explicit = _explicit_stage_settings(raw_deploy, stage.stage_id)
         vllm_config = _project_vllm_config(stage, _stand_in_model_dir(tmp_path, stage))
         for name in _DEPLOY_ENGINE_KEYS:
-            stage_value = _stage_engine_value(stage, name)
-            vllm_value = _vllm_engine_value(vllm_config, name)
+            stage_value = _engine_value(stage, name)
+            vllm_value = _engine_value(vllm_config, name)
             if name == "enforce_eager":
                 # Unset on the CUDA production thinker/talker. ``ModelConfig``
                 # stores False; the stage may still be None. Do not require ``is``.
                 assert bool(vllm_value) == bool(stage_value)
             elif stage_value is not None:
                 assert vllm_value == stage_value
-            yaml_value = _deploy_engine_value(deploy_stage, name)
-            if yaml_value is _MISSING:
+            if name not in explicit:
                 continue
+            yaml_value = explicit[name]
             if name == "enforce_eager":
                 assert bool(vllm_value) == bool(yaml_value)
                 if stage_value is not None:
@@ -218,7 +226,7 @@ def test_production_deploy_projects_into_vllm_config_and_sampling(
                 assert vllm_value == yaml_value
 
         runtime_params = extract_stage_metadata_from_omni_stage_config(stage).default_sampling_params
-        deploy_sampling = deploy_stage.default_sampling_params or {}
+        deploy_sampling = explicit.get("default_sampling_params") or {}
         expected = {name: deploy_sampling[name] for name in _PROJECTED_SAMPLING_KEYS if name in deploy_sampling}
         assert expected
         assert expected.items() <= (stage.model_config.default_sampling_params or {}).items()
