@@ -126,9 +126,13 @@ two outputs differ. **Mask-aware encoders keep the encoder output numerically
 unchanged** (e.g. Step-Audio-2-mini, whose `AudioEncoder` masks padding via
 `make_non_pad_mask`): the on/off encoder outputs are identical in fp32 and nearly
 identical in bfloat16. The bucketed copy never drops real frames: the rung is the
-published length (`samples // hop`) plus a per-model `context_margin` set one past
-the worst-case offset to the real frame count, so it overshoots the real content by
-at most one frame (property-swept in `tests/worker/test_bucketed_encoder.py`). Each
+model's own published per-item length (Step-Audio-2's `audio_lens`; Covo's
+`audio_num_tokens`, scaled by 16 to mel frames) plus a per-model `context_margin`
+covering the frames the model carries past its reported length and the front
+conv's boundary read, so the window never truncates real content and overshoots
+it by at most one frame (Covo's token-scaled length bounds the frames from
+above, over-copying at most 15 frames of the extractor's own padding);
+property-swept in `tests/worker/test_bucketed_encoder.py`. Each
 rung window is a slice of the carried input: the frames past an item's real content
 keep the extractor's own pad value — Whisper-style extraction pads at the log-mel
 silence floor `(max - 4) / 4`, not 0 — and are never zero-filled, so the window
@@ -171,7 +175,7 @@ values depend on the actual audio length distribution):
 
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 16000 / hop` mel frames, where `hop` is the model's verified frame hop (see `_VERIFIED_MODELS`). Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name or no whitelisted model means the feature is a no-op. | Experimental |
 
-> The per-model knobs (`hop`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the one knob above is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
+> The per-model knobs (`hop`, `lengths_key`, `frames_per_length`, `context_margin`, `time_axis`) are not environment variables — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only the one knob above is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
 
 ### NIXL stage transfer
 
