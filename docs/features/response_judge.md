@@ -1,23 +1,60 @@
 # Response Judge Stage
 
-In a realtime voice pipeline, VAD commits a turn at every pause. A
-backchannel ("uh-huh", "okay"), a cough, noise or speech addressed to someone
-else then runs the whole downstream pipeline: the main model generates a
-reply and TTS speaks it.
+In a realtime voice pipeline, deciding when a user has finished speaking
+does not necessarily decide whether the assistant should reply. A complete
+utterance can be a backchannel ("uh-huh", "okay") or speech addressed to
+someone else. Submitting it for reply generation can produce an unwanted
+response.
 
 A **response judge** is an optional stage placed right after the ASR stage. A
 small judge model reads the ASR transcript and decides whether the turn needs
-a reply. A turn that does not ends at the judge, and the main model and TTS
-are not run. Any judge model can be integrated through the stage's model and
+a reply. A rejected turn skips subsequent normal reply generation; any
+prewarmed downstream requests are cancelled and released. Additional judge
+models can be integrated through the stage's model and
 decision interfaces, including chat models that answer with one token and
 pooling (decision / scoring) models. Already integrated judges are selected
 through deployment configuration; new models require adapter code as
 described under "Adding a judge".
 
-```text
-Audio -> VAD commit -> ASR -> response judge -+-> reply needed:    main model -> TTS
-                                              +-> no reply needed: turn ends
+```mermaid
+flowchart TD
+    Audio[User audio] --> Turn[Turn detection and input submission]
+    Turn --> ASR[ASR transcript]
+    ASR --> Judge{Optional response judge}
+    Judge -->|Reply needed| Main[Host main model]
+    Main --> TTS[Speech generation]
+    Judge -->|No reply needed| Listen[End current turn, clean up requests, keep listening]
+    ASR -.->|Judge disabled| Main
 ```
+
+This is the logical decision order; streaming ASR may overlap audio input.
+The host controls turn submission. AURA is the demonstrated host integration,
+with Qwen3 or LAYA selectable as the judge.
+
+## Relationship to VAD and semantic VAD
+
+| Component | Question it answers | Current behavior |
+| --- | --- | --- |
+| Acoustic VAD / `server_vad` | Is speech present, and has silence lasted long enough to end a turn? | Silero detects speech; the server detector applies silence rules. |
+| `semantic_vad` | Does this pause mean the speaker has finished? | Silero finds candidate pauses; Smart Turn scores completion from audio. An incomplete turn waits for resumed speech or the maximum silence timeout. |
+| Response judge | Does this submitted transcript need an assistant reply? | A separate model reads the transcript; rejection ends the current turn through the existing cleanup and listen paths. |
+
+For example, "okay" can be a complete utterance without needing a reply.
+Conversely, it can confirm an action and require a response. Completion and
+reply relevance are different decisions, and the current transcript-only
+judge cannot resolve all context-dependent cases.
+
+This comparison describes the current vLLM-Omni implementation, not every
+system called semantic VAD. Here, semantic VAD uses audio rather than the ASR
+transcript and requires a turn-based (committing) session; native
+auto-responding sessions do not support it. Combining it with a judged
+pipeline requires validating that session mode.
+
+The judge does not control speech onset or undo an interruption: an overlap
+policy may already have triggered barge-in before ASR produces the transcript.
+Measure turn completion, unnecessary replies, missed replies and interruption
+behavior separately. A detector commit is not evidence that the downstream
+assistant actually replied.
 
 ## Behavior
 
@@ -91,6 +128,13 @@ checkpoint, prompt and options, then validate on a separate held-out set.
 The current example uses `T = 1`, so this
 temperature difference does not affect it. Temperature scaling is not
 configurable in this adapter.
+
+The LAYA example pins stage 1 to `dtype: float16`, independently of the
+pipeline-wide deploy dtype. Scores near the threshold can change enough
+under `bfloat16` to flip a decision. Explicit runtime/CLI overrides can still
+replace the stage dtype; validate scores and threshold decisions again when
+changing precision. This setting does not address classification errors
+caused by missing context or the model itself.
 
 For `laya`, the server refuses to start if `options` is empty,
 `reply_option` names an option that is not configured, or `threshold` is not
@@ -201,3 +245,11 @@ went from 43.0 and 44.5 ms to 26.1 and 28.5 ms p50 in two repeats.
 - A request id carries one judged turn at a time; a request must not send a
   new transcript to the judge before the previous one has been decided.
 - The judge adds its own latency and GPU memory to every committed turn.
+- Rejecting an utterance does not prevent an earlier barge-in. A future
+  overlap policy could use the judge decision, but waiting until commit and
+  judgment would also delay real interruptions. An instruction such as
+  "stop" needs a distinct stop-without-reply action rather than being treated
+  as an ordinary backchannel.
+- Side-talk descriptions in the prompt do not guarantee rejection. Requests
+  addressed to a family member can still exceed the reply threshold. Raising
+  that threshold requires checking normal questions as well as side talk.
