@@ -185,3 +185,76 @@ def test_candidate_sampling_reads_nothing_back_to_the_host(device):
         for top_k, top_p in [(2, 0.5), (4, 1.0), (0, 0.8)]:
             candidates = Model._duplex_top_k_top_p_candidates(logits, top_k=top_k, top_p=top_p)
             Model._duplex_draw_candidates(logits, candidates, torch.rand(logits.shape[0], device=device))
+
+
+def _character_cap_case(monkeypatch, *, deferred, all_greedy=True):
+    model, states, md, _ = _setup(0, all_greedy=all_greedy, max_chars=28, turns_open=False)
+    model.max_new_speak_tokens_per_chunk = 64
+    md.top_k[0], md.top_p[0] = 1, 1.0
+    if not deferred:
+        monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *a, **k: None)
+
+    def sample(token):
+        logits = torch.full((1, VOCAB), -100.0)
+        logits[0, token] = 100.0
+        output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+        model._commit_minicpmo45_duplex_pending_samples()
+        return output.sampled_token_ids.item()
+
+    return model, states[0], md, sample
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("all_greedy", [False, True])
+@pytest.mark.parametrize("prefix", [[20] * 9, [20] * 8 + [19]])
+def test_character_target_keeps_crossing_token_then_caps_without_sampling(monkeypatch, deferred, all_greedy, prefix):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
+    # Token 20 has 3 characters, token 19 has 2: 27 + 2 crosses; 26 + 2 reaches 28.
+    md.output_token_ids[0] = prefix.copy()
+    assert sample(19) == 19
+    assert state.generated_tokens == [19]
+    md.output_token_ids[0].append(19)
+    before = md.generators[0].get_state().clone()
+
+    def must_not_sample(*args, **kwargs):
+        pytest.fail("An exhausted character budget must end before any sampler draw")
+
+    monkeypatch.setattr(model, "_minicpmo45_duplex_boundary_hits", must_not_sample)
+    monkeypatch.setattr(model, "_minicpmo45_duplex_stage2_draws", must_not_sample)
+    assert sample(19) == CHUNK_EOS
+    assert state.generated_tokens == [19]
+    assert torch.equal(md.generators[0].get_state(), before)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_character_target_waits_for_complete_utf8_prefix(monkeypatch, deferred):
+    model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+
+    class PartialTokenizer(_CharTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "甲" * 27 + "\ufffd" if list(ids) == [20] else "甲" * 28
+
+    model._minicpmo45_tokenizer_cache = PartialTokenizer()
+    md.output_token_ids[0] = [20]
+    assert sample(19) == 19  # Complete the bytes rather than drop their token.
+    md.output_token_ids[0].append(19)
+    assert sample(19) == CHUNK_EOS
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_character_budget_precedes_future_special_draw_only_when_exhausted(monkeypatch, deferred, exhausted):
+    _, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    md.output_token_ids[0] = [20] * (10 if exhausted else 9)
+    assert sample(TOKEN_IDS["turn_eos_token_id"]) == (CHUNK_EOS if exhausted else TOKEN_IDS["turn_eos_token_id"])
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("hard_cap", [False, True])
+def test_explicit_force_listen_bypasses_only_soft_character_target(monkeypatch, deferred, hard_cap):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    model._minicpmo45_duplex_payload_for_row = lambda row: {"force_listen": True}
+    model.max_new_speak_tokens_per_chunk = 5 if hard_cap else 64
+    md.output_token_ids[0] = [20] * 10
+    assert sample(LISTEN) == (CHUNK_EOS if hard_cap else LISTEN)
+    assert state.generated_tokens == []

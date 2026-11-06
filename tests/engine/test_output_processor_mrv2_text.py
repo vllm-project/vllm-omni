@@ -12,12 +12,12 @@ from vllm.v1.engine import EngineCoreRequest, FinishReason
 from vllm.v1.engine.logprobs import LogprobsProcessor
 
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.output_modality import OutputModality
-from vllm_omni.engine.output_processor import (
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.output_modality import OutputModality
+from vllm_omni.outputs.output_processor import (
     MultimodalOutputProcessor,
     OmniRequestState,
 )
-from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -90,6 +90,8 @@ def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
         output_type=None,
         num_generation_tokens=None,
         finished=True,
+        # Upstream EngineCoreOutput.error is read before any other field.
+        error=None,
     )
 
 

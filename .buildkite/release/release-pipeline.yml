@@ -100,13 +100,15 @@ steps:
     commands:
       - "bash .buildkite/release/scripts/publish-release-images.sh nightly"
       - "bash .buildkite/release/scripts/cleanup-nightly-builds.sh"
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: OMNI_DOCKERHUB_TOKEN
     plugins:
       - docker-login#v3.0.0:
-          username: vllmbot
-          password-env: DOCKERHUB_TOKEN
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
     env:
       DOCKER_BUILDKIT: "1"
-      DOCKERHUB_USERNAME: "vllmbot"
+      DOCKERHUB_USERNAME: "vllm"
 
   - block: "Publish release images to DockerHub"
     key: block-publish-release-images
@@ -123,10 +125,12 @@ steps:
       queue: small_cpu_queue_release
     commands:
       - "bash .buildkite/release/scripts/publish-release-images.sh"
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: OMNI_DOCKERHUB_TOKEN
     plugins:
       - docker-login#v3.0.0:
-          username: vllmbot
-          password-env: DOCKERHUB_TOKEN
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
     env:
       DOCKER_BUILDKIT: "1"
-      DOCKERHUB_USERNAME: "vllmbot"
+      DOCKERHUB_USERNAME: "vllm"
