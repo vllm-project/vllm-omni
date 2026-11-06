@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """L1 tests for BWM ``output_type`` at the DiffusionEngine boundary (CPU).
 
 The engine builds the BWM post-process hook from the registry and passes the
 request's ``output_type`` only through ``sampling_params``; these tests drive
-``DiffusionEngine.postprocess_output`` with a stubbed executor.
+``DiffusionEngine.postprocess_output`` without starting an executor.
 """
 
 from types import SimpleNamespace
@@ -27,19 +27,17 @@ NUM_FRAMES, HEIGHT, WIDTH = 5, 32, 48
 
 
 @pytest.fixture
-def engine(monkeypatch: pytest.MonkeyPatch, mocker) -> DiffusionEngine:
+def engine() -> DiffusionEngine:
     od_config = SimpleNamespace(
         model_class_name="BoundlessWorldModelPipeline",
         custom_pipeline_args=None,
-        streaming_output=False,
         enable_cpu_offload=False,
     )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
-        lambda *args, **kwargs: mocker.Mock(),
-    )
-    monkeypatch.setattr(DiffusionEngine, "_dummy_run", lambda self: None)
-    return DiffusionEngine(od_config)
+    # Exercise registry hook setup and output formatting without runtime startup.
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = od_config
+    engine._init_process_hooks(od_config)
+    return engine
 
 
 def _postprocess(engine: DiffusionEngine, output: torch.Tensor, output_type: str | None):
@@ -48,7 +46,7 @@ def _postprocess(engine: DiffusionEngine, output: torch.Tensor, output_type: str
         sampling_params=OmniDiffusionSamplingParams(output_type=output_type),
         request_id="req-0",
     )
-    results = engine.postprocess_output(request, DiffusionOutput(output=output), 0.0, 0.0, 0.0)
+    results = engine.postprocess_output(request, DiffusionOutput(output=output))
     assert len(results) == 1
     assert len(results[0].images) == 1
     return results[0].images[0]
