@@ -203,5 +203,7 @@ The run used the official ROCm image built from `docker/Dockerfile.rocm`.
 - To clone from local audio instead of a URL, pass a `file://` URI (launch the server with `--allowed-local-media-path <dir>`), or base64-encode the clip into a `data:` URL written to a payload file and send it with `curl -d @payload.json`. Putting the base64 directly on the `curl` command line overflows the OS argument limit (`bash: /usr/bin/curl: Argument list too long`).
 - The tested environment uses `--enforce-eager`.
 - CFM CUDA Graphs follow Stage 0's configuration: `enforce_eager: true` or `compilation_config.cudagraph_mode: NONE` disables their compilation and capture.
+- On CUDA, both stages of `ming_tts.yaml` and `ming_tts_moe.yaml` run on Model Runner V2. To fall back to V1, pass a copy of the deploy config with `model_runner: v1` through `--deploy-config`. ROCm, NPU, XPU and MUSA keep V1.
+- Stage 0 does not support chunked prefill on either runner. Keep its `max_num_batched_tokens` at least `max_model_len`, as the bundled profiles do. A preempted Stage-0 request fails with a truncation error instead of being recomputed, because its decode state is not in the token stream.
 - Non-streaming responses return WAV bytes; streaming responses return PCM.
 - Output is mono 44.1 kHz audio.
