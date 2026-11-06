@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import builtins
 import importlib.util
 import json
 import os
@@ -44,6 +45,19 @@ def aiter_available(monkeypatch):
     aiter_ops = types.ModuleType("vllm._aiter_ops")
     setattr(aiter_ops, "is_aiter_found_and_supported", lambda: True)
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_ops)
+
+
+def test_patch_import_does_not_load_runtime_registry(monkeypatch):
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "vllm_omni.diffusion.registry":
+            pytest.fail("Importing the ROCm patch must not load the runtime registry")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    assert _SPEC is not None and _SPEC.loader is not None
+    _SPEC.loader.exec_module(importlib.util.module_from_spec(_SPEC))
 
 
 def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
@@ -191,3 +205,13 @@ def test_aiter_failure_keeps_model_initialization_successful(monkeypatch):
     model.vae = nn.Sequential(nn.GroupNorm(4, 8))
     assert patch_groupnorm.apply_aiter_groupnorm(model, "Other") is None
     assert type(model.vae[0]) is nn.GroupNorm
+
+
+def test_model_without_vae_needs_no_groupnorm_patch(monkeypatch):
+    model = types.SimpleNamespace()
+    monkeypatch.setattr(
+        patch_groupnorm,
+        "_replace_groupnorm_with_aiter",
+        lambda _: pytest.fail("Models without a VAE need no GroupNorm replacement"),
+    )
+    patch_groupnorm.apply_aiter_groupnorm(model, "OtherDiffusionModel")
