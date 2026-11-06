@@ -36,6 +36,15 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert connector["talker_first_audio"] is True
 
 
+def test_default_duplex_profile_supports_resident_thinker(monkeypatch) -> None:
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    config = load_deploy_config(get_deploy_config_path("qwen3_omni_duplex.yaml"))
+    stages = merge_pipeline_deploy(QWEN3_OMNI_PIPELINE, config)
+    assert not stages[0].yaml_engine_args["use_v2_model_runner"]
+    assert stages[0].yaml_engine_args["async_scheduling"] is True
+    assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
+
+
 @pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
 def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)

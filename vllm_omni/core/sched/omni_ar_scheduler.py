@@ -29,7 +29,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput, token_prefix_digest
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
@@ -220,6 +220,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
+            return
+        if getattr(request, "append_prefix_length", None) is not None and request.request_id not in self.requests:
+            # A delta cannot bootstrap a missing resident. Fail this request,
+            # never execute a suffix as an independent conversation.
+            super().add_request(request)
+            self._reject_turn_delta(request, "Resident turn prefix is missing; restart the session")
             return
         super().add_request(request)
 
@@ -835,6 +841,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _handle_blocked_waiting_request(self, request: Request) -> bool:
+        """Drain the old turn before retiring and reinstalling its worker row.
+
+        Full-prompt continuation resets worker and prefix-output delivery state
+        under the same request ID. Keep that reset behind all previous-turn
+        results, which update_from_output discards using the existing stale
+        token fence. Only this request waits; decode within a turn and other
+        requests keep using asynchronous scheduling.
+        """
+        if getattr(request, "_reset_turn_worker_state", False) and request.num_in_flight_tokens > 0:
+            return False
+        return super()._handle_blocked_waiting_request(request)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -884,6 +903,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             include_cached_payloads=True,
         )
+        for data in scheduler_output.scheduled_new_reqs:
+            request = self.requests[data.req_id]
+            if getattr(request, "_reset_turn_worker_state", False):
+                # Reset worker/hidden-state delivery bookkeeping, not the
+                # scheduler's resident KV blocks. Retirement precedes arrival
+                # in the worker and prefix-output cache protocols.
+                scheduler_output.finished_req_ids.add(data.req_id)
+                request._reset_turn_worker_state = False
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -1346,8 +1373,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished = not finished
                 if finished:
                     request.resumable = False
-                    if self._native_data_plane:
-                        self._pending_data_plane_terminal_req_ids.add(req_id)
+                if self._native_data_plane and (finished or getattr(request, "resume_from_full_prompt", False)):
+                    # Finish the per-turn downstream stream while the Thinker
+                    # request and its KV remain parked for the next append.
+                    self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -1387,7 +1416,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         request.num_computed_tokens -= outstanding_async_tokens
                         request.num_output_placeholders = 0
                     request.spec_token_ids = []
-                    request._output_token_ids.clear()
+                    if not getattr(request, "resume_from_full_prompt", False):
+                        request._output_token_ids.clear()
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
@@ -1604,6 +1634,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
+        if getattr(update, "append_prefix_length", None) is not None:
+            self._resume_from_turn_delta(session, update)
+            return
+        if getattr(update, "resume_from_full_prompt", False):
+            self._resume_from_full_prompt(session, update)
+            return
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Use the same confirmed span that upstream preserves when extending
@@ -1787,6 +1823,114 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _reject_turn_delta(self, session: Request, reason: str) -> None:
+        self._streaming_context_overflow[session.request_id] = (session.client_index, reason)
+        self._overflowed_streaming_requests.add(session.request_id)
+        # A queued append may be applied inside stop handling; that caller
+        # already owns the terminal free, as with a context-length overflow.
+        if not session.is_finished():
+            self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
+
+    def _resume_from_turn_delta(self, session: Request, update: StreamingUpdate) -> None:
+        """Append to the actual resident sequence without comparing history hashes."""
+        confirmed = self._get_confirmed_num_computed_tokens(session)
+        # The frontend ledger also feeds output processing and downstream
+        # prewarm; equal length alone would hide a diverged token history.
+        if (
+            update.append_prefix_length != confirmed
+            or update.cache_salt != session.cache_salt
+            or update.append_prefix_digest != token_prefix_digest(session._all_token_ids[:confirmed])
+        ):
+            self._reject_turn_delta(session, "Resident turn prefix changed; restart the session")
+            return
+        features = list(session.mm_features or ())
+        features.extend(
+            replace(feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset + confirmed))
+            for feature in update.mm_features or ()
+        )
+        retained = confirmed // self.cache_config.block_size * self.cache_config.block_size
+        # Replay the partial block for the stage-output cache. Full blocks and
+        # their hashes stay owned by this resident request; only new blocks are
+        # hashed by upstream when it extends the sequence.
+        snapshot = replace(
+            update,
+            prompt_token_ids=session._all_token_ids[:confirmed] + (update.prompt_token_ids or []),
+            mm_features=features,
+        )
+        self._resume_from_full_prompt(session, snapshot, retained_prefix=retained)
+        logger.debug(
+            "Resident turn delta request=%s prefix=%d appended=%d retained=%d",
+            session.request_id,
+            confirmed,
+            len(update.prompt_token_ids or ()),
+            retained,
+        )
+
+    def _resume_from_full_prompt(
+        self, session: Request, update: StreamingUpdate, *, retained_prefix: int | None = None
+    ) -> None:
+        """Continue a validated turn delta on resident KV, or rebuild a snapshot.
+
+        A full snapshot releases the resident allocation and restarts from no
+        computed tokens, so upstream prefix caching re-matches every unchanged
+        block, including multimodal identities and cache salt.
+        """
+        if self._streaming_update_overflows(session, update, projected_len=len(update.prompt_token_ids)):
+            return
+        if retained_prefix is None:
+            self._release_replaced_streaming_prompt_cache(session)
+            retained = 0
+        else:
+            retained = retained_prefix
+            # Encoder-cache entries are indexed by feature within the request.
+            # The delta re-indexes features after the retained KV; do not let
+            # those indices reuse the previous turn's encoder state.
+            self.encoder_cache_manager.free(session)
+        self._reset_streaming_session_replacement_state(session)
+
+        # Adapt the full snapshot to upstream's streaming-input contract: a
+        # computed prefix, one uncomputed token to discard, and an input delta.
+        # Keeping that lookahead also satisfies upstream versions which trim
+        # at num_tokens - 1 instead of num_computed_tokens. No synthetic token
+        # reaches the worker: upstream discards it before installing the delta.
+        session._all_token_ids[:] = session._all_token_ids[: retained + 1]
+        session.prompt_token_ids = list(session._all_token_ids[:retained])
+        session.num_prompt_tokens = retained
+        session.num_computed_tokens = retained
+        del session.block_hashes[retained // self.hash_block_size :]
+        session.cache_salt = update.cache_salt
+        session.mm_features = []
+        delta_features = []
+        for feature in update.mm_features or ():
+            if feature.mm_position.offset < retained:
+                # This includes a feature spanning the block boundary; it is
+                # the resident's own feature, not a new delta feature.
+                session.mm_features.append(feature)
+            else:
+                # Upstream rebases delta features in place; clone descriptors
+                # so the caller's full snapshot keeps its absolute positions.
+                delta_features.append(
+                    replace(
+                        feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset - retained)
+                    )
+                )
+        delta = replace(update, prompt_token_ids=update.prompt_token_ids[retained:], mm_features=delta_features)
+        super()._update_request_as_session(session, delta)
+
+        # Omni transport and queue ownership remain separate from upstream's
+        # token/hash/position update. Upstream already consumed the waiting
+        # counter and recorded QUEUED; do not run _finish_streaming_session_update
+        # a second time.
+        self._omits_kv_transfer_cache.pop(session.request_id, None)
+        session.additional_information = update.additional_information or None
+        session.model_intermediate_buffer = getattr(update, "model_intermediate_buffer", None)
+        self.deferred_waiting.discard(session)
+        if session in self.kv_holding_waiting:
+            self.kv_holding_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
+        session._reset_turn_worker_state = True
+        self._new_prompt_len_snapshot[session.request_id] = len(session.prompt_token_ids)
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
         """Delegate streaming prompt policy to the stage's payload processor."""
@@ -2361,11 +2505,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
-        return self._has_pending_kv_work() or super().has_requests()
+        return (
+            bool(getattr(self, "_pending_data_plane_terminal_req_ids", ()))
+            or self._has_pending_kv_work()
+            or super().has_requests()
+        )
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
-        return self._has_pending_kv_work() or super().has_finished_requests()
+        return (
+            bool(getattr(self, "_pending_data_plane_terminal_req_ids", ()))
+            or self._has_pending_kv_work()
+            or super().has_finished_requests()
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Check if there are any unfinished requests (including those needing KV transfer)."""

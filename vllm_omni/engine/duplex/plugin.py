@@ -19,7 +19,7 @@ from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import pybase64 as base64
 
@@ -32,10 +32,26 @@ from vllm_omni.engine.duplex.contracts import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
+    from vllm.tokenizers import TokenizerLike
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine import OmniEngineCoreRequest
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+
+
+class DuplexTurnContinuation(Protocol):
+    """Request-owned token ledger and model policy for committed-turn deltas."""
+
+    def tokenize(self, text: str) -> list[int]: ...
+
+    def can_append_turn(self, assistant_text: str) -> bool: ...
+
+    def record_output(self, token_ids: list[int], finished: bool) -> None: ...
+
+    def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]: ...
+
+    def complete_turn(self, prompt: dict, request: OmniEngineCoreRequest, prefix: list[int] | None) -> None: ...
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -438,6 +454,7 @@ class DuplexModelPlugin(ABC):
 
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
+    supports_core_resumable_request: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -457,6 +474,10 @@ class DuplexModelPlugin(ABC):
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""
         return 0
+
+    def create_turn_prompt_tokenizer(self, tokenizer: TokenizerLike) -> DuplexTurnContinuation | None:
+        """Optional per-request tokenizer, discarded with the request's epoch."""
+        return None
 
     def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
         """Separate the next ASR-only input from a batched response input.
@@ -490,6 +511,12 @@ class DuplexModelPlugin(ABC):
         runtime_config: dict[str, object],
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]: ...
+
+    def can_prepare_turn_delta(
+        self, *, state, payload, history_length: int, runtime_config, previous_runtime_config, extra_body
+    ) -> bool:
+        """Whether model window policy permits constructing only a new turn."""
+        return False
 
     def prepare_prompt_config(
         self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]

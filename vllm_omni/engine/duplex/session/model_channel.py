@@ -34,6 +34,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
+    DUPLEX_TURN_DELTA_KEY,
     DuplexAppendPlan,
     DuplexFence,
     DuplexOutputContext,
@@ -185,6 +186,8 @@ class ModelChannel:
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
+        self._append_runtime_config: dict[str, object] = {}
+        self._append_request_id: str | None = None
 
     def is_input_transcription(self, request_id: str) -> bool:
         return request_id in self._input_transcriptions
@@ -213,9 +216,7 @@ class ModelChannel:
     ) -> dict[str, object]:
         session = self._ctx.session
         response_config = session.response_config
-        if not session.capabilities.supports_core_resumable_request and self.should_commit_response_to_history(
-            session, response_id
-        ):
+        if session.capabilities.commits_turns and self.should_commit_response_to_history(session, response_id):
             # Committed-turn models can receive the next utterance before the
             # speaker drains. Reserve the response's chronological slot now;
             # an ACK fills it later without moving it past newer user input.
@@ -342,7 +343,10 @@ class ModelChannel:
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
         stage_id = self._ctx.plugin.input_stage_id(payload)
-        resumable = session.capabilities.supports_core_resumable_request
+        resumable = session.capabilities.supports_core_resumable_request and (
+            stage_id == 0 or not session.capabilities.commits_turns
+        )
+        turn_continuation = resumable and session.capabilities.resident_turn_entry
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
         # Bump turn_id and open a fresh ephemeral request instead.
@@ -404,6 +408,10 @@ class ModelChannel:
             # Freeze the request only after that wait and its close/epoch fence.
             reservation = session.prepare_append(fence)
             already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
+            if turn_continuation and already_submitted and not self._ctx.plugin.data_plane.is_terminal(request_id):
+                raise DuplexInputCapacityError(
+                    "Complete or cancel the current response before continuing its Thinker KV"
+                )
             request_context = self._ctx.manager.ensure_stage_request(
                 session,
                 stage_id=stage_id,
@@ -419,12 +427,39 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
-            conversation, conversation_item_ids = session.history_snapshot()
+            history_cursor = session.history_storage_length
+            history_revision = session.history_revision
+            tail = session.append_history_tail() if turn_continuation and already_submitted else None
+            use_delta = False
+            if (
+                tail is not None
+                and self._append_request_id == request_id
+                and self._ctx.plugin.can_prepare_turn_delta(
+                    state=self._ctx.model_state,
+                    payload=prompt_payload,
+                    history_length=history_cursor,
+                    runtime_config=request_context.runtime_config,
+                    previous_runtime_config=self._append_runtime_config,
+                    extra_body=session.response_config.extra_body,
+                )
+            ):
+                use_delta = await self._ctx.stage_port.can_append_turn(request_id, tail[0])
+                # The eligibility check yields; never use a stale history view.
+                use_delta = use_delta and session.history_revision == history_revision
+            conversation_item_ids: tuple[str | None, ...]
+            if use_delta:
+                assert tail is not None
+                conversation, conversation_item_ids = tail[1], ()
+            else:
+                conversation, conversation_item_ids = session.history_snapshot()
+                history_cursor = session.history_storage_length
+                history_revision = session.history_revision
             prompt_session = {
                 **request_context.session_config,
                 "conversation": list(conversation),
                 "conversation_item_ids": conversation_item_ids,
                 "modalities": list(session.response_config.modalities),
+                DUPLEX_TURN_DELTA_KEY: use_delta,
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
@@ -444,6 +479,8 @@ class ModelChannel:
                 sampling_params=request_context.stage_sampling_params,
             )
             # Preparation may yield while cancellation or session teardown runs.
+            if use_delta and session.history_revision != history_revision:
+                raise DuplexInputCapacityError("Conversation changed during turn preparation; retry the response")
             # Never submit the worker's stale result to the model.
             if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
                 raise DuplexFenceMismatchError(session.fence, fence)
@@ -470,6 +507,8 @@ class ModelChannel:
                     prompt=prompt,
                     already_submitted=already_submitted,
                     resumable=resumable,
+                    resume_from_full_prompt=turn_continuation,
+                    history_revision=history_revision if use_delta else None,
                 )
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input
@@ -504,6 +543,10 @@ class ModelChannel:
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
+                if turn_continuation and session.history_revision == history_revision:
+                    session.checkpoint_append_history(history_cursor)
+                    self._append_request_id = request_id
+                    self._append_runtime_config = dict(request_context.runtime_config)
             except BaseException:
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)
@@ -701,6 +744,8 @@ class ModelChannel:
         # stays true for plugins; the projector object keeps the source finished flag.
         # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
         source_finished = bool(getattr(output, "finished", False))
+        if self._ctx.session.capabilities.resident_turn_entry and item.context.segment_finished:
+            source_finished = True
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
@@ -960,7 +1005,13 @@ class ModelChannel:
         if not isinstance(request_id, str) or not request_id:
             return
         session = self._ctx.session
-        if session.capabilities.supports_core_resumable_request:
+        if not session.capabilities.commits_turns:
+            return
+        if session.capabilities.resident_turn_entry:
+            await self._ctx.stage_port.finish_turn(request_id)
+            for key in list(session.request_resources):
+                if key[0] != 0 and key[1] == request_id:
+                    session.request_resources.pop(key)
             return
         if session.is_draining_request(request_id):
             await self._ctx.stage_port.cleanup([request_id])
@@ -1199,7 +1250,7 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
-            if model_result.get("end_of_turn") is True and not session.capabilities.supports_core_resumable_request:
+            if model_result.get("end_of_turn") is True and session.capabilities.commits_turns:
                 # A failed ephemeral turn owns the same stage resources as a
                 # successful one. Release them before accepting another turn.
                 self._complete_model_turn_without_output(
@@ -1760,11 +1811,11 @@ class ModelChannel:
             return
         if expected_epoch is not None and session.epoch != expected_epoch:
             return
-        # Non-resumable stage0 cannot submit_update after the request finishes;
-        # clear continuation and close the response (silent / listen final).
+        # Committed turns close on their final output even when Stage0 stays
+        # resident. Only native streaming requests may continue decoding here.
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
-        if not session.capabilities.supports_core_resumable_request:
+        if session.capabilities.commits_turns:
             # While stage0 is still producing, closing here clears
             # active_request_id and the later final cannot own the stream.
             # A finished segment may close only when that same request is still
