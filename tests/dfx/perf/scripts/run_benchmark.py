@@ -560,6 +560,12 @@ def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
+    for metric in params.get("required_duplex_metrics", []):
+        count = result.get(f"num_{metric}_samples")
+        assert isinstance(count, int) and not isinstance(count, bool) and count > 0, f"No measured {metric} samples"
+        for stat in ("mean", "median", "p99"):
+            value = result.get(f"{stat}_{metric}")
+            assert _is_finite_number(value) and value >= 0, f"Missing or invalid {stat} {metric}"
     if params.get("duplex_performance_only") or params.get("duplex_metric_aggregation") == "response":
         assert result.get("duplex_metric_aggregation") == "response", "Wrong duplex measurement unit"
         for metric in ("ttft", "audio_ttfp", "audio_rtf"):
@@ -701,6 +707,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "duplex_eval_accuracy_config",
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
+        "required_duplex_metrics",
         "name",
         "enable_negative_prompt",
         "random_request_config",

@@ -20,8 +20,19 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--deploy-config",
-        "tests/dfx/perf/configs/qwen3_omni_duplex_perf.yaml"
-      ]
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+      ],
+      "update": {
+        "model_runner": "v2",
+        "async_chunk": true,
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true
+          }
+        },
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": true
+      }
     },
     "benchmark_params": [
       {
@@ -43,7 +54,7 @@
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a_math",
         "omniinteract_max_video_duration_s": 600,
         "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
-        "name": "c8_accuracy_response_v4",
+        "name": "c8_accuracy_response_stats_v5",
         "duplex_metric_aggregation": "response",
         "metric-percentiles": "50,95",
         "ready_check_timeout_sec": 0,
@@ -51,7 +62,14 @@
         "save_detailed": true,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "omniinteract_require_response": true
+        "omniinteract_require_response": true,
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       }
     ],
     "judge_server_params": {

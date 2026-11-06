@@ -318,6 +318,7 @@ def test_prefix_benchmark_uses_unified_runner(monkeypatch):
     def benchmark(**kwargs):
         calls.append(kwargs)
         assert "--name" not in kwargs["args"]
+        assert "--required-duplex-metrics" not in kwargs["args"]
         assert "--warmup-dataset-path" not in kwargs["args"]
         assert "tests/assets/hunyuan_image3/it2i.jsonl" in kwargs["args"]
         assert kwargs["num_warmups"] == 2
@@ -1355,6 +1356,10 @@ def _qwen3_joint_result(dataset):
     count = params["num_prompts"][0]
     result = _response_performance_result(params["dataset_name"])
     result["completed"] = count
+    for metric in params.get("required_duplex_metrics", []):
+        result[f"num_{metric}_samples"] = count
+        for stat in ("mean", "median", "p99"):
+            result[f"{stat}_{metric}"] = 0.1
     if dataset == "omniinteract":
         summary = result["omniinteract"]
         summary.update(total=count, success=count)
@@ -1461,3 +1466,66 @@ def test_response_performance_rejects_missing_artifacts(dataset_name, field, val
         result[summary_key][field] = value
     with pytest.raises(AssertionError, match=message):
         assert_result(result, {"dataset_name": dataset_name, "duplex_performance_only": True}, 16)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("equals_syntax", [False, True])
+def test_qwen3_duplex_inline_deploy_updates_reach_runtime(monkeypatch, dataset, equals_syntax):
+    from pathlib import Path
+
+    from tests.dfx.conftest import _create_unique_server_params
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+    from vllm_omni.platforms import current_omni_platform
+
+    config = json.loads(Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json").read_text())[0]
+    source = Path(config["server_params"]["extra_cli_args"][1])
+    original = source.read_bytes()
+    # extra_cli_args overrides an earlier serve_args default, as in the CLI.
+    config["server_params"]["serve_args"] = {"deploy-config": "unused.yaml"}
+    if equals_syntax:
+        config["server_params"]["extra_cli_args"] = [f"--deploy-config={source}"]
+    row = _create_unique_server_params([config], Path("unused"))[0]
+    args = row[4]
+    deploy_path = Path(args[-1].split("=", 1)[1] if equals_syntax else args[-1])
+    try:
+        assert deploy_path != source.resolve()
+        assert source.read_bytes() == original
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        stages = merge_pipeline_deploy(QWEN3_OMNI_PIPELINE, deploy)
+        assert [stage.stage_id for stage in deploy.stages] == [0, 1, 2]
+        assert [stage.yaml_engine_args["enable_prefix_caching"] for stage in stages] == [True, False, False]
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert all(stage.yaml_engine_args["async_chunk"] for stage in stages)
+        assert all(stage.yaml_engine_args["session_mode"] == "duplex" for stage in stages)
+        assert all(stage.yaml_engine_args["duplex_max_sessions"] == 8 for stage in stages)
+        assert deploy.duplex_session.collect_stats is True
+        assert deploy.duplex_session.max_sessions == 8
+    finally:
+        deploy_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("metric", ["duplex_busy_rtf", "duplex_stall_ratio"])
+def test_joint_run_requires_measured_server_stats(dataset, metric):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, _ = _qwen3_joint_result(dataset)
+    assert_result(result, params, count)
+    result[f"num_{metric}_samples"] = 0
+    with pytest.raises(AssertionError, match=f"No measured {metric}"):
+        assert_result(result, params, count)
+    result[f"num_{metric}_samples"] = count
+    result[f"mean_{metric}"] = float("nan")
+    with pytest.raises(AssertionError, match=f"Missing or invalid mean {metric}"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("field", ["update", "delete"])
+def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
+    from tests.dfx.conftest import _create_unique_server_params
+
+    config = {"test_name": "missing-deploy", "server_params": {"model": "mock", field: {"async_chunk": True}}}
+    with pytest.raises(ValueError, match="requires stage_config_name or --deploy-config"):
+        _create_unique_server_params([config], tmp_path)

@@ -20,12 +20,23 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--deploy-config",
-        "tests/dfx/perf/configs/qwen3_omni_duplex_perf.yaml"
-      ]
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+      ],
+      "update": {
+        "model_runner": "v2",
+        "async_chunk": true,
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true
+          }
+        },
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": true
+      }
     },
     "benchmark_params": [
       {
-        "name": "c8_accuracy_response_v4",
+        "name": "c8_accuracy_response_stats_v5",
         "dataset_name": "omni-duplex-eval",
         "dataset_path": "Hothan/Omni-DuplexEval@de63329f76daa5e0c604363ef6a2c383dfba45f6",
         "backend": "openai-realtime-duplex",
@@ -172,7 +183,14 @@
         "save_detailed": true,
         "duplex_eval_evaluate": true,
         "duplex_eval_judge_model": "Qwen2.5-7B-Instruct",
-        "duplex_eval_mix": "question"
+        "duplex_eval_mix": "question",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       }
     ],
     "judge_server_params": {

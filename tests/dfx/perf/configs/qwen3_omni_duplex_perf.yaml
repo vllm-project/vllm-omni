@@ -1,9 +1,0 @@
-# Nightly accuracy and performance: 8 concurrent VAD-driven sessions.
-base_config: ../../../../vllm_omni/deploy/qwen3_omni_duplex.yaml
-model_runner: v2
-async_chunk: true
-stages:
-  - stage_id: 0
-    enable_prefix_caching: true
-duplex_session:
-  max_sessions: 8

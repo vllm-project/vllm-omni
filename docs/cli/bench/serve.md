@@ -395,7 +395,7 @@ This is an annotation-based compatibility selection, not a claim that every
 sample has passed model validation. The job streams question audio with video;
 RTD, future-event reminders and continuous monitoring are outside this workload.
 
-The `c8_accuracy_response_v4` workload uses `--duplex-metric-aggregation response`
+The `c8_accuracy_response_stats_v5` workload uses `--duplex-metric-aggregation response`
 and `--metric-percentiles 50,95` to pool responses for TTFT, audio TTFP and RTF.
 Missing measurements are excluded, never substituted with zero. All sessions
 must finish, publish artifacts and provide measured text/audio latency. The
@@ -776,9 +776,13 @@ All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global
 `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
 
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
-using `tests/dfx/perf/configs/qwen3_omni_duplex_perf.yaml`. This overlay inherits
-the normal duplex deployment, selects `model_runner: v2` and `async_chunk: true`,
-enables Thinker prefix caching, and sets `duplex_session.max_sessions` to 8.
+using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via
+`server_params.extra_cli_args`. Inline `server_params.update` values select
+`model_runner: v2`, `async_chunk: true`, Thinker prefix caching,
+`duplex_session.max_sessions: 8`, and `duplex_session.collect_stats: true`.
+The harness applies these settings to a temporary deploy copy, preserving base
+inheritance and removing the copy when pytest exits. No test-specific deploy
+file is checked in and serving defaults remain unchanged.
 Talker and Code2Wav retain prefix caching disabled.
 Both Qwen3-Omni duplex jobs use three GPUs: two for the model stages and one for
 the `Qwen/Qwen2.5-7B-Instruct` text judge, mapped to allocated device index 2.
@@ -813,7 +817,7 @@ artifact publication and judge evaluation add to that estimate. Both jobs retain
 the 180-minute timeout; validation on the target H100/B200 CI hardware remains outstanding.
 OOM, request failures, incomplete artifacts and judge failures fail the job.
 For sizing context, the 2026-11-05 local H200 run (reported by the driver as
-L20X) took 11.5 minutes for the 120-session Omni-DuplexEval measured replay and
+L20X), with session statistics disabled, took 11.5 minutes for the 120-session Omni-DuplexEval measured replay and
 22.7 minutes for the complete pytest job, including startup, warmup and judging.
 These are local observations, not an H100/B200 timeout guarantee.
 
@@ -821,8 +825,15 @@ The generic summary also displays E2E latency and generated audio duration.
 E2E here spans a complete replayed session, including realtime input; it is not
 per-response generation latency. Client TTFT, append TTFP and append RTF appear
 in the separate duplex per-response summary. Server `busy_rtf` and `stall_ratio`
-require `duplex_session.collect_stats`; the nightly overlay leaves this optional
-instrumentation disabled, so these measurements are unavailable rather than zero.
+are collected with `duplex_session.collect_stats: true`: the client fetches
+`session.stats` before closing each session and maps complete turn statistics to
+response rows. Busy RTF is the union of recorded stage-work time divided by
+emitted audio duration. Stall ratio is engine-resident time outside that work
+union divided by emitted audio duration; it is not a playback-underrun ratio.
+These client/server response metrics display mean, median and P99. The harness
+requires nonempty, finite measurements; missing stats do not pass as zeros.
+The stats-enabled workload is named `c8_accuracy_response_stats_v5`; it needs a
+new measured baseline rather than reusing the earlier stats-disabled results.
 
 OmniInteract judging uses the same formal outputs as the performance report and
 records All Global IA-QTF1 plus evaluated/skipped counts. The official eligibility
@@ -849,7 +860,7 @@ The `max_concurrent_requests` statistic counts sessions touching each whole-seco
 bucket. At a wave boundary it can exceed the instantaneous concurrency because
 ending and starting sessions in the same second share a bucket.
 
-The configuration is named `c8_accuracy_response_v4` to distinguish its sample
+The configuration is named `c8_accuracy_response_stats_v5` to distinguish its sample
 selection and judging from older workloads. Use matching hardware and workload
 versions for comparisons; previous C1/C8/C16 16-source-pool results are not baselines
 for these expanded jobs. The earlier `c8_accuracy_response_v3` runs used V1
