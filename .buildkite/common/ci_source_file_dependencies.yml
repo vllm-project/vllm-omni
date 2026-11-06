@@ -687,6 +687,21 @@ source_file_dependencies:
     - tests/helpers/
     - tests/conftest.py
 
+  diffusion_collective_parity:
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/distributed/
+    - vllm_omni/platforms/
+    - vllm_omni/config/
+    - tests/diffusion/distributed/test_comm.py
+    - tests/diffusion/distributed/test_cfg_parallel.py
+    - tests/helpers/distributed.py
+    - tests/helpers/mark.py
+    - tests/helpers/runtime.py
+    - tests/helpers/fixtures/
+    - tests/conftest.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+
   diffusion_qwen_image_perf:
     - *qwen_image
     - tests/dfx/perf/scripts/run_diffusion_benchmark.py
