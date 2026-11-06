@@ -14,6 +14,17 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_unified_decode_graph_disables_legacy_batched_vae_decode():
+    """The unified graph batches VAE decode itself; the legacy path must not run too (#9738)."""
+    config = _VoxCPM2RuntimeConfig(enable_batched_vae_decode=True, enable_unified_decode_graph=True)._normalized()
+    assert config.enable_batched_vae_decode is False
+
+
+def test_batched_vae_decode_survives_without_the_unified_graph():
+    config = _VoxCPM2RuntimeConfig(enable_batched_vae_decode=True, enable_unified_decode_graph=False)._normalized()
+    assert config.enable_batched_vae_decode is True
+
+
 @pytest.mark.parametrize("uses_v2", [False, True])
 def test_runner_specific_audio_defaults(uses_v2):
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
