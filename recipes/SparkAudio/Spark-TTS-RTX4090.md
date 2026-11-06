@@ -132,7 +132,10 @@ reference recording that you have permission to use.
 
 An empty or whitespace-only `SPARK_TTS_REF_TEXT` selects cloning without a
 transcript. A nonempty transcript requires semantic codes from the reference
-encoder. The decoder receives one scheduling placeholder per finished
+encoder. The official prompt concatenates the transcript and target verbatim at
+the boundary. Include a trailing space in the transcript when the language
+requires it (for example, `SPARK_TTS_REF_TEXT="Reference. "`). Chinese text
+can use a punctuation boundary such as `参考音频。` directly. The decoder receives one scheduling placeholder per finished
 request; all speech codes are delivered through the stage connector.
 
 The Spark pipeline declares `shutdown_grace_s=15.0` for its BiCodec stage to
@@ -142,18 +145,33 @@ timeout takes precedence over this stage default.
 
 ## Verification and limits
 
-The offline CUDA smoke test is
-`tests/e2e/offline_inference/test_spark_tts.py`. It checks that one control
-request produces nonempty, finite audio at 16 kHz. In the October run it passed
-with real weights on an RTX 4090. Manual reference-audio clone smoke tests,
-with and without a reference transcript, also produced finite, nonempty,
-non-silent 16 kHz mono WAVs. Both stages exited without a forced kill or leaked
-semaphore warning in these runs. The Buildkite L4 GPU run has not been observed
-yet. A valid waveform does not establish transcript accuracy, naturalness, or
-speaker similarity. Those require separate evaluation.
+Both the CUDA ready and merge lanes run the short and long control-voice
+cases in `tests/e2e/offline_inference/test_spark_tts.py` on one NVIDIA L4.
+The long case checks for more than 21 seconds of audio; the merge lane also
+transcribes it and checks that words from the final sentence are present.
 
-The provided deploy config uses `model_runner: v1`, eager execution,
-`async_chunk: false`, and a 1024-token generation limit. The two stages both
-use logical device `0`; `CUDA_VISIBLE_DEVICES` selects which physical GPU
-that means. Raise concurrency or context limits only after measuring memory
-and output quality on the target hardware.
+The October RTX 4090 real-weight runs used Omni commit
+`5234583f164536898db8c9a9d89c8dd1fbf2b234`, based on upstream `b463516ff`.
+Control synthesis and cloning with and without a transcript produced finite
+16 kHz audio. The stage processes exited with no forced-kill or leaked
+semaphore warning in those runs.
+
+A [reviewer on one H20](https://github.com/vllm-project/vllm-omni/pull/9889#discussion_r4486777275)
+compared `062c582ab` against the official generator. The five short control
+prompts and two clones had equal or lower Whisper large-v3 WER on Omni.
+On a 99-word paragraph, the 1024-token limit cut Omni's output to 19.7 s
+(WER 0.424); the official generator finished at 35.1 s (WER 0.000).
+
+On a local RTX 5060 Ti (16 GB, WSL2), the offline pipeline passed the short
+and long tests with real weights. On the separate 94-word regression
+paragraph, a 1024-token cap produced 19.70 s of speech (Whisper large-v3
+WER 18/94). With the new default of 3000, the model generated 1255 tokens
+and 24.30 s of speech with WER 0/94. The Buildkite L4 run is still pending.
+
+The deploy config selects runner v1, eager execution, and `async_chunk: false`.
+Stage 0 defaults to 3000 generated tokens, matching the official generator.
+Its 4096-token context leaves 1096 input tokens when using the full output
+budget. Count the complete tokenized prompt, including the reference codes
+in clone mode. For longer inputs, shorten the reference or split the target
+text so the prompt and desired output fit together. Both stages use logical
+device 0; `CUDA_VISIBLE_DEVICES` selects the physical GPU.
