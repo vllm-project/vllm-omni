@@ -2493,6 +2493,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 meta_outputs[key] = [
                     self._merge_frame_finished([frame[index] for frame in per_frame]) for index in range(num_reqs)
                 ]
+            elif key == "codec_frame_valid":
+                # Each frame carries its own validity rows, so this mask is not
+                # constant across the step's frames. Concatenate it the same way
+                # ``codec_deltas`` is concatenated above; keeping only the last
+                # frame would drop the mask rows of every earlier frame and
+                # leave the accumulated audio longer than its mask.
+                meta_outputs[key] = [
+                    torch.cat([frame[index] for frame in per_frame], dim=0) for index in range(num_reqs)
+                ]
             else:
                 # Duplex metadata is per request and constant across the step's
                 # frames; the last frame is as good as any and matches what a
@@ -3267,7 +3276,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mask_eos_rows = mask_eos_rows
         self._penalty_histories = penalty_histories
         meta_outputs: dict[str, Any] = {"finished": terminal_flags}
-        if gpu_rows:
+        # The validity mask must travel with the codec rows it describes even
+        # when no codec-state row was queued this step. The prefill step emits
+        # its first sampled frame through ``codec_deltas`` (taken from
+        # ``info["codes"]["audio"]``) while ``gpu_rows`` is still empty; with
+        # the old ``if gpu_rows`` gate that frame shipped without a mask, and
+        # the full-payload accumulator then concatenated 265 audio rows
+        # against 264 mask entries, breaking the stage consumer's
+        # ``reshape(rows.numel(), -1)`` on long TTS requests.
+        if gpu_rows or any(isinstance(item, torch.Tensor) and item.numel() > 0 for item in frame_valid):
             meta_outputs["codec_frame_valid"] = frame_valid
         if emit_duplex_metadata:
             meta_outputs.update(
