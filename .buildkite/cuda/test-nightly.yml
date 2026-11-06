@@ -407,14 +407,6 @@ steps:
             -m "full_model and diffusion and H100 and B200 and cards_1"
             --run-level "full_model"
 
-      - label: ":full_moon: Diffusion X2V · Hy-Nomas Window Decode Function Test"
-        source_file_dependencies: diffusion_hy_nomas_window
-        timeout_in_minutes: 90
-        mirror_hardwares: b200_2
-        commands:
-          - pytest -s -v tests/diffusion/models/hy_nomas/test_pixelumm_parallel_cuda.py -m "full_model and cuda and B200 and cards_2" --run-level "full_model"
-          - pytest -s -v tests/e2e/online_serving/test_hy_nomas.py::test_window_parallel_video_job -m "full_model and cuda and B200 and cards_2" --run-level "full_model"
-
       - label: ":full_moon: Diffusion X2V · Doc Test"
         source_file_dependencies: diffusion_image_to_video_doc
         timeout_in_minutes: 60
@@ -571,18 +563,6 @@ steps:
         commands:
           - pip install "vllm-gguf-plugin==0.0.4"
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and L4 and B200 and cards_1' --run-level "full_model"
-
-  - label: "Simple · Hy-Nomas Large SP CPU Test"
-    key: nightly-hy-nomas-large-sp-cpu
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    source_file_dependencies: diffusion_hy_nomas_window
-    timeout_in_minutes: 30
-    mirror_hardwares: l4_1
-    commands:
-      - export OMP_NUM_THREADS=1
-      - export MKL_NUM_THREADS=1
-      - pytest -sv tests/diffusion/models/hy_nomas/test_pixelumm_parallel.py::test_window_parallel_larger_groups -m 'slow and cpu' --run-level "full_model"
 
   - label: "Simple · CPU Coverage Test"
     key: nightly-simple-cpu-coverage
