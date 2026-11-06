@@ -2160,6 +2160,92 @@ async def _append_turn(h: Harness, *, response: bool = False) -> DuplexStageRequ
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("future_turn", [1, 2])
+async def test_future_model_turn_output_without_response_advances_the_append_fence(
+    future_turn: int,
+) -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        session = h.session
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        assert (session.turn_id, session.active_response_id) == (0, None)
+
+        # The model opens a future turn before turn 0 sent a terminal signal.
+        events = await h.deliver_and_settle(tts_output(request_id, text="嗯，", turn_id=future_turn))
+        assert "response.created" in types(events)
+        assert (session.turn_id, session.active_response_turn_id) == (future_turn, future_turn)
+        assert session.fence == session.accepted_fence
+        assert session.perf is not None
+        turns = {turn["turn_id"]: turn for turn in session.perf.snapshot()["turns"]}
+        assert turns[0]["status"] == "listen"
+        # Completing a skipped turn only closes existing timing records.
+        assert set(turns) == {0, future_turn}
+        assert turns[future_turn]["status"] == "open"
+        assert turns[future_turn]["response_ids"] == [session.active_response_id]
+
+        # A delayed terminal for the superseded turn must not close the new one.
+        response_id = session.active_response_id
+        await _send_model_result_and_settle(h, _terminal_listen_result(request_id, 0))
+        assert session.active_response_id == response_id
+        assert session.turn_id == future_turn
+        turns = {turn["turn_id"]: turn for turn in session.perf.snapshot()["turns"]}
+        assert set(turns) == {0, future_turn}
+        assert turns[future_turn]["status"] == "open"
+
+        submissions = len(h.port.submissions)
+        events = await h.run(append_audio())
+        assert "error" not in types(events)
+        assert len(h.port.submissions) == submissions + 1
+        assert session.fence == session.accepted_fence
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_future_model_turn_while_an_older_response_drains_keeps_ownership() -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        session.capabilities = replace(session.capabilities, supports_concurrent_turn_requests=True)
+        first = await _append_turn(h, response=True)
+        old_response = session.active_response_id
+        assert old_response is not None
+        drain_id = h.manager.stage_request_id(session.fence, stage_id=1, resumable=False)
+        session.bind_stage_request(1, drain_id, fence=session.fence)
+        session.bind_draining_request(drain_id, old_response)
+        session.snapshot_active_response_for_drain()
+        session.complete_model_turn(first.fence.turn_id)
+        current_response = session.begin_response(turn_id=1)
+        h.runner.emit({"type": "response.created", "response_id": current_response})
+        second = await _append_turn(h)
+
+        # A draining request is bound to its old response even if its metadata
+        # announces a later model turn; it cannot reserve a new response.
+        events = await _send_model_result_and_settle(
+            h, {"data_plane_request_id": drain_id, "model_turn_id": 2, "text": " tail"}
+        )
+        assert "response.created" not in types(events)
+        assert find(events, "response.output_audio_transcript.delta").response_id == old_response
+        assert session.active_response_id == current_response
+        assert session.turn_id == 1
+        assert session.fence == session.accepted_fence
+
+        # A future-turn output from the live request advances the fence while
+        # leaving the older drain attached to its own response.
+        events = await _send_model_result_and_settle(
+            h, {"data_plane_request_id": second.request_id, "model_turn_id": 2, "text": "new turn"}
+        )
+        assert find(events, "response.created").response_id == session.active_response_id
+        assert session.active_response_id not in (old_response, current_response)
+        assert session.response_id_for_request(drain_id) == old_response
+        assert session.turn_id == 2
+        assert session.fence == session.accepted_fence
+        submissions = len(h.port.submissions)
+        assert "error" not in types(await h.run(append_audio()))
+        assert len(h.port.submissions) == submissions + 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "state,explicit_turn",
     [

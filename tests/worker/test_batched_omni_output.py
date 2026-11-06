@@ -79,3 +79,16 @@ def test_mixed_stop_flags_do_not_synchronize_cuda():
     assert all("current" not in info.get("audio_codes", {}) for info in infos)
     prefill = model.make_omni_output(hidden[:1], runtime_additional_information=[{}])
     assert model._batch_should_continue is None and prefill.multimodal_outputs == {}
+
+
+@pytest.mark.parametrize("shape", [(), (1, 1), (0, 1)])
+def test_equal_shape_async_snapshot_survives_source_reuse(shape):
+    values = [torch.full(shape, i, dtype=torch.long, device="cuda") for i in range(16)]
+    expected = [value.cpu() for value in values]
+    snapshot = _snapshot_tensor_payload_to_cpu_async(
+        {"list": values, "tuple": tuple(values)}, copy_stream=torch.cuda.Stream(), pin_memory=True
+    )
+    for value in values:
+        value.fill_(-99)
+    snapshot.wait()
+    torch.testing.assert_close(snapshot.payload, {"list": expected, "tuple": tuple(expected)}, rtol=0, atol=0)

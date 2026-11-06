@@ -138,6 +138,8 @@ def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker,
     mask = None if forced is None else torch.tensor(forced)
     talker = SimpleNamespace(_codec_eos_id=7, take_mrv2_forced_eos=mocker.Mock(return_value=mask))
     sampler = MiniCPMO45TalkerSampler(base, talker)
+    # Isolate EOS routing from the separately tested V1-compatible codec draw.
+    mocker.patch.object(sampler, "_sample_like_v1", side_effect=base)
     logits, batch = torch.zeros(2, 8), object()
     assert sampler(logits, batch) is output
     assert output.sampled_token_ids.tolist() == [[2], [3 if forced is None else 7]]
@@ -231,6 +233,8 @@ def test_mrv2_turn_end_drain_masks_cadence_eos(mocker, step, turn_start, turn_en
     base = mocker.Mock(side_effect=lambda logits, _: SimpleNamespace(sampled_token_ids=logits.argmax(-1)[:, None]))
     base.req_states = states
     sampler = MiniCPMO45TalkerSampler(base, talker)
+    # Isolate EOS routing from the separately tested V1-compatible codec draw.
+    mocker.patch.object(sampler, "_sample_like_v1", side_effect=base)
     logits = torch.zeros(1, _EOS + 1)
     logits[0, _EOS] = 10
     output = sampler(logits, batch)
@@ -269,7 +273,9 @@ def _mrv2_turn_end_samples_eos(mocker, talker, *, step: int, code: int, wants_eo
     base.req_states = states
     logits = torch.zeros(1, _EOS + 1)
     logits[0, _EOS if wants_eos else 0] = 10
-    return MiniCPMO45TalkerSampler(base, talker)(logits, batch).sampled_token_ids.item() == _EOS
+    sampler = MiniCPMO45TalkerSampler(base, talker)
+    mocker.patch.object(sampler, "_sample_like_v1", side_effect=base)
+    return sampler(logits, batch).sampled_token_ids.item() == _EOS
 
 
 def test_mrv2_turn_end_drain_waits_for_silence(mocker):
