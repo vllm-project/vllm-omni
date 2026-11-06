@@ -68,9 +68,9 @@ cache and a chunk budget of 2048. The 4B endpoint retains the training protocol'
 request is not acceptance of the head paired with the newly merged backbone.
 This complete deployment always binds the head, including for chat-only
 requests; startup errors name each incompatible scheduler/model setting.
-Invalid prefill/scoring results retain their explicit failed status and log
-the reason at debug level, including nonfinite numerical failures, without
-logging user text or emitting a warning for each malformed client request.
+Invalid prefill/scoring results retain their explicit failed status. Malformed
+client prefill metadata logs at debug level; scoring failures, including
+nonfinite numerical results, log at warning level. Neither path logs user text.
 
 Shared chat sampling preserves JSON Schema on the comprehension stage. Forced
 and required DRVEXO tool calls use the configured parser's native extraction
@@ -83,7 +83,9 @@ downstream Talker/Codec defaults stay unchanged. The DRVEXO speech adapter is
 covered for both 4B and 8B caller-text/reference-audio requests and takes its
 sampling slice from the declared Talker entry-stage ID. It requires the full
 stage-0-indexed sampling list, including Talker and Codec; pre-sliced lists are
-rejected. Standard speech dispatch tests pin this input contract for both models.
+rejected. A single-stage Thinker-only list instead reports that speech output
+is unavailable in that deployment and requires Talker and Codec. Standard
+speech dispatch tests pin the complete-pipeline input contract for both models.
 
 ## Acceptance
 

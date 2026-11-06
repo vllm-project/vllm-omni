@@ -18,6 +18,11 @@ class DRVEXOTTSAdapter(Qwen3TTSAdapter):
     def apply_sampling_overrides(self, sampling_params_list, request, prompt=None, request_id=None):
         # Serving passes all stages indexed from zero, not an entry-stage slice.
         # Both complete DRVEXO pipelines have Talker followed by Codec.
+        if len(sampling_params_list) == self.entry_stage_id:
+            raise ValueError(
+                "Speech output is unavailable in this DRVEXO Thinker-only deployment; "
+                "use a deployment with Talker and Codec"
+            )
         if len(sampling_params_list) != self.entry_stage_id + 2:
             raise ValueError("DRVEXO speech requires the full stage-0-indexed sampling list through Talker and Codec")
         # Qwen3-TTS owns the Talker budget. Keep Thinker's params independent.

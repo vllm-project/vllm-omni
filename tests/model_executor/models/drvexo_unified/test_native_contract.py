@@ -120,11 +120,19 @@ def test_direct_speech_budget_and_finish_reason_belong_to_talker(monkeypatch):
     assert counter.total() == 24
 
 
-@pytest.mark.parametrize("stage_count", [0, 1, 2, 4])
+@pytest.mark.parametrize("stage_count", [0, 2, 4])
 def test_direct_speech_rejects_sampling_list_without_full_pipeline(stage_count):
     adapter = object.__new__(DRVEXOTTSAdapter)
     with pytest.raises(ValueError, match="full stage-0-indexed"):
         adapter.apply_sampling_overrides([object()] * stage_count, None)
+
+
+def test_thinker_only_speech_reports_unavailable_before_sampling_overrides(mocker):
+    adapter = object.__new__(DRVEXOTTSAdapter)
+    overrides = mocker.patch.object(Qwen3TTSAdapter, "apply_sampling_overrides")
+    with pytest.raises(ValueError, match="Speech output is unavailable.*Thinker-only"):
+        adapter.apply_sampling_overrides([object()], None)
+    overrides.assert_not_called()
 
 
 def test_default_speaker_does_not_override_reference_or_leak_to_next_request(monkeypatch):
@@ -189,16 +197,41 @@ def test_nonfinite_head_failure_is_logged_and_next_request_can_score(mocker):
     scorer = mocker.Mock()
     scorer.score.side_effect = [ValueError("Nonfinite native candidate score"), torch.tensor([7.0])]
     debug = mocker.patch.object(decision_module.logger, "debug")
+    warning = mocker.patch.object(decision_module.logger, "warning")
     prefill = UnifiedPrefill(scorer)
     broken = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
     failed = prefill.process(torch.zeros(1, 2560), [broken], [(0, 1)], [0])
     assert failed["drvexo_general_status"][0].item() == -1
     assert failed["drvexo_general_scores"][0].numel() == 0
-    assert "Nonfinite native candidate score" in str(debug.call_args)
+    warning.assert_called_once()
+    assert "Nonfinite native candidate score" in str(warning.call_args)
+    debug.assert_not_called()
     healthy = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
     recovered = prefill.process(torch.zeros(1, 2560), [healthy], [(0, 1)], [0])
     assert recovered["drvexo_general_status"][0].item() == 1
     assert recovered["drvexo_general_scores"][0].item() == 7
+    assert warning.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{"prompt_length": "1", "task": "choice"}, {"task": "choice"}, {"prompt_length": 1, "task": "unknown"}],
+)
+def test_malformed_prefill_remains_debug_only_and_next_request_can_score(mocker, metadata):
+    debug = mocker.patch.object(decision_module.logger, "debug")
+    warning = mocker.patch.object(decision_module.logger, "warning")
+    prefill = UnifiedPrefill(_Scorer())
+    failed = prefill.process(torch.zeros(1, 2560), [{"drvexo_general_decision": metadata}], [(0, 1)], [0])
+    assert failed["drvexo_general_status"][0].item() == -1
+    assert failed["drvexo_general_scores"][0].numel() == 0
+    debug.assert_called_once()
+    warning.assert_not_called()
+    healthy = {"drvexo_general_decision": {"prompt_length": 1, "task": "choice"}}
+    recovered = prefill.process(torch.ones(1, 2560), [healthy], [(0, 1)], [0])
+    assert recovered["drvexo_general_status"][0].item() == 1
+    assert recovered["drvexo_general_scores"][0].item() == 1
+    assert debug.call_count == 1
+    warning.assert_not_called()
 
 
 @pytest.mark.parametrize("components", [{}, {"general_decision_head": {}}, {"general_decision_head": {"metadata": {}}}])

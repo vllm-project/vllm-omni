@@ -101,9 +101,14 @@ class UnifiedPrefill:
                     if prior["contract"] != contract:
                         raise ValueError("Decision contract changed within a live request")
                     if not prior["done"] and offset <= length - 1 < offset + end - start:
-                        score = self.classifier.score(hidden[start + length - 1 - offset], task)
-                        prior["done"] = True
-                        status = 1
+                        try:
+                            score = self.classifier.score(hidden[start + length - 1 - offset], task)
+                        except ValueError as exc:
+                            logger.warning("Rejecting invalid DRVEXO decision score: %s", exc)
+                            status = -1
+                        else:
+                            prior["done"] = True
+                            status = 1
                 except (ValueError, KeyError, TypeError) as exc:
                     logger.debug("Rejecting invalid DRVEXO decision prefill: %s", exc)
                     status = -1
