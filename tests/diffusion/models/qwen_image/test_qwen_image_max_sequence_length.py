@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -169,6 +172,7 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
             guidance_scale_provided=False,
             num_outputs_per_prompt=0,
             generator=None,
+            latents=None,
             true_cfg_scale=None,
             max_sequence_length=None,
         ),
