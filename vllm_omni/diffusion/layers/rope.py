@@ -243,14 +243,7 @@ class RotaryEmbedding(CustomOp):
 
 
 class Cosmos3RotaryEmbedding(CustomOp):
-    """Apply half-rotation RoPE using full-width cos/sin.
-
-    Args:
-        q: Query tensor [B, S, H_q, D].
-        k: Key tensor [B, S, H_kv, D].
-        cos: Cosine coefficients [B or 1, S, 1, D].
-        sin: Sine coefficients [B or 1, S, 1, D].
-    """
+    """Apply half-rotation RoPE using full-width cos/sin."""
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -265,6 +258,14 @@ class Cosmos3RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the native Cosmos3 rotary embedding.
+
+        Args:
+            q: Query tensor [B, S, H_q, D].
+            k: Key tensor [B, S, H_kv, D].
+            cos: Cosine coefficients [B or 1, S, 1, D].
+            sin: Sine coefficients [B or 1, S, 1, D].
+        """
         q_embed = (q * cos) + (self._rotate_half(q) * sin)
         k_embed = (k * cos) + (self._rotate_half(k) * sin)
         return q_embed, k_embed
