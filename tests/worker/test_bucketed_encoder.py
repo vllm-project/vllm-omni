@@ -35,13 +35,25 @@ leak across calls and no call can consume another call's lengths.
     model-side forward failure runs exactly once and never disables bucketing,
     a bucketed-path bug raises — only the deterministic output-contract
     mismatch falls back and disables (and says so).
+* test_rebuild_carries_only_last_hidden_state /
+  test_rebuild_retains_no_request_outputs /
+  test_output_with_per_request_fields_refuses_to_bucket /
+  test_install_rejects_missing_or_unknown_output_kind
+    the output kind is declared per model, never learned at runtime: the
+    rebuild carries only last_hidden_state, no request's output instance
+    outlives its call, an output carrying per-request fields refuses to
+    bucket (disable + eager) instead of copying a stale request's values
+    into later results, and a whitelist entry without a known output_kind
+    fails at install.
 
 All encoder calls run under ``torch.inference_mode()`` (the production
 context); the bucketed path is eager — no CUDA graphs.
 """
 
 import dataclasses
+import gc
 import logging
+import weakref
 from contextlib import contextmanager
 
 import pytest
@@ -147,6 +159,27 @@ def _cfg_with(raw):
     )
 
 
+def _knobs(**overrides):
+    """The verified-knobs stub (the whitelist's shape), overridable per test:
+    ``output_kind`` declares what the test's toy encoder returns."""
+    knobs = {
+        "frames_per_length": 1,
+        "context_margin": 0,
+        "time_axis": 1,
+        "output_kind": "last_hidden_state",
+    }
+    knobs.update(overrides)
+    return knobs
+
+
+def _use_knobs(monkeypatch, **overrides):
+    """Re-stub ``_verified_knobs`` with ``_knobs(**overrides)`` (replacing
+    ``bucket_cfg``'s defaults for one test)."""
+    from vllm_omni.worker import bucketed_encoder
+
+    monkeypatch.setattr(bucketed_encoder, "_verified_knobs", lambda vllm_config: _knobs(**overrides))
+
+
 @contextmanager
 def capture_encoder_logs(caplog):
     """Route the wrapper's logger into ``caplog``.
@@ -182,7 +215,7 @@ def bucket_cfg(monkeypatch):
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: {"frames_per_length": 1, "context_margin": 0, "time_axis": 1},
+        lambda vllm_config: _knobs(),
     )
     if not torch.cuda.is_available():
         pytest.skip("bucketed encoder requires CUDA")
@@ -203,19 +236,13 @@ def test_real_installer_receives_lengths_on_the_encoder_call(bucket_cfg):
 
     feats = make_features()
     with torch.inference_mode():
-        # First call: eager prime (learns the output type).
+        # The lengths argument arrives at the wrapper on the call itself, so
+        # the bucketed path groups by rung from the very first call.
         model.embed_multimodal(
             audio_features=feats,
             audio_lens=torch.tensor(LENGTHS, dtype=torch.int64),
         )
-        # Second call: the lengths argument arrives at the wrapper on the call,
-        # so the bucketed path groups by rung.
-        calls_before = len(model.encoder.calls)
-        model.embed_multimodal(
-            audio_features=feats,
-            audio_lens=torch.tensor(LENGTHS, dtype=torch.int64),
-        )
-    new_shapes = model.encoder.calls[calls_before:]
+    new_shapes = model.encoder.calls
     assert sorted(new_shapes) == sorted([(1, 40, D), (2, 200, D), (1, 100, D)]), new_shapes
 
 
@@ -225,17 +252,10 @@ def test_cumsum_encoder_runs_bucketed_path_not_fallback(bucket_cfg):
 
     feats = make_features()
     with torch.inference_mode():
-        # First eligible call: eager (learns the output type).
-        model.embed_multimodal(
-            audio_features=feats,
-            audio_lens=torch.tensor(LENGTHS, dtype=torch.int64),
-        )
-        calls_after_prime = len(model.encoder.calls)
         out = model.embed_multimodal(
             audio_features=feats,
             audio_lens=torch.tensor(LENGTHS, dtype=torch.int64),
         )
-        calls_after_bucketed = len(model.encoder.calls)
 
     expected = expected_bucketed(feats)
 
@@ -261,7 +281,7 @@ def test_cumsum_encoder_runs_bucketed_path_not_fallback(bucket_cfg):
 
     # (c) Execution evidence: the bucketed call re-entered the encoder with
     #     per-rung window shapes (eager path), not the full-batch fallback.
-    bucketed_shapes = model.encoder.calls[calls_after_prime:calls_after_bucketed]
+    bucketed_shapes = model.encoder.calls
     assert sorted(bucketed_shapes) == sorted([(1, 40, D), (2, 200, D), (1, 100, D)]), bucketed_shapes
 
 
@@ -288,9 +308,10 @@ class MaskToyModel(nn.Module):
         )
 
 
-def test_explicit_lengths_apply_alongside_positional_mask(bucket_cfg):
+def test_explicit_lengths_apply_alongside_positional_mask(bucket_cfg, monkeypatch):
     """(features, mask) call sites must bucket via the explicit ``lengths``
     argument and stay numerically exact for a mask-consuming encoder."""
+    _use_knobs(monkeypatch, output_kind="tensor")  # the mask encoder returns a bare tensor
     model = MaskToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
     wrapper = model.encoder.forward
@@ -341,10 +362,11 @@ class LengthReturningToyModel(nn.Module):
         return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
 
 
-def test_length_returning_encoder_buckets_losslessly(bucket_cfg):
+def test_length_returning_encoder_buckets_losslessly(bucket_cfg, monkeypatch):
     """(features, lengths) encoders must bucket losslessly: each row's true-length
     prefix equals its solo result and the output lengths are the true per-item
     lengths (not rung-padded)."""
+    _use_knobs(monkeypatch, output_kind="lengths_tuple")
     model = LengthReturningToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
     wrapper = model.encoder.forward
@@ -364,11 +386,12 @@ def test_length_returning_encoder_buckets_losslessly(bucket_cfg):
         assert out_lens[row].item() == solo_len.item()
 
 
-def test_length_returning_encoder_shim_nontuple_falls_back(bucket_cfg, caplog):
-    """A length-carrying ``_aux_spec`` (learned from a ``(features, lengths)``
-    prime call) must not silently slice a bare-tensor shim output: the wrapper
-    disables and returns the eager (original) result instead — and says so
-    (the disable is observable, not silent)."""
+def test_length_returning_encoder_shim_nontuple_falls_back(bucket_cfg, caplog, monkeypatch):
+    """A bare-tensor shim output must not silently satisfy the declared
+    ``(features, lengths)`` contract: the wrapper disables and returns the
+    eager (original) result instead — and says so (the disable is observable,
+    not silent)."""
+    _use_knobs(monkeypatch, output_kind="lengths_tuple")
     model = LengthReturningToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
     wrapper = model.encoder.forward
@@ -378,9 +401,8 @@ def test_length_returning_encoder_shim_nontuple_falls_back(bucket_cfg, caplog):
 
     with capture_encoder_logs(caplog):
         with torch.inference_mode():
-            # Prime call: the real (features, lengths) output teaches _aux_spec.
+            # The first call buckets normally through the real encoder.
             model.embed_multimodal(audio_features=feats, audio_lens=lens)
-            assert wrapper._aux_spec is not None and wrapper._aux_spec[0] == "lengths"
 
             eager_features, eager_lens = wrapper._original(feats, lens)
 
@@ -430,7 +452,7 @@ def test_bucketed_path_programming_error_surfaces(bucket_cfg):
     feats = make_features()
     lens = torch.tensor(LENGTHS, dtype=torch.long)
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime call learns the output type
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # first call buckets normally
 
         def broken_bucketed(*args, **kwargs):
             raise ValueError("bucketing bug")
@@ -456,12 +478,7 @@ def test_context_margin_preserves_conv_tail(bucket_cfg, monkeypatch):
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: {
-            "hop": 160,
-            "frames_per_length": 1,
-            "context_margin": 2,
-            "time_axis": 1,
-        },
+        lambda vllm_config: _knobs(hop=160, context_margin=2, output_kind="lengths_tuple"),
     )
 
     class ConvContextEncoder(nn.Module):
@@ -492,7 +509,6 @@ def test_context_margin_preserves_conv_tail(bucket_cfg, monkeypatch):
     lens = torch.tensor(lengths, dtype=torch.long)
 
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
         out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
 
     assert out.shape[0] == len(lengths)
@@ -535,7 +551,7 @@ def test_published_length_margin_3_covers_model_reported_offset(bucket_cfg, monk
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: {"frames_per_length": 1, "context_margin": 3, "time_axis": 1},
+        lambda vllm_config: _knobs(context_margin=3, output_kind="lengths_tuple"),
     )
 
     model = Model().cuda()
@@ -551,7 +567,6 @@ def test_published_length_margin_3_covers_model_reported_offset(bucket_cfg, monk
     lens = torch.tensor(lengths, dtype=torch.long)
 
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
         out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
 
     for row, length in enumerate(lengths):
@@ -621,12 +636,7 @@ def test_time_axis_contract_wins_for_all_short_batch(bucket_cfg, monkeypatch):
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: {
-            "hop": 160,
-            "frames_per_length": 1,
-            "context_margin": 0,
-            "time_axis": 2,
-        },
+        lambda vllm_config: _knobs(hop=160, time_axis=2, output_kind="lengths_tuple"),
     )
 
     class ChannelsFirstConvEncoder(nn.Module):
@@ -665,7 +675,6 @@ def test_time_axis_contract_wins_for_all_short_batch(bucket_cfg, monkeypatch):
     lens = torch.tensor(lengths, dtype=torch.long)
 
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
         out, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
 
     assert wrapper._disabled is False, "an all-short batch must not disable bucketing"
@@ -724,13 +733,12 @@ def test_fixed_window_encoder_contract_engages(bucket_cfg, monkeypatch):
     lengths = [300, 800, 2400]
     feats = torch.randn(len(lengths), 80, 3000, device="cuda")  # (B, mel, T) padded to 30s
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_lens=torch.tensor(lengths))
         hidden = model.embed_multimodal(audio_features=feats, audio_lens=torch.tensor(lengths))
 
-    # Engaged: the bucketed rung windows use the variable-length recipe; the
-    # fixed-window forward only runs once, at the eager prime, with the full
-    # 3000-frame input.
-    assert raw_calls == [(3, 80, 3000)], f"fixed-window forward calls: {raw_calls}"
+    # Engaged: every eligible window is computed by the variable-length
+    # recipe — the fixed-window forward never runs for an eligible batch (the
+    # output kind is declared, so there is no learn pass to serve eagerly).
+    assert raw_calls == [], f"fixed-window forward calls: {raw_calls}"
 
     # Exact where the rung equals the true length (no padding involved).
     assert hidden.shape[0] == len(lengths) and hidden.shape[2] == 64
@@ -825,11 +833,7 @@ def test_reads_model_published_length_field_scaled(bucket_cfg, monkeypatch):
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: {
-            "frames_per_length": 16,
-            "context_margin": 0,
-            "time_axis": 1,
-        },
+        lambda vllm_config: _knobs(frames_per_length=16),
     )
 
     model = ToyModel(lengths_field="audio_num_tokens").cuda()
@@ -838,12 +842,10 @@ def test_reads_model_published_length_field_scaled(bucket_cfg, monkeypatch):
     tokens = torch.tensor([2, 6, 12, 5], dtype=torch.int64)  # * 16 -> 32/96/192/80 frames
     feats = make_features([32, 96, 192, 80])
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_num_tokens=tokens)  # prime
-        calls_before = len(model.encoder.calls)
         model.embed_multimodal(audio_features=feats, audio_num_tokens=tokens)
 
     # 32 -> rung 40, 96 -> rung 100, 192 -> rung 200, 80 -> rung 100.
-    assert sorted(model.encoder.calls[calls_before:]) == sorted([(1, 40, D), (2, 100, D), (1, 200, D)])
+    assert sorted(model.encoder.calls) == sorted([(1, 40, D), (2, 100, D), (1, 200, D)])
 
 
 def test_missing_length_field_falls_back_to_original(bucket_cfg, caplog):
@@ -868,10 +870,11 @@ def test_missing_length_field_falls_back_to_original(bucket_cfg, caplog):
     assert sum(r.levelno == logging.WARNING for r in missing_logs) == 1, "the warning must fire exactly once"
 
 
-def test_positional_host_lengths_fallback_still_buckets(bucket_cfg):
+def test_positional_host_lengths_fallback_still_buckets(bucket_cfg, monkeypatch):
     """A direct encoder call whose forward takes lengths positionally
     (StepAudio2's audio_lens contract) still buckets via the positional source
     in _host_lengths."""
+    _use_knobs(monkeypatch, output_kind="lengths_tuple")
     model = LengthReturningToyModel().cuda()
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
     wrapper = model.encoder.forward
@@ -879,7 +882,6 @@ def test_positional_host_lengths_fallback_still_buckets(bucket_cfg):
     feats = make_features()
     lens = torch.tensor(LENGTHS, dtype=torch.long)
     with torch.inference_mode():
-        model.encoder(feats, lens)  # eligible: eager prime (learns the output type)
         out_features, out_lens = model.encoder(feats, lens)
 
     # Bucketed container: width = largest rung used (200), not the raw T (240).
@@ -899,12 +901,7 @@ def test_mixed_hop_models_each_get_their_own_ladder(monkeypatch):
     cfg = _mock_vllm_config("toy", 1)
 
     def knobs(hop):
-        return lambda vllm_config: {
-            "hop": hop,
-            "frames_per_length": 1,
-            "context_margin": 0,
-            "time_axis": 1,
-        }
+        return lambda vllm_config: _knobs(hop=hop)
 
     monkeypatch.setattr(bucketed_encoder, "_verified_knobs", knobs(160))
     model_a = ToyModel().cuda()
@@ -1013,7 +1010,7 @@ def test_each_call_carries_its_own_lengths(bucket_cfg):
     second = [200, 40, 40, 40]
     feats4 = make_features(first)
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats4, audio_lens=torch.tensor(first))  # prime
+        model.embed_multimodal(audio_features=feats4, audio_lens=torch.tensor(first))  # buckets by ITS lengths
         calls_before = len(model.encoder.calls)
         model.embed_multimodal(audio_features=feats4, audio_lens=torch.tensor(second))
     shapes = model.encoder.calls[calls_before:]
@@ -1171,13 +1168,15 @@ def test_seconds_only_enables_with_default_knobs(bucket_cfg, monkeypatch):
     assert wrapper._context_margin == 0  # the whitelist-provided default margin
 
 
-def test_missing_context_margin_clips_conv_context_at_rung_edge(bucket_cfg):
+def test_missing_context_margin_clips_conv_context_at_rung_edge(bucket_cfg, monkeypatch):
     """Regression: a whitelist context_margin of 0 lets a rung land exactly on
     a row's length, so the rung edge clips the front conv's context reads and
     the boundary output silently diverges from the un-bucketed reference
     (lossy), rather than crashing or warning. Rows whose rung leaves room past
     the content keep the input's own tail and stay exact. This documents why
     the whitelist must carry the verified margin for conv-context encoders."""
+    _use_knobs(monkeypatch, output_kind="lengths_tuple")  # the conv encoder returns (features, lengths)
+
     from torch.nn import functional as F
 
     class ConvContextEncoder(nn.Module):
@@ -1208,7 +1207,6 @@ def test_missing_context_margin_clips_conv_context_at_rung_edge(bucket_cfg):
     lens = torch.tensor(lengths, dtype=torch.long)
 
     with torch.inference_mode():
-        model.embed_multimodal(audio_features=feats, audio_lens=lens)  # prime
         out, _ = model.embed_multimodal(audio_features=feats, audio_lens=lens)
 
     for row, length in enumerate(lengths):
@@ -1254,7 +1252,7 @@ def test_whitelisted_model_gets_verified_knobs(monkeypatch):
     monkeypatch.setitem(
         bucketed_encoder._VERIFIED_MODELS,
         "test_model",
-        {"frames_per_length": 1, "context_margin": 2, "time_axis": 2},
+        {"frames_per_length": 1, "context_margin": 2, "time_axis": 2, "output_kind": "last_hidden_state"},
     )
 
     model = ToyModel().cuda()
@@ -1283,3 +1281,102 @@ def test_uninstall_restores_the_module_forward(bucket_cfg):
     # Re-install after rollback wraps again from a clean slate.
     assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
     assert type(model.encoder.forward).__name__ == "_BucketedEncoder"
+
+
+def test_install_rejects_missing_or_unknown_output_kind(monkeypatch):
+    """A verified whitelist entry without a known ``output_kind`` is a
+    whitelist bug and fails at install (loudly), instead of being discovered
+    at the first call and silently disabling the feature."""
+    from vllm_omni.worker import bucketed_encoder
+
+    model = ToyModel()
+    cfg = _mock_vllm_config("test_model", 0.4)
+    for bad in (None, "bogus"):
+        knobs = {"frames_per_length": 1, "context_margin": 0, "time_axis": 1}
+        if bad is not None:
+            knobs["output_kind"] = bad
+        monkeypatch.setattr(bucketed_encoder, "_verified_knobs", lambda vllm_config, k=knobs: k)
+        with pytest.raises(RuntimeError, match="output_kind"):
+            install_bucketed_encoders(model, vllm_config=cfg)
+
+
+def test_rebuild_carries_only_last_hidden_state(bucket_cfg):
+    """The rebuilt output is a fresh ``BaseModelOutput`` carrying only
+    ``last_hidden_state`` — the declared output contract (see ``_REBUILDERS``):
+    no other field of any request's output can ride along."""
+    from transformers.modeling_outputs import BaseModelOutput
+
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
+
+    feats = make_features()
+    with torch.inference_mode():
+        out = model.encoder(feats, lengths=torch.tensor(LENGTHS, dtype=torch.int64))
+    assert type(out) is BaseModelOutput
+    assert out.hidden_states is None and out.attentions is None
+    assert out.last_hidden_state.shape == (len(LENGTHS), 200, D)
+
+
+def test_rebuild_retains_no_request_outputs(bucket_cfg):
+    """No request's output instance may outlive its call (the review note:
+    "This closure keeps the first request's output alive"): the rebuild
+    captures no per-request instance, so every result is collected once its
+    caller drops it."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
+
+    feats = make_features()
+    refs = []
+    with torch.inference_mode():
+        for _ in range(3):
+            out = model.encoder(feats, lengths=torch.tensor(LENGTHS, dtype=torch.int64))
+            refs.append(weakref.ref(out))
+            del out
+    gc.collect()
+    assert [ref() for ref in refs] == [None, None, None], "a request's output outlived its call"
+
+
+def test_output_with_per_request_fields_refuses_to_bucket(bucket_cfg, caplog):
+    """An output carrying per-request fields (beyond ``last_hidden_state``)
+    cannot be rebuilt from the regrouped features. Instead of silently copying
+    a stale request's values into later results (the old ``dataclasses.replace``
+    behavior), the wrapper refuses to bucket, disables, and serves the eager
+    result — so every request's fields stay its own."""
+
+    @dataclasses.dataclass
+    class StampedOutput:
+        last_hidden_state: torch.Tensor
+        stamp: str = ""
+
+    class StampedEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x: torch.Tensor) -> StampedOutput:
+            self.calls += 1
+            return StampedOutput(last_hidden_state=x.cumsum(dim=1), stamp=f"req{self.calls}")
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = StampedEncoder()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"], lengths=kwargs.get("audio_lens"))
+
+    model = Model().cuda()
+    assert install_bucketed_encoders(model, vllm_config=bucket_cfg) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    feats = make_features()
+    with capture_encoder_logs(caplog):
+        with torch.inference_mode():
+            first = model.embed_multimodal(audio_features=feats, audio_lens=torch.tensor(LENGTHS, dtype=torch.int64))
+            second = model.embed_multimodal(audio_features=feats, audio_lens=torch.tensor(LENGTHS, dtype=torch.int64))
+
+    assert wrapper._disabled is True, "per-request fields must refuse to bucket"
+    assert "stamp" in caplog.text and "cannot reproduce" in caplog.text, "the refusal must be logged"
+    # Each result carries ITS OWN request's stamp — never another's.
+    assert first.stamp != second.stamp
+    torch.testing.assert_close(second.last_hidden_state, feats.cumsum(dim=1), rtol=0, atol=0)

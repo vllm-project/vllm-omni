@@ -204,18 +204,26 @@ def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] 
 #   time_axis       — which feature axis is time: 1 = (B, T, D) time-major,
 #                     2 = (B, mel, T) channels-first. Read the encoder's input
 #                     tensor shape / forward docstring.
+#   output_kind     — what the encoder's forward returns, and hence what the
+#                     bucketed path rebuilds (see _REBUILDERS): "tensor" (bare
+#                     features), "lengths_tuple" ((features, per-item lengths)),
+#                     "last_hidden_state" (a dataclass; rebuilt as a fresh
+#                     BaseModelOutput carrying only last_hidden_state — the
+#                     consumer must read only that field).
 _VERIFIED_MODELS: dict[str, dict[str, object]] = {
     "step_audio_2": {
         "hop": 160,
         "frames_per_length": 1,
         "context_margin": 3,
         "time_axis": 2,
+        "output_kind": "lengths_tuple",
     },
     "covo_audio": {
         "hop": 160,
         "frames_per_length": 16,
         "context_margin": 0,
         "time_axis": 2,
+        "output_kind": "last_hidden_state",
     },
 }
 
@@ -227,24 +235,13 @@ def _verified_knobs(vllm_config) -> dict[str, object] | None:
     return _VERIFIED_MODELS.get(vllm_config.model_config.hf_config.model_type)
 
 
-def _as_tensor(output):
-    if torch.is_tensor(output):
-        return output
-    if isinstance(output, tuple) and len(output) >= 1 and torch.is_tensor(output[0]):
-        return output[0]
-    hidden = getattr(output, "last_hidden_state", None)
-    if torch.is_tensor(hidden):
-        return hidden
-    return None
-
-
 # ------------------------------------------------------------- generic wrapper
 
 
 class _OutputContractError(TypeError):
-    """The compute output does not match the output contract learned at the
-    prime call (e.g. a bare tensor where a ``(features, lengths)`` tuple was
-    expected).
+    """The compute output does not match the output kind declared for the model
+    in ``_VERIFIED_MODELS`` (e.g. a bare tensor where a ``(features, lengths)``
+    tuple was declared).
 
     This is a deterministic structural mismatch, not a bug in the bucketed
     math: the same (encoder, shim) pairing fails the same way on every batch.
@@ -252,35 +249,35 @@ class _OutputContractError(TypeError):
     """
 
 
-def _split_output(output):
-    """Return ``(features, rebuild, aux_spec)`` describing an encoder output.
+def _rebuild_tensor(features, aux):
+    return features
 
-    ``features`` is the tensor the bucketed path re-groups. ``rebuild(features,
-    aux)`` reconstructs the original output type. ``aux_spec`` is ``None`` except
-    for encoders that return ``(features, per-item lengths)``, in which case it is
-    ``("lengths", dtype, device)`` and the bucketed path also re-groups ``aux``.
-    """
-    if torch.is_tensor(output):
-        return output, (lambda features, aux: features), None
-    if isinstance(output, tuple) and len(output) == 1 and torch.is_tensor(output[0]):
-        return output[0], (lambda features, aux: (features,)), None
-    if (
-        isinstance(output, tuple)
-        and len(output) == 2
-        and torch.is_tensor(output[0])
-        and torch.is_tensor(output[1])
-        and output[1].dim() == 1
-    ):
-        lengths = output[1]
-        return (
-            output[0],
-            (lambda features, aux: (features, aux)),
-            ("lengths", lengths.dtype, lengths.device),
-        )
-    hidden = getattr(output, "last_hidden_state", None)
-    if torch.is_tensor(hidden) and dataclasses.is_dataclass(output):
-        return hidden, (lambda features, aux: dataclasses.replace(output, last_hidden_state=features)), None
-    return None
+
+def _rebuild_lengths_tuple(features, aux):
+    return (features, aux)
+
+
+def _rebuild_last_hidden_state(features, aux):
+    from transformers.modeling_outputs import BaseModelOutput
+
+    return BaseModelOutput(last_hidden_state=features)
+
+
+# What the bucketed path rebuilds, per declared output kind (see
+# ``_VERIFIED_MODELS`` ``output_kind``). The output shape is fixed per model,
+# so the rebuild is a stateless function chosen at install: nothing is learned
+# at runtime and no request's output instance is captured — a captured
+# instance would pin that request's activations and copy its other fields into
+# every later result. ``last_hidden_state`` constructs a fresh ``transformers``
+# ``BaseModelOutput`` (the exact class the verified consumer's encoder
+# returns) carrying only ``last_hidden_state``; a compute output whose other
+# fields carry values refuses to bucket (``_tensor_forward``) rather than
+# silently dropping or copying them.
+_REBUILDERS = {
+    "tensor": _rebuild_tensor,
+    "lengths_tuple": _rebuild_lengths_tuple,
+    "last_hidden_state": _rebuild_last_hidden_state,
+}
 
 
 class _BucketedEncoder:
@@ -304,6 +301,8 @@ class _BucketedEncoder:
         ladder: LengthBucketingConfig | None,
         *,
         shim=None,
+        rebuild=None,
+        output_kind: str | None = None,
         context_margin: int = 0,
         time_axis: int | None = None,
         frames_per_length: int = 1,
@@ -314,8 +313,8 @@ class _BucketedEncoder:
         self._active = ladder is not None  # feature armed; False = pass-through
         self._original = module.forward
         self._shim = shim  # optional fixed-window recipe; used ONLY for bucketed windows
-        self._rebuild = None
-        self._aux_spec = None  # e.g. ("lengths", dtype, device) for (features, lengths) outputs
+        self._rebuild = rebuild  # stateless rebuild of the declared output kind
+        self._output_kind = output_kind
         self._disabled = False
         self._truncation_warned = False
         self._missing_lengths_warned = False
@@ -416,26 +415,6 @@ class _BucketedEncoder:
         if sum(windows) >= len(lengths) * time_extent:
             return self._original(*args, **kwargs)
 
-        if self._rebuild is None:
-            # First eligible call: serve it eagerly, learning how to rebuild
-            # the output type; later eligible calls take the bucketed path.
-            # This call is the model's own forward and runs OUTSIDE the
-            # contract fallback below: its errors are the model's, must
-            # surface as-is (never re-run through the original a second time),
-            # and never disable bucketing.
-            output = self._original(*args, **kwargs)
-            split = _split_output(output)
-            if split is None:
-                self._disabled = True
-                logger.warning(
-                    "Bucketed encoder %r disabled: unsupported output type %r",
-                    self.name,
-                    type(output).__name__,
-                )
-                return output
-            self._rebuild = split[1]
-            self._aux_spec = split[2]
-            return output
         try:
             bucketed, aux = self._bucketed(features, lengths, mask, length_arg, windows)
             return self._rebuild(bucketed, aux)
@@ -559,25 +538,53 @@ class _BucketedEncoder:
     def _tensor_forward(self, *inputs):
         # The fixed-window recipe, if any, applies only to the bucketed-window
         # compute. Ineligible calls (kwargs/2-D/non-CUDA/grad/stream-capturing)
-        # and the eager prime call still go through the untouched forward.
+        # and fallback calls still go through the untouched forward.
         target = self._shim if self._shim is not None else self._original
         output = target(*inputs)
-        features = _as_tensor(output)
-        if features is None:
-            raise _OutputContractError(f"encoder {self.name!r} returned an unsupported output type")
-        aux = None
-        if self._aux_spec is not None and self._aux_spec[0] == "lengths":
-            # The encoder returned (features, per-item lengths); carry the
+        if self._output_kind == "lengths_tuple":
+            # The encoder returns (features, per-item lengths); carry the
             # lengths through so _bucketed can re-order them to the item order.
             # The fixed-window shim (when present) produces a dataclass, not a
-            # tuple, so a length-carrying _aux_spec learned from the prime call
-            # would otherwise make output[1] raise on the bucketed path.
-            if not (isinstance(output, tuple) and len(output) == 2):
+            # tuple, so this declared-contract check rejects that pairing
+            # instead of silently slicing the wrong output.
+            if not (
+                isinstance(output, tuple)
+                and len(output) == 2
+                and torch.is_tensor(output[0])
+                and torch.is_tensor(output[1])
+                and output[1].dim() == 1
+            ):
                 raise _OutputContractError(
                     f"encoder {self.name!r} returned {type(output).__name__}, expected a (features, lengths) tuple"
                 )
-            aux = output[1]
-        return features, aux
+            return output[0], output[1]
+        if self._output_kind == "last_hidden_state":
+            hidden = getattr(output, "last_hidden_state", None)
+            if not (dataclasses.is_dataclass(output) and torch.is_tensor(hidden)):
+                raise _OutputContractError(
+                    f"encoder {self.name!r} returned {type(output).__name__}, "
+                    "expected a dataclass with last_hidden_state"
+                )
+            carried_fields = [
+                field.name
+                for field in dataclasses.fields(output)
+                if field.name != "last_hidden_state" and getattr(output, field.name, None) is not None
+            ]
+            if carried_fields:
+                # The rebuild carries only last_hidden_state: refuse rather
+                # than silently dropping the model's other fields (or copying
+                # a stale request's values into them).
+                raise _OutputContractError(
+                    f"encoder {self.name!r} output carries {carried_fields}, "
+                    "which the bucketed rebuild cannot reproduce"
+                )
+            return hidden, None
+        if self._output_kind == "tensor" and torch.is_tensor(output):
+            return output, None
+        raise _OutputContractError(
+            f"encoder {self.name!r} returned {type(output).__name__}, "
+            f"expected a bare tensor (output_kind={self._output_kind!r})"
+        )
 
 
 # --------------------------------------------------------------- auto install
@@ -637,6 +644,8 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     frames_per_length = 1
     context_margin = 0
     time_axis = None
+    rebuild = None
+    output_kind = None
     if verified is not None:
         hop = verified.get("hop") or _DEFAULT_HOP
         rungs = _rungs_from_config(vllm_config, hop)
@@ -645,6 +654,11 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         frames_per_length = int(verified.get("frames_per_length", 1))
         context_margin = verified["context_margin"]
         time_axis = verified["time_axis"]
+        # Raise (not assert) so the whitelist-bug signal survives `python -O`.
+        output_kind = verified.get("output_kind")
+        rebuild = _REBUILDERS.get(output_kind)
+        if rebuild is None:
+            raise RuntimeError(f"verified model must specify output_kind in {sorted(_REBUILDERS)}, got {output_kind!r}")
     elif _rungs_from_config(vllm_config) is not None:
         model_type = vllm_config.model_config.hf_config.model_type if vllm_config is not None else "<unknown>"
         logger.warning(
@@ -678,7 +692,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
                     "(outputs may differ from the un-bucketed forward).",
                     name,
                 )
-        # Keep _original as the untouched forward (fallback + prime); the shim
+        # Keep _original as the untouched forward (the fallback); the shim
         # (the module-bound fixed-window recipe) is used ONLY for bucketed
         # windows via _tensor_forward.
         encoder = _BucketedEncoder(
@@ -686,6 +700,8 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
             name,
             ladder,
             shim=functools.partial(shim_fn, module) if shim_fn is not None else None,
+            rebuild=rebuild,
+            output_kind=output_kind,
             context_margin=context_margin,
             time_axis=time_axis,
             frames_per_length=frames_per_length,
