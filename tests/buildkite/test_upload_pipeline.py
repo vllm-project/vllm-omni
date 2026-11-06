@@ -533,10 +533,6 @@ def _iter_steps(doc: dict):
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
         ),
         (
-            Path(".buildkite/cuda/test-weekly.yml"),
-            {"weekly-omni-performance-vllm-text", "weekly-omni-performance-multi-replicas"},
-        ),
-        (
             Path(".buildkite/npu/test-npu-nightly.yml"),
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
         ),
@@ -552,8 +548,6 @@ def _iter_steps(doc: dict):
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
         ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
         ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True),
         ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
         ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
         ("tests/dfx/perf/scripts/run_benchmark.py", True),
@@ -573,8 +567,7 @@ def test_qwen3_perf_pipeline_selection(
     rendered = _render_test_pipeline(doc, changed_files=[changed_file], pipeline_path=pipeline_path)
     surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
-    # Compare the dependency-filtered Qwen perf jobs. The weekly random job has
-    # no source dependencies and remains unconditional under source filtering.
+    # Compare the dependency-filtered Qwen perf jobs.
     expected_keys = set(legacy_keys) if select_legacy else set()
     assert surviving_keys & legacy_keys == expected_keys
 
