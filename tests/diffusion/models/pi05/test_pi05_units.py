@@ -740,6 +740,73 @@ def test_empty_image_matches_torch_reference():
     assert torch.equal(out, reference)
 
 
+def _all_uint8_values_frame(size: int = 16) -> np.ndarray:
+    """A ``size x size`` frame whose channels together hold every uint8 value."""
+    values = np.arange(256, dtype=np.uint8).reshape(16, 16)
+    frame = np.stack([values, values[::-1, ::-1], np.roll(values, 7)], axis=-1)
+    return np.ascontiguousarray(np.tile(frame, (size // 16, size // 16, 1)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The device conversion path needs a CUDA GPU.")
+def test_device_uint8_conversion_matches_host_path_bit_for_bit():
+    """The batched device conversion must equal the host path in values and strides."""
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import _uint8_frames_to_unit_range_on_device
+
+    device = torch.device("cuda")
+    frames = [
+        _all_uint8_values_frame(),
+        np.zeros((16, 16, 3), dtype=np.uint8),
+        np.full((16, 16, 3), 255, dtype=np.uint8),
+    ]
+    host = [Pi05ImageProcessor(image_size=16).preprocess_single(frame).to(device=device) for frame in frames]
+
+    out = _uint8_frames_to_unit_range_on_device(frames, device)
+
+    assert len(out) == len(host)
+    for got, want in zip(out, host):
+        assert got.dtype == want.dtype
+        assert got.shape == want.shape
+        assert got.stride() == want.stride()
+        assert got.cpu().contiguous().numpy().tobytes() == want.cpu().contiguous().numpy().tobytes()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The device conversion path needs a CUDA GPU.")
+@pytest.mark.parametrize("present", [(True, True, True), (True, False, True), (False, True, False)])
+def test_model_inputs_with_shared_constants_match_the_host_path(present):
+    """Cached constants and device conversion must not change any model input."""
+    from vllm_omni.diffusion.models.pi05 import processor_pi05
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import _ModelInputConstants
+
+    device = torch.device("cuda")
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3, image_resolution=(16, 16))
+    observation = {
+        "images": {key: _all_uint8_values_frame() for key, used in zip(_EXPECTED_CAMERA_ORDER, present) if used},
+        "state": np.linspace(-1.0, 1.0, 32, dtype=np.float32),
+        "prompt": "pick up the red block",
+    }
+
+    constants = _ModelInputConstants(16, device)
+    got = _assemble_model_inputs(observation, config, _FakeTokenizer(), device, None, constants)
+    original = processor_pi05._is_model_sized_uint8_frame
+    processor_pi05._is_model_sized_uint8_frame = lambda image, image_size: False
+    try:
+        want = _assemble_model_inputs(observation, config, _FakeTokenizer(), device, None)
+    finally:
+        processor_pi05._is_model_sized_uint8_frame = original
+
+    for got_group, want_group in zip(got[:2], want[:2]):
+        assert len(got_group) == len(want_group)
+        for got_tensor, want_tensor in zip(got_group, want_group):
+            assert got_tensor.dtype == want_tensor.dtype
+            assert got_tensor.shape == want_tensor.shape
+            assert got_tensor.stride() == want_tensor.stride()
+            assert torch.equal(got_tensor, want_tensor)
+    for got_tensor, want_tensor in zip(got[2:], want[2:]):
+        assert got_tensor.dtype == want_tensor.dtype
+        assert got_tensor.shape == want_tensor.shape
+        assert torch.equal(got_tensor, want_tensor)
+
+
 def test_resize_with_pad_pads_with_minus_one():
     out = resize_with_pad(torch.zeros(1, 3, 100, 200), 224, 224)
     assert out.shape == (1, 3, 224, 224)

@@ -105,6 +105,55 @@ def _uint8_hwc_to_unit_range(image: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(scaled).permute(2, 0, 1).unsqueeze(0)
 
 
+def _is_model_sized_uint8_frame(image: Any, image_size: int) -> bool:
+    """True for a uint8 HWC frame that already has the model resolution."""
+    return isinstance(image, np.ndarray) and image.dtype == np.uint8 and image.shape == (image_size, image_size, 3)
+
+
+def _uint8_frames_to_unit_range_on_device(
+    frames: list[np.ndarray], device: torch.device, divisor: torch.Tensor | None = None
+) -> list[torch.Tensor]:
+    """uint8 HWC frames → float32 ``(1, 3, H, W)`` device tensors in ``[-1, 1]``.
+
+    One host-to-device copy of the raw bytes, then the float32 operations of
+    ``_uint8_hwc_to_unit_range`` in the same order on the device. IEEE float32
+    division, multiplication and subtraction round identically there, and each
+    returned view has the strides the host path's device copy has, so values
+    and layout match it exactly; the unit tests pin both exhaustively. The
+    host path converts 4x the bytes per camera and then copies each camera
+    separately through a strided (non-contiguous) transfer.
+
+    ``divisor`` is a 0-dim float32 device tensor holding 255. It must be a
+    device tensor: with a Python scalar, CUDA division multiplies by the
+    reciprocal instead, which rounds differently for 111 of the 256 values.
+    """
+    if divisor is None:
+        divisor = torch.tensor(255.0, dtype=torch.float32, device=device)
+    stacked = torch.from_numpy(np.stack(frames)).to(device=device)
+    scaled = stacked.to(dtype=torch.float32)
+    scaled /= divisor
+    scaled *= 2.0
+    scaled -= 1.0
+    return [scaled[index].permute(2, 0, 1).unsqueeze(0) for index in range(len(frames))]
+
+
+class _ModelInputConstants:
+    """Device-side model inputs that are identical for every request.
+
+    The model only reads them (the optimized path copies inputs into its
+    static graph buffers), so one instance per processor is shared by all
+    requests instead of being rebuilt and transferred each time.
+    """
+
+    def __init__(self, image_size: int, device: torch.device):
+        self.image_size = image_size
+        self.device = device
+        self.empty_image = Pi05ImageProcessor(image_size=image_size).make_empty_image().to(device=device)
+        self.mask_true = torch.tensor([True], dtype=torch.bool, device=device)
+        self.mask_false = torch.tensor([False], dtype=torch.bool, device=device)
+        self.uint8_divisor = torch.tensor(255.0, dtype=torch.float32, device=device)
+
+
 class Pi05ImageProcessor:
     """Minimal image preprocessor: image → normalized + padded ``[-1,1]`` tensor."""
 
@@ -477,7 +526,14 @@ def _is_image_like(value: Any) -> bool:
     return False
 
 
-def _assemble_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device, state_norm: NormStats | None):
+def _assemble_model_inputs(
+    robot_obs: dict,
+    config,
+    tokenizer,
+    device: torch.device,
+    state_norm: NormStats | None,
+    constants: _ModelInputConstants | None = None,
+):
     """Convert a raw robot observation into ``sample_actions`` inputs.
 
     Returns ``(images, image_masks, lang_tokens, lang_masks)`` — note there is
@@ -506,23 +562,44 @@ def _assemble_model_inputs(robot_obs: dict, config, tokenizer, device: torch.dev
             f"π0.5 observation provides {len(obs_images)} cameras, which exceeds max_cameras={max_cameras}."
         )
 
-    images: list[torch.Tensor] = []
+    if constants is not None and (constants.image_size != image_size or constants.device != device):
+        constants = None
+
+    def empty_slot() -> torch.Tensor:
+        return constants.empty_image if constants is not None else img_proc.make_empty_image().to(device=device)
+
+    def slot_mask(present: bool) -> torch.Tensor:
+        if constants is not None:
+            return constants.mask_true if present else constants.mask_false
+        return torch.tensor([present], dtype=torch.bool, device=device)
+
+    # Model-sized uint8 frames (the serving case) are converted together on the
+    # device; anything else keeps the host path, including its validation.
+    convert_on_device = device.type == "cuda"
+    images: list[torch.Tensor | None] = []
     image_masks: list[torch.Tensor] = []
+    device_slots: list[int] = []
+    device_frames: list[np.ndarray] = []
     for key in camera_keys:
         image = obs_images.get(key)
         if image is None:
-            tensor = img_proc.make_empty_image().to(device=device)
-            mask = False
+            images.append(empty_slot())
+        elif convert_on_device and _is_model_sized_uint8_frame(image, image_size):
+            device_slots.append(len(images))
+            device_frames.append(image)
+            images.append(None)
         else:
-            tensor = img_proc.preprocess_single(image).to(device=device)
-            mask = True
-        images.append(tensor)
-        image_masks.append(torch.tensor([mask], dtype=torch.bool, device=device))
+            images.append(img_proc.preprocess_single(image).to(device=device))
+        image_masks.append(slot_mask(image is not None))
+    if device_frames:
+        divisor = constants.uint8_divisor if constants is not None else None
+        for slot, tensor in zip(device_slots, _uint8_frames_to_unit_range_on_device(device_frames, device, divisor)):
+            images[slot] = tensor
 
     # A checkpoint may declare fewer named slots than the serving graph.
     while len(images) < max_cameras:
-        images.append(img_proc.make_empty_image().to(device=device))
-        image_masks.append(torch.tensor([False], dtype=torch.bool, device=device))
+        images.append(empty_slot())
+        image_masks.append(slot_mask(False))
 
     # Normalize and serialize the state into the tokenized prompt.
     raw_state = as_state_vector(robot_obs.get("state"), config.state_dim)
@@ -533,8 +610,14 @@ def _assemble_model_inputs(robot_obs: dict, config, tokenizer, device: torch.dev
         state_num_bins=config.state_num_bins,
     )
     ids, attn = tokenize_prompt(tokenizer, prompt, config.tokenizer_max_length)
-    lang_tokens = torch.tensor([ids], dtype=torch.long, device=device)
-    lang_masks = torch.tensor([attn], dtype=torch.bool, device=device)
+    if device.type == "cuda":
+        # One transfer for ids and mask instead of two list-to-device tensors.
+        lang = torch.from_numpy(np.asarray([ids, attn], dtype=np.int64)).to(device=device)
+        lang_tokens = lang[0:1]
+        lang_masks = lang[1:2] != 0
+    else:
+        lang_tokens = torch.tensor([ids], dtype=torch.long, device=device)
+        lang_masks = torch.tensor([attn], dtype=torch.bool, device=device)
 
     return images, image_masks, lang_tokens, lang_masks
 
@@ -555,6 +638,9 @@ class Pi05Processor:
         self.device = device
         self._state_norm = build_norm_stats(config.norm_stats, "state")
         self._action_norm = build_norm_stats(config.norm_stats, "action")
+        self._input_constants: _ModelInputConstants | None = None
+        if device.type == "cuda":
+            self._warm_up_device_inputs()
         self.relative_actions = Pi05RelativeActions(
             enabled=config.use_relative_actions,
             exclude_joints=config.relative_exclude_joints,
@@ -571,12 +657,32 @@ class Pi05Processor:
                 config.relative_exclude_joints,
             )
 
+    def _warm_up_device_inputs(self) -> None:
+        """Create the shared inputs and run the device-side input path once.
+
+        Without this the first request builds the constants and takes the
+        first allocations and kernel launches of the frame conversion, which
+        made that one request about 5 ms slower than it is with the host path.
+        """
+        image_size = int(self.config.image_resolution[0])
+        self._input_constants = _ModelInputConstants(image_size, self.device)
+        frame = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+        for count in range(1, int(self.config.max_cameras) + 1):
+            _uint8_frames_to_unit_range_on_device([frame] * count, self.device, self._input_constants.uint8_divisor)
+        lang = torch.from_numpy(np.zeros((2, int(self.config.tokenizer_max_length)), dtype=np.int64)).to(self.device)
+        _ = lang[1:2] != 0
+        torch.accelerator.synchronize(self.device)
+
     def build_model_inputs(self, robot_obs: dict):
         """Raw observation → ``sample_actions`` inputs.
 
         No state tensor comes back: π0.5 carries the state inside ``lang_tokens``.
         """
-        return _assemble_model_inputs(robot_obs, self.config, self.tokenizer, self.device, self._state_norm)
+        if self._input_constants is None:
+            self._input_constants = _ModelInputConstants(int(self.config.image_resolution[0]), self.device)
+        return _assemble_model_inputs(
+            robot_obs, self.config, self.tokenizer, self.device, self._state_norm, self._input_constants
+        )
 
     def build_model_outputs(self, actions: torch.Tensor, robot_obs: dict) -> np.ndarray:
         """Model output → the action chunk the robot receives.
