@@ -495,7 +495,9 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
 
         return dict(
             audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", lens_tensor),
-            audio_lens=MultiModalFieldConfig.batched("audio"),
+            # Read as Python ints (bucketed-encoder lengths): on the device,
+            # every read would be a host synchronization in the prefill step.
+            audio_lens=MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
