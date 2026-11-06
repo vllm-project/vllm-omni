@@ -109,6 +109,7 @@ from vllm_omni.transformers_utils.configs import ming3_audio as _ming3_audio  # 
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import phonon as _phonon  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
