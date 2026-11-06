@@ -1355,7 +1355,10 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
         needs_component_cache = legacy_manual_components or offloads_text_encoder
-        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
+        if (
+            resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+            and needs_component_cache
+        ):
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
             if legacy_manual_components:
                 _register_dlo_component_cache(
@@ -4037,11 +4040,15 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"MiniMax H3 step execution produces one output per request, got num_outputs_per_prompt={num_outputs}"
             )
-        if getattr(self, "_dlo_residency_controller", None) is not None:
+        if getattr(self, "_dlo_residency_controller", None) is not None or (
+            (od_config := getattr(self, "od_config", None)) is not None
+            and resolve_offload_strategy(od_config)
+            in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+        ):
             raise ValueError(
-                "MiniMax H3 step execution is not compatible with distributed layerwise offload; "
-                "the resident-layer window spans a whole denoise loop, so per-step streaming would "
-                "reload the DiT every step. Drop --step-execution or --enable-distributed-layerwise-offload."
+                "MiniMax H3 step execution is not compatible with distributed layerwise offload or submodule offload; "
+                "the offload residency window spans a whole denoise loop, so per-step streaming would "
+                "reload the DiT every step. Drop --step-execution or the offload flag."
             )
         # Request-scoped Cache-DiT (quality=high) mutates hook state on the
         # shared transformer rather than on ``StepRequestState``. In step mode

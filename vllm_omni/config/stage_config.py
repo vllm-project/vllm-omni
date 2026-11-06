@@ -670,6 +670,7 @@ class StageDeployConfig:
     enable_layerwise_offload: bool | None = None
 
     enable_distributed_layerwise_offload: bool | None = None
+    enable_submodule_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
