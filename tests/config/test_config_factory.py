@@ -1718,7 +1718,7 @@ stages:
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
             expect_v2,
             expect_v2,
-            platform == "cuda",
+            expect_v2,
         ]
         assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
 

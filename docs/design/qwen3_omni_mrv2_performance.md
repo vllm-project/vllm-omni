@@ -23,3 +23,21 @@ a one-frame initial codec chunk, CUDA, a local single-rank Talker and prefix cac
 Other deployments retain the regular Code2Wav path.
 `codec_fused_snake` explicitly opts CUDA profiles into fused decoder blocks;
 the base V1 profile retains its original blocks and indexed text cache.
+
+## Ascend generation stage
+
+The default `qwen3_omni_moe.yaml` selects MRv2 for Thinker, Talker and
+Code2Wav on NPU. The NPU generation runner combines the shared Omni V2
+chunk lifecycle with Ascend request state, input batches and forward context.
+Code2Wav does not build AR attention metadata or sample tokens, so it retains
+the generic Omni model state instead of the Thinker/Talker Ascend attention
+adapter. Startup skips language-model token warmup and retains model-owned
+auxiliary graph capture.
+
+The outer generation forward runs eagerly with exact codec input shapes.
+The worker still invokes model-owned auxiliary graph hooks; this does not
+enable the CUDA-only Qwen3 Code2Wav decoder graphs on NPU. NPU audio uses the synchronous
+host materialization path before the native data plane publishes output and
+releases each chunk slot. CUDA retains its asynchronous output path. This
+adaptation alone does not establish a performance or audio-quality gain.
+The duplex profile remains on MRv1.

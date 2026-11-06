@@ -129,8 +129,6 @@ platforms:
           cudagraph_mode: PIECEWISE   # code_predictor MaskedSelect / inner NPU graph replay
         devices: "2"
       - stage_id: 2
-        # The NPU generation worker supports V1; AR stages above use V2.
-        model_runner: v1
         gpu_memory_utilization: 0.3
         compilation_config:
           cudagraph_mode: PIECEWISE
@@ -162,8 +160,6 @@ platforms:
         max_cudagraph_capture_size: 0
         devices: "4"
       - stage_id: 2
-        # The NPU generation worker supports V1; AR stages above use V2.
-        model_runner: v1
         gpu_memory_utilization: 0.3
         enforce_eager: true
         max_cudagraph_capture_size: 0
