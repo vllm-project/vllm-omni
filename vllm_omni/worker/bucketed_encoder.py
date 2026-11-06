@@ -74,8 +74,18 @@ class _ShimOutput:
 
 
 def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
-    """HF WhisperEncoder/Qwen2AudioEncoder compute without the fixed-length
-    assumptions. Input stays in the module's native (B, mel, T) layout."""
+    """WhisperEncoder compute without the fixed-length assumptions.
+
+    A line-for-line port of the wrapped class's own ``forward``
+    (``transformers`` ``WhisperEncoder``), minus its fixed-window
+    ``expected_seq_length`` check and the eval-identity dropout — the same
+    recipe vLLM's variable-length ``WhisperEncoder.forward``
+    (``vllm/model_executor/models/whisper.py``) implements, but running on the
+    module's own submodules/weights (vLLM's forward is bound to its own
+    encoder class and its TP/attention-backend layers, so it cannot serve an
+    HF module). Full-window parity with the reference forward is pinned by
+    ``test_whisper_shim_matches_reference_forward_at_full_window``.
+    Input stays in the module's native (B, mel, T) layout."""
     x = torch.nn.functional.gelu(module.conv1(input_features))
     x = torch.nn.functional.gelu(module.conv2(x)).permute(0, 2, 1)
     x = x + module.embed_positions.weight[: x.size(1)]

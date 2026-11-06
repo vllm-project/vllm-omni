@@ -633,6 +633,45 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
     torch.testing.assert_close(hidden[0, :150], solo_row0.last_hidden_state[0], rtol=0, atol=1e-5)
 
 
+def test_whisper_shim_matches_reference_forward_at_full_window(bucket_env):
+    """Pin the hand-rolled variable-length recipe to the reference forward
+    (reviewer note: it duplicates WhisperEncoder.forward math). At the model's
+    fixed window — the only window the untouched forward accepts — the shim
+    must reproduce that forward exactly on the same weights. Upstream
+    ``transformers`` forward drift fails here, not in production audio output."""
+    from transformers.models.whisper.configuration_whisper import WhisperConfig
+    from transformers.models.whisper.modeling_whisper import WhisperEncoder
+
+    cfg = WhisperConfig(
+        d_model=64,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=128,
+        num_mel_bins=80,
+        max_source_positions=1500,  # fixed window: 1500 * 2 = 3000 mel frames
+    )
+
+    class CovoContractModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = WhisperEncoder(cfg).cuda().eval()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"]).last_hidden_state
+
+    model = CovoContractModel()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+    assert wrapper._shim is not None, "WhisperEncoder must carry the variable-length recipe"
+
+    feats = torch.randn(2, 80, 3000, device="cuda")  # the reference forward's fixed window
+    with torch.inference_mode():
+        reference = wrapper._original(feats).last_hidden_state
+        shimmed = wrapper._shim(feats).last_hidden_state
+
+    torch.testing.assert_close(shimmed, reference, rtol=0, atol=1e-6)
+
+
 def test_qwen2audio_keyword_call_keeps_pooling_and_true_fallback(bucket_env):
     """P1: Qwen2AudioEncoder must NOT carry the Whisper recipe, so an installed
     module's keyword-argument call (Audex contract) runs the untouched forward:
