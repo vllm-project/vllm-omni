@@ -720,8 +720,32 @@ def test_config_incompatible_keep_steps_fails_before_any_encoder_pass(
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     for key, value in config_patch.items():
         setattr(pipeline.od_config, key, value)
+    # The refine/upscale resolvers consult od_config and the upscaler
+    # component; stub them to return minimal resolved specs so the helper's
+    # rejection fires without model wiring, matching the authoritative-side
+    # tests' stub pattern.
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_latent_refine",
+        lambda extra: SimpleNamespace(strength=0.2),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_latent_upscale",
+        lambda extra, *, latent_h, latent_w: SimpleNamespace(latent_height=latent_h, latent_width=latent_w),
+    )
     with pytest.raises(OmniClientError, match=expected_match):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(**extra_args))
+    assert encode_prompt.call_count == 0
+
+
+def test_local_continue_from_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    """The local path rejects continue_from before the second Qwen pass too."""
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    resolve_continuation = Mock(return_value=None)
+    monkeypatch.setattr(pipeline_minimax_h3, "resolve_continuation", resolve_continuation)
+    with pytest.raises(OmniClientError, match="continue_from"):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2, continue_from="job-1"))
     assert encode_prompt.call_count == 0
 
 
