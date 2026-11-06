@@ -12,7 +12,9 @@ neither the graph path, the connector, nor the sampler RNG is responsible.
 
 With ``VLLM_OMNI_ISOLATE_SEEDED_REQUESTS=1`` the scheduler keeps seeded requests
 out of every co-batch: a seeded request waits for the engine to drain, then runs
-alone, and no other request is admitted while it runs. Unseeded traffic keeps
+alone, and no other request is admitted while it runs. "Waiting" covers both the
+regular wait queue and ``kv_holding_waiting``, so a seeded request that resumes
+from KV retention cannot join a running unseeded request either. Unseeded traffic keeps
 batching as before. Measured cost on the same card: 8 concurrent seeded requests
 take 3.25 s instead of 0.77 s, while 8 unseeded requests stay at 0.83 s.
 

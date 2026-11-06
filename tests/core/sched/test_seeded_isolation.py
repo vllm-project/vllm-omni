@@ -70,6 +70,8 @@ def test_request_is_seeded() -> None:
     assert request_is_seeded(None) is False
     assert request_is_seeded(_Params(None)) is False
     assert request_is_seeded(_Params(42)) is True
+    # An explicit seed of 0 is still an explicit seed.
+    assert request_is_seeded(_Params(0)) is True
     assert request_is_seeded(object()) is False
 
 
