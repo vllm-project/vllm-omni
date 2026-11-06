@@ -116,6 +116,41 @@ vllm serve "${MODEL}" \
 The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
 window; see below for more aggressive settings.
 
+### Ref2VA on a 950PR that reports ~86 GB HBM
+
+The sections above match a 128 GB part. On a 950PR whose `npu-smi` reports
+86016 MB, `--usp 4` does not shard the DiT: Ulysses shards the sequence, and
+each card holds a full copy of the weights. The Ref2VA DiT is about 62 GB in
+bf16, and `vllm serve` with `--usp 4` and no quantization raises
+`torch.OutOfMemoryError` after about 79 GiB is already allocated. Tensor
+parallel 4 in bf16 uses about 15.5 GB per card. USP4 plus MXFP8 uses about
+31 GB per card and fits.
+
+For Ref2VA on that device, start from the lossy flags, switch `--task-type`
+to `ref2va`, and narrow the dense window. `skip_layers` keeps those DiT
+blocks dense on every step. `start_step` and `end_step` remain counts of
+leading and trailing dense steps. Measured at 1344x768, 24 fps, 50 steps,
+vLLM-Omni 0.32.0, MindIE-SD 3.2.0. The dense baseline is TP4 bf16
+`FLASH_ATTN` (722.2 s diffuse for 5 s of video), because USP4 bf16 does not
+fit. Sharpness is the ratio of Laplacian variance against the USP4+MXFP8
+dense run of the same prompt.
+
+```bash
+  --task-type ref2va \
+  --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix","start_step":4,"end_step":4,"skip_layers":"0-1,48-49"}}}' \
+  --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}'
+```
+
+| Point | `start_step` | `end_step` | `skip_layers` | 5 s diffuse | vs 722.2 s | sharpness |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Speed | 4 | 4 | `0-1,48-49` | 312.5 s | 2.31× | 0.81 |
+| Sharper | 6 | 6 | `0-2,47-49` | 354.2 s | 2.04× | 0.91 |
+
+One 15 s run of the speed point, against the same TP4 bf16 dense baseline,
+went from 4768 s to 1836 s (2.60×). That pair has no quality comparison.
+When frames look soft, move toward the sharper row before lowering
+`sparsity`.
+
 ### Optional optimizations
 
 The following sections list only the **increment or replacement** relative to
@@ -208,6 +243,8 @@ general throughput guarantee.
   DLO; if your workload never approaches the maximum duration, dropping
   `--enable-distributed-layerwise-offload` may improve latency at the risk of
   OOM on longer durations.
+- On a 950PR with ~86 GB HBM, USP4 bf16 does not fit. Serve that shape with
+  MXFP8, or with tensor parallel instead of USP.
 
 ## Additional resources
 
