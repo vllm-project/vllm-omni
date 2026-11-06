@@ -146,8 +146,8 @@ def apply_snapshot(root: Path, snapshot: Path, generated_slugs: frozenset[str]) 
 
     A page the snapshot did not produce is removed only if git tracks it and its
     slug is one the generator produces. `docs/user_guide/examples/` also holds
-    hand-written pages for model-specific examples — thirteen of the 25 tracked
-    pages — and those are never the generator's to delete.
+    hand-written pages for model-specific examples, which the generator does not
+    produce and must never delete.
     """
     produced_root = snapshot / GENERATED_PAGE_PREFIX
     target_root = root / GENERATED_PAGE_PREFIX
