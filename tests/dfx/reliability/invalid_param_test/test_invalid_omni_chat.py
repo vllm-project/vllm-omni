@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Invalid inputs on omni chat: ``POST /v1/chat/completions``, ``WS /v1/video/chat/stream``, ``WS /v1/realtime``."""
+"""Invalid inputs on omni chat.
+
+Covers ``POST /v1/chat/completions``, ``POST /v1/chat/completions/batch``,
+``POST /v1/completions``, ``WS /v1/video/chat/stream``, and ``WS /v1/realtime``.
+"""
 
 from __future__ import annotations
 
@@ -167,6 +171,75 @@ def test_chat_completions_invalid_requests(
     cfg["err_code"] = err_code
     cfg["err_message"] = err_message
     online_client.send_chat_completions_http_request(cfg)[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /v1/completions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
+def test_completions_rejected_for_thinker_talker(
+    omni_server: OmniServer,
+    online_client: OnlineOmniClient,
+) -> None:
+    """Thinker-talker rejects ``POST /v1/completions`` with 400.
+
+    The handoff segments the sequence with ChatML markers. A bare completion
+    prompt does not carry them, so this route stays closed.
+    """
+    online_client.send_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": "Hello, how are you?",
+                "max_tokens": 10,
+            },
+            "timeout": 120,
+            "err_code": 400,
+            "err_message": "thinker-talker handoff",
+        }
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /v1/chat/completions/batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize(
+    "sad_opts, err_message",
+    [
+        pytest.param({"stream": "not-a-bool"}, None, id="stream_wrong_type"),
+        pytest.param({"n": 2}, "n > 1", id="n_greater_than_one"),
+    ],
+)
+@pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
+def test_batched_completions_with_bad_values(
+    omni_server: OmniServer,
+    online_client: OnlineOmniClient,
+    sad_opts: dict[str, object],
+    err_message: str | None,
+) -> None:
+    """Bad batched chat options (wrong ``stream`` type, ``n=2``) return 400."""
+    messages = [
+        [{"role": "user", "content": "Say hello."}],
+        [{"role": "user", "content": "Say goodbye."}],
+    ]
+    request_config: dict[str, object] = {
+        "json": {
+            "model": omni_server.model,
+            "messages": messages,
+            **sad_opts,
+        },
+        "timeout": 120,
+        "err_code": 400,
+    }
+    if err_message is not None:
+        request_config["err_message"] = err_message
+    online_client.send_batched_chat_completions_http_request(request_config)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

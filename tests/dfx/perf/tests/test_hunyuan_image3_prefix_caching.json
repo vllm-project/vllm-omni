@@ -12,7 +12,7 @@
       "stage_overrides": {
         "0": {
           "max_model_len": 22800,
-          "max_num_batched_tokens": 32768,
+          "max_num_batched_tokens": 40960,
           "diffusion_kv_mode": "dense_legacy",
           "diffusion_kv_max_rows_per_request": 2,
           "enable_prefix_caching": false,
@@ -55,7 +55,7 @@
       "stage_overrides": {
         "0": {
           "max_model_len": 22800,
-          "max_num_batched_tokens": 32768,
+          "max_num_batched_tokens": 40960,
           "diffusion_kv_mode": "paged_scheduler",
           "diffusion_kv_max_rows_per_request": 2,
           "enable_prefix_caching": false,
@@ -98,7 +98,7 @@
       "stage_overrides": {
         "0": {
           "max_model_len": 22800,
-          "max_num_batched_tokens": 32768,
+          "max_num_batched_tokens": 40960,
           "diffusion_kv_mode": "paged_scheduler",
           "diffusion_kv_max_rows_per_request": 2,
           "enable_prefix_caching": true,

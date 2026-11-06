@@ -247,6 +247,30 @@ async def test_note_free_delegation_releases_its_observation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "modalities", "aborted"),
+    [
+        (DELEGATED, ("text",), True),  # the note ends the turn without a Talker
+        (DELEGATED_NO_NOTE, ("text", "audio"), True),  # nothing to speak
+        (DELEGATED, ("text", "audio"), False),  # the note is spoken
+    ],
+    ids=["text-only-note", "audio-no-note", "audio-note"],
+)
+async def test_delegation_without_speech_aborts_prewarmed_code2wav(text, modalities, aborted):
+    """With async_chunk, Code2Wav is prewarmed at submit; a call that skips speech must free it."""
+    h = await delegating_session(modalities=modalities)
+    try:
+        request_id = await observe(h)
+        events = await h.deliver_and_settle(
+            tts_output(request_id, text=text, finished=True), stage_id=0, segment_finished=True
+        )
+        assert len(function_calls(h, events)) == 1
+        assert h.port.aborts == ([[request_id]] if aborted else [])
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_note_audio_is_not_stored_as_spoken_history():
     """A note whose audio never completed must not enter history as spoken.
 

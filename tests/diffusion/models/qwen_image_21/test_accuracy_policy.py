@@ -4,6 +4,7 @@
 """Replay ROCm device metadata without changing the observed pixel results."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +63,7 @@ def test_comparison_and_failed_metrics_are_retained_before_existing_xfail(
     }
     calls = []
     monkeypatch.setenv("QWEN_IMAGE_21_MODEL", str(tmp_path))
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "results"))
     monkeypatch.delenv("QWEN_IMAGE_21_CALIBRATE", raising=False)
     monkeypatch.setattr(accuracy, "current_omni_platform", SimpleNamespace(is_rocm=lambda: True, device_type="cuda"))
     monkeypatch.setattr(accuracy, "device_preflight", lambda _: dict(device))
@@ -96,10 +98,13 @@ def test_comparison_and_failed_metrics_are_retained_before_existing_xfail(
     with pytest.raises(expected_error):
         accuracy.test_qwen_image_21_matches_reference(tmp_path / "artifacts", "full_model", case)
     assert calls == ["preflight", "native", "reference"]
-    report = json.loads(next((tmp_path / "artifacts").rglob("metrics.json")).read_text())
-    assert report["candidate_vs_reference"] == measured
+    report = json.loads(next((tmp_path / "results").glob("result_acc_*.json")).read_text())
+    assert report["comparisons"]["candidate_vs_reference"] == measured
+    assert {metric: report[metric] for metric in measured} == measured
     assert report["resolved_bounds"] == {"ssim": 0.99, "psnr": 40.0}
     assert report["device"] == device["device"]
     assert report["expected_xfail_profile"] == ("gfx942" if observational else None)
     assert not report["calibration_only"] and report["reference_generations"] == 1
-    assert set(report["artifacts"]) == {"native.png", "reference_0.png"}
+    artifact_dir = Path(report["artifacts"])
+    assert artifact_dir.is_relative_to(tmp_path / "artifacts")
+    assert {path.name for path in artifact_dir.glob("*.png")} == {"native.png", "reference_0.png"}

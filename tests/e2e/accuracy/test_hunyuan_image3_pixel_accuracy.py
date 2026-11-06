@@ -21,9 +21,13 @@ from tests.e2e.accuracy.helpers import (
     SimilarityThresholds,
     assert_images_pixel_close,
     assert_similarity,
+    baseline_from_similarity_thresholds,
+    measure_image_similarity,
+    measure_images_pixel_close,
     model_output_dir,
     resolve_device_profile,
     resolve_similarity_thresholds,
+    write_accuracy_result,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -289,19 +293,47 @@ def _assert_against_baseline(image: Image.Image, label: str) -> None:
         psnr_threshold,
     )
 
+    model_label = f"{MODEL_NAME} ({label} vs baseline)"
+    pixel_metrics = measure_images_pixel_close(
+        model_name=model_label,
+        vllm_image=image,
+        diffusers_image=baseline_image,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_pixel",
+        metrics=pixel_metrics,
+        baseline={"mean_abs_diff": MEAN_THRESHOLD, "p99_abs_diff": P99_THRESHOLD},
+        extra={"label": label},
+    )
     assert_images_pixel_close(
-        model_name=f"{MODEL_NAME} ({label} vs baseline)",
+        model_name=model_label,
         vllm_image=image,
         diffusers_image=baseline_image,
         mean_threshold=MEAN_THRESHOLD,
         p99_threshold=P99_THRESHOLD,
+        metrics=pixel_metrics,
+    )
+    ssim, psnr = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=image,
+        diffusers_image=baseline_image,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline=baseline_from_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE),
+        extra={"label": label, "device_profile": device_profile},
     )
     assert_similarity(
-        model_name=f"{MODEL_NAME} ({label} vs baseline)",
+        model_name=model_label,
         vllm_image=image,
         diffusers_image=baseline_image,
         ssim_threshold=thresholds.ssim,
         psnr_threshold=psnr_threshold,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
 
 
