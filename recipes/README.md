@@ -145,7 +145,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
 | [`Wan-AI/Wan2.1-VACE.md`](./Wan-AI/Wan2.1-VACE.md) | Unified T2V, I2V, V2LF, FLF2V, inpaint, and R2V | 1x RTX 5090 (1.3B) / 1x L40S 48GB with layerwise offload (14B) |
 | [`XiaomiMiMo/MiMo-Audio.md`](./XiaomiMiMo/MiMo-Audio.md) | Offline + online omni audio (TTS, ASR, dialogue) | 1x RTX 5090 / 5090D 32GB |
-| [`LiquidAI/LFM3-Omni-2B.md`](./LiquidAI/LFM3-Omni-2B.md) | Multimodal understanding, TTS, and interleaved text/audio | 1x Ascend 910B1 64GB |
+| [`LiquidAI/LFM3-Audio-2B.md`](./LiquidAI/LFM3-Audio-2B.md) | ASR, audio understanding, TTS, and interleaved text/audio | 1x RTX 4090 24GB |
+| [`LiquidAI/LFM3-Omni-2B.md`](./LiquidAI/LFM3-Omni-2B.md) | Multimodal understanding, TTS, and interleaved text/audio | 1x Ascend 910B1 64GB, 1x RTX 4090 24GB |
 | [`StabilityAI/Stable-Diffusion-3.5.md`](./StabilityAI/Stable-Diffusion-3.5.md) | Text-to-image serving (SD 3.5-medium and SD 3.5-large) | 1x RTX A6000 48GB / 1x Intel Arc Pro B70 32GB |
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
