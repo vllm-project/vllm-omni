@@ -310,5 +310,13 @@ with the actual workload and host CPU resources. It changes how pages are
 allocated and registered rather than preallocating the entire bank. See
 [PyTorch CUDA memory management](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf).
 
+For fixed-size large chunks, PyTorch versions supporting
+`pinned_max_round_threshold_mb` can also use
+`pinned_max_round_threshold_mb:128` in the same allocator configuration.
+Allocations larger than that threshold use their requested size rather than
+rounding up to a power of two. This can reduce physical pinned-memory overhead;
+it does not change the logical `bank_bytes` limit or guarantee a latency gain.
+Measure allocator memory and E2E latency separately for the actual chunk sizes.
+
 This is a method transfer, not a reproduction of the paper's benchmark.
 Quality and performance claims need E2E results for the exact revision.
