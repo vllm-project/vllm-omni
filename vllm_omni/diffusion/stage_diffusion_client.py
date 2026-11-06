@@ -16,7 +16,7 @@ import uuid
 import weakref
 from dataclasses import fields, is_dataclass
 from threading import Thread
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import zmq
 import zmq.asyncio
@@ -31,7 +31,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
-from vllm_omni.engine.stage_client import StageClientBase
+from vllm_omni.engine.stage_client import STAGE_SHUTDOWN_TIMEOUT_S, StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
@@ -189,7 +189,7 @@ class StageDiffusionClient(StageClientBase):
         # Background thread to detect silent process death (SIGKILL, segfault)
         # where the subprocess cannot send the ZMQ death sentinel.
         # Mirrors MPClient.start_engine_core_monitor() in vLLM.
-        proc = self._proc_manager.proc
+        proc = cast(StageDiffusionProcManager, self._proc_manager).proc
         self_ref = weakref.ref(self)
 
         def _monitor() -> None:
@@ -484,7 +484,7 @@ class StageDiffusionClient(StageClientBase):
                 result = self._rpc_results.pop(rpc_id, _MISSING_RPC_RESULT)
                 if result is not _MISSING_RPC_RESULT:
                     return result
-                proc = self._proc_manager.proc
+                proc = cast(StageDiffusionProcManager, self._proc_manager).proc
                 if self._engine_dead or not proc.is_alive():
                     self._engine_dead = True
                     raise EngineDeadError(
@@ -535,17 +535,17 @@ class StageDiffusionClient(StageClientBase):
         if self._proc_manager is not None and self._proc_manager.proc.is_alive():
             if self._proc_manager.distributed_executor_backend == "ray":
                 # Let the subprocess kill its remote actors before terminating it.
-                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=10.0)
+                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=STAGE_SHUTDOWN_TIMEOUT_S)
                 if not stopped:
                     logger.warning(
                         "Stage-%d Ray diffusion subprocess did not stop within %.1fs; "
                         "falling back to signal-based shutdown",
                         self.stage_id,
-                        10.0,
+                        STAGE_SHUTDOWN_TIMEOUT_S,
                     )
-                    self._proc_manager.shutdown(timeout=10.0)
+                    self._proc_manager.shutdown(timeout=STAGE_SHUTDOWN_TIMEOUT_S)
             else:
-                self._proc_manager.shutdown(timeout=10.0)
+                self._proc_manager.shutdown(timeout=STAGE_SHUTDOWN_TIMEOUT_S)
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)
