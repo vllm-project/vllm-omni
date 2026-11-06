@@ -66,7 +66,6 @@ __all__ = [
 
 _CONFIG_KEY = "audio_bucket_seconds"
 _CONFIG_PATH = f"additional_config.{_CONFIG_KEY}"
-_DEFAULT_HOP = 160  # fallback only; the per-model hop lives in _VERIFIED_MODELS
 _CHUNK_ROWS = 8  # rows per forward call; bounds transient activation memory
 
 
@@ -151,7 +150,7 @@ class LengthBucketingConfig:
         return self.max_length
 
 
-def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] | None:
+def _ladder_seconds(vllm_config) -> tuple[float, ...] | None:
     """The requested seconds ladder from the stage's ``additional_config``.
 
     ``additional_config.audio_bucket_seconds`` is the opt-in switch: missing,
@@ -175,9 +174,12 @@ def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] 
             raise ValueError(f"{_CONFIG_PATH} entries must be positive finite seconds, got {item!r}")
         values.append(value)
     seconds = sorted(set(values))
-    if not seconds:
-        return None
-    return tuple(max(1, int(round(s * 16000 / hop))) for s in seconds)
+    return tuple(seconds) if seconds else None
+
+
+def _rungs_from_seconds(seconds: tuple[float, ...], frames_per_second: int) -> tuple[int, ...]:
+    """Convert the seconds ladder to mel-frame rungs at the model's frame rate."""
+    return tuple(max(1, int(round(s * frames_per_second))) for s in seconds)
 
 
 # Verified models: the pipeline ``model_type`` -> the per-encoder knobs that have
@@ -193,9 +195,10 @@ def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] 
 # constructor. This table carries only the per-model knobs below.
 #
 # Per-model fields (determined by reading the model's own code):
-#   hop             — STFT hop length in samples, i.e. the mel frame rate; the
-#                     seconds ladder becomes seconds * 16000 / hop frames.
-#                     e.g. 160 = 10 ms at 16 kHz (100 fps).
+#   frames_per_second — mel frames per second of input audio, i.e.
+#                     sample_rate / hop. The seconds ladder becomes
+#                     seconds * frames_per_second frames;
+#                     e.g. 100 = hop 160 at 16 kHz (10 ms per frame).
 #   frames_per_length — feature frames per per-item length unit. The length is
 #                     always the model's own field, read from the encoder call
 #                     (the forward's own argument, or the wrapper's explicit
@@ -223,14 +226,14 @@ def _rungs_from_config(vllm_config, hop: int = _DEFAULT_HOP) -> tuple[int, ...] 
 #                     consumer must read only that field).
 _VERIFIED_MODELS: dict[str, dict[str, object]] = {
     "step_audio_2": {
-        "hop": 160,
+        "frames_per_second": 100,
         "frames_per_length": 1,
         "context_margin": 3,
         "time_axis": 2,
         "output_kind": "lengths_tuple",
     },
     "covo_audio": {
-        "hop": 160,
+        "frames_per_second": 100,
         "frames_per_length": 16,
         "context_margin": 0,
         "time_axis": 2,
@@ -686,11 +689,16 @@ def install_bucketed_encoders(model: nn.Module, encoders: Mapping[str, nn.Module
     rebuild = None
     output_kind = None
     if verified is not None:
-        hop = verified.get("hop") or _DEFAULT_HOP
-        rungs = _rungs_from_config(vllm_config, hop)
-        if rungs is not None:
-            ladder = LengthBucketingConfig(buckets=rungs)
-        frames_per_length = int(verified.get("frames_per_length", 1))
+        # Raise (not assert) so the whitelist-bug signal survives `python -O`.
+        frames_per_second = verified.get("frames_per_second")
+        if not isinstance(frames_per_second, int):
+            raise RuntimeError("verified model must specify frames_per_second (its mel frame rate, sample_rate / hop)")
+        seconds = _ladder_seconds(vllm_config)
+        if seconds is not None:
+            ladder = LengthBucketingConfig(buckets=_rungs_from_seconds(seconds, frames_per_second))
+        frames_per_length = verified.get("frames_per_length")
+        if not isinstance(frames_per_length, int):
+            raise RuntimeError("verified model must specify frames_per_length (feature frames per per-item length unit)")
         context_margin = verified["context_margin"]
         time_axis = verified["time_axis"]
         # Raise (not assert) so the whitelist-bug signal survives `python -O`.
@@ -698,7 +706,7 @@ def install_bucketed_encoders(model: nn.Module, encoders: Mapping[str, nn.Module
         rebuild = _REBUILDERS.get(output_kind)
         if rebuild is None:
             raise RuntimeError(f"verified model must specify output_kind in {sorted(_REBUILDERS)}, got {output_kind!r}")
-    elif _rungs_from_config(vllm_config) is not None:
+    elif _ladder_seconds(vllm_config) is not None:
         model_type = vllm_config.model_config.hf_config.model_type if vllm_config is not None else "<unknown>"
         logger.warning(
             "Bucketed encoder is not verified for model_type %r; disabling the "

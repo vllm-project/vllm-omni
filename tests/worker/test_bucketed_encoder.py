@@ -163,6 +163,7 @@ def _knobs(**overrides):
     """The verified-knobs stub (the whitelist's shape), overridable per test:
     ``output_kind`` declares what the test's toy encoder returns."""
     knobs = {
+        "frames_per_second": 100,
         "frames_per_length": 1,
         "context_margin": 0,
         "time_axis": 1,
@@ -478,7 +479,7 @@ def test_context_margin_preserves_conv_tail(bucket_cfg, monkeypatch):
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: _knobs(hop=160, context_margin=2, output_kind="lengths_tuple"),
+        lambda vllm_config: _knobs(context_margin=2, output_kind="lengths_tuple"),
     )
 
     class ConvContextEncoder(nn.Module):
@@ -636,7 +637,7 @@ def test_time_axis_contract_wins_for_all_short_batch(bucket_cfg, monkeypatch):
     monkeypatch.setattr(
         bucketed_encoder,
         "_verified_knobs",
-        lambda vllm_config: _knobs(hop=160, time_axis=2, output_kind="lengths_tuple"),
+        lambda vllm_config: _knobs(time_axis=2, output_kind="lengths_tuple"),
     )
 
     class ChannelsFirstConvEncoder(nn.Module):
@@ -892,27 +893,27 @@ def test_positional_host_lengths_fallback_still_buckets(bucket_cfg, monkeypatch)
         assert out_lens[row].item() == solo_len.item()
 
 
-def test_mixed_hop_models_each_get_their_own_ladder(monkeypatch):
+def test_mixed_frame_rate_models_each_get_their_own_ladder(monkeypatch):
     """Lengths come from each model's own field, so a second model with a
-    different hop needs no process-wide refusal: each install converts the
-    seconds ladder with its own hop."""
+    different mel frame rate needs no process-wide refusal: each install converts
+    the seconds ladder with its own ``frames_per_second``."""
     from vllm_omni.worker import bucketed_encoder
 
     cfg = _mock_vllm_config("toy", 1)
 
-    def knobs(hop):
-        return lambda vllm_config: _knobs(hop=hop)
+    def knobs(frames_per_second):
+        return lambda vllm_config: _knobs(frames_per_second=frames_per_second)
 
-    monkeypatch.setattr(bucketed_encoder, "_verified_knobs", knobs(160))
+    monkeypatch.setattr(bucketed_encoder, "_verified_knobs", knobs(100))
     model_a = ToyModel().cuda()
     assert install_bucketed_encoders(model_a, {"encoder": model_a.encoder}, vllm_config=cfg) == ["encoder"]
 
-    monkeypatch.setattr(bucketed_encoder, "_verified_knobs", knobs(320))
+    monkeypatch.setattr(bucketed_encoder, "_verified_knobs", knobs(50))
     model_b = ToyModel().cuda()
     assert install_bucketed_encoders(model_b, {"encoder": model_b.encoder}, vllm_config=cfg) == ["encoder"]
 
-    assert tuple(model_a.encoder.forward.ladder.buckets) == (100,)  # 1 s * 16000 / 160
-    assert tuple(model_b.encoder.forward.ladder.buckets) == (50,)  # 1 s * 16000 / 320
+    assert tuple(model_a.encoder.forward.ladder.buckets) == (100,)  # 1 s * 100 fps
+    assert tuple(model_b.encoder.forward.ladder.buckets) == (50,)  # 1 s * 50 fps
 
 
 def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_cfg):
@@ -1144,18 +1145,18 @@ def test_bucketing_stays_off_without_vllm_config():
 def test_invalid_seconds_config_raises(bad):
     """A malformed audio_bucket_seconds must fail loudly at model construction
     (ValueError), never silently disable or mis-arm the feature."""
-    from vllm_omni.worker.bucketed_encoder import _rungs_from_config
+    from vllm_omni.worker.bucketed_encoder import _ladder_seconds
 
     with pytest.raises(ValueError):
-        _rungs_from_config(_cfg_with(bad))
+        _ladder_seconds(_cfg_with(bad))
 
 
 def test_empty_seconds_list_is_off():
     """An explicit empty list means the knob is off (same as unset), not an
     invalid ladder."""
-    from vllm_omni.worker.bucketed_encoder import _rungs_from_config
+    from vllm_omni.worker.bucketed_encoder import _ladder_seconds
 
-    assert _rungs_from_config(_cfg_with([])) is None
+    assert _ladder_seconds(_cfg_with([])) is None
 
 
 def test_seconds_only_enables_with_default_knobs(bucket_cfg, monkeypatch):
