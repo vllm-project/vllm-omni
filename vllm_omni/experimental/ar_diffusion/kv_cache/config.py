@@ -50,6 +50,9 @@ class ARDiffusionKVConfig:
     # Off by default: it costs two max-sequence buffers per layer, per rank. See
     # ARDiffusionPagedForwardContext.history_staging.
     reuse_history_staging: bool = False
+    # Manager page size; boundary rows preserve the default paging visibility.
+    # FA3 TMA needs a multiple of its KV tile; FA4 TMA needs exactly that tile.
+    superpage_tokens: int = 0
     # Also capture the post-window-boundary (reset-cycle) forward during warm-up.
     warmup_capture_reset: bool = False
 
