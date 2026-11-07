@@ -104,6 +104,12 @@ Only `m4s` output is currently accepted. Concatenate the binary frames in
 receive order, then remux the fragmented stream if the target player requires
 a progressive MP4 file.
 
+The shared save helper remuxes both video-only and audio/video streams by
+default, preserving encoded packets and their timestamps. Its `fps` argument
+does not retime this default save. For video-only streams, explicitly supplying
+`video_codec_options` (including an empty dictionary) requests re-encoding at
+`fps`; audio/video saves continue to preserve both encoded tracks.
+
 ### Audio and chunk boundaries
 
 A generation result containing audio must contain exactly one video; multiple

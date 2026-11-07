@@ -45,13 +45,14 @@ def decode_stage_input(data: str, stage_types: Sequence[str]) -> NextStageInputM
 
     The codec returns structs and dataclasses as plain containers, which we rebuild based on stage type.
     """
-    stage_input = NextStageInputMessage(**OmniMsgpackDecoder().decode(base64.b64decode(data)))
+    raw_stage_input = OmniMsgpackDecoder().decode(base64.b64decode(data))
+    stage_input = NextStageInputMessage(**raw_stage_input)
     stage_input.check_stage_ids(len(stage_types))
     if stage_types[stage_input.receiver_stage_id] != "diffusion":
         stage_input.requests = [msgspec.convert(request, OmniEngineCoreRequest) for request in stage_input.requests]
     stage_input.sampling_params_list = [
         _decode_sampling_params(params, stage_type)
-        for params, stage_type in zip(stage_input.sampling_params_list, stage_types, strict=True)
+        for params, stage_type in zip(raw_stage_input["sampling_params_list"], stage_types, strict=True)
     ]
     return stage_input
 

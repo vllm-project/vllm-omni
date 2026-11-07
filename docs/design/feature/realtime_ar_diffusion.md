@@ -190,6 +190,14 @@ For LingBot World v2:
 - `lingbot_world/pipeline.py` constructs conditioning, owns small non-KV session state, and
   produces one block plus the standard metadata envelope.
 
+Regional compilation must allow graph breaks in cross-attention without
+changing residual arithmetic or request-local K/V reuse. The normal attention
+path must not enter an unused context manager: PyTorch 2.13 cannot reconstruct
+`nullcontext(None)` across a graph break. When leased post-attention is enabled,
+keep projection, graph-output consumption, cross-attention and the final
+independent residual tensor inside the lease lifetime, including its native
+fallback when no graph lease is acquired.
+
 ## Ulysses sequence parallelism
 
 LingBot supports pure Ulysses sequence parallelism for both direct and

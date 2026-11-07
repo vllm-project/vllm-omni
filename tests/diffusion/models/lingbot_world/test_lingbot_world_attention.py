@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -58,9 +60,9 @@ def _install_vllm_stubs() -> None:
         sys.modules[name] = ModuleType(name)
 
     distributed = sys.modules["vllm.distributed"]
-    distributed.get_tensor_model_parallel_rank = lambda: 0
-    distributed.get_tensor_model_parallel_world_size = lambda: 1
-    distributed.tensor_model_parallel_all_reduce = lambda value: value
+    setattr(distributed, "get_tensor_model_parallel_rank", lambda: 0)
+    setattr(distributed, "get_tensor_model_parallel_world_size", lambda: 1)
+    setattr(distributed, "tensor_model_parallel_all_reduce", lambda value: value)
 
     class _SeqAllToAll4D:
         @staticmethod
@@ -132,9 +134,11 @@ def _install_vllm_stubs() -> None:
         for name, value in attrs.items():
             setattr(weight, name, value)
 
-    sys.modules["vllm.model_executor.utils"].set_weight_attrs = set_weight_attrs
-    sys.modules["vllm.model_executor.model_loader.weight_utils"].default_weight_loader = lambda param, loaded_weight: (
-        param.data.copy_(loaded_weight)
+    setattr(sys.modules["vllm.model_executor.utils"], "set_weight_attrs", set_weight_attrs)
+    setattr(
+        sys.modules["vllm.model_executor.model_loader.weight_utils"],
+        "default_weight_loader",
+        lambda param, loaded_weight: param.data.copy_(loaded_weight),
     )
 
     class _Linear(nn.Module):
@@ -165,8 +169,8 @@ def _install_vllm_stubs() -> None:
             return (output, self.bias) if self.return_bias else output
 
     linear = sys.modules["vllm.model_executor.layers.linear"]
-    linear.ColumnParallelLinear = _Linear
-    linear.RowParallelLinear = _Linear
+    setattr(linear, "ColumnParallelLinear", _Linear)
+    setattr(linear, "RowParallelLinear", _Linear)
 
     class _QKVLinear(nn.Module):
         def __init__(
@@ -206,19 +210,19 @@ def _install_vllm_stubs() -> None:
             self.calls += 1
             return F.linear(value, self.weight, self.bias), None
 
-    linear.QKVParallelLinear = _QKVLinear
+    setattr(linear, "QKVParallelLinear", _QKVLinear)
 
     class _Conv3dLayer(nn.Conv3d):
         def __init__(self, in_channels: int, out_channels: int, kernel_size, stride, **kwargs) -> None:
             super().__init__(in_channels, out_channels, kernel_size=kernel_size, stride=stride, **kwargs)
 
-    sys.modules["vllm.model_executor.layers.conv"].Conv3dLayer = _Conv3dLayer
+    setattr(sys.modules["vllm.model_executor.layers.conv"], "Conv3dLayer", _Conv3dLayer)
 
     class _LayerNorm(nn.LayerNorm):
         def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True) -> None:
             super().__init__(dim, eps=eps, elementwise_affine=elementwise_affine)
 
-    sys.modules["vllm_omni.diffusion.layers.norm"].LayerNorm = _LayerNorm
+    setattr(sys.modules["vllm_omni.diffusion.layers.norm"], "LayerNorm", _LayerNorm)
 
     class _Attention(nn.Module):
         def __init__(self, *args, softmax_scale: float, **kwargs) -> None:
@@ -241,7 +245,7 @@ def _install_vllm_stubs() -> None:
             weights = scores.softmax(dim=-1)
             return torch.einsum("bhqk,bkhd->bqhd", weights, value)
 
-    sys.modules["vllm_omni.diffusion.attention.layer"].Attention = _Attention
+    setattr(sys.modules["vllm_omni.diffusion.attention.layer"], "Attention", _Attention)
 
     class _RotaryEmbeddingWan(nn.Module):
         def __init__(self, *args, **kwargs) -> None:
@@ -253,7 +257,7 @@ def _install_vllm_stubs() -> None:
             self.calls.append((cos.detach().clone(), sin.detach().clone()))
             return value
 
-    sys.modules["vllm_omni.diffusion.layers.rope"].RotaryEmbeddingWan = _RotaryEmbeddingWan
+    setattr(sys.modules["vllm_omni.diffusion.layers.rope"], "RotaryEmbeddingWan", _RotaryEmbeddingWan)
 
     paged_attention = sys.modules["vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention"]
 
@@ -263,13 +267,21 @@ def _install_vllm_stubs() -> None:
     class _PagedLayerInputs:
         pass
 
-    paged_attention.ARDiffusionPagedLayerContext = _PagedLayerContext
-    paged_attention.ARDiffusionPagedLayerInputs = _PagedLayerInputs
-    paged_attention.ar_diffusion_paged_attention = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("CUDA paged attention was not expected in this CPU test")
+    setattr(paged_attention, "ARDiffusionPagedLayerContext", _PagedLayerContext)
+    setattr(paged_attention, "ARDiffusionPagedLayerInputs", _PagedLayerInputs)
+    setattr(
+        paged_attention,
+        "ar_diffusion_paged_attention",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("CUDA paged attention was not expected in this CPU test")
+        ),
     )
-    paged_attention.paged_write_attn = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("paged path was not expected in this direct-cache test")
+    setattr(
+        paged_attention,
+        "paged_write_attn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("paged path was not expected in this direct-cache test")
+        ),
     )
 
 
@@ -290,7 +302,7 @@ def _load_module():
             if original is _MISSING_MODULE:
                 sys.modules.pop(name, None)
             else:
-                sys.modules[name] = original
+                sys.modules[name] = cast(ModuleType, original)
 
 
 def test_load_module_restores_process_module_state() -> None:
@@ -339,6 +351,7 @@ def _allocate_single_layer(module, *, max_tokens: int):
 
 
 def _set_identity_attention(attention: nn.Module) -> None:
+    projections: tuple[nn.Module, ...]
     qkv = getattr(attention, "qkv", None)
     if qkv is not None:
         projections = (qkv, attention.o)
@@ -663,3 +676,127 @@ def test_the_camera_modulation_reads_only_the_camera_tokens() -> None:
     # A different camera must move it, or the cache key would be hiding a real dependency.
     other = block.camera_modulation(camera + 1)
     assert not torch.equal(first[0], other[0])
+
+
+@pytest.mark.parametrize("precompute_camera", [False, True])
+def test_compiled_block_survives_cross_attention_graph_break_and_reuses_cache(precompute_camera, monkeypatch):
+    module = _load_module()
+    monkeypatch.setitem(sys.modules, _MODULE_NAME, module)
+    torch.manual_seed(0)
+    block = module.LingBotAttentionBlock(dim=2, num_heads=1)
+    cross_attention = block.cross_attn
+
+    class BreakingCrossAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = cross_attention
+
+        def forward(self, hidden, encoder, *, cache):
+            torch._dynamo.graph_break()
+            return self.attention(hidden, encoder, cache=cache)
+
+    block.cross_attn = BreakingCrossAttention()
+    hidden = torch.randn(1, 3, 2)
+    camera = torch.randn_like(hidden)
+    timestep = torch.randn(1, 3, 6, 2)
+    encoder = torch.randn(1, 2, 2)
+    modulation = block.camera_modulation(camera) if precompute_camera else None
+    compiled = torch.compile(block, backend="eager")
+    eager_self = _allocate_single_layer(module, max_tokens=6).self_attention[0]
+    compiled_self = _allocate_single_layer(module, max_tokens=6).self_attention[0]
+    eager_cross = compiled_cross = None
+    for start in (0, 3):
+        arguments = dict(
+            current_start=start,
+            sink_tokens=0,
+            update_cache=True,
+            rotary_emb=(torch.ones(3, 1), torch.zeros(3, 1)),
+            camera_modulation=modulation,
+        )
+        text = encoder if start == 0 else None
+        expected, eager_cross = block(
+            hidden, text, timestep, camera, self_cache=eager_self, cross_cache=eager_cross, **arguments
+        )
+        previous_cross = compiled_cross
+        actual, compiled_cross = compiled(
+            hidden, text, timestep, camera, self_cache=compiled_self, cross_cache=compiled_cross, **arguments
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_cross.key, eager_cross.key, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_cross.value, eager_cross.value, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_self.key, eager_self.key, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_self.value, eager_self.value, rtol=0, atol=0)
+        if previous_cross is not None:
+            assert compiled_cross is previous_cross
+
+
+@pytest.mark.parametrize("acquire_graph", [False, True])
+def test_attention_block_consumes_leased_outputs_before_release_and_retains_native_fallback(acquire_graph, monkeypatch):
+    module = _load_module()
+    torch.manual_seed(0)
+    block = module.LingBotAttentionBlock(dim=2, num_heads=1)
+    hidden, camera, encoder = [torch.randn(1, 3, 2) for _ in range(3)]
+    timestep = torch.randn(1, 1, 6, 2)
+    arguments = dict(
+        current_start=0, sink_tokens=0, update_cache=True, rotary_emb=(torch.ones(3, 1), torch.zeros(3, 1))
+    )
+    graph_values = []
+    handle = block.norm3.register_forward_hook(
+        lambda owner, args, output: graph_values.extend([args[0].clone(), output.clone()])
+    )
+    expected, expected_cache = block(
+        hidden,
+        encoder,
+        timestep,
+        camera,
+        self_cache=_allocate_single_layer(module, max_tokens=3).self_attention[0],
+        cross_cache=None,
+        **arguments,
+    )
+    handle.remove()
+    active = False
+    consumed = []
+
+    class Lease:
+        def consume(self):
+            assert active
+            consumed.append(True)
+            return None, *graph_values
+
+    @contextmanager
+    def acquire(*args):
+        nonlocal active
+        active = True
+        try:
+            yield Lease() if acquire_graph else None
+        finally:
+            active = False
+            if acquire_graph:
+                for value in graph_values:
+                    value.zero_()
+
+    lease_module = ModuleType("leased_post_attention_under_test")
+    setattr(lease_module, "acquire", acquire)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.models.lingbot_world.leased_post_attention", lease_module)
+    block._lingbot_leased_post_attention = object()
+    cross_forward = block.cross_attn.forward
+
+    def cross_attention(*args, **kwargs):
+        assert active
+        return cross_forward(*args, **kwargs)
+
+    monkeypatch.setattr(block.cross_attn, "forward", cross_attention)
+    actual, actual_cache = block(
+        hidden,
+        encoder,
+        timestep,
+        camera,
+        self_cache=_allocate_single_layer(module, max_tokens=3).self_attention[0],
+        cross_cache=None,
+        **arguments,
+    )
+    assert not active
+    assert bool(consumed) == acquire_graph
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_cache.key, expected_cache.key, rtol=0, atol=0)
+    torch.testing.assert_close(actual_cache.value, expected_cache.value, rtol=0, atol=0)

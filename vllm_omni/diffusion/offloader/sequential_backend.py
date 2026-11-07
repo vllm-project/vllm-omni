@@ -390,6 +390,11 @@ class ModelLevelOffloadBackend(OffloadBackend):
         all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
         try:
+            # Unselected DiTs stay resident, including projections called
+            # directly before their top-level forward hook (e.g. AR KV setup).
+            for component in resolved.dits:
+                if not component.selected:
+                    SequentialOffloadHook._move_params(component.module, self.device)
             for encoder in encoders:
                 encoder.to(self.device)
             for vae in vaes:

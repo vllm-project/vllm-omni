@@ -1,6 +1,11 @@
 # LingBot-World Benchmarks — Realtime Streaming Cadence
 
-`benchmark_lingbot_world_realtime.py` measures LingBot-World 2.0 as it is
+For blocking GPU/NPU performance, precision, WBench/VBench and long-session
+pytest jobs, see the [CI regression suite](../../tests/dfx/lingbot_world/README.md).
+The `vllm bench realtime-video --omni` command reports measurements; the pytest
+suite asserts gates. Both use the same packaged protocol client and metric math.
+
+`vllm bench realtime-video --omni` measures LingBot-World 2.0 as it is
 actually deployed: one `WS /v1/realtime/video` session that streams one video
 chunk per AR block, for as long as the world keeps running.
 
@@ -34,7 +39,7 @@ vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
 
 # Terminal 2
 pip install websockets
-python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
+vllm bench realtime-video --omni \
   --host 127.0.0.1 --port 8000 \
   --num-chunks 16 \
   --output-json /tmp/lingbot_world_realtime.json
@@ -56,7 +61,7 @@ vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
   --deploy-config benchmarks/lingbot_world/configs/usp4_compiled.yaml \
   --port 8000
 
-python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
+vllm bench realtime-video --omni \
   --port 8000 --num-chunks 40 --warmup-sessions 1 --sessions 3 \
   --target-fps 12 --output-json /tmp/lingbot_world_repeated.json
 ```
@@ -72,6 +77,28 @@ Compiled mode can pay compilation and capture costs on the first rollout.
 Use `--warmup-sessions 1` before measured repetitions. Excluding the first six
 chunks addresses the attention-window ramp; it does not guarantee that
 compilation and capture have finished.
+
+## Unified CLI and regression ownership
+
+The command is installed with vLLM-Omni. Its workload construction, WebSocket
+client, validation and metrics live in `vllm_omni.benchmarks.lingbot_world`;
+the CLI adapter only registers arguments and dispatches execution. The historical
+`python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py` command
+remains a compatibility wrapper around that implementation. Both commands accept
+the same flags, produce the same JSON schema, retain partial-session diagnostics,
+and exit unsuccessfully when the requested rollout is incomplete.
+
+This PR integrates the existing LingBot workload into `vllm bench`; its blocking
+pytest suite additionally owns reference/candidate server starts, frozen
+calibration, fixed-input numerical replay, native quality evaluators and artifact
+handoff. These acceptance policies stay in pytest and consume the shared
+benchmark implementation rather than introducing a second timing path.
+
+Follow-up work can add workloads for other realtime video models and align
+result export with other `vllm bench` modalities. A concurrent-session benchmark
+requires session-affine server routing first; the current serving contract allows
+one session, so this command measures sequential rollouts. Those extensions do
+not change this PR's metric populations, acceptance gates or default workload.
 
 ## Metrics
 

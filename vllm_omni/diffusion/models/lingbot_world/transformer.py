@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -628,6 +627,35 @@ class LingBotAttentionBlock(nn.Module):
         camera_features = camera_features + camera_hidden_states
         return self.cam_scale_layer(camera_features), self.cam_shift_layer(camera_features)
 
+    def _post_attention(
+        self,
+        hidden_states: torch.Tensor,
+        attention_output: torch.Tensor,
+        gate_msa: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None,
+        *,
+        cross_cache: LingBotAttentionCache | None,
+        camera_modulation: tuple[torch.Tensor, torch.Tensor] | None,
+        lease: Lease | None = None,
+    ) -> tuple[torch.Tensor, LingBotAttentionCache]:
+        if lease is None:
+            num_frames = gate_msa.shape[1]
+            tokens_per_frame = hidden_states.shape[1] // num_frames
+            hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
+            hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
+            hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
+            camera_scale, camera_shift = (
+                self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
+            )
+            hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
+            cross_normalized = self.norm3(hidden_states)
+        else:
+            _, hidden_states, cross_normalized = lease.consume()
+        attention_output, cross_cache = self.cross_attn(cross_normalized, encoder_hidden_states, cache=cross_cache)
+        # Consume graph views before the caller releases the lease.
+        return hidden_states + attention_output, cross_cache
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -661,21 +689,39 @@ class LingBotAttentionBlock(nn.Module):
         modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
         shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation.chunk(6, dim=2)
 
-        hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
         normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
         normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
         if hasattr(self, "_lingbot_leased_post_attention"):
             from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import acquire
 
-            camera_scale, camera_shift = (
+            camera_modulation = (
                 self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
             )
-            post_context = acquire(self, hidden_states, gate_msa, camera_scale, camera_shift)
+            with acquire(self, hidden_states, gate_msa, *camera_modulation) as lease:
+                projection_kwargs = {"_projection_lease": lease} if lease is not None else {}
+                attention_output = self.self_attn(
+                    normalized,
+                    cache=self_cache,
+                    current_start=current_start,
+                    rotary_emb=rotary_emb,
+                    sink_tokens=sink_tokens,
+                    update_cache=update_cache,
+                    **projection_kwargs,
+                )
+                hidden_states, cross_cache = self._post_attention(
+                    hidden_states,
+                    attention_output,
+                    gate_msa,
+                    camera_hidden_states,
+                    encoder_hidden_states,
+                    cross_cache=cross_cache,
+                    camera_modulation=camera_modulation,
+                    lease=lease,
+                )
         else:
-            camera_scale = camera_shift = None
-            post_context = nullcontext(None)
-        with post_context as lease:
-            projection_kwargs = {"_projection_lease": lease} if lease is not None else {}
+            # There is no resource lifetime to manage on this path. In
+            # PyTorch 2.13, graph breaks inside nullcontext(None) fail while
+            # Dynamo reconstructs the context manager's return value.
             attention_output = self.self_attn(
                 normalized,
                 cache=self_cache,
@@ -683,22 +729,16 @@ class LingBotAttentionBlock(nn.Module):
                 rotary_emb=rotary_emb,
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
-                **projection_kwargs,
             )
-            if lease is None:
-                hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
-                hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
-                if camera_scale is None:
-                    camera_scale, camera_shift = (
-                        self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
-                    )
-                hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
-                cross_normalized = self.norm3(hidden_states)
-            else:
-                _, hidden_states, cross_normalized = lease.consume()
-            attention_output, cross_cache = self.cross_attn(cross_normalized, encoder_hidden_states, cache=cross_cache)
-            # This independent tensor is the final consumer; graph views never enter long-lived state.
-            hidden_states = hidden_states + attention_output
+            hidden_states, cross_cache = self._post_attention(
+                hidden_states,
+                attention_output,
+                gate_msa,
+                camera_hidden_states,
+                encoder_hidden_states,
+                cross_cache=cross_cache,
+                camera_modulation=camera_modulation,
+            )
 
         hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
         normalized = self.norm2(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))

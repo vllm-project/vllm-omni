@@ -167,3 +167,36 @@ def test_backends_execute_the_resolved_plan_alone(execution_device, strategy, mo
     finally:
         backend.disable()
     _assert_no_offload_hooks(pipeline)
+
+
+def test_text_encoder_only_offload_keeps_early_dit_projections_resident(execution_device):
+    pipeline = _Pipeline()
+    backend = ModelLevelOffloadBackend(_config(OffloadStrategy.MODEL_LEVEL, {"text_encoder"}), execution_device)
+    backend.enable(pipeline)
+    try:
+        # LingBot projects its cross-attention cache before the top-level DiT
+        # forward. Calling the child must not depend on that forward's hook.
+        projected = pipeline.transformer.proj(torch.ones(1, 4, device=execution_device))
+        assert projected.device == execution_device
+        assert next(pipeline.transformer.parameters()).device == execution_device
+    finally:
+        backend.disable()
+
+
+def test_text_encoder_only_offload_handles_cached_dit_owner_references(execution_device):
+    pipeline = _Pipeline()
+    # Cached block wrappers can retain a registered reference to their owner.
+    # Parameter/buffer traversal deduplicates it; nn.Module.to() recurses.
+    pipeline.transformer.add_module("cached_owner_reference", pipeline.transformer)
+    inputs = torch.ones(1, 4)
+    expected = pipeline(inputs)
+    backend = ModelLevelOffloadBackend(_config(OffloadStrategy.MODEL_LEVEL, {"text_encoder"}), execution_device)
+    try:
+        backend.enable(pipeline)
+        assert backend.enabled
+        assert pipeline.transformer.cached_owner_reference is pipeline.transformer
+        actual = pipeline(inputs.to(execution_device))
+        torch.testing.assert_close(actual.cpu(), expected)
+    finally:
+        backend.disable()
+    _assert_no_offload_hooks(pipeline)

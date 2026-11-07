@@ -33,6 +33,7 @@ L45_YAML_FILES: dict[str, str] = {
     ".buildkite/amd/test-amd-nightly.yml": "amd",
     ".buildkite/amd/test-amd-weekly.yml": "amd",
     ".buildkite/npu/test-npu-nightly.yml": "npu",
+    ".buildkite/npu/test-npu-weekly.yml": "npu",
 }
 
 BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
@@ -104,6 +105,11 @@ NIGHTLY_LABEL_IF = (
 WEEKLY_E2E_IF = f'{_RELEASE_LINE_BRANCH_IF} && build.env("WEEKLY") == "1"'
 WEEKLY_MAIN_IF = f'{_RELEASE_LINE_BRANCH_IF} && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
 WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
+# NPU weekly regressions use WEEKLY without CUDA's NON_CRITICAL tier.
+NPU_WEEKLY_MAIN_IF = WEEKLY_E2E_IF
+NPU_WEEKLY_LABEL_IF = (
+    f'({NPU_WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
+)
 READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
 MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
 MERGE_MAIN_IF = (

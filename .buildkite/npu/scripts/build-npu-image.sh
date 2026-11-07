@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 set -ex
 
 dockerfile=${1:?Dockerfile is required}
@@ -23,10 +26,21 @@ if ! command -v buildctl &> /dev/null; then
   cp /tmp/buildkit/bin/buildctl /usr/local/bin/
 fi
 
-build_args=()
-if [[ -n "${device_suffix}" ]]; then
-  build_args+=(--opt "build-arg:VLLM_ASCEND_DEVICE_SUFFIX=${device_suffix}")
-fi
+# Frozen per-device vendor image bytes. A suffix cannot inherit the A2/B3
+# digest: Docker resolves the digest even when a different tag is supplied.
+case "${device_suffix}" in
+  "") base_digest=sha256:4a666fd818058c26ce445fa890e31ba781d0d43c721631b0d43e2eb550fbef99 ;;
+  -a3) base_digest=sha256:ec7cd7c98616d55500e21a17b63be3a99603d520087f41dc37b60ae6c75d0730 ;;
+  -a5) base_digest=sha256:51dc15c552d8de7141f84815de9d8ff030bc97b413280db742640aa467d632db ;;
+  -310p) base_digest=sha256:22f665099114310858daf90d072eb46ce97ebbbdce1f808879aee68a427de76f ;;
+  *) echo "Unsupported Ascend device suffix: ${device_suffix}" >&2; exit 2 ;;
+esac
+build_args=(
+  --opt "build-arg:VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend"
+  --opt "build-arg:VLLM_ASCEND_VERSION=v0.33.0"
+  --opt "build-arg:VLLM_ASCEND_DEVICE_SUFFIX=${device_suffix}"
+  --opt "build-arg:VLLM_ASCEND_DIGEST=${base_digest}"
+)
 
 export DOCKER_CONFIG=/home/user/.docker
 buildctl \

@@ -163,6 +163,17 @@ def _scores(prediction: Image.Image, reference: Image.Image) -> dict[str, float]
     return {"ssim": ssim, "psnr": psnr, "alpha_mae": float(alpha.mean())}
 
 
+def _expected_xfail_profile(device: dict, profiles: dict) -> str:
+    # ROCm's observational policy belongs to the architecture, which stays
+    # stable when a runtime starts exposing a previously empty marketing name.
+    # Match the complete architecture key so unknown devices gain no exemption.
+    if device["device_type"] == "rocm":
+        identity = device.get("device_arch") or device["device"]
+        architecture = identity.split(":", 1)[0]
+        return architecture if architecture in profiles else "default"
+    return resolve_device_profile(device["device"], profiles=profiles)
+
+
 @pytest.mark.parametrize("case_name", ["it2i", "t2i"])
 @hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level: str, case_name: str) -> None:
@@ -179,7 +190,7 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     device_name = device["device"]
     profile = resolve_device_profile(device_name, profiles=bounds)
     xfail_profiles = policy.get("expected_xfail", {}).get(case_name, {})
-    xfail_profile = resolve_device_profile(device_name, profiles=xfail_profiles)
+    xfail_profile = _expected_xfail_profile(device, xfail_profiles)
     expected_xfail = xfail_profiles.get(xfail_profile)
     if expected_xfail:
         assert isinstance(expected_xfail, str) and expected_xfail
@@ -293,6 +304,8 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     if calibration:
         pytest.xfail(f"Calibration collected; thresholds were not enforced. Artifacts: {output}")
     if expected_xfail:
+        # Keep the real native/reference comparison and its saved metrics above;
+        # an architecture's existing observational rule is not an accuracy pass.
         pytest.xfail(f"{expected_xfail} Artifacts: {output}")
     assert selected is not None
     assert_similarity_metrics(

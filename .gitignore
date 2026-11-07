@@ -246,6 +246,14 @@ datasets/
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
+!tests/dfx/lingbot_world/*.lock.json
+!tests/dfx/lingbot_world/quality.json
+!tests/dfx/lingbot_world/configs/*.json
+!tests/dfx/lingbot_world/calibration/*.json
+!tests/dfx/lingbot_world/calibration/history/cuda_nightly_reference_unrecorded.json
+!tests/dfx/lingbot_world/calibration/history/cuda_nightly_quality_population_unrecorded.json
+!tests/dfx/lingbot_world/calibration/history/cuda_nightly_reference_pre_v032.json
+!tests/dfx/lingbot_world/calibration/history/cuda_nightly_quality_population_pre_v032.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !apps/ComfyUI-ABC-Preview/example_workflows/*.json
 !vllm_omni/model_executor/models/ming_flash_omni/talker_tn/talker_re.json
@@ -296,3 +304,7 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+
+# LingBot regression artifacts and isolated evaluator environments
+lingbot-artifacts/
+.lingbot-ci/

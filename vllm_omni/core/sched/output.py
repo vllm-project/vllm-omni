@@ -85,7 +85,7 @@ class OmniNewRequestData(NewRequestData):
         )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class OmniCachedRequestData(CachedRequestData):
     """Cached request data for omni models with embeddings support.
 
@@ -93,8 +93,24 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
-    additional_information: dict[str, dict | None] = field(default_factory=dict)
+    prompt_token_ids: dict[str, list[int]]
+    additional_information: dict[str, dict | None]
+
+    @classmethod
+    def from_base(
+        cls,
+        data: CachedRequestData,
+        *,
+        prompt_token_ids: dict[str, list[int]],
+        additional_information: dict[str, dict | None],
+    ) -> "OmniCachedRequestData":
+        """Preserve upstream fields while attaching required Omni payloads."""
+        base_data = {field.name: getattr(data, field.name) for field in fields(CachedRequestData)}
+        return cls(
+            **base_data,
+            prompt_token_ids=prompt_token_ids,
+            additional_information=additional_information,
+        )
 
 
 @dataclass

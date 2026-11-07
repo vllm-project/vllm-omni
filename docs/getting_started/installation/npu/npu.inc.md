@@ -215,13 +215,13 @@ cd vllm-omni
 ```
 
 !!! warning "vLLM 0.33 alignment is not yet qualified on NPU"
-    Both `docker/Dockerfile.npu` and `docker/Dockerfile.npu.ci` retain the
-    legacy `v0.32.0` Ascend runtime default. The commands below illustrate
-    hardware suffix selection; they do not produce a validated vLLM 0.33
-    image. Before building this checkout, obtain a matching vLLM 0.33.0 and
-    vLLM-Ascend runtime, pass its verified image repository and tag through
-    `VLLM_ASCEND_IMAGE` and `VLLM_ASCEND_VERSION`, and validate on your NPU.
-    A final vLLM package alone does not establish vLLM-Ascend compatibility.
+    Both NPU Dockerfiles now select the vendor-integrated `v0.33.0` image
+    with a frozen digest. This aligns the vLLM source version; target-device
+    qualification is still required. The vendor plugin has its own development
+    version and must remain with the image's PyTorch, torch-npu and CANN stack.
+    When changing a runtime, update `VLLM_ASCEND_IMAGE`, `VLLM_ASCEND_VERSION`
+    and `VLLM_ASCEND_DIGEST` together. A final vLLM package alone does not
+    establish vLLM-Ascend compatibility.
 
 All hardware variants use `docker/Dockerfile.npu`. Choose the device suffix for your hardware:
 
@@ -235,21 +235,24 @@ All hardware variants use `docker/Dockerfile.npu`. Choose the device suffix for 
 
     ```bash
     docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
-        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a3 .
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a3 \
+        --build-arg VLLM_ASCEND_DIGEST=sha256:ec7cd7c98616d55500e21a17b63be3a99603d520087f41dc37b60ae6c75d0730 .
     ```
 
 === "A5"
 
     ```bash
     docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
-        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a5 .
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a5 \
+        --build-arg VLLM_ASCEND_DIGEST=sha256:51dc15c552d8de7141f84815de9d8ff030bc97b413280db742640aa467d632db .
     ```
 
 === "310P (Experimental)"
 
     ```bash
     docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
-        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-310p .
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-310p \
+        --build-arg VLLM_ASCEND_DIGEST=sha256:22f665099114310858daf90d072eb46ce97ebbbdce1f808879aee68a427de76f .
     ```
 
 # --8<-- [end:pre-built-images]

@@ -98,7 +98,7 @@ def test_r2_01_runs_once_fails_closed_and_publishes_results() -> None:
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
     assert "--collect-only" not in joined
     assert '$${BUILDKITE_PARALLEL_JOB:-0}" == "0"' in joined
-    assert "assert-pytest-collection.sh 1420" in joined
+    assert "assert-pytest-collection.sh 1424" in joined
     assert "VLLM_CI_ALLOW_NO_TESTS" not in joined
     assert any(artifact_dir in command for command in commands)
     assert "-v" in argv

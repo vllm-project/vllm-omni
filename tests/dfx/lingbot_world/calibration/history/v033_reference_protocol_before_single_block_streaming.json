@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "reference_repository": "https://github.com/tzhouam/vllm-omni.git",
+  "reference_revision": "61d19b6094189136ad047bf8b060d4180c3c60bf",
+  "accepted_main_revision": "02286829737a54167e890185bcbb6948ed9afbcf",
+  "established_fix_source_revision": "48cebe5a248d4b0160f20c7fc18b5d1c46883872",
+  "scope": "Each platform and exact profile qualifies independently; no inheritance from CUDA nightly to weekly, long or NPU",
+  "reference_starts_per_cohort": 3,
+  "training_cohorts": 2,
+  "training_reference_starts": 6,
+  "native_reference_spread": "Per case/dimension: max(existing quality.json conservative ceiling, ceil(six-reference range * 1.25 / 0.005) * 0.005)",
+  "pixels": "All 15 unordered pairs of the six actual reference videos per case, complete frames/windows and pinned canonical decoder",
+  "transient_noise": "Maximum two-way reference-cohort excess * 1.25; ceil to 1ms startup-stall / 5ms TTFC",
+  "p95_cv": "Largest training case/cohort reference CV * 1.25; round up to 0.005 and at least 0.03",
+  "performance_regression_fraction": 0.05,
+  "candidate_allowances_changed": false,
+  "candidate_data_used_to_fit": false,
+  "historical_records_immutable": true,
+  "independent_validation_complete": false,
+  "heldout": "Freeze calibration before a third independent reference cohort and final-source candidate campaign; investigate failures without refitting",
+  "runtime": {
+    "cuda": {"vllm": "0.33.0", "torch": "2.14.0"},
+    "npu": "Pin the integrated vLLM 0.33 vendor image by digest, retain actual vllm/torch/torch-npu/vllm-ascend metadata, and require both source preflights; the tag does not establish qualification"
+  }
+}

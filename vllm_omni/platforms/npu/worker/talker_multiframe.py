@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Several codec frames inside one stage-1 ``execute_model``.
 
 One MiniCPM-o Talker decode step is almost all vLLM host work wrapped around a
@@ -63,12 +65,16 @@ import dataclasses
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
+
+if TYPE_CHECKING:
+    from vllm_omni.worker.talker_cuda_graph import CUDANarrowStep
 
 logger = init_logger(__name__)
 
@@ -347,13 +353,15 @@ def begin_narrow_step(
     # platforms/npu/attention/static_shape_decode, which may be absent. Import
     # defensively: when missing, decline as documented and let the caller fall
     # back to wide replay; multi-frame decode and the stop chain are unaffected.
+    static_shape_decode: ModuleType | None
     try:
         from vllm_omni.platforms.npu.attention import static_shape_decode
     except Exception:
         static_shape_decode = None
 
     if static_shape_decode is None:
-        return _decline("the static-shape decode backend is not present in this build")
+        _decline("the static-shape decode backend is not present in this build")
+        return None
     if not narrow_replay_enabled(runner) or inputs_embeds is None or positions is None:
         return None
     rows = len(spans)
@@ -361,7 +369,8 @@ def begin_narrow_step(
         return None
     seq_lens = static_shape_decode.captured_seq_lens(rows)
     if seq_lens is None:
-        return _decline(f"no one-query graph captured for {rows} rows")
+        _decline(f"no one-query graph captured for {rows} rows")
+        return None
     metadata = getattr(forward_context, "attn_metadata", None)
     if isinstance(metadata, dict):
         metadata = next(iter(metadata.values()), None)
@@ -369,9 +378,11 @@ def begin_narrow_step(
     live_seq_lens = getattr(metadata, "seq_lens_device", None)
     graph_slot_mapping = static_shape_decode.captured_slot_mapping(rows)
     if step_slot_mapping is None or live_seq_lens is None or graph_slot_mapping is None:
-        return _decline("this step's attention metadata carries no slot mapping")
+        _decline("this step's attention metadata carries no slot mapping")
+        return None
     if step_slot_mapping.shape[0] < rows * frames:
-        return _decline("slot mapping is shorter than the step's own frames")
+        _decline("slot mapping is shorter than the step's own frames")
+        return None
 
     narrow = NarrowStep(
         rows=rows,
@@ -459,7 +470,7 @@ def run(
     frames: int,
     model_kwargs: dict[str, Any],
     model_kwargs_extra: dict[str, Any],
-    narrow: NarrowStep | None = None,
+    narrow: NarrowStep | CUDANarrowStep | None = None,
 ) -> Any:
     """Run ``frames`` codec frames and return the merged step output.
 
@@ -475,8 +486,9 @@ def run(
     if narrow is not None and hasattr(narrow, "run_fused") and narrow.inputs_embeds.is_cuda:
         from vllm_omni.worker.talker_cuda_graph import run_cuda_fused_step
 
+        cuda_narrow = cast("CUDANarrowStep", narrow)
         fused = run_cuda_fused_step(
-            narrow,
+            cuda_narrow,
             model=model,
             model_kwargs={**model_kwargs, **model_kwargs_extra},
             intermediate_tensors=model_kwargs.get("intermediate_tensors"),
@@ -490,7 +502,7 @@ def run(
         # every frame eagerly under CUDAGraphMode.NONE (2.2x slower than the
         # dispatcher graph the plain path replays). Restore the original
         # context and fall through to the plain frame loop.
-        narrow.restore()
+        cuda_narrow.restore()
         narrow = None
 
     frame_outputs = []
@@ -563,7 +575,7 @@ def _write_frame_embeddings(
     spans: list[tuple[int, int]],
     infos: list[dict[str, Any]],
     frame: int,
-    narrow: NarrowStep | None = None,
+    narrow: NarrowStep | CUDANarrowStep | None = None,
 ) -> None:
     """Put frame ``frame``'s decode embedding into the row the graph reads.
 
