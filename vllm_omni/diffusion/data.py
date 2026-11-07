@@ -315,9 +315,11 @@ class DiffusionParallelConfig:
       convolutions.
     - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
 
-    The "spatial_shard_*" modes are decode-only and currently require
-    ``vae_patch_parallel_size`` to match the DiT group size; otherwise the VAE
-    falls back to tile-parallel decode at runtime.
+    The "spatial_shard_*" modes currently require ``vae_patch_parallel_size``
+    to match the DiT group size; otherwise the VAE falls back to tile-parallel
+    decode at runtime. The Wan VAE also shards encode along the same dimension
+    when that extent divides by ``world_size * 8`` (``* 16`` for Wan2.2 TI2V);
+    other shapes keep tile-parallel encode.
     """
 
     use_hsdp: bool = False

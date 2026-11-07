@@ -317,7 +317,9 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
     """Install on the residual, patchified Wan encoder used by Cosmos3.
 
     State and layouts are independent of the decoder installation. Spatial
-    sharding only replaces decoder modules, so it does not exclude this path.
+    sharding replaces decoder modules in place and builds its encode copy from
+    the original encoder; once this path is installed, spatial-shard encode
+    stands aside (its halo modules would be bypassed by these forwards).
     """
     from . import encoder_forwards as ef
 

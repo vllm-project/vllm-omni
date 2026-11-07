@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
@@ -621,6 +622,177 @@ def test_tile_mode_disables_spatial_shard_decode():
     assert vae._spatial_shard_decode_enabled(z) is False
 
 
+def _tiny_wan_vae(kind: str):
+    from diffusers import AutoencoderKLWan
+
+    torch.manual_seed(0)
+    stats = {"latents_mean": [0.0] * 4, "latents_std": [1.0] * 4}
+    if kind == "wan2.1":
+        vae = AutoencoderKLWan(base_dim=8, z_dim=4, **stats)
+    else:  # Wan2.2 TI2V-style residual, patchified VAE
+        vae = AutoencoderKLWan(
+            base_dim=8,
+            decoder_base_dim=8,
+            z_dim=4,
+            is_residual=True,
+            patch_size=2,
+            in_channels=12,
+            out_channels=12,
+            scale_factor_spatial=16,
+            **stats,
+        )
+    # Perturb every parameter so zero biases and unit norms cannot hide boundary errors.
+    with torch.no_grad():
+        for param in vae.parameters():
+            param.add_(torch.randn_like(param) * 0.1)
+    return vae.double().eval()
+
+
+def _spatial_shard_encode_cpu_worker(rank, world_size, kind, split_dim, shape, all_gather_halo, port, return_dict):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    wan_spatial_shard._halo_exchange_uses_all_gather = lambda: all_gather_halo
+    try:
+        vae = _tiny_wan_vae(kind)
+        state_keys = list(vae.state_dict())
+        pixels = torch.randn(shape, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+        with torch.no_grad():
+            reference = vae._encode(pixels)
+            x = pixels if vae.config.patch_size is None else patchify(pixels, patch_size=vae.config.patch_size)
+            assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim=split_dim, world_size=world_size)
+            sharded = wan_spatial_shard.spatial_shard_encode(vae, x, group=dist.group.WORLD, split_dim=split_dim)
+            repeated = wan_spatial_shard.spatial_shard_encode(vae, x, group=dist.group.WORLD, split_dim=split_dim)
+            # The original encoder must stay untouched for the tile-parallel fallback.
+            unsharded_after = vae._encode(pixels)
+        sharded_encoder = vae.__dict__["_vllm_omni_wan_spatial_shard_encoder"]
+        shared = {id(p) for p in vae.encoder.parameters()}
+        return_dict[rank] = {
+            "shape": tuple(sharded.shape),
+            "reference_shape": tuple(reference.shape),
+            "max_abs_diff": (sharded - reference).abs().max().item(),
+            "repeat_equal": torch.equal(sharded, repeated),
+            "original_unchanged": torch.equal(unsharded_after, reference),
+            "state_keys_unchanged": list(vae.state_dict()) == state_keys,
+            "params_shared": all(id(p) in shared for p in sharded_encoder.parameters()),
+        }
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "world_size, kind, split_dim, shape",
+    [
+        (2, "wan2.1", "width", (1, 3, 9, 48, 64)),
+        (4, "wan2.1", "height", (1, 3, 5, 64, 40)),
+        (2, "wan2.2", "width", (1, 3, 5, 32, 64)),
+    ],
+)
+@pytest.mark.parametrize("all_gather_halo", [False, True], ids=["p2p_halo", "all_gather_halo"])
+def test_spatial_shard_encode_matches_untiled_encode(world_size, kind, split_dim, shape, all_gather_halo):
+    return_dict = mp.get_context("spawn").Manager().dict()
+    port = str(get_open_port())
+    mp.spawn(
+        _spatial_shard_encode_cpu_worker,
+        args=(world_size, kind, split_dim, shape, all_gather_halo, port, return_dict),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for rank in range(world_size):
+        result = return_dict[rank]
+        assert result["shape"] == result["reference_shape"]
+        assert result["max_abs_diff"] < 1e-10, f"rank {rank}: {result['max_abs_diff']}"
+        assert result["repeat_equal"]
+        assert result["original_unchanged"]
+        assert result["state_keys_unchanged"]
+        assert result["params_shared"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "split_dim, shape, world_size, expected",
+    [
+        ("width", (1, 3, 5, 48, 128), 8, True),  # 128 % (8 ranks * 2**3 downsamples) == 0
+        ("height", (1, 3, 5, 720, 64), 8, False),  # 720 % 64 != 0: shards turn odd before a stride-2 conv
+        ("height", (1, 3, 5, 48, 64), 1, False),
+    ],
+)
+def test_can_spatial_shard_encode_requires_stride_aligned_shards(split_dim, shape, world_size, expected):
+    vae = _tiny_wan_vae("wan2.1")
+
+    assert (
+        wan_spatial_shard.can_spatial_shard_encode(vae, torch.zeros(shape), split_dim=split_dim, world_size=world_size)
+        is expected
+    )
+
+
+def _encode_gate_vae(monkeypatch: pytest.MonkeyPatch, *, mode: str, parallel_size: int = 2):
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.dist.get_world_size",
+        lambda group=None: 2,
+    )
+    vae = DistributedAutoencoderKLWan.__new__(DistributedAutoencoderKLWan)
+    vae.distributed_executor = SimpleNamespace(group=object(), parallel_size=parallel_size, parallel_mode=mode)
+    vae.is_distributed_enabled = lambda: True
+    # Bypass nn.Module.__setattr__: the gate tests skip Module.__init__.
+    object.__setattr__(vae, "encoder", _tiny_wan_vae("wan2.1").encoder)
+    return vae
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_encode_dispatches_to_spatial_shard_without_tiling(monkeypatch: pytest.MonkeyPatch):
+    vae = _encode_gate_vae(monkeypatch, mode="spatial_shard_width")
+    # ConfigMixin.config is a read-only view of _internal_dict.
+    object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=None))
+    vae.use_tiling = False
+    calls = []
+    monkeypatch.setattr(
+        wan_spatial_shard,
+        "spatial_shard_encode",
+        lambda vae, x, *, group, split_dim: calls.append(split_dim) or x,
+    )
+
+    x = torch.zeros((1, 3, 5, 16, 32))
+    assert DistributedAutoencoderKLWan._encode(vae, x) is x
+    assert calls == ["width"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "mode, parallel_size, shape",
+    [
+        ("tile", 2, (1, 3, 5, 16, 32)),
+        ("spatial_shard_width", 1, (1, 3, 5, 16, 32)),  # partial VAE group
+        ("spatial_shard_height", 2, (1, 3, 5, 24, 32)),  # 24 rows cannot split into stride-aligned halves
+    ],
+)
+def test_spatial_shard_encode_gate_falls_back(monkeypatch: pytest.MonkeyPatch, mode, parallel_size, shape):
+    vae = _encode_gate_vae(monkeypatch, mode=mode, parallel_size=parallel_size)
+
+    assert vae._spatial_shard_encode_enabled(torch.zeros(shape)) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_spatial_shard_encode_gate_defers_to_encoder_fast_path(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import ENCODER_REPORT_ATTR, WanVaeFastPathReport
+
+    vae = _encode_gate_vae(monkeypatch, mode="spatial_shard_width")
+    x = torch.zeros((1, 3, 5, 16, 32))
+    assert vae._spatial_shard_encode_enabled(x) is True
+
+    setattr(vae, ENCODER_REPORT_ATTR, WanVaeFastPathReport(level="lossless", installed=True))
+    assert vae._spatial_shard_encode_enabled(x) is False
+
+
 # =============================================================================
 # Multi-GPU numerical-correctness test (nightly Diffusion Test group, H100 x2)
 #
@@ -871,3 +1043,90 @@ def test_registry_auto_enables_vae_tiling_only_for_tile_mode(monkeypatch, mocker
     assert config.vae_use_tiling is auto_tiling
     assert model.vae.use_tiling is auto_tiling
     vae.distributed_executor.set_parallel_size.assert_called_once_with(2, mode=mode)
+
+
+_SPATIAL_SHARD_ENCODE_FRAMES = 17
+_SPATIAL_SHARD_ENCODE_HEIGHT = 480
+_SPATIAL_SHARD_ENCODE_WIDTH = 832
+
+
+def _spatial_shard_encode_worker(rank: int, split_dim: str, return_dict, master_port: str) -> None:
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = master_port
+    device = current_omni_platform.get_torch_device(rank)
+    current_omni_platform.set_device(device)
+    dtype = torch.float32
+
+    backend = current_omni_platform.dist_backend
+    init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
+    initialize_model_parallel(
+        sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
+    )
+    model = os.environ.get("VLLM_OMNI_TEST_WAN_VAE", _SPATIAL_SHARD_MODEL)
+    local_vae_only = os.path.isdir(model) and not os.path.isdir(os.path.join(model, "vae"))
+    load = {"torch_dtype": dtype} if local_vae_only else {"subfolder": _SPATIAL_SHARD_SUBFOLDER, "torch_dtype": dtype}
+    try:
+        vae = DistributedAutoencoderKLWan.from_pretrained(model, **load).to(device=device, dtype=dtype).eval()
+        generator = torch.Generator(device=device).manual_seed(0)
+        pixels = torch.rand(
+            (1, 3, _SPATIAL_SHARD_ENCODE_FRAMES, _SPATIAL_SHARD_ENCODE_HEIGHT, _SPATIAL_SHARD_ENCODE_WIDTH),
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        pixels = pixels * 2 - 1
+
+        with torch.inference_mode():
+            vae.use_tiling = False
+            vae.set_parallel_size(1, mode="tile")
+            reference = vae.encode(pixels).latent_dist.mode().float()
+
+            # Spatial-shard modes do not enable native tiling (see the registry test above).
+            vae.set_parallel_size(_SPATIAL_SHARD_WORLD_SIZE, mode=f"spatial_shard_{split_dim}")
+            assert vae._spatial_shard_encode_enabled(pixels)
+            sharded = vae.encode(pixels).latent_dist.mode().float()
+
+        # Encode results are needed by every rank, so every rank checks its copy.
+        diff = (sharded - reference).abs()
+        return_dict[f"max_abs_diff_rank{rank}"] = diff.max().item()
+        return_dict[f"mean_abs_diff_rank{rank}"] = diff.mean().item()
+    finally:
+        destroy_model_parallel()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
+@pytest.mark.parametrize("split_dim", ["height", "width"])
+def test_spatial_shard_encode_matches_untiled_reference(split_dim: str):
+    manager = mp.get_context("spawn").Manager()
+    return_dict = manager.dict()
+    master_port = str(29520 + (1 if split_dim == "width" else 0))
+
+    mp.spawn(
+        _spatial_shard_encode_worker,
+        args=(split_dim, return_dict, master_port),
+        nprocs=_SPATIAL_SHARD_WORLD_SIZE,
+        join=True,
+    )
+
+    for rank in range(_SPATIAL_SHARD_WORLD_SIZE):
+        assert f"max_abs_diff_rank{rank}" in return_dict, f"rank {rank} did not report"
+        max_abs_diff = return_dict[f"max_abs_diff_rank{rank}"]
+        print(
+            f"spatial_shard_{split_dim} encode rank {rank}: max_abs_diff={max_abs_diff:.6e} "
+            f"mean_abs_diff={return_dict[f'mean_abs_diff_rank{rank}']:.6e}"
+        )
+        assert max_abs_diff <= _SPATIAL_SHARD_TOLERANCE, (
+            f"rank {rank}: spatial_shard_{split_dim} encode max_abs_diff {max_abs_diff} exceeds "
+            f"{_SPATIAL_SHARD_TOLERANCE}"
+        )
