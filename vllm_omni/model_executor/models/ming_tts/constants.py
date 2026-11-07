@@ -70,6 +70,7 @@ MAX_DECODE_STEPS = 200
 
 KEY_LATENT_HISTORY = "ming_latent_history"
 KEY_DECODE_STEP = "ming_decode_step"
+KEY_FINAL_DECODE_STEP = "ming_final_decode_step"
 KEY_LAST_STOP_PROB = "ming_last_stop_prob"
 KEY_NEXT_EMBEDS = "ming_next_embeds"
 KEY_PROMPT_LATENTS = "ming_prompt_latents"
