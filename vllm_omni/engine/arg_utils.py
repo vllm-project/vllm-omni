@@ -34,6 +34,7 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "SparkBiCodecDecoder": "spark_bicodec",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
@@ -97,6 +98,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.model_executor.models.spark_tts.configuration_spark_tts import SparkBiCodecConfig
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
@@ -129,6 +131,7 @@ def _register_omni_hf_configs() -> None:
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
+        ("spark_bicodec", SparkBiCodecConfig),
         ("personaplex", PersonaPlexConfig),
         ("bailing_moe_v3_audio", BailingMoeV3AudioConfig),
         ("nemotron_voicechat", NemotronVoiceChatConfig),
@@ -491,10 +494,10 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # The IndexTTS 2.5 bundle and Spark BiCodec checkpoint lack a HuggingFace config.json.
             # Keep this exception model-scoped so other loader failures retain
             # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+            if model_type not in ("indextts2_5", "spark_bicodec") or not os.path.isdir(self.model):
                 return
             config_path = os.path.join(self.model, "config.json")
             if os.path.lexists(config_path):

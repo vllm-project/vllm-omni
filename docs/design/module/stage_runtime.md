@@ -116,6 +116,20 @@ declared lost.
 **Rule:** Repeated shutdown or cleanup signals MUST NOT leak stage clients,
 process managers, or membership registrations.
 
+On POSIX, a local LLM stage wakes its input queue when it receives a signal.
+This lets an idle worker's main thread run its shutdown handler even when
+another thread received SIGTERM. A pipeline can declare a finite, nonnegative
+`StagePipelineConfig.shutdown_grace_s` for an LLM stage's process cleanup.
+`None` retains the upstream timeout policy. The value reaches the process
+manager through both structured and legacy stage configs, for colocated,
+distributed launches with or without a coordinator, and headless launches. An explicit caller timeout takes
+precedence, including zero. Spark declares 15 seconds on its BiCodec stage;
+the shared process manager does not select policy by model name. This grace
+is separate from vLLM's request-draining `shutdown_timeout`. Pipeline construction
+and the legacy launch boundary validate the value. vLLM owns the actual
+terminate, wait, and kill sequence. A POSIX CPU regression exercises that
+sequence on a real child process whose cleanup exceeds the configured grace.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for

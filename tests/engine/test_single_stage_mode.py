@@ -1565,7 +1565,7 @@ class TestLaunchOmniCoreEngines:
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
         mock_manager_cls = mocker.patch(
-            "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
+            "vllm_omni.engine.stage_engine_core_proc_manager.StageCleanupProcManager",
             return_value=local_engine_manager,
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup_with_deadline", autospec=True)
@@ -1643,7 +1643,7 @@ class TestLaunchOmniCoreEngines:
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
         local_engine_manager = mocker.Mock()
         mocker.patch(
-            "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
+            "vllm_omni.engine.stage_engine_core_proc_manager.StageCleanupProcManager",
             return_value=local_engine_manager,
         )
         mock_wait = mocker.patch(
