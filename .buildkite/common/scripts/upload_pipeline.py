@@ -24,6 +24,12 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     List used shared helpers in job dependencies so mixed diffs retain their consumers.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
+  - ``automatic_shard: true`` is uploader-only. Before planning, the uploader
+    tries to build a per-step profile from recent passed main ``timings/jobs``
+    artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). That profile is a greedy
+    estimate of how many jobs fit ``timeout_in_minutes``; pytest-shard then
+    hashes collected tests, so the bins are not packed by those measured files.
+    With no profile the step stays one job and still records ``timings/jobs/*.json``.
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -84,6 +90,8 @@ from ci_conditions import (
     WEEKLY_LABEL_IF,
     WEEKLY_MAIN_IF,
 )
+from merge_shard_timings import prepare_profile_from_history
+from runtime_shard import apply_automatic_shard, load_shard_timings
 from skip_ci import resolve_ci_context_from_git
 
 if str(ROOT) not in sys.path:
@@ -619,6 +627,46 @@ def _get_step_label(step: dict[str, Any]) -> str:
     return str(step.get("group") or step.get("label") or "<step>")
 
 
+_shard_timings_prepared = False
+
+
+def _ensure_shard_timings_env() -> None:
+    """Populate ``VLLM_OMNI_SHARD_TIMINGS`` from recent Buildkite artifacts when unset."""
+    global _shard_timings_prepared
+    if _shard_timings_prepared:
+        return
+    _shard_timings_prepared = True
+    if os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip():
+        return
+    if os.environ.get("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "").strip() in {"1", "true", "yes"}:
+        return
+    output = ROOT / "timings" / "upload-profile.json"
+    try:
+        path = prepare_profile_from_history(output, include_local=False)
+    except Exception as exc:  # noqa: BLE001 - planning must not fail the upload
+        _log(f"automatic-shard: timing download skipped ({exc})")
+        return
+    if path is None:
+        _log("automatic-shard: no historical timings; enrolled steps stay 1 job")
+        return
+    os.environ["VLLM_OMNI_SHARD_TIMINGS"] = str(path)
+    _log(f"automatic-shard: using timing profile {path}")
+
+
+def _shard_timings() -> dict[str, float] | None:
+    _ensure_shard_timings_env()
+    raw = os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip()
+    timings = load_shard_timings()
+    if raw and timings is None and getattr(_shard_timings, "warned", None) != raw:
+        _shard_timings.warned = raw  # type: ignore[attr-defined]
+        _log(f"automatic-shard: {raw!r} is not a file; steps stay 1 job")
+    return timings
+
+
+def _plan_automatic_shard(step: dict[str, Any]) -> dict[str, Any]:
+    return apply_automatic_shard(step, timings=_shard_timings(), root=ROOT, log=_log)
+
+
 def _process_test_steps(
     steps: list[Any],
     changed_files: list[str] | None,
@@ -629,6 +677,9 @@ def _process_test_steps(
     processed: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
+            processed.append(step)
+            continue
+        if "wait" in step:
             processed.append(step)
             continue
 
@@ -654,12 +705,12 @@ def _process_test_steps(
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
         if not expand_mirror_hardwares:
-            processed.append(leaf)
+            processed.append(_plan_automatic_shard(leaf))
             continue
         expanded = _expand_mirror_hardwares(leaf)
         if expanded is None:
             continue
-        processed.append(expanded)
+        processed.append(_plan_automatic_shard(expanded))
 
     return processed
 

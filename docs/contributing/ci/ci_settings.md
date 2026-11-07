@@ -121,7 +121,7 @@ Canonical layout (prefer these paths for new changes):
 
     - **`depends_on`:** leaf jobs depend on `upload-ready-pipeline`, `upload-merge-pipeline`, etc.
     - **`group` / `label`:** `:card_index_dividers:` groups; labels like `Diffusion · Qwen Image Test`.
-    - **`commands`:** `timeout … pytest …` with markers and `--run-level` for the pipeline level.
+    - **`commands`:** pytest with markers and `--run-level` for the pipeline level. Bound the step with `timeout_in_minutes`. A CUDA ready or merge directory sweep that should split from measured durations sets `automatic_shard: true` and does not use a command-level `timeout`.
     - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; name a job key from `ci_source_file_dependencies.yml` (see [Step filtering](#step-filtering)). The key must list every script the step runs; `commands` is not scanned.
 
     **Adding a job**
@@ -444,6 +444,18 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 | --- | ------- |
 | `source_file_dependencies` | Named preset (or list of presets) from [`ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). The uploader expands only that key; it does **not** scan `commands`. If any changed file equals a listed prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. Inline path-prefix lists are still accepted. |
 | `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
+| `automatic_shard` | CUDA ready/merge directory sweep. The uploader strips the key and may set `parallelism` from that step's timing profile. With no profile the step stays one job. See [Automatic shard planning](#automatic-shard-planning). |
+
+#### Automatic shard planning {#automatic-shard-planning}
+
+`automatic_shard: true` does not reserve a pool when the YAML is uploaded.
+
+- **Fallback:** no profile for that step means one job. The step still writes `timings/jobs/<job>-<pid>.json`. Two pytest processes in one job keep both files; durations for the same file are summed.
+- **Profile:** the pipeline's merge step stores a per-step p80 in `timings/merged.json`, taken from raw job files of the latest 20 `passed` or `finished` `main` builds. A previous merged file is not an observation. Failed and running builds are excluded. The label key drops a ` · Shard N/M` suffix, so one step does not use another step's time for the same path.
+- **Plan:** a greedy estimate of how many jobs fit `timeout_in_minutes`, at most 4. pytest-shard then hashes collected node ids, so the count is not a packed assignment of the measured files. One file already over the budget does not add shards. A file with no measurement adds no weight, so a newly added path stays in the one-job plan until a passed build records it.
+- **Overrides:** `VLLM_OMNI_SHARD_TIMINGS` selects a local profile. `VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD=1` skips the history download.
+
+E2E model jobs stay one job. A hung command is bounded only by `timeout_in_minutes`.
 
 ### Policy
 
