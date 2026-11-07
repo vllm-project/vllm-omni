@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Render a one-off PR 1994 CUDA build containing only the selected SGLang smokes."""
+"""Render PR 1994's weekly comparisons or explicitly selected SGLang diagnostics."""
 
 import argparse
 import json
@@ -61,7 +61,7 @@ def qwen_image_performance_job(benchmark: dict) -> dict:
     return job
 
 
-def smoke_pipeline(cases: list[str]) -> dict:
+def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     qwen_performance = cases == ["qwen-image-21-perf"]
     if not qwen_performance and (not cases or len(cases) != len(set(cases)) or set(cases) - GPU_COUNTS.keys()):
         raise ValueError(f"Select distinct model keys from: {', '.join(GPU_COUNTS)}")
@@ -78,6 +78,10 @@ def smoke_pipeline(cases: list[str]) -> dict:
         pipeline["steps"] = [qwen_image_performance_job(benchmark)]
         return pipeline
     pipeline["steps"] = [image]
+    if weekly:
+        pipeline["steps"].extend(
+            [benchmark, weekly_steps["nightly-sglang-omni-qwen3-tts"], qwen_image_performance_job(benchmark)]
+        )
     for case in cases:
         job = deepcopy(benchmark)
         job.update(
@@ -141,9 +145,12 @@ def smoke_pipeline(cases: list[str]) -> dict:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("cases", help="Comma-separated model keys")
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("cases", nargs="?", help="Comma-separated model keys")
+    selection.add_argument("--weekly", action="store_true", help="Run the four validated comparison workloads")
     args = parser.parse_args()
     try:
-        print(json.dumps(smoke_pipeline(args.cases.split(","))))
+        cases = ["minicpm-o-perf"] if args.weekly else args.cases.split(",")
+        print(json.dumps(smoke_pipeline(cases, weekly=args.weekly)))
     except ValueError as exc:
         parser.error(str(exc))

@@ -50,6 +50,9 @@ steps:
             printf '%s\n' "$${smoke_steps}" | buildkite-agent pipeline upload
             exit 0
           fi
+          weekly_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py --weekly)"
+          printf '%s\n' "$${weekly_steps}" | buildkite-agent pipeline upload
+          exit 0
         fi
         buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml
     agents:

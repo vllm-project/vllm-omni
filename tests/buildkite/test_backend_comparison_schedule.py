@@ -34,12 +34,12 @@ def comparison_runner(tmp_path: Path):
     )
     stub.chmod(0o755)
     template = tmp_path / "template.json"
-    template.write_text(
-        '{"steps":[{"key":"image-build-sglang-omni"},'
-        '{"key":"nightly-sglang-omni-qwen3-omni","plugins":[{'
-        '"github.com/buildkite-plugins/kubernetes-buildkite-plugin":'
-        '{"podSpec":{"containers":[{"image":"registry/repo:tag","resources":{"limits":{}}}]}}}]}]}'
-    )
+    pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-sglang-omni.yml").read_text())
+    for step in pipeline["steps"]:
+        for plugin in step.get("plugins", []):
+            if "kubernetes" in plugin:
+                plugin["github.com/buildkite-plugins/kubernetes-buildkite-plugin"] = plugin.pop("kubernetes")
+    template.write_text(json.dumps(pipeline))
     git = bindir / "git"
     git.write_text('#!/bin/bash\nprintf "%s\\n" "$TEST_CHECKOUT"\n')
     git.chmod(0o755)
@@ -73,10 +73,37 @@ def comparison_runner(tmp_path: Path):
     return run
 
 
-def test_schedule_uploads_only_sglang(comparison_runner):
+def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp_path):
     result, calls = comparison_runner({})
     assert result.returncode == 0, result.stderr
-    assert calls == ["buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml"]
+    assert calls == ["buildkite-agent pipeline upload"]
+    pipeline = json.loads((tmp_path / "calls.json").read_text())
+    assert pipeline["env"] == {"BACKEND_COMPARISON_COMMIT": "${BUILDKITE_COMMIT}"}
+    jobs = {step["key"]: step for step in pipeline["steps"]}
+    assert set(jobs) == {
+        "image-build-sglang-omni",
+        "nightly-sglang-omni-qwen3-omni",
+        "nightly-sglang-omni-qwen3-tts",
+        "perf-sglang-qwen-image-21",
+        "perf-sglang-minicpm-o",
+    }
+    for key, cards in (
+        ("nightly-sglang-omni-qwen3-omni", 2),
+        ("nightly-sglang-omni-qwen3-tts", 2),
+        ("perf-sglang-qwen-image-21", 1),
+        ("perf-sglang-minicpm-o", 1),
+    ):
+        job = jobs[key]
+        assert job["agents"] == {"queue": "mithril-h100-pool"}
+        container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
+        assert container["resources"]["limits"]["nvidia.com/gpu"] == cards
+        if key == "perf-sglang-qwen-image-21":
+            assert "depends_on" not in job
+            assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
+            assert ".completed == 10" in job["command"]
+        else:
+            assert job["depends_on"] == "image-build-sglang-omni"
+    assert ".completed == 32" in jobs["perf-sglang-minicpm-o"]["command"]
 
 
 @pytest.mark.parametrize(
@@ -225,7 +252,7 @@ def test_qwen_image_performance_uses_only_the_verified_image(comparison_runner, 
     assert job["key"] == "perf-sglang-qwen-image-21"
     assert "depends_on" not in job
     (container,) = next(iter(job["plugins"][0].values()))["podSpec"]["containers"]
-    assert container["image"] == "registry/repo@" + job["env"]["COMPARISON_IMAGE_DIGEST"]
+    assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
     assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
     (config,) = json.loads((ROOT / job["env"]["COMPARISON_CONFIG"]).read_text())
     reference = json.loads((ROOT / "tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json").read_text())[0]
