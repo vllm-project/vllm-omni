@@ -54,6 +54,9 @@ CHECK_IMPORTS = {
             # STOP AND READ BEFORE YOU ADD ANYTHING ELSE TO THIS LIST:
             # pickle/cloudpickle are unsafe when deserializing untrusted data.
             "tests/diffusion/attention/test_attention_sp.py",
+            # Round-trips ErrorSummary through pickle on purpose: RFC 01 ships it
+            # inside all_gather_object messages, which pickle the object.
+            "tests/diffusion/weight_stack/test_errors.py",
             "tests/helpers/process.py",
             "vllm_omni/diffusion/distributed/group_coordinator.py",
         },
