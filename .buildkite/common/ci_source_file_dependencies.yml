@@ -302,6 +302,19 @@ source_file_dependencies:
     - vllm_omni/worker_v2/
     - vllm_omni/worker/
 
+  # Inputs that can change the exact collection AMD READY R2-01 pins.
+  amd_ready_r2_01_collection:
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run_collection_guard.py
+    - .buildkite/amd/test-amd-ready.yml
+    - .buildkite/common/ci_source_file_dependencies.yml
+    - .buildkite/common/scripts/upload_pipeline.py
+    - .buildkite/cuda/test-ready.yml
+    - pyproject.toml
+    - tests/conftest.py
+    - tests/helpers/
+    - tests/model_executor/
+
   omni_qwen3_omni_function:
     - *qwen3_omni
     - vllm_omni/lora/
