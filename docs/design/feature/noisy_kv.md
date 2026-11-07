@@ -74,9 +74,10 @@ feeds the next group). KV is keyed **per block** `b`: publish / transfer /
 wait when that cell finishes; a remote reader of `b` does not wait for the
 producer's other local blocks.
 
-CausVidWan accepts Self-Forcing / Latest-KV only. Pair schedule with topology: Self-Forcing →
+CausVidWan accepts Self-Forcing / Latest-KV / Same-Step. Pair schedule with topology: Self-Forcing →
 `S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
-vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Clean is an ordering
+vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`); Same-Step → vertical `S=D`
+(`deploy/causvid_wan_same_step.yaml`). Clean is an ordering
 property, independent of the history window (Self-Forcing and Latest-KV always,
 Same-Step runs it for chunk 0 only).
 
@@ -191,6 +192,10 @@ Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
+**Execution envelope.** The data-layer boundary is split into `Session` and `ARDiffusionBatch`. A session owns cross-request state such as retained KV, conditioning, and the streaming decoder; an `ARDiffusionBatch` owns one execution envelope: request identity, session metadata, strategy payload, ownership, cleanup, and output attribution.
+
+`ARDiffusionBatch` is not a promise that every strategy supports the same tensor batching. Paged execution may carry several request records for continuous batching. On the cell path a request-mode call carries one record and a batch wave carries the records that wave owns; `CellPlan`, `chunk_tokens`, and cell-task grouping stay internal to the Noisy strategy, so `max_batch_size` remains cell geometry rather than request-batch cardinality. `DiffusionRequestBatch` is not the Noisy contract, and paged<->Noisy KV conversion is not required.
+
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
@@ -206,6 +211,16 @@ history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
 the sink. This mode currently admits one request at a time; checkpoint quality
 requires separate validation.
 
+Across requests a Same-Step session keeps every denoise step of the trailing
+window plus chunk 0's sink, because a continuation reads the step matching its
+own. Each rank owns one step, so per rank a parked session holds `H` versions
+plus the sink, independent of `D`. That stays resident while another request
+runs, so CausVidWan declares `max_history_versions = 2H + 1` (the parked share
+plus the live window) and the pool is sized for both. A session's first request
+must schedule at least two chunks: a one-chunk cold request skips the sink that
+every continuation reads, so CausVidWan refuses it rather than letting the next
+request fail on the sink owner alone.
+
 ## Configuration
 
 | Layer | Key | Meaning |
@@ -214,7 +229,7 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
+| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv` \| `same_step` |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and multi-chunk shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
@@ -232,7 +247,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
+| No session + Same-Step | Supported (opt-in; CausVid, `step_replicas == D`) |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Designed; not required for #102 |
 

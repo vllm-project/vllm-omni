@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.ar_diffusion.batch import ARDiffusionBatch
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
@@ -218,6 +219,8 @@ class ARDiffusionCellContext:
     kv: NoisyKVState
     inflight: list[Inflight] = field(default_factory=list)
     pending: list[PendingAdmit] = field(default_factory=list)
+    # Execution envelope for this call; the executor only runs requests it owns.
+    batch: ARDiffusionBatch | None = None
 
     def enqueue(
         self,
@@ -227,6 +230,8 @@ class ARDiffusionCellContext:
         chunk_tokens: int,
         retain: Collection[Cell] | None = None,
     ) -> None:
+        if self.batch is not None and req not in self.batch.request_ids:
+            raise ValueError(f"request {req!r} is not part of the AR-Diffusion batch")
         self.pending.append(
             PendingAdmit(
                 req=req,
