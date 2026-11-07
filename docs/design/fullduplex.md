@@ -354,6 +354,15 @@ detached, mutable copies for plugin compatibility. Text, bytes and opaque
 media payloads are shared, rather than cloned. Consumers must treat opaque
 payloads as read-only. Session mutation methods own authoritative writes.
 
+Every non-placeholder history insertion must call `_track_history_message`,
+and removal must call `_forget_history_message`, keeping the source map complete
+for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
+
+The prompt path uses `session.history` for Qwen retained-PCM identity. Unlike
+`snapshot.messages`, it copies only top-level message dictionaries; nested
+protocol/media containers and payloads remain shared with authoritative history
+and must be treated as read-only by prompt consumers.
+
 A source ID is allocated monotonically when a message becomes visible and
 is never reused within that session. Replacing a public item's contents
 preserves its source ID. Deleting it retires the source; recreating the same
@@ -1196,3 +1205,49 @@ playback ACK cannot restore unheard content. These fixtures do not establish
 real audio, serving or model-quality coverage.
 Those measurements still require integration with the existing evaluation
 runner, actual media and a model-backed query path.
+
+## Qwen budget selection and summary memory
+
+Qwen's deployment-owned context policy defaults to `legacy`. Opt-in `budget`
+selection operates on complete exchanges after media binding and candidate L1
+rendering. System messages remain mandatory without separating a user from its
+answer. Rendering preserves source order. The final template, tools, media
+expansion and actual output-token reserve share one deployment context budget.
+A mandatory-input overflow is an explicit error. Pending tool continuations pin
+their source turn; published anchors expire according to selected context
+rather than the legacy fixed message count.
+
+For plugins declaring `uses_context_ledger`, ModelChannel calls
+`observe_history_context` synchronously with the captured versioned snapshot
+and session-owned ledger. Qwen uses that hook to invalidate memory and capture
+source references without passing a mutable ledger to prompt worker threads.
+A history revision change during prompt preparation prevents stale submission.
+The auxiliary runtime refreshes the same context before selecting background
+work and before accepting an asynchronous result.
+
+`budget_summary` reuses SessionMemoryRuntime's single private request slot.
+Successful prompt submission records omitted source references in model runtime
+state. Qwen selects complete text-bearing exchanges from that committed history,
+combines them with any valid previous summary, and renders a bounded stage-0
+request outside the session event loop. It captures source revisions before
+yielding. The request must pass both the runtime epoch/configuration fences and
+Qwen's source/previous-summary check before mailbox publication.
+
+Summary prompts use the checkpoint's ordinary assistant prefix and separate the
+extraction task from quoted conversation instructions. Empty, truncated,
+acknowledgment-only and explicit no-memory results cannot replace a valid
+summary. These checks reject known degenerate outputs; source validity alone
+does not establish the factual accuracy of model-generated memory.
+
+Summary nodes use flat source references instead of an ever-growing parent
+chain. Publication admits the replacement before retiring its predecessor.
+`DuplexContextLedger.discard` removes a derived node and its descendants, without
+changing authoritative history or reusing node IDs. The active summary and one
+attempted-work identity live in Qwen's session state, so unrelated history
+appends do not reset failed-work deduplication. Failed work leaves any valid
+previous summary available. Session re-leasing preserves valid memory; process
+recovery is outside this contract.
+
+The context budget bounds submitted tokens, and summary limits bound generated
+text and active work. Neither mechanism bounds resident authoritative history
+or the number of source references needed to validate a long-lived summary.

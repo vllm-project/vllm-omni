@@ -424,12 +424,20 @@ class ModelChannel:
             view_policy = self._ctx.plugin.context_view_policy(
                 stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
             )
-            if view_policy is None:
+            if view_policy is None and not self._ctx.plugin.uses_context_ledger:
                 history, item_ids = session.history_for_prompt()
                 snapshot = None
             else:
                 snapshot = session.history_snapshot()
                 history, item_ids = session.history, snapshot.item_ids
+            if self._ctx.plugin.uses_context_ledger:
+                assert snapshot is not None
+                self._ctx.plugin.observe_history_context(
+                    snapshot=snapshot,
+                    ledger=session.context_ledger,
+                    state=self._ctx.model_state,
+                    runtime_config=session.runtime_config,
+                )
             prompt_session = {
                 **request_context.session_config,
                 # Keep the prompt accessor's nested content identity: Qwen
@@ -465,6 +473,13 @@ class ModelChannel:
             # Never submit the worker's stale result to the model.
             if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
                 raise DuplexFenceMismatchError(session.fence, fence)
+            if self._ctx.plugin.uses_context_ledger:
+                assert snapshot is not None
+                if session.history_revision != snapshot.history_revision:
+                    raise DuplexRuntimeConfigError(
+                        "Conversation changed during context preparation; retry the response",
+                        code="context_changed",
+                    )
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
             if on_append_prepared is not None:

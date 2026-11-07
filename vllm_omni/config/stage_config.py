@@ -747,6 +747,11 @@ class DuplexSessionRuntimeConfig:
     context_keep_media_turns: int | None = None
     # Experimental text-only extraction; configured only by the deployment.
     context_memory: DuplexContextMemoryConfig | None = None
+    qwen_context_policy: Literal["legacy", "budget", "budget_summary"] = "legacy"
+    qwen_context_max_tokens: int | None = None
+    qwen_summary_max_tokens: int = 512
+    qwen_summary_input_max_tokens: int = 8192
+    qwen_summary_timeout_s: float = 30.0
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
@@ -763,6 +768,21 @@ class DuplexSessionRuntimeConfig:
             raise ValueError("duplex_session.context_memory must be a mapping or null")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
+        if self.qwen_context_policy not in ("legacy", "budget", "budget_summary"):
+            raise ValueError("Unknown duplex_session.qwen_context_policy")
+        for name in ("qwen_context_max_tokens", "qwen_summary_max_tokens", "qwen_summary_input_max_tokens"):
+            value = getattr(self, name)
+            if value is None and name == "qwen_context_max_tokens":
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"duplex_session.{name} must be a positive integer")
+        if (
+            isinstance(self.qwen_summary_timeout_s, bool)
+            or not isinstance(self.qwen_summary_timeout_s, (int, float))
+            or not math.isfinite(self.qwen_summary_timeout_s)
+            or self.qwen_summary_timeout_s <= 0
+        ):
+            raise ValueError("duplex_session.qwen_summary_timeout_s must be finite and positive")
         if self.replica_policy not in ("legacy", "least_sessions"):
             raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
         if self.max_sessions_per_replica is not None and (

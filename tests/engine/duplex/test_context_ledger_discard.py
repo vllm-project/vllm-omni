@@ -10,11 +10,14 @@ import pytest
 
 from tests.engine.duplex.test_memory_card_ledger import _admit, _head, _operation
 from tests.engine.duplex.test_memory_card_ledger import session as _session_fixture
+from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.session.context_ledger import (
+    DuplexContextLedger,
     DuplexContextLevel,
     DuplexContextNodeRejectedError,
     source_refs,
 )
+from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 
 session = _session_fixture
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -205,3 +208,48 @@ def test_flat_source_summary_replacement_survives_discard_of_old_summary(session
     assert replacement.parents == ()
     assert ledger.refresh(session.history_snapshot()) == ()
     assert ledger.nodes() == (replacement,)
+
+
+def test_discard_invalidates_descendants_without_touching_history_or_other_nodes():
+    session = DuplexEngineSession(session_id="discard", config=DuplexSessionConfig(model="test"))
+    session.register_history_item("one", {"role": "user", "content": "one"})
+    session.register_history_item("two", {"role": "user", "content": "two"})
+    snapshot = session.history_snapshot()
+    ledger = DuplexContextLedger()
+    old = ledger.add_node(
+        snapshot,
+        level=DuplexContextLevel.MEDIA_DROPPED,
+        sources=source_refs(snapshot, snapshot.source_ids[0]),
+        message=snapshot.messages[0],
+    )
+    child = ledger.add_node(
+        snapshot, level=DuplexContextLevel.SUMMARY, sources=(), parents=(old.node_id,), message={"content": "child"}
+    )
+    grandchild = ledger.add_node(
+        snapshot,
+        level=DuplexContextLevel.SUMMARY,
+        sources=(),
+        parents=(child.node_id,),
+        message={"content": "grandchild"},
+    )
+    independent = ledger.add_node(
+        snapshot,
+        level=DuplexContextLevel.SUMMARY,
+        sources=source_refs(snapshot, *snapshot.source_ids),
+        message={"content": "replacement"},
+    )
+    assert ledger.discard(old.node_id) == (old.node_id, child.node_id, grandchild.node_id)
+    assert ledger.nodes() == (independent,)
+    assert ledger.l1_node_for(snapshot.source_ids[0]) is None
+    assert ledger.discard(old.node_id) == ()
+    assert ledger.discard(99999) == ()
+    assert session.history_snapshot() == snapshot
+    replacement = ledger.add_node(
+        snapshot,
+        level=DuplexContextLevel.MEDIA_DROPPED,
+        sources=source_refs(snapshot, snapshot.source_ids[0]),
+        message=snapshot.messages[0],
+    )
+    assert replacement.node_id > independent.node_id
+    assert ledger.l1_node_for(snapshot.source_ids[0]) == replacement
+    assert ledger.refresh(snapshot) == ()
