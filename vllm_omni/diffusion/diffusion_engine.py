@@ -165,7 +165,10 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
 
 
 def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
-    """Whether the local pipeline checks cooperative cancellation boundaries."""
+    """Whether full-forward execution checks cooperative cancellation boundaries."""
+    # Step execution has no cancellation scope; it uses scheduler aborts.
+    if getattr(od_config, "step_execution", False):
+        return False
     model_cls = resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
         name = (
