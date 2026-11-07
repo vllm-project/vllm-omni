@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-from collections import deque
+from collections import UserDict, deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -238,6 +238,22 @@ def test_load_poll_generation_preserves_reference_audio_with_list_codes(build_ad
     assert request.prompt_token_ids == [1, 2, 3]
     assert torch.equal(request.additional_information["codes"]["ref"], reference)
     assert request.additional_information["meta"]["ref_audio_sr"] == 24000
+
+
+@pytest.mark.parametrize("tensor_codes", [False, True])
+def test_load_poll_generation_preserves_existing_codes_mapping(build_adapter, tensor_codes):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    request = _req("req-existing", RequestStatus.WAITING)
+    old_audio = torch.tensor([9])
+    reference = torch.tensor([0.25])
+    request.additional_information = {"codes": UserDict({"audio": old_audio})}
+    new_audio = torch.tensor([[1, 2]]) if tensor_codes else [1, 2]
+    connector.get.return_value = ({"codes": {"audio": new_audio, "ref": reference}}, 16)
+
+    assert adapter._poll_single_request(request) is True
+    codes = request.additional_information["codes"]
+    assert torch.equal(codes["ref"], reference)
+    assert torch.equal(codes["audio"], new_audio if tensor_codes else old_audio)
 
 
 def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapter):

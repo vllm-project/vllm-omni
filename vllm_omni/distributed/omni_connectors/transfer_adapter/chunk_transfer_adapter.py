@@ -264,7 +264,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     if key == "codes":
                         if isinstance(value, Mapping):
                             existing_sub = info.get(key)
-                            merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                            merged_sub = dict(existing_sub) if isinstance(existing_sub, Mapping) else {}
                             # Generation stages consume ``codes.audio`` as
                             # prompt ids. Preserve the first-chunk reference
                             # waveform separately so Code2Wav can condition
