@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import inspect
 import json
 import logging
@@ -132,6 +135,8 @@ def retrieve_timesteps(
 
 
 class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    # Both CFG branches share latents and timestep; CLIP (77) and T5 prompts are padded to fixed lengths.
+    supports_cfg_batching = True
     supports_request_batch = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
