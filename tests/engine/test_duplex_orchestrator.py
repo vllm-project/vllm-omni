@@ -23,6 +23,7 @@ from tests.engine.test_orchestrator import (
     FakeStageClient,
     _build_stage_pools,
 )
+from tests.helpers.stage_metadata import stage_metadata_for_client
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex import commands
@@ -89,6 +90,7 @@ def _build(
         output_async_queue=output_q,
         rpc_async_queue=rpc_q,
         stage_pools=pools,
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
         running_counter=running_counter,
         plugin=plugin or MiniCPMO45DuplexPlugin(_encode_audio),
         duplex_session_config=runtime_config or DuplexSessionRuntimeConfig(reaper_interval_s=0.01),
@@ -272,6 +274,7 @@ def test_turn_based_orchestrator_has_no_session_manager() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     assert not hasattr(orchestrator, "session_manager")
 
@@ -1502,6 +1505,9 @@ def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
             output_async_queue=asyncio.Queue(),
             rpc_async_queue=asyncio.Queue(),
             stage_pools=pools,
+            stage_metadata=[
+                stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)
+            ],
             plugin=MiniCPMO45DuplexPlugin(_encode_audio),
             duplex_session_config=_placement_config(),
             **kwargs,

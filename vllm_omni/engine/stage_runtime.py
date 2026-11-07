@@ -210,6 +210,7 @@ class StageRuntime:
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
+        self.stage_metadata: list[StageMetadata] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
         # Serialize process spawning and process-global environment overlays.
@@ -712,6 +713,7 @@ class StageRuntime:
     ) -> None:
         """Populate runtime fields after replica initialization succeeds."""
         self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+        self.stage_metadata = [plan.metadata for plan in stage_plans]
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Hook for runtimes that need infrastructure before replica init."""
@@ -743,10 +745,12 @@ class StageRuntime:
 
     def _validate_native_kv_topology(self, plans: list[LogicalStageInitPlan]) -> None:
         """Reject unsupported native AR->DiT graphs before launching any Worker."""
-        if not any(plan.replicas[0].metadata.stage_type == "diffusion" for plan in plans):
+        if not any(plan.metadata.stage_type == "diffusion" for plan in plans):
             return  # Native LLM prefill/decode is outside this path.
+        # Only stages with replicas on this server have a config to read here.
+        local_plans = [plan for plan in plans if plan.replicas]
         roles = {}
-        for plan in plans:
+        for plan in local_plans:
             replica = plan.replicas[0]
             if replica.stage_vllm_config is not None:
                 config = getattr(replica.stage_vllm_config, "kv_transfer_config", None)
@@ -766,6 +770,13 @@ class StageRuntime:
                 roles[plan.stage_id] = config.get("kv_role") if isinstance(config, Mapping) else config.kv_role
         if not roles:
             return
+        # The producer needs a known receiver for its KV, but if we are running a subset of the
+        # pipeline to run inference through /v1/run, downstream calls may go to any server.
+        if len(local_plans) < len(plans):
+            raise ValueError(
+                "Native AR-to-DiT KV transfer needs every stage in one deployment, "
+                "so it cannot run with --stage-id and no master"
+            )
         if (
             self._async_chunk
             or len(plans) != 2
@@ -972,6 +983,8 @@ class StageRuntime:
                     stage_idx=stage_idx,
                     stage_id=stage_id,
                     replicas=replicas,
+                    metadata=base_metadata,
+                    stage_vllm_config=stage_vllm_config,
                 )
             )
 
@@ -1432,18 +1445,17 @@ class StageRuntime:
 
         for plan in stage_plans:
             replica_clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = replica_clients[0] if replica_clients else None
-            if first_client is None:
+            # A stage without replicas has no clients; a replica that did not come up is still an error.
+            if any(client is None for client in replica_clients):
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
-            metadata = plan.replicas[0].metadata
             # Initialize watermarkers based on the output type as needed
-            watermarkers = StagePool.initialize_watermarkers(metadata.final_output_type, self._watermark_config)
-            if metadata.stage_type != "diffusion":
-                stage_vllm_config = plan.replicas[0].stage_vllm_config
+            watermarkers = StagePool.initialize_watermarkers(plan.metadata.final_output_type, self._watermark_config)
+            if plan.metadata.stage_type != "diffusion":
+                stage_vllm_config = plan.stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
                 output_processor = build_llm_stage_output_processor(

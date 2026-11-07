@@ -18,12 +18,13 @@ from omegaconf import OmegaConf
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from tests.helpers.mock import patch_hf_snapshot_download
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.config.omni_config import OmniStageRuntimeConfig, VllmOmniARStageConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
-from vllm_omni.engine import stage_init_utils
+from vllm_omni.engine import stage_init_utils, stage_runtime
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_init_utils import (
@@ -65,6 +66,18 @@ class _FakeStageConfig:
     stage_type: str
     engine_args: dict[str, object]
     runtime: _FakeRuntimeConfig
+
+
+_NATIVE_KV_PRODUCER = types.SimpleNamespace(
+    metadata=make_stage_metadata(stage_id=0, stage_type="llm"),
+    stage_vllm_config=types.SimpleNamespace(kv_transfer_config=types.SimpleNamespace(kv_role="kv_producer")),
+    stage_cfg=types.SimpleNamespace(engine_args={}),
+)
+_NATIVE_KV_CONSUMER = types.SimpleNamespace(
+    metadata=make_stage_metadata(stage_id=1, stage_type="diffusion", engine_input_source=[0]),
+    stage_vllm_config=None,
+    stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": types.SimpleNamespace(kv_role="kv_consumer")}),
+)
 
 
 def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
@@ -259,15 +272,12 @@ def _make_llm_metadata(
     final_output_type: str | None = None,
     is_comprehension: bool = False,
 ):
-    return types.SimpleNamespace(
+    return make_stage_metadata(
         stage_id=stage_id,
-        stage_type="llm",
         runtime_cfg={},
-        prompt_expand_func=None,
         final_output=final_output,
         final_output_type=final_output_type,
         default_sampling_params=types.SimpleNamespace(name=f"sp-{stage_id}-{replica_id}"),
-        custom_process_input_func=None,
         engine_input_source=[] if stage_id == 0 else [stage_id - 1],
         engine_output_type="text",
         replica_id=replica_id,
@@ -276,17 +286,13 @@ def _make_llm_metadata(
 
 
 def _make_diffusion_metadata(stage_id: int, *, replica_id: int = 0, final_output_type: str = "image"):
-    return types.SimpleNamespace(
+    return make_stage_metadata(
         stage_id=stage_id,
         stage_type="diffusion",
         runtime_cfg={"devices": str(replica_id)},
-        prompt_expand_func=None,
         final_output=True,
         final_output_type=final_output_type,
         default_sampling_params=types.SimpleNamespace(name=f"dsp-{stage_id}-{replica_id}"),
-        custom_process_input_func=None,
-        engine_input_source=[],
-        cfg_kv_collect_func=None,
         replica_id=replica_id,
     )
 
@@ -426,7 +432,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
-    runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
+    runtime = types.SimpleNamespace(stage_pools=[], stage_metadata=[make_stage_metadata()], initialize=lambda: None)
 
     def _capture_create_stage_runtime(**kwargs):
         captured.update(kwargs)
@@ -478,7 +484,11 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
         stage_vllm_config=None,
         output_processor=None,
     )
-    runtime = types.SimpleNamespace(stage_pools=[pool], initialize=lambda: None)
+    runtime = types.SimpleNamespace(
+        stage_pools=[pool],
+        stage_metadata=[make_stage_metadata(prompt_transform_func=prompt_transform)],
+        initialize=lambda: None,
+    )
     monkeypatch.setattr(engine_mod, "create_stage_runtime", lambda **_kwargs: runtime)
 
     engine._initialize_stages(stage_init_timeout=7)
@@ -1037,6 +1047,32 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
     assert runtime.stage_pools[1].stage_vllm_config is cfg1
     assert runtime.stage_pools[0].output_processor is stage0_output_processor
     assert runtime.stage_pools[1].output_processor is stage1_output_processor
+
+
+def test_stage_runtime_initializes_pool_for_stage_without_replicas(monkeypatch):
+    """Ensure a stage with no replicas still gets a pool with its config and output processor."""
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace()],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    vllm_config = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    plan = LogicalStageInitPlan(
+        stage_idx=0, stage_id=0, replicas=[], metadata=_make_llm_metadata(0), stage_vllm_config=vllm_config
+    )
+    output_processor = object()
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_initialize_stage_replicas", lambda *_: {0: []})
+    monkeypatch.setattr(stage_runtime, "build_llm_stage_output_processor", lambda *_args, **_kw: output_processor)
+
+    runtime.initialize()
+
+    (pool,) = runtime.stage_pools
+    assert pool.stage_client is None
+    assert pool.stage_vllm_config is vllm_config
+    assert pool.output_processor is output_processor
 
 
 def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
@@ -2835,7 +2871,7 @@ def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async
             stage_vllm_config=None if diffusion else types.SimpleNamespace(kv_transfer_config=config),
             stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": config}),
         )
-        plans.append(types.SimpleNamespace(stage_id=stage_id, replicas=[replica]))
+        plans.append(LogicalStageInitPlan(stage_idx=stage_id, stage_id=stage_id, replicas=[replica]))
     runtime = object.__new__(StageRuntime)
     runtime._async_chunk = async_chunk
     if valid:
@@ -2843,6 +2879,32 @@ def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async
     else:
         with pytest.raises(ValueError, match="two-stage"):
             runtime._validate_native_kv_topology(plans)
+
+
+@pytest.mark.parametrize(
+    ("producer_replicas", "consumer_replicas"),
+    [([_NATIVE_KV_PRODUCER], []), ([], [_NATIVE_KV_CONSUMER])],
+    ids=["consumer-on-another-server", "producer-on-another-server"],
+)
+def test_native_kv_topology_rejects_server_without_every_stage(producer_replicas, consumer_replicas):
+    """Ensure native AR-to-DiT KV cannot run when another server holds a stage, since the KV has no known receiver."""
+    plans = [
+        LogicalStageInitPlan(
+            stage_idx=0, stage_id=0, replicas=producer_replicas, metadata=_NATIVE_KV_PRODUCER.metadata
+        ),
+        LogicalStageInitPlan(
+            stage_idx=1, stage_id=1, replicas=consumer_replicas, metadata=_NATIVE_KV_CONSUMER.metadata
+        ),
+    ]
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace(), types.SimpleNamespace()],
+        model="dummy-model",
+        config_path=None,
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    with pytest.raises(ValueError, match="needs every stage in one deployment"):
+        runtime._validate_native_kv_topology(plans)
 
 
 @pytest.mark.parametrize("explicit", [None, "1"])

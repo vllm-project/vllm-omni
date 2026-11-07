@@ -25,11 +25,12 @@ from tests.helpers.assertions import assert_audio_speech_response
 from tests.helpers.client import OmniResponse
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import concat_audio
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 from tests.helpers.stage_config import (
     get_deploy_config_path,
     get_deploy_config_stage,
     modify_stage_config,
+    stage_config_path_for_run_level,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_run import decode_output, decode_stage_input, encode_payload
@@ -104,6 +105,16 @@ default_tts_server_params = [
         id="async_chunk",
     )
 ]
+
+
+def _single_stage_server(stage_id: int, run_level: str) -> OmniServer:
+    """Start a /v1/run server that runs only one stage, with no master."""
+    (params,) = run_server_params
+    deploy_config = stage_config_path_for_run_level(params.stage_config_path, run_level)
+    base_args = params.server_args if params.server_args is not None else []
+    serve_args = [*base_args, "--deploy-config", deploy_config, "--stage-id", str(stage_id)]
+    return OmniServer(MODEL, serve_args, env_dict=params.env_dict)
+
 
 # Exercise the throughput path in the existing L4 lane with smaller capacities.
 # The production H200 profile retains its own admission and graph buckets.
@@ -275,6 +286,31 @@ def test_run_stage_chain_returns_speech(omni_server, run_level: str) -> None:
 
     final = requests.post(url, json=next_request, timeout=300)
     final.raise_for_status()
+    response = OmniResponse(success=True, audio_bytes=_output_to_wav(final.json()["output"]), audio_format="audio/wav")
+    assert_audio_speech_response(response, request_config, run_level)
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_run_stage_chain_across_single_stage_servers(run_level: str) -> None:
+    """Ensure servers that each run one stage chain /v1/run calls into the speech."""
+    request_config = {"input": get_prompt(), "voice": "vivian", "response_format": "wav"}
+    # NOTE: Start the servers one at a time to avoid waiting for the other server's GPU memory to clear.
+    with _single_stage_server(0, run_level) as talker:
+        first = requests.post(
+            f"http://{talker.host}:{talker.port}/v1/run",
+            json={"stage_input": _stage0_input(request_config["input"], request_config["voice"])},
+            timeout=300,
+        )
+        first.raise_for_status()
+    next_request = first.json()
+    assert next_request["stage_id"] == 1
+
+    with _single_stage_server(1, run_level) as code2wav:
+        final = requests.post(f"http://{code2wav.host}:{code2wav.port}/v1/run", json=next_request, timeout=300)
+        final.raise_for_status()
     response = OmniResponse(success=True, audio_bytes=_output_to_wav(final.json()["output"]), audio_format="audio/wav")
     assert_audio_speech_response(response, request_config, run_level)
 

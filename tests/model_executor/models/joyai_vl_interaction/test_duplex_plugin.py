@@ -1256,6 +1256,8 @@ async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypat
     # joyai_vl_interaction_duplex.yaml: the Talker is orchestrator-fed, Code2Wav is prewarmed.
     orchestrator.async_chunk = True
     clients[1].custom_process_input_func = joyai_action_to_tts
+    # FakeStageClient defaults to a custom input processor; Code2Wav has none, so it takes async chunks.
+    clients[2].custom_process_input_func = None
 
     async def process_inputs(stage_id, *, request_id, params, **kwargs):
         return _processed_request(request_id, params)
@@ -1293,6 +1295,8 @@ async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker,
     orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
     orchestrator.async_chunk = True
     clients[1].custom_process_input_func = joyai_action_to_tts
+    # FakeStageClient defaults to a custom input processor; Code2Wav has none, so it takes async chunks.
+    clients[2].custom_process_input_func = None
 
     async def process_inputs(stage_id, *, request_id, params, **kwargs):
         return _processed_request(request_id, params)

@@ -9,6 +9,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from tests.helpers.stage_metadata import make_stage_metadata, stage_metadata_for_client
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import (
     ReplicaInfo,
@@ -57,6 +59,7 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import OmniClientError
@@ -98,6 +101,7 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_queue,
         stage_pools=[],
+        stage_metadata=[],
     )
 
     async def wait_for_requests() -> None:
@@ -148,6 +152,7 @@ class FakeStageClient:
         is_comprehension: bool = False,
         model_stage: str | None = None,
         kv_sender_info: dict[str, Any] | None = None,
+        custom_process_input_func: Callable[..., list[dict]] | None = None,
     ) -> None:
         self.stage_id = 0
         self.replica_id = 0
@@ -161,7 +166,9 @@ class FakeStageClient:
         self.is_comprehension = is_comprehension
         self.model_stage = model_stage
         self.next_inputs = list(next_inputs or [])
-        self.custom_process_input_func = None
+        if custom_process_input_func is None and stage_type != "diffusion":
+            custom_process_input_func = self._return_next_inputs
+        self.custom_process_input_func = custom_process_input_func
         self._kv_sender_info = dict(kv_sender_info) if kv_sender_info is not None else None
         self.add_request_calls: list[tuple] = []
         self.abort_calls: list[list[str]] = []
@@ -189,7 +196,7 @@ class FakeStageClient:
     def set_engine_outputs(self, outputs) -> None:
         return None
 
-    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+    def _return_next_inputs(self, *_args, **_kwargs) -> list[dict]:
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -463,6 +470,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    stage_metadata: list[StageMetadata] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -496,6 +504,10 @@ def _build_harness(
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
+                stage_metadata=stage_metadata
+                or [
+                    stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(stage_pools)
+                ],
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
@@ -841,6 +853,43 @@ async def test_run_chain_yields_at_each_stage_until_final_output(orchestrator_fa
         assert msg.engine_outputs.outputs[0].token_ids == list(_STAGE2_OUTPUT_TOKEN_IDS)
         assert msg.finished is True
         assert _CALL3_REQUEST_ID not in request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_run_yields_to_stage_without_replicas(orchestrator_factory) -> None:
+    """Ensure a run call yields the next stage input when that stage has no replicas here."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_processor = FakeOutputProcessor(request_outputs=_finished_outputs(_CALL1_REQUEST_ID))
+    (stage0_pool,) = _build_stage_pools([[stage0]], output_processors=[stage0_processor])
+    # Stage 1 runs on another server, so its pool has no clients.
+    stage1_pool = StagePool(
+        1,
+        clients=[],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    assert not stage1_pool.live_replica_ids()
+    stage1_metadata = make_stage_metadata(
+        stage_id=1,
+        final_output=True,
+        custom_process_input_func=lambda *_args, **_kwargs: [{"prompt_token_ids": list(_STAGE1_INPUT_TOKEN_IDS)}],
+    )
+    orchestrator_fixture = orchestrator_factory(
+        [],
+        stage_pools=[stage0_pool, stage1_pool],
+        stage_metadata=[stage_metadata_for_client(0, stage0), stage1_metadata],
+    )
+
+    try:
+        await _enqueue_run_request(orchestrator_fixture)
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+
+        msg = _get_messages_until_response(orchestrator_fixture)[-1]
+        assert isinstance(msg, NextStageInputMessage)
+        assert msg.receiver_stage_id == 1
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -2026,6 +2075,7 @@ async def test_abort_marks_only_last_final_stage_output_finished() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=pools,
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
     )
     orchestrator.request_states["req-two"] = OrchestratorRequestState(
         request_id="req-two",
@@ -2047,6 +2097,7 @@ async def test_handle_abort_emits_error_result_on_failure() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_queue,
         stage_pools=[],
+        stage_metadata=[],
     )
 
     async def boom(_request_ids, *, abort=False):
@@ -2464,6 +2515,7 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
     )
     await orchestrator._handle_add_request(
         StageSubmissionMessage(
@@ -2501,6 +2553,7 @@ async def test_explicit_run_rejected_before_admission_releases_reservation() -> 
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         async_chunk=True,
     )
 
@@ -2552,6 +2605,10 @@ async def test_explicit_entry_stage_replica_down_before_preselection_returns_cli
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[stage0_pool, stage1_pool],
+        stage_metadata=[
+            stage_metadata_for_client(0, stage0_pool.stage_client),
+            stage_metadata_for_client(1, stage1_pool.stage_client),
+        ],
     )
     # Input-cache rollback has dedicated coverage; this test isolates the
     # preselection error mapping and reservation cleanup.
@@ -2603,6 +2660,7 @@ async def test_explicit_replica_cfg_companion_inherits_parent_affinity() -> None
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
     )
 
     await orchestrator._handle_add_request(
@@ -2956,6 +3014,10 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[source, target],
+        stage_metadata=[
+            stage_metadata_for_client(0, source.stage_client),
+            stage_metadata_for_client(1, target.stage_client),
+        ],
     )
 
     async def check_dispatch(request_id, req_state, request, **kwargs):
@@ -3172,6 +3234,7 @@ async def test_disabled_stage_metrics_drain_native_cache_on_completion(mocker) -
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         log_stats=False,
         collect_stage_metrics=False,
     )
@@ -3285,6 +3348,7 @@ def test_orchestrator_rejects_logging_without_stage_metrics() -> None:
             output_async_queue=None,
             rpc_async_queue=None,
             stage_pools=[],
+            stage_metadata=[],
             log_stats=True,
             collect_stage_metrics=False,
         )
@@ -3571,6 +3635,7 @@ async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_on
         output_async_queue=output,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         running_counter=counter,
     )
 
@@ -4073,6 +4138,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     orchestrator.stage_pools = pools
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
@@ -4115,6 +4181,7 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     duplex_state = OrchestratorRequestState(request_id="duplex-req", session_owned=True)
     plain_state = OrchestratorRequestState(request_id="plain-req")
@@ -4174,6 +4241,7 @@ async def test_raw_stage_error_prefers_request_error_message(mocker):
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
     )
     orchestrator.stage_pools = pools
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
@@ -4211,6 +4279,7 @@ async def test_duplex_session_error_is_not_emitted_twice(mocker):
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
     )
     orchestrator.stage_pools = pools
     orchestrator.request_states["duplex-req"] = OrchestratorRequestState(
@@ -4247,6 +4316,7 @@ async def test_interaction_wait_does_not_block_playback_or_abort(monkeypatch: py
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -4304,6 +4374,7 @@ async def test_interaction_worker_shutdown_cancels_inflight_rpc(monkeypatch: pyt
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -4336,6 +4407,7 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
         output_async_queue=errors,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[],
     )
     for index in range(65):
         await orchestrator._dispatch_message(

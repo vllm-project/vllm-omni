@@ -18,7 +18,11 @@ stage pools.
 
 ## Deployment
 
-We will use Qwen3-TTS as an example for independent stage execution, illustrating how to pass the payload from one stage to the next. First, start the frontend, which also brings up the orchestrator in its own thread. For now, this can be accomplished by passing a stage-id of `none`. Note that you must configure the Omni master server settings for remote replicas.
+Depending on the situation, it may be beneficial to deploy as one frontend with every stage running headless behind a master server, or with one API server per stage. vLLM-Omni supports either approach, which we will demonstrate using Qwen3-TTS as an example.
+
+### One frontend with headless stages
+
+First, start the frontend, which also brings up the orchestrator in its own thread. This can be accomplished by passing `--stage-id none`. Note that you must configure the Omni master server settings for remote replicas.
 
 ```bash
 # Starts the API server on port 8000
@@ -56,6 +60,30 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 ```
 
 You should see both stage 0 and stage 1 register as replicas with the `OmniMasterServer` and that the `DistStageRuntime`s have attached successfully. Once the stages have finished initialization, the server will show as ready.
+
+### One server per stage
+
+Each stage can also run its own API server, without a master server. If you pass `--stage-id` without `--omni-master-address`, the server runs only that stage.
+
+```bash
+# Starts the talker (stage 0) on port 8000
+VLLM_OMNI_ENABLE_RUN_ENDPOINT=1 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --trust-remote-code \
+  --no-async-chunk \
+  --stage-id 0 \
+  --port 8000 \
+  --omni
+
+# Starts code2wav (stage 1) on port 8001
+VLLM_OMNI_ENABLE_RUN_ENDPOINT=1 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --trust-remote-code \
+  --no-async-chunk \
+  --stage-id 1 \
+  --port 8001 \
+  --omni
+```
+
+When run in this way, the caller sends the stage 0 call to the talker's server, then sends its response to code2wav's server. These servers only serve `/v1/run`, `/health`, and `/metrics`; other routes return 400.
 
 ## `POST /v1/run`
 
@@ -99,21 +127,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     # NOTE: the port here is your API server port, not the omni master port
     parser.add_argument("--url", default="http://localhost:8000")
+    # With one server per stage, set this to stage 1's server, e.g., http://localhost:8001
+    parser.add_argument("--stage1-url", default=None)
     parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
     parser.add_argument("--text", default="Hello world")
     parser.add_argument("--speaker", default="vivian")
     parser.add_argument("--out", default="out.wav")
     args = parser.parse_args()
 
-    url = f"{args.url}/v1/run"
+    stage0_url = f"{args.url}/v1/run"
+    stage1_url = f"{args.stage1_url or args.url}/v1/run"
 
     # Stage 0 (talker) returns the request for stage 1.
     stage1_request = httpx.post(
-        url,
+        stage0_url,
         json={
             "stage_input": build_stage0_input(args.model, args.text, args.speaker),
-            # Optional: explicitly run Talker replica 1.
-            "replica_id": 1,
+            # NOTE: You can also select a replica manually by ID if you are running one frontend server in front of multiple replicas.
+            # "replica_id": 1,
         },
         timeout=600,
     )
@@ -121,10 +152,11 @@ def main() -> None:
 
     # Stage 1 (code2wav) returns the final output.
     stage1_body = stage1_request.json()
-    # Optional: independently select Code2Wav replica 0.
-    stage1_body["replica_id"] = 0
+
+    # Example for picking a code2wav replica by ID the same way.
+    # stage1_body["replica_id"] = 0
     final = httpx.post(
-        url,
+        stage1_url,
         json=stage1_body,
         timeout=600,
     )
@@ -150,3 +182,4 @@ This feature is early in its development and currently has the following gaps.
 - The final response only has the last stage's output.
 - No route-specific preprocessing or postprocessing yet, so callers build the stage 0 input and unpack the final output themselves.
 - Async chunking isn't supported.
+- With one server per stage, pipelines that use native AR-to-DiT KV transfer fail at startup, since stage 0 can't know which server the next call goes to.

@@ -58,7 +58,9 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
+from starlette.types import ASGIApp
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.serve.instrumentator import metrics as metrics_api_router
 from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
 from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, TokenizeResponse, TokenizerInfoResponse
 from vllm.exceptions import RetryableRequestError
@@ -402,6 +404,8 @@ def _minimal_args(**overrides) -> SimpleNamespace:
         shutdown_timeout=0,
         stage_configs_path=None,
         deploy_config=None,
+        stage_id=None,
+        omni_master_address=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -454,6 +458,41 @@ class _FakeEngineClient:
 
     async def check_health(self) -> None:
         return None
+
+
+async def _serve_assembled_app(
+    monkeypatch, engine_client: _FakeEngineClient, args: SimpleNamespace | None = None
+) -> ASGIApp:
+    """Run the real API server assembly on fakes and return the ASGI app it would serve."""
+    served: list[ASGIApp] = []
+
+    def fake_build_openai_app(args, supported_tasks):
+        # The upstream app carries vLLM's real /metrics routes.
+        app = FastAPI()
+        metrics_api_router.attach_router(app)
+        return app
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **_kwargs):
+        yield engine_client
+
+    async def fake_omni_init_app_state(engine_client, state, args):
+        state.engine_client = engine_client
+
+    async def fake_serve_http(app, **_kwargs):
+        served.append(app)
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=lambda: asyncio.sleep(0)))
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args or _minimal_args())
+    (app,) = served
+    return app
 
 
 def _marker(name: str):
@@ -678,44 +717,16 @@ async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monk
     alone, or if the migration warning stops being emitted.
     """
 
-    def fake_build_openai_app(args, supported_tasks):
-        return FastAPI()
-
-    @asynccontextmanager
-    async def fake_build_async_omni(*_args, **_kwargs):
-        # No stage declares profiler_config, so the gate must stay closed.
-        yield _FakeEngineClient(
-            stage_configs=[{"engine_args": {}}],
-            vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)),
-        )
-
-    async def fake_omni_init_app_state(engine_client, state, args):
-        state.engine_client = engine_client
-
-    captured: dict[str, object] = {}
-
-    async def fake_serve_http(app, **_kwargs):
-        captured["served_app"] = app
-        task = asyncio.create_task(asyncio.sleep(0))
-        await asyncio.sleep(0)
-        return task
-
     monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/omni-profiler-traces")
-    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
-    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
-    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda app, restrictions: None)
-
-    async def fake_storage_start():
-        captured["storage_started"] = True
-
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
-    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
-
+    # No stage declares profiler_config, so the gate must stay closed.
+    engine_client = _FakeEngineClient(
+        stage_configs=[{"engine_args": {}}],
+        vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)),
+    )
     with caplog.at_level(logging.WARNING):
-        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+        served = await _serve_assembled_app(monkeypatch, engine_client)
 
-    served_app = captured["served_app"]._inner  # type: ignore[attr-defined]
+    served_app = served._inner  # type: ignore[attr-defined]
     manifest = _route_manifest(served_app.routes)
     assert ("POST", "/start_profile") not in manifest
     assert ("POST", "/stop_profile") not in manifest
@@ -809,33 +820,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
     start getting stamped / mutated incorrectly.
     """
-    captured: dict[str, Any] = {}
-
-    def fake_build_openai_app(args, supported_tasks):
-        return FastAPI()
-
-    @asynccontextmanager
-    async def fake_build_async_omni(*_args, **_kwargs):
-        yield _FakeEngineClient()
-
-    async def fake_omni_init_app_state(engine_client, state, args):
-        state.engine_client = engine_client
-
-    async def fake_serve_http(app, **_kwargs):
-        captured["served_app"] = app
-        task = asyncio.create_task(asyncio.sleep(0))
-        await asyncio.sleep(0)
-        return task
-
-    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
-    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
-    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_a, **_k: None)
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=lambda: asyncio.sleep(0)))
-    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
-
-    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
-    middleware = captured["served_app"]
+    middleware = await _serve_assembled_app(monkeypatch, _FakeEngineClient())
 
     http_scope: dict[str, Any] = {"type": "http", "state": {}}
     ws_scope: dict[str, Any] = {"type": "websocket"}
@@ -860,6 +845,22 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     assert "request_timestamp" in http_scope["state"]
     assert isinstance(http_scope["state"]["request_timestamp"], float)
     assert "request_timestamp" not in ws_scope.get("state", {})
+
+
+@pytest.mark.asyncio
+async def test_single_stage_server_rejects_routes_other_than_run(monkeypatch) -> None:
+    """Ensure a server that runs one stage rejects other routes before they reach a handler."""
+    served = await _serve_assembled_app(monkeypatch, _FakeEngineClient(), _minimal_args(stage_id=0))
+    client = TestClient(served)
+
+    # The fake app state has no speech handler, so a 400 rather than a 500 means it was never reached.
+    speech = client.post("/v1/audio/speech", json={"input": "hello"})
+    assert speech.status_code == 400
+    assert "/v1/run" in speech.json()["error"]["message"]
+    assert client.get("/health").status_code == 200
+    assert client.get("/metrics").status_code == 200
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/v1/realtime"):
+        pass
 
 
 @pytest.mark.parametrize(
