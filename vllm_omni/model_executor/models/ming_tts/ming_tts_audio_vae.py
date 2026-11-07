@@ -128,6 +128,11 @@ class MingAudioVAEModel(nn.Module):
             if idx < len(runner_ids) and runner_ids[idx]:
                 # Match the ids on_requests_finished receives, so aborted requests free their state.
                 request_id = runner_ids[idx]
+            elif has_ming_context:
+                # Keyed by the payload id, this state would never be freed by on_requests_finished.
+                raise RuntimeError(
+                    f"Ming Stage-2 got no runner request id for batch slot {idx} ({len(runner_ids)} ids passed)."
+                )
             self._touch_request_state(request_id)
             chunk_id = _coerce_optional_int(_first_present(info.get(KEY_CHUNK_ID), kv_meta.get(KEY_CHUNK_ID)))
             finished = _coerce_finished(

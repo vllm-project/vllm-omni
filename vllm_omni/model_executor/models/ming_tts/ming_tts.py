@@ -261,7 +261,8 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
 
 def _request_id(info_dict: dict[str, Any]) -> str | None:
     # The V1 runner injects ``request_id``; the MRV2 intermediate buffer keys it ``req_id``.
-    return info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id", info_dict.get("req_id")))
+    # Take the first non-None so an explicit None under an earlier key cannot hide a later one.
+    return next((info_dict[k] for k in (KEY_REQUEST_ID, "request_id", "req_id") if info_dict.get(k) is not None), None)
 
 
 def _copy_runtime_controls(update: dict[str, Any], info_dict: dict[str, Any]) -> None:
