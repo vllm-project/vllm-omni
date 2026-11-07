@@ -1024,7 +1024,6 @@ def _run(tmp_path: Path, sp, tp, mode, dtype, batch):
     )
 
 
-@pytest.mark.parallel
 # 832x480 latents give 1560 tokens per frame, so a three-frame chunk is 4680 tokens: not a multiple of 16 and
 # hence not a legal FA2 page. The direct path then pages at 16 tokens and pads the tail past ``seq_lens``.
 @hardware_test(res={"cuda": "L4"})
@@ -1047,6 +1046,7 @@ def test_direct_path_attends_a_chunk_that_is_not_a_legal_page(visible_chunks: in
     assert error <= 1e-2, f"relative L2 {error.item():.3g}"
 
 
+@pytest.mark.parallel
 @hardware_test(res={"cuda": "L4"}, num_cards=2)
 def test_sp2_direct_matches_sp1_fp32(tmp_path):
     _run(tmp_path, 2, 1, "direct", torch.float32, 2)
