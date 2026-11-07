@@ -125,6 +125,8 @@ def _legacy_detect(model_stage, model_arch):
 #     | sed 's/model_stage="//;s/"$//' | sort -u
 # ``test_pipeline_stage_list_is_complete`` enforces the adapter half.
 _PIPELINE_STAGES = [
+    "soprano_ar",
+    "soprano_decoder",
     "AR",
     "ar",
     "asr",

@@ -1908,6 +1908,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         collect["aligner_res"] = res
                     continue
                 audio_output = cast(dict, audio_output)
+                if adapter is not None:
+                    adapter.validate_stream_output(audio_output)
 
                 sr_raw = audio_output.get("sr")
                 if sr_raw is not None:

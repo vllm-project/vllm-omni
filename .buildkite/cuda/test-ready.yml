@@ -13,7 +13,8 @@ steps:
       - label: "Simple · Model Executor Test"
         timeout_in_minutes: 20
         commands:
-          - "pytest -sv tests/model_executor -m 'core_model and cpu'"
+          - "uv pip install --system --python \"$(command -v python3)\" 'inflect>=7.6.0,<8' 'Unidecode>=1.4.0,<2'"
+          - "python3 -m pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Models Test"
@@ -25,7 +26,8 @@ steps:
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
         timeout_in_minutes: 25
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
+          - "uv pip install --system --python \"$(command -v python3)\" 'inflect>=7.6.0,<8' 'Unidecode>=1.4.0,<2'"
+          - "python3 -m pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
@@ -238,6 +240,14 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_drama_3.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
+
+      - label: "TTS · Soprano WAV and Streaming Smoke"
+        source_file_dependencies: tts_soprano_function
+        timeout_in_minutes: 15
+        commands:
+          - "uv pip install --system --python \"$(command -v python3)\" 'inflect>=7.6.0,<8' 'Unidecode>=1.4.0,<2'"
+          - "python3 -m pytest -sv tests/e2e/online_serving/test_soprano_1_1.py -m 'core_model and tts and cuda and L4 and cards_1' --run-level core_model"
+        mirror_hardwares: l4_1
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function

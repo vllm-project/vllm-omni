@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import uuid
 import wave
 from typing import Any
@@ -1128,3 +1129,74 @@ def test_yue2_speech_invalid_field_values(
     online_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
+
+
+# Soprano validation shares the endpoint reliability shard; no per-model helper.
+_SOPRANO_SPEECH = [
+    pytest.param(
+        OmniServerParams(
+            model=os.environ.get("SOPRANO_MODEL_PATH", "ekwek/Soprano-1.1-80M"),
+            stage_config_path=get_deploy_config_path("soprano.yaml"),
+            server_args=["--disable-log-stats"],
+            env_dict={"TRITON_F32_DEFAULT": "ieee", "VLLM_USE_V2_MODEL_RUNNER": "0"},
+        ),
+        id=sku,
+        marks=hardware_marks(res={"cuda": sku}, num_cards=1),
+    )
+    for sku in ["L4", "RTX4090Laptop"]
+]
+
+
+@pytest.mark.parametrize("omni_server", _SOPRANO_SPEECH, indirect=True)
+@pytest.mark.parametrize(
+    "overrides,fragment",
+    [
+        ({"voice": "alloy"}, "voice"),
+        ({"instructions": "Speak happily"}, "instructions"),
+        ({"ref_audio": "file:///this-must-not-be-opened.wav"}, "ref_audio"),
+        ({"language": "Chinese"}, "English"),
+        ({"stream": True}, "streaming"),
+        ({"speed": 1.2}, "speed"),
+        ({"response_format": "mp3"}, "wav"),
+        ({"sample_rate": 24000}, "sample_rate"),
+        ({"max_new_tokens": 513}, "512"),
+        ({"extra_params": {"ignore_eos": True}}, "extra_params"),
+        ({"extra_params": {"top_p": 1.1}}, "sampling"),
+        (
+            {
+                "input": "This sentence is long enough to stand alone. The next sentence is also long enough to stand alone."
+            },
+            "one synthesis unit",
+        ),
+    ],
+)
+def test_soprano_unsupported_speech_fields(omni_server, online_client, overrides, fragment):
+    online_client.send_audio_speech_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "input": "Hello, this is a simple speech synthesis test.",
+                "response_format": "wav",
+                **overrides,
+            },
+            "err_code": 400,
+            "err_message": fragment,
+        }
+    )
+
+
+@pytest.mark.parametrize("omni_server", _SOPRANO_SPEECH, indirect=True)
+def test_soprano_short_generation_error_recovers(omni_server, online_client):
+    # max_new_tokens=1 is legal; an unplayable generation is an expected 500,
+    # not a malformed request or evidence that inference succeeded.
+    payload = {
+        "model": omni_server.model,
+        "input": "Hello, this is a simple speech synthesis test.",
+        "response_format": "wav",
+        "seed": 44,
+    }
+    online_client.send_audio_speech_http_request(
+        {"json": {**payload, "max_new_tokens": 1}, "err_code": 500, "err_message": "failed to synthesize audio"}
+    )
+    online_client.send_health_http_request()
+    online_client.send_audio_speech_request({**payload, "sample_rate": 32000, "min_audio_bytes": 4096})

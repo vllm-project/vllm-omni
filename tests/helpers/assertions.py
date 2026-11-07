@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
-    from tests.helpers.client import DiffusionResponse
+    from tests.helpers.client import DiffusionResponse, OmniResponse
 
 import av
 import numpy as np
@@ -1303,3 +1303,51 @@ __all__ = [
     "assert_video_audio_valid",
     "assert_audio_valid",
 ]
+
+
+def assert_cancelled_audio_speech_response(response: "OmniResponse") -> None:
+    """A partial raw response must be explicitly cancelled, not completed."""
+    assert response.cancelled and not response.success
+    assert response.audio_format and response.audio_format.startswith("audio/pcm")
+    assert response.audio_bytes and len(response.audio_bytes) % 2 == 0
+
+
+def _speech_int16_mono(response: "OmniResponse", sample_rate: int) -> np.ndarray:
+    assert response.audio_bytes, "Missing audio"
+    if response.audio_bytes.startswith(b"RIFF"):
+        audio, rate = sf.read(io.BytesIO(response.audio_bytes), dtype="int16")
+        assert rate == sample_rate
+    else:
+        assert response.audio_format and "pcm" in response.audio_format
+        assert len(response.audio_bytes) % 2 == 0, "Incomplete int16 sample at EOF"
+        audio = np.frombuffer(response.audio_bytes, dtype="<i2")
+    assert audio.ndim == 1 and audio.size > 0
+    assert np.isfinite(audio).all()
+    return audio
+
+
+def assert_audio_speech_equal(
+    actual: "OmniResponse", expected: "OmniResponse", *, sample_rate: int, prefix: bool = False
+) -> None:
+    """Case-specific sample equality across WAV/raw protocols or cancellation."""
+    first = _speech_int16_mono(actual, sample_rate)
+    second = _speech_int16_mono(expected, sample_rate)
+    if prefix:
+        assert len(first) < len(second), "Cancellation must precede complete output"
+        second = second[: len(first)]
+    assert np.array_equal(first, second), "Audio belongs to a different trajectory/request"
+
+
+def assert_audio_speech_samples(response: "OmniResponse", *, samples: int, sample_rate: int) -> None:
+    assert _speech_int16_mono(response, sample_rate).size == samples
+
+
+def assert_audio_stream_progress(response: "OmniResponse") -> None:
+    """Transport-arrival evidence of audio before complete-response EOF."""
+    sizes = response.audio_chunk_sizes
+    arrivals = response.audio_chunk_arrivals_s
+    assert sizes and arrivals and len(sizes) == len(arrivals) > 1
+    assert all(size > 0 for size in sizes)
+    assert response.audio_bytes is not None and sum(sizes) == len(response.audio_bytes)
+    assert arrivals == sorted(arrivals)
+    assert response.e2e_latency is not None and arrivals[0] < response.e2e_latency

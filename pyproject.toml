@@ -34,6 +34,11 @@ classifiers = [
 
 [project.optional-dependencies]
 
+soprano = [
+    "inflect>=7.6.0,<8",
+    "Unidecode>=1.4.0,<2",
+]
+
 tracing = [
     "opentelemetry-sdk>=1.28.0",
     "opentelemetry-exporter-otlp>=1.28.0",
@@ -341,6 +346,7 @@ markers = [
     "H200: [hardware-resource] [cuda] Tests that require H200 GPU",
     "L4: [hardware-resource] [cuda] Tests that require L4 GPU",
     "B200: [hardware-resource] [cuda] Tests that require B200 GPU",
+    "RTX4090Laptop: [hardware-resource] [cuda] Tests on an RTX 4090 Laptop GPU (16 GiB)",
     "RTX5090: [hardware-resource] [cuda] Tests that require an RTX 5090 GPU (SM120, compute capability 12.0)",
     "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
     "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",

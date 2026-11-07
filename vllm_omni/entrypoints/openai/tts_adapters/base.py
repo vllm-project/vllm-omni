@@ -381,6 +381,13 @@ class TTSModelAdapter(ABC):
     def validate_stream_audio(self, *, has_audio: bool) -> None:
         """Validate audio availability before recording streaming success."""
 
+    def validate_stream_output(self, audio_output: Mapping[str, Any]) -> None:
+        """Reject model-reported chunk failures before encoding any audio delta.
+
+        Called for raw audio and SSE. A failure after headers have been sent
+        terminates the stream as an error instead of reporting a clean finish.
+        """
+
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Fold engine-side metadata from the mm payload into ``collect``.
 
