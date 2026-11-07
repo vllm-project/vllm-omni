@@ -57,6 +57,25 @@ def _first_source_image(mm_data: Any) -> Any:
     return images
 
 
+def _grid_token_layout(height: int, width: int, factor: int = 32) -> tuple[int, int, int, int]:
+    """Return (small_tokens, large_tokens, token_h, token_w) for a target size.
+
+    GLM-Image emits a small preview grid plus a large target grid at ``factor``
+    downsampling; the preview keeps the target's aspect ratio at half the
+    linear resolution (16x16 for any square target). Shared by the AR
+    generation budget and the ar2diffusion parser so the two cannot drift.
+    """
+    token_h = height // factor
+    token_w = width // factor
+    large_tokens = token_h * token_w
+
+    ratio = token_h / token_w if token_w > 0 else 1.0
+    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+    small_tokens = small_token_h * small_token_w
+    return small_tokens, large_tokens, token_h, token_w
+
+
 def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
@@ -65,6 +84,11 @@ def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool =
 
     - text-to-image (t2i): small preview + large target + EOS
     - image-to-image (i2i): large target + EOS
+
+    This is the generation budget the reference implementation truncates at;
+    the online serving path sets it as the AR stage's per-request
+    ``max_tokens`` so requests stop at the grid's exact token count instead of
+    the deploy-YAML ceiling.
 
     Args:
         height: Target image height in pixels
@@ -75,18 +99,7 @@ def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool =
     Returns:
         Total number of tokens to generate for the specified mode
     """
-    # Large image tokens (target resolution)
-    token_h = height // factor
-    token_w = width // factor
-    large_tokens = token_h * token_w
-
-    # Small preview tokens (half resolution in each dimension)
-    import math
-
-    ratio = token_h / token_w if token_w > 0 else 1.0
-    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-    small_tokens = small_token_h * small_token_w
+    small_tokens, large_tokens, _, _ = _grid_token_layout(height, width, factor)
 
     # Mode-dependent totals:
     # - t2i: small + large + EOS
@@ -134,15 +147,7 @@ def _parse_generated_tokens(
                 generates only large image tokens (no small preview tokens).
     """
     # Calculate token dimensions for target image
-    token_h = height // factor
-    token_w = width // factor
-    large_image_tokens = token_h * token_w
-
-    # Calculate small preview image dimensions (used in text-to-image)
-    ratio = token_h / token_w if token_w > 0 else 1.0
-    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-    small_image_tokens = small_token_h * small_token_w
+    small_image_tokens, large_image_tokens, token_h, token_w = _grid_token_layout(height, width, factor)
 
     token_tensor = torch.tensor(token_ids, dtype=torch.long)
 

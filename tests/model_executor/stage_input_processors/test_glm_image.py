@@ -186,6 +186,77 @@ class TestComputeMaxTokens:
         assert i2i < t2i
 
 
+class TestComputeMaxTokensMatchesParser:
+    """The serving budget and the ar2diffusion parser share one grid contract.
+
+    Serving sets the AR stage's per-request max_tokens from compute_max_tokens;
+    these tests pin that budget to exactly what _parse_generated_tokens
+    requires, so the two offsets cannot drift apart.
+    """
+
+    @pytest.mark.parametrize(
+        "height,width",
+        [
+            (1024, 1024),
+            (768, 768),
+            (1536, 1536),
+            (2048, 2048),
+            (1024, 512),
+            (1280, 720),
+        ],
+    )
+    def test_t2i_budget_stream_parses_exactly(self, height, width):
+        budget = compute_max_tokens(height, width, is_i2i=False)
+        stream = list(range(budget))
+
+        prior, out_h, out_w = _parse_generated_tokens(stream, height, width, is_i2i=False)
+        assert (out_h, out_w) == (height, width)
+        assert prior.shape[0] == (height // 32) * (width // 32) * 4
+
+        # budget-1 (small+large, no EOS slot) still parses, but one token
+        # below the small+large minimum must fail: the budget is exact.
+        _parse_generated_tokens(stream[:-1], height, width, is_i2i=False)
+        with pytest.raises(ValueError):
+            _parse_generated_tokens(stream[:-2], height, width, is_i2i=False)
+
+    @pytest.mark.parametrize(
+        "height,width",
+        [
+            (1024, 1024),
+            (768, 768),
+            (1536, 1536),
+        ],
+    )
+    def test_i2i_budget_stream_parses_exactly(self, height, width):
+        budget = compute_max_tokens(height, width, is_i2i=True)
+        stream = list(range(budget))
+
+        prior, out_h, out_w = _parse_generated_tokens(stream, height, width, is_i2i=True)
+        assert (out_h, out_w) == (height, width)
+        assert prior.shape[0] == (height // 32) * (width // 32) * 4
+
+        _parse_generated_tokens(stream[:-1], height, width, is_i2i=True)
+        with pytest.raises(ValueError):
+            _parse_generated_tokens(stream[:-2], height, width, is_i2i=True)
+
+
+class TestArMaxTokensRegistry:
+    """The serving path resolves GLM-Image's AR budget through the registry."""
+
+    def test_glm_image_pipeline_declares_builder(self):
+        from vllm_omni.model_extras.registry import get_ar_max_tokens_builder
+
+        assert get_ar_max_tokens_builder("GlmImagePipeline") is compute_max_tokens
+        # AR-only deploys surface the wrapper architecture name.
+        assert get_ar_max_tokens_builder("GlmImageForConditionalGeneration") is compute_max_tokens
+
+    def test_unknown_model_has_no_builder(self):
+        from vllm_omni.model_extras.registry import get_ar_max_tokens_builder
+
+        assert get_ar_max_tokens_builder("SomeOtherPipeline") is None
+        assert get_ar_max_tokens_builder(None) is None
+
+
 # =============================================================================
 # Tests for _upsample_token_ids
 # =============================================================================
