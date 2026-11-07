@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
 
 PHONON_PIPELINE = PipelineConfig(
@@ -22,3 +24,20 @@ PHONON_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+def resolve_phonon_pipeline(hf_config=None):
+    from vllm_omni.transformers_utils.configs.phonon import PhononConfig
+
+    eos = getattr(hf_config, "eos_token_id", None)
+    if eos is None:
+        eos = PhononConfig().eos_token_id
+    if isinstance(eos, list):
+        if len(eos) != 1:
+            raise ValueError("Phonon requires one EOS protocol token")
+        eos = eos[0]
+    stage = replace(
+        PHONON_PIPELINE.stages[0],
+        sampling_constraints={"detokenize": False, "stop_token_ids": [eos]},
+    )
+    return replace(PHONON_PIPELINE, stages=(stage,))
