@@ -46,6 +46,7 @@ from vllm.multimodal.processing import (
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
+    PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
 
@@ -364,6 +365,8 @@ class StepAudio2Processor(ProcessorMixin):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.audio_token = "<audio_patch>"
+        self.sampling_rate = 16000
+        self.max_chunk_size = 25
 
     def __call__(self, text=None, audio=None, **kwargs):
         """Process text and audio inputs."""
@@ -395,15 +398,23 @@ class StepAudio2Processor(ProcessorMixin):
         if audio is None:
             encoded["audio_mels"] = torch.empty((0, 128, 0))
             encoded["audio_lens"] = torch.tensor([], dtype=torch.int32)
+            encoded["audio_num_chunks"] = torch.tensor([], dtype=torch.int32)
             return encoded
 
         audio_list = list(audio) if isinstance(audio, (list, tuple)) else [audio]
 
-        mels = [log_mel_spectrogram(a) for a in audio_list]
+        mels = []
+        audio_num_chunks = []
+        for item in audio_list:
+            waveform = _normalize_audio(item)
+            chunks = waveform.split(self.sampling_rate * self.max_chunk_size)
+            audio_num_chunks.append(len(chunks))
+            mels.extend(log_mel_spectrogram(chunk) for chunk in chunks)
         audio_mels, audio_lens = padding_mels(mels)
 
         encoded["audio_mels"] = audio_mels
         encoded["audio_lens"] = audio_lens
+        encoded["audio_num_chunks"] = torch.tensor(audio_num_chunks, dtype=torch.int32)
         return encoded
 
 
@@ -411,10 +422,13 @@ class StepAudio2AudioInputs(TypedDict):
     """Audio inputs for Step-Audio2"""
 
     audio_mels: torch.Tensor
-    """Shape: (batch, num_mel_bins, time_steps)"""
+    """Shape: (total_chunks, num_mel_bins, time_steps)"""
 
-    audio_lens: list[int]
-    """Shape: (batch,) - length of each audio in time steps"""
+    audio_lens: torch.Tensor
+    """Shape: (total_chunks,) - length of each chunk in time steps"""
+
+    audio_num_chunks: torch.Tensor
+    """Shape: (num_audio_items,) - chunks belonging to each original audio"""
 
 
 class StepAudio2ProcessingInfo(BaseProcessingInfo):
@@ -464,7 +478,8 @@ class StepAudio2DummyInputsBuilder(BaseDummyInputsBuilder[StepAudio2ProcessingIn
         mm_counts: Mapping[str, int],
         mm_options: Mapping[str, object] | None = None,
     ) -> MultiModalDataDict:
-        audio_len = 16000 * 25
+        processor = self.info.get_hf_processor()
+        audio_len = int(processor.sampling_rate * processor.max_chunk_size)
         num_audios = mm_counts.get("audio", 0)
         return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios)}
 
@@ -477,25 +492,12 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         hf_inputs,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        """Map processor outputs to vLLM multimodal fields.
-
-        audio_mels is a padded 3D tensor per audio item with matching audio_lens.
-        Use flat_from_sizes to keep one mm item per audio, so downstream mm_kwargs
-        alignment does not collapse to a single item.
-        """
-        audio_lens = hf_inputs.get("audio_lens", torch.empty(0))
-        if isinstance(audio_lens, torch.Tensor):
-            lens_tensor = audio_lens.flatten()
-        elif audio_lens is None:
-            lens_tensor = torch.empty(0, dtype=torch.int32)
-        else:
-            lens_tensor = torch.tensor(
-                list(audio_lens) if hasattr(audio_lens, "__iter__") else [int(audio_lens)], dtype=torch.int32
-            )
-
+        """Keep every original audio's chunks together through caching/batching."""
+        num_chunks = hf_inputs["audio_num_chunks"]
         return dict(
-            audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", lens_tensor),
-            audio_lens=MultiModalFieldConfig.batched("audio"),
+            audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", num_chunks),
+            audio_lens=MultiModalFieldConfig.flat_from_sizes("audio", num_chunks),
+            audio_num_chunks=MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
@@ -512,46 +514,19 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             add_special_tokens=False,
         )
 
-        audio_items = mm_items.get("audio", [])
-        num_audio_items = len(audio_items) if audio_items else 0
+        tokenizer = self.info.get_tokenizer()
+        audio_start = tokenizer.encode("<audio_start>", add_special_tokens=False)
+        audio_end = tokenizer.encode("<audio_end>", add_special_tokens=False)
 
-        out_mm_data = out_mm_kwargs.get_data()
-        audio_lens = out_mm_data.get("audio_lens")
-
-        feature_lens = []
-        if audio_lens is not None:
-            if isinstance(audio_lens, torch.Tensor):
-                audio_lens_list = audio_lens.tolist()
-            else:
-                audio_lens_list = list(audio_lens) if hasattr(audio_lens, "__iter__") else [audio_lens]
-
-            for length in audio_lens_list:
-                if length > 0:
-                    feature_len = calculate_audio_feature_length(int(length))
-                    feature_lens.append(feature_len)
-
-        # CRITICAL: Align feature_lens with mm_items['audio'] count
-        if num_audio_items > 0:
-            if len(feature_lens) < num_audio_items:
-                default_feature_len = 250
-                pad_count = num_audio_items - len(feature_lens)
-                feature_lens.extend([default_feature_len] * pad_count)
-            elif len(feature_lens) > num_audio_items:
-                feature_lens = feature_lens[:num_audio_items]
-        elif not feature_lens:
-            feature_lens = [250]
-
-        def get_replacement_audio(item_idx: int):
-            """Generate replacement tokens for audio placeholder.
-
-            Following Qwen2.5-Omni pattern: returns list[int] of token IDs.
-            """
-            if item_idx >= len(feature_lens):
-                num_features = 1
-            else:
-                num_features = feature_lens[item_idx]
-
-            return [STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID] * num_features
+        def get_replacement_audio(item_idx: int) -> PromptUpdateDetails:
+            item = out_mm_kwargs["audio"][item_idx]
+            tokens = []
+            for length in item["audio_lens"].data.tolist():
+                num_features = calculate_audio_feature_length(int(length))
+                tokens.extend(audio_start)
+                tokens.extend([STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID] * num_features)
+                tokens.extend(audio_end)
+            return PromptUpdateDetails.select_token_id(tokens, STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID)
 
         return [
             PromptReplacement(
@@ -576,6 +551,8 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             processed_data["audio_mels"] = torch.empty((0, 128, 0))
         if "audio_lens" not in processed_data:
             processed_data["audio_lens"] = torch.tensor([], dtype=torch.int32)
+        if "audio_num_chunks" not in processed_data:
+            processed_data["audio_num_chunks"] = torch.tensor([], dtype=torch.int32)
         return processed_data
 
 
@@ -728,6 +705,7 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         return StepAudio2AudioInputs(
             audio_mels=audio_mels.to(self.dtype).to(self.device),
             audio_lens=audio_lens,
+            audio_num_chunks=kwargs["audio_num_chunks"],
         )
 
     def _process_audio_input(self, audio_input: StepAudio2AudioInputs) -> tuple[torch.Tensor, ...]:
@@ -751,7 +729,14 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_feature_lens_cpu = audio_feature_lens.tolist()
         audio_feature_list = [audio_features[i, : audio_feature_lens_cpu[i]] for i in range(audio_features.size(0))]
 
-        return audio_feature_list
+        # Concatenate chunk embeddings in order for each original audio item.
+        grouped_features = []
+        offset = 0
+        for num_chunks in audio_input["audio_num_chunks"].tolist():
+            chunks = audio_feature_list[offset : offset + num_chunks]
+            grouped_features.append(chunks[0] if num_chunks == 1 else torch.cat(chunks, dim=0))
+            offset += num_chunks
+        return tuple(grouped_features)
 
     def get_multimodal_embeddings(self, **kwargs) -> NestedTensors | None:
         """Get multimodal embeddings"""
