@@ -17,6 +17,64 @@ from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
 
 _NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
+# {(device, dtype, shape, strides): the norm reduction read from the input dtype is bitwise the one over its fp32
+# copy}. The reduction kernel depends on device, dtype and layout, never on values, so one probe on random data
+# per key decides it.
+_FP32_NORM_VERDICTS: dict[tuple, bool] = {}
+_MAX_FP32_NORM_VERDICTS = 256
+_FP32_NORM_PROBE_SEED = 0
+
+
+def _fp32_norm_probe(x: torch.Tensor) -> bool | None:
+    """Compare both reductions on seeded random data shaped like ``x``; ``None`` if that does not fit in memory."""
+    need = 2 * (x.nbytes + 2 * x.numel() * 4)  # random input and its fp32 copy, twice over
+    try:
+        device_module = torch.get_device_module(x.device)
+        free, _ = device_module.mem_get_info(x.device)
+        free += device_module.memory_reserved(x.device) - device_module.memory_allocated(x.device)
+    except Exception:  # CPU or a backend without memory queries
+        free = None
+    if free is not None and need > free:
+        return None
+    try:
+        generator = torch.Generator(device=x.device).manual_seed(_FP32_NORM_PROBE_SEED)
+        probe = torch.empty_like(x).normal_(generator=generator)
+        direct = torch.linalg.vector_norm(probe, dim=1, keepdim=True, dtype=torch.float32)
+        upcast = probe.float().norm(2, 1, keepdim=True)  # what F.normalize(x.float(), dim=1) reduces
+        return bool(torch.equal(direct.view(torch.int32), upcast.view(torch.int32)))
+    except (torch.OutOfMemoryError, RuntimeError) as exc:
+        # XPU reports some out-of-memory failures as a Level Zero RuntimeError.
+        message = str(exc)
+        if isinstance(exc, torch.OutOfMemoryError) or "UR_RESULT_ERROR_OUT_OF" in message:
+            return None
+        raise
+
+
+def fp32_channel_norm(x: torch.Tensor) -> torch.Tensor:
+    """``x.float().norm(2, dim=1, keepdim=True)`` bitwise, without the fp32 copy where a probe shows it is the same.
+
+    Reading the low-precision tensor directly (``vector_norm(..., dtype=float32)``) skips materializing an fp32
+    copy. That is only exact if the backend runs the same reduction for both, so the first call per (device,
+    dtype, shape, layout) checks it on random data and otherwise keeps the upcast. Under ``torch.compile`` it
+    is always the upcast.
+    """
+    if x.dtype is torch.float32:
+        return torch.linalg.vector_norm(x, dim=1, keepdim=True)
+    if torch.compiler.is_compiling():
+        # The probe (generator, memory query, host sync) cannot be traced; the reference expression can.
+        return x.float().norm(2, 1, keepdim=True)
+    key = (x.device, x.dtype, tuple(x.shape), x.stride())
+    verdict = _FP32_NORM_VERDICTS.get(key)
+    if verdict is None:
+        verdict = _fp32_norm_probe(x)
+        if verdict is not None:
+            _FP32_NORM_VERDICTS[key] = verdict
+            if len(_FP32_NORM_VERDICTS) > _MAX_FP32_NORM_VERDICTS:
+                del _FP32_NORM_VERDICTS[next(iter(_FP32_NORM_VERDICTS))]
+    if verdict:
+        return torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32)
+    return x.float().norm(2, 1, keepdim=True)
+
 
 def kernels_allowed(x: torch.Tensor) -> bool:
     """Allow eager CUDA/XPU kernels only when autograd and compilation are inactive."""
@@ -87,9 +145,9 @@ def rms_norm_fastpath(
     if bias is not None:
         x = _add_channel_bias(x, bias)
 
-    # Same reduction kernel as ``F.normalize(x.float(), dim=1)`` runs, reading
-    # the low-precision tensor once instead of materializing an fp32 copy.
-    denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
+    # The reduction ``F.normalize(x.float(), dim=1)`` runs, read from the
+    # low-precision tensor where a probe shows the bits are the same.
+    denom = fp32_channel_norm(x).clamp_min_(1e-12)
 
     if kernels_allowed(x):
         rows = _as_rows(x, denom)
