@@ -1,7 +1,6 @@
 # VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
-# MRV2 is opt-in: use a local deploy overlay with base_config: voxcpm2.yaml
-# and model_runner: v2. The same runtime_config works for both runners.
-# On Ascend the platform section below selects MRV2 by default.
+# CUDA defaults to MRV2 with incremental VAE decoding.
+# Other platforms retain their existing runner and audio settings.
 # Runs on large (H20 141GB) and small (24GB L4) cards alike: the KV cache is
 # pinned to a right-sized budget instead of ballooning to fill the card.
 #
@@ -42,6 +41,8 @@ stages:
 
           audio_emit_every: 1
           vae_decode_every: 3
+          enable_incremental_vae: false
+          enable_exact_patch_batch: false
           enable_batched_cfm: true
           enable_batched_vae_decode: true
           coalesce_audio_d2h: true
@@ -63,7 +64,18 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
-  # Ascend runs the AR stage on Model Runner V2. Audio stays on the packed
-  # per-request path because incremental VAE decoding needs CUDA graphs.
+  cuda:
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        engine_extras:
+          hf_overrides:
+            voxcpm2_runtime_config:
+              vae_decode_every: 1
+              audio_emit_every: 3
+              enable_incremental_vae: true
+              enable_exact_patch_batch: false
+              # Incremental unified graphs batch VAE internally.
+              enable_batched_vae_decode: false
   npu:
     model_runner: v2

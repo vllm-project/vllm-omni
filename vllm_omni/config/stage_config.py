@@ -1236,7 +1236,7 @@ def _apply_platform_overrides(
                 if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
                     base_val = getattr(base, key, None)
                     if isinstance(base_val, dict):
-                        setattr(base, key, {**base_val, **val})
+                        setattr(base, key, _get_recursively_merged_dict(base_val, val))
                         continue
                 setattr(base, key, val)
             else:
