@@ -601,9 +601,10 @@ class Qwen3TTSPromptEmbedsBuilder:
     def get_text_tokenizer(self):
         if self._text_tokenizer is None:
             import transformers
+            from packaging.version import Version
 
             kwargs: dict[str, Any] = dict(trust_remote_code=True, use_fast=True)
-            if transformers.__version__ < "5":
+            if Version(transformers.__version__).major < 5:
                 kwargs["fix_mistral_regex"] = True
             tok = AutoTokenizer.from_pretrained(self._model_path, **kwargs)
             tok.padding_side = "left"

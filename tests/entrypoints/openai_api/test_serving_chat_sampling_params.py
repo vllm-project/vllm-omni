@@ -8,6 +8,7 @@ are correctly applied to the comprehension stage while preserving YAML defaults.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -17,10 +18,173 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 
-from tests.helpers.serving_chat import build_serving_chat
+from tests.helpers.serving_chat import build_serving_chat, collect_stream, make_text_omni_output, parse_sse_chunks
 from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("model_type", ["drvexo_speech_qwen35_4b", "drvexo_speech_8b", "qwen3_omni_moe"])
+@pytest.mark.parametrize("supports_json", [False, True, None])
+@pytest.mark.parametrize("choice", ["auto", "required", "none", "named"])
+def test_native_tool_format_is_parsed_for_forced_calls(mock_engine_client, supports_json, choice, model_type):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    instance.model_config.hf_config = SimpleNamespace(model_type=model_type)
+    instance.enable_auto_tools = True
+    parser = SimpleNamespace() if supports_json is None else SimpleNamespace(supports_required_and_named=supports_json)
+    instance.parser_cls = SimpleNamespace(tool_parser_cls=parser)
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "杭州天气"}],
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+        tool_choice={"type": "function", "function": {"name": "weather"}} if choice == "named" else choice,
+    )
+    expected = choice == "auto" or (
+        model_type.startswith("drvexo_") and supports_json is False and choice in ("named", "required")
+    )
+    assert instance._should_stream_with_auto_tool_parsing(request) is expected
+
+
+@pytest.mark.parametrize("model_type", ["drvexo_speech_qwen35_4b", "qwen3_omni_moe"])
+def test_response_schema_is_kept_only_on_comprehension_stage(mock_engine_client, model_type):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    serving_chat.model_config.hf_config = SimpleNamespace(model_type=model_type)
+    mock_engine_client.stage_configs.append(SimpleNamespace(stage_type="llm", is_comprehension=False))
+    mock_engine_client.default_sampling_params_list.append(SamplingParams(temperature=0.7, max_tokens=99))
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": False,
+    }
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "杭州"}],
+        response_format={"type": "json_schema", "json_schema": {"name": "city", "schema": schema}},
+    )
+    params = serving_chat._build_sampling_params_list_from_request(request)
+    assert params[0].structured_outputs is not None
+    assert params[0].structured_outputs.json == schema
+    assert params[1].structured_outputs is None
+    assert params[2].structured_outputs is None
+    assert params[2].max_tokens == 99
+    assert params[2].temperature == 0.7
+    assert mock_engine_client.default_sampling_params_list[0].structured_outputs is None
+
+
+@pytest.mark.parametrize("choice", ["required", "named"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.asyncio
+async def test_other_models_keep_forced_json_tool_semantics(mock_engine_client, mocker, choice, stream):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    instance.model_config.hf_config = SimpleNamespace(model_type="qwen3_omni_moe")
+    instance.enable_auto_tools = True
+    # This parser cannot parse plain JSON. It must never intercept the existing
+    # named/required JSON response path for an unrelated model.
+    parser = mocker.Mock(supports_required_and_named=False)
+    instance.parser_cls = SimpleNamespace(tool_parser_cls=parser)
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "weather"}],
+        modalities=["text"],
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+        tool_choice={"type": "function", "function": {"name": "weather"}} if choice == "named" else choice,
+        stream=stream,
+    )
+    text = '{"city":"杭州"}' if choice == "named" else '[{"name":"weather","parameters":{"city":"杭州"}}]'
+    output = make_text_omni_output(text=text, finish_reason="stop")
+    if stream:
+
+        async def results():
+            yield output
+
+        chunks = parse_sse_chunks(
+            await collect_stream(
+                instance.chat_completion_stream_generator(
+                    request,
+                    results(),
+                    "test-req",
+                    "test",
+                    [],
+                    mocker.Mock(),
+                    mocker.Mock(),
+                )
+            )
+        )
+        calls = [
+            call
+            for chunk in chunks
+            for item in chunk.get("choices", [])
+            for call in item.get("delta", {}).get("tool_calls", [])
+        ]
+        assert any(call.get("function", {}).get("name") == "weather" for call in calls)
+        assert json.loads("".join(call.get("function", {}).get("arguments", "") for call in calls)) == {"city": "杭州"}
+    else:
+        choices, *_ = instance._create_text_choice(request, output, mocker.Mock(), [], "assistant")
+        assert choices[0].message.tool_calls[0].function.name == "weather"
+        assert json.loads(choices[0].message.tool_calls[0].function.arguments) == {"city": "杭州"}
+        assert choices[0].message.content in (None, "")
+    parser.assert_not_called()
+
+
+@pytest.mark.parametrize("continue_second", [False, True])
+@pytest.mark.asyncio
+async def test_required_tools_announced_together_keep_unique_stream_ids(mock_engine_client, mocker, continue_second):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    instance.enable_auto_tools = True
+    instance.model_config.hf_config.model_type = "kimi_k2"
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "weather in three cities"}],
+        modalities=["text"],
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+        tool_choice="required",
+        stream=True,
+    )
+    first = '[{"name":"weather","parameters":{"city":"杭州"}},'
+    second = '{"name":"weather","parameters":{"city":"上海"}}'
+    third = ',{"name":"weather","parameters":{"city":"北京"}}]'
+    split = second.index("上海") + 1 if continue_second else len(second)
+
+    async def results():
+        yield make_text_omni_output(text=first + second[:split], token_ids=[10])
+        yield make_text_omni_output(text=second[split:] + third, token_ids=[11], finish_reason="stop")
+
+    chunks = parse_sse_chunks(
+        await collect_stream(
+            instance.chat_completion_stream_generator(
+                request, results(), "test-req", "test", [], mocker.Mock(), mocker.Mock()
+            )
+        )
+    )
+    calls = [
+        call
+        for chunk in chunks
+        for item in chunk.get("choices", [])
+        for call in item.get("delta", {}).get("tool_calls", [])
+    ]
+    announced = [call for call in calls if call.get("id") is not None]
+    assert [call["index"] for call in announced] == [0, 1, 2]
+    assert [call["id"] for call in announced] == [f"functions.weather:{i}" for i in range(3)]
+    for index, city in enumerate(("杭州", "上海", "北京")):
+        arguments = "".join(call.get("function", {}).get("arguments", "") for call in calls if call["index"] == index)
+        assert json.loads(arguments) == {"city": city}
+
+
+@pytest.mark.asyncio
+async def test_tool_request_without_chat_parser_is_validation_error(mock_engine_client, mocker):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    instance.parser_cls = None
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        tool_choice="auto",
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+    )
+    renderer = mocker.Mock()
+    with pytest.raises(ValueError, match="no chat parser"):
+        await instance._preprocess_chat(request, [], None, "auto", tool_parser=mocker.Mock(), renderer=renderer)
+    renderer.render_chat_async.assert_not_called()
 
 
 @pytest.fixture

@@ -25,6 +25,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import anyio
 import torch
 import uvloop
 import vllm.envs as envs
@@ -468,6 +469,21 @@ async def omni_run_server_worker(
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        chat = getattr(app.state, "openai_serving_chat", None)
+        config = getattr(getattr(chat, "model_config", None), "hf_config", None)
+        from vllm_omni.transformers_utils.configs.drvexo import DRVEXO_MODEL_TYPES
+
+        if chat is not None and getattr(config, "model_type", None) in DRVEXO_MODEL_TYPES:
+            from .drvexo_routes import router as drvexo_router
+            from .drvexo_speech import load_speech_tokenizer
+
+            app.state.drvexo_decision_limiter = anyio.CapacityLimiter(1)
+            if getattr(engine_client, "num_stages", 0) == 3:
+                app.state.drvexo_speech_tokenizer = await anyio.to_thread.run_sync(
+                    load_speech_tokenizer, chat.model_config.model
+                )
+            app.include_router(drvexo_router)
 
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.

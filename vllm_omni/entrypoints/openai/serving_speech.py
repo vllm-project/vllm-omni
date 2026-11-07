@@ -1893,7 +1893,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # generation validation.
         adapter = self._get_tts_adapter()
         if tts_params is not None and usage_acc is None and adapter is not None and adapter.validates_generation:
-            usage_acc = SpeechOutputTokenCounter()
+            usage_acc = SpeechOutputTokenCounter(entry_stage_id=adapter.entry_stage_id)
 
         try:
             async for res in generator:
@@ -2157,7 +2157,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio streams (``stream_format='audio'``) send their headers before the
         audio is generated, so they cannot report a duration at all.
         """
-        usage_acc = SpeechOutputTokenCounter()
+        adapter = self._get_tts_adapter()
+        usage_acc = SpeechOutputTokenCounter(entry_stage_id=adapter.entry_stage_id if adapter else 0)
         emitted_audio = False
         audio_format: dict[str, int] = {}
         collect: dict[str, Any] = {}
@@ -2292,6 +2293,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         model_type: str | None = None
+        entry_stage_id = 0
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
             adapter.normalize(request)
@@ -2303,6 +2305,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             output_policy = prepared.output_policy
+            entry_stage_id = adapter.entry_stage_id
             _ensure_cache_salt(adapter, request, prompt, tts_params)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
@@ -2355,10 +2358,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list = copy.deepcopy(sampling_params_list)
             for name in ("temperature", "top_p", "top_k"):
                 if (value := request.extra_params.get(name)) is not None:
-                    setattr(sampling_params_list[0], name, value)
-            if sampling_params_list[0].extra_args is None:
-                sampling_params_list[0].extra_args = {}
-            sampling_params_list[0].extra_args.update(request.extra_params)
+                    setattr(sampling_params_list[entry_stage_id], name, value)
+            if sampling_params_list[entry_stage_id].extra_args is None:
+                sampling_params_list[entry_stage_id].extra_args = {}
+            sampling_params_list[entry_stage_id].extra_args.update(request.extra_params)
             logger.info("Applied extra_params: %s", request.extra_params)
 
         # Apply adapter-owned sampling overrides, including request-level token
@@ -2370,7 +2373,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            stage0_params = sampling_params_list[0]
+            stage0_params = sampling_params_list[entry_stage_id]
             stage0_params.seed = request.seed
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
@@ -2401,6 +2404,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             output_modalities=output_modalities,
             arrival_time=arrival_time,
             watermarking=request.watermarking,
+            entry_stage_id=entry_stage_id,
         )
         # Only the non-streaming path consumes output policies (in
         # `_generate_audio_bytes`); streaming never reads them. Store late —
@@ -2485,7 +2489,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         final_output: OmniRequestOutput | None = None
         # Non-streaming is FINAL_ONLY, so the stage-0 output carries the full
         # token sequence; the counter records its length for output_tokens.
-        usage_acc = SpeechOutputTokenCounter()
+        adapter = self._get_tts_adapter()
+        usage_acc = SpeechOutputTokenCounter(entry_stage_id=adapter.entry_stage_id if adapter else 0)
         audio_res: OmniRequestOutput | None = None
         aligner_res: OmniRequestOutput | None = None
         async for res in generator:

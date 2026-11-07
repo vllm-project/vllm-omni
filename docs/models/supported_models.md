@@ -19,6 +19,8 @@ th {
 
 | Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | Ascend NPU | Intel GPU | Recipe |
 | -------------- | -------- | ------------------- | ------------ | --------- | ----- | ----------- | -------- |
+| `DRVEXOSpeech8BForConditionalGeneration` | DRVEXO Speech 8B | Complete local unified checkpoint | ✅︎ | | | | [GB10 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/DRVEXO/DRVEXO-Speech-8B-GB10.md) |
+| `DRVEXOSpeechQwen35ForConditionalGeneration` | DRVEXO 4B Unified (experimental) | Complete local merged BF16 checkpoint | GB10 smoke tested | | | | [Integration guide](drvexo_unified_4b.md) |
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-Omni.md) |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `MingFlashOmniForConditionalGeneration` + `MingImagePipeline` | Ming-flash-omni-2.0 (omni-speech + imagegen<sup>1</sup>) | `Jonathan1909/Ming-flash-omni-2.0` | ✅︎ | | | ✅︎ | — |

@@ -199,3 +199,36 @@ platform remains separate from the shared Python routing tests.
 - [Qwen2.5-Omni consumer fix, #5019](https://github.com/vllm-project/vllm-omni/pull/5019)
 - [Adding an Omni model](../../contributing/model/adding_omni_model.md)
 - [Test writing guide](../../contributing/ci/test_writing_guide.md)
+
+## Request payload lifetime
+
+An explicit nonempty admission payload replaces the current request snapshot;
+missing payload does not erase state already seeded for that live request.
+Legacy metadata is decoded per request and overlays the current admission's
+payload. Invalid legacy metadata is logged and ignored, preserving the previous
+behavior; it does not fail unrelated admissions in the scheduler step.
+
+The runner owns cleanup: `_update_states` removes both cached request state and
+the intermediate buffer for finished or aborted IDs before processing new
+admissions. Reusing a finished ID in the same step therefore starts without the
+previous caller's payload. Preemption retains the same cached request and
+payload; streaming updates follow `_update_streaming_input_additional_info`.
+CPU scheduler tests exercise both preempted resume and finished-ID reuse.
+
+## Final-prefill output consumers
+
+A model setting `requires_request_computed_tokens` receives
+`request_computed_tokens` alongside `request_token_spans` in its output
+kwargs. Values are CPU integer offsets before this step, in the same current
+batch order as spans and intermediate buffers. DRVEXO uses the offset to
+score exactly the final prompt token across chunk boundaries and to avoid
+scoring decode tokens. This opt-in output metadata does not change the
+preprocess phase fields above or infer phase from a span's length.
+
+Scheduler offsets are installed by `_update_states` before input preparation;
+row reordering applies to the same persistent batch arrays. `_model_forward`
+reads these offsets before the current chunk is counted. CPU runner tests drive
+real cached scheduler updates through forward in both synchronous and async
+scheduling modes, including multiple prefill chunks and row reordering. They
+do not establish GPU async-scheduling or speculative-decoding acceptance;
+the DRVEXO deployment uses async scheduling off and no speculative decoder.

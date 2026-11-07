@@ -10,6 +10,19 @@ from vllm.model_executor.models.registry import (
 
 _OMNI_MODELS = {
     "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
+    "DRVEXOSpeechQwen35ForConditionalGeneration": (
+        "drvexo_unified",
+        "thinker",
+        "DRVEXOSpeechQwen35ForConditionalGeneration",
+    ),
+    "DRVEXOUnifiedTalker": ("drvexo_unified", "talker", "DRVEXOUnifiedTalker"),
+    "DRVEXOSpeech8BTalker": ("drvexo_speech_8b", "talker", "DRVEXOSpeech8BTalker"),
+    "DRVEXOSpeech8BCode2Wav": ("drvexo_speech_8b", "code2wav", "DRVEXOSpeech8BCode2Wav"),
+    "DRVEXOSpeech8BForConditionalGeneration": (
+        "drvexo_speech_8b",
+        "thinker",
+        "DRVEXOSpeech8BForConditionalGeneration",
+    ),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
