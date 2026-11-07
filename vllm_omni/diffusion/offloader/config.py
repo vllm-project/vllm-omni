@@ -11,7 +11,11 @@ from typing import Any, TypeVar
 
 DIT_COMPONENT = "dit"
 TEXT_ENCODER_COMPONENT = "text_encoder"
+VAE_COMPONENT = "vae"
+# Components with a layer form; every per-component transfer covers these.
 OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT})
+# VAEs only swap whole modules: they have no streamable block ring.
+MODULE_OFFLOAD_COMPONENTS = OFFLOAD_COMPONENTS | {VAE_COMPONENT}
 DEFAULT_OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT})
 
 _KeyT = TypeVar("_KeyT")
@@ -195,6 +199,8 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
 
     mode = _parse_enum(value["mode"], OffloadMode, "diffusion offload mode")
     components = parse_offload_components(value["components"])
+    if mode is OffloadMode.LAYER and VAE_COMPONENT in components:
+        raise ValueError("Offload component 'vae' supports only mode='module'; VAEs have no streamable blocks")
 
     raw_layer_options = value.get("layer_options", {})
     if not isinstance(raw_layer_options, Mapping):
@@ -306,7 +312,8 @@ def resolve_offload(config: Any) -> ResolvedOffload:
             raise ValueError("diffusion_offload_config cannot be combined with legacy enable_*_offload flags")
         transfers = {component: DLOTransfer.RANK_LOCAL for component in OFFLOAD_COMPONENTS}
         for component, options in public.layer_options.items():
-            transfers[component] = options.weight_transfer or DLOTransfer.RANK_LOCAL
+            if component in OFFLOAD_COMPONENTS:  # VAEs never stream, so they have no transfer
+                transfers[component] = options.weight_transfer or DLOTransfer.RANK_LOCAL
         dit_options = public.layer_options.get(DIT_COMPONENT)
         resolved = ResolvedOffload(
             strategy=strategy,
@@ -387,9 +394,9 @@ def parse_offload_components(value: Collection[str]) -> frozenset[str]:
     components = list(value)
     if not components:
         raise ValueError("offload components must not be empty")
-    unknown = sorted(set(components) - OFFLOAD_COMPONENTS)
+    unknown = sorted(set(components) - MODULE_OFFLOAD_COMPONENTS)
     if unknown:
-        choices = ", ".join(sorted(OFFLOAD_COMPONENTS))
+        choices = ", ".join(sorted(MODULE_OFFLOAD_COMPONENTS))
         raise ValueError(f"Unknown diffusion offload component(s): {', '.join(unknown)}; choose from: {choices}")
     return frozenset(components)
 
