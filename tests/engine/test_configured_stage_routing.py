@@ -7,6 +7,7 @@ import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
@@ -33,7 +34,14 @@ from tests.watermarking.test_base import NoopWatermarker
 from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.messages import AbortRequestMessage, AbortResultMessage, ErrorMessage, StageSubmissionMessage
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AbortResultMessage,
+    ErrorMessage,
+    NextStageInputMessage,
+    OutputMessage,
+    StageSubmissionMessage,
+)
 from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, StreamingSegmentState
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -519,6 +527,41 @@ async def test_lost_preselected_replica_cannot_be_reselected():
     assert isinstance(orch.output_async_queue.get_nowait(), ErrorMessage)
     assert "r" not in orch.request_states
     assert not pool.clients[1].add_request_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transitions", [None, ((0, 2),), ((0, 2), (2, 1))])
+async def test_run_calls_follow_configured_route(transitions):
+    orch, state, clients = _direct_orchestrator(transitions)
+    path = orch._request_stage_path(state)
+    state.yield_stage_id = 0
+    for client in clients:
+        client.next_inputs = [{"prompt_token_ids": [1, 2]}]
+    try:
+        for index, stage_id in enumerate(path):
+            request_id = state.request_id
+            await orch._route_output(stage_id, 0, _build_request_output(request_id), state, None)
+            response = orch.output_async_queue.get_nowait()
+            assert request_id not in orch.request_states
+            if index == len(path) - 1:
+                assert isinstance(response, OutputMessage) and response.finished
+                assert response.stage_id == stage_id
+                break
+            assert isinstance(response, NextStageInputMessage)
+            receiver = path[index + 1]
+            assert (response.source_stage_id, response.receiver_stage_id) == (stage_id, receiver)
+            next_request_id = f"r-{index + 1}"
+            await orch._handle_next_stage_input(msgspec.structs.replace(response, request_id=next_request_id))
+            assert clients[receiver].add_request_calls
+            state = orch.request_states[next_request_id]
+            assert state.final_stage_id == path[-1]
+            assert state.entry_stage_id == receiver
+            assert state.yield_stage_id == (receiver if receiver != path[-1] else None)
+        assert orch.output_async_queue.empty()
+        assert not orch.request_states
+        assert all(not pool._request_bindings for pool in orch.stage_pools)
+    finally:
+        await orch._cleanup_request_ids(list(orch.request_states), abort=True)
 
 
 @pytest.mark.asyncio

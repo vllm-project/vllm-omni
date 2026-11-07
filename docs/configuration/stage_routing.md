@@ -57,6 +57,8 @@ stage ID in the prefix.
 Output modalities select the last matching stage in route order. For example,
 under `0 -> 2 -> 1`, stage 1 can finish a request after stage 2. Stage sampling
 parameters remain indexed by stage ID.
+Independent stage calls use the same route tail and handoff order. A serialized
+stage input is validated against the configured order, not numeric stage IDs.
 Worker connector endpoints remain fixed for the full route. A request ending
 early can leave unread outgoing payloads, which follow the backend cleanup
 contract below; this feature does not prune all data-plane sends per request.

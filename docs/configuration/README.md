@@ -2,7 +2,7 @@
 
 This section lists the most common options for running vLLM-Omni.
 
-For options within a vLLM Engine, please refer to the [vLLM 0.32 configuration guide](https://docs.vllm.ai/en/v0.32.0/configuration/index.html).
+For options within a vLLM Engine, please refer to the [vLLM 0.33 configuration guide](https://docs.vllm.ai/en/v0.33.0/configuration/index.html).
 
 Each model defines fixed topology in a registered `PipelineConfig` and runtime
 overrides in a deploy YAML.
