@@ -21,6 +21,41 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
 
 from vllm_omni.platforms import current_omni_platform
 
+# Captured attention bound for one image or video frame. Larger frames stay
+# eager because replay reuses the max_seqlen baked in at capture.
+MAX_GRAPH_FRAME_PATCHES = 4096
+MAX_GRAPH_FRAMES_PER_VIDEO = 32
+
+
+def supports_npu_encoder_graphs() -> bool:
+    if not current_omni_platform.is_npu():
+        return False
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    return not is_310p()
+
+
+def pad_attention_bounds(bounds: list[int], total: int, max_sequences: int) -> list[int]:
+    """Cover replay padding with short attention sequences.
+
+    Ascend FIA must assign every query row to a sequence. A single sequence
+    over all padding costs attention quadratic in the padding length. Pieces
+    no longer than the longest live sequence cost at most as much as the same
+    number of live rows, and grow only when the sequence count would exceed
+    ``max_sequences``.
+    """
+    pad = total - bounds[-1]
+    if pad <= 0:
+        return list(bounds)
+    longest = max((end - start for start, end in zip(bounds, bounds[1:])), default=0)
+    slots = max(1, max_sequences - (len(bounds) - 1))
+    step = max(longest, -(-pad // slots), 1)
+    padded = list(bounds)
+    while padded[-1] < total:
+        padded.append(min(total, padded[-1] + step))
+    return padded
+
+
 _FLASH_BACKENDS = {
     AttentionBackendEnum.FLASH_ATTN,
     AttentionBackendEnum.ROCM_AITER_FA,
@@ -55,7 +90,10 @@ def _pad_cu_seqlens(dst: torch.Tensor, src: torch.Tensor) -> None:
 
 
 class Qwen3OmniVisionEncoderCudaGraphMixin:
-    """Image and audio protocol methods; video retains embed_multimodal.
+    """Image, video, and audio protocol methods.
+
+    Video frames share the image path. A video longer than one captured budget
+    is replayed as successive frame chunks by SingleReplayEncoderCudaGraphManager.
 
     Images replay on the ``"default"`` path and audio on the ``"audio"`` path.
     The runner encodes one modality per group, so each replay uses one path.
@@ -80,14 +118,25 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # attention advances a host-side amax slot per call, which a graph
         # would freeze. The pipeline-group query comes last so a thinker built
         # without a vision tower or distributed state never reaches it.
-        if (
-            not self.multimodal_config.enable_mm_embeds
-            and self.multimodal_config.mm_encoder_attn_dtype is None
-            and self.multimodal_config.get_limit_per_prompt("image") > 0
-            and getattr(self.visual, "attn_backend", None) in _FLASH_BACKENDS
-            and get_pp_group().is_first_rank
-        ):
+        # Video uses the same captured path; NPU towers have no CUDA attention
+        # backend, so a supported Ascend device is enough.
+        mm = self.multimodal_config
+        if mm.enable_mm_embeds or mm.mm_encoder_attn_dtype is not None:
+            return
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is not None and getattr(vllm_config.model_config, "enforce_eager", False):
+            return
+        image = mm.get_limit_per_prompt("image") > 0
+        video = mm.get_limit_per_prompt("video") > 0
+        if not image and not video:
+            return
+        backend_ok = supports_npu_encoder_graphs() or getattr(self.visual, "attn_backend", None) in _FLASH_BACKENDS
+        if not backend_ok or not get_pp_group().is_first_rank:
+            return
+        if image:
             self._add_encoder_cudagraph_modality("image")
+        if video:
+            self._add_encoder_cudagraph_modality("video")
 
     def _enable_audio_encoder_cudagraph(self, vllm_config) -> None:
         # Same conditions as images. In addition audio stays eager when the
@@ -95,12 +144,16 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # parallel there) and under model runner v2, which builds the upstream
         # manager and never consults encoder_cudagraph_group_eligible; and the
         # largest budget must hold at least one audio chunk. Audio graphs are
-        # CUDA only, so ROCm, NPU and XPU take the same eager path. The stage's
-        # additional_config can turn audio graphs off while images still replay.
+        # validated on CUDA and on Ascend NPUs other than 310P, so ROCm and XPU
+        # take the eager path. The stage's additional_config can turn audio
+        # graphs off while images still replay.
         audio_tower = getattr(self, "audio_tower", None)
         mm = self.multimodal_config
+        if not getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
+            return
         if mm.enable_mm_embeds or mm.mm_encoder_attn_dtype is not None or mm.get_limit_per_prompt("audio") <= 0:
             return
+        npu = supports_npu_encoder_graphs()
         reason = None
         if not _audio_graphs_requested(vllm_config):
             reason = "additional_config sets audio_encoder_cudagraph to false"
@@ -108,18 +161,19 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             reason = "model runner v2 is in use"
         elif mm.mm_encoder_tp_mode == "data":
             reason = "the multimodal encoder runs data parallel"
-        elif not current_omni_platform.is_cuda():
+        elif not (npu or current_omni_platform.is_cuda()):
             reason = (
-                f"audio encoder graphs are validated on CUDA only, this platform is {current_omni_platform.device_name}"
+                "audio encoder graphs are validated on CUDA and Ascend NPU only, "
+                f"this platform is {current_omni_platform.device_name}"
             )
-        elif getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
+        elif not npu and getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
             reason = f"the audio attention backend is {getattr(audio_tower, 'attn_backend', None)}"
         elif self._max_encoder_cudagraph_budget(vllm_config) < self._audio_tokens_per_chunk():
             reason = f"no encoder graph budget holds one {self._audio_tokens_per_chunk()}-token audio chunk"
         if reason is None:
             if get_pp_group().is_first_rank:
                 self._add_encoder_cudagraph_modality("audio")
-        elif getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
+        else:
             logger.info("Audio encoder CUDA graphs stay off: %s.", reason)
 
     def _max_encoder_cudagraph_budget(self, vllm_config) -> int:
@@ -132,11 +186,12 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
 
     def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
         modalities = getattr(self, "_encoder_cudagraph_modalities", ["image"])
-        both = len(modalities) > 1
+        vision = "image" in modalities or "video" in modalities
+        both = vision and "audio" in modalities
         keys: list[str] = []
         paths: dict[str, EncoderCudaGraphPathConfig] = {}
         padding_logics = {}
-        if "image" in modalities:
+        if vision:
             keys += ["pixel_values", "rotary_pos_emb_cos", "rotary_pos_emb_sin", "cu_seqlens", "max_seqlen"]
             if self.visual.apply_vit_abs_pos_embed:
                 keys.append("pos_embeds")
@@ -150,11 +205,10 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             padding_logics["audio_cu_seqlens"] = _pad_cu_seqlens
         # The output width only sizes the data-parallel gather, which audio
         # never uses.
-        out_hidden_size = (
-            self.visual_dim + self.multiscale_dim if "image" in modalities else self.audio_tower.proj2.output_size
-        )
+        out_hidden_size = self.visual_dim + self.multiscale_dim if vision else self.audio_tower.proj2.output_size
         return EncoderCudaGraphConfig(
             modalities=list(modalities),
+            max_frames_per_video=self.get_max_frames_per_video(),
             buffer_keys=keys,
             out_hidden_size=out_hidden_size,
             padding_logics=padding_logics,
@@ -162,9 +216,17 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         )
 
     def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
-        return "audio" if "input_audio_features" in mm_kwargs else "image"
+        if "input_audio_features" in mm_kwargs:
+            return "audio"
+        if "video_grid_thw" in mm_kwargs:
+            return "video"
+        return "image"
 
     def get_max_frames_per_video(self) -> int:
+        # Upstream multiplies this by the item cap when
+        # encoder_cudagraph_max_frames_per_batch is unset.
+        if "video" in getattr(self, "_encoder_cudagraph_modalities", []):
+            return MAX_GRAPH_FRAMES_PER_VIDEO
         return 1
 
     def get_encoder_cudagraph_budget_range(self, vllm_config) -> tuple[int, int]:
@@ -210,12 +272,30 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             return True
         return max(self._audio_lengths(mm_kwargs), default=0) >= self.audio_tower.n_window * 2
 
+    def encoder_cudagraph_replay_supported(self, mm_kwargs: dict[str, Any], max_frames_per_batch: int) -> bool:
+        """False when one replay cannot reproduce this vision group.
+
+        Audio eligibility is ``encoder_cudagraph_group_eligible``. A video
+        longer than ``max_frames_per_batch`` is split into frame chunks by the
+        single-replay manager instead of failing this check permanently.
+        Without video, capture bakes the whole budget as ``max_seqlen``, so
+        the per-frame patch bound only applies when video is captured.
+        """
+        if self.get_input_modality(mm_kwargs) == "audio":
+            return True
+        grid = self._image_grid(mm_kwargs)
+        if max_frames_per_batch > 1 and any(int(h) * int(w) > MAX_GRAPH_FRAME_PATCHES for _, h, w in grid):
+            return False
+        if self.get_input_modality(mm_kwargs) != "video":
+            return True
+        return sum(int(t) for t, _, _ in grid) <= max_frames_per_batch
+
     def _audio_lengths(self, mm_kwargs: dict[str, Any]) -> list[int]:
         lengths = mm_kwargs["audio_feature_lengths"]
         return [int(n) for n in (lengths if isinstance(lengths, list) else lengths.tolist())]
 
     def _image_grid(self, mm_kwargs: dict[str, Any]) -> list[list[int]]:
-        grid = mm_kwargs["image_grid_thw"]
+        grid = mm_kwargs[f"{self.get_input_modality(mm_kwargs)}_grid_thw"]
         return grid if isinstance(grid, list) else grid.tolist()
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
@@ -234,10 +314,12 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             ]
         merge = self.visual.spatial_merge_size
         result = []
+        modality = self.get_input_modality(mm_kwargs)
         for t, h, w in self._image_grid(mm_kwargs):
-            if t != 1 or h <= 0 or w <= 0 or h % merge or w % merge:
+            t, h, w = int(t), int(h), int(w)
+            if (t != 1 and modality == "image") or t <= 0 or h <= 0 or w <= 0 or h % merge or w % merge:
                 raise ValueError(f"Invalid Qwen3-Omni image grid: {(t, h, w)}")
-            result.append(EncoderItemSpec(input_size=h * w, output_tokens=(h // merge) * (w // merge)))
+            result.append(EncoderItemSpec(input_size=t * h * w, output_tokens=t * (h // merge) * (w // merge)))
         return result
 
     def select_encoder_cudagraph_items(self, mm_kwargs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
@@ -257,15 +339,15 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
                 selected["feature_attention_mask"] = [mask[i] for i in indices]
             return selected
         grid = self._image_grid(mm_kwargs)
-        pixels = mm_kwargs["pixel_values"]
+        modality = self.get_input_modality(mm_kwargs)
+        pixel_key = "pixel_values_videos" if modality == "video" else "pixel_values"
+        pixels = mm_kwargs[pixel_key]
         offsets = [0]
         for spec in self.get_encoder_cudagraph_item_specs(mm_kwargs):
             offsets.append(offsets[-1] + spec.input_size)
         return {
-            "pixel_values": torch.cat([pixels[offsets[i] : offsets[i + 1]] for i in indices])
-            if indices
-            else pixels[:0],
-            "image_grid_thw": [grid[i] for i in indices],
+            pixel_key: torch.cat([pixels[offsets[i] : offsets[i + 1]] for i in indices]) if indices else pixels[:0],
+            f"{modality}_grid_thw": [grid[i] for i in indices],
         }
 
     def prepare_encoder_cudagraph_capture_inputs(
@@ -290,6 +372,27 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # Infer the RoPE layout from one real minimal grid. No large dummy
         # aspect ratio is needed, and no dummy grid indexes past the RoPE cache.
         small = visual.prepare_encoder_metadata([[1, merge, merge]])
+        if max_frames_per_batch > 1:
+            # Video attention is per frame. Cap the baked max_seqlen so a large
+            # token budget does not capture one sequence over every patch.
+            sequence_capacity = max(max_batch_size, max_frames_per_batch)
+            max_sequence = min(patches, MAX_GRAPH_FRAME_PATCHES)
+            capture_lengths = [max_sequence] * (patches // max_sequence)
+            if patches % max_sequence:
+                capture_lengths.append(patches % max_sequence)
+            if len(capture_lengths) > sequence_capacity:
+                max_sequence = patches
+                capture_lengths = [patches]
+            boundaries = [0]
+            for length in capture_lengths:
+                boundaries.append(boundaries[-1] + length)
+            boundaries += [patches] * (sequence_capacity + 1 - len(boundaries))
+            cu_seqlens = torch.tensor(boundaries, device=device, dtype=torch.int32)
+            max_seqlen = max_sequence
+        else:
+            cu_seqlens = torch.full((max_batch_size + 1,), patches, device=device, dtype=torch.int32)
+            cu_seqlens[0] = 0
+            max_seqlen = patches
         values = {
             "rotary_pos_emb_cos": torch.ones(
                 (patches, *small["rotary_pos_emb_cos"].shape[1:]),
@@ -301,12 +404,10 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
                 device=device,
                 dtype=small["rotary_pos_emb_sin"].dtype,
             ),
-            "cu_seqlens": torch.full((max_batch_size + 1,), patches, device=device, dtype=torch.int32),
+            "cu_seqlens": cu_seqlens,
             # This host scalar is baked into the captured attention launch.
-            # Any single image in this graph has at most `patches` patches.
-            "max_seqlen": torch.tensor(patches, dtype=torch.int32),
+            "max_seqlen": torch.tensor(max_seqlen, dtype=torch.int32),
         }
-        values["cu_seqlens"][0] = 0
         patch_embed = visual.patch_embed
         patch_width = patch_embed.proj.in_channels * patch_embed.temporal_patch_size * patch_embed.patch_size**2
         values["pixel_values"] = torch.zeros((patches, patch_width), device=device, dtype=dtype)
@@ -334,13 +435,17 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
                     "audio_chunks": tower.pad_chunks(features, metadata["chunk_lengths"]),
                     "audio_valid_index": metadata["valid_index"],
                     "audio_cu_seqlens": metadata["cu_seqlens"],
+                    # Not a graph input: Ascend FIA rebinds sequence lengths
+                    # from the host on every replay.
+                    "audio_cu_seqlens_host": metadata["cu_seqlens_host"],
                 }
             )
         values = self.visual.prepare_encoder_metadata(self._image_grid(mm_kwargs))
         # Replaying a smaller request must not lower the scalar bound retained
         # by the capture. Tensor positions and sequence boundaries do change.
         values.pop("max_seqlen")
-        values["pixel_values"] = mm_kwargs["pixel_values"]
+        pixel_key = "pixel_values_videos" if self.get_input_modality(mm_kwargs) == "video" else "pixel_values"
+        values["pixel_values"] = mm_kwargs[pixel_key]
         return EncoderCudaGraphReplayBuffers(values=values)
 
     def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
@@ -362,7 +467,8 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
                 mm_kwargs["input_audio_features"].to(tower.dtype),
                 tower.prepare_encoder_metadata(self._audio_lengths(mm_kwargs)),
             )
-        return self.visual(mm_kwargs["pixel_values"], self._image_grid(mm_kwargs))
+        pixel_key = "pixel_values_videos" if self.get_input_modality(mm_kwargs) == "video" else "pixel_values"
+        return self.visual(mm_kwargs[pixel_key], self._image_grid(mm_kwargs))
 
     def postprocess_encoder_output(
         self,

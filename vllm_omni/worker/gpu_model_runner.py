@@ -357,6 +357,42 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         )
 
     @torch.inference_mode()
+    def profile_encoder_cudagraph_memory(self) -> int:
+        """Measure encoder graphs before allocating the language model KV cache."""
+        import gc
+
+        from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+        from vllm.config import set_current_vllm_config
+        from vllm.distributed.parallel_state import graph_capture
+        from vllm.platforms import current_platform
+
+        if current_omni_platform.is_npu():
+            from vllm_ascend.worker.v1.model_runner import graph_capture
+
+        # Match capture_model: NONE never captures an encoder manager either.
+        if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            return 0
+        manager = self._create_encoder_cudagraph_manager()
+        if manager is None:
+            return 0
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        free_before = torch.accelerator.get_memory_info()[0]
+        try:
+            with set_current_vllm_config(self.vllm_config), self._freeze_gc(), graph_capture(device=self.device):
+                set_cudagraph_capturing_enabled(True)
+                try:
+                    manager.capture(graph_pool=current_platform.graph_pool_handle())
+                finally:
+                    set_cudagraph_capturing_enabled(False)
+            torch.accelerator.synchronize()
+            return max(0, free_before - torch.accelerator.get_memory_info()[0])
+        finally:
+            manager.clear()
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+    @torch.inference_mode()
     def _create_encoder_cudagraph_manager(self):
         raw_model = self.get_model()
         if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
@@ -371,6 +407,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             and supports_encoder_cudagraph(raw_model)
         ):
             return None
+        if self.device.type == "npu":
+            from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import SingleReplayEncoderNpuGraphManager
+
+            return SingleReplayEncoderNpuGraphManager(
+                vllm_config=self.vllm_config, device=self.device, dtype=self.dtype, model=raw_model
+            )
         return SingleReplayEncoderCudaGraphManager(
             vllm_config=self.vllm_config, device=self.device, dtype=self.dtype, model=raw_model
         )
@@ -2408,12 +2450,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     # __class__ cell inside this nested function. `narrow.context`
                     # is None once a narrow step was restored (fused graph
                     # declined); only a live step owns the one-query buffers.
-                    active = narrow is not None and narrow.context is not None
+                    live = narrow if narrow is not None and narrow.context is not None else None
                     return super(OmniGPUModelRunner, self)._model_forward(
-                        input_ids=None if active else input_ids,
-                        positions=narrow.positions if active else positions,
+                        input_ids=None if live is not None else input_ids,
+                        positions=live.positions if live is not None else positions,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
+                        inputs_embeds=live.inputs_embeds if live is not None else inputs_embeds,
                         **model_kwargs,
                         **model_kwargs_extra,
                     )
@@ -2432,7 +2474,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     frames=frames,
                     model_kwargs=model_kwargs,
                     model_kwargs_extra=model_kwargs_extra,
-                    narrow=narrow,
+                    narrow=cast(Any, narrow),
                 )
             finally:
                 if narrow is not None:

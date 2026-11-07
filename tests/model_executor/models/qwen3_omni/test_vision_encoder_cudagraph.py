@@ -31,6 +31,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture(autouse=True)
 def _first_pipeline_rank(monkeypatch):
     monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    # CPU contracts must not follow the host: an NPU host skips the CUDA
+    # attention-backend gate and builds NPU audio graphs.
+    monkeypatch.setattr(graph_module, "supports_npu_encoder_graphs", lambda: False)
 
 
 class _PatchEmbed(nn.Module):
@@ -156,7 +159,7 @@ def test_real_wrapper_construction_controls_runner_protocol(monkeypatch, stage, 
         assert manager.model is model
         assert manager.config.out_hidden_size == 12
         assert manager.supports_modality("image")
-        assert not manager.supports_modality("video")
+        assert manager.supports_modality("video")
         assert not manager.supports_modality("audio")
 
 
@@ -174,6 +177,7 @@ def test_runner_builds_no_manager_without_multimodal_inputs(monkeypatch):
 def test_thinker_construction_enables_the_image_graph(monkeypatch):
     cfg = _config()
     cfg.quant_config = None
+    cfg.model_config.use_v2_model_runner = False
     thinker_config = cfg.model_config.hf_config.thinker_config
     thinker_config.architectures = ["Qwen3OmniMoeThinkerForConditionalGeneration"]
     thinker_config.vision_config.deepstack_visual_indexes = [0, 1]
@@ -191,13 +195,13 @@ def test_thinker_construction_enables_the_image_graph(monkeypatch):
     assert supports_encoder_cudagraph(cls(vllm_config=cfg))
 
 
-@pytest.mark.parametrize("change", ["no_image_limit", "sdpa_backend", "fp8_attention", "later_pipeline_rank", None])
+@pytest.mark.parametrize("change", ["no_vision_limit", "sdpa_backend", "fp8_attention", "later_pipeline_rank", None])
 def test_image_graph_gate(monkeypatch, change):
     model = _thinker()
     del model.supports_encoder_cudagraph
     mm = model.multimodal_config
-    if change == "no_image_limit":
-        mm.get_limit_per_prompt = lambda modality: 0 if modality == "image" else 4
+    if change == "no_vision_limit":
+        mm.get_limit_per_prompt = lambda modality: 0 if modality in ("image", "video") else 4
     elif change == "sdpa_backend":
         model.visual.attn_backend = AttentionBackendEnum.TORCH_SDPA
     elif change == "fp8_attention":
@@ -321,6 +325,17 @@ def test_capture_has_full_budget_and_replay_keeps_scalar_bound():
     assert values["cu_seqlens"].tolist() == [0, 4, 4]
 
 
+def test_frame_patch_bound_applies_only_when_video_caps_max_seqlen():
+    model = _thinker()
+    side = int(graph_module.MAX_GRAPH_FRAME_PATCHES**0.5) + 2
+    large = {"image_grid_thw": [[1, side, side]]}
+    # Image-only graphs bake the whole budget as max_seqlen.
+    assert model.encoder_cudagraph_replay_supported(large, 0)
+    assert model.encoder_cudagraph_replay_supported(large, 1)
+    # Video capture caps max_seqlen per frame, so a larger image stays eager.
+    assert not model.encoder_cudagraph_replay_supported(large, 128)
+
+
 def test_graph_entry_preserves_vision_module_hooks():
     model = _thinker()
     values = model.prepare_encoder_cudagraph_capture_inputs(2, 2, 0, torch.device("cpu"), torch.float32).values
@@ -356,8 +371,10 @@ def _run_encoder_step(monkeypatch, model, manager, batches):
     return [cached[key] for key in keys]
 
 
-def test_actual_runner_dispatch_keeps_video_and_audio_eager(monkeypatch):
-    model = _thinker()
+def test_actual_runner_dispatch_keeps_uncaptured_video_and_audio_eager(monkeypatch):
+    cfg = _config()
+    cfg.model_config.multimodal_config.get_limit_per_prompt = lambda modality: 0 if modality == "video" else 4
+    model = _thinker(cfg)
     manager = _cpu_manager(model)
     eager_modalities = []
 
