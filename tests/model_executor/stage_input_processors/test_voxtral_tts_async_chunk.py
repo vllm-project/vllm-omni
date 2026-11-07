@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import deserialize_payload, serialize_payload, to_dict
 from vllm_omni.model_executor.stage_input_processors.voxtral_tts import (
     generator2tokenizer_async_chunk,
 )
@@ -78,7 +79,7 @@ def test_flush_tail_when_finished():
 
 
 def test_eof_marker_when_finished_with_no_frames():
-    """Emits EOF marker with empty codes when finished with no accumulated frames."""
+    """Emits a terminal-only marker when finished with no accumulated frames."""
     transfer_manager = _make_transfer_manager()
     request = _req("rid-eof", finished=True)
 
@@ -88,8 +89,15 @@ def test_eof_marker_when_finished_with_no_frames():
         request=request,
     )
 
-    assert payload.codes.audio.tolist() == []
+    assert payload.codes is None
     assert payload.meta.finished.item() is True
+
+    # The connector payload schema and its AdditionalInformation wire format
+    # must preserve a terminal-only marker without inventing an empty code tensor.
+    wire_payload = serialize_payload(to_dict(payload))
+    restored_payload = deserialize_payload(wire_payload)
+    assert "codes" not in restored_payload
+    assert restored_payload["meta"]["finished"].item() is True
 
 
 def test_normal_chunk_emission():
@@ -118,6 +126,42 @@ def test_normal_chunk_emission():
     context_length = codes[1]
     assert ctx_frames == 20  # 25 - 5(chunk_size_at_begin)
     assert context_length == 5  # 25 - 20(chunk_size_at_begin * 4)
+
+
+def test_no_frame_after_emitted_boundary_does_not_reemit_cached_chunk():
+    transfer_manager = _make_transfer_manager(
+        codec_chunk_frames=4,
+        codec_left_context_frames=0,
+        codec_chunk_frames_at_begin=2,
+    )
+    request_id = "rid-replay-boundary"
+    request = _req(request_id, finished=False)
+
+    first_payload = generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.tensor([1.0, 1.0])}},
+        request,
+    )
+    assert first_payload is None
+    emitted_payload = generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.tensor([2.0, 2.0])}},
+        request,
+    )
+    assert emitted_payload is not None
+    assert emitted_payload.codes.audio[1].item() == 2
+    cached_frames = list(transfer_manager.code_prompt_token_ids[request_id])
+
+    # Replay at the already-emitted boundary can have a multimodal wrapper but
+    # no new codec frame. It must not send the cached chunk a second time.
+    replay_payload = generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": None}},
+        request,
+    )
+
+    assert replay_payload is None
+    assert transfer_manager.code_prompt_token_ids[request_id] == cached_frames
 
 
 def test_small_initial_chunks():
@@ -213,3 +257,54 @@ def test_none_multimodal_output_not_finished_returns_none():
     )
 
     assert payload is None
+
+
+def test_interleaved_requests_keep_frames_separate_and_cleanup_on_finish():
+    transfer_manager = _make_transfer_manager(
+        codec_chunk_frames=4,
+        codec_left_context_frames=0,
+        codec_chunk_frames_at_begin=2,
+    )
+    req_a = _req("rid-a", finished=False)
+    req_b = _req("rid-b", finished=False)
+
+    assert (
+        generator2tokenizer_async_chunk(
+            transfer_manager,
+            {"codes": {"audio": torch.full((8,), 1.0)}},
+            req_a,
+        )
+        is None
+    )
+    assert (
+        generator2tokenizer_async_chunk(
+            transfer_manager,
+            {"codes": {"audio": torch.full((8,), 9.0)}},
+            req_b,
+        )
+        is None
+    )
+    chunk_a = generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.full((8,), 2.0)}},
+        req_a,
+    )
+    assert chunk_a is not None
+    assert chunk_a.codes.audio[0].item() == 0
+    assert chunk_a.codes.audio[1].item() == 2
+    assert chunk_a.codes.audio[2:].tolist() == [1] * 8 + [2] * 8
+
+    # Ending on a chunk boundary emits EOF without replaying the last chunk.
+    req_a_done = _req("rid-a", finished=True)
+    payload_a = generator2tokenizer_async_chunk(transfer_manager, None, req_a_done)
+    assert payload_a is not None
+    assert payload_a.codes is None
+    assert payload_a.meta.finished.item()
+    assert "rid-a" not in transfer_manager.code_prompt_token_ids
+
+    req_b_done = _req("rid-b", finished=True)
+    payload_b = generator2tokenizer_async_chunk(transfer_manager, None, req_b_done)
+    assert payload_b is not None
+    assert payload_b.codes.audio[1].item() == 1
+    assert payload_b.codes.audio[2:].tolist() == [9] * 8
+    assert "rid-b" not in transfer_manager.code_prompt_token_ids
