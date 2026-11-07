@@ -304,6 +304,19 @@ def _marks_for_platform(platform: str, resource: SkuSpec, num_cards: int) -> lis
     return marks
 
 
+def _is_accelerator_platform() -> bool:
+    """Return True when the running platform exposes a real accelerator."""
+    from vllm_omni.platforms import current_omni_platform
+
+    return (
+        current_omni_platform.is_cuda()
+        or current_omni_platform.is_rocm()
+        or current_omni_platform.is_xpu()
+        or current_omni_platform.is_npu()
+        or current_omni_platform.is_musa()
+    )
+
+
 def _skipif_not_platform(platform: str) -> pytest.MarkDecorator:
     import pytest
 
@@ -317,6 +330,15 @@ def _skipif_not_platform(platform: str) -> pytest.MarkDecorator:
         "musa": current_omni_platform.is_musa,
     }
     return pytest.mark.skipif(not checkers[platform](), reason=f"Requires {platform} platform")
+
+
+def _skipif_no_accelerator() -> pytest.MarkDecorator:
+    import pytest
+
+    return pytest.mark.skipif(
+        not _is_accelerator_platform(),
+        reason="Test requires an accelerator platform (CUDA/ROCm/XPU/NPU/MUSA).",
+    )
 
 
 def _apply_marks(func, marks: list[pytest.MarkDecorator]):
@@ -345,6 +367,7 @@ def hardware_marks(*, res: dict[str, SkuSpec], num_cards: int | dict[str, int] =
     all_marks: list[pytest.MarkDecorator] = []
     for platform, resource in res.items():
         all_marks.extend(_marks_for_platform(platform, resource, num_cards_dict[platform]))
+    all_marks.append(_skipif_no_accelerator())
     return all_marks
 
 
