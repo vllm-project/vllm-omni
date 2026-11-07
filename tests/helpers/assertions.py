@@ -675,7 +675,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
             print(f"gender pitch assist: reclassifying male->female (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
             gender = "female"
-        print(
+        print(  # codeql[py/clear-text-logging-sensitive-data]
             f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}"
             + (f", median_f0={median_f0:.1f}Hz" if median_f0 is not None else "")
         )
@@ -701,7 +701,9 @@ def _assert_preset_voice_gender_from_audio(
     if expected_gender is None:
         return
     estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
-    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
+    print(
+        f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}"
+    )  # codeql[py/clear-text-logging-sensitive-data]
     if estimated_gender != "unknown":
         assert estimated_gender == expected_gender, (
             f"{voice_name!r} is expected {expected_gender}, but {GENDER_MISMATCH_MESSAGE} {estimated_gender!r}"

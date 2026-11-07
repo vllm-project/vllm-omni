@@ -13,7 +13,6 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
 ]
 

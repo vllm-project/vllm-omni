@@ -64,10 +64,10 @@ async def init_weight_transfer_engine(request: Request):
         engine = _get_engine_client(request)
         await engine.init_weight_transfer_engine(init_info)
         return JSONResponse(content={"message": "Weight transfer initialized"})
-    except Exception as err:
+    except Exception:
         logger.exception("Failed to initialize weight transfer engine")
         return JSONResponse(
-            content={"error": f"Failed to initialize: {err}"},
+            content={"error": "Failed to initialize weight transfer engine"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
 
@@ -79,10 +79,10 @@ async def start_weight_update(request: Request):
         engine = _get_engine_client(request)
         await engine.start_weight_update()
         return JSONResponse(content={"message": "Weight update started"})
-    except Exception as err:
+    except Exception:
         logger.exception("Failed to start weight update")
         return JSONResponse(
-            content={"error": f"Failed to start weight update: {err}"},
+            content={"error": "Failed to start weight update"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
 
@@ -121,10 +121,10 @@ async def update_weights(request: Request):
         engine = _get_engine_client(request)
         await engine.update_weights(update_info)
         return JSONResponse(content={"message": "Weights updated"})
-    except Exception as err:
+    except Exception:
         logger.exception("Failed to update weights")
         return JSONResponse(
-            content={"error": f"Failed to update weights: {err}"},
+            content={"error": "Failed to update weights"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
 
@@ -136,9 +136,9 @@ async def finish_weight_update(request: Request):
         engine = _get_engine_client(request)
         await engine.finish_weight_update()
         return JSONResponse(content={"message": "Weight update finished"})
-    except Exception as err:
+    except Exception:
         logger.exception("Failed to finish weight update")
         return JSONResponse(
-            content={"error": f"Failed to finish weight update: {err}"},
+            content={"error": "Failed to finish weight update"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )

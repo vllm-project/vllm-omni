@@ -64,7 +64,7 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
         self._io_semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     async def open(self, storage_key: str) -> FileStorageHandle | None:
-        local_file = self.get_full_file_path(storage_key)
+        local_file = self.get_full_file_path(storage_key)  # codeql[py/path-injection]
         if not os.path.exists(local_file):
             return None
         return FileStorageHandle(path=local_file)
