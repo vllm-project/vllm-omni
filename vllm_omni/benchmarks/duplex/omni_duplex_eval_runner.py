@@ -579,8 +579,8 @@ async def _bounded_ack_join(task: asyncio.Task) -> None:
     if pending:
         task.add_done_callback(_consume_task_exception)
         logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
-    elif not task.cancelled() and task.exception() is not None:
-        raise task.exception()
+    elif not task.cancelled() and (error := task.exception()) is not None:
+        raise error
 
 
 async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:
