@@ -58,7 +58,7 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
     - Directly combines them with CFG formula
     - **CFG batching**: pipelines that set `supports_cfg_batching = True` compute both predictions in one
     `predict_noise()` call on the branches concatenated along dim 0, then split the output at the positive batch
-    size (`enable_cfg_batching`, default on). See [Opt in to CFG batching](#opt-in-to-cfg-batching).
+    size (`enable_cfg_batching`, default off). See [Opt in to CFG batching](#opt-in-to-cfg-batching).
 
 `scheduler_step_maybe_with_cfg()` ensures consistent latent states across all ranks:
 

@@ -104,8 +104,8 @@ In `DiffusionParallelConfig`
 
 Without CFG-Parallel (`cfg_parallel_size=1`), some pipelines run the positive and negative branch as one denoiser
 call on the two branches concatenated along the batch dimension, instead of two calls. This halves the denoiser
-calls per step, which helps most where a step is launch-bound (small resolutions, eager mode). It is on by default
-(`enable_cfg_batching`); disable it with `--no-enable-cfg-batching` or `Omni(..., enable_cfg_batching=False)`.
+calls per step, which helps most where a step is launch-bound (small resolutions, eager mode). It is off by default;
+enable it with `--enable-cfg-batching` or `Omni(..., enable_cfg_batching=True)`.
 
 - Pipelines opt in with `supports_cfg_batching = True`: SDXL, SD3, FLUX.1 (true CFG) and FLUX.1-Kontext,
   FLUX.2 and FLUX.2-Klein, Wan2.2 T2V/TI2V/I2V/VACE.

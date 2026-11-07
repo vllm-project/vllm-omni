@@ -887,7 +887,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False
     # Mirrors OmniDiffusionConfig.enable_cfg_batching.
-    enable_cfg_batching: bool = True
+    enable_cfg_batching: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"

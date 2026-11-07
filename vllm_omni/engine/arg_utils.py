@@ -803,7 +803,7 @@ class OrchestratorArgs:
     diffusion_use_graph: bool = False
     diffusion_graph_release_after_denoise: bool = False
     # Run both CFG branches as one batched denoiser call on pipelines that
-    # support it. None defers to the OmniDiffusionConfig default (enabled).
+    # support it. None defers to the OmniDiffusionConfig default (disabled).
     enable_cfg_batching: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
