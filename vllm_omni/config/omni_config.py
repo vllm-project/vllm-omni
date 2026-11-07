@@ -839,7 +839,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     cache_config: Any = field(default_factory=dict)
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
-    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    # ``None`` means "not specified": ``__post_init__`` resolves it from the
+    # model's paged-KV capability and the stage configuration, exactly as
+    # ``OmniDiffusionConfig`` does, so the projection and the runtime config
+    # cannot disagree.
+    diffusion_kv_mode: DiffusionKVCacheMode | None = None
     enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
@@ -988,7 +992,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             validate_host_weight_runtime_options,
             validate_kv_cache_dtype_vs_attention_specs,
         )
-        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
+        from vllm_omni.diffusion.diffusion_kv.config import resolve_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
 
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
@@ -1062,17 +1066,47 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             )
         validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
 
-        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
-        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+        # The projection may know only ``model_arch`` until the pipeline class is
+        # resolved, so both feed this lookup. It still fills ``model_class_name``
+        # from ``model_arch`` before the stage is serialized, which is why the
+        # runtime ``OmniDiffusionConfig`` can look up ``model_class_name`` alone
+        # and the two cannot disagree on the serialized stage payload.
+        metadata = get_diffusion_model_metadata(self.model_class_name or self.model_arch)
+        explicit_kv_mode = self.diffusion_kv_mode
+        kv_resolution = resolve_diffusion_kv_cache_mode(
+            explicit_kv_mode,
+            model_paged_kv_default_eligible=metadata.paged_kv_default_eligible,
+            max_rows_per_request=self.diffusion_kv_max_rows_per_request,
+            model_default_max_rows=metadata.paged_kv_max_rows_per_request,
+            step_execution=bool(self.step_execution),
+            offload_enabled=self._has_diffusion_offload_enabled(),
+            attention_backend=self._paged_attention_backend(),
+            paged_only_features=self._paged_only_features(),
+        )
+        if explicit_kv_mode is not None:
+            self.diffusion_kv_mode = kv_resolution.mode
+        # An unset mode stays unset: this projection is serialized into the stage
+        # config, and baking a resolved default here would freeze it, so a later
+        # change to the default could not reach deploy-config stages. The runtime
+        # ``OmniDiffusionConfig`` resolves the unset value.
+        #
+        # The row limit is never written back for either case: an inherited
+        # metadata value is resolved again from the model integration at runtime,
+        # so freezing it into the stage config would pin a value the model could
+        # later revise.
+        #
+        # The sequence-parallel layout and legacy imported AR KV
+        # (``omni_kv_config['need_recv_cache']``) are not projection fields, so
+        # those incompatibilities are reported when the runtime config is built,
+        # one stage later, and still before any model is loaded. Everything else
+        # above is validated here.
+        if self.enable_prefix_caching and not kv_resolution.is_paged:
             raise ValueError(
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
                 "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
             )
-        if (
-            self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and self.diffusion_kv_max_rows_per_request is None
-        ):
-            raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1097,6 +1131,47 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
+
+    def _has_diffusion_offload_enabled(self) -> bool:
+        """Return whether any weight-offload path is configured.
+
+        Paged KV has not been validated with CPU, layerwise, or distributed
+        layerwise offload, so an implicit KV-mode resolution must stay on the
+        dense path for those stages.
+        """
+
+        return bool(
+            self.enable_cpu_offload
+            or self.enable_layerwise_offload
+            or self.enable_distributed_layerwise_offload
+            or self.diffusion_offload_config
+        )
+
+    def _paged_only_features(self) -> tuple[str, ...]:
+        """Return the enabled features that only run on the paged KV path."""
+
+        features = []
+        if self.enable_prefix_caching:
+            features.append("enable_prefix_caching")
+        if self.kv_transfer_config is not None:
+            features.append("kv_transfer_config")
+        return tuple(features)
+
+    def _paged_attention_backend(self) -> str | None:
+        """Return the attention backend the paged self-attention role resolves to.
+
+        Paged KV is a self-attention feature (cross attention rejects a paged
+        cache role), and the attention layer resolves a role through
+        ``per_role[role]`` -> ``per_role[role_category]`` -> ``default``. Reading
+        only ``default`` would miss a ``per_role`` override that selects a
+        backend without a paged implementation.
+        """
+
+        # Both config classes normalize ``diffusion_attention_config`` before
+        # resolving the KV mode, so the effective backend (including the
+        # DIFFUSION_ATTENTION_BACKEND fallback) is readable here.
+        spec, _source = self.diffusion_attention_config.resolve_with_source(role="self", role_category="self")
+        return None if spec is None else spec.backend
 
     def _propagate_quantization_from_tf_config(self, tf_config: Any) -> None:
         quant_config = getattr(tf_config, "quant_config", None)
