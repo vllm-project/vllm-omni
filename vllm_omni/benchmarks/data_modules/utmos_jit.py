@@ -15,9 +15,62 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
+
+_INT16_INPUT_SCALE = 32768.0
+
+
+def _detect_utmos_input_scale(model: torch.jit.ScriptModule) -> float:
+    """Recognize int16 normalization on the waveform, through optional ``to`` casts.
+
+    Only follow a single-use path from the sole waveform argument. A division
+    of a feature/output, or a graph that also consumes the unnormalized input,
+    does not establish an int16 input contract and must not rescale the input.
+    """
+    import torch
+
+    inputs = list(model.graph.inputs())
+    if len(inputs) != 2 or inputs[1].type().kind() != "TensorType":
+        return 1.0
+    waveform = inputs[1]
+    while True:
+        uses = list(waveform.uses())
+        if len(uses) != 1 or uses[0].offset != 0:
+            return 1.0
+        node = uses[0].user
+        if node.kind() == "aten::to":
+            waveform = node.output()
+            continue
+        operands = list(node.inputs())
+        if node.kind() != "aten::div" or len(operands) != 2:
+            return 1.0
+        if operands[1].node().kind() != "prim::Constant":
+            return 1.0
+        divisor = operands[1].toIValue()
+        if isinstance(divisor, torch.Tensor):
+            if divisor.numel() != 1:
+                return 1.0
+            divisor = divisor.item()
+        return _INT16_INPUT_SCALE if divisor == _INT16_INPUT_SCALE else 1.0
+
+
+class _UTMOSScorer:
+    """Accept float32 [-1, 1] audio while preserving the archive's input scale."""
+
+    def __init__(self, model: torch.jit.ScriptModule) -> None:
+        self._model = model
+        self._input_scale = _detect_utmos_input_scale(model)
+
+    def __call__(self, audio: torch.Tensor) -> torch.Tensor:
+        if self._input_scale != 1.0:
+            # Out of place: a caller may reuse its waveform for WER/SIM.
+            audio = audio * self._input_scale
+        return self._model(audio)
 
 
 def retarget_utmos_jit_devices(module: Any, device: str) -> int:
@@ -52,8 +105,13 @@ def retarget_utmos_jit_devices(module: Any, device: str) -> int:
     return _walk_module(module)
 
 
-def load_utmos_jit(path: str, device: str) -> Any:
-    """Load UTMOS on ``device`` and retarget the traced ``cuda:0`` constants."""
+def load_utmos_jit(path: str, device: str) -> _UTMOSScorer:
+    """Load a scorer accepting float32 [-1, 1] audio on ``device``.
+
+    Retarget baked devices as before, then adapt amplitude once per call if
+    the archive normalizes its waveform input by 32768 (``balacoon/utmos``).
+    Both the in-process scorer and the NPU worker use this callable.
+    """
     if device.startswith("npu"):
         import torch_npu  # noqa: F401
     import torch
@@ -63,10 +121,11 @@ def load_utmos_jit(path: str, device: str) -> Any:
     rewritten = retarget_utmos_jit_devices(model, device)
     if rewritten == 0:
         raise RuntimeError(f"UTMOS graph has no cuda:0 device constants to retarget onto {device}.")
+    scorer = _UTMOSScorer(model)
     warmup = torch.zeros(1, 16000, dtype=torch.float32, device=device)
     with torch.no_grad():
-        model(warmup)
-    return model
+        scorer(warmup)
+    return scorer
 
 
 def serve_utmos_npu(jit_path: str, conn: Any) -> None:
