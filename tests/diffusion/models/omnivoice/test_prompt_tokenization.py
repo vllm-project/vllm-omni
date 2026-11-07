@@ -13,6 +13,7 @@ from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import (
     OmniVoicePipeline,
     _tokenize_with_nonverbal_tags,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -45,7 +46,7 @@ def test_prepare_request_tokenizes_text_once_with_reference_audio(audio_mode):
         prompt["multi_modal_data"] = {"audio": [(np.full(2400, 0.2, dtype=np.float32), 24000)]}
         prompt["voice_name"] = "speaker"
 
-    prepared = pipeline._prepare_request_input(prompt, {"seed": 42})
+    prepared = pipeline._prepare_request_input(prompt, OmniDiffusionSamplingParams(seed=42))
 
     assert pipeline.tokenizer.encode.call_count == 2  # One style and one text encoding.
     expected_ref_text = "reference" if audio_mode == "none" else "reference."
