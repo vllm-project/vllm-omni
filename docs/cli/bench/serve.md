@@ -47,35 +47,26 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The total number of requests to send, an integer.
 
 - `--max-concurrency`
-  "Maximum number of concurrent requests. This can be used "
-        "to help simulate an environment where a higher level component "
-        "is enforcing a maximum number of concurrent requests. While the "
-        "--request-rate argument controls the rate at which requests are "
-        "initiated, this argument will control how many are actually allowed "
-        "to execute at a time. This means that when used in combination, the "
-        "actual request rate may be lower than specified with --request-rate, "
-        "if the server is not processing requests fast enough to keep up."
+  Limit the number of requests executing concurrently. `--request-rate`
+  controls arrivals, while this option limits active requests. If the server
+  cannot keep up, the achieved request rate can be lower than the configured rate.
 
 - `--request-rate`
-  "Number of requests per second. If this is inf, "
-        "then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process or gamma distribution "
-        "to synthesize the request arrival times."
+  Set the offered request rate in requests per second. `inf` schedules all
+  requests immediately, subject to the concurrency limit. Finite rates use
+  generated arrival times from a Poisson process or gamma distribution.
 
 - `--ignore-eos`
-  "Set ignore_eos flag when sending the benchmark request."
+  Set the `ignore_eos` flag in benchmark requests.
 
 - `--metric-percentiles`
-  Comma-separated list of percentiles for selected metrics. "
-        "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
-        "Default value is \"99\"."
-        "Use \"--percentile-metrics\" to select metrics.
+  Select percentiles as a comma-separated list, for example `25,50,75`.
+  The default is `99`. Use `--percentile-metrics` to select the metrics.
 
 - `--percentile-metrics`
-        "Comma-separated list of selected metrics to report percentiles."
-                    "This argument specifies the metrics to report percentiles."
-                    'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
-                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+  Select metrics as a comma-separated list, for example `ttft,tpot,itl,e2el`
+  for text or `audio_ttfp,audio_rtf` for speech. Consult `--help=all` for the
+  metric choices supported by the installed version.
 
 - `--goodput`
   Specify request-level service objectives as space-separated `KEY:VALUE` pairs, with values in milliseconds.
@@ -90,17 +81,14 @@ Print per-stage benchmark metrics for --omni serving when stage metrics are retu
 Specify to save benchmark results to a json file
 
 - `--save-detailed`
-"When saving the results, whether to include per request "
-        "information such as response, error, ttfs, tpots, etc."
+  Include per-request details, such as responses, errors, and timings, in saved results.
 
 - `--result-dir`
- "Specify directory to save benchmark json results."
-        "If not specified, results are saved in the current directory."
+  Set the directory for benchmark JSON results. Defaults to the current directory.
 
 - `--result-filename`
-"Specify the filename to save benchmark json results."
-        "If not specified, results will be saved in "
-        "{label}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
+  Set the filename for benchmark JSON results. If omitted, the filename is
+  generated from the label, request rate, model ID, and timestamp.
 
 - `--random-prefix-len`
   Number of fixed prefix tokens before the random context in a request.
