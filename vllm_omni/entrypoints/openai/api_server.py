@@ -1024,10 +1024,14 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             enable_force_include_usage=args.enable_force_include_usage,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+            allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
         state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+            allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
 
         # audio related
