@@ -203,5 +203,7 @@ Isolation: [metric that stayed unchanged, isolating the gain to <stage>]
   orchestrator monitor), `docs/contributing/metrics.md`
 - `.claude/skills/review-pr/references/checks/perf-verification.md`: what
   reviewers will ask for
+- `omni-perf-ceiling`: reachable ceiling and per-stage headroom before
+  choosing levers
 - `quantization` skill for precision work; `vllm-omni-test` for perf JSON rows
   under `tests/dfx/perf/tests/`
