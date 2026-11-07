@@ -1,0 +1,49 @@
+[
+  {
+    "test_name": "test_sglang_qwen_image_21_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Native SGLang Diffusion, one H100, common online images/generations client.",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "backend": "sglang",
+        "num-gpus": 1,
+        "attention-backend": "torch_sdpa",
+        "warmup-mode": "off"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "return_stage_metrics": true
+        },
+        "seed": 0,
+        "num_warmups": 2
+      }
+    ],
+    "server_type": "sglang-diffusion"
+  }
+]

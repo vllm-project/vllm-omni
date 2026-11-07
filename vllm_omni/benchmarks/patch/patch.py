@@ -466,6 +466,8 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
         return  # voice comes from --extra-body in config; no ref_audio to merge
     base = dict(rfi.extra_body) if rfi.extra_body else {}
     base.update(ex)
+    if sample.seed_tts_chat_ref_audio_field == "audio.ref_audio":
+        base["audio"] = {**(base.get("audio") or {}), "ref_audio": base.pop("ref_audio")}
     rfi.extra_body = base
 
 
@@ -969,6 +971,11 @@ def get_samples(args, tokenizer, **kwargs):
                 "Seed-TTS requires --dataset-path (HF dataset repo id or local directory) or "
                 "--hf-name for the Hub dataset id."
             )
+        chat_ref_audio_field = getattr(args, "seed_tts_chat_ref_audio_field", "ref_audio")
+        if chat_ref_audio_field == "audio.ref_audio" and (
+            args.dataset_name != "seed-tts" or args.backend != "openai-chat-omni"
+        ):
+            raise ValueError("audio.ref_audio requires seed-tts with --backend openai-chat-omni")
         reference_as_input = bool(getattr(args, "seed_tts_reference_as_input", False))
         if reference_as_input and (args.dataset_name != "seed-tts" or args.backend != "openai-realtime-chat"):
             raise ValueError("--seed-tts-reference-as-input requires seed-tts with --backend openai-realtime-chat")
@@ -1013,6 +1020,7 @@ def get_samples(args, tokenizer, **kwargs):
             no_oversample=args.no_oversample,
             turns_per_session=turns_per_session,
             reference_as_input=reference_as_input,
+            chat_ref_audio_field=chat_ref_audio_field,
         )
 
     # Handle random-mm dataset (Omni's synthetic multimodal dataset)
@@ -2163,7 +2171,8 @@ async def async_request_openai_chat_omni_completions(
                                     content = delta.get("content")
                                     if not content and isinstance(delta.get("audio"), dict):
                                         content = delta["audio"].get("data")
-                                    if modality == "text":
+                                    # OpenAI-compatible streams may omit the modality extension.
+                                    if modality == "text" or (modality is None and delta.get("content")):
                                         token_delta, completion_tokens_seen = _resolve_token_delta_from_usage(
                                             completion_tokens,
                                             completion_tokens_seen,
@@ -2189,11 +2198,15 @@ async def async_request_openai_chat_omni_completions(
                                             )
                                         if has_text_content:
                                             generated_text += content
-                                    elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
-                                        audio_generate_time = timestamp - st
+                                    if modality == "audio" or (
+                                        modality is None and isinstance(delta.get("audio"), dict)
+                                    ):
+                                        if isinstance(delta.get("audio"), dict):
+                                            content = delta["audio"].get("data")
                                         if content:
+                                            if output.audio_ttfp == 0.0:
+                                                output.audio_ttfp = timestamp - st
+                                            audio_generate_time = timestamp - st
                                             audio_bytes = base64.b64decode(content)
                                             if response_format == "wav":
                                                 try:
@@ -2333,6 +2346,9 @@ async def async_request_openai_chat_omni_completions(
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = not streaming_error_received
+                    if output.success and "audio" in (payload.get("modalities") or []) and audio_frames == 0:
+                        output.success = False
+                        output.error = "Audio was requested but no decodable audio frames were received"
                     retryable_response = streaming_error_received and streaming_errors_retryable
                 else:
                     output.error = response.reason or ""
