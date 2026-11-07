@@ -794,7 +794,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        17,
+        13,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
@@ -1322,16 +1322,21 @@ def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     assert AITER_MHA_CACHE_PUBLISH not in pytest_commands[1]
 
 
-def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
-    step = _find_step("Diffusion Stable Audio Layerwise Offload Test (quarantined)")
-
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    _assert_build_scoped_aiter_mha_cache(step, STABLE_AUDIO_LAYERWISE_NODE, publishes=False)
+def test_stable_audio_layerwise_merge_owner_is_removed() -> None:
+    pipeline = yaml.safe_load(AMD_MERGE_PIPELINE.read_text(encoding="utf-8"))
+    labels = [step.get("label") for step in _walk_steps(pipeline["steps"])]
+    assert "Diffusion Stable Audio Layerwise Offload Test (quarantined)" not in labels
 
     blocking = _find_step("Diffusion Model CPU offloading Test")
+    commands = "\n".join(blocking["commands"])
+    deselect = f"--deselect='{STABLE_AUDIO_LAYERWISE_NODE}'"
+
+    assert blocking["grade"] == "Blocking"
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in blocking["commands"]
     assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
+    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
+    assert "tests/diffusion/offloader/test_diffusion_layerwise_offload.py" in commands
+    assert deselect in commands
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
@@ -1889,6 +1894,80 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
+def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
+
+    assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 60
+    assert step["source_file_dependencies"] == [
+        "diffusion_offloader",
+        "diffusion_stable_audio_function",
+    ]
+    assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-layerwise-offload/**/*"]
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level full_model" in command
+    assert "timeout --signal=TERM --kill-after=2m 45m" in command
+    assert STABLE_AUDIO_LAYERWISE_NODE in command
+    assert "test_diffusion_cpu_offload.py" not in command
+    assert "riverclouds/qwen_image_random" not in command
+    assert "if pytest --collect-only -q" in command
+    assert "else\n  exit $$?" in command
+    assert "PIPESTATUS[0]" in command
+    assert "Expected exactly one Stable Audio layerwise-offload node" in command
+    assert "Expected exactly one executed Stable Audio layerwise-offload test" in command
+    assert "skipped != 0" in command
+    _assert_build_scoped_aiter_mha_cache(
+        step,
+        "tests/diffusion/offloader/test_diffusion_layerwise_offload.py",
+        publishes=False,
+    )
+    cpu_offload = "\n".join(_find_step("Stable Audio CPU Offload", AMD_NIGHTLY_PIPELINE)["commands"])
+    assert "test_diffusion_layerwise_offload.py" not in cpu_offload
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_WEEKLY_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert 'label: "Stable Audio Layerwise Offload"' not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_stable_audio_layerwise_offload_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="Stable Audio Layerwise Offload",
+        command_fragment="pytest -s -v -ra",
+        expected_message=("Expected exactly one executed Stable Audio layerwise-offload test"),
+        artifact_env="LAYERWISE_OFFLOAD_ARTIFACT_DIR",
+        job_id_prefix="layerwise-offload-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     runner = AMD_RUNNER.read_text(encoding="utf-8")
     template = AMD_TEMPLATE.read_text(encoding="utf-8")
@@ -1962,7 +2041,7 @@ def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
     assert "exit 5" in two_commands
     similarity = Path(WAN22_SIMILARITY).read_text(encoding="utf-8")
     assert "require_similarity_artifacts" in similarity
-    assert "similarity.json" in similarity
+    assert "write_accuracy_result" in similarity
     assert "Missing offline artifacts" not in similarity
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
@@ -2276,7 +2355,8 @@ def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
     assert "test_qwen_image_21_matches_reference[t2i]" in commands
     assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
     accuracy_test = Path("tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py").read_text(encoding="utf-8")
-    assert 'os.environ.get("BUILDKITE_COMMIT")' in accuracy_test
+    assert "write_accuracy_result" in accuracy_test
+    assert "write_json_artifact" not in accuracy_test
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image 2.1 Accuracy" not in text
@@ -3108,7 +3188,7 @@ def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
 
     assert blocking_step["agent_pool"] == "mi300_2"
     assert blocking_step["grade"] == "Blocking"
-    assert "assert-pytest-collection.sh 17" in blocking_commands
+    assert "assert-pytest-collection.sh 13" in blocking_commands
     assert shm_path not in blocking_commands
 
     step = _find_step("Qwen3-Omni SHM Leak Test", AMD_MERGE_PIPELINE)
@@ -3174,15 +3254,12 @@ _QWEN3_OMNI_READY_NODES = (
     "test_thinker_prefix_caching_async_chunk_identical[prefix_cache_async_chunk]",
     "tests/e2e/online_serving/test_qwen3_omni.py::"
     "test_thinker_prefix_caching_async_chunk_shared_image_prefix[prefix_cache_async_chunk]",
-    "tests/e2e/online_serving/test_qwen3_omni.py::test_completions_rejected_for_thinker_talker[default-rocm]",
     "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_text[default-rocm]",
     "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_audio_out[default-rocm]",
-    "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts0-default-rocm]",
-    "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts1-default-rocm]",
 )
 
 
-def test_qwen3_omni_ready_selects_eleven_core_model_nodes() -> None:
+def test_qwen3_omni_ready_selects_eight_core_model_nodes() -> None:
     """READY runs the online core_model cases only, and only on two MI325 cards."""
     step = _find_step("Omni Model Test Qwen3-Omni", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3202,7 +3279,7 @@ def test_qwen3_omni_ready_selects_eleven_core_model_nodes() -> None:
     assert "pytest.xml" in command
     assert "pytest.log" in command
     assert "pytest-summary.txt" in command
-    assert "Expected exactly 11 executed Qwen3-Omni READY tests" in command
+    assert "Expected exactly 8 executed Qwen3-Omni READY tests" in command
     for node in _QWEN3_OMNI_READY_NODES:
         assert node in command
     assert command.count("tests/e2e/online_serving/test_qwen3_omni.py::") == len(_QWEN3_OMNI_READY_NODES)
@@ -3211,11 +3288,11 @@ def test_qwen3_omni_ready_selects_eleven_core_model_nodes() -> None:
 @pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
-        (0, 11, 0, None, 0),
-        (0, 11, 1, None, 5),
+        (0, 8, 0, None, 0),
+        (0, 8, 1, None, 5),
         (0, 0, 0, None, 5),
-        (1, 11, 0, None, 1),
-        (0, 11, 0, 124, 124),
+        (1, 8, 0, None, 1),
+        (0, 8, 0, 124, 124),
     ],
     ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
 )
@@ -3232,7 +3309,7 @@ def test_qwen3_omni_ready_executes_junit_guard_before_exit(
         pipeline_path=AMD_READY_PIPELINE,
         step_label="Omni Model Test Qwen3-Omni",
         command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly 11 executed Qwen3-Omni READY tests",
+        expected_message="Expected exactly 8 executed Qwen3-Omni READY tests",
         artifact_env="ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR",
         job_id_prefix="qwen3-omni-ready-guard",
         pytest_status=pytest_status,
@@ -3825,6 +3902,9 @@ _WORKER_ONE_CARD_EXCLUDED = (
 _WORKER_ONE_CARD_NODES = (
     "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[1]",
     "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[3]",
+    "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape0]",
+    "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape1]",
+    "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape2]",
     "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets0]",
     "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets1]",
     "tests/worker/test_batched_omni_output.py::test_mixed_stop_flags_do_not_synchronize_cuda",
@@ -3867,7 +3947,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    32 ids. R2-01 still collects 1420 model-executor nodes and does not run them.
+    35 ids. R2-01 still collects 1420 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3887,7 +3967,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     ]
     assert command.count('--run-level "core_model"') == 2
     assert quoted == _WORKER_ONE_CARD_NODES
-    assert len(_WORKER_ONE_CARD_NODES) == 32
+    assert len(_WORKER_ONE_CARD_NODES) == 35
     for path in _WORKER_ONE_CARD_FILES:
         assert sum(node.startswith(path + "::") for node in quoted) >= 1
         assert command.count(f"\n  {path} \\\n") == 2
@@ -3896,7 +3976,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         assert "MI325" not in Path(path).read_text(encoding="utf-8")
     assert "diff -u /tmp/worker-ready-expected.txt" in command
     assert "--junitxml=" in command
-    assert "Expected exactly 32 executed one-card worker GPU tests" in command
+    assert "Expected exactly 35 executed one-card worker GPU tests" in command
     assert "pytest.log" not in command
     assert "pytest-summary.txt" not in command
     assert "PIPESTATUS" not in command
@@ -3966,15 +4046,16 @@ def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
     assert '"rocm": "MI325"' in _hardware_decorator(source, "test_text_to_audio_001")
     assert '"rocm": 1' in _hardware_decorator(source, "test_text_to_audio_001")
     for name in _DRAMA3_EXCLUDED:
-        assert "rocm" not in _hardware_decorator(source, name)
-    assert source.count('"rocm": "MI325"') == 1
+        assert '"rocm": "MI325"' in _hardware_decorator(source, name)
+        assert "@pytest.mark.core_model" not in _hardware_decorator(source, name)
+    assert source.count('"rocm": "MI325"') == 4
 
 
 def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     """MERGE runs the READY node at advanced_model. READY stays core_model.
 
     ``--run-level advanced_model`` drops dummy weights and enables the shared
-    speech transcript check. Voice-clone nodes stay unmarked for ROCm.
+    speech transcript check. Voice-clone nodes run in their own MERGE job.
     """
     ready = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
     step = _find_step("MERGE · Drama 3 Text-to-Audio", AMD_MERGE_PIPELINE)
@@ -4006,7 +4087,7 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert command.count('--run-level "advanced_model"') == 2
     assert "core_model" not in command
     assert "full_model" not in command
-    assert command.count(_DRAMA3_READY_NODE) == 1
+    assert command.count(_DRAMA3_READY_NODE) == 3
     assert "diff -u /tmp/drama3-merge-expected.txt" in command
     assert "Expected exactly one executed Drama 3 MERGE test" in command
     assert "@pytest.mark.core_model" in selected
@@ -4018,7 +4099,7 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert "_delete_dummy_load_format" in weight_selector
     for name in _DRAMA3_EXCLUDED:
         assert name not in command
-        assert "rocm" not in _hardware_decorator(source, name)
+        assert '"rocm": "MI325"' in _hardware_decorator(source, name)
 
 
 _DEVICE_REDUCTION_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
@@ -4602,7 +4683,7 @@ def test_device_reduction_ready_renders_blocking() -> None:
     [
         (
             "ROCm · One-Card Worker GPU Test",
-            "Expected exactly 32 executed one-card worker GPU tests",
+            "Expected exactly 35 executed one-card worker GPU tests",
         ),
         (
             "ROCm · One-Card Worker Copy Test",
@@ -4665,8 +4746,8 @@ def test_device_reduction_ready_executes_junit_guard_before_exit(
     [
         (
             "ROCm · One-Card Worker GPU Test",
-            32,
-            "Expected exactly 32 executed one-card worker GPU tests",
+            35,
+            "Expected exactly 35 executed one-card worker GPU tests",
             "WORKER_READY_ARTIFACT_DIR",
             "worker-ready-guard",
         ),

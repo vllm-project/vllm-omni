@@ -378,8 +378,17 @@ chain. The runners only call `_prefix_cache_step_begin` before retiring
 finished requests, `_prefix_cache_save_mrv2` after postprocess, and
 `_prefix_cache_output_finalizer` when building the async output.
 
-Duplex sessions on MRv2 commit each utterance as a fresh request, so they
-use this path unchanged. The NPU MRv2 runner does not build the cache.
+MiniCPM-o's turn-mode Thinker opts into this output cache. Its `latent`,
+`latent_input_ids` and `latent_positions` are all token-aligned outputs from
+the same forward and must be restored together before the llm2tts bridge
+selects the reply's hidden rows. CUDA turn profiles enable this on both V1
+and MRv2. MiniCPM-o duplex keeps prefix caching disabled because its mutable
+KV window cannot share cached blocks; the Talker does not opt into output
+replay.
+
+Duplex models that commit each utterance as a fresh request can use this path
+when their KV and model-state contracts permit reuse. The NPU MRv2 runner does
+not build the cache.
 
 Fish Omni retains the default `allow` policy: its MRv2 model state saves the
 generated codebooks before a slot is reused and restores full frame rows on

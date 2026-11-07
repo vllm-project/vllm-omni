@@ -63,6 +63,7 @@ def test_runner_assisted_mixed_batch_has_independent_token_and_request_capacity(
 def _make_runner():
     """Create an OmniGPUModelRunner without calling __init__."""
     runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
     runner._staged_writes = staged_writes.StagedWrites()
     runner.model = MagicMock()
     runner.model_config = SimpleNamespace(logits_processors=None)

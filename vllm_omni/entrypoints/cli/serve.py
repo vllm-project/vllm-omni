@@ -667,6 +667,12 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-application",
+            choices=["runtime", "merged"],
+            default=None,
+            help="Apply diffusion LoRA per request, or merge one global policy into dense weights.",
+        )
+        omni_config_group.add_argument(
             "--lora-scale",
             type=float,
             default=None,

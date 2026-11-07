@@ -64,10 +64,13 @@ positive block size. The conversion below reads that size back off the spec the
 parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
-Nothing here has been executed: it needs an engine, a checkpoint and a GPU. The
-arithmetic it delegates to is CPU-covered by
+The arithmetic it delegates to is CPU-covered by
 ``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
 also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
+``tests/worker_v2/test_minicpmo_duplex_block_table.py`` exercises MRv2's actual
+GPU block-table gather across the allocation bound and after compaction. The
+spec disables ordinary sliding-window masking: that bound sizes admission,
+but does not authorize the worker to hide the manager's retained pages.
 
 Wiring, in the order the pieces get used
 ----------------------------------------
@@ -271,6 +274,18 @@ class MiniCPMO45DuplexWindowSpec(ChunkWindowSpec):
     MRO, so an unregistered subclass silently keeps the parent manager and the
     trim entry point is never reachable.
     """
+
+    @property
+    def num_retained_tokens(self) -> int:
+        """Disable MRv2's ordinary sliding-window block-table masking.
+
+        Zero tells BlockTables to preserve the manager's complete table. Our
+        sliding_window is an admission bound, not an attention mask: only the
+        duplex manager may remove history, retaining sink pages and reanchoring
+        the remaining positions. Sessions with windowing off can also exceed
+        that bound. Masking their leading blocks silently loses live context.
+        """
+        return 0
 
 
 def duplex_window_spec(geometry: DuplexWindowGeometry, layer_spec: SlidingWindowSpec) -> MiniCPMO45DuplexWindowSpec:
