@@ -15,7 +15,12 @@ from PIL import Image
 from vllm.config.load import LoadConfig
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
-from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import (
+    assert_similarity,
+    measure_image_similarity,
+    model_output_dir,
+    write_accuracy_result,
+)
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
@@ -23,7 +28,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 
 MODEL_ID = "jdopensource/JoyAI-Image-Edit-Diffusers"
@@ -58,9 +63,10 @@ def _local_files_only(model: str) -> bool:
 def _joy_image_edit_pipeline_cls() -> type[Any]:
     diffusers = pytest.importorskip("diffusers")
     pipeline_cls = getattr(diffusers, "JoyImageEditPipeline", None)
-    if pipeline_cls is None:
-        pytest.skip("diffusers.JoyImageEditPipeline is required for JoyAI-Image-Edit parity testing.")
-    return pipeline_cls
+    if isinstance(pipeline_cls, type):
+        return pipeline_cls
+    pytest.skip("diffusers.JoyImageEditPipeline is required for JoyAI-Image-Edit parity testing.")
+    raise AssertionError("unreachable")
 
 
 def _load_input_image() -> Image.Image:
@@ -357,7 +363,7 @@ def _run_diffusers_joy_image_edit(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
     _joy_image_edit_pipeline_cls()
     model = _model_name()
@@ -384,6 +390,19 @@ def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
     print(f"  vllm_omni: {vllm_output_path}")
     print(f"  diffusers: {diffusers_output_path}")
 
+    ssim, psnr = measure_image_similarity(
+        model_name=MODEL_ID,
+        vllm_image=vllm_image,
+        diffusers_image=diffusers_image,
+        width=WIDTH,
+        height=HEIGHT,
+    )
+    write_accuracy_result(
+        model_id=MODEL_ID,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+    )
     assert_similarity(
         model_name=MODEL_ID,
         vllm_image=vllm_image,
@@ -392,6 +411,8 @@ def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
         height=HEIGHT,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
     _print_latent_metrics(
         _run_latent_parity_comparison(

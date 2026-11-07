@@ -97,13 +97,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             if self.request_belongs_to_session(request_id, session_id):
                 self.close_request(request_id)
 
-    def has_request(self, request_id: str) -> bool:
-        return request_id in self._requests
-
-    def has_pending_audio(self, request_id: str) -> bool:
-        state = self._requests.get(request_id)
-        return bool(state and state.pending_audio_without_text)
-
     def audio_offset(self, request_id: str | None) -> int | None:
         if request_id is None:
             return None
@@ -574,12 +567,6 @@ def coerce_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def payload_turn_id(payload: object) -> int | None:
-    if not isinstance(payload, Mapping):
-        return None
-    return coerce_int(payload.get("duplex_turn_id"))
 
 
 def output_turn_id_from_metadata(mm_output: dict[str, object]) -> int | None:

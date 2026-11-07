@@ -10,9 +10,14 @@ import pytest
 import torch
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -309,3 +314,51 @@ def test_execute_request_server_error_has_no_client_status(executor, monkeypatch
     assert runner_output.result.error == "CUDA out of memory"
     assert runner_output.result.error_status_code is None
     assert runner_output.result.error_type is None
+
+
+@pytest.mark.parametrize(
+    "error,expected_status,expected_type",
+    [
+        (OmniClientError("invalid schedule"), 400, "BadRequestError"),
+        (OmniClientError("rejected", status_code=422, error_type="ScheduleError"), 422, "ScheduleError"),
+        (RuntimeError("worker failed"), None, None),
+        (ValueError("ordinary value error"), None, None),
+    ],
+)
+def test_execute_request_keeps_error_metadata_and_next_request(
+    executor, monkeypatch, error, expected_status, expected_type
+):
+    exec_, worker = executor
+    monkeypatch.setattr(exec_, "_device_is_usable", lambda: True)
+    good = DiffusionOutput(output="ok")
+    worker.execute_method.side_effect = [error, good]
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[
+            NewRequestData(
+                request_id=name,
+                req=OmniDiffusionRequest(
+                    request_id=name,
+                    prompt={"prompt": "a test"},
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+                ),
+            )
+            for name in ("bad", "good")
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+
+    result = exec_.execute_request(scheduler_output)
+
+    bad, healthy = result.runner_outputs
+    assert bad.request_id == "bad"
+    assert bad.finished is True
+    assert bad.result.error == str(error)
+    assert bad.result.error_status_code == expected_status
+    assert bad.result.error_type == expected_type
+    assert healthy.request_id == "good"
+    assert healthy.result is good
+    assert exec_.is_dead is False

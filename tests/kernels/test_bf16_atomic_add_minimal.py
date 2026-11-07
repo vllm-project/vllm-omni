@@ -13,7 +13,13 @@ if hasattr(torch.version, "musa") and torch.version.musa is not None:
 
 from vllm.triton_utils import tl, triton
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.musa]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+    *hardware_marks(res={"musa": "S5000"}, num_cards=1),
+]
 
 
 @triton.jit

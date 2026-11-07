@@ -23,13 +23,14 @@ from vllm.logger import init_logger
 # ``get_quantization_config()`` (which unconditionally does
 # ``from .humming import HummingConfig``) does not crash when the real
 # ``humming`` wheel is not installed.  Only populate the bare-minimum
-# names that ``humming.py`` accesses at module level.
+# names that ``humming.py`` accesses at module level. The stubs are installed
+# only while resolving a vLLM quantization class, then removed from sys.modules.
 # ---------------------------------------------------------------------------
-def _register_humming_stubs() -> None:
+def _register_humming_stubs() -> dict[str, ModuleType]:
     """Register stub ``humming`` sub-modules so that the optional
     humming quantization backend can be imported without the real wheel."""
     if "humming" in sys.modules:
-        return  # already present (real or stub)
+        return {}  # already present (real or stub)
 
     # --- sub-modules ---
     submodules: dict[str, tuple[str, ...]] = {
@@ -65,12 +66,14 @@ def _register_humming_stubs() -> None:
     for name, mod in registry.items():
         sys.modules[name] = mod
 
+    return registry
 
-_register_humming_stubs()
 
 from vllm.model_executor.layers.quantization import (  # noqa: E402
     QUANTIZATION_METHODS,
-    get_quantization_config,
+)
+from vllm.model_executor.layers.quantization import (  # noqa: E402
+    get_quantization_config as _get_vllm_quantization_config,
 )
 from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
     QuantizationConfig,
@@ -81,7 +84,22 @@ from .component_config import ComponentQuantizationConfig  # noqa: E402
 logger = init_logger(__name__)
 
 
+def _get_quantization_config(method: str) -> type[QuantizationConfig]:
+    """Resolve a vLLM quantization class without leaking placeholder modules."""
+    stubs = _register_humming_stubs()
+    try:
+        return _get_vllm_quantization_config(method)
+    finally:
+        for name, module in reversed(tuple(stubs.items())):
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
+
+
 def _build_fp8(**kw: Any) -> QuantizationConfig:
+    if kw.get("weight_scheme") == "per_channel":
+        from .fp8_config import SerializedPerChannelFp8Config
+
+        return SerializedPerChannelFp8Config.from_config(kw)
     if kw.get("is_checkpoint_fp8_serialized", False):
         from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
@@ -96,6 +114,20 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     from .int8_config import DiffusionInt8Config
 
     return DiffusionInt8Config(**kw)
+
+
+def _build_convrot_int8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W8A8 diffusion config (CUDA only)."""
+    from .convrot_config import DiffusionConvRotInt8Config
+
+    return DiffusionConvRotInt8Config(**kw)
+
+
+def _build_convrot_int4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W4A4 (+ optional INT8 layers) diffusion config (CUDA only)."""
+    from .convrot_config import DiffusionConvRotInt4Config
+
+    return DiffusionConvRotInt4Config(**kw)
 
 
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
@@ -180,6 +212,8 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "fp8": _build_fp8,
     "int8": _build_int8,
+    "convrot_int8": _build_convrot_int8,
+    "convrot_int4": _build_convrot_int4,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
@@ -305,7 +339,7 @@ def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
 
 
 def _build_modelopt_from_config(method: str, config: Mapping[str, Any]) -> QuantizationConfig:
-    config_cls = get_quantization_config(method)
+    config_cls = _get_quantization_config(method)
     normalized_config = dict(config)
     normalized_config.setdefault("quant_method", method)
     return config_cls.from_config(normalized_config)
@@ -339,7 +373,7 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
     if method not in QUANTIZATION_METHODS:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
-    config_cls = get_quantization_config(method)
+    config_cls = _get_quantization_config(method)
 
     from vllm.config.quantization import resolve_quantization_config
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig

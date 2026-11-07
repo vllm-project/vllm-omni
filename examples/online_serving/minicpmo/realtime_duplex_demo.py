@@ -17,6 +17,8 @@ import json
 import math
 import sys
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -24,9 +26,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni.clients.duplex import (  # noqa: E402
+    DEFINITIVE_REFUSAL_CODES,
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
+    AudioFormat,
     DuplexClient,
+    DuplexClientBase,
+    DuplexClientError,
+    DuplexConnectionError,
+    DuplexSessionClosedError,
+    ErrorEvent,
     EventCollector,
     acknowledge_collected_playback,
     read_pcm16_wav,
@@ -99,6 +108,25 @@ class _StreamingOutputWriter:
         )
 
 
+class _TimedInputClient(DuplexClient):
+    """Record the transmitted media clock without retaining audio payloads."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.input_timeline: list[dict[str, float]] = []
+
+    async def send(self, event: dict[str, object]) -> str:
+        event_id = await super().send(event)
+        if event.get("type") == "input_audio_buffer.append" and "audio_end_ms" in event:
+            self.input_timeline.append(
+                {
+                    "sent_at_s": time.monotonic(),
+                    "audio_end_s": float(event["audio_end_ms"]) / 1000.0,
+                }
+            )
+        return event_id
+
+
 class _StreamingEventCollector(EventCollector):
     def __init__(self, writer: _StreamingOutputWriter) -> None:
         super().__init__()
@@ -107,6 +135,27 @@ class _StreamingEventCollector(EventCollector):
     def add(self, event: dict[str, object], *, received_at_s: float | None = None) -> None:
         super().add(event, received_at_s=received_at_s)
         self._writer.handle(self.events[-1])
+
+    async def consume(self, client: DuplexClientBase) -> None:
+        """Collect events and, like the web client, ack each reply once it has fully played.
+
+        This offline client plays everything it receives, so a finished reply's
+        whole audio counts as played.
+        """
+        try:
+            async for event in client.events():
+                self.add(event.raw)
+                response_id = self.response_id(event.raw)
+                if event.raw.get("type") != "response.done" or not response_id:
+                    continue
+                pcm16 = self.audio_bytes(response_id)
+                if not pcm16:
+                    continue
+                played_ms = AudioFormat("pcm16", self.output_sample_rate_hz).duration_ms(len(pcm16))
+                with suppress(DuplexClientError):
+                    await client.ack_playback(played_ms, response_id=response_id, item_id=f"item_{response_id}")
+        except DuplexSessionClosedError:
+            pass
 
 
 def _input_committed_index(
@@ -136,6 +185,141 @@ def _post_commit_model_decision(
     return None
 
 
+def _post_commit_response_created(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> bool:
+    if committed_index is None:
+        return False
+    return any(event.get("type") == "response.created" for event in events[committed_index + 1 :])
+
+
+def _response_event_id(event: dict[str, object]) -> str | None:
+    """Response id of a response.* event, tolerating both wire shapes.
+
+    The server projects ``response.created``/``response.done`` with a nested
+    ``response.id``; a few legacy events only carry a top-level ``response_id``.
+    """
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("id"), str):
+        return response["id"]
+    response_id = event.get("response_id")
+    return response_id if isinstance(response_id, str) else None
+
+
+def _response_done_is_terminal(event: dict[str, object]) -> bool:
+    """Whether a ``response.done`` counts as a drained answer.
+
+    A cancelled generation is a terminal state, but it produced no answer, so
+    it must not satisfy the drain on its own.
+    """
+    response = event.get("response")
+    return not isinstance(response, dict) or response.get("status") != "cancelled"
+
+
+def _post_commit_definitive_refusal(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> bool:
+    """Whether the server definitively refused the forced post-commit create.
+
+    ``DEFINITIVE_REFUSAL_CODES`` are terminal answers to ``response.create``:
+    the committed turn holds nothing the model can answer. Only the fallback
+    re-ask can trigger them (the demo sends no other create, and a server that
+    already answered commits with a precreated response never refuses), so a
+    post-commit event with one of these codes means the mandatory final
+    answer, if any, was delivered by an earlier response and the recognition
+    judging -- not this timeout -- is what decides whether that answer covers
+    the input.
+    """
+    return bool(_post_commit_refusal_indexes(events, committed_index))
+
+
+def _post_commit_refusal_indexes(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> frozenset[int]:
+    """Positions of the refusal errors that answered the forced create.
+
+    Scoped to the post-commit window on purpose: an earlier refusal came from
+    some other ask and must keep failing the run. Positions rather than object
+    identities keep the filter correct even if a collector hands back copies.
+    """
+    if committed_index is None:
+        return frozenset()
+    return frozenset(
+        index
+        for index in range(committed_index + 1, len(events))
+        if events[index].get("type") == "error" and ErrorEvent(events[index]).code in DEFINITIVE_REFUSAL_CODES
+    )
+
+
+def _post_commit_forced_response_settled(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> bool:
+    """Whether every response created after the commit reached a terminal state.
+
+    A forced commit must be drained before the session closes: closing while
+    the requested response is still generating drops its transcript and audio,
+    which is exactly the silent failure a mandatory final answer must not have.
+
+    The forced answer is always a response created after the commit -- the
+    server precreates it on an idle commit, or promotes the deferred create
+    once an in-flight response settles. So the drain matches ``response.created``
+    against ``response.done`` by response id: it settles when every post-commit
+    creation is closed by a done of the same id and at least one of those
+    terminals is a non-cancelled one. This is what keeps a pre-commit response
+    that settles after the commit, or a spontaneous one, from posing as the
+    answer while the promoted create is still queued; and it lets a cancelled
+    spontaneous response close its own creation without either counting as the
+    answer or hanging the drain behind the completed forced one.
+    """
+    if committed_index is None:
+        return False
+    created: set[str] = set()
+    # Any done closes its creation, cancelled or not, so an interrupted
+    # response cannot block the drain forever.
+    done: set[str] = set()
+    # Only a non-cancelled terminal counts as a drained answer.
+    answered: set[str] = set()
+    anonymous_created = 0
+    anonymous_done = 0
+    anonymous_answered = 0
+    for event in events[committed_index + 1 :]:
+        event_type = event.get("type")
+        if event_type == "response.created":
+            response_id = _response_event_id(event)
+            if response_id is None:
+                anonymous_created += 1
+            else:
+                created.add(response_id)
+        elif event_type == "response.done":
+            response_id = _response_event_id(event)
+            answered_done = _response_done_is_terminal(event)
+            if response_id is None:
+                # Events without an id cannot pair; count them so an
+                # anonymous terminal still closes the matching anonymous
+                # creation instead of hanging the drain.
+                anonymous_done += 1
+                if answered_done:
+                    anonymous_answered += 1
+            else:
+                done.add(response_id)
+                if answered_done:
+                    answered.add(response_id)
+    # The drained answer must be one of the post-commit creations, so a
+    # pre-commit response settling after the commit still cannot pose as it;
+    # every post-commit creation is closed; at least one closed with a
+    # non-cancelled terminal. The anonymous branch is best-effort: without
+    # ids nothing pairs, so an id-less pre-commit settle can still pass for
+    # the answer and only the quiescence guard holds the window open. The
+    # server always sends ids on the wire, so this only matters for the
+    # synthetic/anonymous event shapes.
+    post_commit_answered = bool(answered & created) or (anonymous_created > 0 and anonymous_answered > 0)
+    return post_commit_answered and created <= done and anonymous_done >= anonymous_created
+
+
 def _latest_model_decision(
     events: list[dict[str, object]],
     after_index: int,
@@ -158,7 +342,12 @@ def _response_in_progress(events: list[dict[str, object]]) -> bool:
     )
 
 
-async def _commit_input_after_playback_checkpoint(client: DuplexClient, collector: EventCollector) -> float:
+async def _commit_input_after_playback_checkpoint(
+    client: DuplexClient,
+    collector: EventCollector,
+    *,
+    create_response: bool = False,
+) -> float:
     """Commit input only after preserving already-played assistant history.
 
     Native duplex can finish several responses while the user is still
@@ -168,10 +357,21 @@ async def _commit_input_after_playback_checkpoint(client: DuplexClient, collecto
     Checkpoint playback first so the server commits each assistant item at its
     original history position.  A second acknowledgement after the commit can
     then safely advance response-local playback that drained in the meantime.
+
+    ``create_response`` sets the commit's ``response_create`` flag. Native
+    duplex sessions auto-respond: the model decides per unit whether to speak
+    or keep listening, so a session can end with the last user turn
+    unanswered. Forwarding this flag makes the commit ask for one response
+    built from the committed input: when the commit retains answerable audio,
+    the server opens the forced response immediately (``precreate_response``);
+    when the input was already consumed unit by unit, the server answers the
+    commit without scheduling anything and the drain's ``response.create``
+    re-ask settles the session on a definitive refusal. Either way the final
+    turn reaches a definitive state instead of ending on model luck.
     """
     await acknowledge_collected_playback(client, collector)
     commit_sent_at_s = time.monotonic()
-    await client.commit()
+    await client.commit(create_response=True if create_response else None)
     return commit_sent_at_s
 
 
@@ -183,6 +383,236 @@ def _event_count_after(
     if index is None:
         return 0
     return sum(event.get("type") == event_type for event in events[index + 1 :])
+
+
+#: How long a forced final commit may take to open its response before the
+#: client re-asks with an explicit ``response.create``. A native duplex
+#: precreated response usually arrives well under a second after the commit
+#: acknowledgement, so this only absorbs a slow stage-0 schedule.
+_FORCED_RESPONSE_CREATE_TIMEOUT_S = 15.0
+
+#: Once every post-commit response looks settled, keep waiting this long for
+#: one more ``response.created`` before the drain returns. After a spontaneous
+#: (or pre-commit) response settles, there is a short window before the
+#: promoted forced create opens -- an id-paired predicate alone cannot see a
+#: promotion that is still queued, so the drain also requires a brief
+#: quiescence over ``response.created``/``response.done``/``response.listen``.
+_FORCED_RESPONSE_SETTLE_QUIET_S = 1.5
+
+#: How long the fallback ``response.create`` keeps retrying through transient
+#: transport failures. A send can land inside a resume/teardown window and
+#: raise ``DuplexConnectionError`` even though the session is still alive; the
+#: re-ask itself is idempotent server-side (a duplicate create while a response
+#: is active is refused with ``response_already_active`` rather than corrupting
+#: the session), so retrying within this window is the difference between a
+#: drained forced answer and a silent 90 s hang.
+_FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S = 15.0
+
+#: Interval between fallback ``response.create`` retries.
+_FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S = 1.0
+
+#: Response lifecycle signals that can precede a promoted forced create.
+_RESPONSE_SIGNAL_TYPES = frozenset(
+    {
+        "response.created",
+        "response.done",
+        "response.listen",
+    }
+)
+
+
+def _last_post_commit_response_signal_at_s(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> float | None:
+    """Monotonic receive time of the last response signal after the commit.
+
+    ``EventCollector.add`` stamps every stored event with
+    ``_client_received_at_s`` on the monotonic clock, so the quiescence guard
+    measures real event times instead of the polling phase.
+    """
+    if committed_index is None:
+        return None
+    last: float | None = None
+    for event in events[committed_index + 1 :]:
+        if event.get("type") in _RESPONSE_SIGNAL_TYPES:
+            received_at_s = event.get("_client_received_at_s")
+            if isinstance(received_at_s, int | float):
+                last = float(received_at_s)
+    return last
+
+
+async def _drain_forced_post_commit_response(
+    client: DuplexClient,
+    collector: EventCollector,
+    *,
+    committed_index: int | None,
+    timeout_s: float,
+    create_timeout_s: float = _FORCED_RESPONSE_CREATE_TIMEOUT_S,
+    settle_quiet_s: float = _FORCED_RESPONSE_SETTLE_QUIET_S,
+    fallback_retry_window_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_WINDOW_S,
+    fallback_retry_interval_s: float = _FORCED_RESPONSE_FALLBACK_RETRY_INTERVAL_S,
+    commit_may_defer_create: bool = True,
+    on_fallback_sent: Callable[[], None] | None = None,
+) -> bool:
+    """Drain the commit-requested response, re-asking if it never opens.
+
+    The commit carries ``response_create``, so the server answers its retained
+    audio directly. The drain settles only when at least one response created
+    after the commit has reached a terminal state, every post-commit creation
+    is done -- matched by response id, so a pre-commit response settling after
+    the commit cannot pose as the answer -- and no further response signal has
+    arrived for ``settle_quiet_s`` seconds, which spans the window between a
+    spontaneous settle and the promoted forced create.
+
+    If no response opened, ``response.create`` is the protocol's second,
+    explicit way to ask for the same answer. Whether a post-commit
+    ``response.done`` may keep the re-ask armed depends on how the server can
+    treat the commit (``commit_may_defer_create``): a session whose model does
+    not auto-respond can hold the commit behind an active response and promote
+    it with its forced create once that response settles, so a post-commit
+    ``response.done`` -- even a cancelled one, or the settle of a pre-commit
+    response -- means the promotion may still be in flight and the drain keeps
+    waiting instead of re-asking into ``response_already_active``. A native
+    auto-response session does not defer an audio commit taken while it is
+    idle: it submits the retained input at once or acknowledges with nothing
+    scheduled, so a post-commit settle is final -- the server is idle, and
+    suppressing the re-ask there would strand an already-answered session in
+    ``TimeoutError``; the re-ask stays armed and settles it on the forced
+    answer or on the definitive refusal. (The deferrals such a session still
+    has, and the caller keys ``commit_may_defer_create`` on all of them: a
+    video-only commit -- no audio in the buffer while a response runs, on a
+    model that accepts video without audio and has no concurrent-turn
+    capability, and only when the session ever appended video frames; and a
+    commit that landed while a response was already running -- there the
+    runner rides the in-flight answer instead of precreating, so that settle
+    belongs to the old response and the answer's own ``response.created``
+    follows. A settle is treated as final only when none of the conditions
+    above applies; a session whose model does not auto-respond always takes
+    the park-and-promote deferral, so its commits are always treated as
+    deferring ``(not auto_response)``.) Errors reported after the commit
+    suppress the re-ask
+    either way, since the server is refusing rather than slow. The flip side
+    for CI triage on a deferring session: if the server drops the deferred
+    create after such activity, the drain can only end in ``TimeoutError`` --
+    no re-ask will have fired -- so a client timeout in that situation points
+    at a lost promotion on the server side, not at a missing fallback.
+
+    A re-ask can itself fail client-side: a send landing inside a transport
+    resume window raises ``DuplexConnectionError`` while the session is still
+    alive. Connection-level failures are therefore retried for up to
+    ``fallback_retry_window_s`` (bounded by ``timeout_s``); a closed session
+    or any other client error ends the re-ask immediately, and so does a
+    response that finally opens on its own. The re-ask is idempotent
+    server-side -- a duplicate create while a response is active is refused
+    with ``response_already_active`` -- so a retry that races a promotion is
+    harmless.
+
+    A delivered re-ask can also be *refused*: when the commit retained no
+    answerable audio (the model already answered every scene while the input
+    was still streaming, so the final buffer is trailing silence), the server
+    answers ``response.create`` with ``response_create_without_input`` or
+    ``text_only_turn_unsupported`` instead of a response. Those refusals are
+    definitive -- no amount of waiting produces the missing response -- so
+    the drain settles on them and the caller forgives exactly those two
+    error codes; whether the earlier answers actually covered the input is
+    what the recognition judging decides.
+
+    Returns whether the explicit fallback was sent. Raises ``TimeoutError``
+    when the drain does not finish, so the caller records a client timeout
+    instead of closing on a half-generated answer.
+    """
+    fallback_sent = False
+    try:
+        await wait_for_condition(
+            lambda: _post_commit_response_created(collector.events, committed_index),
+            timeout_s=create_timeout_s,
+            label="post-commit forced response.created",
+        )
+    except TimeoutError:
+        if (
+            _event_count_after(collector.events, "error", committed_index) == 0
+            and (
+                not commit_may_defer_create
+                or _event_count_after(collector.events, "response.done", committed_index) == 0
+            )
+            and not _response_in_progress(collector.events)
+        ):
+            retry_deadline_s = time.monotonic() + min(fallback_retry_window_s, timeout_s)
+            attempt = 0
+            while not fallback_sent:
+                if _post_commit_response_created(collector.events, committed_index):
+                    break
+                if (
+                    _event_count_after(collector.events, "error", committed_index)
+                    or (
+                        commit_may_defer_create
+                        and _event_count_after(collector.events, "response.done", committed_index)
+                    )
+                    or _response_in_progress(collector.events)
+                ):
+                    break
+                attempt += 1
+                try:
+                    await client.send({"type": "response.create"})
+                    fallback_sent = True
+                    if on_fallback_sent is not None:
+                        # The caller reports the fallback even when this drain
+                        # goes on to time out: a timeout must not read as "the
+                        # re-ask was never sent".
+                        on_fallback_sent()
+                    if attempt > 1:
+                        # Confirms the retry rescued the re-ask; a first-try
+                        # success needs no extra noise.
+                        print(
+                            f"[forced-response] response.create fallback succeeded on attempt {attempt}",
+                            flush=True,
+                        )
+                except (DuplexClientError, DuplexSessionClosedError) as exc:
+                    # Surface which exception delayed the re-ask: the drain
+                    # timeout alone cannot say which side failed.
+                    print(
+                        f"[forced-response] response.create fallback attempt {attempt} failed: {exc!r}",
+                        flush=True,
+                    )
+                    if not isinstance(exc, DuplexConnectionError):
+                        break
+                    remaining_s = retry_deadline_s - time.monotonic()
+                    if remaining_s <= 0:
+                        break
+                    await asyncio.sleep(min(fallback_retry_interval_s, remaining_s))
+
+    def _drained() -> bool:
+        if _post_commit_definitive_refusal(collector.events, committed_index):
+            # The server refused to force an answer from the committed turn:
+            # nothing more can arrive for this drain. Whether the input was
+            # in fact already answered is the recognition report's judgement.
+            return True
+        if not (
+            _post_commit_forced_response_settled(collector.events, committed_index)
+            and not _response_in_progress(collector.events)
+        ):
+            return False
+        if settle_quiet_s <= 0:
+            return True
+        last_signal_at_s = _last_post_commit_response_signal_at_s(collector.events, committed_index)
+        if last_signal_at_s is None:
+            return True
+        return time.monotonic() - last_signal_at_s >= settle_quiet_s
+
+    await wait_for_condition(
+        _drained,
+        timeout_s=timeout_s,
+        label="post-commit forced response drain",
+    )
+    return fallback_sent
+
+
+def _video_has_audio(video_path: Path) -> bool:
+    import av
+
+    with av.open(str(video_path)) as container:
+        return bool(container.streams.audio)
 
 
 def _probe_video_frames_and_fps(video_path: Path) -> tuple[int, float]:
@@ -373,13 +803,25 @@ def _extract_video_input(
     caller already has ``--input-wav``, extract frames against that WAV
     duration instead so a silent clip cannot fail ``load_audio``.
     """
+    num_frames, frame_rate = _probe_video_frames_and_fps(video_path)
+    video_duration_s = num_frames / frame_rate
     audio_path = _extract_video_soundtrack(video_path, work_dir)
+    # Match official get_audio_segments(adjust_length=True): the video
+    # timeline determines the number of one-second audio units. Decoders
+    # can retain AAC padding (e.g. 180.032 s for a 180 s video); treating it
+    # as real input creates an extra, frame-less unit on the final commit.
+    unit_count = max(1, int(math.ceil(video_duration_s - 1e-9)))
+    target_bytes = unit_count * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    pcm = read_pcm16_wav(audio_path)
+    aligned_pcm = pcm[:target_bytes].ljust(target_bytes, b"\0")
+    if aligned_pcm != pcm:
+        write_pcm16_wav(audio_path, aligned_pcm, sample_rate_hz=PCM16_SAMPLE_RATE)
     frames_b64, stacked_b64 = _extract_video_frames(
         video_path,
         work_dir,
         fps=fps,
         max_side=max_side,
-        duration_s=_pcm16_wav_duration_s(audio_path),
+        duration_s=video_duration_s,
         stack_frames=stack_frames,
     )
     return audio_path, frames_b64, stacked_b64
@@ -393,7 +835,7 @@ def _resolve_duplex_av_inputs(
     fps: float,
     max_side: int,
     stack_frames: int = 1,
-) -> tuple[str, list[str], list[str | None]]:
+) -> tuple[str | None, list[str], list[str | None]]:
     """Return ``(wav_path, frames_b64, stacked_b64)``. External WAV wins over video audio."""
     if input_video:
         video_path = Path(input_video)
@@ -407,6 +849,17 @@ def _resolve_duplex_av_inputs(
                 stack_frames=stack_frames,
             )
             return input_wav, frames, stacked
+        if not _video_has_audio(video_path):
+            frame_count, frame_rate = _probe_video_frames_and_fps(video_path)
+            frames, stacked = _extract_video_frames(
+                video_path,
+                work_dir,
+                fps=fps,
+                max_side=max_side,
+                stack_frames=stack_frames,
+                duration_s=frame_count / frame_rate,
+            )
+            return None, frames, stacked
         extracted_wav, frames, stacked = _extract_video_input(
             video_path,
             work_dir,
@@ -433,17 +886,25 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         stack_frames=args.stack_frames,
     )
 
-    input_pcm16 = read_pcm16_wav(Path(input_wav))
-    if not input_pcm16:
+    input_pcm16 = read_pcm16_wav(Path(input_wav)) if input_wav is not None else b""
+    if input_wav is not None and not input_pcm16:
         raise ValueError("input WAV has no audio")
 
     collector = _StreamingEventCollector(stream_writer)
-    client = DuplexClient(
+    client = _TimedInputClient(
         args.url,
         model=args.model,
         config=create_duplex_session_config(
             ref_audio=_ref_audio_data_url(args.ref_audio),
             temperature=args.temperature,
+            instructions=args.instructions,
+            extra_body={
+                "sliding_window_mode": args.sliding_window_mode,
+                "basic_window_high_tokens": args.basic_window_high_tokens,
+                "basic_window_low_tokens": args.basic_window_low_tokens,
+                "context_max_units": args.context_max_units,
+                "context_previous_max_tokens": args.context_previous_max_tokens,
+            },
         ),
         reconnect=None,
         heartbeat_interval_s=None,
@@ -455,21 +916,90 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # subscribed; seed it so counts and capability lookups still work.
         collector.add({"type": "session.created", "session": client.session_info})
         stream_event_cursor = len(collector.events)
-        frames_sent = await client.stream_pcm(
-            input_pcm16,
-            chunk_ms=args.chunk_ms,
-            realtime=not args.no_realtime_pacing,
-            video_frames=video_frames,
-            stacked_video_frames=stacked_video_frames,
-        )
+        input_stream_started_at_s = time.monotonic()
+        if input_wav is None:
+            frames_sent = 0
+            frame_period_s = 1.0 / max(args.video_fps, 1e-6)
+            for i, frame in enumerate(video_frames):
+                frames = [frame]
+                if i < len(stacked_video_frames) and stacked_video_frames[i] is not None:
+                    frames.append(stacked_video_frames[i])
+                await client.send({"type": "input_audio_buffer.append", "video_frames": frames})
+                frames_sent += 1
+                if not args.no_realtime_pacing:
+                    # Same media clock as stream_pcm: a sleep of one frame period
+                    # after each send would accumulate send overhead.
+                    delay_s = input_stream_started_at_s + frames_sent * frame_period_s - time.monotonic()
+                    await asyncio.sleep(max(0.0, delay_s))
+        else:
+            frames_sent = await client.stream_pcm(
+                input_pcm16,
+                chunk_ms=args.chunk_ms,
+                realtime=not args.no_realtime_pacing,
+                video_frames=video_frames,
+                stacked_video_frames=stacked_video_frames,
+            )
+        # Let the model answer the final utterance while holding the last frame.
+        # A commit alone does not supply more model time to native duplex.
+        tail_frames_sent = 0
+        if args.tail_silence_s > 0:
+            tail_pcm = bytes(round(args.tail_silence_s * PCM16_SAMPLE_RATE) * PCM16_BYTES_PER_SAMPLE)
+            # PCM still buffered on the server keeps its media clock: a fresh
+            # stream would attach the held frame one second into the tail,
+            # after the unit that contains the end of the utterance closed.
+            # A clip with no audio has no buffered PCM, so the tail holds the
+            # last frame on its own clock.
+            tail_timeline = (
+                {
+                    "video_frames": video_frames,
+                    "stacked_video_frames": stacked_video_frames,
+                    "media_origin_ms": client.config.input_audio.duration_ms(len(input_pcm16)),
+                    "unit_index": frames_sent,
+                }
+                if input_pcm16
+                else {
+                    "video_frames": video_frames[-1:],
+                    "stacked_video_frames": stacked_video_frames[-1:],
+                }
+            )
+            tail_frames_sent = await client.stream_pcm(
+                tail_pcm,
+                chunk_ms=args.chunk_ms,
+                realtime=not args.no_realtime_pacing,
+                **tail_timeline,
+            )
+            input_pcm16 += tail_pcm
         commit_event_cursor = len(collector.events)
         stream_decision = _latest_model_decision(collector.events, stream_event_cursor)
         input_has_residual_model_unit = _has_residual_model_unit(
             input_pcm16,
             chunk_period_ms=_chunk_period_ms(collector.events),
         )
+        # ``getattr`` keeps every Namespace built before this flag existed
+        # working unchanged: only callers that ask for a mandatory final
+        # answer opt in.
+        final_create_response = bool(getattr(args, "final_create_response", False))
+        forced_response_fallback_sent = False
+        # Whether this session ever appended video frames: only such a session
+        # can take the runner's video-only commit deferral (see the drain call
+        # below). The recognition driver never appends video, so CI runs
+        # record False here by construction.
+        video_frames_appended = bool(video_frames)
+        # Whether a response was still running when the final commit was
+        # issued: the runner then rides the in-flight answer instead of
+        # precreating, so a settle right after the commit belongs to the old
+        # response rather than to an idle server.
+        response_in_progress_at_commit = False
+        # A drain timeout must not erase the fact that the re-ask reached the
+        # server: record it as soon as the send succeeds, then fold it back in
+        # after the wait ends.
+        fallback_progress = {"sent": False}
         wait_for_post_commit_decision = False
-        commit_sent_at_s = await _commit_input_after_playback_checkpoint(client, collector)
+        commit_sent_at_s = await _commit_input_after_playback_checkpoint(
+            client,
+            collector,
+            create_response=final_create_response,
+        )
         wait_error: str | None = None
         committed_index: int | None = None
         post_commit_decision: str | None = None
@@ -481,18 +1011,59 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
             committed_index = _input_committed_index(collector.events, commit_event_cursor)
             stream_decision = _latest_model_decision(collector.events[: committed_index + 1], stream_event_cursor)
-            wait_for_post_commit_decision = input_has_residual_model_unit or _response_in_progress(
-                collector.events[: committed_index + 1]
+            wait_for_post_commit_decision = (
+                final_create_response
+                or input_has_residual_model_unit
+                or _response_in_progress(collector.events[: committed_index + 1])
             )
             if wait_for_post_commit_decision:
-                await wait_for_condition(
-                    lambda: _post_commit_model_decision(collector.events, committed_index) is not None,
-                    timeout_s=args.timeout_s,
-                    label="post-commit model decision or response drain",
-                )
+                if final_create_response:
+                    response_in_progress_at_commit = _response_in_progress(collector.events[: committed_index + 1])
+                    forced_response_fallback_sent = await _drain_forced_post_commit_response(
+                        client,
+                        collector,
+                        committed_index=committed_index,
+                        timeout_s=args.timeout_s,
+                        create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
+                        # When may a settle that lands after the commit be the
+                        # preamble of more server work, so the re-ask must
+                        # stay armed instead of firing?
+                        # - A session whose model does not auto-respond can
+                        #   park the forced create behind an active response
+                        #   and promote it later.
+                        # - A session that ever appended video frames can take
+                        #   the video-only deferral (a commit with no audio
+                        #   while a response runs, on a model that accepts
+                        #   video without audio; the runner drops the deferral
+                        #   when the payload carries audio). This driver's
+                        #   recognition runs never append video, so the flag
+                        #   is False for them by construction -- recorded in
+                        #   ``post_commit.video_frames_appended``.
+                        # - The commit landed while a response was running:
+                        #   the runner then drops the forced precreate and the
+                        #   terminal input rides the in-flight answer instead,
+                        #   so that settle belongs to the old response and the
+                        #   answer's own ``response.created`` follows.
+                        # The client-side flag is the server's own value, not
+                        # a guess: ``SessionConfig.to_payload`` puts this same
+                        # ``auto_response`` into the session's ``extra_body``
+                        # at connect time and the server derives its
+                        # auto-response scheduling from exactly that key.
+                        commit_may_defer_create=(
+                            not client.config.auto_response or bool(video_frames) or response_in_progress_at_commit
+                        ),
+                        on_fallback_sent=lambda: fallback_progress.__setitem__("sent", True),
+                    )
+                else:
+                    await wait_for_condition(
+                        lambda: _post_commit_model_decision(collector.events, committed_index) is not None,
+                        timeout_s=args.timeout_s,
+                        label="post-commit model decision or response drain",
+                    )
                 post_commit_decision = _post_commit_model_decision(collector.events, committed_index)
         except TimeoutError as exc:
             wait_error = str(exc)
+        forced_response_fallback_sent = forced_response_fallback_sent or fallback_progress["sent"]
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
         await client.close(timeout_s=args.timeout_s)
@@ -545,7 +1116,19 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             input_committed_at_s=commit_sent_at_s,
             response_id=response_id,
         )
-        errors = collector.errors()
+        # The forced final create can be answered by a definitive refusal --
+        # the commit retained nothing answerable, so the final answer was
+        # already given by an earlier response (or the input was not
+        # answerable at all, which the recognition report judges). Only
+        # refusals that arrived after the commit are forgiven: an earlier one
+        # came from some other ask and still fails the run, as does every
+        # other error.
+        forgiven_indexes = (
+            _post_commit_refusal_indexes(collector.events, committed_index)
+            if final_create_response and committed_index is not None
+            else frozenset()
+        )
+        errors = collector.errors(exclude_indexes=forgiven_indexes)
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:
@@ -555,6 +1138,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in collector.events),
             encoding="utf-8",
         )
+        (output_dir / "input_timeline.json").write_text(json.dumps(client.input_timeline, indent=2), encoding="utf-8")
         (output_dir / "output.pcm").write_bytes(audio)
         if audio:
             write_pcm16_wav(
@@ -564,6 +1148,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
 
         result = {
+            "validation_scope": "transport_and_lifecycle_only",
             "ok": (
                 collector.count("session.created") > 0
                 and collector.count("session.closed") > 0
@@ -572,11 +1157,30 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 and (bool(audio) or not args.require_audio)
             ),
             "model_decision": model_decision,
+            "input_stream_started_at_s": input_stream_started_at_s,
+            "realtime_pacing": not args.no_realtime_pacing,
+            "sampling_temperature": args.temperature,
+            "sliding_window_mode": args.sliding_window_mode,
+            "basic_window_high_tokens": args.basic_window_high_tokens,
+            "basic_window_low_tokens": args.basic_window_low_tokens,
+            "context_max_units": args.context_max_units,
+            "context_previous_max_tokens": args.context_previous_max_tokens,
+            "tail_silence_s": args.tail_silence_s,
+            "tail_video_frames_sent": tail_frames_sent,
             "post_commit": {
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
+                "final_create_response": final_create_response,
+                "forced_response_fallback_sent": forced_response_fallback_sent,
                 "input_had_residual_model_unit": input_has_residual_model_unit,
+                "video_frames_appended": video_frames_appended,
+                "response_in_progress_at_commit": response_in_progress_at_commit,
+                "response_created_count": _event_count_after(
+                    collector.events,
+                    "response.created",
+                    committed_index,
+                ),
                 "response_listen_count": _event_count_after(
                     collector.events,
                     "response.listen",
@@ -589,6 +1193,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 ),
             },
             "input_video": args.input_video,
+            "input_wav": args.input_wav,
             "video_frames_extracted": len(video_frames),
             "video_frames_sent": frames_sent,
             "video_stacked_frames_extracted": sum(frame is not None for frame in stacked_video_frames),
@@ -681,15 +1286,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ref-audio",
-        required=True,
         help=(
-            "Reference WAV for the MiniCPM-o duplex assistant voice. "
-            "This demo matches the official flow by always providing a reference audio clip."
+            "Optional reference WAV for the MiniCPM-o duplex assistant voice. "
+            "The server defaults to the model-bundled assets/HT_ref_audio.wav."
         ),
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--instructions",
+        help="Session system prompt. Omit to use the model's Streaming Omni Conversation default.",
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -697,8 +1305,35 @@ def parse_args() -> argparse.Namespace:
         help="Stage 0 sampling temperature; omit to preserve the model default.",
     )
     parser.add_argument("--no-realtime-pacing", action="store_true")
+    parser.add_argument("--sliding-window-mode", choices=("off", "basic", "context"), default="off")
+    parser.add_argument("--basic-window-high-tokens", type=int, default=8000)
+    parser.add_argument("--basic-window-low-tokens", type=int, default=6000)
+    parser.add_argument("--context-max-units", type=int, default=24)
+    parser.add_argument("--context-previous-max-tokens", type=int, default=500)
+    parser.add_argument(
+        "--tail-silence-s",
+        type=int,
+        default=0,
+        help="Additional silent seconds holding the last frame to allow the final answer to finish.",
+    )
+    parser.add_argument(
+        "--final-create-response",
+        action="store_true",
+        help=(
+            "Ask the server for one response on the final commit and drain it "
+            "before closing. Native duplex lets the model keep listening, so "
+            "without this the last user turn can stay unanswered."
+        ),
+    )
     parser.add_argument("--require-audio", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.tail_silence_s < 0:
+        parser.error("--tail-silence-s must be nonnegative")
+    if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
+        parser.error("window watermarks must satisfy 0 < low < high")
+    if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:
+        parser.error("context window limits must be positive")
+    return args
 
 
 def main() -> None:

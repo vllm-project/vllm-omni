@@ -70,6 +70,36 @@ Code2Wav consumes them through a shared-memory async connector.
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
+### Default model runner
+
+On CUDA the default deployment runs the Thinker and Code2Wav on Model Runner V2.
+The Talker stays on V1 because its multi-frame decode runs only on V1;
+`minicpmo_4_5_turn_mrv2.yaml` runs all three stages on V2 with single-frame
+Talker decode. Other platforms retain Model Runner V1. Every stage keeps `async_chunk: true`.
+
+The ordinary turn profile inherits the CUDA V2 default and enables Thinker
+prefix caching on CUDA. MRv2 restores cached latent rows and their token/position
+metadata together for the Talker. NPU, ROCm, XPU and MUSA retain disabled caching.
+`minicpmo_4_5_turn_mrv2.yaml` additionally selects its own capacity and
+scheduling settings, including stage 0 `async_chunk: false`. To select V1 on CUDA, override
+`platforms.cuda.model_runner: v1` in a custom deployment overlay. CUDA turn
+profiles keep Thinker prefix caching enabled with either runner; duplex
+profiles keep it disabled.
+
+Stage-0 speculative decoding (including n-gram) cannot be combined with the
+stage-output prefix cache. Existing CUDA turn overlays that enable speculation
+must also set stage 0 `enable_prefix_caching: false` under `platforms.cuda`;
+otherwise initialization raises an error asking to disable prefix caching.
+Setting it only at stage level does not override an explicit platform entry.
+
+The output cache also needs host RAM: its persistent CPU mirror has the same
+number of blocks as the Thinker KV pool, with no independent block limit.
+It stores hidden states, `latent`, token ids and positions. Temporary GPU rows
+awaiting a host copy use a 512 MiB flush threshold, not a hard allocation cap.
+The H200 turn profile's 4 GiB Talker KV reservation does not budget these buffers.
+See [cache memory sizing](../../docs/design/minicpm_o45_mrv2_performance.md#turn-prefix-cache-memory)
+before enabling large Thinker KV pools or increasing concurrency.
+
 ### Migration from the fused deployment
 
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
@@ -217,6 +247,11 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
+
+`--ref-audio` is optional for serving: omitting it uses the model-bundled
+`assets/HT_ref_audio.wav`; pass a WAV path to override the assistant voice.
+The Omni-DuplexEval generation CLI intentionally requires an explicit
+reference WAV to keep the assistant voice fixed across benchmark samples.
 
 The demo prints transcript deltas as they arrive and saves the streamed
 24 kHz audio to WAV files. The same session shape is available from Python

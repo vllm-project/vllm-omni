@@ -3,13 +3,14 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
     MossAudioTokenizerMultiheadAttention,
     MossAudioTokenizerRotaryEmbedding,
 )
 from vllm_omni.model_executor.models.moss_tts.first_frame_special import EmptyHistoryAttention, StatelessFirstGraphs
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 
 @pytest.mark.parametrize("batch", [1, 3])
@@ -31,7 +32,7 @@ def test_empty_history_attention_matches_original_causal_attention(batch, length
     query = torch.randn(batch, length, 384, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():
         expected = original(query, query, query)
-        actual = special(query, query, query)
+        actual = special(query, query, query, attn_bias=None)
     # Different BF16 GEMM/attention accumulation orders need not be bitwise equal.
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.005)
 
@@ -62,3 +63,32 @@ def test_first_frame_outputs_survive_cross_bucket_replays(buckets):
             saved.append((actual, actual.clone()))
         for actual, snapshot in saved:
             torch.testing.assert_close(actual, snapshot, rtol=0, atol=0)
+
+
+def test_empty_history_transformer_preserves_bias_sharing_contract():
+    import copy
+
+    from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    reference = MossAudioTokenizerTransformer(
+        d_model=384,
+        num_heads=6,
+        num_layers=2,
+        dim_feedforward=512,
+        causal=True,
+        context=64,
+        positional_embedding="rope",
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).eval()
+    special = copy.deepcopy(reference)
+    for layer in special.layers:
+        layer.self_attn = EmptyHistoryAttention(layer.self_attn)
+    query = torch.randn(3, 8, 384, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode():
+        expected = reference(query)
+        actual = special(query)
+    torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.01)
+    assert all(layer.self_attn._cached_attn_bias is None for layer in special.layers)

@@ -1,0 +1,125 @@
+meta:
+  title: "MOSS-TTSD-v1.0"
+  slug: "moss-ttsd-v1.0"
+  provider: "OpenMOSS"
+  description: "OpenMOSS's 8B spoken-dialogue generation model for expressive, multi-speaker, ultra-long conversations — served via vLLM-Omni through the OpenAI /v1/audio/speech API (24 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - OpenMOSS-Team/MOSS-TTS
+    - OpenMOSS-Team/MOSS-TTS-Realtime
+    - OpenMOSS-Team/MOSS-VoiceGenerator
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-TTSD-v1.0"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "8B"
+  active_parameters: "8B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--deploy-config"
+    - "vllm_omni/deploy/moss_ttsd.yaml"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "MOSS-TTSD multi-speaker dialogue synthesis via /v1/audio/speech (24 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "OpenMOSS-Team/MOSS-TTSD-v1.0",
+            "input": "[S1] Hi, how was your day? [S2] Pretty good, thanks for asking!",
+            "voice": "default",
+            "response_format": "wav"
+          }' --output dialogue.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 32
+    description: "MOSS-TTSD-v1.0 8B (MossTTSDelay, n_vq=16) — multi-speaker dialogue TTS"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [MOSS-TTSD-v1.0](https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v1.0) is the
+  **spoken-dialogue** member of OpenMOSS's MOSS-TTS Family, served through
+  **vLLM-Omni** with the OpenAI-compatible `/v1/audio/speech` API. It generates
+  expressive, **multi-speaker, ultra-long dialogues** and (per OpenMOSS) leads on
+  objective metrics while outperforming top closed-source systems in subjective
+  evaluations. Output is **24 kHz mono**.
+
+  Dialogue formatting (speaker turns, e.g. `[S1] ... [S2] ...`) and any
+  multi-speaker reference conditioning follow the upstream
+  [MOSS-TTSD](https://github.com/OpenMOSS/MOSS-TTSD) conventions — consult the
+  upstream repo for the exact turn/reference schema.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU comparable to the 8B MOSS-TTS profile
+    (~18 GB talker + ~8 GB codec; e.g. an 80 GB H100 with headroom for long
+    dialogues).
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  MOSS-TTSD shares `model_type=moss_tts_delay` with the other MossTTSDelay
+  checkpoints, so pass its deploy config explicitly:
+
+  ```bash
+  vllm serve OpenMOSS-Team/MOSS-TTSD-v1.0 --omni \
+    --deploy-config vllm_omni/deploy/moss_ttsd.yaml --port 8000
+  ```
+
+  ## Client usage
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "OpenMOSS-Team/MOSS-TTSD-v1.0",
+      "input": "[S1] Hi, how was your day? [S2] Pretty good, thanks for asking!",
+      "voice": "default",
+      "response_format": "wav"
+    }' --output dialogue.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **24 kHz mono**.
+  - Shares the `OpenMOSS-Team/MOSS-Audio-Tokenizer` codec (~7 GB, auto-downloaded;
+    override with `MOSS_TTS_CODEC_PATH`).
+
+  ## References
+
+  - [Model card](https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v1.0)
+  - [MOSS-TTSD GitHub](https://github.com/OpenMOSS/MOSS-TTSD)
+  - [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS)
