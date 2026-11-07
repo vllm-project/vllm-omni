@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import logging
 import math
 import time
 from collections.abc import Callable, Sequence
@@ -88,6 +89,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -650,19 +652,21 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         Named ``_mb`` to match the public ``peak_memory_mb`` field.
         """
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
-        peak_allocated_bytes = current_omni_platform.max_memory_allocated()
-
-        pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
-
         peak_memory_mb = peak_reserved_bytes / (1024**2)
 
-        logger.debug(
-            "Peak GPU memory (this request): %s GiB reserved, %s GiB allocated, %s GiB pool overhead (%.1f%%)",
-            format_gib(peak_reserved_bytes),
-            format_gib(peak_allocated_bytes),
-            format_gib(pool_overhead_bytes),
-            pool_overhead_bytes / peak_reserved_bytes * 100 if peak_reserved_bytes > 0 else 0.0,
-        )
+        # The allocated peak only feeds the debug line, and each of these
+        # platform calls builds the full allocator statistics, so skip the
+        # second one on the request path unless that line will be emitted.
+        if logger.isEnabledFor(logging.DEBUG):
+            peak_allocated_bytes = current_omni_platform.max_memory_allocated()
+            pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
+            logger.debug(
+                "Peak GPU memory (this request): %s GiB reserved, %s GiB allocated, %s GiB pool overhead (%.1f%%)",
+                format_gib(peak_reserved_bytes),
+                format_gib(peak_allocated_bytes),
+                format_gib(pool_overhead_bytes),
+                pool_overhead_bytes / peak_reserved_bytes * 100 if peak_reserved_bytes > 0 else 0.0,
+            )
         return peak_memory_mb
 
     def _prepare_request_for_forward(
@@ -821,6 +825,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
+            if latency_trace.ENABLED:
+                for req in reqs:
+                    latency_trace.mark(req.request_id, "runner_start")
             for req in reqs:
                 self._prepare_request_for_forward(
                     req,
@@ -941,6 +948,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 cache_summary(self.pipeline, details=True)
 
         self._maybe_send_stage_payload(reqs, outputs)
+        if latency_trace.ENABLED:
+            for req in reqs:
+                latency_trace.mark(req.request_id, "runner_end")
 
         return self._runner_output_from_outputs(reqs, outputs)
 

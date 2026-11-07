@@ -306,6 +306,27 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
     assert getattr(request, "kv_computed_tokens", ()) == (imported_tokens or ())
 
 
+@pytest.mark.parametrize("debug, allocated_reads", [(False, 0), (True, 1)], ids=["info", "debug"])
+def test_sample_peak_memory_reads_the_allocated_peak_only_for_the_debug_line(monkeypatch, debug, allocated_reads):
+    reads = {"reserved": 0, "allocated": 0}
+
+    def _reserved() -> int:
+        reads["reserved"] += 1
+        return 3 * 1024**2
+
+    def _allocated() -> int:
+        reads["allocated"] += 1
+        return 2 * 1024**2
+
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", _reserved)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", _allocated)
+    monkeypatch.setattr(model_runner_module.logger, "isEnabledFor", lambda level: debug and level >= logging.DEBUG)
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+
+    assert DiffusionModelRunner._sample_peak_memory_mb(runner) == 3.0
+    assert reads == {"reserved": 1, "allocated": allocated_reads}
+
+
 def _make_compile_runner(
     model=None,
     *,

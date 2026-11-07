@@ -23,8 +23,12 @@ from vllm_omni.engine.async_engine_utils import OutputQueueSink
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import (
+    _diffusion_output_wakeup_enabled,
     _event_driven_orch_enabled,
 )
+from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 from .test_orchestrator import (
     FakeOutputProcessor,
@@ -97,6 +101,75 @@ def test_default_is_event_driven_loop(monkeypatch, value, expected) -> None:
         fixture.thread.join(timeout=5)
         for q in fixture.queues:
             q.close()
+
+
+class _WakeupDiffusionStageClient(FakeStageClient):
+    """Diffusion client that offers the output wake-up, as the inline client does."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.wait_timeouts: list[float] = []
+
+    async def wait_diffusion_output(self, timeout: float) -> None:
+        self.wait_timeouts.append(timeout)
+        await asyncio.sleep(0.005)
+
+
+def test_diffusion_output_wakeup_flag_parsing(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP", raising=False)
+    assert _diffusion_output_wakeup_enabled() is True
+    for value in ("1", "true", "True", "YES", "on"):
+        monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP", value)
+        assert _diffusion_output_wakeup_enabled() is True
+    for value in ("0", "false", "off", ""):
+        monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP", value)
+        assert _diffusion_output_wakeup_enabled() is False
+
+
+def test_diffusion_output_waiter_needs_one_replica_and_a_wakeup_client() -> None:
+    assert StagePool(0, [FakeStageClient(stage_type="diffusion")]).diffusion_output_waiter() is None
+
+    client = _WakeupDiffusionStageClient(stage_type="diffusion")
+    assert StagePool(0, [client]).diffusion_output_waiter() == client.wait_diffusion_output
+
+    replicas = [_WakeupDiffusionStageClient(stage_type="diffusion") for _ in range(2)]
+    assert StagePool(0, replicas).diffusion_output_waiter() is None
+
+
+@pytest.mark.parametrize("flag, expect_wakeup", [(None, True), ("0", False)], ids=["default", "opt-out"])
+@pytest.mark.asyncio
+async def test_idle_diffusion_poller_awaits_the_client_wakeup(
+    orchestrator_factory, monkeypatch, flag, expect_wakeup
+) -> None:
+    """An idle diffusion poller awaits its client's wake-up; ``0`` keeps the 1 ms poll.
+
+    The output is delivered either way.
+    """
+    if flag is None:
+        monkeypatch.delenv("VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP", flag)
+    stage0 = _WakeupDiffusionStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+
+    await _enqueue_add_request(
+        orchestrator_fixture,
+        request_id="req-wake",
+        prompt={"prompt": "draw a cat"},
+        original_prompt={"prompt": "draw a cat"},
+        sampling_params_list=[OmniDiffusionSamplingParams()],
+        final_stage_id=0,
+    )
+    await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+    assert "req-wake" in orchestrator_fixture.orchestrator.request_states
+
+    stage0.push_diffusion_output(OmniRequestOutput.from_error("req-wake", "gpu fault"))
+    await _wait_for(lambda: "req-wake" not in orchestrator_fixture.orchestrator.request_states)
+
+    if expect_wakeup:
+        assert set(stage0.wait_timeouts) == {orchestrator_module._ORCH_READER_RECONCILE_INTERVAL_S}
+    else:
+        assert stage0.wait_timeouts == []
 
 
 @pytest.mark.asyncio

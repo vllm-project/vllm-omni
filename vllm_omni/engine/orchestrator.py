@@ -89,6 +89,7 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.tracing import RequestTrace
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm_omni.engine import OmniEngineCoreOutput
@@ -116,6 +117,19 @@ _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 _PREWARM_UNCOPIED_PROMPT_KEYS = frozenset(
     ("prompt_token_ids", "multi_modal_data", "mm_processor_kwargs", "additional_information")
 )
+
+
+# The event-driven loop waits for an inline diffusion stage's next output
+# instead of polling it every millisecond. VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP=0
+# restores the 1 ms nowait poll for every diffusion pool.
+_DIFFUSION_OUTPUT_WAKEUP_ENV = "VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP"
+
+
+def _diffusion_output_wakeup_enabled() -> bool:
+    value = os.environ.get(_DIFFUSION_OUTPUT_WAKEUP_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _event_driven_orch_enabled() -> bool:
@@ -468,6 +482,7 @@ class OrchestratorBase:
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
         self._event_driven_orch = _event_driven_orch_enabled()
+        self._diffusion_output_wakeup = _diffusion_output_wakeup_enabled()
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -691,6 +706,8 @@ class OrchestratorBase:
         """Read messages from the main thread via request_async_queue."""
         while True:
             msg = await self.request_async_queue.get()
+            if latency_trace.ENABLED:
+                latency_trace.mark(getattr(msg, "request_id", None), "orch_dequeued")
             msg_type = msg.type
 
             if await self._dispatch_message(msg):
@@ -1249,6 +1266,10 @@ class OrchestratorBase:
                             diffusion_output = pool.poll_diffusion_output(replica_id)
                             if diffusion_output is None:
                                 continue
+                            if latency_trace.ENABLED:
+                                rid = getattr(diffusion_output, "request_id", None)
+                                latency_trace.mark(rid, "orch_output_polled")
+                                latency_trace.mark(rid, "orch_output_dispatched")
 
                             if self._absorb_diffusion_metrics(stage_id, replica_id, diffusion_output):
                                 idle = False
@@ -1342,10 +1363,20 @@ class OrchestratorBase:
                             continue
                         if output is None:
                             continue
+                        if latency_trace.ENABLED:
+                            latency_trace.mark(getattr(output, "request_id", None), "orch_output_polled")
                         await ready_q.put(("diffusion", stage_id, replica_id, output))
                         self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
                         got = True
-                    await asyncio.sleep(0 if got else 0.001)
+                    if got:
+                        await asyncio.sleep(0)
+                        continue
+                    wait_for_output = pool.diffusion_output_waiter() if self._diffusion_output_wakeup else None
+                    if wait_for_output is None:
+                        await asyncio.sleep(0.001)
+                    else:
+                        # Bounded so replica membership is still re-read while idle.
+                        await wait_for_output(_ORCH_READER_RECONCILE_INTERVAL_S)
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
@@ -1519,6 +1550,8 @@ class OrchestratorBase:
                 raw_terminal_request_ids: set[str] = set()
                 try:
                     if kind == "diffusion":
+                        if latency_trace.ENABLED:
+                            latency_trace.mark(getattr(payload, "request_id", None), "orch_output_dispatched")
                         pool = self.stage_pools[stage_id]
                         if self._absorb_diffusion_metrics(stage_id, replica_id, payload):
                             self._orch_monitor.note_loop(idle=False)
@@ -1606,6 +1639,7 @@ class OrchestratorBase:
                     stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+            latency_trace.mark(output.request_id, "orch_output_routed")
 
     async def _handle_stage_error(
         self,
@@ -3908,6 +3942,7 @@ class Orchestrator(OrchestratorBase):
         self.request_states[request_id] = req_state
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
+        latency_trace.mark(request_id, "orch_state_ready")
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
@@ -3979,6 +4014,7 @@ class Orchestrator(OrchestratorBase):
                 if stage_id != 0:
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
                 return
+            latency_trace.mark(request_id, "orch_stage_submitted")
 
         if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state, attach_prewarm_payload=True)

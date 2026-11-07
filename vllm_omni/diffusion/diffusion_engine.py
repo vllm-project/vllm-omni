@@ -81,6 +81,7 @@ from vllm_omni.metrics.utils import (
     extract_diffusion_denoise_ms,
     extract_diffusion_vae_decode_ms,
 )
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
@@ -512,9 +513,12 @@ class DiffusionEngine:
             logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
+        latency_trace.mark(request.request_id, "diffusion_preprocessed")
         request_id = self._add_prepared_request(request)
+        latency_trace.mark(request_id, "diffusion_scheduler_enqueued")
         generator = self.get_output_stream(request_id)
         async for output in generator:
+            latency_trace.mark(request_id, "diffusion_output_dequeued")
             output_ready_wait_time = output.output_ready_wait_time
             # The stream now materializes async outputs before yielding. Keep
             # that wait separate from execution time in the timing breakdown.
@@ -560,6 +564,7 @@ class DiffusionEngine:
                 if kv_recv_ms > 0:
                     metrics_update["kv_recv_time_ms"] = kv_recv_ms
                 request_output.metrics.update(metrics_update)
+            latency_trace.mark(request_id, "diffusion_postprocessed")
             yield formatted_outputs
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
@@ -727,6 +732,9 @@ class DiffusionEngine:
                 self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
             self._emit_request_started_outputs(sched_output)
+            if latency_trace.ENABLED:
+                for _rid in sched_output.scheduled_request_ids:
+                    latency_trace.mark(_rid, "busy_scheduled")
 
             if sched_output.is_empty:
                 finished_ids = {
@@ -745,6 +753,9 @@ class DiffusionEngine:
                     else BatchRunnerOutput.from_list([])
                 )
                 self._poll_native_kv()
+                if latency_trace.ENABLED:
+                    for _rid in sched_output.scheduled_request_ids:
+                        latency_trace.mark(_rid, "busy_executed")
                 worker_execution_completed = True
             except Exception as exc:
                 # Shutdown can interrupt an in-flight executor call. Exit through
@@ -777,6 +788,9 @@ class DiffusionEngine:
                     runner_output,
                     worker_execution_completed=worker_execution_completed,
                 )
+                if latency_trace.ENABLED:
+                    for _rid in sched_output.scheduled_request_ids:
+                        latency_trace.mark(_rid, "busy_emitted")
             except Exception as exc:
                 self._fail_engine(exc)
                 return
@@ -1503,6 +1517,7 @@ class DiffusionEngine:
         try:
             while True:
                 output: DiffusionOutput = await queue.get()
+                latency_trace.mark(request_id, "diffusion_stream_item")
                 async_output_id = output.async_output_id
                 if async_output_id is not None:
                     with self._cv:

@@ -628,7 +628,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             req = new_req.req
             try:
-                args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
+                # The worker's single-request entry point runs on the config it
+                # was started with and ignores this argument, so send a
+                # placeholder instead of pickling the whole config per request.
+                args: tuple = (req, None, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
                 timeout_options: dict[str, Any] = {"timeout": _DLO_DP_WAVE_TIMEOUT_S}
