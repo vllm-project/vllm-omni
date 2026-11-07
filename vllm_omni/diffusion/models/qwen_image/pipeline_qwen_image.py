@@ -802,6 +802,7 @@ class QwenImagePipeline(
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
             generator=sampling.generator,
+            latents=sampling.latents,
             true_cfg_scale=sampling.true_cfg_scale or 4.0,
             max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
