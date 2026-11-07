@@ -15,14 +15,84 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
+    SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    SEED_TTS_OFFICIAL_TTS_USER_PREFIX,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_EN,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_EN,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH,
+    SeedTTSSampleRequest,
+)
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _attach_seed_tts_to_request_func_input,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("locale", "prompt", "ref_text", "prefix", "suffix"),
+    [
+        (
+            "zh",
+            "目标文本",
+            "参考",
+            SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH,
+            SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH,
+        ),
+        (
+            "en",
+            "target text",
+            "reference",
+            SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_EN,
+            SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_EN,
+        ),
+    ],
+)
+def test_seed_tts_request_uses_locale_matched_voice_clone_contract(locale, prompt, ref_text, prefix, suffix):
+    ref_audio = "data:audio/wav;base64,AAAA"
+    sample = SeedTTSSampleRequest(
+        prompt=prompt,
+        prompt_len=2,
+        expected_output_len=64,
+        multi_modal_data=None,
+        request_id=f"seed-{locale}-0",
+        seed_tts_locale=locale,
+        seed_tts_speech_extra={"ref_audio": ref_audio, "ref_text": ref_text},
+        seed_tts_system_prompt=SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    )
+    rfi = SimpleNamespace(extra_body={})
+    _attach_seed_tts_to_request_func_input(sample, rfi)
+    content = rfi.omni_chat_messages[0]["content"]
+    assert [part["type"] for part in content] == ["text", "audio_url", "text"]
+    assert content[0]["text"] == prefix
+    assert content[1]["audio_url"]["url"] == ref_audio
+    assert content[2]["text"] == suffix
+    assert rfi.extra_body["ref_audio"] == ref_audio
+    assert rfi.omni_chat_messages[1]["content"] == [
+        {"type": "text", "text": f"{SEED_TTS_OFFICIAL_TTS_USER_PREFIX} {prompt}"}
+    ]
+
+
+def test_seed_tts_missing_reference_keeps_text_only_system_message():
+    sample = SeedTTSSampleRequest(
+        prompt="target",
+        prompt_len=1,
+        expected_output_len=64,
+        multi_modal_data=None,
+        request_id="seed-zh-1",
+        seed_tts_locale="zh",
+        seed_tts_speech_extra=None,
+        seed_tts_system_prompt=SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    )
+    rfi = SimpleNamespace(extra_body=None)
+    _attach_seed_tts_to_request_func_input(sample, rfi)
+    assert rfi.omni_chat_messages[0]["content"] == [{"type": "text", "text": SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT}]
 
 
 class MockResponse:

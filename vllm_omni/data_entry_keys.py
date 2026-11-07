@@ -12,6 +12,7 @@ Categories under ``OmniPayload``:
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
@@ -145,6 +146,38 @@ class EmbeddingsStruct(_StructBase):
 class CodesStruct(_StructBase):
     audio: torch.Tensor | None = None
     ref: torch.Tensor | None = None
+
+    # Keep the wire struct compatible with legacy stage consumers that still
+    # use ``isinstance(codes, Mapping)`` followed by ``codes.get(...)``.
+    # This avoids materializing a second dict while preserving the typed
+    # msgspec payload on the inter-stage boundary.
+    def __getitem__(self, key: str) -> torch.Tensor | None:
+        if key == "audio":
+            return self.audio
+        if key == "ref":
+            return self.ref
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        if self.audio is not None:
+            yield "audio"
+        if self.ref is not None:
+            yield "ref"
+
+    def __len__(self) -> int:
+        return int(self.audio is not None) + int(self.ref is not None)
+
+    def keys(self) -> tuple[str, ...]:
+        return tuple(self)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+Mapping.register(CodesStruct)
 
 
 class IdsStruct(_StructBase):
