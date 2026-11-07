@@ -18,6 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _RNGModel(torch.nn.Module):
     supports_mm_request_rng = True
+    mm_rng_seed_field = "vae_generator_seed"
 
     def bind_mm_rng_provider(self, provider: RequestRNGProvider) -> None:
         self.provider = provider
@@ -81,4 +82,3 @@ def test_npu_load_model_binds_request_rng(monkeypatch, mocker, is_310p, enabled)
         assert runner._mm_rng_provider.streams == {}
     else:
         assert runner._mm_rng_provider is None
-    assert runner._mm_rng_contexts == {}

@@ -16,8 +16,11 @@ from transformers import BatchFeature, PretrainedConfig
 from vllm import SamplingParams
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
+from vllm.multimodal.cache.lru import LruKeyReplicatedReceiverCache
 from vllm.multimodal.cache.shm import ShmObjectStoreReceiverCache, ShmObjectStoreSenderCache
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem, PlaceholderRange
+from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
+from vllm.multimodal.processing import ProcessorInputs
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -28,7 +31,6 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.core.sched.output import OmniNewRequestData
-from vllm_omni.inputs.mm_rng import MMRNGContext, contextualize_mm_features
 from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
 from vllm_omni.model_executor.models.hunyuan_image3 import autoencoder_kl_3d
 from vllm_omni.model_executor.models.hunyuan_image3 import hunyuan_image3 as hunyuan
@@ -127,17 +129,24 @@ def _make_request(mocker, req_id, images, seed=42):
     )
     processor = hunyuan.HunyuanImage3MultiModalProcessor.__new__(hunyuan.HunyuanImage3MultiModalProcessor)
     processor.info = mocker.Mock(spec=hunyuan.HunyuanImage3ProcessingInfo)
+    processor.info.model_id = "hunyuan-test"
+    processor.info.ctx = mocker.Mock()
+    processor.info.ctx.get_mm_config.return_value = MultiModalConfig()
     processor.info.get_image_processor.return_value = lambda *args, **kwargs: features
     kwargs = {} if seed is None else {"vae_generator_seed": seed}
+    identities = processor._get_mm_hashes(
+        ProcessorInputs(
+            prompt=[],
+            mm_data_items=MultiModalDataItems({"image": ImageProcessorItems(images)}),
+            hf_processor_mm_kwargs=kwargs,
+        )
+    )["image"]
     output = processor._call_hf_processor("", {"images": images}, kwargs, {})
     fields = processor._get_mm_fields_config(output, kwargs)
     elements = {key: field.build_elems(key, output[key]) for key, field in fields.items()}
-    from vllm.multimodal.inputs import MultiModalKwargsItem
 
     mm_features, offset = [], 1
-    for i, im in enumerate(images):
-        # Synthetic content identities; hashing behavior is tested separately.
-        identity = str((im.shape, im.flatten()[0].item(), seed))
+    for i, (im, identity) in enumerate(zip(images, identities, strict=True)):
         length = im.shape[1] * im.shape[2] + 2
         mm_features.append(
             MultiModalFeatureSpec(
@@ -149,14 +158,7 @@ def _make_request(mocker, req_id, images, seed=42):
             )
         )
         offset += length
-    context = (
-        None if seed is None else MMRNGContext("hunyuan-ar-vae-v1", seed, ("vae_generator_seed", "vae_token_grid_hw"))
-    )
-    if context:
-        mm_features = contextualize_mm_features(mm_features, context)
-    req = Request(req_id, [1] * (offset + 1), SamplingParams(seed=999), None, mm_features=mm_features)
-    req.mm_rng_context = context
-    return req
+    return Request(req_id, [1] * (offset + 1), SamplingParams(seed=999), None, mm_features=mm_features)
 
 
 @pytest.fixture
@@ -178,7 +180,9 @@ def schedule(inputs=None, *, new=(), finished=()):
 
 
 def admit(runner, *requests, finished=()):
-    new = [OmniNewRequestData.from_base(NewRequestData.from_request(req, ([],)), req) for req in requests]
+    new = [
+        OmniNewRequestData.from_base(NewRequestData.from_request(req, ([],), uses_mrope=True), req) for req in requests
+    ]
     runner._update_states(schedule(new=new, finished=finished))
 
 
@@ -343,7 +347,7 @@ def test_pause_finish_and_request_id_reuse(runner, make_request):
     assert_latents(runner._execute_mm_encoder(schedule({"A": [2]})), [expected[2]])
     assert provider.handles["A"] != old_handle
     runner._update_states(schedule(finished=["A"]))
-    assert not provider.streams and not provider.handles and not runner._mm_rng_contexts
+    assert not provider.streams and not provider.handles
 
 
 @pytest.mark.cpu
@@ -362,12 +366,40 @@ def test_seedless_and_seeded_groups_keep_global_rng_behavior(runner, make_reques
 
 
 @pytest.mark.cpu
-def test_missing_request_context_is_rejected(runner, make_request):
-    req = make_request("A", images()[:1])
+def test_inconsistent_image_seeds_are_rejected(runner, make_request):
+    req = make_request("A", images())
+    seed = req.mm_features[1].data["vae_generator_seed"]
+    req.mm_features[1].data["vae_generator_seed"] = replace(seed, data=torch.tensor(0))
     admit(runner, req)
-    runner._mm_rng_contexts.clear()
-    with pytest.raises(ValueError, match="request RNG context"):
+    with pytest.raises(ValueError, match="seed does not match"):
         runner._execute_mm_encoder(schedule({"A": [0]}))
+
+
+@pytest.mark.cpu
+def test_full_prefix_hit_needs_no_provider_state(runner, make_request):
+    req = make_request("A", images())
+    req.num_computed_tokens = req.num_prompt_tokens
+    admit(runner, req)
+    assert all("vae_generator_seed" in feature.data for feature in runner.requests["A"].mm_features)
+    assert runner._execute_mm_encoder(schedule()) == []
+    assert not runner._mm_rng_provider.streams
+    runner._update_states(schedule(finished=["A"]))
+
+
+@pytest.mark.cpu
+def test_lru_restores_seed_before_scheduler(runner, make_request, mocker):
+    config = mocker.Mock()
+    config.get_multimodal_config.return_value = MultiModalConfig(mm_processor_cache_gb=0.01)
+    receiver = LruKeyReplicatedReceiverCache(config)
+    receiver.get_and_update_features(make_request("warm", images(), 123).mm_features)
+    req = make_request("A", images(), 123)
+    req.mm_features = [replace(feature, data=None) for feature in req.mm_features]
+    # EngineCore resolves processor-cache hits before scheduler prefix stripping.
+    req.mm_features = receiver.get_and_update_features(req.mm_features)
+    req.num_computed_tokens = req.mm_features[2].mm_position.offset
+    admit(runner, req)
+    expected, _ = reference(runner, images(), 123)
+    assert_latents(runner._execute_mm_encoder(schedule({"A": [2]})), expected[2:])
 
 
 @pytest.mark.cpu
@@ -390,11 +422,9 @@ def test_shm_worker_resolution_of_cached_predecessor(runner, monkeypatch, mocker
                 handles.append(replace(feature, data=address))
             req.mm_features = handles
             req.num_computed_tokens = handles[1].mm_position.offset
-            data = OmniNewRequestData.from_base(NewRequestData.from_request(req, ([],)), req)
-            assert data.mm_rng_context == req.mm_rng_context
+            data = OmniNewRequestData.from_base(NewRequestData.from_request(req, ([],), uses_mrope=True), req)
             assert data.mm_features[0].data is handles[0].data
             assert "address" in data.mm_features[0].data
-            assert OmniNewRequestData.from_request(req, ([],)).mm_rng_context == req.mm_rng_context
             output = schedule({"A": [2]}, new=[data])
             wrapper = object.__new__(WorkerWrapperBase)
             wrapper.mm_receiver_cache = receiver
@@ -550,18 +580,17 @@ def test_real_vae_posterior_matches_draw_plan_and_replay(runner, make_request, m
         feature.data["vae_token_grid_hw"] = replace(
             grid, data=torch.tensor([pixels.shape[-2] // 16, pixels.shape[-1] // 16])
         )
-    context = req.mm_rng_context
-    specs = model.get_mm_rng_specs(req.mm_features, context)
+    specs = model.get_mm_rng_specs(req.mm_features, 42)
     posteriors = [vae.encode(pixels.unsqueeze(0)).latent_dist for pixels in refs]
     for index, posterior in enumerate(posteriors):
         assert specs[index] == RandomDrawSpec(
             tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device
         )
 
-    reference_generator = torch.Generator(device="cpu").manual_seed(context.seed)
+    reference_generator = torch.Generator(device="cpu").manual_seed(42)
     expected = [posterior.sample(reference_generator) for posterior in posteriors]
     provider = runner._mm_rng_provider
-    handle = provider.register(req.request_id, context.seed, specs)
+    handle = provider.register(req.request_id, 42, specs)
     # Starting at the last image requires replay of two differently sized
     # predecessors. Revisiting earlier images must restore their own draws.
     for index in (2, 0, 1, 2):

@@ -12,8 +12,6 @@ import torch
 if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
 
-    from vllm_omni.inputs.mm_rng import MMRNGContext
-
 MM_RNG_ITEM_KEY = "mm_rng_item"
 
 
@@ -105,12 +103,11 @@ class RequestRNGProvider:
 
 class SupportsMMRequestRNG(Protocol):
     supports_mm_request_rng: bool
+    mm_rng_seed_field: str
 
     def bind_mm_rng_provider(self, provider: RequestRNGProvider) -> None: ...
 
-    def get_mm_rng_specs(
-        self, features: list["MultiModalFeatureSpec"], context: "MMRNGContext"
-    ) -> dict[int, RandomDrawSpec]: ...
+    def get_mm_rng_specs(self, features: list["MultiModalFeatureSpec"], seed: int) -> dict[int, RandomDrawSpec]: ...
 
     def advance_mm_rng(self, generator: torch.Generator, spec: RandomDrawSpec) -> None: ...
 

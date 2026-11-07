@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import gc
+import hashlib
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+import msgspec
 import numpy as np
 import regex as re
 import torch
@@ -29,7 +31,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.exceptions import VLLMValidationError
-from vllm.inputs import MultiModalDataDict, MultiModalInput
+from vllm.inputs import MultiModalDataDict, MultiModalHashes, MultiModalInput
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
@@ -68,7 +70,6 @@ from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
-    MultiModalKwargsOptionalItems,
 )
 from vllm.multimodal.parse import (
     MultiModalDataItems,
@@ -90,7 +91,6 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
-from vllm_omni.inputs.mm_rng import HUNYUAN_VAE_RNG_POLICY, MM_RNG_CONTEXT_KEY, MMRNGContext
 from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
 from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
     HunYuanMLP,
@@ -106,6 +106,8 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
 
 logger = init_logger(__name__)
+
+HUNYUAN_VAE_RNG_POLICY = "hunyuan-ar-vae-v1"
 
 
 @support_torch_compile(
@@ -1041,8 +1043,6 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
 class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3ProcessingInfo]):
     """Multimodal processor for HunyuanImage3 model."""
 
-    mm_rng_seed_field = "vae_generator_seed"
-
     @staticmethod
     def _validate_vae_generator_seed(seed: object) -> int:
         # The per-image transport field is torch.long, even on platforms whose
@@ -1051,53 +1051,25 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
             raise VLLMValidationError("Hunyuan vae_generator_seed must be a signed 64-bit integer")
         return int(seed)
 
-    @staticmethod
-    def validate_mm_rng_inputs(context: MMRNGContext, mm_kwargs: MultiModalKwargsOptionalItems) -> None:
-        """Reject malformed request metadata before it reaches worker execution."""
-        HunyuanImage3MultiModalProcessor._validate_vae_generator_seed(context.seed)
-        required = ("vae_generator_seed", "vae_token_grid_hw")
-        if context.policy != HUNYUAN_VAE_RNG_POLICY or not set(required).issubset(context.retain_fields):
-            raise VLLMValidationError("Invalid Hunyuan VAE RNG policy or retained metadata")
-        for item in mm_kwargs.get("image", ()):
-            # Cache hits and SHM addresses refer to already-processed data that
-            # is resolved later by the receiver; never dereference them here.
-            if item is None or "address" in item:
-                continue
-            if any(key not in item for key in required):
-                raise VLLMValidationError("Seeded Hunyuan inputs require VAE seed and grid metadata for every image")
-            seed = item["vae_generator_seed"].data
-            grid = item["vae_token_grid_hw"].data
-            if (
-                not isinstance(seed, torch.Tensor)
-                or seed.device.type != "cpu"
-                or seed.dtype != torch.long
-                or seed.numel() != 1
-                or seed.item() != context.seed
-            ):
-                raise VLLMValidationError("VAE image seed must match the request RNG context")
-            if (
-                not isinstance(grid, torch.Tensor)
-                or grid.device.type != "cpu"
-                or grid.dtype != torch.long
-                or grid.shape != (2,)
-                or not bool((grid > 0).all())
-            ):
-                raise VLLMValidationError("VAE token grid must contain two positive integer dimensions")
-
     def apply(self, inputs: ProcessorInputs, timing_ctx: TimingContext) -> MultiModalInput:
         seed = inputs.hf_processor_mm_kwargs.get("vae_generator_seed")
         if seed is not None:
-            seed = self._validate_vae_generator_seed(seed)
-        result = super().apply(inputs, timing_ctx)
-        if seed is not None:
-            context = MMRNGContext(
-                policy=HUNYUAN_VAE_RNG_POLICY,
-                seed=seed,
-                retain_fields=("vae_generator_seed", "vae_token_grid_hw"),
-            )
-            self.validate_mm_rng_inputs(context, result["mm_kwargs"])
-            result[MM_RNG_CONTEXT_KEY] = context
-        return result
+            self._validate_vae_generator_seed(seed)
+        return super().apply(inputs, timing_ctx)
+
+    def _get_mm_hashes(self, inputs: ProcessorInputs) -> MultiModalHashes:
+        hashes = super()._get_mm_hashes(inputs)
+        if inputs.hf_processor_mm_kwargs.get("vae_generator_seed") is None:
+            return hashes
+        # Upstream already hashes the seed and processor kwargs. Extend each
+        # image's identity with the preceding draws before cache lookup. This
+        # scopes both processor and encoder caches to the reference prefix.
+        prefix = b""
+        image_hashes = []
+        for image_hash in hashes.get("image", ()):
+            prefix = hashlib.sha256(msgspec.msgpack.encode((HUNYUAN_VAE_RNG_POLICY, prefix, image_hash))).digest()
+            image_hashes.append(f"{HUNYUAN_VAE_RNG_POLICY}:{prefix.hex()}")
+        return {**hashes, "image": image_hashes}
 
     def _call_hf_processor(
         self,
@@ -1513,16 +1485,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     """
 
     supports_mm_request_rng = True
+    mm_rng_seed_field = "vae_generator_seed"
     _mm_rng_provider: RequestRNGProvider | None = None
 
     def bind_mm_rng_provider(self, provider: RequestRNGProvider) -> None:
         self._mm_rng_provider = provider
 
-    def get_mm_rng_specs(
-        self, features: list[MultiModalFeatureSpec], context: MMRNGContext
-    ) -> dict[int, RandomDrawSpec]:
-        if context.policy != HUNYUAN_VAE_RNG_POLICY:
-            raise ValueError(f"Unsupported Hunyuan VAE RNG policy: {context.policy}")
+    def get_mm_rng_specs(self, features: list[MultiModalFeatureSpec], seed: int) -> dict[int, RandomDrawSpec]:
         specs = {}
         for index, feature in enumerate(features):
             if feature.modality != "image":
@@ -1530,8 +1499,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             data = feature.data
             if data is None or "vae_token_grid_hw" not in data or "vae_generator_seed" not in data:
                 raise ValueError("Seeded Hunyuan requests require VAE metadata for every reference image")
-            if int(data["vae_generator_seed"].data.item()) != context.seed:
-                raise ValueError("VAE image seed does not match the request RNG context")
+            if int(data["vae_generator_seed"].data.item()) != seed:
+                raise ValueError("VAE image seed does not match the request seed")
             token_h, token_w = data["vae_token_grid_hw"].data.tolist()
             h = token_h * self.config.vae_downsample_factor[0] * self.config.patch_size
             w = token_w * self.config.vae_downsample_factor[1] * self.config.patch_size

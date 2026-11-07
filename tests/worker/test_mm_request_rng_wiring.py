@@ -14,6 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _RNGModel(torch.nn.Module):
     supports_mm_request_rng = True
+    mm_rng_seed_field = "vae_generator_seed"
 
     def bind_mm_rng_provider(self, provider: RequestRNGProvider) -> None:
         self.provider = provider
@@ -42,7 +43,6 @@ def test_load_model_binds_request_rng_only_for_opted_in_models(mocker, enabled):
 
     runner.load_model()
 
-    assert runner._mm_rng_contexts == {}
     if enabled:
         assert isinstance(runner._mm_rng_provider, RequestRNGProvider)
         assert model.provider is runner._mm_rng_provider

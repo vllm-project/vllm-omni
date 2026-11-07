@@ -1,190 +1,112 @@
-# Request-owned multimodal random streams
+# Hunyuan request-owned multimodal random streams
 
 HunyuanImage3 conditional VAE sampling uses one random stream per seeded AR
-request. Reference images consume that stream in their original request order,
-as intended by [#4145](https://github.com/vllm-project/vllm-omni/pull/4145).
+request. Reference images consume it in input order, as intended by
+[#4145](https://github.com/vllm-project/vllm-omni/pull/4145).
 [Issue #9362](https://github.com/vllm-project/vllm-omni/issues/9362) exposed that
-the previous implementation instead used the first seed for an entire encoder
-batch. Its result depended on unrelated requests and which images were cached.
+one encoder batch instead shared its first seed, making conditioning depend on
+unrelated requests and cache hits.
 
-## Ownership and interfaces
+## Processor identities and existing transport
 
-```mermaid
-flowchart TD
-    P[Hunyuan processor: resolved seed] --> I[Omni InputProcessor: request context and encoder identity]
-    I --> E[EngineCore: scheduler request]
-    E --> S[Scheduler: work and compact image metadata]
-    S --> R[Omni Runner: request lifecycle]
-    R --> G[RequestRNGProvider: generators and checkpoints]
-    R --> B[Existing encoder batching: request handle and image index]
-    B --> H[Hunyuan: draw specifications]
-    H --> G
-    G --> V[VAE posterior sampling]
-    V --> G
-```
+Hunyuan's `_get_mm_hashes` extends each image's upstream hash with a policy
+version and the preceding reference hashes. The upstream hash already includes
+`vae_generator_seed` and the processor options. The resulting prefix chain
+scopes both processor and encoder caches before scheduling and KV block hashing.
+Upstream encoder LoRA scoping remains unchanged. Request IDs are excluded:
+identical seeded reference prefixes can reuse results across requests, while
+`[A, A]` has distinct identities for its two sampling positions.
 
-The optional `SupportsMMRequestRNG` contract binds a model to a Runner-owned
-provider. The model supplies the ordered random draw specifications and the
-operation that consumes a skipped draw. The provider owns generators and
-checkpoints; it never uses the AR token sampler's generator. Each executing
-worker owns device-local objects. Generator objects are not serialized or
-transferred between AR and DiT stages.
+This deliberately reduces processor-cache reuse across reference positions.
+Changing an earlier reference can require later images to be processed again.
+UUID-only inputs work when the corresponding prefix-scoped entries are cached;
+if a new prefix misses, the caller must provide the image data again. UUIDs are
+not permanent media storage: upstream also requires a cache hit when pixels
+are omitted. No measured processing or memory overhead is claimed.
 
-`MMRNGContext` carries the policy version, the processor's actual seed, and
-the names of compact metadata fields needed by the model. Hunyuan emits this
-context on every processor invocation, including all-cache-hit invocations.
-`OmniInputProcessor` preserves it for both raw prompts and rendered engine
-inputs. It delegates tokenization and multimodal preprocessing to the existing
-renderer and delegates request construction to upstream vLLM.
-For raw prompts, parameter, LoRA and DP-rank checks run before rendering can
-mutate the sender cache. A request rejected by these early checks leaves no
-unsent image entries that could break the next request's cache lookup.
+The processor validates the signed 64-bit seed before mutating its cache and
+stores it in each image's existing `vae_generator_seed` field. Both that field
+and `vae_token_grid_hw` use `keep_on_cpu=True`. Hunyuan uses M-RoPE, so upstream
+prefix stripping retains these fields after dropping covered image pixels.
+LRU payloads are restored before scheduling; SHM payloads are restored before
+worker execution. The worker reads the seed from the resolved image item.
+There is no additional request field or custom input-processing prelude.
 
-Before encoder batching, the Runner attaches a CPU `(request_handle, mm_index)`
-field to a shallow copy of each scheduled image item. Upstream grouping and
-encoding remain responsible for batching and output order. Shared processor
-cache items never contain runtime handles. `embed_multimodal(**kwargs)` keeps
-its upstream signature.
+## Worker ownership and replay
 
-The draw plan and image-to-draw positions are built once per request. Each
-encoder dispatch maps only its scheduled items to original image indices,
-using the request ID and encoder identifier returned by upstream batching.
-These identities remain aligned through filtering and reordering, independently
-of placeholder object identity. Checkpoints are stored in a list whose indices
-are consecutive draw boundaries, allowing direct lookup without scanning prior
-images or checkpoints. Request updates revalidate the cached plan at the
-lifecycle boundary, outside the per-image encoding loop.
+The optional `SupportsMMRequestRNG` interface binds the model to a runner-owned
+`RequestRNGProvider`. The model declares its seed field, supplies an ordered
+shape/dtype/device draw plan, and implements the exact skipped-draw operation.
+Each worker owns its device-local generator and checkpoints. They are separate
+from AR token-sampling state and are not transferred between stages.
 
-`RandomDrawSpec` resolves an accelerator device without an index to the current
-device when the specification is constructed. Explicit accelerator indices
-remain distinct, and CPU device aliases normalize to `cpu`. The plan and actual
-posterior are compared using these fixed devices, so later current-device
-changes cannot reinterpret an existing plan.
+The runner builds the plan once when a seeded request first needs encoding.
+It attaches `(request_handle, mm_index)` to a shallow copy of each scheduled
+item, preserving shared processor-cache entries. Request ID plus the contextual
+encoder identifier associates results with original image indices through
+upstream filtering and reordering. `embed_multimodal(**kwargs)` is unchanged.
 
-## Cache behavior and random-stream restoration
+For image `i`, the provider restores a checkpoint at or before its logical draw
+position. Missing predecessors are replayed with the same `randn_tensor` shape,
+dtype and device as posterior sampling; their noise is discarded without VAE
+forwards. Reordering and recomputation restore the same position. Failed draws
+do not commit a checkpoint. Device aliases are resolved before comparing the
+planned and actual posterior specifications.
 
-Processor `mm_hash` remains unchanged; upstream processor hashing already
-includes a supplied `vae_generator_seed` in the processor kwargs. Encoder
-`identifier` is derived from
-the policy, seed and original identities of the reference prefix through the
-current image. Including the original identities preserves existing adapter
-scope. The transformation happens before the scheduler constructs KV block
-hashes. Request IDs are excluded, so identical reference prefixes can reuse
-encoder outputs across requests. Different preceding images conservatively
-prevent reuse even if their random draw shapes happen to match.
+All-prefix hits need no generator until encoding becomes necessary. Preemption
+preserves existing state; completion, abort and shutdown release it. Reusing a
+finished request ID creates a new handle. Updates to an existing request must
+preserve its references, seed and draw plan.
 
-The reference chain belongs to encoder identities rather than processor
-`mm_hash` values. Processor caching also resolves UUID-only inputs whose pixels
-are omitted after an earlier request supplied them. A cached image from `[A]`
-must still resolve when a later request supplies `[B, A]` with only A's UUID.
-Including the reference prefix in the processor key would turn that valid
-lookup into a miss with no pixels available to recompute it.
+Legacy GPU and NPU runners initialize the provider during model loading.
+MRv2 lacks the required encoder metadata/lifecycle integration and rejects
+models declaring this capability at startup. Use `model_runner: v1` for this
+Hunyuan AR path. Missing seeds retain global-RNG sampling and the original
+image-based cache identities; seed zero enables request-owned sampling.
 
-For image `i`, the provider restores the closest checkpoint at or before `i`.
-It replays missing predecessor draws using the same shape, dtype, device and
-`randn_tensor` operation as the posterior sampler, discarding those temporary
-noise tensors. It does not execute the predecessor VAE forwards. Each successful
-replayed draw appends a checkpoint. A successful sample appends the next boundary
-or replaces it when recomputing an earlier image; an exception in replay or
-sampling does not commit the failed draw. A repeated or reordered encoder call
-restores its logical position instead of consuming the current tail of the stream.
+## DiT integration boundary
 
-KV prefix hits can remove image pixels before dispatch. The Omni scheduler
-adapter preserves `vae_token_grid_hw` and `vae_generator_seed` from the full
-request, independently of M-RoPE configuration. SHM handles stay intact until
-the worker's normal receiver resolves them. Hunyuan checks its inferred draw
-specification against the actual posterior before sampling.
+The canonical uncached DiT order is: conditional VAE draws in reference order,
+then initial generated-image noise, then subsequent draws. CFG copies sampled
+conditioning without another posterior draw for each branch.
 
-Pausing or preempting a request preserves its RNG state. Completion and abort
-remove it, including steps with zero scheduled tokens. Reusing a request ID
-creates a new handle. Worker shutdown clears the remaining state.
+The current DiT path skips conditional draws when AR-KV import or native KV
+covers those images, shifting the initial noise and later RNG state. This
+pre-existing limitation is not fixed by the AR changes. Integration in
+[#9192](https://github.com/vllm-project/vllm-omni/issues/9192) must replay skipped
+draws or restore an equivalent validated state. Replay must match the actual
+posterior shape/dtype/device, including autocast. VAE backends returning tensors
+directly require their own sampling contract; blindly replaying the ordinary
+posterior draw is incorrect for that branch.
 
-## DiT draw order and AR-KV integration
+That integration must compare initial noise and subsequent RNG state across
+local misses, native prefix hits and AR-KV imports, including repeated and
+unequal-sized references and supported CFG/VAE configurations. Imported
+conditioning must also have the matching reference and sampling identity.
 
-The canonical DiT random stream follows the uncached local execution path:
+Seedless behavior currently differs: AR may reuse a global-RNG sample through
+its image-based cache; DiT uses explicit generator state when supplied and
+otherwise request-local reference identities. #9192 must define a shared
+identity for realized seedless conditioning before combining these caches.
+This change preserves both stages' existing seedless policies.
 
-1. Use the supplied generator, or create the request generator from its seed.
-2. Sample each conditional image's VAE posterior in reference order. Repeated
-   references consume separate draws. CFG copies the sampled conditioning; it
-   does not introduce another posterior draw for each CFG branch.
-3. Draw the initial generated-image noise from that same stream, followed by
-   any later operations that consume the generator.
+## Validation
 
-The current DiT path skips conditional encoding when imported AR KV or native
-KV covers the conditional images. It also skips those posterior draws, so the
-initial noise can differ from a local cache miss with the same seed. This is
-a pre-existing DiT limitation; the AR request-stream fix does not resolve it.
-Seed-scoped cache keys alone do not restore a skipped random-stream position.
-
-The integration in [#9192](https://github.com/vllm-project/vllm-omni/issues/9192)
-must preserve the canonical order when reusing conditional KV. Replay should
-consume and discard the same `randn_tensor` calls as the actual posterior,
-without repeating VAE forwards, or restore an equivalent validated RNG state.
-Its draw specifications must match the executing VAE's shape, dtype and device,
-including autocast behavior. A VAE backend returning tensors directly must be
-handled according to its own sampling behavior; the wrapper does not call
-`latent_dist.sample` in that branch. Replaying the ordinary posterior draw
-unconditionally would therefore be incorrect.
-
-Acceptance coverage for that integration must compare local misses, native
-prefix hits and AR-KV imports at the initial noise and subsequent generator
-state, with the same seed or supplied generator state. Include repeated and
-different-sized references, all CFG branches, and the supported VAE backends.
-Imported conditioning must also have the matching reference and sampling
-identity; matching the DiT noise alone does not establish AR-to-DiT parity.
-
-Unseeded behavior currently differs between stages. AR retains its existing
-global-RNG sampling and image-based encoder identity, allowing a previously
-sampled embedding and its KV to be reused. DiT native prefix identities use an
-explicit generator's state when supplied; with neither generator nor seed,
-reference identities are request-local. These are compatibility behaviors,
-not a shared seedless reuse contract. Before combining the caches, #9192 must
-define how a seedless request identifies its realized conditioning across the
-stage boundary and test that unrelated requests cannot exchange it. This PR
-does not change either stage's seedless policy.
-
-## Compatibility and validation boundary
-
-The legacy Omni GPU and NPU runners bind request RNG during model loading.
-MRv2 does not yet carry the request context and per-image RNG indices, so it
-rejects models declaring this capability at startup. Use `model_runner: v1`
-for a Hunyuan AR stage. This avoids accepting requests into an unsupported
-runner and discovering the missing provider during worker execution.
-
-The existing seed-forwarding paths are preserved. A delivered seed, including
-zero, enables the request stream. The processor validates the signed 64-bit
-seed before updating its cache. Admission also validates the model's RNG
-policy and available per-image seed/grid metadata, including manually rendered
-engine inputs; malformed values produce request validation errors. Cached or
-SHM payloads are resolved by their normal receivers, and worker-side checks
-remain to detect internal inconsistencies. Absent seeds retain `generator=None`
-and global RNG behavior; DiT and token-sampling RNG are unchanged.
-
-Seeded engine inputs must retain the processor-produced context. The reference
-list and sampling plan remain fixed within a request; incompatible updates are
-rejected before reusing its cached plan.
-
-Regression tests use production processing, cache, scheduling, batching and
-posterior sampling with tiny network substitutes. Comparisons are exact within
-one device and dtype; they do not assert equality between CPU/CUDA or different
-precisions. These tests establish RNG and lifecycle behavior, not pretrained
-Hunyuan image quality, distributed performance, or AR-to-DiT integration.
-Additional CPU tests exercise GPU/NPU model-load wiring and MRv2 startup
-rejection. A randomly initialized `AutoencoderKLConv3D` checks the draw plan
-and replay with the model's spatial/temporal compression and latent channels,
-using smaller hidden widths and image dimensions in FP32 and BF16. This is
-actual VAE encoding evidence, not a production-resolution or pretrained test.
-CPU cases cover request lifecycle, cache transport and plan reuse. CUDA cases
-focus on mixed-request sampling and missing-predecessor replay, each in FP32,
-FP16 and BF16.
-
-Run from the repository root with the supported vLLM and Omni dependencies:
+Regressions exercise production processing, caching, scheduling, batching and
+posterior sampling with tiny network substitutes. They cover mixed seeds,
+zero/absent seeds, duplicate references, reorder/recompute, partial encoder and
+prefix hits, LRU/SHM transport, request lifecycle and one-time plan construction.
+GPU/NPU load-hook tests verify provider wiring on CPU; MRv2 tests verify startup
+rejection. A random-weight `AutoencoderKLConv3D` checks real posterior geometry
+and replay in FP32/BF16, retaining the model's compression topology and latent
+channels with smaller hidden widths and image sizes.
 
 ```bash
 python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py -m 'core_model and cpu' -q
 python -m pytest tests/model_executor/models/test_hunyuan_request_rng.py -m 'core_model and cuda and L4' --run-level=core_model -q
 ```
 
-The CUDA tests require one CUDA GPU and no model weights; the L4 mark selects
-the existing CI runner tier. Both test paths are already collected by the
-CPU and model-executor CUDA sweeps in `test-ready.yml`.
+CUDA cases cover FP32/FP16/BF16 mixed-request sampling and predecessor replay.
+Equality is checked within one device and dtype. These checks do not establish
+pretrained image quality, NPU hardware inference, distributed performance or
+AR-to-DiT parity.
