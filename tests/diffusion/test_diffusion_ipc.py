@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
+import gc
 import multiprocessing as mp
 import queue
 import threading
@@ -15,6 +16,7 @@ import pytest
 import torch
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
+import vllm_omni.diffusion.ipc as diffusion_ipc
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
@@ -240,6 +242,77 @@ def test_numpy_object_array_stays_inline() -> None:
     assert packed is values
 
 
+@pytest.mark.parametrize("writeable", [True, False])
+def test_nested_non_native_endian_numpy_round_trips_through_shm(writeable: bool) -> None:
+    dtype = np.dtype(np.float32).newbyteorder("S")
+    values = np.arange(300_000, dtype=dtype).reshape(600, 500)
+    values.flags.writeable = writeable
+    output = DiffusionOutput(output={"nested": [values]})
+    created = []
+
+    try:
+        pack_diffusion_output_shm(output)
+        handle = output.output["nested"][0]
+        created.append(handle)
+        assert handle["__ndarray_shm__"] is True
+        assert handle["numpy_dtype"] == str(dtype)
+
+        unpack_diffusion_output_shm(output)
+        restored = output.output["nested"][0]
+        assert restored.dtype == dtype
+        assert restored.shape == values.shape
+        np.testing.assert_array_equal(restored, values)
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=handle["name"])
+    finally:
+        diffusion_ipc._unlink_shm_handles(created)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_numpy_packing_failure_unlinks_all_allocations(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
+    first = np.arange(300_000, dtype=np.float32)
+    second = first.copy()
+    payload = {"nested": [first, second]}
+    output = DiffusionOutput(output=payload)
+    segments = []
+    real_new_shm_array = diffusion_ipc._new_shm_array
+
+    def track_allocation(shape, dtype):
+        shm, array, handle = real_new_shm_array(shape, dtype)
+        segments.append(shm)
+        return shm, array, handle
+
+    error = error_type("injected packing failure")
+
+    def fail_second_copy(*args, **kwargs):
+        if len(segments) == 2:
+            raise error
+        return real_copy(*args, **kwargs)
+
+    real_copy = np.copyto
+    monkeypatch.setattr(diffusion_ipc, "_new_shm_array", track_allocation)
+    monkeypatch.setattr(np, "copyto", fail_second_copy)
+
+    try:
+        with pytest.raises(error_type, match="injected packing failure") as raised:
+            pack_diffusion_output_shm(output)
+
+        assert raised.value is error
+        assert output.output is payload
+        assert len(segments) == 2
+        for segment in segments:
+            assert segment.buf is None
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=segment.name)
+    finally:
+        for segment in segments:
+            segment.close()
+            with contextlib.suppress(FileNotFoundError):
+                segment.unlink()
+
+
 def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
     tensor = torch.arange(300_000, dtype=torch.float32)
     envelope = {
@@ -430,12 +503,76 @@ def test_pack_value_preserves_dtype_shape_and_values_for_bfloat16() -> None:
         assert packed["__tensor_shm__"] is True
         assert packed["shape"] == list(tensor.shape)
         assert packed["torch_dtype"] == "torch.bfloat16"
-        assert packed["numpy_dtype"] == "float32"
+        assert packed["numpy_dtype"] == "uint16"
 
         unpacked = _unpack_if_shm_handle(packed)
         assert isinstance(unpacked, torch.Tensor)
         assert unpacked.dtype == torch.bfloat16
-        torch.testing.assert_close(unpacked, tensor)
+        assert torch.equal(unpacked.view(torch.uint16), tensor.view(torch.uint16))
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+@pytest.mark.parametrize("enable_registered_shm", [False, True])
+def test_only_opted_in_host_tensors_borrow_shm_on_unpack(enable_registered_shm: bool) -> None:
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    packed = diffusion_ipc._tensor_to_shm(tensor, enable_registered_shm=enable_registered_shm)
+
+    try:
+        assert packed["borrow_on_unpack"] is enable_registered_shm
+        segment = shared_memory.SharedMemory(name=packed["name"])
+        try:
+            unpacked = _unpack_if_shm_handle(packed)
+            # Either way the receiver unlinks the name, even while a borrowed
+            # tensor still maps the segment.
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=packed["name"])
+            # Write through the unlinked segment: only a borrowed tensor sees it.
+            np.ndarray(tensor.shape, dtype=np.float32, buffer=segment.buf)[0] = -1.0
+            assert (unpacked[0].item() == -1.0) is enable_registered_shm
+        finally:
+            segment.close()
+        # A view, like a per-request batch split, keeps the data valid alone.
+        tail = unpacked[1:]
+        del unpacked
+        gc.collect()
+        torch.testing.assert_close(tail, tensor[1:])
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+class _UnusableStream:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"host tensors must not use the D2H stream (accessed {name!r})")
+
+
+def test_host_tensor_with_d2h_stream_skips_staging_copy() -> None:
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    output = DiffusionOutput(output=tensor)
+
+    pack_diffusion_output_shm(output, d2h_stream=_UnusableStream())
+    packed = output.output
+    try:
+        assert isinstance(packed, dict) and packed["__tensor_shm__"] is True
+        unpack_diffusion_output_shm(output)
+        torch.testing.assert_close(output.output, tensor)
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+def test_bfloat16_nan_payloads_round_trip_bit_exact() -> None:
+    # Quiet and signalling NaNs with payloads and both signs, plus -inf and the
+    # smallest subnormal. An fp32 round trip would collapse every NaN to 0x7fc0.
+    special = torch.tensor([0x7FC1, 0xFFA5, 0x7F81, 0x7FC0, 0xFF80, 0x0001], dtype=torch.int32).to(torch.uint16)
+    bits = special.repeat(_large_numel(torch.bfloat16) // special.numel() + 1)
+    tensor = bits.view(torch.bfloat16)
+    packed = _pack_value_if_large(tensor)
+
+    try:
+        assert isinstance(packed, dict) and packed["numpy_dtype"] == "uint16"
+        unpacked = _unpack_if_shm_handle(packed)
+        assert unpacked.dtype == torch.bfloat16
+        assert torch.equal(unpacked.view(torch.uint16), bits)
     finally:
         _cleanup_shm_handle(packed)
 
