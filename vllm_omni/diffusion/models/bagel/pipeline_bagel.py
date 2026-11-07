@@ -327,6 +327,28 @@ def default_ae_params() -> AutoEncoderParams:
     )
 
 
+def bagel_image_size(
+    width: int, height: int, max_size: int, min_size: int, stride: int, max_pixels: int = 14 * 14 * 9 * 1024
+):
+    """Target (width, height) of BAGEL's aspect-preserving, stride-aligned ImageTransform (same algorithm as #4345)."""
+
+    def fit(w, h, s):
+        return tuple(max(stride, int(round(round(v * s) / stride) * stride)) for v in (w, h))
+
+    w, h = fit(width, height, max(min(max_size / max(width, height), 1.0), min_size / min(width, height)))
+    if w * h > max_pixels:
+        w, h = fit(w, h, max_pixels / (w * h))
+    if max(w, h) > max_size:
+        w, h = fit(w, h, max_size / max(w, h))
+    return w, h
+
+
+def bagel_vit_transform(img: Image.Image) -> torch.Tensor:
+    """BAGEL's ImageTransform(980, 224, 14): resize, ToTensor, Normalize(mean=0.5, std=0.5) -> (3, H, W)."""
+    img = img.convert("RGB").resize(bagel_image_size(*img.size, 980, 224, 14), Image.BICUBIC)
+    return torch.from_numpy(np.array(img)).float().permute(2, 0, 1) / 127.5 - 1.0
+
+
 class SiglipNaViTWrapper(nn.Module):
     def __init__(self, vision_model):
         super().__init__()
@@ -352,7 +374,7 @@ class SiglipNaViTWrapper(nn.Module):
             mask[..., start:end, start:end] = 0.0
 
         outputs = self.vision_model.encoder(inputs_embeds=hidden_states, attention_mask=mask)
-        return outputs.last_hidden_state.squeeze(0)
+        return self.vision_model.post_layernorm(outputs.last_hidden_state).squeeze(0)
 
 
 class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
@@ -710,185 +732,130 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if image_input:
                 image_input = [Image.open(image) if isinstance(image, str) else image for image in image_input]
 
-            if image_input:
-                # If we have an image, we prefill with it
-                if self.image_processor and self.vae:
+            stride = self.bagel.latent_downsample
+            max_img_size = int(self.bagel.max_latent_size * stride)
 
-                    def vit_transforms(img):
-                        return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
+            def _resize_to_stride(img):
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                w, h = img.size
+                scale = min(max_img_size / max(w, h), 1.0)
+                min_img_size = min(256, max_img_size)
+                scale = max(scale, min_img_size / min(w, h))
+                new_w = max(stride, int(round(w * scale / stride) * stride))
+                new_h = max(stride, int(round(h * scale / stride) * stride))
+                new_w = min(new_w, max_img_size)
+                new_h = min(new_h, max_img_size)
+                if new_w != w or new_h != h:
+                    img = img.resize((new_w, new_h), Image.BICUBIC)
+                return img
 
-                    stride = self.bagel.latent_downsample
-                    max_img_size = int(self.bagel.max_latent_size * stride)
+            def vae_transforms(img):
+                return torch.from_numpy(np.array(img.convert("RGB"))).float().permute(2, 0, 1) / 127.5 - 1.0
 
-                    def _resize_to_stride(img):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        w, h = img.size
-                        # Scale down if longest edge exceeds max
-                        scale = min(max_img_size / max(w, h), 1.0)
-                        # Scale up if shortest edge is too small (min 256)
-                        min_img_size = min(256, max_img_size)
-                        scale = max(scale, min_img_size / min(w, h))
-                        new_w = max(stride, int(round(w * scale / stride) * stride))
-                        new_h = max(stride, int(round(h * scale / stride) * stride))
-                        # Clamp to max
-                        new_w = min(new_w, max_img_size)
-                        new_h = min(new_h, max_img_size)
-                        if new_w != w or new_h != h:
-                            img = img.resize((new_w, new_h), Image.BICUBIC)
-                        return img
+            def to_device(inputs):
+                return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
 
-                    image_input = [_resize_to_stride(img) for img in image_input]
-
-                    resized_w, resized_h = image_input[0].size
-                    if not image_shape_requested:
-                        image_shape = (resized_h, resized_w)
-                    logger.info(
-                        "img2img: resized source to %dx%d, generating at %dx%d",
-                        resized_w,
-                        resized_h,
-                        image_shape[1],
-                        image_shape[0],
-                    )
-
-                    def vae_transforms(img):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
-                        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
-                        return arr.permute(2, 0, 1)
-
-                    # Update gen_context with image (VAE + ViT)
-                    gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
-                        curr_kvlens=gen_context["kv_lens"],
-                        curr_rope=gen_context["ropes"],
-                        images=image_input,
-                        transforms=vae_transforms,
-                        new_token_ids=self.new_token_ids,
-                    )
-                    for k, v in gen_input_vae.items():
-                        if torch.is_tensor(v):
-                            gen_input_vae[k] = v.to(self.device)
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        enabled=self.device.type != "cpu",
-                        dtype=self.od_config.dtype,
-                    ):
-                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                            self.vae, gen_context["past_key_values"], **gen_input_vae
-                        )
-                    gen_context["kv_lens"] = newlens_vae
-                    gen_context["ropes"] = new_rope_vae
-
-                    gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
-                        curr_kvlens=gen_context["kv_lens"],
-                        curr_rope=gen_context["ropes"],
-                        images=image_input,
-                        transforms=vit_transforms,
-                        new_token_ids=self.new_token_ids,
-                    )
-                    for k, v in gen_input_img.items():
-                        if torch.is_tensor(v):
-                            gen_input_img[k] = v.to(self.device)
-                    for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
-                        gen_input_img.pop(k, None)
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        enabled=self.device.type != "cpu",
-                        dtype=self.od_config.dtype,
-                    ):
-                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
-                            gen_context["past_key_values"], **gen_input_img
-                        )
-                    gen_context["kv_lens"] = newlens_img
-                    gen_context["ropes"] = new_rope_img
-
-                    cfg_text_context = deepcopy(gen_context)
-
-            # Strip <|im_start|>/<|im_end|> wrappers that end2end.py may have
-            # already added, so prepare_prompts doesn't double-add bos/eos.
-            clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
-
-            # Update gen_context with text prompt
-            generation_input, newlens, new_rope = self.bagel.prepare_prompts(
-                curr_kvlens=gen_context["kv_lens"],
-                curr_rope=gen_context["ropes"],
-                prompts=[clean_prompt],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
+            autocast = torch.autocast(
+                device_type=self.device.type, enabled=self.device.type != "cpu", dtype=self.od_config.dtype
             )
-            # Fail fast with a clear error instead of CUDA gather OOB.
-            max_tid = int(generation_input["packed_text_ids"].max().item())
-            emb_n = int(self.language_model.vocab_size)
-            if max_tid >= emb_n:
-                raise ValueError(
-                    "Tokenizer/model vocab mismatch: max token id "
-                    f"{max_tid} >= embed_tokens size {emb_n}. "
-                    "This usually means you're not using the tokenizer shipped with the Bagel checkpoint, "
-                    "or llm_config.vocab_size is smaller than the tokenizer vocab."
-                )
-            for k, v in generation_input.items():
-                if torch.is_tensor(v):
-                    generation_input[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    gen_context["past_key_values"], **generation_input
-                )
-            gen_context["kv_lens"] = newlens
-            gen_context["ropes"] = new_rope
 
-            # cfg_text_context: update with negative prompt (no text condition).
-            # When empty, keep cfg_text_context as-is (kv_lens=0) to match
-            # original BAGEL.
+            def add_text(context, text, *, bos=True, eos=True):
+                text_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_prompts(
+                    curr_kvlens=context["kv_lens"],
+                    curr_rope=context["ropes"],
+                    prompts=[text],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
+                    bos=bos,
+                    eos=eos,
+                )
+                max_tid = int(text_input["packed_text_ids"].max().item())
+                emb_n = int(self.language_model.vocab_size)
+                if max_tid >= emb_n:
+                    raise ValueError(
+                        "Tokenizer/model vocab mismatch: max token id "
+                        f"{max_tid} >= embed_tokens size {emb_n}. "
+                        "This usually means you're not using the tokenizer shipped with the Bagel checkpoint, "
+                        "or llm_config.vocab_size is smaller than the tokenizer vocab."
+                    )
+                with autocast:
+                    context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        context["past_key_values"], **to_device(text_input)
+                    )
+
+            def add_image(context, img, padded_latent=None):
+                """A context image is a clean VAE block followed by a ViT block (BAGEL update_context_image)."""
+                vae_img = _resize_to_stride(img)
+                vae_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_vae_images(
+                    curr_kvlens=context["kv_lens"],
+                    curr_rope=context["ropes"],
+                    images=[vae_img],
+                    transforms=vae_transforms,
+                    new_token_ids=self.new_token_ids,
+                )
+                vae_input = to_device(vae_input)
+                with autocast:
+                    if padded_latent is None:
+                        padded_latent = self.vae.encode(vae_input["padded_images"])
+                    context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                        self.vae, context["past_key_values"], **vae_input, padded_latent=padded_latent
+                    )
+                vit_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_vit_images(
+                    curr_kvlens=context["kv_lens"],
+                    curr_rope=context["ropes"],
+                    images=[img],
+                    transforms=bagel_vit_transform,
+                    new_token_ids=self.new_token_ids,
+                )
+                for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                    vit_input.pop(k, None)
+                with autocast:
+                    context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                        context["past_key_values"], **to_device(vit_input)
+                    )
+                return vae_img.size[::-1], padded_latent
+
+            # Pack text and images in prompt order (BAGEL interleave_inference): the chat template puts one
+            # <|image_pad|> per image; without matching placeholders the images go first, then the prompt.
+            images = image_input if image_input and self.image_processor and self.vae else []
+            clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+            segments = clean_prompt.split("<|image_pad|>")
+            if len(segments) != len(images) + 1:
+                if images and len(segments) > 1:
+                    logger.warning(
+                        "%d <|image_pad|> placeholder(s) for %d image(s); image positions are "
+                        "ambiguous, packing all images before the prompt.",
+                        len(segments) - 1,
+                        len(images),
+                    )
+                segments = [""] * len(images) + ["".join(segments)]
+            text_indices = [i for i, text in enumerate(segments) if text]
+            for i, text in enumerate(segments):
+                if i in text_indices:
+                    add_text(gen_context, text, bos=i == text_indices[0], eos=i == text_indices[-1])
+                if i < len(images):
+                    shape, padded_latent = add_image(gen_context, images[i])
+                    # Exclude positive text while retaining the same sampled image latent.
+                    add_image(cfg_text_context, images[i], padded_latent=padded_latent)
+                    if i == 0:
+                        if not image_shape_requested:
+                            image_shape = shape
+                        logger.info(
+                            "img2img: resized source to %dx%d, generating at %dx%d",
+                            shape[1],
+                            shape[0],
+                            image_shape[1],
+                            image_shape[0],
+                        )
             prompt_negative = first_prompt.get("negative_prompt") if isinstance(first_prompt, dict) else None
             neg_prompt = prompt_negative if prompt_negative is not None else extra_args.get("negative_prompt", "")
             if neg_prompt:
-                neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
-                    curr_kvlens=cfg_text_context["kv_lens"],
-                    curr_rope=cfg_text_context["ropes"],
-                    prompts=[neg_prompt],
-                    tokenizer=self.tokenizer,
-                    new_token_ids=self.new_token_ids,
-                )
-                for k, v in neg_input.items():
-                    if torch.is_tensor(v):
-                        neg_input[k] = v.to(self.device)
-                with torch.autocast(
-                    device_type=self.device.type,
-                    enabled=self.device.type != "cpu",
-                    dtype=self.od_config.dtype,
-                ):
-                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                        cfg_text_context["past_key_values"], **neg_input
-                    )
-                cfg_text_context["kv_lens"] = neg_newlens
-                cfg_text_context["ropes"] = neg_rope
-
-            # cfg_img_context: update with text prompt (no image condition)
-            cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
-                curr_kvlens=cfg_img_context["kv_lens"],
-                curr_rope=cfg_img_context["ropes"],
-                prompts=[clean_prompt],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
-            )
-            for k, v in cfg_img_generation_input.items():
-                if torch.is_tensor(v):
-                    cfg_img_generation_input[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                cfg_img_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    cfg_img_context["past_key_values"], **cfg_img_generation_input
-                )
-            cfg_img_context["kv_lens"] = cfg_img_newlens
-            cfg_img_context["ropes"] = cfg_img_new_rope
+                add_text(cfg_text_context, neg_prompt)
+            # Image-unconditional CFG retains positive text. Tokenize it once
+            # to preserve BPE across span boundaries.
+            if text_indices:
+                add_text(cfg_img_context, "".join(segments))
 
         # ---- Detect output modality and think mode ----
         modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
@@ -1572,12 +1539,12 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                                     break
                             # Handle flattened patch embedding for SigLIP
                             if cand.endswith("embeddings.patch_embedding.weight") and tensor.ndim == 2:
-                                # Checkpoint has (Hidden, C*P*P), model expects (Hidden, C, P, P)
                                 if shapes.get(cand) is not None:
                                     target_shape = shapes[cand]
                                     if tensor.numel() == torch.prod(torch.tensor(target_shape)):
-                                        # Reshape tensor to match target
-                                        tensor = tensor.view(target_shape)
+                                        # Bagel stores this as a Linear with (P, Q, C) columns
+                                        out_ch, in_ch, p, q = target_shape
+                                        tensor = tensor.view(out_ch, p, q, in_ch).permute(0, 3, 1, 2).contiguous()
                                         picked = cand
                                         break
 
