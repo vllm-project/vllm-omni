@@ -1,0 +1,217 @@
+{
+  "action_tokens_per_frame": 4,
+  "contract_sha256": "10935c813af25ece837f058c809919a33b0a74e0c663b0974a7cdaa3f60b8915",
+  "default_embodiment": "agibotworld",
+  "embodiments": {
+    "abc_yam": {
+      "domain_id": 16,
+      "input_action_dim": 59
+    },
+    "agibot_gear_gripper": {
+      "domain_id": 15,
+      "input_action_dim": 59
+    },
+    "agibot_gear_gripper_ext": {
+      "domain_id": 15,
+      "input_action_dim": 59
+    },
+    "agibotworld": {
+      "domain_id": 15,
+      "input_action_dim": 59
+    },
+    "behavior1k_lerobot": {
+      "domain_id": 22,
+      "input_action_dim": 59
+    },
+    "camera_pose": {
+      "domain_id": 2,
+      "input_action_dim": 59
+    },
+    "hand_pose": {
+      "domain_id": 3,
+      "input_action_dim": 59
+    },
+    "molmoact2_yam": {
+      "domain_id": 16,
+      "input_action_dim": 59
+    },
+    "xdof_yam": {
+      "domain_id": 16,
+      "input_action_dim": 59
+    }
+  },
+  "input_contract": {
+    "action_dim": 59,
+    "action_space": "normalized_unified_v1",
+    "domain_routing": "scalar_or_per_action_row",
+    "model_mode": "forward_dynamics",
+    "runtime_normalization": false,
+    "validity": "masked_to_zero_after_normalization_by_source"
+  },
+  "layout": {
+    "fields": [
+      {
+        "name": "ego_pose",
+        "offset": 0,
+        "size": 9
+      },
+      {
+        "name": "right_wrist_pose",
+        "offset": 9,
+        "size": 9
+      },
+      {
+        "name": "right_fingertips",
+        "offset": 18,
+        "size": 15
+      },
+      {
+        "name": "right_gripper_width_m",
+        "offset": 33,
+        "size": 1
+      },
+      {
+        "name": "left_wrist_pose",
+        "offset": 34,
+        "size": 9
+      },
+      {
+        "name": "left_fingertips",
+        "offset": 43,
+        "size": 15
+      },
+      {
+        "name": "left_gripper_width_m",
+        "offset": 58,
+        "size": 1
+      }
+    ],
+    "id": "unified_v1",
+    "pose_convention": "backward_chunk_anchored_16f",
+    "rotation_representation": "rot6d_columns"
+  },
+  "model_action_dim": 64,
+  "normalizer": {
+    "method": "global_asinh_unified_v1",
+    "runtime_application": false,
+    "source": {
+      "artifact_path": "cosmos3_nano_sim_bimanual_action_sources/ae695e2c643a5626b3c3564f00705aa3a83ab0da7640549c7340db71172594b0.json",
+      "path": "projects/cosmos3/cosmos3/datasets/action/normalizers/global_asinh_v1_backward_anchored_gripper_metric.json",
+      "pose_convention_authority": "resolved_canonical_lance_training_config",
+      "repository_revision": "e3343dae1b6ce5327252b0c7a94bb610178ecb77",
+      "sha256": "ae695e2c643a5626b3c3564f00705aa3a83ab0da7640549c7340db71172594b0"
+    }
+  },
+  "num_embodiment_domains": 32,
+  "padding": {
+    "stage": "after_normalization_and_validity_mask",
+    "value": 0.0
+  },
+  "schema_version": 5,
+  "training_config_excerpt": {
+    "datasets": [
+      {
+        "camera_mask": false,
+        "embodiment": "camera_pose",
+        "name": "camera_lance_480_chunk_anchored",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.cosmos3.datasets.action.lance.lance_camera_dataset.LanceCameraDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "agibotworld",
+        "name": "agibotworld_beta",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceAgiBotDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "agibot_gear_gripper",
+        "name": "agibotgeargripper_offshelf",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceAgiBotDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "agibot_gear_gripper",
+        "name": "agibotgeargripper_custom",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceAgiBotDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "agibot_gear_gripper_ext",
+        "name": "agibotgeargripper_customext",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceAgiBotDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "molmoact2_yam",
+        "name": "molmoact2_yam",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceYAMDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "xdof_yam",
+        "name": "xdofyam",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceYAMDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "abc_yam",
+        "name": "abcyam",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceYAMDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": false,
+        "embodiment": "hand_pose",
+        "name": "mecka_all",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceMeckaDataset",
+        "translation_scale": 1.0
+      },
+      {
+        "camera_mask": true,
+        "embodiment": "behavior1k_lerobot",
+        "name": "behavior1k",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "rotation_format": "rot6d",
+        "target": "projects.cosmos3.interactive.datasets.action.canonical_lance_action_datasets.CanonicalLanceBehavior1KDataset",
+        "translation_scale": 1.0
+      }
+    ],
+    "experiment": "simulation_sfdmd_bimanual_prod_64N_chunk2_v001",
+    "loader": {
+      "action_schema": "unified_v1",
+      "append_action_caption_semantics": false,
+      "append_duration_fps_timestamps": false,
+      "append_resolution_info": false,
+      "append_viewpoint_info": false,
+      "enable_mode_specific_prompt": false,
+      "format_prompt_as_json": false,
+      "global_asinh": true,
+      "metric_gripper": true
+    }
+  }
+}
