@@ -77,8 +77,6 @@ class SingleReplayEncoderCudaGraphManager(EncoderCudaGraphManager):
         replay_supported = getattr(self.model, "encoder_cudagraph_replay_supported", None)
         if replay_supported is not None and not replay_supported(mm_kwargs, self.max_frames_per_batch):
             return False
-        if self.use_dp:
-            return True
         return len(specs) <= self.max_batch_size and all(
             sum(spec.get_path_output_tokens(path) for spec in specs) <= max(budgets)
             for path, budgets in self.path_token_budgets.items()

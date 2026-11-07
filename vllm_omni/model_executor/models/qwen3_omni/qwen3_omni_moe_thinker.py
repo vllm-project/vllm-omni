@@ -134,10 +134,7 @@ from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
-from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import (
-    Qwen3OmniVisionEncoderCudaGraphMixin,
-    supports_npu_encoder_graphs,
-)
+from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import Qwen3OmniVisionEncoderCudaGraphMixin
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
@@ -1295,16 +1292,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # CUDA audio replays through the shared encoder manager. NPU audio uses
         # full-width NPUGraphs because that manager path is CUDA-only.
         self._audio_encoder_graphs = None
-        mm = self.multimodal_config
-        if (
-            vllm_config.compilation_config.cudagraph_mm_encoder
-            and not getattr(vllm_config.model_config, "enforce_eager", False)
-            and supports_npu_encoder_graphs()
-            and mm.get_limit_per_prompt("audio") > 0
-            and mm.mm_encoder_attn_dtype is None
-            and mm.mm_encoder_tp_mode != "data"
-            and get_pp_group().is_first_rank
-        ):
+        if self._npu_audio_encoder_graphs_enabled(vllm_config):
             from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import Qwen3OmniAudioEncoderNpuGraphs
 
             self._audio_encoder_graphs = Qwen3OmniAudioEncoderNpuGraphs(self.audio_tower)

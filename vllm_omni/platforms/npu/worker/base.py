@@ -5,6 +5,7 @@
 
 import time
 
+from vllm import envs
 from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 
@@ -56,7 +57,8 @@ class OmniNPUWorkerBase(NPUWorker):
         available = super().determine_available_memory()
         self.encoder_cudagraph_memory_estimate = 0
         if (
-            self.vllm_config.compilation_config.cudagraph_mm_encoder
+            envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            and self.vllm_config.compilation_config.cudagraph_mm_encoder
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and not self.cache_config.kv_cache_memory_bytes
         ):

@@ -24,6 +24,7 @@ from vllm_omni.platforms import current_omni_platform
 # Captured attention bound for one image or video frame. Larger frames stay
 # eager because replay reuses the max_seqlen baked in at capture.
 MAX_GRAPH_FRAME_PATCHES = 4096
+MAX_GRAPH_FRAMES_PER_VIDEO = 32
 
 
 def supports_npu_encoder_graphs() -> bool:
@@ -170,6 +171,21 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         elif getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
             logger.info("Audio encoder CUDA graphs stay off: %s.", reason)
 
+    def _npu_audio_encoder_graphs_enabled(self, vllm_config) -> bool:
+        """Whether to build the NPU audio graphs that replace the CUDA-only audio path."""
+        mm = self.multimodal_config
+        return (
+            vllm_config.compilation_config.cudagraph_mm_encoder
+            and not getattr(vllm_config.model_config, "enforce_eager", False)
+            and supports_npu_encoder_graphs()
+            and _audio_graphs_requested(vllm_config)
+            and not mm.enable_mm_embeds
+            and mm.get_limit_per_prompt("audio") > 0
+            and mm.mm_encoder_attn_dtype is None
+            and mm.mm_encoder_tp_mode != "data"
+            and get_pp_group().is_first_rank
+        )
+
     def _max_encoder_cudagraph_budget(self, vllm_config) -> int:
         budgets = vllm_config.compilation_config.encoder_cudagraph_token_budgets
         return max(budgets) if budgets else self.get_encoder_cudagraph_budget_range(vllm_config)[1]
@@ -217,8 +233,10 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         return "image"
 
     def get_max_frames_per_video(self) -> int:
+        # Upstream multiplies this by the item cap when
+        # encoder_cudagraph_max_frames_per_batch is unset.
         if "video" in getattr(self, "_encoder_cudagraph_modalities", []):
-            return 32
+            return MAX_GRAPH_FRAMES_PER_VIDEO
         return 1
 
     def get_encoder_cudagraph_budget_range(self, vllm_config) -> tuple[int, int]:
@@ -270,11 +288,13 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         Audio eligibility is ``encoder_cudagraph_group_eligible``. A video
         longer than ``max_frames_per_batch`` is split into frame chunks by the
         single-replay manager instead of failing this check permanently.
+        Without video, capture bakes the whole budget as ``max_seqlen``, so
+        the per-frame patch bound only applies when video is captured.
         """
         if self.get_input_modality(mm_kwargs) == "audio":
             return True
         grid = self._image_grid(mm_kwargs)
-        if any(int(h) * int(w) > MAX_GRAPH_FRAME_PATCHES for _, h, w in grid):
+        if max_frames_per_batch > 1 and any(int(h) * int(w) > MAX_GRAPH_FRAME_PATCHES for _, h, w in grid):
             return False
         if self.get_input_modality(mm_kwargs) != "video":
             return True

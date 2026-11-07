@@ -188,8 +188,10 @@ def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
                     assert not fia_updates
                 if grids == [[10, 8, 8]]:
                     assert manager.graph_hits == vision_hits + 3
-                    # Chunks of 4, 4 and 2 frames: the second chunk reuses the first's lengths.
-                    assert len(fia_updates) == 2
+                    # Chunks of 4, 4 and 2 frames share the 64-token graph. The
+                    # 2-frame tail pads with frame-sized sequences, so all
+                    # three replays carry the same FIA lengths.
+                    assert len(fia_updates) == 1
                 previous_grids = grids
                 got = torch.cat(parts)
                 torch.testing.assert_close(got, ref, rtol=0.016, atol=0.002)
@@ -225,24 +227,27 @@ def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "enabled,explicit,mode,expected,profiled",
+    "enabled,explicit,mode,estimate,expected,profiled",
     [
-        (True, None, "PIECEWISE", 6, True),
-        (False, None, "PIECEWISE", 10, False),
-        (True, 10, "PIECEWISE", 10, False),
-        (True, None, "NONE", 10, False),
+        (True, None, "PIECEWISE", True, 6, True),
+        (False, None, "PIECEWISE", True, 10, False),
+        (True, 10, "PIECEWISE", True, 10, False),
+        (True, None, "NONE", True, 10, False),
+        (True, None, "PIECEWISE", False, 10, False),
     ],
 )
-def test_npu_encoder_memory_reservation(monkeypatch, enabled, explicit, mode, expected, profiled):
+def test_npu_encoder_memory_reservation(monkeypatch, enabled, explicit, mode, estimate, expected, profiled):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
     pytest.importorskip("vllm_ascend")
+    from vllm import envs
     from vllm.config import CUDAGraphMode
 
     from vllm_omni.platforms.npu.worker.base import NPUWorker, OmniNPUWorkerBase
 
     monkeypatch.setattr(NPUWorker, "determine_available_memory", lambda self: 10 << 30)
+    monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", estimate, raising=False)
     profile = Mock(return_value=4 << 30)
     worker = object.__new__(OmniNPUWorkerBase)
     worker.vllm_config = SimpleNamespace(

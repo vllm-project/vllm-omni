@@ -100,7 +100,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
   --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}, "additional_config": {"audio_encoder_cudagraph": false}}}'
 ```
 
-Video frames use the same opt-in. A video longer than one captured budget replays that graph on successive frames, because frame attention does not cross frames. Supported Ascend NPUs (not 310P) capture vision with the ACL graph manager and audio with one full-width NPUGraph per chunk count from 1 to 64. MRv2 rejects `cudagraph_mm_encoder: true` because it does not apply these replay bounds; use `model_runner: v1`. The shipped profiles leave `cudagraph_mm_encoder` false so the extra graph memory stays available to the KV cache. On NPU, keep `cudagraph_mode: PIECEWISE` when turning the flag on.
+Video frames use the same opt-in. A video longer than one captured budget replays that graph on successive frames, because frame attention does not cross frames. Supported Ascend NPUs (not 310P) capture vision with the ACL graph manager and audio with one full-width NPUGraph per chunk count from 1 to 64, plus one exact-width graph per single clip shorter than one second (99 graphs). `audio_encoder_cudagraph: false` turns the audio graphs off on NPU as well. MRv2 rejects `cudagraph_mm_encoder: true` because it does not apply these replay bounds; use `model_runner: v1`. The shipped profiles leave `cudagraph_mm_encoder` false so the extra graph memory stays available to the KV cache. On NPU, keep `cudagraph_mode: PIECEWISE` when turning the flag on.
 
 ### Stage-based launch (one stage per process)
 
