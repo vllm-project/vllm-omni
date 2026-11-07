@@ -221,6 +221,44 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
+#### VAE spatial tile size and overlap
+
+Append these independent CLI options to the lossless or lossy launch command:
+
+```bash
+  --vae-tile-size 384 \
+  --vae-tile-overlap 64
+```
+
+Tile size is the square spatial tile edge in **pixels**, applied to both
+`tile_size` (encode) and `decoder_tile_size` (decode) in the H3 diffusion
+pipeline, including the standalone decoder pipeline. Overlap sets both
+`tile_overlap_min` and `decoder_tile_overlap_min` in pixels. It is a minimum;
+the checkpoint's grid algorithm may use a larger actual overlap. Each option
+defaults to unset, independently preserving its checkpoint settings. Neither
+enables tiling: retain `--vae-use-tiling` or the existing VAE parallel
+configuration. The separate AR encoder stage does not consume these options.
+
+Tile size must be a positive integer and overlap a nonnegative integer; both
+must be divisible by the checkpoint's spatial compression ratio. On each grid,
+the effective overlap must be strictly smaller than the effective tile size.
+The pair is validated together before either setting changes. For the shipped
+ratio 16, `--vae-tile-size 64 --vae-tile-overlap 32` is valid even though
+64 would be invalid with the checkpoint's minimum overlap of 64. Overlap 0
+is accepted but removes the minimum-overlap guarantee. Temporal tiling,
+tile batch size, and rank count remain unchanged. Unsupported VAE adapters
+reject either explicit option during initialization.
+
+These settings only configure the video VAE; they do not modify DiT weights,
+attention, or denoising settings. When a reference image/video is VAE-encoded,
+changed encoding results can indirectly change the DiT's conditioning latents.
+
+Changing tile size or overlap can change device memory use and generated
+pixels; it does not guarantee lower latency. At 1344×768 with minimum overlap
+64, tile sizes 256, 384, and 512 produce 28, 12, and 6 spatial tiles
+respectively. With eight VAE ranks, six tiles trigger the existing rank-local
+decode fallback.
+
 #### Cache-DiT
 
 Append to enable DiT block caching with TaylorSeer extrapolation — see the
