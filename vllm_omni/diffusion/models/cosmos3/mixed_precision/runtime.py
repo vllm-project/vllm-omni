@@ -8,10 +8,12 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from .config import Cosmos3MixedPrecisionConfig
+from .moe import RecordedMoE, ensure_supported_moe_method, install_moe_dispatch
 from .strategy import (
     Cosmos3PrecisionStrategy,
     Fp8W8A8W8A16Strategy,
@@ -74,10 +76,11 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
 
 
 class Cosmos3MixedPrecisionRuntime:
-    """Own one transformer's schedule state and wrapped linear inventory."""
+    """Own one transformer's schedule state and wrapped layer inventory."""
 
     def __init__(self, config: Cosmos3MixedPrecisionConfig) -> None:
         self.config = config
+        self.routed_experts: list[RecordedMoE] = []
         # TODO: Make this request-local before Cosmos3 supports interleaved
         # denoising requests on one transformer instance.
         self._generation_high_precision = False
@@ -110,13 +113,38 @@ class Cosmos3MixedPrecisionRuntime:
                 )
                 wrapped_count += 1
 
-        if not wrapped_count:
-            raise ValueError("Cosmos3 mixed precision found no compatible FP8 or NVFP4 ModelOpt linears")
+        for path, component in components.items():
+            for local_name, module in component.named_modules():
+                routed_experts = getattr(module, "routed_experts", None)
+                if not isinstance(routed_experts, torch.nn.Module):
+                    continue
+                base_method = routed_experts.quant_method
+                if isinstance(base_method, UnquantizedFusedMoEMethod):
+                    continue
+                module_name = getattr(routed_experts, "layer_name", None) or f"{path}.{local_name}.routed_experts"
+                ensure_supported_moe_method(base_method, module_name)
+                install_moe_dispatch(base_method, self, path, module_name)
+                self.routed_experts.append(RecordedMoE(routed_experts, base_method, module_name, path))
+
+        if not wrapped_count and not self.routed_experts:
+            raise ValueError(
+                "Cosmos3 mixed precision found no compatible FP8 or NVFP4 ModelOpt linears or FP8 routed experts"
+            )
+
+    @property
+    def has_routed_experts(self) -> bool:
+        return bool(self.routed_experts)
 
     def use_high_precision(self, path: PrecisionPath) -> bool:
         return self.config.reasoner == "a16" if path == "reasoner" else self._generation_high_precision
 
     def set_step(self, step_index: int, num_steps: int) -> None:
+        for record in self.routed_experts:
+            if record.routed_experts.quant_method is not record.base_method:
+                raise RuntimeError(
+                    f"Cosmos3 mixed precision lost control of {record.module_name}: its routed-expert quant method "
+                    "was replaced (e.g. by the LoRA MoE wrapper)"
+                )
         self._generation_high_precision = self.config.use_high_precision(step_index, num_steps)
 
     def reset(self) -> None:

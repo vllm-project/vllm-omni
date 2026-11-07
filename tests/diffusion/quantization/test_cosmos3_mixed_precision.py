@@ -713,6 +713,26 @@ def test_fp8_rejects_non_tensorwise_scales() -> None:
         )
 
 
+def test_fp8_accepts_one_tensorwise_scale_per_merged_shard() -> None:
+    # Merged gate/up layers hold a scale per shard until post-load requantization.
+    layer = _fp8_layer(output_size=4, input_size=2)
+    layer.logical_widths = [2, 2]
+    layer.weight_scale = torch.tensor([1.0, torch.finfo(torch.float32).min])
+    Fp8W8A8W8A16Strategy().validate_before_processing(_BaseMethod(), layer, "gen.mlp.gate_up_proj")
+
+
+def test_fp8_rejects_merged_scales_that_do_not_match_shards() -> None:
+    layer = _fp8_layer(output_size=4, input_size=2)
+    layer.logical_widths = [2, 2]
+    layer.weight_scale = torch.ones(4, 1)
+    with pytest.raises(ValueError, match="tensorwise FP8"):
+        Fp8W8A8W8A16Strategy().validate_before_processing(
+            _BaseMethod(),
+            layer,
+            "gen.mlp.gate_up_proj",
+        )
+
+
 def test_nvfp4_reference_materializes_live_cutlass_weights() -> None:
     layer = _nvfp4_layer()
     strategy = Nvfp4W4A4W4A16Strategy()

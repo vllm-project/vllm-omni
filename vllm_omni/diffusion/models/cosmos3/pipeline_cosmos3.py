@@ -2117,6 +2117,13 @@ class Cosmos3OmniDiffusersPipeline(
                 setattr(self.scheduler, name, value.cpu())
 
     @property
+    def diffusion_lora_defer_moe_wrap(self) -> bool:
+        # The LoRA MoE wrapper replaces the expert quant method, dropping the
+        # mixed-precision apply override, so skip the eager no-adapter wrap.
+        runtime = getattr(self.transformer, "mixed_precision_runtime", None)
+        return runtime is not None and runtime.has_routed_experts
+
+    @property
     def guidance_scale(self):
         return self._guidance_scale
 

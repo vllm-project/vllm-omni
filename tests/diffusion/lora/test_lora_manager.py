@@ -319,7 +319,8 @@ def test_moe_lora_context_is_skipped_without_token_capacity(monkeypatch):
     assert calls == []
 
 
-def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
+@pytest.mark.parametrize("defer_moe_wrap", [False, True])
+def test_moe_runners_are_wrapped_at_init_unless_pipeline_defers(monkeypatch, defer_moe_wrap):
     import vllm.model_executor.layers.fused_moe as upstream_moe
 
     import vllm_omni.lora.manager as manager_mod
@@ -347,6 +348,7 @@ def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
     pipeline = torch.nn.Module()
     pipeline.transformer = torch.nn.Module()
     pipeline.transformer.experts = _TargetMoERunner()
+    pipeline.diffusion_lora_defer_moe_wrap = defer_moe_wrap
     manager = DiffusionLoRAManager(
         pipeline=pipeline,
         device=torch.device("cpu"),
@@ -354,8 +356,8 @@ def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
         max_num_batched_tokens=8,
     )
 
-    assert "transformer.experts" in manager._lora_modules
-    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+    assert ("transformer.experts" in manager._lora_modules) is not defer_moe_wrap
+    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA) is not defer_moe_wrap
 
 
 def test_publish_moe_lora_context_uses_no_lora_mapping_until_adapter_is_active(monkeypatch):
