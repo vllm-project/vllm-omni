@@ -146,6 +146,33 @@ def test_ldd_uses_runtime_library_paths_and_rejects_missing_dependencies(
     assert not cache.ldd_resolves(module, runner=missing_runner, library_paths=[])
 
 
+def test_dynamic_library_paths_include_therock_openblas_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    torch_lib = site_packages / "torch/lib"
+    therock_lib = site_packages / "_rocm_sdk_libraries/lib/rocm_sysdeps/lib"
+    therock_runtime_lib = site_packages / "_rocm_sdk_runtime/lib/rocm_sysdeps/lib"
+    torch_lib.mkdir(parents=True)
+    therock_lib.mkdir(parents=True)
+    therock_runtime_lib.mkdir(parents=True)
+    (therock_lib / "librocm-openblas.so.0").touch()
+    (therock_lib / "librocm-openblas.so.0.3").touch()
+    (therock_runtime_lib / "librocm-openblas.so.0").touch()
+
+    class TorchDistribution:
+        def locate_file(self, path: str) -> Path:
+            return site_packages / path
+
+    def distribution(name: str) -> TorchDistribution:
+        assert name == "torch"
+        return TorchDistribution()
+
+    monkeypatch.setattr(cache.importlib.metadata, "distribution", distribution)
+
+    assert cache.dynamic_library_paths()[:3] == [torch_lib, therock_lib, therock_runtime_lib]
+
+
 def test_image_dependency_identity_tracks_the_rocm_image_inputs(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     for relative in cache._IMAGE_DEPENDENCY_PATHS:
@@ -155,12 +182,25 @@ def test_image_dependency_identity_tracks_the_rocm_image_inputs(tmp_path: Path) 
     requirements = root / "requirements"
     requirements.mkdir()
     (requirements / "rocm.txt").write_text("torch\n", encoding="utf-8")
+    backport = root / "tools/gradio_pillow13"
+    backport.mkdir()
+    for filename in ("manifest.json", "backport.patch", "build-constraints.txt", "NOTICE.md"):
+        (backport / filename).write_text(filename, encoding="utf-8")
 
     original = cache.dependency_identity(root)
     assert len(original) == 64
     assert cache.dependency_identity(root) == original
     (requirements / "rocm.txt").write_text("torch==2\n", encoding="utf-8")
     assert cache.dependency_identity(root) != original
+    (requirements / "rocm.txt").write_text("torch\n", encoding="utf-8")
+    for path in (root / "tools/build_gradio_pillow13.py", *backport.iterdir()):
+        content = path.read_bytes()
+        path.write_bytes(content + b"changed\n")
+        assert cache.dependency_identity(root) != original, path
+        path.write_bytes(content)
+        assert cache.dependency_identity(root) == original
+    shutil.rmtree(backport)
+    assert cache.dependency_identity(root) == ""
 
 
 def test_stage_and_restore_verify_module_identity_and_provenance(tmp_path: Path) -> None:

@@ -93,6 +93,7 @@ def _replace_streaming_session(session: Request) -> None:
 
 def _make_drain_sched(session: Request) -> MagicMock:
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True

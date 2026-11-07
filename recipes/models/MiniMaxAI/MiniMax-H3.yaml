@@ -42,7 +42,7 @@ model:
       command: |
         uv venv
         source .venv/bin/activate
-        uv pip install vllm==0.26.0
+        uv pip install --torch-backend=cu130 vllm==0.33.0
       note: "H3 also needs current vLLM-Omni main for the modular FL2VA/Ref2VA pipeline — see the extra install block below."
   architecture: dense
   parameter_count: "64B"
@@ -900,7 +900,7 @@ guide: |
   ```bash
   uv venv
   source .venv/bin/activate
-  uv pip install vllm==0.26.0
+  uv pip install --torch-backend=cu130 vllm==0.33.0
   git clone --depth 1 https://github.com/vllm-project/vllm-omni.git /path/to/vllm-omni
   cd /path/to/vllm-omni
   uv pip install -e .
@@ -1093,6 +1093,11 @@ guide: |
   [uv](https://docs.astral.sh/uv/getting-started/installation/). The eight-step
   models currently need the source branch from
   [vLLM-Omni #9167](https://github.com/vllm-project/vllm-omni/pull/9167):
+
+  This external fork's instructions retain its vLLM 0.32.0 runtime. They do
+  not install or qualify this checkout's final vLLM 0.33.0 alignment; follow
+  the [source installation guide](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/gpu/#build-wheel-from-source)
+  for this checkout. FastH3 on the 0.33.0 runtime remains unverified.
 
   ```bash
   sudo apt-get update

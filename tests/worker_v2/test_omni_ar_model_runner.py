@@ -156,6 +156,8 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
 def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch, needs_history, include_hidden, engine_output_type
 ) -> None:
+    # Native prompt-logprob preparation otherwise pins memory using CUDA.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])
@@ -392,6 +394,35 @@ def test_fresh_per_step_outputs_are_not_repacked() -> None:
 
 
 @pytest.mark.cpu
+def test_variable_length_snapshots_reuse_capacity_without_retaining_every_prefill() -> None:
+    """A long multimodal workload must retain four peaks, not every shape."""
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace()
+    runner.main_stream = MagicMock()
+    runner._async_mm_snapshot_slots = [{} for _ in range(4)]
+    runner._async_mm_snapshot_events = [None] * 4
+    runner._async_mm_snapshot_pending = [False] * 4
+    runner._async_mm_snapshot_cursor = 0
+    runner._last_multimodal_snapshot_slot = None
+    published = []
+    # Revisit smaller prefills after growth, as well as decode-sized outputs.
+    lengths = list(range(32, 96)) + [1, 32, 8, 64] * 4
+    for step, length in enumerate(lengths):
+        source = torch.full((length, 16), float(step))
+        snapshot = runner._retain_multimodal_outputs({"hidden_states": {"layers": {0: source, 24: source}}})
+        published.append(snapshot.copy_to_cpu(lambda tensor: tensor.clone()))
+        runner._release_multimodal_snapshot(runner._last_multimodal_snapshot_slot, object())
+        source.fill_(-1)
+
+    retained = sum(t.numel() for slot in runner._async_mm_snapshot_slots for t in slot.values())
+    assert retained <= 4 * max(lengths) * 16 * 2
+    for step, (length, host) in enumerate(zip(lengths, published)):
+        assert host["hidden_states"]["layers"][0].shape == (length, 16)
+        assert torch.all(host["hidden_states"]["layers"][0] == step)
+
+
+@pytest.mark.cpu
 def test_snapshot_slots_bounded_by_shape_and_packed_grouping_isolation(monkeypatch) -> None:
     slot: dict[tuple[Any, ...], torch.Tensor] = {}
     omni_ar_model_runner._copy_mm_to_snapshot_slot(torch.ones(1, 2), slot)
@@ -501,6 +532,12 @@ def test_async_output_slices_request_payloads_with_graph_padding(
         async_chunk=async_chunk,
     ).get_output()
 
+    # Native publication recognizes the redundant full-payload channel by
+    # identity, so a producer refactor must not introduce a shallow list copy.
+    if async_chunk:
+        assert output.pooler_output is None
+    else:
+        assert output.pooler_output is output.inter_stage_outputs
     for i, payload in enumerate(output.inter_stage_outputs):
         torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
         torch.testing.assert_close(payload["codes.ref"], refs[i])
@@ -620,6 +657,7 @@ def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
         finalize_multimodal=lambda payload, _num_sampled: payload,
     ).get_output()
     assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
     engine_output = _rehydrated_output(pooling_output=output.pooler_output[0])
     if output.multimodal_outputs:
         engine_output.multimodal_output = output.multimodal_outputs[0]
@@ -1137,6 +1175,44 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+    if not streaming:
+        assert result.pooler_output is result.inter_stage_outputs
+
+
+@pytest.mark.cpu
+def test_stage0_async_chunk_publishes_thinker_latent_once(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc_np=np.array([0, 2]),
+        num_scheduled_tokens=np.array([2]),
+        num_tokens_after_padding=2,
+    )
+    latent = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    # Stage 0 does not send connector chunks, so the orchestrator pooler keeps
+    # the latent. The client channel must not mirror it.
+    result = _async_output(
+        sampler_output=SamplerOutput(torch.tensor([[7]]), None, None, torch.tensor([1]), torch.tensor([0])),
+        num_sampled_tokens=torch.tensor([1]),
+        multimodal_outputs={"latent": latent},
+        input_batch=batch,
+        async_chunk=True,
+        partition_async_payload=False,
+    ).get_output()
+    assert result.multimodal_outputs is None
+    assert result.pooler_output[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert result.inter_stage_outputs[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+    partitioned = _async_output(
+        sampler_output=SamplerOutput(torch.tensor([[7]]), None, None, torch.tensor([1]), torch.tensor([0])),
+        num_sampled_tokens=torch.tensor([1]),
+        multimodal_outputs={"latent": latent.clone()},
+        input_batch=batch,
+        async_chunk=True,
+    ).get_output()
+    assert partitioned.pooler_output is None
+    assert partitioned.multimodal_outputs is None
+    assert partitioned.inter_stage_outputs[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
 @pytest.mark.cpu
