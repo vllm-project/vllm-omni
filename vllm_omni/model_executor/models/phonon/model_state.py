@@ -204,8 +204,6 @@ class PhononModelState(OmniModelState):
             self.model._continue = keep
         else:
             self.model._continue[rows] = keep
-        for index, slot in enumerate(input_batch.idx_mapping_np[self._rows]):
-            self.intermediate_buffer.buffers[int(slot)]["next_embedding"] = feedback[index]
         # Sync B=1 waits for D2H in get_output() before the next replay.
         # Async scheduling needs an owned flag while the prior copy is in flight.
         if self.scheduler_config.async_scheduling:

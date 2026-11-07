@@ -112,7 +112,6 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch, async_schedul
         for step in range(2):
             state.run_preprocess(batch, {})
             state.run_postprocess(torch.ones(1, 8), batch)
-            assert torch.equal(buffers[0]["next_embedding"], state.next_embeddings[0])
             _, marker = state.postprocess_model_output(torch.ones(1, 8), batch, None)
             assert marker
             output = state.prepare_streaming_audio_output(batch, None, marker)
