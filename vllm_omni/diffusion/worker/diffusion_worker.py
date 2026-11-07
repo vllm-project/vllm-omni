@@ -98,6 +98,8 @@ if TYPE_CHECKING:
     from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
+    from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
+
 logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
@@ -1867,10 +1869,11 @@ class WorkerProc:
         wake_event: Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        *,
+        sharing_registry: ConsumerWorkerRegistry | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
-        registry = getattr(od_config, "_sharing_worker_registry", None)
-        if registry is not None and not registry.register(rank):
+        if sharing_registry is not None and not sharing_registry.register(rank):
             return  # Parent sealed the sharing group before this worker started.
         from vllm_omni.plugins import load_omni_general_plugins
 

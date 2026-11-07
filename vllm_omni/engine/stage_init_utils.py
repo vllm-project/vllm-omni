@@ -2121,7 +2121,8 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    # Runtime-only ownership is carried separately from serialized configuration.
+    # Startup-only carrier: the manager retains ownership and the executor
+    # removes this registry before od_config is serialized in request RPCs.
     setattr(od_config, "_sharing_worker_registry", getattr(stage_cfg, "_sharing_worker_registry", None))
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 

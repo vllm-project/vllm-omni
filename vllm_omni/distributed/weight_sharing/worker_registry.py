@@ -9,6 +9,7 @@ No monitor process or polling thread is needed.
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 
 import psutil
@@ -64,6 +65,21 @@ class ConsumerWorkerRegistry:
                 processes.append(process)
             except psutil.NoSuchProcess:
                 pass
-        _, alive = psutil.wait_procs(processes, timeout=timeout)
-        if any(p.is_running() and p.status() != psutil.STATUS_ZOMBIE for p in alive):
-            raise RuntimeError("consumer worker exit unconfirmed; retain provider")
+        # Observe exit without reaping: multiprocessing.Process owns waitpid
+        # and must collect its child's exit status itself during join().
+        deadline = time.monotonic() + timeout
+        while processes:
+            alive = []
+            for process in processes:
+                try:
+                    if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                        alive.append(process)
+                except psutil.NoSuchProcess:
+                    pass
+            if not alive:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("consumer worker exit unconfirmed; retain provider")
+            processes = alive
+            time.sleep(min(0.05, remaining))

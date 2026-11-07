@@ -49,6 +49,7 @@ def test_partial_startup_tracks_existing_peers_and_blocks_late_imports(weight_sh
             registry.terminate(5)
         child.join(10)
         assert not child.is_alive()
+        assert child.exitcode is not None
         registry.terminate(5)  # Cleanup may be retried after the manager dies.
     finally:
         if child.is_alive():
@@ -57,6 +58,46 @@ def test_partial_startup_tracks_existing_peers_and_blocks_late_imports(weight_sh
         reader.close()
         hold.close()
         release.close()
+
+
+@pytest.mark.parametrize("exit_state", ["gone", "zombie", "running"])
+def test_exit_confirmation_handles_disappearance_and_retains_provider_on_timeout(weight_sharing, mocker, exit_state):
+    module = importlib.import_module(f"{weight_sharing.__name__}.worker_registry")
+    registry = module.ConsumerWorkerRegistry(multiprocessing.get_context("spawn"), 1)
+    registry._data[1:3] = [123, 12]
+    process = mocker.Mock()
+    process.create_time.return_value = 12
+    process.is_running.return_value = True
+    final_status = {
+        "gone": module.psutil.NoSuchProcess(123),
+        "zombie": module.psutil.STATUS_ZOMBIE,
+        "running": module.psutil.STATUS_RUNNING,
+    }[exit_state]
+    process.status.side_effect = [module.psutil.STATUS_RUNNING, final_status]
+    mocker.patch.object(module.psutil, "Process", return_value=process)
+    if exit_state == "running":
+        with pytest.raises(RuntimeError, match="exit unconfirmed; retain provider"):
+            registry.terminate(0)
+    else:
+        registry.terminate(0)
+    process.kill.assert_called_once_with()
+    assert not registry.register(0)
+
+
+def test_exit_polling_obeys_timeout(weight_sharing, mocker):
+    module = importlib.import_module(f"{weight_sharing.__name__}.worker_registry")
+    registry = module.ConsumerWorkerRegistry(multiprocessing.get_context("spawn"), 1)
+    registry._data[1:3] = [123, 12]
+    process = mocker.Mock()
+    process.create_time.return_value = 12
+    process.is_running.return_value = True
+    process.status.return_value = module.psutil.STATUS_RUNNING
+    mocker.patch.object(module.psutil, "Process", return_value=process)
+    mocker.patch.object(module.time, "monotonic", side_effect=[10, 10, 10.06, 10.08])
+    sleep = mocker.patch.object(module.time, "sleep")
+    with pytest.raises(RuntimeError, match="exit unconfirmed; retain provider"):
+        registry.terminate(0.08)
+    assert [call.args[0] for call in sleep.call_args_list] == pytest.approx([0.05, 0.02])
 
 
 @pytest.fixture
