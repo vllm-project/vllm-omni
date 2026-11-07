@@ -175,6 +175,9 @@ def _qk_norm_rope(
 
 
 def swiglu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if x.device.type == "npu" and x.dtype == y.dtype == torch.bfloat16:
+        # SiLU returns BF16 here, preserving the rounding before multiplication.
+        return F.silu(x) * y
     return F.silu(x.float(), inplace=False).to(x.dtype) * y
 
 
