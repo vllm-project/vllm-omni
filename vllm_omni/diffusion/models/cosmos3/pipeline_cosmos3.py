@@ -1097,6 +1097,7 @@ class Cosmos3OmniDiffusersPipeline(
         scheduler_config = FlowUniPCMultistepScheduler.load_config(
             model_path,
             subfolder="scheduler",
+            revision=od_config.revision,
             local_files_only=local_files_only,
         )
         self.is_distilled_model = scheduler_config.get("_class_name") == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS
@@ -1110,6 +1111,7 @@ class Cosmos3OmniDiffusersPipeline(
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             subfolder="text_tokenizer",
+            revision=od_config.revision,
             local_files_only=local_files_only,
         )
 
@@ -1117,6 +1119,7 @@ class Cosmos3OmniDiffusersPipeline(
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
             model_path,
             subfolder="vae",
+            revision=od_config.revision,
             torch_dtype=self.dtype,
             local_files_only=local_files_only,
         ).to(self.device)
@@ -1200,7 +1203,7 @@ class Cosmos3OmniDiffusersPipeline(
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model_path,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),

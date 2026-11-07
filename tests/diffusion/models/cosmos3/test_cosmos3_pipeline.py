@@ -802,6 +802,7 @@ def _make_od_config(
         enable_diffusion_pipeline_profiler=False,
         enable_session_state_manager=False,
         model="/nonexistent/model/path",
+        revision=None,
         dtype=torch.float32,
         flow_shift=None,
         quantization_config=None,
@@ -842,6 +843,18 @@ def test_pipeline_init_uses_flow_unipc_with_cosmos3_defaults(stub_real_pipeline_
     }
     assert pipeline.is_distilled_model is False
     assert pipeline._engine_init_flow_shift == 2.5
+
+
+def test_pipeline_init_loads_transformer_weights_from_requested_revision(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.revision = "fp8"
+
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+    assert [source.revision for source in pipeline.weights_sources] == ["fp8"]
+    assert stub_real_pipeline_init.load_config_calls[0]["kwargs"]["revision"] == "fp8"
 
 
 @pytest.mark.parametrize("cfg_parallel_size,ulysses_degree", [(1, 1), (1, 2), (2, 1), (2, 2)])
