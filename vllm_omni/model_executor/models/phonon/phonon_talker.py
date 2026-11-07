@@ -5,12 +5,13 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.model_executor.layers.attention import Attention
 
 from .flow import PhononFlowHead
 
 
 class PhononAttention(nn.Module):
-    def __init__(self, config, *, cache_config=None, prefix="", paged=False):
+    def __init__(self, config, *, cache_config=None, prefix=""):
         super().__init__()
         width = config["d_model"]
         self.heads = config["num_heads"]
@@ -22,15 +23,15 @@ class PhononAttention(nn.Module):
             config["max_period"] ** (-torch.arange(0, self.head_dim, 2).float() / self.head_dim),
             persistent=False,
         )
-        self.attention = None
-        if paged:
-            from vllm.model_executor.layers.attention import Attention
+        self.attention = Attention(
+            self.heads,
+            self.head_dim,
+            self.head_dim**-0.5,
+            cache_config=cache_config,
+            prefix=prefix + ".attn",
+        )
 
-            self.attention = Attention(
-                self.heads, self.head_dim, self.head_dim**-0.5, cache_config=cache_config, prefix=prefix + ".attn"
-            )
-
-    def forward(self, inputs, positions, cache=None):
+    def forward(self, inputs, positions):
         packed = self.in_proj(inputs).view(-1, 3, self.heads, self.head_dim)
         query, key, value = packed.unbind(1)
         angles = positions[:, None, None].float() * self.frequencies
@@ -42,60 +43,43 @@ class PhononAttention(nn.Module):
             return rotated.flatten(-2).to(tensor.dtype)
 
         query, key = rotate(query), rotate(key)
-        if self.attention is not None:
-            output = self.attention(query.flatten(1), key.flatten(1), value.flatten(1))
-        else:
-            if cache is None:
-                raise ValueError("CPU reference attention requires an explicit request cache")
-            offset = cache[0].shape[0]
-            key = torch.cat((cache[0], key), 0)
-            value = torch.cat((cache[1], value), 0)
-            cache[:] = [key, value]
-            queries = torch.arange(inputs.shape[0], device=inputs.device) + offset
-            keys = torch.arange(key.shape[0], device=inputs.device)
-            output = F.scaled_dot_product_attention(
-                query.transpose(0, 1),
-                key.transpose(0, 1),
-                value.transpose(0, 1),
-                attn_mask=keys[None, :] <= queries[:, None],
-            )
-            output = output.transpose(0, 1).flatten(1)
+        output = self.attention(query.flatten(1), key.flatten(1), value.flatten(1))
         return self.out_proj(output)
 
 
 class PhononLayer(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, *, cache_config=None, prefix=""):
         super().__init__()
         width = config["d_model"]
-        self.self_attn = PhononAttention(config, **kwargs)
+        self.self_attn = PhononAttention(config, cache_config=cache_config, prefix=prefix)
         self.norm1 = nn.LayerNorm(width, eps=1e-5)
         self.norm2 = nn.LayerNorm(width, eps=1e-5)
         self.linear1 = nn.Linear(width, config["dim_feedforward"], bias=False)
         self.linear2 = nn.Linear(config["dim_feedforward"], width, bias=False)
 
-    def forward(self, inputs, positions, cache=None):
-        inputs = inputs + self.self_attn(self.norm1(inputs), positions, cache)
+    def forward(self, inputs, positions):
+        inputs = inputs + self.self_attn(self.norm1(inputs), positions)
         return inputs + self.linear2(F.gelu(self.linear1(self.norm2(inputs))))
 
 
 class PhononBackbone(nn.Module):
-    def __init__(self, config, *, cache_config=None, paged=False, prefix="flow_lm.transformer"):
+    def __init__(self, config, *, cache_config=None, prefix="flow_lm.transformer"):
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                PhononLayer(config, cache_config=cache_config, paged=paged, prefix=f"{prefix}.layers.{index}.self_attn")
+                PhononLayer(config, cache_config=cache_config, prefix=f"{prefix}.layers.{index}.self_attn")
                 for index in range(config["num_layers"])
             ]
         )
 
-    def forward(self, inputs, positions, caches=None):
-        for index, layer in enumerate(self.layers):
-            inputs = layer(inputs, positions, None if caches is None else caches[index])
+    def forward(self, inputs, positions):
+        for layer in self.layers:
+            inputs = layer(inputs, positions)
         return inputs
 
 
 class PhononFlowLM(nn.Module):
-    def __init__(self, config, *, cache_config=None, paged=False):
+    def __init__(self, config, *, cache_config=None):
         super().__init__()
         cfg = config["flow_lm"]
         width, latent = cfg["d_model"], cfg["ldim"]
@@ -103,7 +87,7 @@ class PhononFlowLM(nn.Module):
         self.emb_mean = nn.Parameter(torch.zeros(latent), requires_grad=False)
         self.emb_std = nn.Parameter(torch.ones(latent), requires_grad=False)
         self.input_linear = nn.Linear(latent, width, bias=False)
-        self.transformer = PhononBackbone(cfg, cache_config=cache_config, paged=paged)
+        self.transformer = PhononBackbone(cfg, cache_config=cache_config)
         self.out_norm = nn.LayerNorm(width, eps=1e-5)
         self.out_eos = nn.Linear(width, 1)
         self.flow_net = PhononFlowHead(latent, cfg["flow_dim"], width, cfg["flow_depth"])
@@ -147,9 +131,8 @@ class PhononFlowLM(nn.Module):
         # Backend buffers are initialized by vLLM, outside the official checkpoint.
         for index, layer in enumerate(self.transformer.layers):
             attention = layer.self_attn.attention
-            if attention is not None:
-                for name, buffer in attention.named_buffers():
-                    mapped[f"transformer.layers.{index}.self_attn.attention.{name}"] = buffer
+            for name, buffer in attention.named_buffers():
+                mapped[f"transformer.layers.{index}.self_attn.attention.{name}"] = buffer
         self.load_state_dict(mapped, strict=True)
 
 
@@ -173,7 +156,7 @@ class PhononTalkerForConditionalGeneration(nn.Module):
         self.eos_token_id = self.config.eos_token_id
         self.continue_token_id = self.config.audio_continue_token_id
         self.phonon_config = self.config.to_dict()
-        self.flow_lm = PhononFlowLM(self.phonon_config, cache_config=vllm_config.cache_config, paged=True)
+        self.flow_lm = PhononFlowLM(self.phonon_config, cache_config=vllm_config.cache_config)
         from vllm.utils.torch_utils import set_default_torch_dtype
 
         from .mimi_decoder import MimiStreamingDecoder

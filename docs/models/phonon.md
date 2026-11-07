@@ -58,7 +58,7 @@ no checkpoint download.
 pytest -v --noconftest -o addopts='' tests/model_executor/models/phonon
 ```
 
-Full-weight CPU generation, compiled decoder and CUDA Graph output-lifecycle
+Full-weight compiled decoder and CUDA Graph output-lifecycle
 checks are in the offline e2e suite. They resolve the four required files from
 `gradium/phonon-31m-en` through the standard HF cache. An optional
 `PHONON_CHECKPOINT_DIR` overrides the model source.
@@ -83,8 +83,7 @@ Local macOS CPU validation passed seven focused tests with official weights.
 The CUDA graph test was skipped because CUDA is unavailable locally. Config,
 pipeline and TTS adapter registration were checked locally. Full GPU serving,
 BF16 audio quality, graph capture/replay, cross-stream execution and performance
-remain server validation items. CPU reference attention uses request-local
-uncached concatenation solely for regression, while serving uses vLLM paged KV.
+remain server validation items. The AR backbone uses vLLM paged KV exclusively.
 The tests establish finite audio, EOS completion and codec chunk consistency.
 They do not establish numerical parity against a separately executed official
 runtime or a speech intelligibility score.

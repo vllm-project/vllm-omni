@@ -9,13 +9,14 @@ import torch
 
 from vllm_omni.model_executor.models.phonon.mimi_decoder import MimiStreamingDecoder
 from vllm_omni.model_executor.models.phonon.model_state import PhononModelState
-from vllm_omni.model_executor.models.phonon.phonon_talker import PhononFlowLM, PhononLayer
+from vllm_omni.model_executor.models.phonon.phonon_talker import PhononFlowLM
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch, async_scheduling):
     config = {
         "flow_lm": {
             "d_model": 8,
@@ -54,15 +55,28 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
         "lsd_decode_steps": 1,
         "eos_threshold": -1000.0,
     }
-    model = SimpleNamespace(
-        phonon_config=config, flow_lm=PhononFlowLM(config), mimi=MimiStreamingDecoder(config["mimi"], 1)
-    )
+
+    class FakeFlow(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bos_emb = torch.nn.Parameter(torch.zeros(4))
+            self.input_linear = torch.nn.Linear(4, 8, bias=False)
+            self.register_buffer("emb_mean", torch.zeros(4))
+            self.register_buffer("emb_std", torch.ones(4))
+
+        def conditioning(self):
+            return self.bos_emb.new_zeros(8)
+
+        def sample(self, hidden, noise):
+            return noise, hidden[:, :1]
+
+    model = SimpleNamespace(phonon_config=config, flow_lm=FakeFlow(), mimi=MimiStreamingDecoder(config["mimi"], 1))
     buffers = [{}]
     intermediate = SimpleNamespace(buffers=buffers)
 
     def base_init(owner, *args):
         owner.model = model
-        owner.scheduler_config = SimpleNamespace(max_num_seqs=1)
+        owner.scheduler_config = SimpleNamespace(max_num_seqs=1, async_scheduling=async_scheduling)
         owner.dtype = torch.float32
         owner._static_inputs_embeds = torch.zeros(16, 8)
         owner.intermediate_buffer = intermediate
@@ -72,6 +86,15 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
     monkeypatch.setattr(OmniModelState, "remove_request", lambda *args: None)
     cfg = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=True))
     state = PhononModelState(cfg, model, None, torch.device("cpu"))
+    flow_flags = []
+    original_sample = state.flow.sample
+
+    def sample_with_flag_reference(*args):
+        result = original_sample(*args)
+        flow_flags.append(result[0])
+        return result
+
+    monkeypatch.setattr(state.flow, "sample", sample_with_flag_reference)
     batch = SimpleNamespace(
         num_reqs=1,
         idx_mapping=torch.tensor([0]),
@@ -93,6 +116,7 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
             _, marker = state.postprocess_model_output(torch.ones(1, 8), batch, None)
             assert marker
             output = state.prepare_streaming_audio_output(batch, None, marker)
+            assert (output.valid is flow_flags[-1]) == (not async_scheduling)
             assert output.get_output()[0] is not None
             assert bool(model._continue[0]) == (step == 0)
         old_histories = [module.history.clone() for module in model.mimi.modules() if hasattr(module, "history")]
@@ -134,24 +158,6 @@ def test_official_loader_preserves_backend_buffers_and_requires_model_weights():
         lm.load_official_weights({})
     with pytest.raises(RuntimeError, match="Unexpected key"):
         lm.load_official_weights({**weights, "flow_lm.unknown.weight": torch.zeros(1)})
-
-
-def test_bf16_ar_rope_preserves_dtype_in_eager_and_compiled_forward():
-    config = {"d_model": 8, "num_heads": 2, "dim_feedforward": 16, "max_period": 10000.0}
-    layer = PhononLayer(config).to(dtype=torch.bfloat16).eval()
-    inputs = torch.randn(3, 8, dtype=torch.bfloat16)
-    positions = torch.arange(4096, 4099)
-    cache = [torch.empty(0, 2, 4, dtype=torch.bfloat16) for _ in range(2)]
-    with torch.inference_mode():
-        expected = layer(inputs, positions, cache)
-        assert expected.dtype == torch.bfloat16
-        assert all(tensor.dtype == torch.bfloat16 for tensor in cache)
-        assert torch.isfinite(expected).all()
-        compiled = torch.compile(layer, backend="eager", fullgraph=True)
-        fresh_cache = [torch.empty(0, 2, 4, dtype=torch.bfloat16) for _ in range(2)]
-        actual = compiled(inputs, positions, fresh_cache)
-        assert actual.dtype == torch.bfloat16
-        torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("project_voice", [True, False])
