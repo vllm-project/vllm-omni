@@ -36,6 +36,7 @@ bash run_server.sh
 ```
 
 The script allows overriding:
+
 - `MODEL` (default: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
 - `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
@@ -66,6 +67,7 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
+
 - `POST /v1/videos`: create a video generation job (async)
 - `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
