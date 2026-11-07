@@ -269,6 +269,10 @@ class UlyssesParallelAttention:
     def name(self) -> str:
         return "ulysses"
 
+    @property
+    def paged_kv_asymmetric_layout(self) -> bool:
+        return False
+
     def pre_attention(
         self,
         query: torch.Tensor,

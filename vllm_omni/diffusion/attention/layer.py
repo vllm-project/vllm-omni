@@ -506,10 +506,16 @@ class Attention(nn.Module):
             reason = self._cross_backend_limitation(attn_metadata)
             if reason is not None:
                 blocked = self._cross_fallback_blocker(attn_metadata)
+                assert self.sdpa_fallback is not None
                 result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
+                if blocked:
+                    assert self.attn_backend is not None
+                    backend_name = self.attn_backend.get_name()
+                else:
+                    backend_name = "SDPA"
                 return replace(
                     result,
-                    backend=self.attn_backend.get_name() if blocked else "SDPA",
+                    backend=backend_name,
                     path="cross_unsupported" if blocked else "cross_sdpa_fallback",
                     support=CapabilityResult.unsupported(blocked) if blocked else CapabilityResult.unmigrated(reason),
                 )
@@ -566,6 +572,8 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        paged_kv_asymmetric_layout = False
+
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
@@ -579,13 +587,52 @@ class Attention(nn.Module):
                 raise NotImplementedError(
                     "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
                 )
-            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
-                raise NotImplementedError(
-                    f"paged Scheduler KV is not supported with the {strategy_name!r} sequence-parallel strategy"
-                )
-            if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
+            if strategy_name in ("ulysses", "ulysses_allgather_kv") and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
+                forward_ctx = get_forward_context() if is_forward_context_available() else None
+                sp_padding_size = int(getattr(forward_ctx, "sp_padding_size", 0))
+                if sp_padding_size:
+                    raise NotImplementedError(
+                        "Paged AllGather-KV currently requires the sequence length "
+                        "to be divisible by its effective sequence-parallel degree; "
+                        f"got sp_padding_size={sp_padding_size}"
+                    )
 
+        if (
+            use_paged_attention
+            and strategy is not self._no_parallel_strategy
+            and strategy.name in ("allgather_kv", "ulysses_allgather_kv")
+            and attn_metadata is None
+        ):
+            attn_metadata = AttentionMetadata()
+        if (
+            use_paged_attention
+            and strategy is not self._no_parallel_strategy
+            and strategy.name in ("allgather_kv", "ulysses_allgather_kv")
+        ):
+            published_asymmetric_layout = getattr(strategy, "paged_kv_asymmetric_layout", None)
+            if published_asymmetric_layout is not True:
+                raise RuntimeError(
+                    "Paged AllGather-KV strategy did not publish its asymmetric local-Q/global-KV layout: "
+                    f"strategy={strategy.name!r}, layout={published_asymmetric_layout!r}"
+                )
+            paged_kv_asymmetric_layout = True
+            sequence_parallel_degree = getattr(strategy, "paged_kv_sequence_parallel_degree", None)
+            if type(sequence_parallel_degree) is not int or sequence_parallel_degree <= 1:
+                raise RuntimeError(
+                    "Paged AllGather-KV strategy did not publish a valid input sequence-sharding degree: "
+                    f"strategy={strategy.name!r}, degree={sequence_parallel_degree!r}"
+                )
+            assert paged_adapter is not None
+            paged_adapter.validate_allgather_sp_before_collective(
+                self.prefix,
+                query,
+                key,
+                value,
+                omni_attn_metadata=attn_metadata,
+                sequence_parallel_degree=sequence_parallel_degree,
+            )
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
@@ -656,6 +703,7 @@ class Attention(nn.Module):
                 key,
                 value,
                 omni_attn_metadata=attn_metadata,
+                asymmetric_layout=paged_kv_asymmetric_layout,
             )
             out = self.attention.forward_paged(paged_kv_context)
         else:
@@ -759,6 +807,7 @@ class Attention(nn.Module):
 
     def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
         if self.backend_explicit:
+            assert self.attn_backend is not None
             return (
                 f"Explicit backend {self.attn_backend.get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata)}"
@@ -793,6 +842,7 @@ class Attention(nn.Module):
                 blocked = self._cross_fallback_blocker(attn_metadata)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
+                assert self.sdpa_fallback is not None
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -37,6 +37,9 @@ class ParallelAttentionStrategy(Protocol):
     @property
     def name(self) -> str: ...
 
+    @property
+    def paged_kv_asymmetric_layout(self) -> bool: ...
+
     def pre_attention(
         self,
         query: torch.Tensor,
@@ -68,6 +71,10 @@ class NoParallelAttention:
     @property
     def name(self) -> str:
         return "none"
+
+    @property
+    def paged_kv_asymmetric_layout(self) -> bool:
+        return False
 
     def pre_attention(
         self,

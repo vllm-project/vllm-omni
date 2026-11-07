@@ -78,6 +78,12 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
     def name(self) -> str:
         return "ulysses_allgather_kv"
 
+    @property
+    def paged_kv_sequence_parallel_degree(self) -> int:
+        """Total input sequence sharding across the Ulysses x AG mesh."""
+
+        return self._sp_size * self._sp_group.ulysses_world_size
+
     def _assert_equal_region_lengths(self, region_len: int, device: torch.device) -> None:
         """Fail fast when the ``A`` regions do not have equal length.
 
