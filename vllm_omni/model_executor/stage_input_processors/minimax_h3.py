@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, unflatten_payload
+from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -39,10 +40,51 @@ def prepare_encoder_prompt(
     prompt: Any,
     sampling_params_list: Sequence[Any],
 ) -> Any:
+    """Prepare the H3 encoder request.
+
+    TODO(encoder-stage, keep_steps): CodeVideoModel early-only video
+    conditioning needs a SECOND Qwen pass over the same prompt with the video
+    reference removed from the presentation (``qwen_videos=[]`` and
+    ``condition_labels`` without the ``("video", i)`` entries; prompt text
+    unchanged). The result must reach the diffusion stage as
+    ``MiniMaxH3EncoderConditioning.base_hidden_states`` /
+    ``base_token_tags`` -- the wire fields already exist in
+    ``conditioning.py`` and the diffusion stage already consumes them.
+
+    Implementation route: when ``sampling.extra_args["keep_steps"]`` is set
+    and the request is task ref2va with image + video references, issue one
+    additional encoder-stage request whose ``prepare_encoder_prompt`` output
+    omits the video from ``qwen_mm_data`` and ``condition_labels``, then merge
+    its hidden states/tags into the encoder output payload under the two
+    ``base_*`` keys before the payload is handed to the DiT stage.
+    Until this is wired, keep_steps requests that would switch are
+    rejected HERE, at intake, so split-stage clients get the 400 without
+    paying for the encoder stage; the ``keep_steps == num_inference_steps``
+    no-op passes through (the diffusion stage normalizes it away), matching
+    the combined deployment's contract. Intake only sees the requested (or
+    default) step count: on checkpoints that pin a distilled schedule the
+    effective count can be smaller, so a value the diffusion stage would
+    treat as a no-op may be conservatively rejected here. The diffusion
+    stage owns the authoritative validation either way (requested-step
+    consistency, range, and the pinned-schedule rejection). The
+    local-text-encoder path (tests/offline) already works end to end via
+    ``_prepare_local_conditioning``.
+    """
+    sampling = _diffusion_sampling_params(sampling_params_list)
+    keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
+    if keep_steps is not None:
+        num_steps = int(sampling.num_inference_steps or MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS)
+        if type(keep_steps) is not int or not 1 <= keep_steps <= num_steps:
+            raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [1, {num_steps}]")
+        if keep_steps != num_steps:
+            raise OmniClientError(
+                "MiniMax H3 keep_steps is not supported across a separate encoder stage yet; it requires "
+                "the diffusion stage's local text encoder (see the TODO in this file)"
+            )
     multi_modal_data = prompt.get("multi_modal_data") if isinstance(prompt, Mapping) else None
     if isinstance(multi_modal_data, Mapping) and multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None:
         raise OmniClientError("MiniMax H3 timeline guides require the media encoder in the diffusion stage")
-    prepared = prepare_encoder_inputs(prompt, _diffusion_sampling_params(sampling_params_list))
+    prepared = prepare_encoder_inputs(prompt, sampling)
     if isinstance(prompt, str):
         prompt = {"prompt": prompt}
     text = prepared.prompt
