@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     REQUIRED_FILES,
     HyNomasARConfig,
 )
+from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
@@ -45,8 +46,6 @@ from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     validate_sequence_parallelism,
 )
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasInteractionSession, validate_camera_payload
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import (
     action_conditioning,
     normalize_request,
@@ -110,29 +109,11 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
 
 
 def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
-    arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
-    local_pixels = config["local_attention_tile_pixels"]
-    if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
-        raise ValueError("Hy-Nomas local_attention_tile_pixels must be a nonnegative multiple of 16.")
+    """Construct the native PixelUMM decoder in BF16, excluding checkpoint metadata."""
+    kwargs = {name: value for name, value in config.items() if not name.startswith("_")}
     with set_default_torch_dtype(torch.bfloat16), torch.device(device):
-        decoder = DCAEVPixelUMMDecoder(arch, local_attention_tile=local_pixels // 16)
-    vae = PixelUMMDCAELatentDecoder(
-        decoder,
-        **{
-            name: config[name]
-            for name in (
-                "denoising_step_list",
-                "num_steps",
-                "seed",
-                "temporal_window_latents",
-                "temporal_overlap_latents",
-                "decoder_tile_pixels",
-                "decoder_tile_overlap_pixels",
-                "tail_hold_latents",
-            )
-        },
-    )
-    return vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+        vae = PixelUMMDecoder(**kwargs)
+    return vae.eval().requires_grad_(False)
 
 
 def validate_config(config: OmniDiffusionConfig) -> None:
@@ -303,8 +284,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if component in components:
                 raise ValueError(f"Duplicate Hy-Nomas component weight stream: {component}")
             components.add(component)
-            loader = load_transformer_weights if component == "transformer" else load_component_weights
-            names = loader(getattr(self, component), ((name.partition(".")[2], value) for name, value in entries))
+            module = getattr(self, component)
+            stream = ((name.partition(".")[2], value) for name, value in entries)
+            if component == "transformer":
+                names = load_transformer_weights(module, stream)
+            elif hasattr(module, "load_weights"):
+                # The native decoder stacks the checkpoint's q/k/v and gate/up projections.
+                names = module.load_weights(stream)
+            else:
+                names = load_component_weights(module, stream)
             loaded.update(f"{component}.{name}" for name in names)
         if components != {"transformer", "vae"}:
             raise ValueError(

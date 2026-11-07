@@ -68,14 +68,15 @@ def pipelines(model_cleanup):
     config.parallelism.sp_size = 1
     config.parallelism.shard_text_encoder = False
     device = get_local_device()
+    custom_args = {}
+    if "HY_NOMAS_TEXT_ENCODER" in os.environ:
+        custom_args["text_encoder"] = os.environ["HY_NOMAS_TEXT_ENCODER"]
     omni_config = OmniDiffusionConfig(
         model=os.environ.get("HY_NOMAS_MODEL", MODEL_ID),
         dtype=torch.bfloat16,
         distributed_executor_backend="mp",
         enforce_eager=True,
-        custom_pipeline_args={"text_encoder": os.environ["HY_NOMAS_TEXT_ENCODER"]}
-        if "HY_NOMAS_TEXT_ENCODER" in os.environ
-        else {},
+        custom_pipeline_args=custom_args,
     )
     reference = candidate = None
     try:

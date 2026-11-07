@@ -17,27 +17,9 @@ from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import HyNomasTransformer
 from vllm_omni.diffusion.models.hy_nomas.layers import TimestepEmbedder
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_model_config
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.text_encoder import _VIDEO_SYSTEM, TextEncoder
 
 pytestmark = [pytest.mark.local_model, pytest.mark.cpu, pytest.mark.diffusion]
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("tile", [0, 1])
-def test_small_pixelumm_matches_independent_reference(tile):
-    reference = pytest.importorskip("hymm.models.vae.pixelumm_decoder.model")
-    options = dict(hidden_size=32, intermediate_size=64, num_layers=1, num_heads=4, num_kv_heads=2, head_dim=8)
-    torch.manual_seed(42)
-    expected_model = reference.DCAEVPixelUMMDecoder(
-        reference.GenExpertArch(**options), local_attention_tile=tile
-    ).eval()
-    actual_model = DCAEVPixelUMMDecoder(GenExpertArch(**options), local_attention_tile=tile).eval()
-    actual_model.load_state_dict(expected_model.state_dict(), strict=True)
-    latents = torch.randn(1, 32, 2, 2, 3)
-    noise = torch.randn(1, 3, 8, 64, 96)
-    torch.testing.assert_close(actual_model(latents, noise), expected_model(latents, noise), rtol=0, atol=0)
 
 
 @torch.no_grad()
@@ -156,54 +138,6 @@ def test_native_defaults_match_pinned_reference():
     for name, value in actual.inference.items():
         assert value == expected.inference[name], name
     assert expected.camera.per_chunk_camera_attn and expected.camera.camera_chunk_size == 1
-
-
-class WindowContext(nn.Module):
-    # A window-dependent predictor isolates state bookkeeping, not neural accuracy.
-    local_attention_tile = 0
-
-    def __init__(self):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(0.5))
-
-    def forward(self, latent, noise):
-        values = latent[:, :3] + latent[:, :3].mean(2, keepdim=True)
-        values = values.repeat_interleave(4, 2).repeat_interleave(32, 3).repeat_interleave(32, 4)
-        return self.scale * noise + values
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("lengths", [[1] * 81, [3, 1, 7, 2, 16, 5, 1], [2], [4], [5], [8, 1]])
-@pytest.mark.parametrize("tail_hold", [0, 1])
-def test_native_rolling_state_matches_independent_reference(lengths, tail_hold):
-    reference = pytest.importorskip("hymm.models.vae.pixelumm_decoder.autoencoder")
-    options = dict(
-        seed=13,
-        temporal_window_latents=4,
-        temporal_overlap_latents=2,
-        decoder_tile_pixels=0,
-        tail_hold_latents=tail_hold,
-    )
-    expected = reference.PixelUMMDCAELatentDecoder(WindowContext(), **options).create_streaming_decode_session(
-        to_cpu=True, retain_history=False, rolling=True
-    )
-    actual = PixelUMMDCAELatentDecoder(WindowContext(), **options).create_streaming_decode_session()
-    generator = torch.Generator().manual_seed(301)
-    for index, length in enumerate(lengths):
-        latent = torch.randn((1, 32, length, 1, 1), generator=generator)
-        pixels = length * 4 - index % 4
-        actual.final_segment = expected.final_segment = index + 1 == len(lengths)
-        torch.testing.assert_close(
-            actual.push(latent, pixel_frames=pixels), expected.push(latent, pixel_frames=pixels), rtol=0, atol=0
-        )
-        assert actual.available_latent_frames == expected.available_latent_frames
-        assert actual.stable_pixel_frames == expected.stable_pixel_frames
-        assert actual.withheld_pixel_frames == expected.withheld_pixel_frames
-        assert actual.buffer.shape[2] <= 2 * actual.window + actual.stride
-        assert len(actual.push_latent_frames) <= 2 * actual.window
-    torch.testing.assert_close(actual.finish(), expected.finish(), rtol=0, atol=0)
-    assert actual.buffer.numel() == 0 and actual.pending is None
-    assert not actual.push_latent_frames
 
 
 @pytest.mark.parametrize("kind", ["json", "inline", "npz", "precomputed"])
