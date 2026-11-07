@@ -11,11 +11,25 @@ from tests.buildkite.test_amd_pipeline import AMD_MERGE_PIPELINE, _assert_nightl
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 LABEL = "MERGE · Bagel Shared-Memory Connectors"
+BAGEL_CONNECTOR_TEST = Path("tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py")
 NODES = (
     "tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py::test_bagel_img2img_shared_memory_connector",
     "tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py::test_bagel_text2img_shared_memory_connector",
 )
 GROUPS = (("connectors", 2),)
+
+
+def test_gap_07_limits_relaxed_pixel_tolerance_to_rocm_img2img() -> None:
+    source = BAGEL_CONNECTOR_TEST.read_text(encoding="utf-8")
+
+    assert "PIXEL_TOLERANCE = 10" in source
+    assert "ROCM_PIXEL_TOLERANCE = 20" in source
+    assert "TEXT2IMG_PIXEL_TOLERANCE = 5" in source
+    assert source.count("current_omni_platform.is_rocm()") == 1
+    assert "return ROCM_PIXEL_TOLERANCE" in source
+    assert "return PIXEL_TOLERANCE" in source
+    assert "_validate_pixels(generated_image, tolerance=_img2img_pixel_tolerance())" in source
+    assert "tolerance=TEXT2IMG_PIXEL_TOLERANCE" in source
 
 
 def test_gap_07_selects_bounded_advanced_rocm_cases() -> None:
