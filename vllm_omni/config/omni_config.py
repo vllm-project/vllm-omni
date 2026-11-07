@@ -271,6 +271,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ulysses_a2a_permute: bool
     cfg_parallel_size: int
     vae_patch_parallel_size: int
+    vae_encode_parallel_size: int
     vae_parallel_mode: str
     text_encoder_tp_size: int
     use_hsdp: bool
@@ -727,6 +728,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_a2a_permute: bool = False
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
+    vae_encode_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False

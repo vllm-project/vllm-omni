@@ -9,7 +9,7 @@ import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
@@ -89,6 +89,7 @@ from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     PreparedEncoderInputs,
+    _image_from_tensor,
     continuation_inherits_source_canvas,
     encode_media,
     prepare_encoder_inputs,
@@ -606,6 +607,38 @@ def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
     return [int(seed) + output_index for output_index in range(int(num_outputs))]
 
 
+def _assign_minimax_h3_images_to_ranks(
+    image_sizes: Sequence[tuple[int, int]],
+    workers: int,
+) -> list[list[int]]:
+    """Deterministically balance reference images across worker ranks.
+
+    The assignment is computed identically on every rank from the image
+    dimensions, so no metadata collective is needed before encoding. Images are
+    placed largest-first onto the least-loaded worker; ties fall back to the
+    lower rank index. Each worker's list is sorted back into request order so
+    reconstruction is stable.
+    """
+    if workers < 1:
+        raise ValueError(f"workers must be >= 1, got {workers}")
+    assigned: list[list[int]] = [[] for _ in range(workers)]
+    loads = [0] * workers
+    order = sorted(
+        range(len(image_sizes)),
+        key=lambda index: (
+            -(int(image_sizes[index][0]) * int(image_sizes[index][1])),
+            index,
+        ),
+    )
+    for index in order:
+        worker = min(range(workers), key=lambda candidate: (loads[candidate], candidate))
+        assigned[worker].append(index)
+        loads[worker] += max(1, int(image_sizes[index][0]) * int(image_sizes[index][1]))
+    for indices in assigned:
+        indices.sort()
+    return assigned
+
+
 def _dit_rank_world() -> tuple[Any, int, int]:
     if not dist.is_initialized():
         return None, 0, 1
@@ -747,6 +780,7 @@ class MiniMaxH3Pipeline(
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "encode_prompt",
         "_encode_local_media",
+        "_encode_images_data_parallel",
         "diffuse",
         "decode",
         "video_vae.decode_latent",
@@ -967,6 +1001,9 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
+        self.vae_encode_parallel_size = int(getattr(self.parallel_config, "vae_encode_parallel_size", 1) or 1)
+        if self.vae_encode_parallel_size < 1:
+            raise ValueError(f"vae_encode_parallel_size must be >= 1, got {self.vae_encode_parallel_size}")
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
@@ -1004,6 +1041,7 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("encode_prompt")
         if not self.load_vae_encoder:
             self._PROFILER_TARGETS.remove("_encode_local_media")
+            self._PROFILER_TARGETS.remove("_encode_images_data_parallel")
         modular = is_minimax_h3_modular(str(od_config.model), od_config.revision)
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
@@ -1838,6 +1876,12 @@ class MiniMaxH3Pipeline(
                         except BaseException:
                             logger.exception("Failed to release retained allocator cache after offload failure")
                     raise
+
+    def _dp_component_scope(self, component: nn.Module):
+        """Skip the video VAE scope already held by the image DP caller."""
+        if component is self.video_vae:
+            return nullcontext()
+        return self._component_on_device(component)
 
     @staticmethod
     def _is_output_owner_rank() -> bool:
@@ -2900,27 +2944,204 @@ class MiniMaxH3Pipeline(
             tensors[name] = _broadcast_tensor(source, dtype=dtype, device=self.device) if dtype is not None else None
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
+    def _encode_images_data_parallel(
+        self,
+        images: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[tuple[int, int, int]]]:
+        """Encode reference images as image-level data parallelism.
+
+        Runs inside ``encode_media``'s VAE residency window. Each participating
+        rank encodes a disjoint image subset with native VAE tile parallelism
+        disabled for the call, then all ranks join the same collectives so
+        empty ranks cannot deadlock. Every rank rebuilds the per-image row
+        blocks in request order from the same gathered payload.
+        """
+        group, rank, world_size = _dit_rank_world()
+        pil_images = [_image_from_tensor(value) for value in images]
+        shapes = [(1, image.height // 16, image.width // 16) for image in pil_images]
+        configured_workers = int(getattr(self, "vae_encode_parallel_size", 1) or 1)
+        workers = min(configured_workers, int(world_size), len(pil_images))
+        if workers <= 1:
+            if int(world_size) != 1:
+                raise RuntimeError("MiniMax-H3 image-level DP requires at least two images, ranks, and workers")
+            rows = [self.video_vae.encode_image(image, rank_local=True) for image in pil_images]
+            return rows, shapes
+
+        if configured_workers > int(world_size):
+            logger.warning_once(
+                "MiniMax-H3 vae_encode_parallel_size=%d exceeds the DiT world size=%d; clamping to %d",
+                configured_workers,
+                int(world_size),
+                int(world_size),
+            )
+        assignment = _assign_minimax_h3_images_to_ranks(
+            [image.size for image in pil_images],
+            workers,
+        )
+        local_indices = assignment[rank] if rank < workers else []
+        local_rows: list[torch.Tensor] = []
+        local_error: Exception | None = None
+        try:
+            local_rows = [self.video_vae.encode_image(pil_images[index], rank_local=True) for index in local_indices]
+        except Exception as exc:
+            local_error = exc
+
+        # Agree on failures before any payload collective. Otherwise a rank
+        # that failed during encode skips the collectives its peers enter.
+        if int(world_size) > 1:
+            error_infos: list[tuple[str, str, bool] | None] = [None] * int(world_size)
+            info = (
+                None
+                if local_error is None
+                else (
+                    type(local_error).__name__,
+                    str(local_error),
+                    isinstance(local_error, (OmniClientError, ValueError)),
+                )
+            )
+            dist.all_gather_object(error_infos, info, group=group)
+            for error_rank, remote_info in enumerate(error_infos):
+                if remote_info is not None:
+                    error_type, message, is_client_error = remote_info
+                    text = f"MiniMax-H3 image-level DP encode failed on rank {error_rank} ({error_type}): {message}"
+                    error = OmniClientError(text) if is_client_error else RuntimeError(text)
+                    if error_rank == rank and local_error is not None:
+                        raise error from local_error
+                    raise error
+        elif local_error is not None:
+            raise local_error
+
+        local_flat = (
+            torch.cat(local_rows) if local_rows else torch.empty((0, 96), dtype=torch.float32, device=self.device)
+        )
+        local_flat = local_flat.to(device=self.device, dtype=torch.float32)
+
+        local_count = torch.tensor([local_flat.shape[0]], dtype=torch.long, device=self.device)
+        gathered_counts = [torch.empty_like(local_count) for _ in range(world_size)]
+        dist.all_gather(gathered_counts, local_count, group=group)
+        max_rows = max(int(count.item()) for count in gathered_counts)
+
+        per_image_rows = torch.zeros(len(pil_images), dtype=torch.long, device=self.device)
+        for index, rows in zip(local_indices, local_rows, strict=True):
+            per_image_rows[index] = rows.shape[0]
+        dist.all_reduce(per_image_rows, op=dist.ReduceOp.SUM, group=group)
+
+        if max_rows > 0:
+            padded = torch.zeros((max_rows, 96), dtype=torch.float32, device=self.device)
+            if local_flat.shape[0]:
+                padded[: local_flat.shape[0]] = local_flat
+            gathered_rows = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(gathered_rows, padded, group=group)
+        else:
+            gathered_rows = [torch.empty((0, 96), dtype=torch.float32, device=self.device) for _ in range(world_size)]
+
+        # Every rank has the same gathered payload and row counts, so rebuild
+        # locally instead of sending the complete result from rank 0 again.
+        parts: list[tuple[int, torch.Tensor]] = []
+        for worker, indices in enumerate(assignment):
+            offset = 0
+            for index in indices:
+                row_count = int(per_image_rows[index].item())
+                parts.append((index, gathered_rows[worker][offset : offset + row_count]))
+                offset += row_count
+        parts.sort(key=lambda item: item[0])
+        flat_rows = (
+            torch.cat([part for _, part in parts], dim=0)
+            if parts
+            else torch.empty((0, 96), dtype=torch.float32, device=self.device)
+        )
+        # ``encode_image`` returns CPU rows; keep that contract so image rows
+        # can be concatenated with video/guide rows collected on any device.
+        flat_rows = flat_rows.cpu()
+        rows: list[torch.Tensor] = []
+        offset = 0
+        for index in range(len(pil_images)):
+            row_count = int(per_image_rows[index].item())
+            rows.append(flat_rows[offset : offset + row_count])
+            offset += row_count
+        return rows, shapes
+
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
         group, rank, world_size = _dit_rank_world()
+        configured_workers = int(getattr(self, "vae_encode_parallel_size", 1) or 1)
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
             media = self._distribute_media_inputs(media)
+            image_count = len(media.images)
+        else:
+            image_count = len(media.images) if media is not None else 0
+            if configured_workers > 1 and int(world_size) > 1:
+                count_header = [image_count]
+                dist.broadcast_object_list(count_header, src=0, group=group)
+                image_count = int(count_header[0])
+        parallel_images = configured_workers > 1 and int(world_size) > 1 and image_count >= 2
+        if parallel_images and not distributed_video:
+            media = self._distribute_media_inputs(media)
+        image_workers = min(configured_workers, int(world_size), image_count) if parallel_images else 0
+        has_non_image_visuals = media is not None and (
+            bool(media.videos)
+            or media.video_edit is not None
+            or any(guide.frames is not None for guide in media.timeline_guides)
+        )
+        rank_needs_vae = parallel_images and (rank < image_workers or (distributed_video and has_non_image_visuals))
+        image_encoder = (lambda: self._encode_images_data_parallel(media.images)) if parallel_images else None
         conditioning = None
         error = None
-        try:
-            if rank == 0 or distributed_video:
-                assert media is not None
-                conditioning = encode_media(
-                    media,
-                    video_vae=self.video_vae,
-                    audio_vae=self.audio_vae,
-                    emit_conditioning=rank == 0,
-                    component_scope=self._component_on_device,
-                )
-        except ValueError as exc:
-            error = OmniClientError(str(exc))
-        except Exception as exc:
-            error = exc
+        with ExitStack() as component_stack:
+            try:
+                if parallel_images:
+                    # Load the encoder only on ranks that own images (or that
+                    # must run non-image codecs); idle ranks still join the
+                    # collectives below. Agree on load failures before entering
+                    # any payload collective so a failed rank can join too.
+                    load_error: Exception | None = None
+                    if rank_needs_vae:
+                        try:
+                            component_stack.enter_context(self._component_on_device(self.video_vae.encoder_component))
+                        except Exception as exc:
+                            load_error = exc
+                    if int(world_size) > 1:
+                        load_errors: list[tuple[str, str, bool] | None] = [None] * int(world_size)
+                        info = (
+                            None
+                            if load_error is None
+                            else (
+                                type(load_error).__name__,
+                                str(load_error),
+                                isinstance(load_error, (OmniClientError, ValueError)),
+                            )
+                        )
+                        dist.all_gather_object(load_errors, info, group=group)
+                        for error_rank, remote_info in enumerate(load_errors):
+                            if remote_info is not None:
+                                error_type, message, is_client_error = remote_info
+                                text = (
+                                    "MiniMax-H3 image-level DP encoder load failed on rank "
+                                    f"{error_rank} ({error_type}): {message}"
+                                )
+                                error = OmniClientError(text) if is_client_error else RuntimeError(text)
+                                if error_rank == rank and load_error is not None:
+                                    raise error from load_error
+                                raise error
+                    elif load_error is not None:
+                        raise load_error
+                if rank == 0 or distributed_video or parallel_images:
+                    assert media is not None
+                    component_scope = self._dp_component_scope if parallel_images else self._component_on_device
+                    conditioning = encode_media(
+                        media,
+                        video_vae=self.video_vae,
+                        audio_vae=self.audio_vae,
+                        emit_conditioning=rank == 0,
+                        component_scope=component_scope,
+                        image_encoder=image_encoder,
+                        encode_non_image_visuals=rank == 0 or distributed_video,
+                        on_visual_complete=component_stack.close,
+                    )
+            except ValueError as exc:
+                error = OmniClientError(str(exc))
+            except Exception as exc:
+                error = exc
         if world_size > 1:
             # All participants finish the codec phase before any latent broadcast.
             errors = [None] * world_size
