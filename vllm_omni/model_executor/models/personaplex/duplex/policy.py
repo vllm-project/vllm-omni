@@ -18,6 +18,9 @@ ZERO_TEXT_TOKEN = 3
 SILENCE_TOKENS = (948, 243, 1178, 546, 1736, 1030, 1978, 2008)
 SINE_TOKENS = (430, 1268, 381, 1611, 1095, 1495, 56, 472)
 AUDIO_SILENCE_FRAME_CNT = 6  # 0.5 s at 12.5 Hz
+# Depformer steps of a kyutai Moshi checkpoint: its own 8 codebooks only.
+# PersonaPlex checkpoints train 16 (agent and user).
+MOSHI_DEPFORMER_STEPS = 8
 
 
 def wrap_with_system_tags(text: str) -> str:
@@ -27,6 +30,7 @@ def wrap_with_system_tags(text: str) -> str:
 
 __all__ = [
     "AUDIO_SILENCE_FRAME_CNT",
+    "MOSHI_DEPFORMER_STEPS",
     "SILENCE_TOKENS",
     "SINE_TOKENS",
     "ZERO_TEXT_TOKEN",

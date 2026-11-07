@@ -257,6 +257,97 @@ async def test_prepare_runtime_config_reports_prefill_failures_as_runtime_config
     assert excinfo.value.code == "model_path_unavailable"
 
 
+@pytest.mark.asyncio
+async def test_a_moshi_checkpoint_opens_sessions_without_a_prompt(monkeypatch) -> None:
+    checks: list[tuple[str, str | None]] = []
+
+    def fake_steps(model_path: str, revision: str | None) -> int:
+        checks.append((model_path, revision))
+        return 8
+
+    def no_prefill(*_args) -> int:
+        raise AssertionError("Moshi has no voice or persona prefill")
+
+    monkeypatch.setattr(stage0, "checkpoint_depformer_steps", fake_steps)
+    monkeypatch.setattr(stage0, "personaplex_prefill_slots", no_prefill)
+    plugin = _plugin()
+    model_config = SimpleNamespace(model="/models/moshiko")
+
+    runtime_config = await plugin.prepare_runtime_config(DuplexSessionConfig(voice=" "), model_config=model_config)
+    again = await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+
+    assert (
+        runtime_config
+        == again
+        == {
+            "personaplex_model_path": "/models/moshiko",
+            "personaplex_voice_prompt": None,
+            "personaplex_persona": None,
+            "personaplex_prefill_slots": 0,
+        }
+    )
+    assert checks == [("/models/moshiko", None)]
+    plan = plugin.plan_append(
+        request_id="r",
+        fence=DuplexFence(session_id="s", epoch=0),
+        session_config={},
+        runtime_config=runtime_config,
+        seq=1,
+        turn_seq=0,
+        payload=_pcm_payload(np.zeros(FRAME_SIZE, dtype=np.float32)),
+        final=False,
+        sampling_params=None,
+    )
+    # The first append is the initial-token frame alone.
+    assert plan.prompt["prompt_token_ids"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_that_cannot_be_read_yet_is_checked_again(monkeypatch) -> None:
+    results = iter([None, 8])
+    checks: list[tuple[str, str | None]] = []
+
+    def fake_steps(model_path: str, revision: str | None) -> int | None:
+        checks.append((model_path, revision))
+        return next(results)
+
+    monkeypatch.setattr(stage0, "checkpoint_depformer_steps", fake_steps)
+    monkeypatch.setattr(stage0, "personaplex_prefill_slots", lambda *_args: 3)
+    plugin = _plugin()
+    model_config = SimpleNamespace(model="kyutai/moshiko-pytorch-bf16", revision="abc123")
+
+    first = await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    second = await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    third = await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+
+    assert first["personaplex_prefill_slots"] == 3
+    assert second["personaplex_prefill_slots"] == third["personaplex_prefill_slots"] == 0
+    assert checks == [("kyutai/moshiko-pytorch-bf16", "abc123")] * 2
+
+
+@pytest.mark.parametrize(
+    ("config", "code"),
+    [
+        (DuplexSessionConfig(voice="NATF2.pt"), "voice_unsupported"),
+        (DuplexSessionConfig(instructions="Be brief."), "instructions_unsupported"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_moshi_session_refuses_a_voice_or_instructions(monkeypatch, config, code) -> None:
+    monkeypatch.setattr(stage0, "checkpoint_depformer_steps", lambda _path, _revision: 8)
+    plugin = _plugin()
+
+    with pytest.raises(DuplexRuntimeConfigError) as excinfo:
+        await plugin.prepare_runtime_config(config, model_config=SimpleNamespace(model="/models/moshiko"))
+    assert excinfo.value.code == code
+
+    current = {"personaplex_model_path": "/models/moshiko", "personaplex_voice_prompt": None}
+    with pytest.raises(DuplexRuntimeConfigError) as excinfo:
+        plugin.runtime_config_for_update(config, current)
+    assert excinfo.value.code == code
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(), current) == current
+
+
 @pytest.mark.parametrize("voice", ["../NATF2.pt", "voices/NATF2.pt", "NATF2.wav", "/abs/NATF2.pt"])
 @pytest.mark.asyncio
 async def test_prepare_runtime_config_rejects_voices_that_are_not_bundled_basenames(voice: str) -> None:
