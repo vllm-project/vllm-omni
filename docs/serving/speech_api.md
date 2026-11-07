@@ -354,7 +354,7 @@ Choose the input policy according to when synthesis should start:
 | --- | --- | --- | --- |
 | `buffered` (default) | `none` (default) | After `input.done`, using all accumulated text. | The handler waits for generation before processing another input message. |
 | `buffered` | `sentence` or `clause` | At each linguistic boundary, before `input.done`; remaining text is flushed at `input.done`. | The handler waits for each segment's generation before processing another input message. |
-| `commitment` | `none` (required) | At each semantic-readiness boundary; `input.done` closes and flushes the policy. | The reader can accept and queue later segments while the synthesis worker runs. M1 supports the documented Qwen3-TTS Chinese/English scope. |
+| `commitment` | `none` (required) | Queued at each semantic-readiness boundary and synthesized in order; `input.done` closes and flushes the policy. | The reader can accept and queue later segments while the synthesis worker runs. M1 supports the documented Qwen3-TTS Chinese/English scope. |
 
 All three configurations submit independent TTS requests. None appends later
 text to the prompt of a model request that is already generating, or preserves
@@ -379,8 +379,8 @@ default buffered configuration, the first synthesis request still waits for
 `input.done`. Commitment mode requires `split_granularity="none"` because only
 the readiness policy may decide its irreversible boundaries.
 
-For model-native audio input/output sessions, see the separate
-[`/v1/realtime` duplex API](realtime_openai_duplex_api.md). Its model-specific
+For the separate turn-based audio input/output protocol, see the
+[`/v1/realtime` Realtime Audio API](realtime_openai_duplex_api.md). Its model-specific
 support does not make an arbitrary TTS backend support incremental prompt
 extension through `/v1/audio/speech/stream`.
 
