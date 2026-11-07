@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 from .cuda_graph_wrapper import FlowSampleRunner, MimiDecodeRunner
@@ -45,6 +46,7 @@ class PhononModelState(OmniModelState):
             raise ValueError("Phonon initial release requires max_num_seqs=1")
         count = self.scheduler_config.max_num_seqs
         self.mimi_positions = torch.zeros(count, dtype=torch.long, device=device)
+        self.tail_frames = torch.full((count,), 3, dtype=torch.long, device=device)
         self.remaining_tail = torch.full((count,), -1, dtype=torch.long, device=device)
         self.active = torch.ones(count, dtype=torch.bool, device=device)
         self.next_embeddings = torch.zeros(
@@ -58,12 +60,13 @@ class PhononModelState(OmniModelState):
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
-        self.decoder.reset_slots([req_index])
-        self.mimi_positions[req_index] = 0
-        self.remaining_tail[req_index] = -1
-        self.active[req_index] = True
-        self.next_embeddings[req_index] = 0
+        self.decoder.reset_slots(req_index)
+        self.mimi_positions[req_index].zero_()
+        self.remaining_tail[req_index].fill_(-1)
+        self.active[req_index].fill_(True)
+        self.next_embeddings[req_index].zero_()
         buffer = self.intermediate_buffer.buffers[req_index]
+        self.tail_frames[req_index].fill_(int(buffer.get("phonon_tail_frames", 3)))
         params = buffer.get("sampling_params")
         seed = getattr(params, "seed", None)
         buffer["phonon_generator"] = (
@@ -78,19 +81,20 @@ class PhononModelState(OmniModelState):
         if "phonon_text_ids" in buffer:
             from .prompt import build_prompt
 
-            voice = torch.as_tensor(buffer["phonon_voice"])
+            voice = buffer["phonon_voice"]
             buffer["phonon_prompt_embeds"] = build_prompt(
                 self.model.flow_lm,
                 buffer["phonon_text_ids"],
                 voice,
                 project_voice=bool(buffer.get("phonon_project_voice", True)),
+                conditioning=self.condition,
             )
 
     def remove_request(self, req_index_or_id):
         index = self._resolve_req_index(req_index_or_id)
         if index is not None:
-            self.decoder.reset_slots([index])
-            self.active[index] = False
+            self.decoder.reset_slots(index)
+            self.active[index].fill_(False)
         super().remove_request(req_index_or_id)
 
     def on_request_preempted(self, req_id, req_index):
@@ -110,7 +114,6 @@ class PhononModelState(OmniModelState):
                 raise ValueError(
                     "Phonon requires phonon_prompt_embeds built from the official text and speaker conditioning"
                 )
-            prompt = torch.as_tensor(prompt, device=embeds.device, dtype=embeds.dtype)
             if computed < prompt.shape[0]:
                 embeds[start : start + count].copy_(prompt[computed : computed + count])
                 if computed + count == prompt.shape[0]:
@@ -126,7 +129,7 @@ class PhononModelState(OmniModelState):
         if not self._rows:
             self.audio_output = PhononAudioOutput(None, None, [], count)
             return
-        rows = torch.tensor(self._rows, device=hidden_states.device)
+        rows = index_to_device(self._rows, hidden_states.device)
         slots = input_batch.idx_mapping[rows].long()
         last = input_batch.query_start_loc[rows + 1].long() - 1
         hidden = hidden_states[last]
@@ -146,13 +149,7 @@ class PhononModelState(OmniModelState):
         latent, eos = self.flow.sample(hidden, noise)
         valid = self.active[slots]
         previous = self.remaining_tail[slots]
-        tail_frames = torch.tensor(
-            [
-                self.intermediate_buffer.buffers[int(input_batch.idx_mapping_np[row])].get("phonon_tail_frames", 3)
-                for row in self._rows
-            ],
-            device=hidden.device,
-        )
+        tail_frames = self.tail_frames[slots]
         tail = torch.where(
             (previous < 0) & (eos.flatten() > self.model.phonon_config["eos_threshold"]), tail_frames, previous
         )
