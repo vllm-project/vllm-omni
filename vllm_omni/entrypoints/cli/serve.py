@@ -825,8 +825,8 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             default=None,
             help=(
-                "Diffusion-only: autotune FlashInfer GEMMs on CUDA (e.g. FP8 linears on SM100+/SM120) so they "
-                "use tuned tactics instead of heuristics. The first request of each new shape pays the tuning; "
+                "Diffusion-only: autotune FlashInfer GEMMs on CUDA (on SM100+: MXFP8 and per-tensor FP8 linears) "
+                "so they use tuned tactics instead of heuristics. The first request of each new shape pays the tuning; "
                 "tactics are cached per rank under VLLM_CACHE_ROOT and reused after a restart."
             ),
         )

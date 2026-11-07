@@ -211,3 +211,24 @@ def test_cache_path_is_stable_across_config_objects(tmp_path, monkeypatch):
 
     assert first == second  # a restart builds a new config object and must find the same file
     assert first != other
+
+
+class _OnlineQuantConfig:  # stands in for a vLLM QuantizationConfig that model loading mutates
+    def __init__(self):
+        self.ignored_layers = ["img_mlp"]
+
+    def get_name(self):
+        return "fp8"
+
+
+def test_cache_path_ignores_state_added_by_model_load(tmp_path, monkeypatch):
+    monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
+    config = _OnlineQuantConfig()
+    before = dw._flashinfer_autotune_cache_path(_od_config(True, quantization_config=config), 0)
+    config.packed_modules_mapping = {"qkv": object()}  # runtime state, differs per process
+    config.loaded_layers = {f"blocks.{i}" for i in range(4)}
+
+    assert dw._flashinfer_autotune_cache_path(_od_config(True, quantization_config=config), 0) == before
+    other = _OnlineQuantConfig()
+    other.ignored_layers = []
+    assert dw._flashinfer_autotune_cache_path(_od_config(True, quantization_config=other), 0) != before

@@ -254,6 +254,19 @@ def _stable_config_repr(value: Any, depth: int = 0) -> str:
         return "[" + ",".join(_stable_config_repr(v, depth + 1) for v in value) + "]"
     if isinstance(value, (set, frozenset)):
         return "{" + ",".join(sorted(_stable_config_repr(v, depth + 1) for v in value)) + "}"
+    get_name = getattr(value, "get_name", None)
+    if callable(get_name):
+        # A quantization config: its method and the layers it skips, not runtime state the model load adds to it.
+        try:
+            name = get_name()
+        except Exception:
+            name = None
+        skipped = next(
+            (getattr(value, a) for a in ("ignored_layers", "ignore", "modules_to_not_convert") if hasattr(value, a)),
+            None,
+        )
+        method, skip = _stable_config_repr(name, depth + 1), _stable_config_repr(skipped, depth + 1)
+        return f"{type(value).__qualname__}({method},{skip})"
     if dataclasses.is_dataclass(value):
         attrs = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
     else:
@@ -548,9 +561,10 @@ class DiffusionWorker:
         """FlashInfer autotune for forwards that run a request shape this worker has not tuned yet.
 
         vLLM tunes FlashInfer kernels only in its LLM worker warm-up, so without this the diffusion
-        stage runs FlashInfer GEMMs (e.g. FP8 linears on SM100+/SM120) on the library's heuristic
-        tactic. Tune mode profiles only cache misses, but it also adds milliseconds of host time to
-        every FlashInfer call even on cache hits, so it is entered only for the first request of each
+        stage runs FlashInfer GEMMs (on SM100+: MXFP8 linears and per-tensor-activation FP8 linears;
+        online per-token FP8 uses CUTLASS) on the library's heuristic tactic. Tune mode profiles
+        only cache misses, but it also adds milliseconds of host time to every FlashInfer call even
+        on cache hits, so it is entered only for the first request of each
         new shape signature (with step execution: every step of that request, since prefill and
         decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
         The per-rank cache file is loaded once and rewritten when new tactics were profiled.
@@ -567,7 +581,9 @@ class DiffusionWorker:
         if not has_flashinfer():
             logger.warning_once("diffusion_flashinfer_autotune is set but FlashInfer is not installed; ignoring it.")
             return nullcontext()
-        cache_path = _flashinfer_autotune_cache_path(od_config, self.rank)
+        cache_path = self.__dict__.get("_flashinfer_autotune_cache_file") or _flashinfer_autotune_cache_path(
+            od_config, self.rank
+        )
         self._load_flashinfer_autotune_cache(cache_path)
         seen: set[tuple[Any, ...]] = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
         tuning_ids: set[str] = self.__dict__.setdefault("_flashinfer_tuning_request_ids", set())
@@ -611,6 +627,9 @@ class DiffusionWorker:
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if getattr(self.od_config, "diffusion_flashinfer_autotune", False):
+            # Key the autotune cache before loading: the load attaches runtime state to the quantization config.
+            self._flashinfer_autotune_cache_file = _flashinfer_autotune_cache_path(self.od_config, self.rank)
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
         cutlass_fp8_context = (
