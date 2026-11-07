@@ -1008,7 +1008,15 @@ def calculate_metrics(
                 audio_ttfp_measured = session_metrics.get("ttfp_ms") is not None
             else:
                 audio_ttfp_measured = audio_ttfp_value > 0
-            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("rtf") is not None
+            audio_duration_value = float(getattr(outputs[i], defs.AUDIO_DURATION, 0.0) or 0.0)
+            if isinstance(session_metrics, dict):
+                audio_rtf_measured = session_metrics.get("rtf") is not None
+            else:
+                # A request that produced no audio has no RTF sample. Counting the
+                # 0.0 placeholder pulls the mean and percentiles down in mixed
+                # text+audio runs, where text requests would otherwise all read
+                # as perfectly real-time synthesis.
+                audio_rtf_measured = audio_duration_value > 0
             if ttft_measured:
                 ttfts.append(outputs[i].ttft)
             if audio_ttfp_measured:
@@ -1017,7 +1025,7 @@ def calculate_metrics(
                 audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
             goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
             goodput_audio_ttfps.append(audio_ttfp_value if audio_ttfp_measured else None)
-            audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
+            audio_duration.append(audio_duration_value)
             audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
             total_images += image_count
