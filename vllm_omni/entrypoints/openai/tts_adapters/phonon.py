@@ -50,7 +50,7 @@ class PhononAdapter(ARTTSAdapter):
             "prompt_token_ids": [0] * (frames + len(ids) + 1),
             "additional_information": {
                 "phonon_text_ids": ids,
-                "phonon_voice": voice.tolist(),
+                "phonon_voice": voice,
                 "phonon_project_voice": project,
                 "phonon_tail_frames": tail,
             },

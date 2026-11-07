@@ -6,6 +6,8 @@ import torch
 from safetensors import safe_open
 from transformers.utils.hub import cached_file
 
+from vllm_omni.utils.device_copy import to_device_nonblocking
+
 
 def load_voice(model_path, config, revision=None):
     filename = cached_file(model_path, "default-voice.safetensors", revision=revision)
@@ -31,13 +33,16 @@ def prepare_text(text):
     return text, tail
 
 
-def build_prompt(lm, text_ids, voice, *, project_voice=True):
+def build_prompt(lm, text_ids, voice, *, project_voice=True, conditioning=None):
     parameter = lm.bos_emb
-    voice = voice.to(device=parameter.device, dtype=parameter.dtype)
+    voice = to_device_nonblocking(voice.to(dtype=parameter.dtype), parameter.device)
     if voice.ndim == 3:
         voice = voice.squeeze(0)
     if project_voice:
         voice = lm.speaker_projection(voice.transpose(0, 1))
-    text = lm.text_embedding(torch.as_tensor(text_ids, device=parameter.device, dtype=torch.long))
-    bos = lm.input_linear(lm.bos_emb) + lm.conditioning()
+    ids = to_device_nonblocking(torch.as_tensor(text_ids, dtype=torch.long), parameter.device)
+    text = lm.text_embedding(ids)
+    if conditioning is None:
+        conditioning = lm.conditioning()
+    bos = lm.input_linear(lm.bos_emb) + conditioning
     return torch.cat((voice, text, bos[None]), 0)

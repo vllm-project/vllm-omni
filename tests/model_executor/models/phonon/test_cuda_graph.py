@@ -56,11 +56,33 @@ def test_graph_stream_handoff_and_slot_reset():
                 first = actual
                 saved = first.clone()
         torch.testing.assert_close(first, saved)
-        runner.reset_slots(slot)
+        tail_valid = torch.ones(1, dtype=torch.bool, device="cuda")
+        tail_positions = positions + eager.upsample_ratio
+        expected_tail = eager(codec_latent, slot, tail_positions)
+        old_tail, tail_event = runner.decode(codec_latent, slot, tail_positions)
+        runner.reset_slots(1)
         eager.reset_slots(slot)
         positions.zero_()
         actual, event = runner.decode(codec_latent, slot, positions)
         torch.cuda.current_stream().wait_event(event)
-        torch.testing.assert_close(
-            actual, eager(codec_latent, slot, positions), atol=2e-5, rtol=2e-4
-        )
+        torch.testing.assert_close(actual, eager(codec_latent, slot, positions), atol=2e-5, rtol=2e-4)
+
+        # Deliver the old request's final PCM after slot reset and a new decode.
+        from vllm_omni.model_executor.models.phonon.model_state import PhononAudioOutput
+
+        copy_stream = torch.cuda.Stream()
+        snapshot = PhononAudioOutput(old_tail, tail_valid, [0], 1, tail_event)
+
+        def copy_tensor(tensor):
+            host = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            host.copy_(tensor, non_blocking=True)
+            tensor.record_stream(copy_stream)
+            return host
+
+        with torch.cuda.stream(copy_stream):
+            host_snapshot = snapshot.to_cpu(copy_stream, copy_tensor)
+            copied = torch.cuda.Event()
+            copied.record(copy_stream)
+        copied.synchronize()
+        delivered = host_snapshot.get_output()[0]["model_outputs"]
+        torch.testing.assert_close(delivered, expected_tail.cpu().flatten(), atol=2e-5, rtol=2e-4)

@@ -12,15 +12,16 @@ class MimiDecodeRunner:
         self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.capture = capture and self.stream is not None
         self.buckets = {}
-        self.finished = None
+        if self.stream is not None:
+            self.stream.wait_stream(torch.cuda.current_stream(device))
 
-    def wait(self):
-        if self.finished is not None:
-            torch.cuda.current_stream().wait_event(self.finished)
-
-    def reset_slots(self, slots):
-        self.wait()
-        self.decoder.reset_slots(slots)
+    def reset_slots(self, slot: int):
+        if self.stream is None:
+            self.decoder.reset_slots(slot)
+            return
+        # Decode, owned PCM snapshot and slot reset share the same stream order.
+        with torch.cuda.stream(self.stream):
+            self.decoder.reset_slots(slot)
 
     def _bucket(self, batch):
         if batch in self.buckets:
@@ -66,11 +67,11 @@ class MimiDecodeRunner:
                 graph.replay()
             # Own output storage before the next replay overwrites the graph output.
             output = output.clone()
-            self.finished = torch.cuda.Event()
-            self.finished.record(self.stream)
+            finished = torch.cuda.Event()
+            finished.record(self.stream)
         # The producer may reuse Flow's output once the side-stream copy completes.
         main.wait_event(copied)
-        return output, self.finished
+        return output, finished
 
 
 class FlowSampleRunner:

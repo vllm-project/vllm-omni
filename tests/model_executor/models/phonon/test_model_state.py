@@ -84,6 +84,7 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
     )
     buffers[0] = {"req_id": "first", "phonon_prompt_embeds": torch.ones(1, 8), "phonon_tail_frames": 1}
     state.add_request(0, SimpleNamespace(req_id="first"))
+    assert state.tail_frames[0] == 1
     with torch.inference_mode():
         for step in range(2):
             state.run_preprocess(batch, {})
@@ -101,6 +102,7 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
         state.add_request(0, SimpleNamespace(req_id="second"))
         assert state.mimi_positions[0] == 0
         assert state.remaining_tail[0] == -1
+        assert state.tail_frames[0] == 3
         assert state.next_embeddings.count_nonzero() == 0
         assert state.active[0]
         for module in model.mimi.modules():
@@ -149,3 +151,65 @@ def test_bf16_ar_rope_preserves_dtype_in_eager_and_compiled_forward():
         actual = compiled(inputs, positions, fresh_cache)
         assert actual.dtype == torch.bfloat16
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("project_voice", [True, False])
+def test_voice_uses_tensor_transport_without_python_list(monkeypatch, project_voice):
+    import sentencepiece
+    from transformers.utils import hub
+
+    from vllm_omni.engine.serialization import (
+        deserialize_additional_information,
+        serialize_additional_information,
+    )
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+    from vllm_omni.model_executor.models.phonon import prompt as prompt_module
+
+    shape = (1, 512, 125) if project_voice else (1, 125, 512)
+    voice = torch.randn(shape)
+    monkeypatch.setattr(hub, "cached_file", lambda *args, **kwargs: "unused")
+    monkeypatch.setattr(
+        sentencepiece, "SentencePieceProcessor", lambda **kwargs: SimpleNamespace(encode=lambda text: [2, 3])
+    )
+    monkeypatch.setattr(prompt_module, "load_voice", lambda *args: (voice, project_voice))
+    config = SimpleNamespace(model="test/voice", hf_config=SimpleNamespace(to_dict=lambda: {}))
+    adapter = PhononAdapter(SimpleNamespace(engine_client=SimpleNamespace(model_config=config)))
+    prepared = adapter._build(SimpleNamespace(input="Hello world"))
+    info = prepared.prompt["additional_information"]
+    assert info["phonon_voice"] is voice
+    payload = serialize_additional_information(info)
+    entry = payload.entries["phonon_voice"]
+    assert entry.tensor_data is not None
+    assert entry.list_data is None
+    restored = deserialize_additional_information(payload)
+    assert isinstance(restored["phonon_voice"], torch.Tensor)
+    torch.testing.assert_close(restored["phonon_voice"], voice)
+    assert restored["phonon_project_voice"] == project_voice
+    assert len(prepared.prompt["prompt_token_ids"]) == 128
+
+
+def test_slot_reset_is_enqueued_on_codec_stream_without_main_wait(monkeypatch):
+    from contextlib import contextmanager
+
+    from vllm_omni.model_executor.models.phonon.cuda_graph_wrapper import MimiDecodeRunner
+
+    calls = []
+    stream = object()
+    runner = MimiDecodeRunner.__new__(MimiDecodeRunner)
+    runner.stream = stream
+    runner.decoder = SimpleNamespace(reset_slots=lambda slot: calls.append(("reset", slot)))
+
+    @contextmanager
+    def use_stream(selected):
+        assert selected is stream
+        calls.append("enter")
+        yield
+        calls.append("exit")
+
+    def unexpected_main_stream(*args, **kwargs):
+        pytest.fail("Slot reset must not insert a main-stream wait")
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_main_stream)
+    runner.reset_slots(0)
+    assert calls == ["enter", ("reset", 0), "exit"]
