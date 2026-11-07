@@ -62,6 +62,60 @@ def test_npu_card_count_mark_is_independent_of_sku():
     assert "gpu" not in names
 
 
+def test_oot_resource_selects_matching_out_of_tree_device(monkeypatch):
+    import vllm_omni.platforms
+
+    class OutOfTreePlatform:
+        def is_out_of_tree(self):
+            return True
+
+        def get_device_name(self):
+            return "Tenstorrent Wormhole"
+
+        def get_device_count(self):
+            return 2
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", OutOfTreePlatform())
+    marks = hardware_marks(res={"oot": "Tenstorrent"}, num_cards=2)
+    assert _mark_names(marks) >= {"oot", "cards_2"}
+    assert next(mark for mark in marks if mark.name == "oot").kwargs == {"resource": "Tenstorrent"}
+    assert next(mark for mark in marks if mark.name == "skipif").args == (False,)
+
+
+def test_oot_resource_skips_a_different_platform(monkeypatch):
+    import vllm_omni.platforms
+
+    class InTreePlatform:
+        def is_out_of_tree(self):
+            return False
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", InTreePlatform())
+    marks = hardware_marks(res={"oot": "Tenstorrent"})
+    assert next(mark for mark in marks if mark.name == "skipif").args == (True,)
+
+
+@pytest.mark.parametrize(
+    ("device_name", "device_count"),
+    [("AMD MI300X", 2), ("Tenstorrent Wormhole", 1)],
+)
+def test_oot_resource_skips_mismatched_or_undersized_device(monkeypatch, device_name, device_count):
+    import vllm_omni.platforms
+
+    class OutOfTreePlatform:
+        def is_out_of_tree(self):
+            return True
+
+        def get_device_name(self):
+            return device_name
+
+        def get_device_count(self):
+            return device_count
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", OutOfTreePlatform())
+    marks = hardware_marks(res={"oot": "Tenstorrent"}, num_cards=2)
+    assert next(mark for mark in marks if mark.name == "skipif").args == (True,)
+
+
 def test_hardware_marks_rejects_mixed_counts_on_one_item():
     with pytest.raises(ValueError, match="different per-platform num_cards"):
         hardware_marks(
@@ -83,6 +137,54 @@ def test_same_count_multi_platform_stays_one_item():
     assert "cards_2" in names
     assert "H100" in names
     assert "MI325" in names
+
+
+@pytest.mark.parametrize(
+    ("active_platform", "device_name", "device_count", "should_skip"),
+    [
+        ("cuda", "NVIDIA H100", 1, False),
+        ("oot", "Tenstorrent Wormhole", 1, False),
+        ("oot", "AMD MI300X", 1, True),
+        ("oot", "Tenstorrent Wormhole", 0, True),
+    ],
+)
+def test_same_count_cuda_and_oot_are_alternatives(monkeypatch, active_platform, device_name, device_count, should_skip):
+    import vllm.platforms
+
+    import vllm_omni.platforms
+
+    class CurrentPlatform:
+        def is_cuda(self):
+            return active_platform == "cuda"
+
+        def is_rocm(self):
+            return False
+
+        def is_xpu(self):
+            return False
+
+        def device_count(self):
+            return device_count
+
+    class CurrentOmniPlatform:
+        def is_out_of_tree(self):
+            return active_platform == "oot"
+
+        def get_device_name(self):
+            return device_name
+
+        def get_device_count(self):
+            return device_count
+
+    monkeypatch.setattr(vllm.platforms, "current_platform", CurrentPlatform())
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", CurrentOmniPlatform())
+
+    @hardware_test(res={"cuda": "H100", "oot": "Tenstorrent"})
+    def _probe():
+        return None
+
+    skip = next(mark for mark in _probe.pytestmark if mark.name == "skipif")
+    assert skip.args == (should_skip,)
 
 
 def test_rocm_multicard_marks_skip_an_undersized_rocm_worker(monkeypatch):
