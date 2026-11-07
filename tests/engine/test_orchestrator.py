@@ -2790,14 +2790,23 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
 
 
 @pytest.mark.parametrize("distributed_hook", ["_hub", "_lb"])
-def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: str) -> None:
+def test_stage_pool_pinned_binding_is_honoured_in_distributed_mode(distributed_hook: str) -> None:
+    """A pin addresses the attached client directly, so hub/LB mode cannot block it.
+
+    The load balancer only chooses a replica for unpinned submissions; a session
+    reservation from the duplex placement owner must still reach its replica.
+    """
     pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
     setattr(pool, distributed_hook, object())
 
-    with pytest.raises(StageUnavailableError, match="only supported for local stage pools"):
-        pool.bind_request_to_replica("pinned", 1)
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_replica_id("pinned") == 1
 
-    assert pool.get_bound_replica_id("pinned") is None
+    # The availability check is what keeps this safe: a detached replica is
+    # still refused instead of being silently rerouted to another one.
+    pool.clients[1] = None
+    with pytest.raises(StageUnavailableError, match="is unavailable"):
+        pool.bind_request_to_replica("other", 1)
 
 
 @pytest.mark.asyncio

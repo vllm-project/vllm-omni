@@ -1487,7 +1487,7 @@ async def test_legacy_session_open_keeps_request_round_robin_and_has_no_placemen
 
 
 @pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
-def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
+def test_least_sessions_rejects_distributed_startup_without_groups(distributed_hook) -> None:
     pools = _build_stage_pools([[FakeStageClient()]], stage_vllm_configs=_stage_configs(1))
     kwargs = {}
     if distributed_hook == "hub":
@@ -1496,7 +1496,7 @@ def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
         pools[0].attach_load_balancer(SimpleNamespace())
     else:
         kwargs["membership_controller"] = SimpleNamespace()
-    with pytest.raises(ValueError, match="does not support distributed"):
+    with pytest.raises(ValueError, match="requires duplex_session.replica_groups"):
         DuplexOrchestrator(
             request_async_queue=asyncio.Queue(),
             output_async_queue=asyncio.Queue(),
@@ -1506,6 +1506,26 @@ def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
             duplex_session_config=_placement_config(),
             **kwargs,
         )
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb"])
+def test_least_sessions_accepts_distributed_startup_with_groups(distributed_hook) -> None:
+    """A declared topology is the distributed opt-in: placement is built and used."""
+    pools = _build_stage_pools([[FakeStageClient()]], stage_vllm_configs=_stage_configs(1))
+    if distributed_hook == "hub":
+        pools[0].attach_hub(SimpleNamespace())
+    else:
+        pools[0].attach_load_balancer(SimpleNamespace())
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=[{0: 0}]),
+    )
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.snapshot()["groups"] == [{0: 0}]
 
 
 def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:

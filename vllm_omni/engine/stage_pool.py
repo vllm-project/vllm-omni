@@ -552,14 +552,21 @@ class StagePool:
     # ---- Legacy (non-distributed) route binding ----
 
     def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
-        """Bind a real request to a required local replica, without selecting a fallback.
+        """Bind a real request to a required replica, without selecting a fallback.
 
         Call before input preprocessing or sender metadata construction, then
         pass the same pin to submission to recheck availability. Session
         reservations belong to the duplex placement owner, not this ledger.
+
+        This applies to distributed pools too: ``clients`` holds a proxy per
+        attached replica whether it runs locally or behind the hub, and
+        ``is_replica_available`` is the pool's own view of that attachment. The
+        pin is therefore honoured by addressing the pinned client directly
+        instead of consulting the load balancer. A replica that the hub has
+        detached is rejected here by the availability check, and one that dies
+        mid-request still reaches ``_handle_dead_replica`` through
+        ``EngineDeadError``, which marks the reservation unavailable.
         """
-        if self._hub is not None or self._lb is not None:
-            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
         if not self.is_replica_available(replica_id):
             raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
         bound = self.get_bound_replica_id(request_id)
