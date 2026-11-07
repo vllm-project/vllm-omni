@@ -53,7 +53,7 @@ def _initialize(module):
 
 def _capture(manager):
     from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-    from vllm_ascend.worker.model_runner_v1 import graph_capture
+    from vllm_ascend.worker.v1.model_runner import graph_capture
 
     with torch.inference_mode(), graph_capture(device=torch.device("npu:0")):
         set_cudagraph_capturing_enabled(True)
