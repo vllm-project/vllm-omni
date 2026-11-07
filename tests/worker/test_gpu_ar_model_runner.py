@@ -2020,6 +2020,7 @@ class TestPreferModelSamplerNoneFallback:
         }
         expected = {
             "audio8_tts",
+            "chatterbox",  # Original always supplies the CFG sampler's SamplerOutput.
             "cosyvoice3",
             "glm_tts",
             "higgs_audio_v2",

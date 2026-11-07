@@ -1,0 +1,138 @@
+# Chatterbox Turbo deploy: T3 (GPT-2 backbone) -> S3Gen (meanflow + HiFT).
+#
+# Default mode is async-chunk streaming through SharedMemoryConnector. Pass
+# ``--no-async-chunk`` to the serve CLI to have stage 1 decode each finished
+# utterance once instead.
+#
+# Runner: both stages run on Model Runner V2 with its native data plane on
+# CUDA, where it was measured: with and without streaming, at 1 and at 8
+# concurrent streams, V2 and the default runner are within run-to-run
+# variation of each other. Set ``model_runner: v1`` to use the default
+# runner; both are supported. The ``platforms:`` section at the end keeps
+# V1 where V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
+#
+# Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 keeps float32 weights
+# for HiFT, which is not half-precision safe, runs the flow decoder under
+# bfloat16 autocast (the config's ``flow_dtype``, overridable through
+# ``hf_overrides``), and runs eagerly (its convolutions see a different
+# length every step).
+#
+# Prefix caching is off for correctness, not speed: stage 0's prompt is
+# placeholder ids, and the real prefix arrives as embeddings, so two requests
+# of equal length would share a cache entry whatever their voice or text.
+#
+# No stage loads a tokenizer: prompts are placeholder ids and nothing is
+# detokenized.
+#
+# Chunking: the first chunk is 15 tokens plus the padding that aligns the
+# reference prompt to 15 (20 for a ten-second reference), then 30, then 60;
+# every chunk waits for the flow's 3-token lookahead, which is the model's
+# and not a setting. Smaller chunks start audio sooner and cost more flow
+# work. Stage 1 decodes each chunk with the last codec_left_context_frames
+# tokens already played, which keeps a chunk's cost constant.
+#
+# The one Turbo profile: 64 requests at once, what one H100 (79.6 GiB) fits
+# with the memory arithmetic below; the H100 recipe measures it from 8 to 64
+# clients. TUNE PER GPU: on a smaller or slower card lower max_num_seqs and
+# recompute the fractions from that card's memory with the same arithmetic,
+# before raising the chunk size.
+pipeline: chatterbox_turbo
+model_runner: v2
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_chunk_frames: 15
+      codec_max_chunk_frames: 60
+      codec_stream_scale_factor: 2
+      # Played tokens stage 1 decodes each chunk with again (two seconds).
+      codec_left_context_frames: 50
+
+stages:
+  - stage_id: 0
+    # Halves the backbone's weights. Its logits are only sampled from, and
+    # the end-to-end transcripts pass with it.
+    dtype: bfloat16
+    max_num_seqs: 64
+    # 1 speaker slot + up to 375 prompt tokens + text + 1 start token + 1000
+    # output tokens: a text of up to 671 tokens has the full 1000-token
+    # output. A longer text is accepted and ends at whatever the 2048 leave
+    # for output; the engine refuses a prompt of 2048 tokens or more.
+    max_model_len: 2048
+    # One step can prefill a whole prompt. A smaller budget splits the
+    # prefill over steps, which stage 0 handles: later first token, steadier
+    # decode steps for the requests already speaking.
+    max_num_batched_tokens: 2048
+    # Measured on H100: 1.12 GiB of weights with vLLM's own, 0.08 GiB of
+    # activations, 0.06 GiB of graphs and 96 KiB of KV cache per token. The
+    # 64 slots at 2048 tokens need 12.0 GiB of KV cache, about 13.3 GiB in
+    # all; 0.20 of the H100's 79.6 GiB is 15.9 GiB.
+    gpu_memory_utilization: 0.20
+    enforce_eager: false
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    # The reference encoders run in the API process, on the stages' device:
+    # the API process must see device 0. NPU, XPU and MUSA use the CPU
+    # (platforms block below). Read by the serving adapter.
+    additional_config:
+      conditioning_device: cuda:0
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 1000
+      top_p: 0.95
+      repetition_penalty: 1.2
+      max_tokens: 1000
+
+  - stage_id: 1
+    dtype: float32
+    # Seeds the flow-noise buffer, so every process draws the same one.
+    seed: 0
+    # One utterance per stage 0 request.
+    max_num_seqs: 64
+    # The longest utterance this stage is built for: its noise buffer and
+    # the budget below are sized from it. It must not be smaller than stage
+    # 0's max_model_len, which is what bounds an utterance whatever
+    # max_tokens a request asks for; the engine does not compare a streamed
+    # chunk with this value, so a smaller one would let an utterance outgrow
+    # both with no error.
+    max_model_len: 2048
+    # At least max_num_seqs * max_model_len (64 * 2048); the stage refuses to
+    # start with less. A new request the step's budget cannot cover is
+    # scheduled with part of its tokens, and the decoder would take that
+    # part for the utterance.
+    max_num_batched_tokens: 131072
+    # This stage keeps no KV cache; the fraction bounds the flow's and HiFT's
+    # activations for max_num_seqs utterances (11.9 GiB of the H100).
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    skip_tokenizer_init: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+
+# The reference encoders cannot use an NPU, XPU or MUSA device; ROCm keeps cuda:0.
+platforms:
+  npu:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        additional_config:
+          conditioning_device: cpu
+  xpu:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        additional_config:
+          conditioning_device: cpu
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        additional_config:
+          conditioning_device: cpu
