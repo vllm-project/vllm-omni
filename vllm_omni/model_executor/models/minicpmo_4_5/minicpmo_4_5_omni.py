@@ -407,6 +407,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
                     if turn_ended and not pending_speech_context:
                         force_listen = True
+                    elif turn_ended and not force_listen and getattr(state, "carried_context", False):
+                        self._minicpmo45_answer_unless_listen_wins(logits, row_idx, listen_id)
 
             if not force_listen:
                 continue
@@ -417,6 +419,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 logits[row_idx].fill_(float("-inf"))
                 logits[row_idx].narrow(0, listen_id, 1).fill_(0.0)
                 force_listen_segments.add(segment_key)
+
+    @staticmethod
+    def _minicpmo45_answer_unless_listen_wins(logits: torch.Tensor, row_idx: int, listen_id: int) -> None:
+        """Keep <|listen|> only when it is the most likely token.
+
+        Used for the rest of a request that carries the conversation across a
+        barge-in, on each silent step after the user has spoken while the model
+        is not replying. With that context, listening is close to the top at
+        this point more often, and once <|listen|> is sampled every silent unit
+        after it makes listening more likely still, so one draw can leave a
+        question unanswered. Device ops only, so the row decision needs no sync.
+        """
+        row = logits[row_idx]
+        listen_slot = row.narrow(0, listen_id, 1)
+        listen_slot.masked_fill_(listen_slot < row.max(), float("-inf"))
 
     # -------------------- Device utilities --------------------
     @staticmethod
@@ -825,6 +842,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            restore_window_units = getattr(helper, "restore_window_units", None)
+            if restore_window_units is not None:
+                restore_window_units(state)
         return state
 
     @staticmethod
@@ -1154,7 +1174,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             for request_id in finished_req_ids:
                 session_key = request_sessions.pop(request_id, None)
                 if session_key is not None and isinstance(sessions, dict):
-                    sessions.pop(session_key, None)
+                    state = sessions.pop(session_key, None)
+                    stash_window_units = getattr(helper, "stash_window_units", None)
+                    if stash_window_units is not None:
+                        stash_window_units(session_key, state)
         forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
         if isinstance(forced_segments, set):
             finished = set(finished_req_ids)

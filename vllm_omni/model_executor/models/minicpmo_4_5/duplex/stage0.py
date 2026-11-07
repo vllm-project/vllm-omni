@@ -62,6 +62,64 @@ class _MiniCPMO45WindowUnit:
 
 
 @dataclass
+class _MiniCPMO45CarriedWindow:
+    """A finished Stage-0 request's completed window units, kept in host memory."""
+
+    #: Every unit's embeds, concatenated; on the host, so no GPU memory is held.
+    embeds: torch.Tensor | None
+    #: Rows of each original embed tensor, unit after unit.
+    rows: list[int]
+    #: Embed tensors per unit.
+    unit_sizes: list[int]
+    token_ids: list[list[int]]
+    device: torch.device | str | None
+    time: float
+    #: Units whose embeds could not be packed; kept as they are.
+    units: list[_MiniCPMO45WindowUnit] | None = None
+
+    @classmethod
+    def pack(cls, units: list[_MiniCPMO45WindowUnit], now: float) -> _MiniCPMO45CarriedWindow:
+        import torch
+
+        tensors = [embed for unit in units for embed in unit.embeds]
+        first = tensors[0] if tensors else None
+        if first is None or not all(
+            isinstance(t, torch.Tensor)
+            and t.dim() == 2
+            and t.dtype == first.dtype
+            and t.shape[1] == first.shape[1]
+            and t.device == first.device
+            for t in tensors
+        ):
+            if first is not None:
+                logger.warning_once(
+                    "MiniCPM-o carried window embeds are not uniform 2-D tensors; keeping them in place"
+                )
+            return cls(None, [], [], [], None, now, units=list(units))
+        packed = torch.cat(tensors)
+        # A pinned, stream-ordered copy: the step does not wait for it, and unpack's copy back runs after it.
+        host = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=packed.is_cuda)
+        host.copy_(packed, non_blocking=packed.is_cuda)
+        return cls(
+            embeds=host,
+            rows=[int(t.shape[0]) for t in tensors],
+            unit_sizes=[len(unit.embeds) for unit in units],
+            token_ids=[list(unit.token_ids) for unit in units],
+            device=first.device,
+            time=now,
+        )
+
+    def unpack(self) -> list[_MiniCPMO45WindowUnit]:
+        if self.units is not None or self.embeds is None:
+            return list(self.units or ())
+        parts = iter(self.embeds.to(self.device, non_blocking=True).split(self.rows))
+        return [
+            _MiniCPMO45WindowUnit(embeds=[next(parts) for _ in range(size)], token_ids=ids)
+            for size, ids in zip(self.unit_sizes, self.token_ids)
+        ]
+
+
+@dataclass
 class _MiniCPMO45Stage0SessionState:
     session_id: str
     #: Any: MiniCPM-o remote-code processor (transformers, no importable type).
@@ -81,6 +139,11 @@ class _MiniCPMO45Stage0SessionState:
     window_enabled: bool = False
     pending_window_unit: _MiniCPMO45WindowUnit | None = None
     pending_window_generated_tokens: list[int] = field(default_factory=list)
+    #: Completed units of the session's previous Stage-0 request (a barge-in
+    #: ended it), waiting for the scheduler's first window plan of this one.
+    carried_window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
+    #: The context holds units carried over from the session's previous request.
+    carried_context: bool = False
     current_turn_ended: bool = True
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
@@ -158,6 +221,47 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Built with the model, before its weights load and it switches to eval mode:
         # the streaming encoder's CUDA graphs are captured later, by build_audio_cuda_graph().
         self._audio_graph_attempted = False
+        # session_id -> completed window units of its last finished Stage-0 request.
+        self._carried_window_units: dict[str, _MiniCPMO45CarriedWindow] = {}
+
+    #: Seconds a finished request's units wait for the session's next request. The
+    #: worker cannot tell an abort from a normal finish, so it keeps every finished
+    #: request's units, in host memory, for this long. Longer than the scheduler's
+    #: ``_MINICPMO45_CARRIED_WINDOW_TTL_S``, so it never drops units the scheduler
+    #: still plans to place.
+    _CARRIED_WINDOW_TTL_S = 30.0
+
+    def stash_window_units(self, session_id: str, state: _MiniCPMO45Stage0SessionState | None) -> None:
+        """Keep a finished Stage-0 request's completed window units for its session's next epoch.
+
+        A barge-in ends the epoch's Stage-0 request, and the next append opens a
+        new one whose context starts from the session template. The scheduler
+        keeps the same units, and its first window plan for the new request
+        (``carried_units``) puts them back ahead of that request's own, so the
+        model keeps the conversation it had. The unit open at the cut is left
+        out on both sides: its closing tokens never reached the KV.
+        """
+        carried = self._carried_window_units
+        carried.pop(session_id, None)
+        now = time.monotonic()
+        for stale in [sid for sid, kept in carried.items() if now - kept.time > self._CARRIED_WINDOW_TTL_S]:
+            carried.pop(stale)
+        if state is None or not state.window_enabled:
+            return
+        # Units this request carried but never got to place go on to the next one.
+        units = [*state.carried_window_units, *state.window_units]
+        if units:
+            carried[session_id] = _MiniCPMO45CarriedWindow.pack(units, now)
+
+    def restore_window_units(self, state: _MiniCPMO45Stage0SessionState) -> None:
+        """Give a new request's state the units :meth:`stash_window_units` kept for its session."""
+        carried = self._carried_window_units
+        kept = carried.pop(state.session_id, None)
+        now = time.monotonic()
+        for stale in [sid for sid, other in carried.items() if now - other.time > self._CARRIED_WINDOW_TTL_S]:
+            carried.pop(stale)
+        fresh = kept is not None and now - kept.time <= self._CARRIED_WINDOW_TTL_S
+        state.carried_window_units = kept.unpack() if fresh and state.window_enabled else []
 
     def build_audio_cuda_graph(self) -> bool:
         """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent; failures stay eager).
@@ -742,17 +846,53 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         state.window_units = new_units
 
+    def _end_carried_speech_with_listen(self, unit: _MiniCPMO45WindowUnit) -> None:
+        """Close the last unit before a cut as one where the model stopped speaking.
+
+        A speech unit ends in <|chunk_eos|> or <|chunk_tts_eos|>, which tells the
+        model it is still mid-turn. After a barge-in or cancel the next units are
+        the user's, so the unit is closed with <|listen|> instead, as when the
+        model yields on its own. The length is unchanged.
+        """
+        ids = unit.token_ids
+        speech_terminators = {self.chunk_eos_token_id, self.chunk_tts_eos_token_id} - {-1}
+        if len(ids) < 2 or len(unit.embeds) < 2 or ids[-1] != self.unit_end_token_id:
+            return
+        if ids[-2] not in speech_terminators or self.listen_token_id < 0:
+            return
+        if self.turn_eos_token_id >= 0 and self.turn_eos_token_id in ids:
+            # The model had already ended its turn in this unit; keep its tokens.
+            return
+        unit.token_ids = [*ids[:-2], self.listen_token_id, ids[-1]]
+        unit.embeds = [*unit.embeds[:-2], self._embed_token(self.listen_token_id), unit.embeds[-1]]
+
     def _window_replacement_parts(
         self,
         state: _MiniCPMO45Stage0SessionState,
         stage0_window: dict[str, Any] | None,
     ) -> tuple[list[Any], list[int]] | None:
-        if not isinstance(stage0_window, dict) or stage0_window.get("replace") is not True:
+        if not isinstance(stage0_window, dict):
+            return None
+        # The first window plan of a request is the only one that can place carried units.
+        carried, state.carried_window_units = state.carried_window_units, []
+        if stage0_window.get("replace") is not True:
             return None
         try:
             drop_units = max(0, int(stage0_window.get("drop_units", 0)))
+            carried_units = max(0, int(stage0_window.get("carried_units", 0) or 0))
         except (TypeError, ValueError):
             return None
+        if carried_units > len(carried):
+            raise RuntimeError(
+                "MiniCPM-o Stage-0 carried window history is shorter than the scheduler plan: "
+                f"plan={carried_units}, kept={len(carried)}"
+            )
+        # The scheduler places the newest units: an older one it dropped is never more recent than these.
+        placed = carried[len(carried) - carried_units :] if carried_units else []
+        if placed:
+            self._end_carried_speech_with_listen(placed[-1])
+            state.carried_context = True
+        state.window_units[:0] = placed
         if drop_units > len(state.window_units):
             raise RuntimeError(
                 "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
