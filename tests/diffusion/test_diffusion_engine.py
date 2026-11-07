@@ -979,8 +979,8 @@ async def test_async_add_req_and_stream_response():
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
     def _finalize(rid, out, err=None, **kwargs):
-        # Stream consumers stop on ``finished``; keep result_data for assertions.
-        return SimpleNamespace(result_data=out.result.result_data, finished=True, async_output_id=None)
+        # Use the real output contract consumed by the asynchronous stream.
+        return DiffusionOutput(custom_output={"result_data": out.result.result_data})
 
     engine._finalize_finished_request = _finalize
 
@@ -1022,7 +1022,7 @@ async def test_async_add_req_and_stream_response():
         engine.worker_thread.join(timeout=5)
     assert len(results) == 5
     for rid, res, elapsed in results:
-        assert rid in res.result_data
+        assert rid in res.custom_output["result_data"]
 
     eps = 0.5
     latencies = [r[2] for r in results]
