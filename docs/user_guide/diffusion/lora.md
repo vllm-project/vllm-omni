@@ -21,6 +21,59 @@ not supported by this generic path.
 For adapter-only RL updates and memory/validation requirements, see
 [engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
 
+### Runtime LoRA with module-level CPU offload
+
+The Z-Image-Turbo integration test compares runtime PEFT LoRA with and without
+[module-level CPU offload](offloader/module_offload.md). The offloaded configuration is:
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    dtype="bfloat16",
+    lora_backend="peft",
+    lora_application="runtime",
+    diffusion_offload_config={
+        "mode": "module",
+        "components": ["dit", "text_encoder"],
+    },
+    max_cpu_loras=2,
+    enforce_eager=True,
+    diffusion_attention_config={"default": {"backend": "TORCH_SDPA"}},
+)
+```
+
+This configuration is validated on a single RTX 4090. The reference run first
+generates without any adapters. The offloaded run preloads a rank-8 adapter
+and loads a rank-16 adapter on demand. The test
+checks A-to-B-to-A switching, zero scale, adapter removal from a request, and
+reactivation. Both adapters must change the image; repeating an adapter or
+returning to the base model must reproduce the corresponding output. Each
+output is also compared pixel-for-pixel with offloading disabled.
+
+Run from the repository root with the matching vLLM/vLLM-Omni environment,
+pytest dependencies, one CUDA GPU with 24 GB VRAM, and the model weights cached
+(or enough disk space and network access to download them):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pytest -sv \
+  tests/diffusion/lora/test_diffusion_lora.py::test_zimage_lora_module_offload \
+  -m 'advanced_model and cuda' --run-level advanced_model
+```
+
+The test uses BF16, eager execution, `TORCH_SDPA`, one prompt, a fixed seed,
+256-by-256 images, two inference steps, and synthetic adapters targeting the
+first transformer's fused QKV projection. It prints device-wide peak memory
+and per-request wall-clock latency after one warmup sequence and three measured
+repetitions. Memory polling includes worker processes; run on an
+otherwise idle GPU. These measurements describe this small correctness
+workload, not production-resolution quality or throughput.
+
+This coverage does not establish compatibility for other models, arbitrary
+adapter formats or target modules, quantization, compilation, other offload
+strategies, or the global merged LoRA policy.
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
