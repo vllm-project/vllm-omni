@@ -17,10 +17,12 @@ Key invariants tested:
   - voice/speaker parameter compatibility in chat completions
 """
 
+import base64
 import time
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.outputs import CompletionOutput, RequestOutput
 
@@ -31,7 +33,6 @@ from tests.helpers.serving_chat import (
     make_text_omni_output,
     parse_sse_chunks,
 )
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -366,7 +367,104 @@ async def test_declared_modality_not_produced_text_finish_suppressed():
 
 
 @pytest.mark.asyncio
-async def test_audio_chunk_without_waveform_keeps_stream_alive():
+@pytest.mark.parametrize("choice_order", [(0,), (0, 1), (1, 0)])
+@pytest.mark.parametrize("empty_audio_kind", ["list", "tensor"])
+@pytest.mark.parametrize("batched", [False, True])
+async def test_streaming_wav_header_is_only_in_first_chunk(choice_order, empty_audio_kind, batched, mocker):
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["audio"], n=len(choice_order))
+    request.audio = {"format": "wav", "voice": "alloy"}
+
+    def make_audio_chunk(index, *, empty=False, finished=False):
+        result = _make_audio_omni_output(index=index)
+        if empty:
+            audio = [] if empty_audio_kind == "list" else torch.empty(0)
+        else:
+            audio = torch.linspace(-0.5, 0.5, 100) * (index + 1) / 2
+            if index == 1:
+                audio = torch.stack((audio, -audio))
+        result.outputs[0].multimodal_output = {"audio": audio, "sr": 16000 + index * 8000}
+        result.outputs[0].finish_reason = "stop" if finished else None
+        result.finished = finished
+        return result
+
+    del serving_chat._create_audio_choice
+
+    async def result_generator():
+        first_index = choice_order[0]
+        batches = [
+            [make_audio_chunk(index, empty=True) for index in choice_order],
+            [make_audio_chunk(first_index)],
+            [make_audio_chunk(first_index, finished=True)],
+        ]
+        if len(choice_order) > 1:
+            second_index = choice_order[1]
+            # In the same result, one choice needs its header while the other
+            # already emitted it. Their waveforms and sample rates also differ.
+            batches[1].append(make_audio_chunk(second_index, empty=True))
+            batches[2].append(make_audio_chunk(second_index))
+            batches.extend(
+                [
+                    [make_audio_chunk(second_index, empty=True)],
+                    [make_audio_chunk(second_index, finished=True)],
+                ]
+            )
+        for batch in batches:
+            if batched:
+                result = batch[0]
+                for other in batch[1:]:
+                    result.outputs.extend(other.outputs)
+                yield result
+            else:
+                for result in batch:
+                    yield result
+
+    raw_lines = await collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=mocker.MagicMock(),
+            request_metadata=mocker.MagicMock(),
+        )
+    )
+
+    chunks = parse_sse_chunks(raw_lines)
+    per_choice: dict[int, list[bytes]] = {}
+    for chunk in chunks:
+        if chunk.get("modality") != "audio":
+            continue
+        for choice in chunk["choices"]:
+            content = choice.get("delta", {}).get("content")
+            if not content:
+                continue
+            index = choice["index"]
+            per_choice.setdefault(index, []).append(base64.b64decode(content))
+            assert choice["audio_metadata"] == {
+                "format": "wav",
+                "sample_rate_hz": 16000 + index * 8000,
+                "frame_count": 100,
+                "channels": index + 1,
+            }
+
+    assert set(per_choice) == set(choice_order)
+    for index, audio_chunks in per_choice.items():
+        assert len(audio_chunks) == 2
+        assert audio_chunks[0][:4] == b"RIFF"
+        assert int.from_bytes(audio_chunks[0][24:28], "little") == 16000 + index * 8000
+        assert int.from_bytes(audio_chunks[0][22:24], "little") == index + 1
+        assert len(audio_chunks[0]) == 44 + 100 * (index + 1) * 2
+        assert len(audio_chunks[1]) == 100 * (index + 1) * 2
+        assert audio_chunks[1][:4] != b"RIFF"
+        assert audio_chunks[0][44:] == audio_chunks[1]
+    if len(choice_order) > 1:
+        assert per_choice[0][1] != per_choice[1][1]
+
+
+@pytest.mark.asyncio
+async def test_audio_chunk_without_waveform_keeps_stream_alive(mocker):
     """An audio message with no PCM must not break the stream.
 
     ``_create_audio_choice`` used to return an ErrorResponse here, which the
@@ -380,10 +478,7 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     empty_audio = _make_audio_omni_output()
     empty_audio.outputs[0].multimodal_output = {"audio": []}
 
-    def create_audio_choice(omni_res, role, request, stream=False):
-        return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)
-
-    serving_chat._create_audio_choice = create_audio_choice
+    del serving_chat._create_audio_choice
 
     async def result_generator():
         yield make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
@@ -397,8 +492,8 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
             request_id="test-req",
             model_name="test-model",
             conversation=[],
-            tokenizer=MagicMock(),
-            request_metadata=MagicMock(),
+            tokenizer=mocker.MagicMock(),
+            request_metadata=mocker.MagicMock(),
         )
     )
 
@@ -410,15 +505,18 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
 
 
 @pytest.mark.asyncio
-async def test_audio_choice_error_response_is_not_iterated_as_choices():
+async def test_audio_choice_error_response_is_not_iterated_as_choices(mocker):
     """Any ErrorResponse from the audio path is skipped, not iterated."""
     from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
     serving_chat = build_serving_chat()
     request = make_request(modalities=["text", "audio"])
 
-    serving_chat._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: serving_chat._create_error_response("boom")
+    serving_chat._create_audio_choice = mocker.MagicMock(
+        side_effect=lambda omni_res, role, request, stream=False, wav_header_sent=None: (
+            serving_chat._create_error_response("boom"),
+            set(),
+        )
     )
 
     async def result_generator():
@@ -432,8 +530,8 @@ async def test_audio_choice_error_response_is_not_iterated_as_choices():
             request_id="test-req",
             model_name="test-model",
             conversation=[],
-            tokenizer=MagicMock(),
-            request_metadata=MagicMock(),
+            tokenizer=mocker.MagicMock(),
+            request_metadata=mocker.MagicMock(),
         )
     )
 
