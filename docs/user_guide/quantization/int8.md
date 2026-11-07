@@ -11,7 +11,7 @@ Only online activation scaling is currently supported.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| --- | --- |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
@@ -27,10 +27,13 @@ guide.
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
 | Model | HF models | CUDA | Ascend NPU | Mode | Recommendation |
-|-------|-----------|:----:|:----------:|------|----------------|
+| --- | --- | :---: | :---: | --- | --- |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Online W8A8 | All layers |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Online W8A8 | Validate before enabling in docs |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | Online W8A8 | All layers |
+| MOSS-Image-Base | `OpenMOSS-Team/MOSS-Image-Base` | Yes (A800, TP1) | Not validated | Online W8A8 | Main DiT projections; text refinement stays BF16 |
+
+See the [MOSS recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MOSS-Image/MOSS-Image-Base.md#int8-quantization) for its precision policy and deployment command.
 
 Other diffusion models may work if their transformer uses supported linear
 layers, but they are not validated in this guide.
@@ -38,14 +41,14 @@ layers, but they are not validated in this guide.
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | Qwen3-Omni | Thinker language-model stage | Not validated | Prefer checkpoint-supported ModelOpt FP8 or AutoRound paths |
 | Qwen3-TTS | TTS language-model stage | Not validated | No Int8 TTS stage support is documented |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | BAGEL | Stage-specific transformer or DiT module | Not validated | Requires explicit stage routing |
 | GLM-Image | Stage-specific transformer or DiT module | Not validated | Requires quality comparison with BF16 |
 
@@ -84,7 +87,7 @@ vllm serve <your-model> --omni --quantization int8
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `method` | str | - | Quantization method (`"int8"`) |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling; static is not supported |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16/FP16 |
