@@ -57,6 +57,7 @@ class _FakeTalker(nn.Module):
 def _make_talker_model(model_dir) -> CosyVoice3Model:
     model = object.__new__(_cosyvoice3_model_cls())
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model.model_stage = "cosyvoice3_talker"
     model.model_dir = str(model_dir)
     model.model = _FakeTalker()

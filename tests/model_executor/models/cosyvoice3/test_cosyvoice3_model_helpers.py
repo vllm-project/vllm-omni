@@ -93,6 +93,7 @@ def _make_code2wav_model(
 ) -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model.model_stage = "cosyvoice3_code2wav"
     hift_cfg = {} if not with_stride_cfg else {"upsample_rates": [8, 5, 3], "istft_params": {"hop_len": 4}}
     model.config = SimpleNamespace(
@@ -118,6 +119,7 @@ def _make_code2wav_model(
 def _make_talker_model() -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model._pending_rejection_rng = None
     model._sampled_token_feedback = None
     model.model_stage = "cosyvoice3_talker"
@@ -1280,6 +1282,7 @@ def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
 def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owned):
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model.model_stage = stage
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
@@ -1333,3 +1336,139 @@ def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_com
             expected_events += ["default"]
     assert result is expected
     assert events == expected_events
+
+
+def test_ras_accepts_upstream_call_and_preserves_bias_context(monkeypatch):
+    from functools import partial
+    from types import MethodType
+
+    import numpy as np
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _ras_mrv2_sample
+
+    class CheckedContextError(Exception):
+        pass
+
+    bounds = torch.tensor([4], dtype=torch.int32)
+    idx = torch.tensor([0], dtype=torch.int32)
+    logits = torch.zeros(1, 8)
+    batch = SimpleNamespace(
+        expanded_idx_mapping=idx,
+        idx_mapping=idx,
+        idx_mapping_np=np.array([0]),
+        cu_num_logits_np=np.array([0, 1]),
+        expanded_local_pos=idx,
+        positions=torch.tensor([3]),
+        logits_indices=torch.tensor([0]),
+        input_ids=torch.tensor([2]),
+        seq_lens_cpu_upper_bound=bounds,
+    )
+    bias = object.__new__(LogitBiasState)
+
+    def apply_bias(values, ctx):
+        assert values.dtype == torch.float32
+        np.testing.assert_array_equal(ctx.seq_lens_upper_bound_np, bounds.numpy())
+        assert ctx.expanded_idx_mapping is idx
+        assert ctx.input_ids.tolist() == [2]
+        assert ctx.pos.tolist() == [3]
+        raise CheckedContextError
+
+    monkeypatch.setattr(bias, "apply", apply_bias)
+
+    def unexpected_penalty(*args):
+        pytest.fail("RAS must not apply ordinary penalties")
+
+    sampler = SimpleNamespace(
+        compute_nans=False,
+        get_logprobs_dims=lambda rows: None,
+        logits_processors=[SimpleNamespace(apply=unexpected_penalty), bias],
+    )
+    sampler.sample = MethodType(
+        partial(
+            _ras_mrv2_sample,
+            default_top_p=0.8,
+            default_top_k=25,
+            win_size=10,
+            tau_r=0.1,
+            eps=1e-5,
+        ),
+        sampler,
+    )
+    # Execute the actual upstream positional/keyword call; stop before GPU sampling.
+    with pytest.raises(CheckedContextError):
+        Sampler.__call__(sampler, logits, batch)
+    assert torch.equal(logits, torch.zeros_like(logits))
+
+
+def _decoder(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    monkeypatch.setattr(module, "cosyvoice3_packed_streaming_enabled", lambda: True)
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+    model = object.__new__(CosyVoice3Code2Wav)
+    torch.nn.Module.__init__(model)
+    model.calls = []
+    model.ratio = 1
+    # Avoid loading weights: exercise actual dispatch, row slicing and yields.
+    monkeypatch.setattr(CosyVoice3Code2Wav, "token_mel_ratio", property(lambda self: self.ratio))
+
+    def flow(items, n_timesteps, *, stream_items):
+        assert stream_items
+        model.calls.append(("flow", [item["tag"] for item in items]))
+        features = torch.stack([torch.full((1, 6), float(item["tag"])) for item in items])
+        return features, [6] * len(items), [1] * len(items)
+
+    def hift(feat, *, cache_state, finalize):
+        tag = int(feat[0, 0, 0])
+        model.calls.append(("hift", tag))
+        return feat, None if finalize else {"tag": tag}
+
+    model.flow_batch_mels = flow
+    model._stream_hift_from_feat = hift
+    return model
+
+
+def _incremental_items(count, finals=()):
+    return [
+        {
+            "tag": index,
+            "token": torch.zeros(1, count - index, dtype=torch.long),
+            "prompt_token": torch.zeros(1, 1, dtype=torch.long),
+            "token_offset_tokens": 0,
+            "finalize": index in finals,
+        }
+        for index in range(count)
+    ]
+
+
+def test_streaming_iterator_pauses_between_hift_and_flow_groups(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import iter_decode_streaming_batch
+
+    model = _decoder(monkeypatch)
+    iterator = iter_decode_streaming_batch(model, _incremental_items(3, finals=(0,)))
+    assert model.calls == []
+    first = next(iterator)
+    assert first[0] == 1
+    assert model.calls == [("flow", [1, 2]), ("hift", 1)]
+    second = next(iterator)
+    assert second[0] == 2
+    assert model.calls[-1] == ("hift", 2)
+    assert len(model.calls) == 3  # Neither final Flow nor final HiFT ran ahead.
+    last = next(iterator)
+    assert last[0] == 0
+    assert last[2] is None
+    assert model.calls[-2:] == [("flow", [0]), ("hift", 0)]
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+
+@pytest.mark.parametrize("count", [1, 8, 11])
+def test_list_api_restores_request_order_across_incremental_groups(monkeypatch, count):
+    model = _decoder(monkeypatch)
+    outputs = model.forward_streaming_batch(_incremental_items(count, finals=(0, 2)))
+    assert [int(speech[0, 0, 0]) for speech, _ in outputs] == list(range(count))
+    assert [cache is None for _, cache in outputs] == [i in (0, 2) for i in range(count)]
+    assert all(len(tags) <= 8 for name, tags in model.calls if name == "flow")
