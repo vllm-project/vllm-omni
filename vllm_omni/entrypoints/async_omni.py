@@ -15,6 +15,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
@@ -1662,4 +1663,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Return the task set exposed by the orchestrator-backed engine."""
-        return tuple(self.engine.supported_tasks)
+        tasks = tuple(self.engine.supported_tasks)
+        if self.transcription_stage is not None and "transcription" not in tasks:
+            tasks += ("transcription",)
+        return tasks
+
+    @cached_property
+    def transcription_stage(self):
+        from vllm_omni.entrypoints.transcription import resolve_transcription_stage
+
+        return resolve_transcription_stage(self)

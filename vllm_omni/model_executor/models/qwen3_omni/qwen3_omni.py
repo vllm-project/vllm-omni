@@ -19,7 +19,8 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeThinkerConfig,
 )
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
+from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
@@ -29,6 +30,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsRealtime,
+    SupportsTranscription,
     supports_encoder_cudagraph,
 )
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
@@ -167,6 +169,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     SupportsMRoPE,
     SupportsRealtime,
     SupportsQuant,
+    SupportsTranscription,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -199,6 +202,23 @@ class Qwen3OmniMoeForConditionalGeneration(
         apply_outer_quant_config_mapping(self)
 
     realtime_max_tokens = 64
+
+    # PR #3526's wrapper delegation, kept on the existing Thinker implementation.
+    # Original contribution: Nick Pratley <nick@npratley.net>.
+    # Serving capability discovery additionally checks the loaded stage topology.
+    supported_languages = Qwen3OmniMoeThinkerForConditionalGeneration.supported_languages
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> SpeechToTextConfig:
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_speech_to_text_config(model_config, task_type)
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params: SpeechToTextParams) -> PromptType:
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_generation_prompt(stt_params)
+
+    @classmethod
+    def post_process_output(cls, text: str) -> str:
+        return Qwen3OmniMoeThinkerForConditionalGeneration.post_process_output(text)
 
     # Set by the MRv2 model state once eager Talker-MTP frames are enabled.
     eager_frames_active = False

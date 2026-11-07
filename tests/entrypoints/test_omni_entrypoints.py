@@ -577,10 +577,19 @@ def _enqueue_fatal_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any
 async def test_get_supported_tasks_returns_engine_supported_tasks():
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(supported_tasks=("generate", "speech"))
+    omni.transcription_stage = None
 
     supported_tasks = await omni.get_supported_tasks()
 
     assert supported_tasks == ("generate", "speech")
+
+
+@pytest.mark.asyncio
+async def test_supported_transcription_preserves_other_tasks():
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(supported_tasks=("generate", "speech"))
+    omni.transcription_stage = object()
+    assert await omni.get_supported_tasks() == ("generate", "speech", "transcription")
 
 
 def test_model_config_and_vllm_config_forward_from_comprehension_stage():

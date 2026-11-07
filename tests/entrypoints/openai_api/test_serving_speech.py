@@ -4460,6 +4460,7 @@ class TestAsyncOmniSupportedTasks:
 
         omni = AsyncOmni.__new__(AsyncOmni)
         omni.engine = SimpleNamespace(supported_tasks=("speech",))
+        omni.transcription_stage = None
         tasks = await omni.get_supported_tasks()
         assert "generate" not in tasks
         assert "speech" in tasks
@@ -4473,6 +4474,7 @@ class TestAsyncOmniSupportedTasks:
 
         omni = AsyncOmni.__new__(AsyncOmni)
         omni.engine = SimpleNamespace(supported_tasks=("generate", "speech"))
+        omni.transcription_stage = None
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
 
