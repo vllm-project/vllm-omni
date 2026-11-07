@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -18,6 +19,29 @@ from vllm_omni.diffusion.models.gr00t.modeling.modules.embodiment_conditioned_ml
 from vllm_omni.diffusion.models.gr00t.modeling.processing_gr00t_n1d7 import Gr00tN1d7DataCollator
 
 logger = logging.getLogger(__name__)
+
+
+def _initial_action_noise(
+    shape: tuple[int, int, int],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    generator: torch.Generator | Sequence[torch.Generator | None] | None,
+) -> torch.Tensor:
+    """Draw the initial flow-matching noise for a batch of action chunks.
+
+    ``generator`` is either one generator for the whole batch, or a sequence with one
+    entry per sample. In the second form each sample draws its noise exactly as it would
+    alone in a batch of one, so requests batched together keep their own seeds. A
+    ``None`` entry draws that sample's noise from the global RNG.
+    """
+    if isinstance(generator, Sequence):
+        if len(generator) != shape[0]:
+            raise ValueError(f"Expected {shape[0]} per-sample generators, got {len(generator)}.")
+        return torch.cat(
+            [torch.randn((1, *shape[1:]), dtype=dtype, device=device, generator=g) for g in generator], dim=0
+        )
+    return torch.randn(shape, dtype=dtype, device=device, generator=generator)
 
 
 class Gr00tN1d7ActionHead(nn.Module):
@@ -139,7 +163,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             backbone_output: Output from the backbone model
             options: ``generator`` (a ``torch.Generator`` on the model device) draws
                 the initial action noise; ``None`` leaves ``torch.randn`` on the
-                global RNG, as upstream Isaac-GR00T does. The ``rtc_*`` keys drive
+                global RNG, as upstream Isaac-GR00T does. A list with one generator
+                per sample gives each sample its own noise stream. The ``rtc_*`` keys drive
                 real-time chunking when ``action_input`` carries a previous chunk.
         """
         vl_embeds = backbone_features
@@ -147,8 +172,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
         generator = options.get("generator") if options else None
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
+        actions = _initial_action_noise(
+            (batch_size, self.config.action_horizon, self.action_dim),
             dtype=vl_embeds.dtype,
             device=device,
             generator=generator,
