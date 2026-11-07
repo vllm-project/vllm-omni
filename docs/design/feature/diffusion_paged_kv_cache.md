@@ -182,13 +182,20 @@ Before real requests are admitted, the engine and Workers:
 1. Resolve `diffusion_kv_mode` and prepare a maximum-shape profile request.
 2. Register paged attention layers and collect a native `KVCacheSpec` per KV
    group.
-3. Run the marked memory profile to determine non-KV memory. This probe is not
-   a latency sample. On NPU, it may use SDPA only when MindIE-SD is
-   unavailable; this is the sole intentional fallback and applies only to this
-   startup profile.
+3. Run the marked memory profile to determine non-KV memory. Paged model
+   semantics and collective communication remain active, but marked attention
+   layers return zero outputs without KV reads/writes or dense attention.
+   Encoders and other unmarked attention layers execute normally.
 4. Build the native cache configuration and resolve block geometry.
 5. Allocate rank-local physical pages and create the Scheduler facade over the
    same geometry.
+6. Run post-allocation warmup when the model provides a valid warmup request;
+   it uses real Scheduler allocations and paged attention. HunyuanImage3 skips
+   the generic blank-image warmup because its image-edit input's placeholder
+   token layout does not match the latent patch grid. This is a limitation of
+   the synthetic input, not paged KV: the first real request initializes and
+   uses the paged kernels. The pre-allocation capacity profile does not
+   measure paged-kernel workspaces.
 
 `kv_cache_memory_bytes` is a physical KV-pool budget per Worker rank, not a
 request token count. When omitted, the normal utilization path sizes the pool
@@ -332,8 +339,9 @@ required.
   are follow-up integrations; `ar_diffusion_kv` is a separate contract.
 - Quantized KV and CPU/DLO offload combinations are untested.
 - For a formal `paged_scheduler` request, missing native metadata or backend
-  support is an explicit error, not a dense or SDPA fallback. The marked
-  startup memory profile is the only intentional exception.
+  support is an explicit error, not a dense or SDPA fallback. Only the marked
+  startup memory profile can run before KV initialization, with zero attention
+  outputs instead of cache access.
 
 ## Related Files
 
