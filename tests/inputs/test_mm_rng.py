@@ -138,8 +138,33 @@ def test_raw_and_rendered_inputs_keep_actual_vae_seed(raw, seed, mocker):
 def test_seeded_manual_engine_input_without_context_is_rejected(mocker):
     engine_input = _engine_input(None)
     processor = _input_processor(engine_input, mocker)
-    with pytest.raises(ValueError, match="processor-produced mm_rng_context"):
+    with pytest.raises(VLLMValidationError, match="processor-produced mm_rng_context"):
         processor.process_inputs("manual", engine_input, PoolingParams(), ("embed",))
+
+
+@pytest.mark.parametrize(
+    "invalid", ["policy", "context_seed", "seed_mismatch", "missing_grid", "grid_shape", "grid_size"]
+)
+def test_invalid_rng_metadata_is_rejected_before_worker_dispatch(invalid, mocker):
+    context = _context()
+    item = _item()
+    if invalid == "policy":
+        context = replace(context, policy="unknown")
+    elif invalid == "context_seed":
+        context = replace(context, seed=2**63)
+    elif invalid == "seed_mismatch":
+        item = _item(1)
+    elif invalid == "missing_grid":
+        del item["vae_token_grid_hw"]
+    else:
+        grid = [2] if invalid == "grid_shape" else [2, 0]
+        item["vae_token_grid_hw"] = replace(item["vae_token_grid_hw"], data=torch.tensor(grid))
+    engine_input = _engine_input(context, [item])
+    processor = _input_processor(engine_input, mocker)
+    with pytest.raises(VLLMValidationError, match="VAE|Hunyuan"):
+        processor.process_inputs("invalid", engine_input, PoolingParams(), ("embed",))
+    valid = _engine_input(_context())
+    assert processor.process_inputs("valid", valid, PoolingParams(), ("embed",)).mm_rng_context == _context()
 
 
 def test_reference_prefix_identity_shares_only_matching_rng_context():
@@ -331,3 +356,67 @@ def test_profile_dummy_inputs_do_not_inherit_configured_request_seed(real_proces
     assert image_counts == [1]
     assert MM_RNG_CONTEXT_KEY not in result
     assert "vae_generator_seed" not in result["mm_kwargs"]["image"][0]
+
+
+@pytest.mark.parametrize("seed", [-(2**63) - 1, 2**63, 1.5, "42", True])
+def test_invalid_seed_is_rejected_before_processor_cache_mutation(seed, real_processor, mocker):
+    processor, image_counts = real_processor
+    sender = LruKeyReplicatedSenderCache(processor.info.ctx.model_config)
+    inputs = ProcessorInputs(
+        [99],
+        processor.info.get_data_parser().parse_mm_data({"image": Image.new("RGB", (4, 4), "red")}),
+        {"image": ["image-uuid"]},
+        hf_processor_mm_kwargs={"vae_generator_seed": seed},
+        cache=sender,
+    )
+    cache_write = mocker.spy(sender, "get_and_update_item")
+    with pytest.raises(VLLMValidationError, match="vae_generator_seed"):
+        processor.apply(inputs, TimingContext(enabled=False))
+    assert image_counts == []
+    cache_write.assert_not_called()
+    valid = processor.apply(
+        replace(inputs, hf_processor_mm_kwargs={"vae_generator_seed": 0}), TimingContext(enabled=False)
+    )
+    assert valid["mm_kwargs"]["image"][0] is not None
+
+
+def test_uuid_only_image_reuses_processor_data_after_reference_prefix_changes(real_processor, mocker):
+    processor, image_counts = real_processor
+    parser = processor.info.get_data_parser()
+    model_config = processor.info.ctx.model_config
+    sender = LruKeyReplicatedSenderCache(model_config)
+    receiver = LruKeyReplicatedReceiverCache(model_config)
+
+    def placeholders(mm_items, **_):
+        count = mm_items.get_count("image", strict=False)
+        return [99] * (2 * count), {
+            "image": [PlaceholderFeaturesInfo("image", i, 2 * i, [99, 99], None) for i in range(count)]
+        }
+
+    processor._maybe_apply_prompt_updates = placeholders
+    a = Image.new("RGB", (4, 4), "red")
+    b = Image.new("RGB", (4, 4), "blue")
+    first_inputs = ProcessorInputs(
+        [99],
+        parser.parse_mm_data({"image": [a]}),
+        {"image": ["A"]},
+        hf_processor_mm_kwargs={"vae_generator_seed": 0},
+        cache=sender,
+    )
+    first = processor.apply(first_inputs, TimingContext(enabled=False))
+    first_request = _input_processor(first, mocker).process_inputs("first", first, PoolingParams(), ("embed",))
+    cached_a = receiver.get_and_update_features(first_request.mm_features)[0]
+
+    second = processor.apply(
+        replace(
+            first_inputs, mm_data_items=parser.parse_mm_data({"image": [b, None]}), mm_uuid_items={"image": ["B", "A"]}
+        ),
+        TimingContext(enabled=False),
+    )
+    assert image_counts == [1, 1]  # Only B needs pixel processing in the second request.
+    assert second["mm_kwargs"]["image"][1] is None
+    second_request = _input_processor(second, mocker).process_inputs("second", second, PoolingParams(), ("embed",))
+    moved_a = receiver.get_and_update_features(second_request.mm_features)[1]
+    assert moved_a.mm_hash == cached_a.mm_hash
+    assert moved_a.data is cached_a.data
+    assert moved_a.identifier != cached_a.identifier

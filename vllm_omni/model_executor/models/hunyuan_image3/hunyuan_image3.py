@@ -28,6 +28,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs import MultiModalDataDict, MultiModalInput
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
@@ -67,6 +68,7 @@ from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
+    MultiModalKwargsOptionalItems,
 )
 from vllm.multimodal.parse import (
     MultiModalDataItems,
@@ -1041,15 +1043,60 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
 
     mm_rng_seed_field = "vae_generator_seed"
 
+    @staticmethod
+    def _validate_vae_generator_seed(seed: object) -> int:
+        # The per-image transport field is torch.long, even on platforms whose
+        # Generator also accepts unsigned 64-bit seeds.
+        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or not -(2**63) <= seed < 2**63:
+            raise VLLMValidationError("Hunyuan vae_generator_seed must be a signed 64-bit integer")
+        return int(seed)
+
+    @staticmethod
+    def validate_mm_rng_inputs(context: MMRNGContext, mm_kwargs: MultiModalKwargsOptionalItems) -> None:
+        """Reject malformed request metadata before it reaches worker execution."""
+        HunyuanImage3MultiModalProcessor._validate_vae_generator_seed(context.seed)
+        required = ("vae_generator_seed", "vae_token_grid_hw")
+        if context.policy != HUNYUAN_VAE_RNG_POLICY or not set(required).issubset(context.retain_fields):
+            raise VLLMValidationError("Invalid Hunyuan VAE RNG policy or retained metadata")
+        for item in mm_kwargs.get("image", ()):
+            # Cache hits and SHM addresses refer to already-processed data that
+            # is resolved later by the receiver; never dereference them here.
+            if item is None or "address" in item:
+                continue
+            if any(key not in item for key in required):
+                raise VLLMValidationError("Seeded Hunyuan inputs require VAE seed and grid metadata for every image")
+            seed = item["vae_generator_seed"].data
+            grid = item["vae_token_grid_hw"].data
+            if (
+                not isinstance(seed, torch.Tensor)
+                or seed.device.type != "cpu"
+                or seed.dtype != torch.long
+                or seed.numel() != 1
+                or seed.item() != context.seed
+            ):
+                raise VLLMValidationError("VAE image seed must match the request RNG context")
+            if (
+                not isinstance(grid, torch.Tensor)
+                or grid.device.type != "cpu"
+                or grid.dtype != torch.long
+                or grid.shape != (2,)
+                or not bool((grid > 0).all())
+            ):
+                raise VLLMValidationError("VAE token grid must contain two positive integer dimensions")
+
     def apply(self, inputs: ProcessorInputs, timing_ctx: TimingContext) -> MultiModalInput:
-        result = super().apply(inputs, timing_ctx)
         seed = inputs.hf_processor_mm_kwargs.get("vae_generator_seed")
         if seed is not None:
-            result[MM_RNG_CONTEXT_KEY] = MMRNGContext(
+            seed = self._validate_vae_generator_seed(seed)
+        result = super().apply(inputs, timing_ctx)
+        if seed is not None:
+            context = MMRNGContext(
                 policy=HUNYUAN_VAE_RNG_POLICY,
-                seed=int(seed),
+                seed=seed,
                 retain_fields=("vae_generator_seed", "vae_token_grid_hw"),
             )
+            self.validate_mm_rng_inputs(context, result["mm_kwargs"])
+            result[MM_RNG_CONTEXT_KEY] = context
         return result
 
     def _call_hf_processor(

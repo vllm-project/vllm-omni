@@ -30,6 +30,7 @@ from tests.helpers.mark import hardware_marks
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.inputs.mm_rng import MMRNGContext, contextualize_mm_features
 from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
+from vllm_omni.model_executor.models.hunyuan_image3 import autoencoder_kl_3d
 from vllm_omni.model_executor.models.hunyuan_image3 import hunyuan_image3 as hunyuan
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import DiagonalGaussianDistribution
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -511,4 +512,60 @@ def test_sparse_image_indices_restore_after_reverse_order_and_failure():
     for index in (2, 8):
         with provider.sample(handle, index, spec) as generator:
             assert torch.equal(draw(generator), expected[index])
+    assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_real_vae_posterior_matches_draw_plan_and_replay(runner, make_request, monkeypatch, dtype):
+    # HunyuanImage-3.0-Instruct config.json uses spatial/temporal factors 16/4,
+    # 32 latent channels and five encoder levels with two residual blocks each.
+    # Keep that topology, shrinking only hidden channels and image dimensions
+    # for CPU coverage. These are random weights, not pretrained-image evidence.
+    monkeypatch.setattr(autoencoder_kl_3d, "get_local_device", lambda: torch.device("cpu"))
+    vae = (
+        autoencoder_kl_3d.AutoencoderKLConv3D(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=32,
+            block_out_channels=(32, 32, 32, 64, 64),
+            layers_per_block=2,
+            ffactor_spatial=16,
+            ffactor_temporal=4,
+            sample_size=384,
+            sample_tsize=96,
+            scaling_factor=0.562679178327931,
+            only_encoder=True,
+        )
+        .to(dtype=dtype)
+        .eval()
+    )
+    model = runner.model
+    model.vae = vae
+    model.config = PretrainedConfig(vae_downsample_factor=(16, 16), patch_size=1, vae={"latent_channels": 32})
+    refs = [torch.zeros((3, h, w), dtype=dtype) for h, w in ((64, 64), (64, 96), (96, 64))]
+    req = make_request("real-vae", refs)
+    for feature, pixels in zip(req.mm_features, refs, strict=True):
+        grid = feature.data["vae_token_grid_hw"]
+        feature.data["vae_token_grid_hw"] = replace(
+            grid, data=torch.tensor([pixels.shape[-2] // 16, pixels.shape[-1] // 16])
+        )
+    context = req.mm_rng_context
+    specs = model.get_mm_rng_specs(req.mm_features, context)
+    posteriors = [vae.encode(pixels.unsqueeze(0)).latent_dist for pixels in refs]
+    for index, posterior in enumerate(posteriors):
+        assert specs[index] == RandomDrawSpec(
+            tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device
+        )
+
+    reference_generator = torch.Generator(device="cpu").manual_seed(context.seed)
+    expected = [posterior.sample(reference_generator) for posterior in posteriors]
+    provider = runner._mm_rng_provider
+    handle = provider.register(req.request_id, context.seed, specs)
+    # Starting at the last image requires replay of two differently sized
+    # predecessors. Revisiting earlier images must restore their own draws.
+    for index in (2, 0, 1, 2):
+        with provider.sample(handle, index, specs[index]) as generator:
+            actual = posteriors[index].sample(generator)
+        assert torch.equal(actual, expected[index])
     assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())

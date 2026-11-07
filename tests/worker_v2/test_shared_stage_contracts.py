@@ -87,3 +87,31 @@ def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatc
     with pytest.raises(RuntimeError, match="stop before sampler allocation"):
         runner.load_model()
     assert upstream.init_model_state is original_initializer
+
+
+def test_load_model_rejects_request_rng_before_serving(monkeypatch):
+    import vllm.v1.worker.gpu.model_runner as upstream
+
+    from vllm_omni.worker_v2 import omni_model_runner as module
+
+    class RequestRNGModel(torch.nn.Module):
+        supports_mm_request_rng = True
+
+    runner = object.__new__(module.OmniGPUModelRunner)
+    model = RequestRNGModel()
+    original_initializer = upstream.init_model_state
+
+    def unexpected_model_state(*args):
+        pytest.fail("Unsupported request RNG reached MRv2 model state initialization")
+
+    monkeypatch.setattr(module, "init_omni_model_state", unexpected_model_state)
+
+    def load(parent):
+        parent.model = model
+        upstream.init_model_state(None, model, None, None)
+        pytest.fail("Unsupported request RNG reached MRv2 sampler initialization")
+
+    monkeypatch.setattr(upstream.GPUModelRunner, "load_model", load)
+    with pytest.raises(NotImplementedError, match="model_runner: v1"):
+        runner.load_model()
+    assert upstream.init_model_state is original_initializer

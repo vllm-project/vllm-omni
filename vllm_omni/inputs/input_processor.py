@@ -84,10 +84,16 @@ class OmniInputProcessor(InputProcessor):
             if request.mm_features:
                 seed_field = getattr(self.renderer.get_mm_processor(), "mm_rng_seed_field", None)
                 if seed_field and any(f.data is not None and seed_field in f.data for f in request.mm_features):
-                    raise ValueError("Seeded multimodal inputs require their processor-produced mm_rng_context")
+                    raise VLLMValidationError(
+                        "Seeded multimodal inputs require their processor-produced mm_rng_context"
+                    )
             return request
         if not isinstance(context, MMRNGContext):
-            raise TypeError("mm_rng_context must be a model-produced MMRNGContext")
+            raise VLLMValidationError("mm_rng_context must be a model-produced MMRNGContext")
+        validate_rng = getattr(self.renderer.get_mm_processor(), "validate_mm_rng_inputs", None)
+        if not callable(validate_rng):
+            raise VLLMValidationError("The multimodal processor does not support request RNG metadata")
+        validate_rng(context, decoder_input["mm_kwargs"])
         request = OmniEngineCoreRequest.from_request(request, mm_rng_context=context)
         request.mm_features = contextualize_mm_features(request.mm_features or [], context)
         return request

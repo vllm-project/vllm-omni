@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.model_executor.mm_request_rng import supports_mm_request_rng
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
@@ -383,6 +384,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         import vllm.v1.worker.gpu.model_runner as _mr_module
 
         def _init_model_state(vllm_config: Any, model: Any, encoder_cache: Any, device: Any) -> Any:
+            # MRv2's encoder runner does not carry request RNG contexts or
+            # occurrence indices. Reject this unsupported combination before
+            # serving requests rather than failing a seeded encode mid-step.
+            if supports_mm_request_rng(model):
+                raise NotImplementedError(
+                    f"{type(model).__name__} requires request-owned multimodal RNG, which MRv2 does not support. "
+                    "Set model_runner: v1 for this stage in the deploy config."
+                )
             # Runs after the model is built and before the sampler is: a model
             # whose logits head is narrower than its HF config reports (the
             # MiniCPM-o codec Talker's config has no vocab_size at all) sizes

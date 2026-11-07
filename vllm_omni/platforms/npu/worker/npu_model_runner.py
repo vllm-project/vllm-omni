@@ -99,6 +99,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
         enable_sp(self.vllm_config)
         # ---------------------------------------Omni-new----------------------------------------------
         model = getattr(self, "model", None)
+        self._init_mm_request_rng()
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
             candidate = getattr(model, "consume_sampled_token_ids_cpu_override", None)
