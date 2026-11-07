@@ -59,6 +59,76 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+### Hardware-specific block qualification
+
+When a model selects native and vendor implementations of the same block,
+qualify the extension seam before changing selection policy:
+
+1. Load the same nontrivial state dict strictly into both implementations.
+2. Exercise identity and channel-changing skip paths plus production mode
+   branches.
+3. Compare shape, dtype, and values with declared per-dtype tolerances.
+4. Assert that the normal platform entry selects the intended class and that
+   accelerated operations actually execute.
+5. Restore process-global backend state after successful and failing calls.
+6. Report block timings separately from model and request timings.
+7. Record both the benchmark checkout revision and the imported package source
+   path; an editable installation can otherwise execute a different checkout.
+8. List the tested hardware and execution modes explicitly. Unrun
+   `torch.compile` and CUDA Graph cells remain pending, not implicitly covered
+   by eager-mode results.
+
+Block qualification does not replace checkpoint loading, generated-output
+quality, or request-level validation through the normal model entry.
+
+For HunyuanImage3 ResBlocks, the initial evidence at `fa3d24d6` covers eager
+execution on A100 80GB PCIe; an independent H200 eager reproduction was reported
+by the reviewer on PR #7421. Neither establishes `torch.compile` or CUDA Graph
+qualification. The production-sized BF16 fixtures failed the unchanged
+`rtol=atol=0.02` gate at `e055a2d8` (33 passed, 2 failed in the full matrix).
+The original smaller-fixture results do not qualify those geometries.
+
+The production up/down cases cover the corresponding control-flow branches.
+Both implementations use identity samplers there, so these cases do not
+establish spatial upsampling or downsampling equivalence.
+
+The qualification module's single-L4 resource marks match the CUDA ready lane's
+model-test selection. They describe the CI target, not successful L4
+qualification. L4 and current-source production-sized BF16 qualification remain
+pending; A100 or H200 evidence must not be extrapolated to L4. The unchanged
+numerical gate still applies to both production cases.
+
+For numerical attribution without changing the benchmark's correctness gate:
+
+```bash
+python -m benchmarks.kernels.hunyuan_image3_resblock_benchmarks \
+  --diagnose --dtype bfloat16 --case production_patch_embed \
+  --output-json patch-embed-diagnostic.json
+python -m benchmarks.kernels.hunyuan_image3_resblock_benchmarks \
+  --diagnose --dtype bfloat16 --case production_final_layer \
+  --output-json final-layer-diagnostic.json
+```
+
+These CUDA-only, untimed diagnostics reuse the qualification's original
+geometry, parameter/input seeds, nonzero shared weights and tolerances. A failed
+uninstrumented final comparison writes its JSON before exiting with status 1;
+neither it nor intermediate agreement authorizes performance acceptance.
+Ordinary benchmark mode still asserts correctness before timing.
+
+The JSON separates propagated error in actual forwards from same-native-input
+replays at GN/SiLU, conv1, embedding, adaptive GN/SiLU, conv2, skip and final
+addition. It records native GN/modulation/scale/shift summaries and captured
+cuDNN policies. GN and modulation inside fused kernels are not separately
+materialized: the FP32 arithmetic probe is mechanism evidence, not a capture of
+those internal values or an automatic explanation of the historical failures.
+Convolution replays compare original policies, matched NVIDIA policy, and a
+native-only policy change. TF32 settings are recorded but not changed for BF16.
+CPU copies and hooks make these runs unsuitable for timing; bitwise comparison
+against uninstrumented forwards exposes capture/repeatability differences.
+Use a dedicated process because cuDNN policies are process-global, although
+temporary flags and hooks are restored on errors. Investigate mismatches and
+rerun the unchanged GPU qualification matrix on the recorded source revision.
+
 ## Weight reloading
 
 Pipelines that support live RL weight updates opt in with
