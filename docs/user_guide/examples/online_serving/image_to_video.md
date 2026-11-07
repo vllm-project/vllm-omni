@@ -3,7 +3,24 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/image_to_video>.
 
 
-This example demonstrates how to deploy the Wan2.2 image-to-video model for online video generation using vLLM-Omni.
+This example demonstrates how to deploy image-to-video models for online
+video generation using vLLM-Omni.
+
+## Supported Models
+
+| Model | Model ID |
+|-------|----------|
+| Wan2.2 I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
+| SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
+
+For SANA-Video 2B image-to-video online serving, see the
+[SANA-Video 2B recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/NVIDIA/SANA-Video-2B.md).
+
+This example demonstrates online image-to-video generation with vLLM-Omni.
+The startup script defaults to Wan2.2, but `MODEL` can select any supported
+image-to-video model. The existing curl helper remains a concrete Wan2.2
+request through the standard Videos API.
 
 ## Start Server
 
@@ -23,11 +40,26 @@ bash run_server.sh
 
 The script allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
-- `PORT` (default: `8091`)
-- `BOUNDARY_RATIO` (default: `0.875`)
-- `FLOW_SHIFT` (default: `12.0`)
+- `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
+
+### Ascend / Local LightX2V Example
+
+For a local Wan2.2-LightX2V Diffusers directory on Ascend/NPU, you can start the server like this:
+
+```bash
+vllm serve /path/to/Wan2.2-I2V-A14B-LightX2V-Diffusers-Lightning \
+  --omni \
+  --port 8091 \
+  --flow-shift 12 \
+  --cfg-parallel-size 1 \
+  --ulysses-degree 4 \
+  --use-hsdp \
+  --trust-remote-code \
+  --allowed-local-media-path / \
+  --seed 42
+```
 
 ## Async Job Behavior
 
@@ -72,37 +104,52 @@ curl -X POST http://localhost:8091/v1/videos/sync \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
-  -F "enable_frame_interpolation=true" \
-  -F "frame_interpolation_exp=1" \
-  -F "frame_interpolation_scale=1.0" \
+  -F 'extra_params={"sample_solver":"euler"}' \
   -F "seed=42" \
   -o sync_i2v_output.mp4
 ```
+
+For Wan Lightning/Distill checkpoints, pass `{"sample_solver":"euler"}` via `extra_params`. The default solver is `unipc`.
+
+Example matching the local LightX2V deployment above:
+
+```bash
+curl -sS -X POST http://localhost:8091/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "prompt=A cat playing with yarn" \
+  -F "input_reference=@/path/to/input.jpg" \
+  -F "width=832" \
+  -F "height=480" \
+  -F "num_frames=81" \
+  -F "fps=16" \
+  -F "num_inference_steps=4" \
+  -F "guidance_scale=1.0" \
+  -F "guidance_scale_2=1.0" \
+  -F "boundary_ratio=0.875" \
+  -F "seed=42" \
+  -F 'extra_params={"sample_solver":"euler"}' \
+  -o ./output.mp4
+```
+
+Use `/v1/videos/sync` if you want to write the MP4 directly to a file. `POST /v1/videos` is async and returns job metadata, not inline `b64_json`.
 
 ## Storage
 
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files
-  (default: `/tmp/storage`)
-- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete/open
-  operations (default: `4`)
-- `VLLM_OMNI_SERVER_STORAGE__FILE_TTL`: optional TTL for generated files in
-  seconds
-- `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL`: optional sweep interval in
-  seconds for enforcing file TTL; defaults to `300` when TTL is set
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+
+`VLLM_OMNI_STORAGE_PATH` and `VLLM_OMNI_STORAGE_MAX_CONCURRENCY` are deprecated and will be
+removed in a future release; use the names above instead.
 
 Example:
 
 ```bash
 export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
-export VLLM_OMNI_SERVER_STORAGE__FILE_TTL=86400
-export VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL=300
 ```
-
-See also: [Configuration Options](../../../configuration/README.md)
 
 ## API Calls
 
@@ -111,6 +158,9 @@ See also: [Configuration Options](../../../configuration/README.md)
 ```bash
 # Basic image-to-video generation
 bash run_curl_image_to_video.sh
+
+# Wan Lightning/Distill checkpoints
+SAMPLE_SOLVER=euler bash run_curl_image_to_video.sh
 
 # Or execute directly (OpenAI-style multipart)
 create_response=$(curl -s http://localhost:8091/v1/videos \
@@ -127,9 +177,7 @@ create_response=$(curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
-  -F "enable_frame_interpolation=true" \
-  -F "frame_interpolation_exp=1" \
-  -F "frame_interpolation_scale=1.0" \
+  -F 'extra_params={"sample_solver":"euler"}' \
   -F "seed=42")
 
 video_id=$(echo "$create_response" | jq -r '.id')
@@ -188,34 +236,11 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
-  -F "enable_frame_interpolation=true" \
-  -F "frame_interpolation_exp=1" \
-  -F "frame_interpolation_scale=1.0" \
+  -F 'extra_params={"sample_solver":"euler"}' \
   -F "seed=42"
 ```
 
-Frame interpolation is also available for supported Wan2.2 I2V requests. See
-[Frame Interpolation](../../diffusion/frame_interpolation.md) for worker-side
-execution details and feature constraints.
-
-### Frame Interpolation Example
-
-```bash
-curl -X POST http://localhost:8091/v1/videos/sync \
-  -F "prompt=A bear playing with yarn, smooth motion" \
-  -F "input_reference=@/path/to/qwen-bear.png" \
-  -F "width=832" \
-  -F "height=480" \
-  -F "num_frames=33" \
-  -F "fps=16" \
-  -F "num_inference_steps=40" \
-  -F "guidance_scale=1.0" \
-  -F "guidance_scale_2=1.0" \
-  -F "enable_frame_interpolation=true" \
-  -F "frame_interpolation_exp=1" \
-  -F "frame_interpolation_scale=1.0" \
-  -o sync_i2v_interpolated.mp4
-```
+`sample_solver` is supported by Wan2.2 online serving through the existing `extra_params` field, which is merged into the pipeline `extra_args`. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 
 ## Create Response Format
 
@@ -284,6 +309,10 @@ done
     ``````sh
     --8<-- "examples/online_serving/image_to_video/run_curl_image_to_video.sh"
     ``````
+??? abstract "run_curl_sana_video.sh"
+    ``````sh
+    --8<-- "examples/online_serving/image_to_video/run_curl_sana_video.sh"
+    ``````
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/image_to_video/run_server.sh"
@@ -291,4 +320,12 @@ done
 ??? abstract "run_server_hunyuan_video_15.sh"
     ``````sh
     --8<-- "examples/online_serving/image_to_video/run_server_hunyuan_video_15.sh"
+    ``````
+??? abstract "run_server_sana_video.sh"
+    ``````sh
+    --8<-- "examples/online_serving/image_to_video/run_server_sana_video.sh"
+    ``````
+??? abstract "run_server_sana_video_diffusers.sh"
+    ``````sh
+    --8<-- "examples/online_serving/image_to_video/run_server_sana_video_diffusers.sh"
     ``````

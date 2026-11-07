@@ -29,8 +29,8 @@ python image_edit.py \
 ### JoyAI-Image-Edit
 
 JoyAI-Image-Edit uses the same `image_edit.py` CLI and supports one input
-image per request. Requested dimensions are snapped to the nearest supported
-Joy bucket; for square outputs, use `1024x1024`.
+image per request. Requested dimensions are snapped to the nearest supported Joy
+bucket; for square outputs, use 1024x1024.
 
 ```bash
 python image_edit.py \
@@ -75,14 +75,18 @@ Key arguments:
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+- `--strength`: **Z-Image only** - controls the denoising start timestep for I2I (default: 0.6). Range: [0.0, 1.0]. Lower values preserve more of the original image; higher values allow more creative changes.
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 
 ## Example materials
 
 ??? abstract "image_edit.py"
-    ``````py
-    --8<-- "examples/offline_inference/image_to_image/image_edit.py"
+    Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py>.
+
+??? abstract "run_qwen_image_21.sh"
+    ``````sh
+    --8<-- "examples/offline_inference/image_to_image/run_qwen_image_21.sh"
     ``````
 ??? abstract "run_qwen_image_edit_2511.sh"
     ``````sh

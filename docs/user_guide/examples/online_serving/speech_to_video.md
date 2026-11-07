@@ -2,6 +2,7 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/speech_to_video>.
 
+
 This example demonstrates how to deploy the Wan2.2 speech-to-video (S2V) model for online video generation using vLLM-Omni.
 
 ## Supported Models
@@ -43,17 +44,6 @@ The script allows overriding:
 ```bash
 TP=4 bash run_server.sh
 ```
-
-## API Endpoints
-
-The server provides OpenAI-compatible video generation endpoints:
-
-- `POST /v1/videos`: create a video generation job (async)
-- `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
-- `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
-- `GET /v1/videos`: list stored video jobs
-- `GET /v1/videos/{video_id}/content`: download the generated video file
-- `DELETE /v1/videos/{video_id}`: delete the job and any stored output
 
 ## Sync API (Recommended for Testing)
 
@@ -126,3 +116,14 @@ curl -L "http://127.0.0.1:8091/v1/videos/${video_id}/content" -o s2v_output.mp4
 - `--cache-backend cache_dit` enables DiT caching for ~2x speedup on cached steps.
 - Audio is muxed into the output MP4 automatically.
 - Always pass `fps=16` to ensure correct video/audio alignment.
+
+## Example materials
+
+??? abstract "run_curl_speech_to_video.sh"
+    ``````sh
+    --8<-- "examples/online_serving/speech_to_video/run_curl_speech_to_video.sh"
+    ``````
+??? abstract "run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/speech_to_video/run_server.sh"
+    ``````
