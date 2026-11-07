@@ -143,6 +143,14 @@ class _VoxCPM2RuntimeConfig:
             if not cfg.enable_batched_cfm:
                 logger.info("VoxCPM2 unified decode graph requires batched CFM; enabling it.")
                 cfg = dataclasses.replace(cfg, enable_batched_cfm=True)
+            if cfg.enable_batched_vae_decode:
+                # The unified graph batches VAE decode itself (same reason as the
+                # incremental-VAE rule above); keeping the legacy latent-cohort
+                # path active alongside it corrupts concurrent requests - repeated
+                # syllables and near-zero transcript similarity on the v1 runner,
+                # where enable_incremental_vae never fires (#9738).
+                logger.info("VoxCPM2 unified decode graph supersedes batched VAE decode; disabling the legacy path.")
+                cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
         return cfg
 
     def unified_decode_graph_available(self, *, use_cuda_graph: bool) -> bool:
