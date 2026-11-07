@@ -86,3 +86,26 @@ def test_graph_stream_handoff_and_slot_reset():
         copied.synchronize()
         delivered = host_snapshot.get_output()[0]["model_outputs"]
         torch.testing.assert_close(delivered, expected_tail.cpu().flatten(), atol=2e-5, rtol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("frames", [1, 16, 270])
+def test_direct_ring_attention_matches_cpu_reference(frames):
+    from vllm_omni.model_executor.models.phonon.mimi_kernels import ring_attention_chunk
+
+    torch.manual_seed(89)
+    slots = torch.tensor([2, 0])
+    positions = torch.tensor([247, 500])
+    keys = torch.randn(3, 250, 2, 64)
+    values = torch.randn_like(keys)
+    gpu_keys, gpu_values = keys.cuda(), values.cuda()
+    for _ in range(2):
+        query, key, value = [torch.randn(2, frames, 2, 64) for _ in range(3)]
+        expected = ring_attention_chunk(query, key, value, keys, values, slots, positions)
+        actual = ring_attention_chunk(
+            query.cuda(), key.cuda(), value.cuda(), gpu_keys, gpu_values, slots.cuda(), positions.cuda()
+        )
+        torch.testing.assert_close(actual.cpu(), expected, atol=2e-5, rtol=2e-4)
+        torch.testing.assert_close(gpu_keys.cpu(), keys)
+        torch.testing.assert_close(gpu_values.cpu(), values)
+        positions += frames

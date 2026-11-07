@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .mimi_kernels import causal_conv_step, ring_attention_step
+from .mimi_kernels import causal_conv_step, ring_attention_chunk
 
 
 class StreamingConv(nn.Module):
@@ -16,10 +16,17 @@ class StreamingConv(nn.Module):
         super().__init__()
         self.conv = nn.Conv1d(inputs, outputs, kernel, dilation=dilation)
         self.register_buffer("history", torch.zeros(slots, inputs, dilation * (kernel - 1)), persistent=False)
+        self.register_buffer("scratch", torch.empty(0), persistent=False)
 
     def forward(self, inputs, slots):
         return causal_conv_step(
-            inputs, self.conv.weight, self.conv.bias, self.history, slots, dilation=self.conv.dilation[0]
+            inputs,
+            self.conv.weight,
+            self.conv.bias,
+            self.history,
+            slots,
+            dilation=self.conv.dilation[0],
+            scratch=self.scratch if self.scratch.shape[-1] == self.history.shape[-1] + inputs.shape[-1] else None,
         )
 
 
@@ -69,30 +76,22 @@ class MimiAttention(nn.Module):
         shape = (slots, config["transformer_context"], self.heads, width // self.heads)
         self.register_buffer("key_pool", torch.zeros(shape), persistent=False)
         self.register_buffer("value_pool", torch.zeros(shape), persistent=False)
-        frequencies = config["transformer_max_period"] ** (
-            -torch.arange(0, width // self.heads, 2).float() / (width // self.heads)
-        )
-        self.register_buffer("frequencies", frequencies, persistent=False)
 
-    def forward(self, inputs, slots, positions):
+    def forward(self, inputs, slots, positions, rotary):
         batch, frames, width = inputs.shape
         packed = self.in_proj(inputs).view(batch, frames, 3, self.heads, -1)
-        outputs = []
-        for frame in range(frames):
-            query, key, value = packed[:, frame].unbind(1)
-            position = positions + frame
-            angles = position[:, None, None].float() * self.frequencies
-            cosine, sine = angles.cos(), angles.sin()
+        query, key, value = packed.unbind(2)
+        cosine, sine = rotary
 
-            def rotate(tensor):
-                even, odd = tensor[..., 0::2], tensor[..., 1::2]
-                return torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), -1).flatten(-2)
+        def rotate(tensor):
+            even, odd = tensor[..., 0::2], tensor[..., 1::2]
+            rotated = torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), -1)
+            return rotated.flatten(-2).to(tensor.dtype)
 
-            attended = ring_attention_step(
-                rotate(query), rotate(key), value, self.key_pool, self.value_pool, slots, position
-            )
-            outputs.append(attended.flatten(1))
-        return self.out_proj(torch.stack(outputs, 1))
+        attended = ring_attention_chunk(
+            rotate(query), rotate(key), value, self.key_pool, self.value_pool, slots, positions
+        )
+        return self.out_proj(attended.flatten(2))
 
 
 class LayerScale(nn.Module):
@@ -116,8 +115,8 @@ class MimiLayer(nn.Module):
         self.layer_scale_1 = LayerScale(width, config["transformer_layer_scale"])
         self.layer_scale_2 = LayerScale(width, config["transformer_layer_scale"])
 
-    def forward(self, inputs, slots, positions):
-        inputs = inputs + self.layer_scale_1(self.self_attn(self.norm1(inputs), slots, positions))
+    def forward(self, inputs, slots, positions, rotary):
+        inputs = inputs + self.layer_scale_1(self.self_attn(self.norm1(inputs), slots, positions, rotary))
         return inputs + self.layer_scale_2(self.linear2(F.gelu(self.linear1(self.norm2(inputs)))))
 
 
@@ -145,6 +144,9 @@ class MimiStreamingDecoder(nn.Module):
         )
         self.input_projection = nn.Linear(dimension, width, bias=False) if dimension != width else nn.Identity()
         self.layers = nn.ModuleList([MimiLayer(config, num_slots) for _ in range(config["transformer_num_layers"])])
+        head_dim = width // config["transformer_num_heads"]
+        frequencies = config["transformer_max_period"] ** (-torch.arange(0, head_dim, 2).float() / head_dim)
+        self.register_buffer("frequencies", frequencies, persistent=False)
         self.output_projection = (
             nn.Linear(width, decoder_width, bias=False) if decoder_width != width else nn.Identity()
         )
@@ -167,6 +169,13 @@ class MimiStreamingDecoder(nn.Module):
         decoder.extend([nn.ELU(), StreamingConv(channels, config["channels"], config["last_kernel_size"], num_slots)])
         self.decoder = nn.ModuleList(decoder)
         self.samples_per_frame = round(config["sample_rate"] / config["frame_rate"])
+        frames = self.upsample_ratio
+        for layer in self.decoder:
+            if isinstance(layer, StreamingTranspose):
+                frames *= layer.convtr.stride[0]
+            for module in layer.modules():
+                if isinstance(module, StreamingConv):
+                    module.scratch = torch.empty(num_slots, module.history.shape[1], module.history.shape[-1] + frames)
 
     def reset_slots(self, slots):
         for module in self.modules():
@@ -181,8 +190,11 @@ class MimiStreamingDecoder(nn.Module):
         if self.upsample is not None:
             inputs = self.upsample(inputs, slots)
         inputs = self.input_projection(inputs.transpose(1, 2))
+        position = positions[:, None] + torch.arange(inputs.shape[1], device=positions.device)
+        angles = position[:, :, None, None].float() * self.frequencies
+        rotary = angles.cos(), angles.sin()
         for layer in self.layers:
-            inputs = layer(inputs, slots, positions)
+            inputs = layer(inputs, slots, positions, rotary)
         inputs = self.output_projection(inputs).transpose(1, 2)
         for layer in self.decoder:
             inputs = layer(inputs) if isinstance(layer, nn.ELU) else layer(inputs, slots)
