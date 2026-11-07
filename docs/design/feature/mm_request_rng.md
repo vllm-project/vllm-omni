@@ -47,10 +47,19 @@ cache items never contain runtime handles. `embed_multimodal(**kwargs)` keeps
 its upstream signature.
 
 The draw plan and image-to-draw positions are built once per request. Each
-encoder dispatch maps only its scheduled items to original image indices.
-Checkpoints cover a contiguous prefix of draw boundaries, allowing direct
-lookup without scanning prior images or checkpoints. Request updates revalidate
-the cached plan at the lifecycle boundary, outside the per-image encoding loop.
+encoder dispatch maps only its scheduled items to original image indices,
+using the request ID and encoder identifier returned by upstream batching.
+These identities remain aligned through filtering and reordering, independently
+of placeholder object identity. Checkpoints are stored in a list whose indices
+are consecutive draw boundaries, allowing direct lookup without scanning prior
+images or checkpoints. Request updates revalidate the cached plan at the
+lifecycle boundary, outside the per-image encoding loop.
+
+`RandomDrawSpec` resolves an accelerator device without an index to the current
+device when the specification is constructed. Explicit accelerator indices
+remain distinct, and CPU device aliases normalize to `cpu`. The plan and actual
+posterior are compared using these fixed devices, so later current-device
+changes cannot reinterpret an existing plan.
 
 ## Cache behavior and random-stream restoration
 
@@ -65,10 +74,11 @@ prevent reuse even if their random draw shapes happen to match.
 For image `i`, the provider restores the closest checkpoint at or before `i`.
 It replays missing predecessor draws using the same shape, dtype, device and
 `randn_tensor` operation as the posterior sampler, discarding those temporary
-noise tensors. It does not execute the predecessor VAE forwards. A successful
-sample records the next checkpoint; an exception in sampling does not commit
-that image. A repeated or reordered encoder call restores its logical position
-instead of consuming the current tail of the stream.
+noise tensors. It does not execute the predecessor VAE forwards. Each successful
+replayed draw appends a checkpoint. A successful sample appends the next boundary
+or replaces it when recomputing an earlier image; an exception in replay or
+sampling does not commit the failed draw. A repeated or reordered encoder call
+restores its logical position instead of consuming the current tail of the stream.
 
 KV prefix hits can remove image pixels before dispatch. The Omni scheduler
 adapter preserves `vae_token_grid_hw` and `vae_generator_seed` from the full

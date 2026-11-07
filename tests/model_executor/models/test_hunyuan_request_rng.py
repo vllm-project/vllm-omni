@@ -206,6 +206,8 @@ def assert_latents(outputs, expected):
     indirect=["runner"],
 )
 def test_mixed_requests_reordering_and_recomputation(runner, seed_b, make_request):
+    if runner.device.type == "cuda":
+        runner.model.vae.device = torch.device("cuda")
     refs = images()
     a, b = make_request("A", refs), make_request("B", refs[::-1], seed_b)
     admit(runner, a, b)
@@ -221,6 +223,57 @@ def test_mixed_requests_reordering_and_recomputation(runner, seed_b, make_reques
         assert torch.equal(provider.streams[provider.handles[req_id]].checkpoints[3], state)
         assert torch.equal(runner.requests[req_id].generator.get_state(), token_states[req_id])
         assert all(MM_RNG_ITEM_KEY not in f.data for f in runner.requests[req_id].mm_features)
+
+
+@pytest.mark.cpu
+def test_rebuilt_and_reordered_batch_refs_preserve_request_indices(runner, make_request, mocker):
+    refs = images()
+    a = make_request("A", [refs[0], refs[0], refs[1]])
+    b = make_request("B", refs[:1])
+    missing = make_request("missing", refs[:1], None)
+    missing.mm_features[0] = replace(missing.mm_features[0], data=None)
+    admit(runner, a, missing, b)
+    assert a.mm_features[0].identifier == b.mm_features[0].identifier
+    upstream_batch = GPUModelRunner._batch_mm_inputs_from_scheduler
+
+    def rebuilt_batch(instance, scheduled):
+        hashes, items, positions = upstream_batch(instance, scheduled)
+        assert len(items) == 4  # The upstream path omits the missing payload.
+        return hashes[::-1], items[::-1], [(req_id, replace(position)) for req_id, position in positions[::-1]]
+
+    mocker.patch.object(GPUModelRunner, "_batch_mm_inputs_from_scheduler", new=rebuilt_batch)
+    scheduled = schedule({"A": [0, 1, 2], "missing": [0], "B": [0]})
+    hashes, items, positions = runner._batch_mm_inputs_from_scheduler(scheduled)
+    expected_order = [("B", 0), ("A", 2), ("A", 1), ("A", 0)]
+    provider = runner._mm_rng_provider
+    for (req_id, index), mm_hash, (_, item), (owner, position) in zip(
+        expected_order, hashes, items, positions, strict=True
+    ):
+        feature = runner.requests[req_id].mm_features[index]
+        assert owner == req_id and mm_hash == feature.identifier
+        assert position is not feature.mm_position
+        assert item[MM_RNG_ITEM_KEY].data.tolist() == [provider.handles[req_id], index]
+    expected_a, _ = reference(runner, [refs[0], refs[0], refs[1]], 42)
+    expected_b, _ = reference(runner, refs[:1], 42)
+    assert_latents(runner._execute_mm_encoder(scheduled), [expected_b[0], *expected_a[::-1]])
+
+
+@pytest.mark.cpu
+def test_random_draw_spec_resolves_device_aliases_once(mocker):
+    module = mocker.Mock()
+    module.current_device.return_value = 1
+    get_module = mocker.patch("torch.get_device_module", return_value=module)
+    cpu = RandomDrawSpec((1,), torch.float32, torch.device("cpu"))
+    assert replace(cpu, device=torch.device("cpu:0")) == cpu
+    get_module.assert_not_called()
+    implicit = replace(cpu, device=torch.device("cuda"))
+    assert implicit.device == torch.device("cuda:1")
+    assert implicit == replace(cpu, device=torch.device("cuda:1"))
+    module.current_device.assert_called_once()
+    module.current_device.return_value = 0
+    assert implicit.device == torch.device("cuda:1")
+    assert replace(cpu, device=torch.device("cuda")) == replace(cpu, device=torch.device("cuda:0"))
+    assert implicit != replace(cpu, device=torch.device("cuda:0"))
 
 
 @pytest.mark.parametrize(
@@ -427,12 +480,24 @@ def test_sparse_image_indices_restore_after_reverse_order_and_failure():
         return randn_tensor(spec.shape, generator=generator, device=spec.device, dtype=spec.dtype)
 
     expected = {index: draw(reference_generator) for index in (2, 5, 8)}
+    advance = provider.advance
+
+    def fail_replay(generator, draw_spec):
+        advance(generator, draw_spec)
+        raise RuntimeError("replay")
+
+    provider.advance = fail_replay
+    with pytest.raises(RuntimeError, match="replay"):
+        with provider.sample(handle, 5, spec):
+            pytest.fail("failed predecessor replay reached target sampling")
+    assert len(provider.streams[handle].checkpoints) == 1
+    provider.advance = advance
     # A failed first sample may retain replayed predecessors, but not its own boundary.
     with pytest.raises(RuntimeError, match="first sample"):
         with provider.sample(handle, 5, spec) as generator:
             draw(generator)
             raise RuntimeError("first sample")
-    assert set(provider.streams[handle].checkpoints) == {0, 1}
+    assert len(provider.streams[handle].checkpoints) == 2
     with pytest.raises(ValueError, match="specification"):
         with provider.sample(handle, 5, replace(spec, shape=(1,))):
             pytest.fail("invalid posterior accepted")

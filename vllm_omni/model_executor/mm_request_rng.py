@@ -23,13 +23,22 @@ class RandomDrawSpec:
     dtype: torch.dtype
     device: torch.device
 
+    def __post_init__(self) -> None:
+        device = self.device
+        if device.type == "cpu":
+            device = torch.device("cpu")
+        elif device.index is None:
+            # Resolve aliases once so later device switches cannot change the plan.
+            device = torch.device(device.type, torch.get_device_module(device).current_device())
+        object.__setattr__(self, "device", device)
+
 
 @dataclass
 class _RequestStream:
     seed: int
     specs: dict[int, RandomDrawSpec]
     generator: torch.Generator
-    checkpoints: dict[int, torch.Tensor] = field(default_factory=dict)
+    checkpoints: list[torch.Tensor] = field(default_factory=list)
     positions: dict[int, int] = field(init=False)
     draws: tuple[RandomDrawSpec, ...] = field(init=False)
 
@@ -65,7 +74,7 @@ class RequestRNGProvider:
         handle = self._next_handle
         self._next_handle += 1
         self.handles[req_id] = handle
-        self.streams[handle] = _RequestStream(seed, dict(sorted(specs.items())), generator, {0: generator.get_state()})
+        self.streams[handle] = _RequestStream(seed, dict(sorted(specs.items())), generator, [generator.get_state()])
         return handle
 
     def discard(self, req_id: str) -> None:
@@ -79,16 +88,19 @@ class RequestRNGProvider:
         if stream.specs.get(mm_index) != actual:
             raise ValueError("VAE posterior does not match the request's random draw specification")
         position = stream.positions[mm_index]
-        # Replay records every intermediate boundary, so checkpoints always
-        # cover the contiguous prefix [0, len(checkpoints) - 1], even on failure.
+        # List indices are consecutive draw boundaries, including after failure.
         start = min(position, len(stream.checkpoints) - 1)
         stream.generator.set_state(stream.checkpoints[start])
         for i in range(start, position):
             self.advance(stream.generator, stream.draws[i])
-            stream.checkpoints[i + 1] = stream.generator.get_state()
+            stream.checkpoints.append(stream.generator.get_state())
         yield stream.generator
         # An exception in sampling does not commit the failed image's state.
-        stream.checkpoints[position + 1] = stream.generator.get_state()
+        state = stream.generator.get_state()
+        if position + 1 == len(stream.checkpoints):
+            stream.checkpoints.append(state)
+        else:
+            stream.checkpoints[position + 1] = state
 
 
 class SupportsMMRequestRNG(Protocol):

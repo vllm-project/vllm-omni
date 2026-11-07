@@ -264,15 +264,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         model = self.get_model()
         assert supports_mm_request_rng(model)
         item_indices = {
-            (req_id, id(self.requests[req_id].mm_features[index].mm_position)): index
+            (req_id, self.requests[req_id].mm_features[index].identifier): index
             for req_id, indices in scheduler_output.scheduled_encoder_inputs.items()
             for index in indices
         }
-        for i, ((modality, item), (req_id, position)) in enumerate(zip(items, refs)):
+        for i, (identifier, (modality, item), (req_id, _)) in enumerate(zip(hashes, items, refs)):
             context = self._mm_rng_contexts.get(req_id)
             if context is None:
                 continue
-            mm_index = item_indices[req_id, id(position)]
+            mm_index = item_indices[req_id, identifier]
             handle = provider.handles.get(req_id)
             if handle is None:
                 features = self.requests[req_id].mm_features
