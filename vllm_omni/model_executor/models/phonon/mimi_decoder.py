@@ -184,14 +184,6 @@ class MimiStreamingDecoder(nn.Module):
                 if isinstance(module, StreamingConv):
                     module.scratch = torch.empty(num_slots, module.history.shape[1], module.history.shape[-1] + frames)
 
-    def reset_slots(self, slots):
-        for module in self.modules():
-            if isinstance(module, (StreamingConv, StreamingTranspose)):
-                module.history[slots] = 0
-            elif isinstance(module, MimiAttention):
-                module.key_pool[slots] = 0
-                module.value_pool[slots] = 0
-
     def forward(self, latent, slots, positions):
         reset = positions == 0
         inputs = self.quantizer_projection(latent)
