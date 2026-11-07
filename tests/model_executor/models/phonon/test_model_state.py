@@ -203,3 +203,31 @@ def test_slot_reset_uses_current_stream_without_cross_stream_wait(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", unexpected_stream_operation)
     runner.reset_slots(0)
     assert calls == [0]
+
+
+def test_mimi_runner_dispatch_with_lightweight_decoder():
+    from vllm_omni.model_executor.models.phonon.cuda_graph_wrapper import MimiDecodeRunner
+
+    class FakeDecoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.ones(1))
+            self.register_buffer("history", torch.zeros(2, 4))
+
+        def forward(self, latent, slots, positions):
+            previous = torch.where(positions[:, None] == 0, 0, self.history[slots])
+            output = previous + latent.squeeze(-1) * self.scale
+            self.history[slots] = output
+            return output[:, None, :]
+
+    decoder = FakeDecoder()
+    runner = MimiDecodeRunner(decoder)
+    with torch.inference_mode():
+        first, event = runner.decode(torch.ones(1, 4, 1), torch.tensor([1]), torch.tensor([0]))
+        assert event is None
+        later, _ = runner.decode(torch.ones(1, 4, 1), torch.tensor([1]), torch.tensor([1]))
+        torch.testing.assert_close(first, torch.ones(1, 1, 4))
+        torch.testing.assert_close(later, torch.full((1, 1, 4), 2.0))
+        reused, _ = runner.decode(torch.full((1, 4, 1), 3.0), torch.tensor([1]), torch.tensor([0]))
+        torch.testing.assert_close(reused, torch.full((1, 1, 4), 3.0))
+        assert decoder.history[0].count_nonzero() == 0
