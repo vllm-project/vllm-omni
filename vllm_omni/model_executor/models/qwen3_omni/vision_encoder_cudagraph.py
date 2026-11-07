@@ -144,12 +144,16 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # parallel there) and under model runner v2, which builds the upstream
         # manager and never consults encoder_cudagraph_group_eligible; and the
         # largest budget must hold at least one audio chunk. Audio graphs are
-        # CUDA only, so ROCm, NPU and XPU take the same eager path. The stage's
-        # additional_config can turn audio graphs off while images still replay.
+        # validated on CUDA and on Ascend NPUs other than 310P, so ROCm and XPU
+        # take the eager path. The stage's additional_config can turn audio
+        # graphs off while images still replay.
         audio_tower = getattr(self, "audio_tower", None)
         mm = self.multimodal_config
+        if not getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
+            return
         if mm.enable_mm_embeds or mm.mm_encoder_attn_dtype is not None or mm.get_limit_per_prompt("audio") <= 0:
             return
+        npu = supports_npu_encoder_graphs()
         reason = None
         if not _audio_graphs_requested(vllm_config):
             reason = "additional_config sets audio_encoder_cudagraph to false"
@@ -157,34 +161,20 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             reason = "model runner v2 is in use"
         elif mm.mm_encoder_tp_mode == "data":
             reason = "the multimodal encoder runs data parallel"
-        elif not current_omni_platform.is_cuda():
+        elif not (npu or current_omni_platform.is_cuda()):
             reason = (
-                f"audio encoder graphs are validated on CUDA only, this platform is {current_omni_platform.device_name}"
+                "audio encoder graphs are validated on CUDA and Ascend NPU only, "
+                f"this platform is {current_omni_platform.device_name}"
             )
-        elif getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
+        elif not npu and getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
             reason = f"the audio attention backend is {getattr(audio_tower, 'attn_backend', None)}"
         elif self._max_encoder_cudagraph_budget(vllm_config) < self._audio_tokens_per_chunk():
             reason = f"no encoder graph budget holds one {self._audio_tokens_per_chunk()}-token audio chunk"
         if reason is None:
             if get_pp_group().is_first_rank:
                 self._add_encoder_cudagraph_modality("audio")
-        elif getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
+        else:
             logger.info("Audio encoder CUDA graphs stay off: %s.", reason)
-
-    def _npu_audio_encoder_graphs_enabled(self, vllm_config) -> bool:
-        """Whether to build the NPU audio graphs that replace the CUDA-only audio path."""
-        mm = self.multimodal_config
-        return (
-            vllm_config.compilation_config.cudagraph_mm_encoder
-            and not getattr(vllm_config.model_config, "enforce_eager", False)
-            and supports_npu_encoder_graphs()
-            and _audio_graphs_requested(vllm_config)
-            and not mm.enable_mm_embeds
-            and mm.get_limit_per_prompt("audio") > 0
-            and mm.mm_encoder_attn_dtype is None
-            and mm.mm_encoder_tp_mode != "data"
-            and get_pp_group().is_first_rank
-        )
 
     def _max_encoder_cudagraph_budget(self, vllm_config) -> int:
         budgets = vllm_config.compilation_config.encoder_cudagraph_token_budgets
@@ -196,11 +186,12 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
 
     def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
         modalities = getattr(self, "_encoder_cudagraph_modalities", ["image"])
-        both = len(modalities) > 1
+        vision = "image" in modalities or "video" in modalities
+        both = vision and "audio" in modalities
         keys: list[str] = []
         paths: dict[str, EncoderCudaGraphPathConfig] = {}
         padding_logics = {}
-        if "image" in modalities or "video" in modalities:
+        if vision:
             keys += ["pixel_values", "rotary_pos_emb_cos", "rotary_pos_emb_sin", "cu_seqlens", "max_seqlen"]
             if self.visual.apply_vit_abs_pos_embed:
                 keys.append("pos_embeds")
@@ -214,7 +205,6 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             padding_logics["audio_cu_seqlens"] = _pad_cu_seqlens
         # The output width only sizes the data-parallel gather, which audio
         # never uses.
-        vision = "image" in modalities or "video" in modalities
         out_hidden_size = self.visual_dim + self.multiscale_dim if vision else self.audio_tower.proj2.output_size
         return EncoderCudaGraphConfig(
             modalities=list(modalities),
@@ -445,6 +435,9 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
                     "audio_chunks": tower.pad_chunks(features, metadata["chunk_lengths"]),
                     "audio_valid_index": metadata["valid_index"],
                     "audio_cu_seqlens": metadata["cu_seqlens"],
+                    # Not a graph input: Ascend FIA rebinds sequence lengths
+                    # from the host on every replay.
+                    "audio_cu_seqlens_host": metadata["cu_seqlens_host"],
                 }
             )
         values = self.visual.prepare_encoder_metadata(self._image_grid(mm_kwargs))

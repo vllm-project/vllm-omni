@@ -56,23 +56,6 @@ class SingleReplayEncoderCudaGraphManager(EncoderCudaGraphManager):
                 self.path_token_budgets[path] = capped
             logger.info("Encoder CUDA graph budgets after per-path caps: %s", self.path_token_budgets)
 
-    def capture(self, graph_pool: Any):
-        super().capture(graph_pool)
-        capture_audio = getattr(self.model, "capture_audio_encoder_cudagraph", None)
-        if capture_audio is not None:
-            capture_audio(graph_pool)
-
-    def clear(self):
-        super().clear()
-        audio = getattr(self.model, "_audio_encoder_graphs", None)
-        if audio is not None:
-            audio.clear()
-
-    def get_num_graphs_to_capture(self):
-        audio = getattr(self.model, "_audio_encoder_graphs", None)
-        extra = audio.num_graphs_to_capture() if audio is not None else 0
-        return super().get_num_graphs_to_capture() + extra
-
     def _fits_one_replay(self, mm_kwargs: dict[str, Any], specs: list[EncoderItemSpec]) -> bool:
         replay_supported = getattr(self.model, "encoder_cudagraph_replay_supported", None)
         if replay_supported is not None and not replay_supported(mm_kwargs, self.max_frames_per_batch):
@@ -201,25 +184,3 @@ class SingleReplayEncoderCudaGraphManager(EncoderCudaGraphManager):
                 stats["hit_rate"] * 100,
             )
         return [dest[i] for i in indices]
-
-
-class AudioOnlyEncoderCudaGraphManager:
-    """Runner capture lifecycle for Qwen3-Omni with vision disabled."""
-
-    def __init__(self, model):
-        self.model = model
-        self.token_budgets = [1]
-
-    def supports_modality(self, modality):
-        # Audio execution stays in embed_multimodal so audio/video pairing and
-        # output length bookkeeping continue to use the model's audio path.
-        return False
-
-    def get_num_graphs_to_capture(self):
-        return self.model._audio_encoder_graphs.num_graphs_to_capture()
-
-    def capture(self, graph_pool):
-        self.model.capture_audio_encoder_cudagraph(graph_pool)
-
-    def clear(self):
-        self.model._audio_encoder_graphs.clear()

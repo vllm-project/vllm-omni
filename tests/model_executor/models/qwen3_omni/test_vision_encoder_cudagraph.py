@@ -336,20 +336,6 @@ def test_frame_patch_bound_applies_only_when_video_caps_max_seqlen():
     assert not model.encoder_cudagraph_replay_supported(large, 128)
 
 
-@pytest.mark.parametrize(
-    "change",
-    [None, "audio_opt_out", "embeds", "enforce_eager", "not_npu"],
-)
-def test_npu_audio_graph_gate(monkeypatch, change):
-    monkeypatch.setattr(graph_module, "supports_npu_encoder_graphs", lambda: change != "not_npu")
-    cfg = _config(embeds=change == "embeds")
-    if change == "audio_opt_out":
-        cfg.additional_config = {"audio_encoder_cudagraph": False}
-    if change == "enforce_eager":
-        cfg.model_config.enforce_eager = True
-    assert _thinker(cfg)._npu_audio_encoder_graphs_enabled(cfg) is (change is None)
-
-
 def test_graph_entry_preserves_vision_module_hooks():
     model = _thinker()
     values = model.prepare_encoder_cudagraph_capture_inputs(2, 2, 0, torch.device("cpu"), torch.float32).values

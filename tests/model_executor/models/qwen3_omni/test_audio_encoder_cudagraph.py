@@ -40,8 +40,11 @@ N_WINDOW, N_WINDOW_INFER, MEL = 8, 64, 8
 @pytest.fixture(autouse=True)
 def _first_pipeline_rank(monkeypatch):
     monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-    # Audio graphs are CUDA only; these CPU tests stand in for a CUDA platform unless a case changes it.
+    # Audio graphs run on CUDA and Ascend NPU; these CPU tests stand in for a CUDA platform unless a case changes it.
     monkeypatch.setattr(graph_module, "current_omni_platform", _platform("cuda"))
+    monkeypatch.setattr(
+        graph_module, "supports_npu_encoder_graphs", lambda: graph_module.current_omni_platform.is_npu()
+    )
     # The tiny tower uses its own chunk size; production lengths assume 100-frame chunks.
     monkeypatch.setattr(
         graph_module,
@@ -170,7 +173,7 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
 
 
 def _platform(name):
-    return SimpleNamespace(is_cuda=lambda: name == "cuda", device_name=name)
+    return SimpleNamespace(is_cuda=lambda: name == "cuda", is_npu=lambda: name == "npu", device_name=name)
 
 
 @pytest.mark.parametrize(
@@ -189,6 +192,7 @@ def _platform(name):
         "rocm_aiter_backend",
         "rocm_platform",
         "npu_platform",
+        "npu_sdpa_backend",
         "xpu_platform",
         None,
     ],
@@ -223,8 +227,13 @@ def test_audio_graph_gate(monkeypatch, change):
     elif change in ("rocm_platform", "npu_platform", "xpu_platform"):
         # ROCm returns FLASH_ATTN on CDNA without AITER and on RDNA, so the backend alone does not exclude it.
         monkeypatch.setattr(graph_module, "current_omni_platform", _platform(change.removesuffix("_platform")))
+    elif change == "npu_sdpa_backend":
+        # Ascend attention replaces the CUDA backends, so the backend gate does not apply.
+        monkeypatch.setattr(graph_module, "current_omni_platform", _platform("npu"))
+        thinker.audio_tower.attn_backend = AttentionBackendEnum.TORCH_SDPA
     thinker._enable_audio_encoder_cudagraph(cfg)
-    assert ("audio" in thinker.get_encoder_cudagraph_config().modalities) is (change is None)
+    enabled = change in (None, "npu_platform", "npu_sdpa_backend")
+    assert ("audio" in thinker.get_encoder_cudagraph_config().modalities) is enabled
     # The image path stays enabled either way.
     assert supports_encoder_cudagraph(thinker)
 
@@ -243,10 +252,9 @@ def test_unrecognised_audio_graph_setting_is_rejected():
     [
         (True, "data_parallel", "the multimodal encoder runs data parallel"),
         (False, "data_parallel", None),
-        (True, "rocm", "audio encoder graphs are validated on CUDA only, this platform is rocm"),
-        (True, "npu", "audio encoder graphs are validated on CUDA only, this platform is npu"),
-        (True, "xpu", "audio encoder graphs are validated on CUDA only, this platform is xpu"),
-        (False, "npu", None),
+        (True, "rocm", "audio encoder graphs are validated on CUDA and Ascend NPU only, this platform is rocm"),
+        (True, "xpu", "audio encoder graphs are validated on CUDA and Ascend NPU only, this platform is xpu"),
+        (False, "xpu", None),
     ],
 )
 def test_audio_graphs_left_off_are_logged_when_encoder_graphs_are_on(monkeypatch, graphs_on, case, reason):
@@ -277,16 +285,16 @@ def test_audio_graphs_stay_on_with_other_additional_config():
     thinker = _thinker(cfg)
     thinker.audio_tower = _tower()
     thinker._enable_audio_encoder_cudagraph(cfg)
-    assert thinker.get_encoder_cudagraph_config().modalities == ["image", "audio"]
+    assert thinker.get_encoder_cudagraph_config().modalities == ["image", "video", "audio"]
 
 
-def test_config_keeps_the_image_only_path_and_adds_an_audio_path():
-    image_only = _thinker().get_encoder_cudagraph_config()
-    assert image_only.modalities == ["image"]
-    assert list(image_only.paths) == ["default"] and not image_only.paths["default"].allow_zero_tokens
+def test_config_keeps_the_vision_only_path_and_adds_an_audio_path():
+    vision_only = _thinker().get_encoder_cudagraph_config()
+    assert vision_only.modalities == ["image", "video"]
+    assert list(vision_only.paths) == ["default"] and not vision_only.paths["default"].allow_zero_tokens
 
     config = _audio_thinker().get_encoder_cudagraph_config()
-    assert config.modalities == ["image", "audio"]
+    assert config.modalities == ["image", "video", "audio"]
     assert config.paths["default"].allow_zero_tokens and config.paths["audio"].allow_zero_tokens
     assert config.paths["audio"].min_token_budget == 2
     assert set(config.padding_logics) == {"cu_seqlens", "audio_cu_seqlens"}

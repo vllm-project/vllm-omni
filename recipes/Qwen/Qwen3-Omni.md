@@ -77,30 +77,53 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     "2": {"max_num_seqs": 4}
   }'
 
-# Replay the thinker's image and audio encoders from CUDA graphs (video stays eager)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}}}'
 ```
 
-With the encoder graphs on, the thinker captures one graph per token budget
-(64 to 256 image tokens, 13 to 104 audio tokens, i.e. up to 8 seconds of audio,
-and up to 4 items per replay by default). A step's images, or its audio
-clips, replay together when one captured graph holds them all; otherwise they
-run through the eager encoder in one call, as do audio clips that are all
-shorter than one second. Set `encoder_cudagraph_token_budgets`
-and `encoder_cudagraph_max_vision_items_per_batch` in the same
-`compilation_config` to change them (for audio, each listed budget rounds down
-to whole 13-token chunks and stops at 104 tokens); each captured budget adds
-graph memory on the thinker's GPU. Audio graphs are CUDA only; audio also stays eager with model runner v2,
-with `mm_encoder_tp_mode: data`, and when no listed budget reaches 13 tokens;
-to keep the image graphs and run audio eagerly in other setups, start with
+### Encoder graphs
 
-```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}, "additional_config": {"audio_encoder_cudagraph": false}}}'
+The thinker can replay its vision (image and video) and audio encoders from
+captured graphs (`cudagraph_mm_encoder`). This needs model runner v1, because
+MRv2 does not apply the replay bounds below and rejects the flag at startup.
+
+- NPU (Ascend, not 310P) runs v1 and turns encoder graphs on by default, with
+  vision budgets of 256 to 4096 tokens. Keep `cudagraph_mode: PIECEWISE`.
+- CUDA defaults to MRv2, so encoder graphs stay off. To turn them on, save this
+  overlay as `deploy.yaml` and launch with `--deploy-config deploy.yaml`
+  (`compilation_config` is replaced as a whole, so repeat its other fields):
+
+```yaml
+base_config: /absolute/path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
+platforms:
+  cuda:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        compilation_config:
+          custom_ops: ["+rotary_embedding"]
+          cudagraph_mm_encoder: true
+          encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
+          encoder_cudagraph_max_vision_items_per_batch: 16
+          encoder_cudagraph_max_frames_per_batch: 128
 ```
 
-Video frames use the same opt-in. A video longer than one captured budget replays that graph on successive frames, because frame attention does not cross frames. Supported Ascend NPUs (not 310P) capture vision with the ACL graph manager and audio with one full-width NPUGraph per chunk count from 1 to 64, plus one exact-width graph per single clip shorter than one second (99 graphs). `audio_encoder_cudagraph: false` turns the audio graphs off on NPU as well. MRv2 rejects `cudagraph_mm_encoder: true` because it does not apply these replay bounds; use `model_runner: v1`. The shipped profiles leave `cudagraph_mm_encoder` false so the extra graph memory stays available to the KV cache. On NPU, keep `cudagraph_mode: PIECEWISE` when turning the flag on.
+The thinker captures one graph per token budget. Images and video frames share
+the vision graphs. A video longer than one captured budget replays that graph
+on successive frame chunks, because frame attention does not cross frames;
+frames larger than 4096 patches stay eager when video graphs are captured.
+Audio uses whole 13-token chunks of one second each and stops at 104 tokens,
+i.e. up to 8 seconds of audio per step, on both CUDA and NPU. A step's images,
+or its audio clips, replay together when one captured graph holds them all;
+otherwise they run through the eager encoder in one call, as do audio clips
+that are all shorter than one second. Each listed budget rounds down to whole
+audio chunks. Audio also stays eager with `mm_encoder_tp_mode: data` and when
+no listed budget reaches 13 tokens.
+
+Each captured budget adds graph memory, which is reserved before the thinker's
+KV cache is sized. To keep the vision graphs and run audio eagerly, set
+`additional_config: {"audio_encoder_cudagraph": false}` on stage 0; to turn
+encoder graphs off, set `cudagraph_mm_encoder: false`. Padded replays can round
+differently from eager execution, so validate accuracy on your backend and
+workload.
 
 ### Stage-based launch (one stage per process)
 

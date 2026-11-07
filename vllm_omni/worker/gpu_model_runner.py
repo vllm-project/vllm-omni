@@ -395,19 +395,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     @torch.inference_mode()
     def _create_encoder_cudagraph_manager(self):
         raw_model = self.get_model()
-        from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
-
-        if (
-            self.compilation_config.cudagraph_mm_encoder
-            and self.supports_mm_inputs
-            and getattr(raw_model, "_audio_encoder_graphs", None) is not None
-            and not supports_encoder_cudagraph(raw_model)
-        ):
-            from vllm_omni.worker.encoder_cudagraph import AudioOnlyEncoderCudaGraphManager
-
-            return AudioOnlyEncoderCudaGraphManager(raw_model)
         if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
             return super()._create_encoder_cudagraph_manager()
+        from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
+
         from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
 
         if not (
