@@ -3219,12 +3219,12 @@ class TestPlatformOverrides:
 
     @pytest.mark.parametrize("deploy_name", ["qwen3_omni_moe.yaml", "qwen3_omni_moe_mrv2.yaml"])
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
-    def test_qwen3_omni_encoder_graphs_are_opt_in(self, deploy_name, platform):
+    def test_qwen3_omni_encoder_graph_defaults(self, deploy_name, platform):
         deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(deploy_name)), platform=platform)
         config = deploy.stages[0].compilation_config
-        # Encoder graphs reserve memory before KV allocation, so every shipped
-        # profile leaves them off; the budgets are preset for the opt-in.
-        assert config["cudagraph_mm_encoder"] is False
+        # NPU runs the V1 runner, which applies the replay bounds. CUDA defaults
+        # to MRv2, which rejects encoder graphs, so they stay an opt-in there.
+        assert config["cudagraph_mm_encoder"] is (platform == "npu")
         assert config["encoder_cudagraph_token_budgets"] == [256, 512, 1024, 2048, 4096]
         if platform == "cuda":
             assert config["custom_ops"] == ["+rotary_embedding"]

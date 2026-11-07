@@ -62,11 +62,7 @@ class OmniNPUWorkerBase(NPUWorker):
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and not self.cache_config.kv_cache_memory_bytes
         ):
-            model = self.model_runner.get_model()
-            if not (
-                getattr(model, "encoder_cudagraph_single_replay", False)
-                or getattr(model, "_audio_encoder_graphs", None) is not None
-            ):
+            if not getattr(self.model_runner.get_model(), "encoder_cudagraph_single_replay", False):
                 return available
             self.encoder_cudagraph_memory_estimate = self.model_runner.profile_encoder_cudagraph_memory()
             logger.info("Reserved %.2f GiB for encoder NPU graphs", self.encoder_cudagraph_memory_estimate / (1 << 30))

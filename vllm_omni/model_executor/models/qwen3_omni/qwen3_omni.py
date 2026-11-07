@@ -112,7 +112,6 @@ logger = init_logger(__name__)
 # wrapper that the runner inspects.
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
-    "capture_audio_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
     "encoder_cudagraph_group_eligible",
     "encoder_cudagraph_replay_supported",
@@ -265,9 +264,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
-            self._audio_encoder_graphs = getattr(self.thinker, "_audio_encoder_graphs", None)
-            if self._audio_encoder_graphs is not None:
-                self.capture_audio_encoder_cudagraph = self.thinker.capture_audio_encoder_cudagraph
             if supports_encoder_cudagraph(self.thinker):
                 # Expose the protocol on this stage instance only. Defining
                 # these methods on the shared class also advertises an encoder

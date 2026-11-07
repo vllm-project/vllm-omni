@@ -63,24 +63,11 @@ def _capture(manager):
             set_cudagraph_capturing_enabled(False)
 
 
-@pytest.mark.parametrize("input_stride", [1, 2])
-def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
+def _audio_tower():
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeAudioEncoderConfig
     from vllm.utils.torch_utils import set_default_torch_dtype
-    from vllm_ascend.worker.encoder_acl_graph import update_encoder_graph_params
 
-    import vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs as graphs_module
-    from tests.model_executor.models.qwen3_omni.test_vision_encoder_cudagraph_cuda import _engine_config, _vision_config
-    from vllm_omni.model_executor.models.qwen3_omni.audio_encoder_cudagraph import audio_chunk_metadata
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3Omni_VisionTransformer,
-        Qwen3OmniMoeAudioEncoder,
-        Qwen3OmniMoeThinkerForConditionalGeneration,
-    )
-    from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import (
-        Qwen3OmniAudioEncoderNpuGraphs,
-        SingleReplayEncoderNpuGraphManager,
-    )
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import Qwen3OmniMoeAudioEncoder
 
     config = Qwen3OmniMoeAudioEncoderConfig(
         d_model=128,
@@ -97,22 +84,14 @@ def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
     )
     with set_default_torch_dtype(torch.bfloat16), torch.device("npu"):
         tower = Qwen3OmniMoeAudioEncoder(config)
-        visual = Qwen3Omni_VisionTransformer(vision_config=_vision_config())
     _initialize(tower)
-    _initialize(visual)
-    model = object.__new__(Qwen3OmniMoeThinkerForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.visual = visual
-    model.vllm_config = _engine_config()
-    model.multimodal_config = model.vllm_config.model_config.multimodal_config
-    model.visual_dim, model.multiscale_dim = 64, 128
-    model._enable_image_encoder_cudagraph()
-    assert model.supports_encoder_cudagraph
-    audio = Qwen3OmniAudioEncoderNpuGraphs(tower, budgets=(1, 2, 3, 4))
-    model._audio_encoder_graphs = audio
-    model.audio_tower = tower
+    return tower
+
+
+def _npu_manager(model):
     from types import SimpleNamespace
 
+    from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import SingleReplayEncoderNpuGraphManager
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
     runner = SimpleNamespace(
@@ -125,20 +104,65 @@ def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
     )
     manager = OmniGPUModelRunner._create_encoder_cudagraph_manager(runner)
     assert isinstance(manager, SingleReplayEncoderNpuGraphManager)
+    return manager
+
+
+def _audio_inputs(lengths, input_stride):
+    features = torch.randn(80, sum(lengths) * input_stride, dtype=torch.bfloat16, device="npu")[:, ::input_stride]
+    return {"input_audio_features": features, "audio_feature_lengths": torch.tensor(lengths)}
+
+
+def _eager_audio(tower, inputs):
+    lengths = inputs["audio_feature_lengths"].tolist()
+    output_lens = tower.prepare_encoder_metadata(lengths)["aftercnn_lens"]
+    features = inputs["input_audio_features"]
+    return tower(features, torch.tensor(lengths, device="npu")).split(output_lens)
+
+
+@pytest.mark.parametrize("input_stride", [1, 2])
+def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+    from vllm_ascend.worker.encoder_acl_graph import update_encoder_graph_params
+
+    import vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs as graphs_module
+    from tests.model_executor.models.qwen3_omni.test_vision_encoder_cudagraph_cuda import _engine_config, _vision_config
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3Omni_VisionTransformer,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+    )
+
+    tower = _audio_tower()
+    with set_default_torch_dtype(torch.bfloat16), torch.device("npu"):
+        visual = Qwen3Omni_VisionTransformer(vision_config=_vision_config())
+    _initialize(visual)
+    model = object.__new__(Qwen3OmniMoeThinkerForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.visual = visual
+    model.audio_tower = tower
+    model.vllm_config = _engine_config()
+    model.multimodal_config = model.vllm_config.model_config.multimodal_config
+    model.visual_dim, model.multiscale_dim = 64, 128
+    model._enable_image_encoder_cudagraph()
+    model._enable_audio_encoder_cudagraph(model.vllm_config)
+    assert model.get_encoder_cudagraph_config().modalities == ["image", "video", "audio"]
+    manager = _npu_manager(model)
+    # Four 13-token chunks: the 64-token budget rounds down to whole chunks.
+    # The uncaptured zero budget lets vision groups skip the audio path.
+    assert manager.path_token_budgets["audio"] == [0, 52]
     retained = []
     fia_updates = []
-    previous_grids = None
+    previous: dict[str, list] = {}
 
     def counted_update(*args, **kwargs):
-        fia_updates.append(args)
+        fia_updates.append(kwargs.get("path", "default"))
         return update_encoder_graph_params(*args, **kwargs)
 
     monkeypatch.setattr(graphs_module, "update_encoder_graph_params", counted_update)
     try:
         _capture(manager)
         with torch.inference_mode():
-            # Same captured tensor shapes, different clip boundaries. Interleave
-            # vision replay to catch audio/vision FIA registry collisions.
+            # Interleave audio and vision replays to catch FIA registry collisions
+            # between the audio and default paths.
             for lengths, grids in [
                 ([100, 100], [[1, 4, 4]]),
                 ([200], [[1, 2, 8], [1, 4, 4]]),
@@ -150,24 +174,27 @@ def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
                 ([200], [[10, 8, 8]]),
                 ([100, 100], [[1, 4, 4]]),
             ]:
-                features = torch.randn(80, sum(lengths) * input_stride, dtype=torch.bfloat16, device="npu")[
-                    :, ::input_stride
-                ]
-                lens = torch.tensor(lengths, device="npu")
-                output_lens = audio_chunk_metadata(lengths, 100, 800)[-1]
-                expected = tower(features, lens, torch.tensor(output_lens, device="npu")).split(output_lens)
+                audio_inputs = _audio_inputs(lengths, input_stride)
+                expected = _eager_audio(tower, audio_inputs)
                 if lengths == [100, 100]:
-                    merged = tower(features, torch.tensor([200], device="npu"), torch.tensor([26], device="npu"))
+                    # Same captured shapes as [200], different clip boundaries.
+                    merged = tower(audio_inputs["input_audio_features"], torch.tensor([200], device="npu"))
                     assert not torch.allclose(torch.cat(expected), merged, rtol=0.016, atol=0.002)
-                # Exercise the serving dispatch, including CPU feature lengths.
-                hits = audio.graph_hits
-                actual = model._process_audio_input(
-                    {"input_features": features, "audio_feature_lengths": torch.tensor(lengths)}
-                )
-                assert audio.graph_hits == hits + len(lengths)
+                hits = manager.graph_hits
+                fia_updates.clear()
+                actual = manager.execute(audio_inputs)
+                assert actual is not None
+                assert manager.graph_hits == hits + len(lengths)
+                if previous.get("audio") == lengths:
+                    # The graph already holds these FIA lengths.
+                    assert not fia_updates
+                else:
+                    assert fia_updates == ["audio"]
+                previous["audio"] = lengths
                 for got, ref in zip(actual, expected):
                     torch.testing.assert_close(got, ref, rtol=0.016, atol=0.002)
                     retained.append((got, got.clone()))
+
                 modality = "video" if grids[0][0] > 1 else "image"
                 pixels = torch.randn(sum(t * h * w for t, h, w in grids), 384, device="npu", dtype=torch.bfloat16)
                 inputs = {
@@ -183,47 +210,54 @@ def test_audio_and_vision_replay(npu_state, input_stride, monkeypatch):
                 fia_updates.clear()
                 parts = manager.execute(inputs)
                 assert parts is not None
-                if grids == previous_grids:
-                    # The graph already holds these FIA lengths.
+                if previous.get("vision") == grids:
                     assert not fia_updates
                 if grids == [[10, 8, 8]]:
                     assert manager.graph_hits == vision_hits + 3
                     # Chunks of 4, 4 and 2 frames share the 64-token graph. The
                     # 2-frame tail pads with frame-sized sequences, so all
                     # three replays carry the same FIA lengths.
-                    assert len(fia_updates) == 1
-                previous_grids = grids
+                    assert fia_updates == ["default"]
+                previous["vision"] = grids
                 got = torch.cat(parts)
                 torch.testing.assert_close(got, ref, rtol=0.016, atol=0.002)
                 retained.extend((part, part.clone()) for part in parts)
-            short = torch.randn(80, 99, device="npu", dtype=torch.bfloat16)
-            assert audio.execute(short, [99]) is None
-            expected_short = tower(short, torch.tensor([99], device="npu"), torch.tensor([13], device="npu"))
-            actual_short = model._process_audio_input(
-                {"input_features": short, "audio_feature_lengths": torch.tensor([99])}
-            )
-            torch.testing.assert_close(actual_short[0], expected_short, rtol=0.016, atol=0.002)
+            # Clips all shorter than one chunk stay eager.
+            assert manager.execute(_audio_inputs([99], input_stride)) is None
             for got, saved in retained:
                 torch.testing.assert_close(got, saved, rtol=0, atol=0)
     finally:
         torch.npu.synchronize()
         manager.clear()
-    assert not audio.graphs
 
-    # Audio-only deployments use the same capture/clear lifecycle.
-    from vllm_omni.worker.encoder_cudagraph import AudioOnlyEncoderCudaGraphManager
 
-    audio_only = AudioOnlyEncoderCudaGraphManager(model)
+def test_audio_only_replay(npu_state):
+    from tests.model_executor.models.qwen3_omni.test_vision_encoder_cudagraph_cuda import _engine_config
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+    )
+
+    tower = _audio_tower()
+    model = object.__new__(Qwen3OmniMoeThinkerForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.audio_tower = tower
+    model.vllm_config = _engine_config()
+    model.multimodal_config = model.vllm_config.model_config.multimodal_config
+    model._enable_audio_encoder_cudagraph(model.vllm_config)
+    assert model.get_encoder_cudagraph_config().modalities == ["audio"]
+    manager = _npu_manager(model)
     try:
-        _capture(audio_only)
+        _capture(manager)
         with torch.inference_mode():
-            actual = audio.execute(features, lengths)
-            for got, ref in zip(actual, expected):
-                torch.testing.assert_close(got, ref, rtol=0.016, atol=0.002)
+            for lengths in ([200], [150, 100], [200]):
+                inputs = _audio_inputs(lengths, 1)
+                actual = manager.execute(inputs)
+                assert actual is not None
+                for got, ref in zip(actual, _eager_audio(tower, inputs)):
+                    torch.testing.assert_close(got, ref, rtol=0.016, atol=0.002)
     finally:
         torch.npu.synchronize()
-        audio_only.clear()
-    assert not audio.graphs
+        manager.clear()
 
 
 @pytest.mark.parametrize(

@@ -127,7 +127,7 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE   # Qwen3-Omni not FULL-cudagraph-safe on NPU
-          cudagraph_mm_encoder: false  # opt-in; graphs reserve memory before KV allocation
+          cudagraph_mm_encoder: true  # NPU runs V1; the encoder graph reserve is taken before KV allocation
           encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
           encoder_cudagraph_max_vision_items_per_batch: 16
           encoder_cudagraph_max_frames_per_batch: 128

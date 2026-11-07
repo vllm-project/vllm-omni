@@ -534,6 +534,7 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
             "chunk_lengths": chunk_lengths,
             "valid_index": valid_index_host,
             "cu_seqlens": cu_seqlens,
+            "cu_seqlens_host": cu_seqlens_host,
             # Attention reads this scalar on the host.
             "max_seqlen": self.compute_attn_mask_seqlen(cu_seqlens_host),
             "aftercnn_lens": aftercnn_lens,
@@ -1111,14 +1112,6 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         audio_input: Qwen2_5OmniAudioFeatureInputs,
     ) -> tuple[torch.Tensor, ...]:
         input_features = audio_input["input_features"]
-        # NPU audio graphs live beside the CUDA manager path. A miss falls
-        # through to the same eager metadata forward CUDA uses.
-        graphs = getattr(self, "_audio_encoder_graphs", None)
-        if graphs is not None:
-            lengths = audio_input["audio_feature_lengths"].tolist()
-            outputs = graphs.execute(input_features.to(self.audio_tower.dtype), lengths)
-            if outputs is not None:
-                return outputs
         # audio_feature_lengths is kept on the CPU, so the chunk layout is
         # built without reading anything back from the device.
         metadata = self.audio_tower.prepare_encoder_metadata(audio_input["audio_feature_lengths"].tolist())
@@ -1173,11 +1166,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     }
 
     supported_languages = ISO639_1_SUPPORTED_LANGS
-
-    def capture_audio_encoder_cudagraph(self, graph_pool):
-        graphs = getattr(self, "_audio_encoder_graphs", None)
-        if graphs is not None:
-            graphs.capture(graph_pool)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1289,13 +1277,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         self._enable_image_encoder_cudagraph()
         self._enable_audio_encoder_cudagraph(vllm_config)
-        # CUDA audio replays through the shared encoder manager. NPU audio uses
-        # full-width NPUGraphs because that manager path is CUDA-only.
-        self._audio_encoder_graphs = None
-        if self._npu_audio_encoder_graphs_enabled(vllm_config):
-            from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import Qwen3OmniAudioEncoderNpuGraphs
-
-            self._audio_encoder_graphs = Qwen3OmniAudioEncoderNpuGraphs(self.audio_tower)
 
         with self._mark_language_model(vllm_config):
             lm_vllm_config = vllm_config.with_hf_config(
