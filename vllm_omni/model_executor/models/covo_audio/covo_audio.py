@@ -144,7 +144,10 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
     ) -> Mapping[str, MultiModalFieldConfig]:
         return {
             "audio_features": MultiModalFieldConfig.batched("audio"),
-            "audio_num_tokens": MultiModalFieldConfig.batched("audio"),
+            # Read as Python ints (embed_multimodal truncation, bucketed-encoder
+            # lengths): on the device, every read would be a host synchronization
+            # in the prefill step.
+            "audio_num_tokens": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(
