@@ -89,7 +89,7 @@ def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatc
     assert upstream.init_model_state is original_initializer
 
 
-def test_load_model_allows_request_rng_model(monkeypatch):
+def test_load_model_binds_request_rng_model(monkeypatch, mocker):
     import vllm.v1.worker.gpu.model_runner as upstream
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
@@ -102,6 +102,8 @@ def test_load_model_allows_request_rng_model(monkeypatch):
     runner.jit_warmup_registry = JitWarmupRegistry(None)
     runner.use_aux_hidden_state_outputs = False
     model = RequestRNGModel()
+    model.bind_mm_rng_provider = mocker.Mock()
+    model.advance_mm_rng = mocker.Mock(side_effect=AssertionError("Loading must not draw request RNG"))
     original_initializer = upstream.init_model_state
     model_state = object()
     monkeypatch.setattr(module, "init_omni_model_state", lambda *args: model_state)
@@ -113,4 +115,6 @@ def test_load_model_allows_request_rng_model(monkeypatch):
     monkeypatch.setattr(upstream.GPUModelRunner, "load_model", load)
     runner.load_model()
     assert runner.model is model and runner.model_state is model_state
+    model.bind_mm_rng_provider.assert_called_once_with(runner._mm_rng_state.provider)
+    model.advance_mm_rng.assert_not_called()
     assert upstream.init_model_state is original_initializer

@@ -29,7 +29,9 @@ the worker reads the seed directly. No additional request wire field is needed.
 
 The model declares `SupportsMMRequestRNG`, supplies a shape/dtype/device draw plan
 and implements skipped draws. The runner owns device-local generators/checkpoints,
-separate from AR token sampling, and builds a plan on first encoding. It attaches
+separate from AR token sampling. MRv1 builds a plan on first encoding; MRv2 records
+the compact plan at request admission before upstream releases consumed encoder
+inputs, including CPU metadata. Neither retains pixels for replay. The runner attaches
 `(request_handle, mm_index)` to a shallow item copy, associating scheduled items by
 request ID and contextual identifier through upstream filtering and reordering.
 
@@ -41,9 +43,12 @@ Preemption retains state; completion/abort/shutdown release it. Reused request I
 get new handles; live updates must preserve references, seed and draw plan.
 All-prefix hits need no generator until encoding becomes necessary.
 
-GPU/NPU v1 `load_model` binds the provider. MRv2 allows model loading and seedless
-inputs, but rejects seeded image requests during preprocessing before cache access;
-use `model_runner: v1` for those requests. Execution is serialized eager encoding;
+GPU MRv1/MRv2 and NPU MRv1 `load_model` bind the same provider. MRv2 tags temporary
+input copies around its native encoder call and retains plans across preemption;
+only completion, abort and shutdown discard them. Seeded inputs are accepted by both
+runner versions. Hunyuan on NPU MRv2 still needs a separate model state providing
+Ascend attention metadata; this RNG adapter does not add that model support.
+Execution is serialized eager encoding;
 encoder CUDA graph capture is outside scope. Seed zero enables request sampling.
 Seedless AR (no effective `vae_generator_seed`) intentionally retains global-RNG
 sampling and image-based cache reuse. Multiple requests may share the encoder
@@ -75,6 +80,8 @@ missing-only transfer remain integration work under the
 ## Validation
 
 Tests cover processor/cache paths, scheduler/runner batching, replay and lifecycle.
+MRv2 tests use the real encoder cache, batching and Hunyuan posterior sampling,
+including released input payloads, cache hits, preemption, retries and request-ID reuse.
 CPU load-hook tests replace hardware dependencies. The NPU dispatch test uses the
 real Ascend runner and a weight-free Hunyuan VAE on CPU to verify tagging and replay;
 it requires Ascend dependencies and is included in NPU CI. It is not NPU inference evidence.
@@ -85,7 +92,7 @@ They check posterior specs, samples and RNG state; CUDA request tests also cover
 No pretrained quality, distributed TP, NPU hardware or AR-to-DiT E2E claim is made.
 
 ```bash
-python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py tests/worker/test_mm_request_rng_wiring.py tests/worker_v2/test_shared_stage_contracts.py -m 'core_model and cpu' -q
+python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py tests/worker/test_mm_request_rng_wiring.py tests/worker_v2/test_shared_stage_contracts.py tests/worker_v2/test_mm_request_rng.py -m 'core_model and cpu' -q
 python -m pytest tests/platforms/npu/test_mm_request_rng.py -m 'core_model and npu and A3' --run-level=core_model -q
-python -m pytest tests/model_executor/models/test_hunyuan_request_rng.py -m 'core_model and cuda and L4' --run-level=core_model -q
+python -m pytest tests/model_executor/models/test_hunyuan_request_rng.py tests/worker_v2/test_mm_request_rng.py -m 'core_model and cuda and L4' --run-level=core_model -q
 ```

@@ -10,9 +10,20 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard
 import torch
 
 if TYPE_CHECKING:
-    from vllm.multimodal.inputs import MultiModalFeatureSpec
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
 
 MM_RNG_ITEM_KEY = "mm_rng_item"
+
+
+def tag_mm_rng_item(item: "MultiModalKwargsItem", modality: str, handle: int, mm_index: int) -> "MultiModalKwargsItem":
+    from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
+
+    # Processor-cache items can be shared across requests. Only this call's
+    # shallow copy may contain a worker-local request handle.
+    tagged = MultiModalKwargsItem(item)
+    field = MultiModalFieldConfig.batched(modality, keep_on_cpu=True)
+    tagged[MM_RNG_ITEM_KEY] = field.build_elems(MM_RNG_ITEM_KEY, torch.tensor([[handle, mm_index]]))[0]
+    return tagged
 
 
 @dataclass(frozen=True)

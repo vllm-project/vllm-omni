@@ -135,25 +135,17 @@ def test_profile_dummy_inputs_do_not_inherit_configured_request_seed(real_proces
 
 
 @pytest.mark.parametrize("seed", [0, 42])
-@pytest.mark.parametrize("cached", [False, True])
-def test_mrv2_rejects_seeded_images_before_cache_access(real_processor, processor_cache, mocker, seed, cached):
+def test_mrv2_accepts_seeded_images_and_uuid_cache_hits(real_processor, processor_cache, seed):
     processor, image_counts = real_processor
-    model_config = processor.info.ctx.model_config
+    processor.info.ctx.model_config.use_v2_model_runner = True
     inputs = make_inputs(processor, [Image.new("RGB", (4, 4), "red")], ["image-uuid"], seed, processor_cache)
-    if cached:
-        processor.apply(inputs, TimingContext(enabled=False))
-        inputs = replace(inputs, mm_data_items=processor.info.get_data_parser().parse_mm_data({"image": [None]}))
-    image_counts.clear()
-    cache_access = mocker.spy(processor_cache, "get_and_update_item")
-    model_config.use_v2_model_runner = True
-    with pytest.raises(VLLMValidationError, match="MRv2.*model_runner: v1"):
-        processor.apply(inputs, TimingContext(enabled=False))
-    assert image_counts == []
-    cache_access.assert_not_called()
-    # Reject only this request; the same processor still accepts seedless images.
-    valid = make_inputs(processor, [Image.new("RGB", (4, 4), "blue")], ["next-image"], None, processor_cache)
-    result = processor.apply(valid, TimingContext(enabled=False))
-    assert "vae_generator_seed" not in result["mm_kwargs"]["image"][0]
+    first = processor.apply(inputs, TimingContext(enabled=False))
+    assert first["mm_kwargs"]["image"][0] is not None
+    inputs = replace(inputs, mm_data_items=processor.info.get_data_parser().parse_mm_data({"image": [None]}))
+    cached = processor.apply(inputs, TimingContext(enabled=False))
+    assert cached["mm_hashes"] == first["mm_hashes"] and image_counts == [1, 0]
+    item = cached["mm_kwargs"]["image"][0]
+    assert item is None or "address" in item
 
 
 def test_mrv2_allows_seed_without_images(real_processor):

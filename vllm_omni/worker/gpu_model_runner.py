@@ -15,7 +15,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
-from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem, PlaceholderRange
+from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
@@ -40,9 +40,9 @@ from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.mm_request_rng import (
-    MM_RNG_ITEM_KEY,
     RequestRNGProvider,
     supports_mm_request_rng,
+    tag_mm_rng_item,
 )
 from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
@@ -273,12 +273,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if handle is None:
                 features = self.requests[req_id].mm_features
                 handle = provider.register(req_id, seed, model.get_mm_rng_specs(features, seed))
-            field = MultiModalFieldConfig.batched(modality, keep_on_cpu=True)
-            # Cache items are shared across requests. Only this invocation's
-            # shallow copy may contain a worker-local request handle.
-            item = MultiModalKwargsItem(item)
-            item[MM_RNG_ITEM_KEY] = field.build_elems(MM_RNG_ITEM_KEY, torch.tensor([[handle, mm_index]]))[0]
-            items[i] = modality, item
+            items[i] = modality, tag_mm_rng_item(item, modality, handle, mm_index)
         return hashes, items, refs
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
