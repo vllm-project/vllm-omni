@@ -19,6 +19,7 @@ from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
     get_output_tensor_range,
+    get_video_generation_defaults,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
     should_preserve_reference_image_size,
@@ -194,6 +195,15 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
         }
     )
     assert should_init_extra_args_for_non_diffusion_stages(pipeline_name) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_minwm_defaults_accept_a_trajectory_and_reject_a_malformed_one() -> None:
+    assert get_video_generation_defaults("MinWMAction2VPipeline", {"trajectory": "a*4,w*8,s*7"}).num_frames == 77
+    for trajectory in ("w*2,x*1", "w2", "", 3):
+        with pytest.raises(ValueError, match="trajectory"):
+            get_video_generation_defaults("MinWMAction2VPipeline", {"trajectory": trajectory})
 
 
 @pytest.mark.core_model
