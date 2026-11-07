@@ -25,6 +25,7 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
+from .reference_kv_cache import ReferenceKVRefreshRequiredError
 from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -427,7 +428,19 @@ def minimax_h3_denoise_loop(
                 if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None:
                     fk["pdd_step"] = step
                 with torch.inference_mode():
-                    v_video, v_audio = model(**fk)
+                    if reference_kv_state is None:
+                        v_video, v_audio = model(**fk)
+                    else:
+                        replay_refresh = False
+                        try:
+                            v_video, v_audio = model(**fk)
+                        except ReferenceKVRefreshRequiredError:
+                            replay_refresh = True
+                        if replay_refresh:
+                            # Exit the exception scope before recomputing so
+                            # the probe traceback cannot retain activations.
+                            reference_kv_state.promote_step_to_refresh()
+                            v_video, v_audio = model(**fk)
                 if reference_kv_state is not None:
                     reference_kv_state.end_step()
                 mv_video_t = v_video.float()[update]
