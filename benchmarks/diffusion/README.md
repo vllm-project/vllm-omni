@@ -106,6 +106,9 @@ Common optional flags:
 
 - `--output-file`: Write metrics to a JSON file.
 - `--disable-tqdm`: Disable the progress bar.
+- `--request-timeout`: Total timeout in seconds for each HTTP request (default: `300`). Set to `0` to disable the total timeout; negative or non-finite values are rejected. Applies to warmup and measured requests across all endpoints, including video submission, polling, content retrieval, and cleanup. Existing connection and socket timeout settings are preserved.
+
+For example, add `--request-timeout 600` when a valid generation can take longer than five minutes. The configured value is printed and saved as `request_timeout` in the result JSON so runs with different client budgets can be distinguished. This is separate from `--video-job-timeout`, which controls the existing asynchronous video-job deadline checks between HTTP operations. Each HTTP operation uses its own request timeout, including when the total timeout is disabled.
 
 ### Resolution / frames / steps: CLI defaults vs dataset fields
 
