@@ -43,13 +43,19 @@ Preemption retains state; completion/abort/shutdown release it. Reused request I
 get new handles; live updates must preserve references, seed and draw plan.
 All-prefix hits need no generator until encoding becomes necessary.
 
+In vLLM 0.33, `encoder_input_updates` releases only worker-side feature data;
+EngineCore retains the original inputs. On resumption, the scheduler rebuilds
+`NewRequestData` from those originals. Hunyuan's M-RoPE prefix stripping removes
+covered pixels but retains seed/grid metadata, so re-admission can rebuild and
+validate the complete plan even after the worker released every image input.
+
 GPU MRv1/MRv2 and NPU MRv1 `load_model` bind the same provider. MRv2 tags temporary
 input copies around its native encoder call and retains plans across preemption;
-only completion, abort and shutdown discard them. Seeded inputs are accepted by both
-runner versions. Hunyuan on NPU MRv2 still needs a separate model state providing
-Ascend attention metadata; this RNG adapter does not add that model support.
-Execution is serialized eager encoding;
-encoder CUDA graph capture is outside scope. Seed zero enables request sampling.
+only completion, abort and shutdown discard them. Hunyuan AR is unsupported on
+NPU MRv2, with or without a seed: its model state lacks Ascend attention metadata,
+and the NPU runner rejects it at startup. Use `model_runner: v1` on NPU.
+Execution is serialized eager encoding; encoder CUDA graph capture is outside scope.
+Seed zero enables request sampling.
 Seedless AR (no effective `vae_generator_seed`) intentionally retains global-RNG
 sampling and image-based cache reuse. Multiple requests may share the encoder
 output from one VAE posterior sample. Re-encoding after eviction may produce a
@@ -82,6 +88,9 @@ missing-only transfer remain integration work under the
 Tests cover processor/cache paths, scheduler/runner batching, replay and lifecycle.
 MRv2 tests use the real encoder cache, batching and Hunyuan posterior sampling,
 including released input payloads, cache hits, preemption, retries and request-ID reuse.
+They exercise upstream input-release generation and re-admission of independent
+request copies after partial/all image consumption, with and without prefix hits.
+Mixed-request CPU/CUDA cases also check nonempty prompt embedding assembly.
 CPU load-hook tests replace hardware dependencies. The NPU dispatch test uses the
 real Ascend runner and a weight-free Hunyuan VAE on CPU to verify tagging and replay;
 it requires Ascend dependencies and is included in NPU CI. It is not NPU inference evidence.

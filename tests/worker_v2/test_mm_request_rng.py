@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MRv2 request lifecycle and real encoder dispatch with weight-free Hunyuan."""
 
+from copy import copy
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
@@ -96,7 +100,7 @@ def encode(v2, scheduled):
     ],
     indirect=True,
 )
-def test_mrv2_replays_released_prefix_and_mixed_requests(v2, make_request):
+def test_mrv2_replays_released_prefix_and_mixed_requests(v2, make_request, mocker):
     refs = hunyuan_rng.images()
     a, b = make_request("A", [*refs, refs[0]], 42), make_request("B", refs[:1], 0)
     covered = a.mm_features[0].mm_position
@@ -110,7 +114,32 @@ def test_mrv2_replays_released_prefix_and_mixed_requests(v2, make_request):
     v2._apply_encoder_input_updates(update)
     expected_a, state_a = hunyuan_rng.reference(v2, [*refs, refs[0]], 42)
     expected_b, _ = hunyuan_rng.reference(v2, refs[:1], 0)
-    hunyuan_rng.assert_latents(encode(v2, {"B": [0], "A": [1, 2, 3]}), [*expected_b, *expected_a[1:]])
+    counts = np.array([len(a.prompt_token_ids) - a.num_computed_tokens, len(b.prompt_token_ids)])
+    batch = mocker.Mock(
+        spec=InputBatch,
+        req_ids=["A", "B"],
+        num_tokens=int(counts.sum()),
+        num_tokens_after_padding=int(counts.sum()),
+        input_ids=torch.tensor(a.prompt_token_ids[a.num_computed_tokens :] + b.prompt_token_ids, device=v2.device),
+        num_scheduled_tokens=counts,
+        query_start_loc_np=np.array([0, counts[0], counts.sum()]),
+        prefill_len_np=np.array([len(a.prompt_token_ids), len(b.prompt_token_ids)]),
+        num_computed_tokens_np=np.array([a.num_computed_tokens, 0]),
+    )
+    # Encode in B/A order, then gather in A/B order through the real nonempty
+    # token merge. Include separator, ViT and ordinary text embeddings.
+    actual = v2._get_mm_embeddings({"B": [0], "A": [1, 2, 3]}, batch)
+    zero = expected_a[0].new_zeros((1, 3))
+    expected = []
+    for images, latents, start in (
+        ([*refs, refs[0]], expected_a, a.num_computed_tokens),
+        (refs[:1], expected_b, 0),
+    ):
+        parts = [zero]
+        for image, latent in zip(images, latents, strict=True):
+            parts.extend((latent, zero, image[:, 0, 0][None].to(zero)))
+        expected.append(torch.cat([*parts, zero])[start:])
+    assert torch.equal(actual, torch.cat(expected))
     handle = provider.handles["A"]
     assert torch.equal(provider.streams[handle].generator.get_state(), state_a)
     assert all(MM_RNG_ITEM_KEY not in f.data for req in (a, b) for f in req.mm_features)
@@ -118,6 +147,53 @@ def test_mrv2_replays_released_prefix_and_mixed_requests(v2, make_request):
     for i in (1, 3):
         v2.encoder_cache.free_encoder_cache(a.mm_features[i].identifier)
     hunyuan_rng.assert_latents(encode(v2, {"A": [3, 1]}), [expected_a[3], expected_a[1]])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("consumed", [1, 3])
+@pytest.mark.parametrize("prefix_hit", [False, True])
+def test_mrv2_readmits_after_input_release_and_preemption(v2, make_request, consumed, prefix_hit):
+    refs = hunyuan_rng.images()
+    req = make_request("A", refs, 42)
+    first = NewRequestData.from_request(req, ([],), req.all_token_ids, uses_mrope=True)
+    v2.add_requests(hunyuan_rng.schedule(new=[first]))
+    encode(v2, {"A": list(range(consumed))})
+    provider = v2.model._mm_rng_provider
+    handle, plan = provider.handles["A"], v2._mm_rng_state.plans["A"]
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.use_v2_model_runner, scheduler.is_encoder_decoder = True, False
+    scheduler.requests, scheduler._pending_encoder_input_ids = {"A": req}, {}
+    pos = req.mm_features[consumed - 1].mm_position
+    req.num_computed_tokens = pos.offset + pos.length
+    output = hunyuan_rng.schedule()
+    output.encoder_input_updates = scheduler._get_encoder_input_updates({"A": 1}, [first], {})
+    assert output.encoder_input_updates == {"A": {i: None for i in range(consumed)}}
+    v2._apply_encoder_input_updates(output)
+    assert all(v2.encoder_cache.mm_features["A"][i].data is None for i in range(consumed))
+    # Even the uniprocess executor must preserve EngineCore's original pixels.
+    assert all(f.data is not None and "vae_pixel_values" in f.data for f in req.mm_features)
+    output.preempted_req_ids = {"A"}
+    v2.finish_requests(output)
+
+    # Re-admit independent Request/feature objects using schedule()'s actual
+    # serialization entry point, with either retained prefix KV or recompute.
+    resumed = copy(req)
+    resumed.mm_features = [replace(f) for f in req.mm_features]
+    resumed.num_computed_tokens = req.num_computed_tokens if prefix_hit else 0
+    new = NewRequestData.from_request(resumed, ([],), resumed.all_token_ids, uses_mrope=True)
+    for feature in new.mm_features:
+        assert feature.data is not None
+        assert "vae_generator_seed" in feature.data and "vae_token_grid_hw" in feature.data
+    if prefix_hit:
+        assert all("vae_pixel_values" not in f.data for f in new.mm_features[:consumed])
+    v2.add_requests(hunyuan_rng.schedule(new=[new]))
+    assert provider.handles["A"] == handle and v2._mm_rng_state.plans["A"] == plan
+    indices = list(range(consumed if prefix_hit else 0, len(refs)))
+    v2.encoder_cache.reset_encoder_cache()
+    expected, expected_state = hunyuan_rng.reference(v2, refs, 42)
+    hunyuan_rng.assert_latents(encode(v2, {"A": indices}), [expected[i] for i in indices])
+    assert torch.equal(provider.streams[handle].generator.get_state(), expected_state)
 
 
 @pytest.mark.cpu
