@@ -2883,6 +2883,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     hidden[end - 1 : end],
                     codes,
                     request_id,
+                    state,
                     step,
                     min_tokens,
                     max_tokens,
