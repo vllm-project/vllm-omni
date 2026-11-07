@@ -2160,8 +2160,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
 
-        self._omits_kv_transfer_cache.pop(request.request_id, None)
-
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.
         # Use getattr for safety with test __new__ code paths.
@@ -2290,6 +2288,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             return kv_xfer_params, ec_xfer_params
         finally:
+            # Pop last: _should_transfer_kv_for_request() above reads the
+            # flags through _omni_final_stage_flags(), which re-caches them.
+            self._omits_kv_transfer_cache.pop(request_id, None)
             self._free_input_coordinator_request(request_id)
             # Normal completion runs through here, not finish_requests()
             # (the abort path) -- see vllm-project/vllm-omni#5349.
