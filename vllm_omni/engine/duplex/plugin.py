@@ -635,6 +635,18 @@ class DuplexModelPlugin(ABC):
         """Add model-owned context before planning an append on the session loop."""
         return config
 
+    uses_context_ledger: bool = False
+
+    def observe_history_context(
+        self,
+        *,
+        snapshot: DuplexHistorySnapshot,
+        ledger: DuplexContextLedger,
+        state: DuplexModelSessionState,
+        runtime_config: Mapping[str, object],
+    ) -> None:
+        """Observe versioned sources on the session owner loop, never a worker thread."""
+
     async def prepare_auxiliary_request(
         self,
         *,

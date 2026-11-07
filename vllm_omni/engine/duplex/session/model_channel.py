@@ -429,7 +429,11 @@ class ModelChannel:
             view_policy = self._ctx.plugin.context_view_policy(
                 stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
             )
-            if view_policy is None and not self._ctx.plugin.uses_history_context:
+            if (
+                view_policy is None
+                and not self._ctx.plugin.uses_history_context
+                and not self._ctx.plugin.uses_context_ledger
+            ):
                 history, item_ids = session.history_for_prompt()
                 snapshot = None
             else:
@@ -459,6 +463,14 @@ class ModelChannel:
                 self._ctx.plugin.bind_history_context(
                     state=self._ctx.model_state, snapshot=snapshot, ledger=session.context_ledger
                 )
+            if self._ctx.plugin.uses_context_ledger:
+                assert snapshot is not None
+                self._ctx.plugin.observe_history_context(
+                    snapshot=snapshot,
+                    ledger=session.context_ledger,
+                    state=self._ctx.model_state,
+                    runtime_config=session.runtime_config,
+                )
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
@@ -478,6 +490,15 @@ class ModelChannel:
             # Never submit the worker's stale result to the model.
             if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
                 raise DuplexFenceMismatchError(session.fence, fence)
+            if (
+                self._ctx.plugin.uses_context_ledger
+                and snapshot is not None
+                and session.history_revision != snapshot.history_revision
+            ):
+                raise DuplexRuntimeConfigError(
+                    "Conversation changed during context preparation; retry the response",
+                    code="context_changed",
+                )
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
             if on_append_prepared is not None:
