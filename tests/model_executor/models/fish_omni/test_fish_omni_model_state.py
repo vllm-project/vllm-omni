@@ -347,3 +347,47 @@ def test_pipeline_capacity_preemption_restores_frames_after_slot_reuse(make_stat
     assert "a" not in state._suspended
     outputs = scheduler.update_from_output(resumed, _output(request))
     assert all(output.finish_reason is None for batch in outputs.values() for output in batch.outputs)
+
+
+def _reference_state(make_state) -> ms.FishOmniModelState:
+    """A model state of a model that samples with hf_overrides fish_omni_reference_sampling."""
+    state = make_state()
+    state.reference_sampling = True
+    state._pending_epsilon_cutoffs = {}
+    return state
+
+
+def _sampled_request(req_id: str, top_k: int, extra_args: dict | None):
+    request = _request(req_id)
+    request.sampling_params = SimpleNamespace(temperature=1.0, top_k=top_k, top_p=1.0, seed=None, extra_args=extra_args)
+    return request
+
+
+def test_reference_sampling_slots_hold_the_request_top_k_uncapped_and_its_epsilon_cutoff(make_state):
+    """The reference rules span every candidate, so top-k is not capped at max_top_k (0 turns
+    it off); an unset epsilon_cutoff takes 1e-3; the first frame's window is the prompt tail.
+    The UVA staging pools stand in for pinned host buffers."""
+    state = _reference_state(make_state)
+    slot_columns = 5 + state.buffers.slot_ras.shape[1]
+    state._slot_pool = SimpleNamespace(copy_to_uva=torch.from_numpy, size=(4, slot_columns))
+    state._epsilon_pool = SimpleNamespace(copy_to_uva=torch.from_numpy, size=(4, 2))
+
+    state.add_request(1, _sampled_request("a", 200, {"epsilon_cutoff": 0.02}))
+    state.add_request(3, _sampled_request("b", 0, None))
+    _, _, ras = state._pending_slots[1]
+    state._flush_slot_writes()
+
+    buffers = state.buffers
+    assert buffers.slot_top_k[[1, 3]].tolist() == [200, 0]
+    assert not state._warned_top_k
+    assert buffers.slot_epsilon_cutoff[[1, 3]].tolist() == torch.tensor([0.02, 1e-3]).tolist()
+    assert ras[-PROMPT.shape[0] :] == PROMPT[:, 0].tolist()
+    assert state._pending_epsilon_cutoffs == {}
+
+
+def test_an_epsilon_cutoff_without_reference_sampling_is_refused_not_ignored(make_state):
+    state = make_state()
+    state.add_request(0, _sampled_request("a", 30, {"epsilon_cutoff": 0}))
+
+    with pytest.raises(ValueError, match="hf_overrides fish_omni_reference_sampling: true"):
+        state.add_request(1, _sampled_request("b", 30, {"epsilon_cutoff": 0.002}))
