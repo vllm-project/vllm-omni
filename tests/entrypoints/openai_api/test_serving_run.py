@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.messages import NextStageInputMessage, OutputMessage
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
 from vllm_omni.engine.serialization import serialize_additional_information
@@ -56,6 +57,7 @@ def _engine_client(response: NextStageInputMessage | OutputMessage | None = None
     response = response or _next_stage_input()
     return SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="llm")] * 2,
+        _configured_stage_routing=lambda: StageRouting.from_transitions(2),
         run_entry_stage=AsyncMock(return_value=response),
         run_downstream_stage=AsyncMock(return_value=response),
     )
@@ -75,6 +77,29 @@ def test_stage_input_round_trips_llm_receiver():
     request.additional_information = serialize_additional_information({"codes": torch.arange(2)})
     stage_input = _next_stage_input([request])
     assert decode_stage_input(encode_payload(stage_input), ("llm", "llm")) == stage_input
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source, receiver, valid", [(2, 1, True), (1, 2, False), (2, 0, False)])
+async def test_downstream_stage_call_validates_configured_order(source, receiver, valid):
+    engine_client = _engine_client()
+    engine_client.stage_configs = [SimpleNamespace(stage_type="llm")] * 3
+    engine_client._configured_stage_routing = lambda: StageRouting.from_transitions(3, ((0, 2), (2, 1)))
+    stage_input = msgspec.structs.replace(
+        _next_stage_input(),
+        source_stage_id=source,
+        receiver_stage_id=receiver,
+        sampling_params_list=[SamplingParams() for _ in range(3)],
+    )
+    request = RunRequest(stage_id=receiver, stage_input=encode_payload(stage_input))
+    if valid:
+        await ServingRun(engine_client).run(request, request_id="routed")
+        engine_client.run_downstream_stage.assert_awaited_once()
+        assert engine_client.run_downstream_stage.call_args.args[0].receiver_stage_id == receiver
+    else:
+        with pytest.raises((ValueError, OmniClientError)):
+            await ServingRun(engine_client).run(request, request_id="routed")
+        engine_client.run_downstream_stage.assert_not_awaited()
 
 
 def test_stage_input_round_trips_sampling_params():

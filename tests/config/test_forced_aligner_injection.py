@@ -9,8 +9,11 @@ from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES as _PIPELINE_REGISTRY
 from vllm_omni.config.stage_config import (
     DeployConfig,
+    PipelineConfig,
     StageExecutionType,
+    StagePipelineConfig,
 )
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     extract_stage_metadata_from_omni_stage_config,
@@ -78,6 +81,51 @@ def test_inject_noop_without_forced_aligner():
 
     assert ext_pipeline is pipeline
     assert len(ext_deploy.stages) == 0
+
+
+@pytest.mark.parametrize(
+    ("transitions", "order"),
+    [
+        (None, (0, 1, 2)),
+        (((0, 1), (1, 2)), (0, 1, 2)),
+        (((0, 2),), (0, 2)),
+        (((2, 1), (0, 2)), (0, 2, 1)),
+        ((), (0,)),
+    ],
+)
+def test_injected_aligner_extends_actual_route_tail(transitions, order):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.engine.omni_engine_base import OmniEngineBase
+
+    pipeline = PipelineConfig(
+        model_type="test",
+        stages=tuple(StagePipelineConfig(i, "audio", final_output=True, final_output_type="audio") for i in range(3)),
+        stage_transitions=transitions,
+    )
+    deploy = DeployConfig()
+    overrides = {"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B"}
+    extended, extended_deploy = inject_forced_aligner_stage(pipeline, deploy, overrides)
+
+    assert extended.stages[-1].input_sources == (order[-1],)
+    route = StageRouting.from_transitions(len(extended.stages), extended.stage_transitions)
+    assert route.stage_order == (*order, 3)
+    assert pipeline.stage_transitions == transitions
+    assert len(pipeline.stages) == 3 and deploy.stages == []
+    assert (extended.stage_transitions is None) == (transitions is None)
+
+    typed = VllmOmniConfig.from_pipeline_config(extended, user_deploy_config=extended_deploy)
+    legacy = StageConfigFactory._resolve_legacy_from_registry(pipeline, overrides, user_deploy_config=deploy)
+    assert typed.pipeline_config == legacy.pipeline_config == extended
+    assert tuple(typed.stage_configs[-1].input_sources) == (order[-1],)
+    assert tuple(legacy.stage_configs[-1].input_sources) == (order[-1],)
+
+    engine = object.__new__(OmniEngineBase)
+    engine.pipeline_config = pipeline
+    engine._set_pipeline_runtime_config(legacy.pipeline_config, None)
+    assert engine.pipeline_config is legacy.pipeline_config
+    assert StageRouting.from_transitions(
+        len(legacy.stage_configs), engine.pipeline_config.stage_transitions
+    ).stage_order == (*order, 3)
 
 
 @pytest.mark.parametrize("async_chunk", [True, False])
