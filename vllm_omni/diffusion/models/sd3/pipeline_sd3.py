@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import inspect
 import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -12,7 +15,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
+from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer, TorchAoConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -22,16 +25,46 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.sd3.sd3_transformer import (
-    SD3Transformer2DModel,
-)
+from vllm_omni.diffusion.models.sd3.sd3_transformer import SD3Transformer2DModel
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig, resolve_component_quant_config
+from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _get_t5_quantization_config(
+    quant_config: "QuantizationConfig | None", *, cpu_offload: bool = False
+) -> TorchAoConfig | None:
+    # A global DiT config must not implicitly quantize the Transformers encoder.
+    if not isinstance(quant_config, ComponentQuantizationConfig):
+        return None
+    encoder_config = quant_config.resolve("text_encoder_3")
+    if encoder_config is None:
+        return None
+    if not isinstance(encoder_config, DiffusionInt8Config):
+        raise ValueError("SD3 text_encoder_3 supports only online INT8 weight-only quantization")
+    if encoder_config.is_checkpoint_int8_serialized:
+        raise ValueError("SD3 text_encoder_3 requires an online INT8 config, not a serialized INT8 checkpoint")
+    if cpu_offload:
+        raise ValueError(
+            "SD3 INT8 T5 requires resident models; disable diffusion CPU offload or omit text_encoder_3 quantization"
+        )
+
+    from torchao.quantization import Int8WeightOnlyConfig
+
+    return TorchAoConfig(
+        quant_type=Int8WeightOnlyConfig(set_inductor_config=False),
+        modules_to_not_convert=encoder_config.ignored_layers,
+    )
 
 
 def get_sd3_image_post_process_func(
@@ -158,6 +191,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         self.device = get_local_device()
         model = od_config.model
+        t5_quantization_config = _get_t5_quantization_config(
+            od_config.quantization_config,
+            cpu_offload=resolve_offload(od_config).strategy is not OffloadStrategy.NONE,
+        )
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
@@ -234,8 +271,17 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             prefetch_list=sd3_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            quantization_config=t5_quantization_config,
+            # Quantize each checkpoint tensor on CPU before GPU placement;
+            # never materialize the full BF16 T5 on GPU.
+            device_map="cpu" if t5_quantization_config is not None else None,
         )
-        self.transformer = SD3Transformer2DModel(od_config=od_config)
+        if t5_quantization_config is not None:
+            self.text_encoder_3.to(self.device)
+        self.transformer = SD3Transformer2DModel(
+            od_config=od_config,
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
+        )
 
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKL.from_pretrained,
@@ -589,7 +635,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         """
         self.scheduler.set_begin_index(0)
 
-        for _, t in enumerate(timesteps):
+        for t in timesteps:
             if self.interrupt:
                 continue
             self._current_timestep = t
@@ -724,6 +770,13 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 max_sequence_length=max_sequence_length,
             )
 
+        compute_dtype = self.od_config.dtype
+        prompt_embeds = prompt_embeds.to(dtype=compute_dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=compute_dtype)
+        if do_cfg:
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=compute_dtype)
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(dtype=compute_dtype)
+
         num_channels_latents = self.transformer.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -751,6 +804,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
 
         self._current_timestep = None
+
         if output_type == "latent":
             image = latents
         else:

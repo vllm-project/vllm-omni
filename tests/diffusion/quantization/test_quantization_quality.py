@@ -222,6 +222,24 @@ QUALITY_CONFIGS = [
         diffusion_attention_backend="TORCH_SDPA",
     ),
     QualityTestConfig(
+        id="fp8_int8_sd3_medium",
+        model="stabilityai/stable-diffusion-3-medium-diffusers",
+        quantization={"transformer": {"method": "fp8"}, "text_encoder_3": {"method": "int8"}},
+        task="t2i",
+        prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.25,
+        num_inference_steps=20,
+    ),
+    QualityTestConfig(
+        id="fp8_int8_sd3_5_medium",
+        model="stabilityai/stable-diffusion-3.5-medium",
+        quantization={"transformer": {"method": "fp8"}, "text_encoder_3": {"method": "int8"}},
+        task="t2i",
+        prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.25,
+        num_inference_steps=20,
+    ),
+    QualityTestConfig(
         id="fp8_ltx2",
         model="Lightricks/LTX-2",
         quantization="fp8",
@@ -451,6 +469,29 @@ def _free_gpu_memory():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_benchmark_rejects_null_component_config(monkeypatch):
+    from benchmarks.diffusion.quantization_quality import parse_args
+
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--model", "local-model", "--quantization-config", "null"])
+    with pytest.raises(SystemExit) as exc:
+        parse_args()
+    assert exc.value.code == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_benchmark_component_config_reaches_omni(monkeypatch):
+    from benchmarks.diffusion.quantization_quality import _build_omni_kwargs, parse_args
+
+    spec = {"transformer": {"method": "fp8"}, "text_encoder_3": {"method": "int8"}}
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--model", "local-model", "--quantization-config", json.dumps(spec)])
+    args = parse_args()
+    kwargs = _build_omni_kwargs(args, quantization=args.quantization_config)
+    assert kwargs["quantization_config"] == spec
 
 
 @pytest.mark.core_model
