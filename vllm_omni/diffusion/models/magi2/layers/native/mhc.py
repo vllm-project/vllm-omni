@@ -14,6 +14,7 @@ import torch
 from vllm_omni.diffusion.layers.mhc import MHCMix, MHCPostResidual
 
 from ...common_layers import MHCTensorTuple
+from ...mhc_sinkhorn import mhc_sinkhorn_iterations
 
 _mhc_post_residual = MHCPostResidual()
 _mhc_mix = MHCMix()
@@ -30,6 +31,27 @@ def _mhc_mix_fp32(
     accumulate = torch.promote_types(streams.dtype, torch.float32)
     mixed = (residual_matrix.to(accumulate).unsqueeze(-1) * streams.to(accumulate).unsqueeze(1)).sum(2)
     return mixed.to(streams.dtype) + branch
+
+
+def _mhc_post_residual_fused_sinkhorn(
+    post_logits: torch.Tensor,
+    residual_logits: torch.Tensor,
+    alpha_post: torch.Tensor,
+    bias_post: torch.Tensor,
+    alpha_residual: torch.Tensor,
+    bias_residual: torch.Tensor,
+    *,
+    scale: float,
+    iterations: int,
+    epsilon: float,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``MHCPostResidual.forward_native`` with the Sinkhorn iterations of four streams in one kernel."""
+    post = 2.0 * torch.sigmoid(alpha_post * scale * post_logits + bias_post.unsqueeze(0))
+    logits = alpha_residual * scale * residual_logits.float() + bias_residual.unsqueeze(0).float()
+    matrix = torch.exp(logits - logits.amax(dim=(-2, -1), keepdim=True))
+    residual = mhc_sinkhorn_iterations(matrix, iterations, epsilon)
+    return post.to(out_dtype), residual.to(out_dtype)
 
 
 class MHCHandler:
@@ -52,6 +74,8 @@ class MHCHandler:
         self.matmul_scale = 1.0 / math.sqrt(float(num_streams * hidden_size))
         # Hardware leaves may opt into FP32 stream contractions.
         self.fp32_stream_contractions = False
+        # Hardware leaves may opt into the one-kernel Sinkhorn iterations.
+        self.fused_sinkhorn = False
 
     def flatten(self, tensor: torch.Tensor) -> torch.Tensor:
         self._check_multi(tensor)
@@ -131,7 +155,12 @@ class MHCHandler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         alpha_post, bias_post, post_logits = post
         alpha_residual, bias_residual, residual_logits = residual
-        prepare = _mhc_post_residual if not torch.compiler.is_compiling() else _mhc_post_residual.forward_native
+        if not torch.compiler.is_compiling():
+            prepare = _mhc_post_residual
+        elif self.fused_sinkhorn and not (torch.is_grad_enabled() and any(t.requires_grad for t in (*post, *residual))):
+            prepare = _mhc_post_residual_fused_sinkhorn
+        else:
+            prepare = _mhc_post_residual.forward_native
         return prepare(
             post_logits,
             residual_logits,
