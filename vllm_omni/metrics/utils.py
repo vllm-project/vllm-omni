@@ -128,6 +128,11 @@ def observe_diffusion_finalize(
             mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
 
     pre_s = diff_metrics.get("preprocess_time_s")
+    if pre_s is None and exec_s is not None:
+        # The engine leaves preprocess out when no pre-processor ran. The
+        # histogram keeps its 0 sample for such requests until the metrics
+        # owners decide otherwise (RFC #8671).
+        pre_s = 0.0
     if pre_s is not None:
         mod_metrics.observe_diffusion_preprocess(stage_label, replica_label, float(pre_s))
 
