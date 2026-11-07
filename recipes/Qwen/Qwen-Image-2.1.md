@@ -18,7 +18,7 @@
 
 Use this recipe as a starting point for running `Qwen/Qwen-Image-2.1`. A single
 pipeline class, `QwenImage21Pipeline`, handles both pure text-to-image requests
-(no condition image) and image-conditioned requests with up to 4 condition
+(no condition image) and image-conditioned requests with up to 10 condition
 images: prompt and condition images are encoded together by a Qwen3-VL text
 encoder, so editing-style requests go through the same serving path as
 text-to-image.
@@ -170,7 +170,7 @@ or via the bundled launcher:
 bash examples/offline_inference/image_to_image/run_qwen_image_21.sh
 ```
 
-Up to 4 condition images can be passed via `--image`:
+Up to 10 condition images can be passed via `--image`:
 
 ```bash
 python examples/offline_inference/image_to_image/image_edit.py \
@@ -190,6 +190,13 @@ shared example otherwise loads inputs as RGB. Add `--width` and `--height`
 it from the last condition image's aspect ratio at approximately 1024×1024.
 Use `--num-outputs-per-prompt` to generate multiple images and `--vae-use-tiling`
 to reduce VAE memory usage. The launcher accepts these options as well.
+
+Each condition image is resized to approximately 1024×1024 pixels in area
+before encoding. More reference images increase encoding and prefix KV-cache
+memory; account for the reference count when choosing batch size and CFG settings.
+For large reference sets on an 80GB GPU, start with `--max-num-seqs 1`.
+With step execution, use `--enforce-eager` to leave room for the condition prefix
+instead of CUDA-graph pools.
 
 ## Online Serving
 
@@ -291,7 +298,7 @@ OpenAI-compatible multimodal endpoint (`/v1/chat/completions` with
 | `num_inference_steps` | 50 | Number of denoising steps. |
 | `height` / `width` | 1024×1024 | Must be multiples of 32. For image-conditioned requests, leaving them unset derives the output size from the last condition image's aspect ratio at ~1024×1024. |
 | `negative_prompt` | None | Ignored at the default CFG scale of 1.0; used only when `true_cfg_scale > 1`. |
-| condition images | — | Up to 4 input images per request; more than 4 raises an error. |
+| condition images | — | Up to 10 input images per request; more than 10 raises an error. |
 | `seed` | — | Fix for reproducible outputs. |
 
 The default CFG scale of 1.0 runs only the positive-prompt branch at each
@@ -383,7 +390,7 @@ for the scope rules.
 
 The cached prefix K/V can be stored in FP8 E4M3 (with per-token-per-head fp32
 scales), halving the prefix-cache memory — relevant for long prompts (up to
-8192 text tokens) and up to 4 condition images (~4096 latent tokens each).
+8192 text tokens) and up to 10 condition images (~4096 latent tokens each).
 Prefill quantizes once; decode dequantizes per step, so attention compute is
 unchanged. Enable it through the model-specific `extras` config (e.g. in the
 deploy YAML's stage `extras` or as an `Omni(...)` engine kwarg):
@@ -407,8 +414,8 @@ cache, so `"fp8_v"` buys back about 9.8 dB at 75% (instead of 50%) of the origin
 cache size. The residual error is inherent e4m3 precision accumulated
 coherently over the denoising trajectory; finer scale granularity
 (per-tensor/per-head/per-token were compared) or Hadamard-rotated V did not
-improve it. The saving scales with prefix length. These sizes are calculated at the
-limit (8192 text tokens + 4 condition images, ~24.6k prefix tokens), not
+improve it. The saving scales with prefix length. These sizes are calculated for
+a four-image example (8192 text tokens + 4 condition images, ~24.6k prefix tokens), not
 measured on the 1024 T2I run above: ~12.9 GB per CFG branch in bf16, ~6.6 GB
 in `"fp8"` and ~9.7 GB in `"fp8_v"`. That is where this option matters. Treat it as an opt-in for
 memory-bound long-prompt / multi-image workloads, not a free lunch;
