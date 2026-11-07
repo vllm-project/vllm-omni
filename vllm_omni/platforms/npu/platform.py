@@ -402,7 +402,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         output data.
         """
         try:
-            torch.npu.current_stream().synchronize()
             # The async output worker uses the public ``torch.Stream`` API.
             # With torch_npu 2.10, a native ``torch.npu.Event`` cannot be
             # consumed by that wrapper stream (the reverse direction is
