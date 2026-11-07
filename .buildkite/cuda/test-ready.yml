@@ -281,6 +281,17 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · Qwen Image 2.1 Test"
+        source_file_dependencies: diffusion_qwen_image_21_function
+        timeout_in_minutes: 55
+        commands:
+          - |
+            timeout 50m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_qwen_image_21.py -m 'advanced_model and diffusion and cuda' --run-level 'advanced_model'
+            "
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · HunyuanVideo-1.5 Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         commands:
