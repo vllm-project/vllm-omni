@@ -1676,6 +1676,74 @@ class TestTTSMethods:
 
         assert exc_info.value.retryable is False
 
+    @pytest.mark.asyncio
+    async def test_collect_and_raise_synthesis_error_helper(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        """The shared helper is the single place the flag is surfaced."""
+        adapter = mocker.MagicMock()
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio"):
+            speech_server._collect_and_raise_synthesis_error({"audio": [b"x"]}, {})
+
+        # A clean output must not raise.
+        adapter.collect_response_metadata = lambda _audio_output, collect: None
+        speech_server._collect_and_raise_synthesis_error({"audio": [b"x"]}, {})
+
+    def test_batch_items_pass_collect_so_failures_surface(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        """Batch used to swallow the flag: no ``collect`` was passed at all."""
+        speech_server._check_model = mocker.AsyncMock(return_value=None)
+        speech_server._batch_max_items = 32
+        speech_server._validate_tts_request = mocker.Mock(return_value=None)
+        speech_server._generate_audio_bytes = mocker.AsyncMock(side_effect=TTSGenerationError("boom", retryable=False))
+
+        batch = BatchSpeechRequest(items=[SpeechBatchItem(input="hello")])
+        response = asyncio.run(speech_server.create_speech_batch(batch))
+
+        call = speech_server._generate_audio_bytes.await_args
+        assert isinstance(call.kwargs.get("collect"), dict)
+        assert response.results[0].status == "error"
+        assert "boom" in (response.results[0].error or "")
+
+    @pytest.mark.asyncio
+    async def test_streaming_audio_synthesis_error_terminates_the_stream(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        """A flagged failure must abort the stream instead of completing cleanly."""
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        adapter = mocker.MagicMock()
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        adapter.validate_stream_audio = lambda **_kwargs: None
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+        mocker.patch.object(
+            speech_server,
+            "create_audio",
+            return_value=SimpleNamespace(audio_data=b"dummy", media_type="audio/pcm"),
+        )
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio"):
+            async for _chunk in speech_server._generate_audio_chunks(
+                mock_generate(), "speech-stream-synth-err", collect={}
+            ):
+                pass
+
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
         mock_engine_client = mocker.MagicMock()
