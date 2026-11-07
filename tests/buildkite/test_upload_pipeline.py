@@ -574,23 +574,44 @@ def test_qwen3_perf_pipeline_selection(
 
 
 @pytest.mark.parametrize(
-    ("changed_file", "selected"),
+    ("changed_files", "selected"),
     [
-        ("tests/model_executor/models/minicpmo_4_5/test_talker_mrv2_cuda.py", True),
-        (".buildkite/amd/test-amd-ready.yml", True),
-        ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", False),
+        (["tests/model_executor/models/minicpmo_4_5/test_talker_mrv2_cuda.py"], True),
+        ([".buildkite/amd/test-amd-ready.yml"], True),
+        (["vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py"], False),
+        (
+            [
+                ".buildkite/cuda/test-ready.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/ci_source_file_dependencies.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/scripts/upload_pipeline.py",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
     ],
 )
 def test_cuda_ready_r2_01_collection_count_follows_its_inputs(
     monkeypatch: pytest.MonkeyPatch,
-    changed_file: str,
+    changed_files: list[str],
     selected: bool,
 ) -> None:
     """A change that can move the AMD R2-01 pin must run its CUDA READY check."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     _load_source_file_dependencies.cache_clear()
     doc = yaml.safe_load(CUDA_READY_YAML.read_text(encoding="utf-8"))
-    rendered = _render_test_pipeline(doc, changed_files=[changed_file], pipeline_path=CUDA_READY_YAML)
+    rendered = _render_test_pipeline(doc, changed_files=changed_files, pipeline_path=CUDA_READY_YAML)
     labels = {step.get("label") for step in _iter_steps(rendered)}
 
     assert ("Simple · ROCm R2-01 Collection Count" in labels) is selected
