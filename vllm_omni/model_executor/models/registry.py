@@ -369,6 +369,7 @@ _OMNI_MODELS = {
         "vibevoice",
         "VibeVoiceForConditionalGeneration",
     ),
+    "PhononTalkerForConditionalGeneration": ("phonon", "phonon_talker", "PhononTalkerForConditionalGeneration"),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",

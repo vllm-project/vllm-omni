@@ -1,0 +1,25 @@
+model_runner: v2
+async_chunk: false
+dtype: bfloat16
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    kv_cache_memory_bytes: 268435456
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512]
+      max_cudagraph_capture_size: 512
+    devices: "0"
+    engine_extras:
+      hf_overrides:
+        architectures: [PhononTalkerForConditionalGeneration]
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1500
+      detokenize: false
