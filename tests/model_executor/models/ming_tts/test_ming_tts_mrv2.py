@@ -104,7 +104,8 @@ def test_ming_tts_postprocess_finds_pending_update_by_mrv2_req_id():
     model.model_stage = "llm"
     model.model = _PendingLLM("req-0")
 
-    update = model.postprocess(torch.zeros(1, 16), req_id="req-0", **{KEY_DECODE_STEP: 3})
+    # An explicit None under an earlier key must not hide ``req_id``.
+    update = model.postprocess(torch.zeros(1, 16), req_id="req-0", request_id=None, **{KEY_DECODE_STEP: 3})
 
     assert update[KEY_REQUEST_ID] == "req-0"
     assert update[KEY_DECODE_STEP] == 4
@@ -143,3 +144,7 @@ def test_ming_audio_vae_releases_aborted_request_state():
 
     vae.on_requests_finished({"runner-a"})
     assert set(vae._past_key_values) == set(vae._stream_state) == {"runner-b"}
+
+    # A payload without a runner id could never be freed, so it must fail loudly.
+    with pytest.raises(RuntimeError, match="no runner request id"):
+        vae(model_intermediate_buffer=[chunk, dict(chunk)], request_ids=["runner-c"])
