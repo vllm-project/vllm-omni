@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from dataclasses import asdict, fields, replace
@@ -2695,6 +2696,51 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+@pytest.mark.parametrize("stage_id", [0, 3])
+@pytest.mark.parametrize("encode_json", [False, True], ids=["mapping", "json"])
+def test_cli_sampling_defaults_merge_by_stage_id(stage_id: int, encode_json: bool) -> None:
+    pipeline = PipelineConfig(
+        model_type="test_sampling_defaults",
+        stages=(
+            StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=stage_id,
+                default_sampling_params={
+                    "num_inference_steps": 50,
+                    "guidance_scale": 3.0,
+                    "extra_args": {"flow_shift": 5.0},
+                },
+            )
+        ]
+    )
+    overrides = {str(stage_id): {"guidance_scale": 0.0, "extra_args": {"use_system_prompt": "dynamic"}}}
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"default_sampling_params": json.dumps(overrides) if encode_json else overrides},
+    )
+    assert config.stage_by_id(stage_id).model_config.default_sampling_params == {
+        "num_inference_steps": 50,
+        "guidance_scale": 0.0,
+        "extra_args": {"flow_shift": 5.0, "use_system_prompt": "dynamic"},
+    }
+    assert deploy.stages[0].default_sampling_params == {
+        "num_inference_steps": 50,
+        "guidance_scale": 3.0,
+        "extra_args": {"flow_shift": 5.0},
+    }
 
 
 def test_kernel_config_mapping_has_a_typed_owner_and_projects_to_engine_args():

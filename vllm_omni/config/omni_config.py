@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
@@ -2423,6 +2424,21 @@ class VllmOmniConfig:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        sampling_defaults = cli_overrides.get("default_sampling_params")
+        if isinstance(sampling_defaults, str):
+            sampling_defaults = json.loads(sampling_defaults)
+        for stage_key, overrides in (sampling_defaults or {}).items():
+            stage_id = int(stage_key)
+            if stage_id not in deploy_by_id:
+                stage_deploy = StageDeployConfig(stage_id=stage_id)
+                deploy.stages.append(stage_deploy)
+                deploy_by_id[stage_id] = stage_deploy
+            stage_deploy = deploy_by_id[stage_id]
+            defaults = stage_deploy.default_sampling_params or {}
+            merged = {**defaults, **overrides}
+            if "extra_args" in overrides:
+                merged["extra_args"] = {**defaults.get("extra_args", {}), **overrides["extra_args"]}
+            stage_deploy.default_sampling_params = merged
         update_deploy_config_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 
