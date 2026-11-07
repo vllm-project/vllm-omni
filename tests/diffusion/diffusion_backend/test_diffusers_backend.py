@@ -381,12 +381,17 @@ class TestPipelineArgumentsHandling:
             adapter.load_weights()
         mock_from_pretrained.assert_not_called()
 
-    def test_adapter_rejects_dduf_file_with_converted_quantization(self):
-        with pytest.raises(NotImplementedError, match="dduf_file"):
+    @pytest.mark.parametrize("dduf_key", ["dduf_file", "dduf_entries"])
+    @pytest.mark.parametrize("quantization_config", [None, SimpleNamespace(quant_method="gguf")])
+    def test_adapter_rejects_dduf_load_kwargs(self, quantization_config, dduf_key):
+        load_kwargs: dict[str, object] = {dduf_key: "model.dduf"}
+        if quantization_config is not None:
+            load_kwargs["quantization_config"] = object()
+        with pytest.raises(NotImplementedError, match="DDUF"):
             DiffusersAdapterPipeline(
                 od_config=_make_od_config(
-                    quantization_config=SimpleNamespace(quant_method="int8"),
-                    diffusers_load_kwargs={"dduf_file": "model.dduf"},
+                    quantization_config=quantization_config,
+                    diffusers_load_kwargs=load_kwargs,
                 )
             )
 
@@ -407,17 +412,14 @@ class TestPipelineArgumentsHandling:
         adapter = DiffusersAdapterPipeline(
             od_config=_make_od_config(
                 quantization_config=SimpleNamespace(quant_method="gguf"),
-                diffusers_load_kwargs={
-                    "dduf_file": "model.dduf",
-                    "quantization_config": diffusers_native_quantization_config,
-                },
+                diffusers_load_kwargs={"quantization_config": diffusers_native_quantization_config},
             )
         )
         adapter.load_weights()
 
         kwargs = mock_from_pretrained.call_args.kwargs
         assert kwargs["quantization_config"] is diffusers_native_quantization_config
-        assert kwargs["dduf_file"] == "model.dduf"
+        assert "dduf_file" not in kwargs
 
     def test_adapter_load_weights_builds_diffusers_native_quantization_config_from_dict(self, mocker):
         FakePipelineQuantizationConfig, FakeTorchAoConfig, _ = _patch_fake_diffusers_quantization_backends(mocker)

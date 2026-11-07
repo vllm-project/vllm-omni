@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/diffusers_pipeline_adapter>.
 
-
 vLLM-Omni supports running diffusion models with the diffusers backend, directly serving any 🤗 Diffusers pipeline online without implementing them natively.
 
 ## Limitations
@@ -58,6 +57,9 @@ For example: `--diffusers-load-kwargs '{"use_safetensors": true}'`.
 
 When a parameter is available in the vLLM-Omni interface, it will be adapted here.
 But if that parameter is simultaneously set in both the vLLM-Omni interface and `diffusers_load_kwargs`, the **latter** will take precedence.
+
+Diffusers 0.42.1 removed DDUF loading, so `dduf_file` and `dduf_entries` are rejected by the diffusers backend.
+Convert a DDUF bundle to the standard Diffusers directory format before loading it.
 
 ### `--diffusers-call-kwargs`
 
