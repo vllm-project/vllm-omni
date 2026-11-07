@@ -587,20 +587,14 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
 
         return model_output
 
-    def _gather_runtime_additional_information(self):
-        """NPU parity fix for MiniCPM-o-4.5 Code2Wav request_id injection.
+    def _gather_runtime_additional_information(self) -> list[dict]:
+        """Stamp missing request IDs without changing the payload layout.
 
-        On GPU, ``OmniGPUModelRunner._preprocess`` unconditionally writes
-        ``req_infos["request_id"] = req_id`` (gpu_model_runner.py:1756) so that
-        every stage's ``model_intermediate_buffer`` entry carries the engine
-        request id. The NPU runner inherits ``execute_model`` from vllm_ascend
-        and never runs omni's ``_preprocess``, so this id is otherwise missing
-        on NPU. This override mirrors that GPU step at the gather point (called
-        from ``_build_model_kwargs_extra`` -> forward), using the engine
-        authoritative ``input_batch.req_ids`` and writing it both top-level and
-        into ``meta`` so Code2Wav._parse_item (which reads either key) resolves
-        it. Only fills when absent, so async_chunk=True handoffs that already
-        carry the id are left untouched.
+        Reuse GPU gathering for batch order and generated_len, then supply the
+        request ID needed by Code2Wav, which accepts either the top-level or
+        nested field. Like GPU preprocessing, keep flat metadata flat: adding
+        an ID-only meta dict would hide MammothModa2's top-level T2I fields
+        from its model-side metadata reader. Existing handoff IDs are retained.
         """
         infos = super()._gather_runtime_additional_information()
         for req_id, info in zip(self.input_batch.req_ids, infos):
@@ -609,9 +603,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
             if info.get("request_id"):
                 continue
             meta = info.get("meta")
-            if not isinstance(meta, dict):
-                meta = {}
-                info["meta"] = meta
-            meta["request_id"] = req_id
+            if isinstance(meta, dict):
+                meta["request_id"] = req_id
             info["request_id"] = req_id
         return infos
