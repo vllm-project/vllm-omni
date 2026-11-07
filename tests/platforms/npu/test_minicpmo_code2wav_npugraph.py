@@ -492,10 +492,13 @@ def test_fused_body_npugraph_matches_its_eager_path_with_inference_weights():
     embedding[1].copy_(embedding[0])
     lengths = torch.tensor([6, 4], device="npu")
     cnn = torch.randn(2, 2, 32, 2, device="npu")
-    att = torch.randn(2, 2, 2, 5, 16, device="npu")
+    # ``(depth, 2, N, H, frames, D)``: K and V keep a leading axis so one
+    # layer slice is a contiguous pair; the upstream packed layout instead
+    # merges both halves into a ``2 * head_dim`` trailing width.
+    att = torch.randn(2, 2, 2, 2, 5, 8, device="npu")
     mask = torch.ones(2, 6, 11, dtype=torch.bool, device="npu")
     static_cnn = torch.empty_like(cnn)
-    static_att = torch.empty(2, 2, 2, 11, 16, device="npu")
+    static_att = torch.empty(2, 2, 2, 2, 11, 8, device="npu")
 
     def run(cnn_out, att_out, body=blocks_forward_chunk_fused_npu):
         return body(estimator, x, embedding, mask, cnn, att, cnn_out, att_out, lengths)

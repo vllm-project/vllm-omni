@@ -147,15 +147,27 @@ def _graphable_estimator_step(
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
     old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+    # Upstream walks the layers itself and needs ``[K | V]`` packed per layer,
+    # while the buffers kept across steps split K/V on a leading axis: pack on
+    # the way in and unpack the result back into ``att_out``, so the graph's
+    # output placeholder stays on the split layout the next step expects.
+    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+        _pack_att_cache,
+        _packed_att_buffer,
+        _unpack_att_cache,
+    )
+
+    packed_out = _packed_att_buffer(att_out)
     result = estimator.blocks_forward_chunk(
         estimator_input,
         time_embedding,
         attn_mask,
         old_cnn,
-        old_att,
+        _pack_att_cache(old_att),
         cnn_out,
-        att_out,
+        packed_out,
     )
+    _unpack_att_cache(packed_out, att_out)
     return result, cnn_out, att_out
 
 
