@@ -12,7 +12,25 @@ steps:
     steps:
       - label: "Simple · Model Executor Test"
         timeout_in_minutes: 20
+        env:
+          QWEN3_OMNI_PROCESSOR_REQUIRED: "1"
         commands:
+          # Cache only the pinned processor/tokenizer; pytest stays local-only.
+          - |
+            python - <<'PY'
+            from transformers import AutoProcessor
+            from tests.model_executor.models.qwen3_omni.test_duplex_context_view_processor import (
+                PROCESSOR_MODEL,
+                PROCESSOR_REVISION,
+            )
+
+            AutoProcessor.from_pretrained(
+                PROCESSOR_MODEL,
+                revision=PROCESSOR_REVISION,
+                local_files_only=False,
+                trust_remote_code=False,
+            )
+            PY
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
