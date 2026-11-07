@@ -304,6 +304,55 @@ def resolve_int_by_sequential_keys(
     return None
 
 
+def _is_pooled_output(candidate: object) -> bool:
+    """Whether ``candidate`` is one pooled output rather than a list of them.
+
+    A ``PoolingOutput`` carries the pooled ``data`` and no per-completion
+    fields. The check is duck-typed on purpose, so a renamed or subclassed
+    upstream type is still recognized; the trade-off is that any non-sequence
+    object exposing ``data`` (a bare tensor, for example) is read as a single
+    pooled entry instead of being iterated. That is the safer direction: a
+    pooled entry is never mistaken for a sequence of completions, while the
+    reverse would lose the completions' text and finish reason.
+    """
+    return hasattr(candidate, "data") and not isinstance(candidate, Sequence)
+
+
+def iter_output_entries(mm_source: object) -> list[Any]:
+    """Return the output entries carried by ``mm_source.outputs`` as a list.
+
+    vLLM's generation ``RequestOutput`` carries a list of ``CompletionOutput``
+    in ``outputs``, but a pooling stage's ``PoolingRequestOutput`` carries a
+    single ``PoolingOutput`` there: upstream ``_new_request_output`` unwraps
+    the one-element list before building it. Normalize both shapes so callers
+    can iterate the entries without mistaking a ``PoolingOutput`` for a
+    sequence of completions.
+
+    Any other iterable is read as a sequence of completions, as before. No
+    upstream ``outputs`` type is a string or a mapping, but the fallback would
+    expand one into characters or keys.
+
+    Args:
+        mm_source: Duck-typed container with an optional ``outputs`` attribute
+            (e.g. vLLM ``RequestOutput`` or ``PoolingRequestOutput``).
+
+    Returns:
+        The output entries in discovery order. Empty when ``outputs`` is absent.
+    """
+    outs = getattr(mm_source, "outputs", None)
+    if outs is None:
+        return []
+    if isinstance(outs, (list, tuple)):
+        return list(outs)
+    if _is_pooled_output(outs):
+        return [outs]
+    try:
+        return list(outs)
+    except TypeError:
+        # Neither a sequence of completions nor a pooled output.
+        return [outs]
+
+
 def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     """Return the first non-empty multimodal_output Mapping on ``mm_source``.
 
@@ -325,7 +374,7 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(mm, Mapping) and mm:
         return mm
-    outs = getattr(mm_source, "outputs", None)
+    outs = iter_output_entries(mm_source)
     if outs:
         nested = getattr(outs[0], "multimodal_output", None)
         if isinstance(nested, Mapping) and nested:
@@ -343,6 +392,8 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
 
     Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
     Used by stage-pool metrics aggregation that needs to visit every mm payload.
+    A pooling stage contributes no multimodal Mapping: its ``PoolingOutput``
+    carries pooled tensors, not a ``multimodal_output``.
 
     Args:
         mm_source: Duck-typed container with optional ``multimodal_output`` and/or
@@ -356,7 +407,7 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in getattr(mm_source, "outputs", None) or []:
+    for output in iter_output_entries(mm_source):
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
@@ -636,17 +687,17 @@ def count_tokens_from_outputs(engine_outputs: list[Any]) -> int:
     total = 0
     for _ro in engine_outputs:
         try:
-            outs = getattr(_ro, "outputs", None)
-            if outs and len(outs) > 0:
-                for output in outs:
-                    # In DELTA mode token_ids only contains the latest chunk.
-                    # Omni's output processor attaches the cumulative sequence
-                    # for inter-stage routing and accurate metrics.
-                    tokens = getattr(output, "cumulative_token_ids", None)
-                    if tokens is None:
-                        tokens = getattr(output, "token_ids", None)
-                    if tokens is not None:
-                        total += len(tokens)
+            for output in iter_output_entries(_ro):
+                # In DELTA mode token_ids only contains the latest chunk.
+                # Omni's output processor attaches the cumulative sequence
+                # for inter-stage routing and accurate metrics.
+                # A pooled output carries no token ids, so a pooling stage
+                # counts as zero tokens rather than raising.
+                tokens = getattr(output, "cumulative_token_ids", None)
+                if tokens is None:
+                    tokens = getattr(output, "token_ids", None)
+                if tokens is not None:
+                    total += len(tokens)
         except Exception:
             # Ignore any issues with individual outputs to keep token counting best-effort.
             pass
