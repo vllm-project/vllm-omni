@@ -1702,7 +1702,10 @@ stages:
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_default_runner_is_v2_on_cuda_only(self, platform):
+    def test_qwen3_omni_default_runner_is_v2_on_cuda_and_npu(self, platform, monkeypatch):
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
         pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         assert isinstance(pipeline, PipelineConfig)
         deploy = _apply_platform_overrides(
@@ -1710,9 +1713,13 @@ stages:
             platform=platform,
         )
         stages = merge_pipeline_deploy(pipeline, deploy)
-        expect_v2 = platform == "cuda"
+        expect_v2 = platform in {"cuda", "npu"}
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            expect_v2,
+            expect_v2,
+            expect_v2,
+        ]
         assert stages[0].yaml_engine_args["enable_prefix_caching"] is expect_v2
 
         duplex = _apply_platform_overrides(
@@ -2095,7 +2102,8 @@ stages:
         ("yaml_name", "platform", "enabled"),
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
-            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("qwen3_omni_moe.yaml", "npu", True),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),

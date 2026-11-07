@@ -6,7 +6,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -106,6 +106,12 @@ TALKER_CODEC_NOTHINK_ID = 4203  # No-think mode
 TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+
 logger = init_logger(__name__)
 
 # The encoder CUDA graph protocol, forwarded from the thinker to the stage
@@ -188,6 +194,17 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_active = False
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
+
+    def create_omni_model_state(
+        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
+    ) -> "OmniModelState":
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        if current_omni_platform.is_npu() and self.model_stage in ("thinker", "talker"):
+            from vllm_omni.platforms.npu.models.qwen3_omni_model_state import NPUQwen3OmniModelState
+
+            return NPUQwen3OmniModelState(vllm_config, self, encoder_cache, device)
+        return OmniModelState(vllm_config, self, encoder_cache, device)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

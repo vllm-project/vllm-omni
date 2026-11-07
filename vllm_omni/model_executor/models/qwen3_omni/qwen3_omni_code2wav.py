@@ -299,6 +299,17 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
         if device is None:
             device = next(self.parameters()).device
+        if device.type == "npu":
+            from vllm_omni.platforms.npu.models.code2wav_graph import (
+                NPUGraphDecoderWrapper,
+                prepare_code2wav_graph_runtime,
+            )
+
+            prepare_code2wav_graph_runtime()
+            self._cudagraph_wrapper = NPUGraphDecoderWrapper(self, self.config.num_quantizers)
+            self._cudagraph_enabled = True
+            logger.info("Code2Wav exact-shape NPUGraph enabled (capture on first use, up to 32 shapes).")
+            return
         if device.type != "cuda":
             logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)
             return
@@ -357,7 +368,25 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             extra_shapes,
         )
 
-    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+    def _graph_attention_mask(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        # Codec inputs are contiguous, unpadded sequences without a KV
+        # cache. Explicit masks avoid HF packed-sequence detection reading
+        # device values on the host during NPUGraph capture.
+        positions = torch.arange(hidden.shape[1], device=hidden.device)
+        distance = positions[:, None] - positions[None, :]
+        allowed = distance >= 0
+        full_mask = torch.zeros(distance.shape, dtype=hidden.dtype, device=hidden.device)
+        full_mask.masked_fill_(~allowed, torch.finfo(hidden.dtype).min)
+        attention_mask = {"full_attention": full_mask[None, None]}
+        if self.pre_transformer.has_sliding_layers:
+            sliding_mask = torch.zeros_like(full_mask)
+            sliding_mask.masked_fill_(
+                ~(allowed & (distance < self.config.sliding_window)), torch.finfo(hidden.dtype).min
+            )
+            attention_mask["sliding_attention"] = sliding_mask[None, None]
+        return attention_mask
+
+    def forward(self, codes: torch.Tensor, *, graph_safe_mask: bool = False) -> torch.Tensor:
         """
         Convert num_quantizers-layer RVQ codes to audio waveform.
 
@@ -376,7 +405,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        attention_mask = self._graph_attention_mask(hidden) if graph_safe_mask else None
+        hidden = self.pre_transformer(inputs_embeds=hidden, attention_mask=attention_mask).last_hidden_state
         # Shape: [batch, seq_len, hidden_size]
 
         # Algorithm search happens during eager warmup before graph capture.
