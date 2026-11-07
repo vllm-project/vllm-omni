@@ -234,6 +234,41 @@ class TestParseGeneratedTokens:
         # Prior tokens should be upsampled: 1024 tokens -> 4*1024 = 4096
         assert prior.shape[0] == 1024 * 4
 
+    @pytest.mark.parametrize(
+        ("height", "width", "image_token_count", "terminal_eos", "expected_tokens"),
+        [
+            (768, 768, 1120, True, 832),
+            (1536, 1536, 4353, False, 2560),
+        ],
+    )
+    def test_t2i_rejects_token_overrun(self, height, width, image_token_count, terminal_eos, expected_tokens):
+        token_ids = [1] * image_token_count + ([16385] if terminal_eos else [])
+
+        with pytest.raises(
+            ValueError,
+            match=f"t2i token parse failed: actual_tokens={image_token_count}, expected_tokens={expected_tokens}",
+        ):
+            _parse_generated_tokens(token_ids, height, width)
+
+    @pytest.mark.parametrize(
+        ("height", "width", "preview_tokens", "target_tokens"),
+        [
+            (768, 768, 256, 576),
+            (1024, 1024, 256, 1024),
+            (1536, 1536, 256, 2304),
+            (1024, 512, 242, 512),
+        ],
+    )
+    @pytest.mark.parametrize("terminal_eos", [False, True])
+    def test_t2i_exact_grid_preserves_prior(self, height, width, preview_tokens, target_tokens, terminal_eos):
+        token_ids = [9] * preview_tokens + [1] * target_tokens + ([16385] if terminal_eos else [])
+
+        prior, actual_height, actual_width = _parse_generated_tokens(token_ids, height, width)
+
+        assert (actual_height, actual_width) == (height, width)
+        assert prior.shape == (target_tokens * 4,)
+        assert torch.all(prior == 1)
+
     def test_i2i_standard(self):
         # 1024x1024, i2i: large(1024) + EOS
         large_tokens = list(range(1024))
@@ -371,6 +406,15 @@ class TestAr2Diffusion:
         assert result["height"] == 1024
         assert result["width"] == 1024
         assert "prior_token_ids" in result["extra"]
+
+    def test_t2i_token_overrun_skips_diffusion(self, caplog):
+        token_ids = [1] * 1120 + [16385]
+        prompt = {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 768, "target_w": 768}}
+
+        result = ar2diffusion([_source_output(token_ids)], prompt=prompt)
+
+        assert result is None
+        assert "actual_tokens=1120, expected_tokens=832" in caplog.text
 
     def test_i2i_with_mm_output(self):
         """Test image-to-image with prior_token_image_ids from AR model."""
