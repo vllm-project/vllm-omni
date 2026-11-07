@@ -283,8 +283,8 @@ def test_encoder_capture_batches_reject_invalid_configuration(rows):
         MiniCPMO45Code2Wav(vllm_config=config)
 
 
-@pytest.mark.parametrize("chunk_enabled,flow_enabled", [(False, True), (True, False), (True, True)])
-def test_encoder_graph_configs_remain_independent(monkeypatch, chunk_enabled, flow_enabled):
+@pytest.mark.parametrize("chunk_enabled,flow_enabled", [(False, False), (False, True), (True, False), (True, True)])
+def test_encoder_graph_configs_are_unified_and_flow_precapture_delegates(monkeypatch, chunk_enabled, flow_enabled):
     config = _config()
     config.scheduler_config = SimpleNamespace(max_num_seqs=3)
     config.model_config.stage_connector_config["extra"].update(
@@ -298,8 +298,10 @@ def test_encoder_graph_configs_remain_independent(monkeypatch, chunk_enabled, fl
     model = MiniCPMO45Code2Wav(vllm_config=config)
     flow_config = model._encoder_graph_config
     chunk_config = model._chunk_encoder_graph_config
-    assert flow_config["enabled"] is flow_enabled
-    assert flow_config["rows"] == [1, 2]
+    enabled = chunk_enabled or flow_enabled
+    assert flow_config is chunk_config
+    assert chunk_config["enabled"] is enabled
+    assert chunk_config["rows"] == [1, 2]
     sentinel = object()
     seen = []
 
@@ -311,12 +313,88 @@ def test_encoder_graph_configs_remain_independent(monkeypatch, chunk_enabled, fl
     backend = BatchedToken2Wav(
         _FakeToken2Wav(), encoder_graph_config=flow_config, chunk_encoder_graph_config=chunk_config
     )
-    assert seen == [flow_config]
-    assert backend._encoder_graphs is (sentinel if flow_enabled else None)
-    assert (backend._chunk_encoder_graph is not None) is chunk_enabled
-    if chunk_enabled:
+    assert len(seen) == 1
+    assert seen[0]["enabled"] is enabled
+    assert backend._encoder_graphs is (sentinel if enabled else None)
+    assert (backend._chunk_encoder_graph is not None) is enabled
+    if enabled:
         assert backend._chunk_encoder_graph.max_graphs == 2
         assert backend._chunk_encoder_graph.capture_after == 4
+    precaptured = []
+
+    def _fake_precapture(features, *, cap_to_max_graphs=None):
+        precaptured.append((features, cap_to_max_graphs))
+        return 3
+
+    monkeypatch.setattr(backend, "precapture_chunk_encoder", _fake_precapture)
+    marker = object()
+    assert backend.precapture_flow_encoder(marker) == 3
+    assert precaptured == [(marker, False)]
+
+
+def test_legacy_flow_encoder_config_preserves_unbounded_precapture(monkeypatch):
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=4)
+    config.model_config.stage_connector_config["extra"].update(
+        cfm_encoder_cuda_graph=True,
+        cfm_encoder_graph_rows=[1, 2, 3, 4],
+    )
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._chunk_encoder_graph_config["max_graphs"] is None
+    backend = BatchedToken2Wav(_FakeToken2Wav(), chunk_encoder_graph_config=model._chunk_encoder_graph_config)
+    backend.flow.encoder_proj.out_features = 80
+    assert backend._chunk_encoder_cap_precapture is False
+    captured_keys = []
+    graph = backend._chunk_encoder_graph
+    monkeypatch.setattr(backend, "_flow_supports_graphs", lambda: True)
+    monkeypatch.setattr(backend, "_pre_lookahead_len", lambda: 3)
+    monkeypatch.setattr(backend, "_upsample_stride", lambda: 2)
+    monkeypatch.setattr(backend, "_encoder_position_tables", lambda: ())
+    monkeypatch.setattr(backend, "_ensure_relpos_pe", lambda tokens, att: None)
+    monkeypatch.setattr(
+        backend,
+        "setup_batch",
+        lambda features, rows: [
+            SimpleNamespace(
+                flow_cache={
+                    "conformer_cnn_cache": torch.zeros(1, 2, 2),
+                    "conformer_att_cache": torch.zeros(1, 1, 1, 4, 2),
+                }
+            )
+        ],
+    )
+
+    def _fake_capture(keys, **kw):
+        captured_keys.extend(keys)
+        return len(keys)
+
+    monkeypatch.setattr(graph, "capture", _fake_capture)
+    features = SimpleNamespace(mels=torch.zeros(1, 200, 80))
+    count = backend.precapture_chunk_encoder(features)
+    assert count > 8
+    assert len(captured_keys) == count
+
+
+def test_trt_stepper_never_pads_non_aligned_chunk_when_cfm_graph_enabled():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    adapter._cfm_graph_enabled = True
+    adapter._cfm_graph_bucket_frames = 16
+    seen_widths: list[int] = []
+
+    def step(*, x, mu, t, spks, cond, cnn_cache, att_cache):
+        del mu, t, spks, cond, cnn_cache, att_cache
+        seen_widths.append(int(x.shape[-1]))
+        cnn_out = torch.zeros(1, x.shape[0], 2, 1)
+        att_out = torch.zeros(1, x.shape[0], 1, x.shape[-1], 2)
+        return x, cnn_out, att_out
+
+    adapter._trt_stepper = SimpleNamespace(step=step)
+    mu = torch.ones((1, 1, 10))
+    cond = torch.zeros((1, 1, 10))
+    speakers = torch.ones((1, 1))
+    out, _, _ = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+    assert int(out.shape[-1]) == 10
+    assert seen_widths == [10] * adapter.n_timesteps
 
 
 def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
