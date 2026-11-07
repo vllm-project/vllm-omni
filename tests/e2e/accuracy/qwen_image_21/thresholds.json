@@ -1,12 +1,25 @@
 {
   "status": "selected",
+  "expected_xfail": {
+    "it2i": {
+      "gfx942": "ROCm MIOpen condition-image encoding is process-nondeterministic on gfx942; keep the real comparison observational until a stable pixel gate can be calibrated."
+    }
+  },
   "calibration_notes": {
     "Ascend.it2i": {
       "comparison": "Native TORCH_SDPA uses dense block-causal prefill; the reference uses segmented NPU SDPA. Their rounding difference amplified during denoising in this IT2I case.",
       "observed_baseline": "Fixed BF16, seed-42, 40-step case on Ascend910B1 with torch 2.10.0+cpu and torch-npu 2.10.0.post4: SSIM 0.72273, PSNR 21.29696 dB. These are observations, not selected bounds.",
       "selection": "User selected SSIM >= 0.70 and PSNR >= 20 dB for Ascend IT2I on 2026-10-14, based on the observed A2 baseline. Observed headroom is 0.02273 SSIM and 1.29696 dB; cross-machine/library-version variability remains unmeasured. NPU nightly targets A3, which is not yet validated. Recalibrate if the attention policy changes."
+    },
+    "gfx942.it2i": {
+      "comparison": "ROCm uses TORCH_SDPA on both sides. The condition-image VAE encode remains on MIOpen defaults because deterministic MIOpen has no suitable algorithm for these encoder shapes; this produces process-to-process variation that is not present in T2I.",
+      "observed_baseline": "Buildkite AMD #14526, #14527, and #14529 were isolated MI300-class gfx942 runs with 206141652992 bytes, BF16, seed 42, 40 steps, torch 2.13.0+git733fca1, and pinned Diffusers 6256aa7. Native-versus-reference IT2I measured SSIM/PSNR 0.98526782/34.91715 dB, 0.87714267/19.05496 dB, and 0.69533402/13.22608 dB. In #14527, two independently reseeded references measured 0.97050065/28.51167 dB. T2I was stable across all three jobs at 0.99675041/44.62690 dB with identical native and reference hashes.",
+      "selection": "No gfx942 IT2I pixel floor was selected on 2026-10-23: accepting the observed range would admit visible corruption without bounding future process-to-process variation. Run the real IT2I request/reference comparison as an expected XFAIL and retain its metrics and artifacts; keep the strict default T2I gate. Recalibrate if the checkpoint, PyTorch/MIOpen stack, attention policy, condition-image preprocessing, or VAE implementation changes."
     }
   },
-  "it2i": {"default": {"ssim": 0.99, "psnr": 40.0}, "Ascend": {"ssim": 0.7, "psnr": 20.0}},
+  "it2i": {
+    "default": {"ssim": 0.99, "psnr": 40.0},
+    "Ascend": {"ssim": 0.7, "psnr": 20.0}
+  },
   "t2i": {"default": {"ssim": 0.99, "psnr": 40.0}, "Ascend": {"ssim": 0.99, "psnr": 40.0}}
 }

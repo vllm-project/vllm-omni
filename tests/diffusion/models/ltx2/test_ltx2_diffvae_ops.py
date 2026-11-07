@@ -9,7 +9,7 @@ import sys
 import pytest
 import torch
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.models.ltx2.ops import qk_rms_norm as qk_rms_norm_ops
 from vllm_omni.diffusion.models.ltx2.ops import residual_adaln as residual_adaln_ops
 from vllm_omni.diffusion.models.ltx2.ops import resolve_ltx2_vae_operators
@@ -41,6 +41,7 @@ def _load_fna_ops():
     return pytest.importorskip("vllm_omni.diffusion.models.ltx2.ops.fna", exc_type=ImportError)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_diffvae_model_and_tests_do_not_import_tilelang_backend() -> None:
     # Use a fresh interpreter: reloading the model in this process would leave
     # already-imported distributed subclasses pointing at the old base class.
@@ -62,6 +63,7 @@ def test_diffvae_model_and_tests_do_not_import_tilelang_backend() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_diffvae_fna_tile_map_covers_exact_neighborhood() -> None:
     fna_ops = _load_fna_ops()
     problem = fna_ops.Problem(13, 14, 17, (11, 11, 11))
@@ -93,6 +95,7 @@ def test_diffvae_fna_tile_map_covers_exact_neighborhood() -> None:
                         assert key_block in selected
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_diffvae_fna_metadata_uses_static_kernel_shapes() -> None:
     fna_ops = _load_fna_ops()
     for shape in ((11, 11, 11), (13, 14, 17), (66, 96, 128), (79, 192, 192)):
@@ -104,6 +107,7 @@ def test_diffvae_fna_metadata_uses_static_kernel_shapes() -> None:
             assert metadata.shape == (ids.numel(), limit)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_diffvae_fna_rejects_oversized_packed_tile_grid() -> None:
     fna_ops = _load_fna_ops()
     with pytest.raises(ValueError, match="15-bit metadata"):
@@ -198,6 +202,7 @@ def test_diffvae_swiglu_tiled_is_bit_exact(dim: int, rows: int, isolated_runtime
     assert torch.equal(actual, expected)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     ("dim", "expected_rows"),
     [(256, 131072), (512, 65536), (1024, 32768), (2048, 16384)],

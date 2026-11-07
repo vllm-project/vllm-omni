@@ -3,7 +3,7 @@
 """Tests for SeqAllToAll4D, SeqAllToAll5D, and RingComm communication primitives.
 
 CPU tests use gloo on CPU tensors (no GPU). Nightly parity tests run the same
-checks on real multi-GPU NCCL collectives.
+checks on real multi-GPU NCCL/RCCL collectives.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import torch
 
 from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -25,8 +26,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
-_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=2)
+_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 
@@ -348,7 +349,7 @@ def test_4d_identity(world_size: int, use_sync: bool):
         head_size=32,
         use_sync=use_sync,
         device_kind="cpu",
-        master_port=29610,
+        master_port=get_open_port(),
     )
 
 
@@ -368,7 +369,7 @@ def test_5d_identity(world_size: int, use_sync: bool):
         head_size=32,
         use_sync=use_sync,
         device_kind="cpu",
-        master_port=29611,
+        master_port=get_open_port(),
     )
 
 
@@ -384,12 +385,12 @@ def test_ring_p2p(world_size: int):
         num_heads=8,
         head_size=128,
         device_kind="cpu",
-        master_port=29612,
+        master_port=get_open_port(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Nightly: same checks on real multi-GPU NCCL collectives
+# Nightly: same checks on real multi-GPU NCCL/RCCL collectives
 # ---------------------------------------------------------------------------
 
 

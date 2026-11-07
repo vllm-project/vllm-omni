@@ -4,12 +4,39 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from pydantic import ValidationError
 
+from vllm_omni.quantization import factory as quantization_factory
 from vllm_omni.quantization.factory import build_quant_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_humming_stubs_are_scoped_to_registry_resolution(monkeypatch) -> None:
+    stub_names = (
+        "humming",
+        "humming.config",
+        "humming.dtypes",
+        "humming.layer",
+        "humming.schema",
+        "humming.utils",
+        "humming.utils.weight",
+    )
+    for name in stub_names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    def resolve(method: str):
+        assert method == "fp8"
+        assert all(name in sys.modules for name in stub_names)
+        return quantization_factory.QuantizationConfig
+
+    monkeypatch.setattr(quantization_factory, "_get_vllm_quantization_config", resolve)
+
+    assert quantization_factory._get_quantization_config("fp8") is quantization_factory.QuantizationConfig
+    assert all(name not in sys.modules for name in stub_names)
 
 
 def _online_classes():
@@ -65,7 +92,7 @@ def test_online_ignore_patterns_skip_layer_quantization() -> None:
     assert isinstance(config, OnlineQuantizationConfig)
     layer = LinearBase(16, 16, quant_config=config, prefix="transformer.final_layer.proj", disable_tp=True)
     assert isinstance(layer.quant_method, UnquantizedLinearMethod)
-    assert config.resolve_quant_method_cls(layer, "transformer.blocks.0.attn.to_q") is not None
+    assert config.resolve_quant_method_cls(type(layer), "transformer.blocks.0.attn.to_q") is not None
 
 
 def test_online_targets() -> None:
