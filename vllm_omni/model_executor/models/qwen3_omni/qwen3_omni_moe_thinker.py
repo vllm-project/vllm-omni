@@ -117,6 +117,7 @@ from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.torch_utils import async_tensor_h2d
+
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
