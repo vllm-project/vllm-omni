@@ -116,6 +116,11 @@ declared lost.
 **Rule:** Repeated shutdown or cleanup signals MUST NOT leak stage clients,
 process managers, or membership registrations.
 
+EngineCore stage clients allow 10 seconds for process teardown, including Python
+interpreter finalization. Explicit caller timeouts, including zero, override this
+default. Upstream process managers retain ownership and the bounded forced-exit
+fallback; this does not change the request-draining policy.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for

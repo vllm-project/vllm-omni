@@ -183,6 +183,15 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
     _outputs_awaiting_stage_payload: dict[str, tuple[int, OmniEngineCoreOutput]]
 
+    def shutdown(self) -> None:
+        """Release Omni transport resources as well as vLLM's connectors."""
+        try:
+            adapter = getattr(self, "chunk_transfer_adapter", None)
+            if adapter is not None:
+                adapter.shutdown()
+        finally:
+            super().shutdown()
+
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
 

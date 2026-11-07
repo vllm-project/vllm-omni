@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 
+# Include interpreter finalization, not just model/scheduler teardown.
+# A multi-model stage can take longer than vLLM's 5s best-effort default.
+STAGE_SHUTDOWN_TIMEOUT_S = 10.0
+
 
 class StageClient(Protocol):
     """Shared metadata and lifecycle surface for all stage clients.

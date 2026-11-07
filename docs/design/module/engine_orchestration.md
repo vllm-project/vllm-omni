@@ -114,6 +114,27 @@ without selecting the next logical stage.
 **Rule:** Once a request reaches a terminal state, orchestration MUST NOT
 forward new work for that request.
 
+### Shutdown waiting
+
+Replica shutdown remains sequential on the orchestrator thread. Explicit engine
+shutdown reserves 20 seconds per currently attached replica in addition to the
+existing 30-second orchestration allowance. This includes two 10-second phases
+for backends that first request graceful shutdown and then fall back to signals;
+EngineCore clients normally use only one phase. Empty replica slots are excluded;
+replicas, not logical stages, determine this allowance. Waiting returns as soon
+as the orchestrator exits. If it remains alive after the allowance, runtime
+release stays deferred to avoid concurrent resource teardown. Weak-finalizer
+cleanup keeps its existing short, best-effort wait.
+For example, eight attached replicas reserve a 190-second join allowance
+(30 + 8 * 20); this is a maximum wait for the orchestrator, not a fixed delay
+or an end-to-end shutdown deadline.
+
+Transfer shutdown stops queued work rather than draining it. Send and receive
+loops check the stop signal between operations, let an in-flight operation
+finish, and join before closing the connector. This does not guarantee delivery
+of the last chunk to a downstream stage; callers that need graceful request
+draining must finish those requests before shutting down the stages.
+
 ## Invariant namespace
 
 `ORCH-INV` reserves `001-099` for dependency direction, `100-199` for
