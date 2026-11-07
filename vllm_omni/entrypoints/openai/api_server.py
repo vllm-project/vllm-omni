@@ -1257,6 +1257,7 @@ async def omni_init_app_state(
             request_logger=request_logger,
             chat_template_config=chat_template_config,
             log_error_stack=args.log_error_stack,
+            enable_flash_late_interaction=getattr(args, "enable_flash_late_interaction", True),
         )
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
