@@ -79,6 +79,10 @@ logger = logging.getLogger(__name__)
 # image's aspect ratio and to resize condition images before encoding.
 OUTPUT_RESOLUTION = 1024
 
+# Code-owned attention selection for both execution protocols. Request
+# extra_args intentionally cannot override this setting.
+_DEFAULT_ATTN_PATH = "auto"
+
 # Re-export the shared metadata value locally so this pipeline keeps a nearby,
 # descriptive constant for validation without becoming the source of truth.
 MAX_QWEN_IMAGE_21_INPUT_IMAGES = QWEN_IMAGE_21_MAX_INPUT_IMAGES
@@ -1160,9 +1164,8 @@ class QwenImage21Pipeline(
         )
         output_type = common_sampling_params.output_type or "pil"
 
-        # Batch homogeneity decides the attention path: a homogeneous batch
-        # (same condition-image count and sizes per request) can use the
-        # piecewise-span backend; heterogeneous batches take the dense 4D mask.
+        # Batch homogeneity constrains the code-selected attention path:
+        # heterogeneous batches require automatic selection or the dense mask.
         signatures = [
             (
                 len(entry["vae_images"] or []),
@@ -1171,7 +1174,12 @@ class QwenImage21Pipeline(
             for entry in per_request_images
         ]
         homogeneous = all(sig == signatures[0] for sig in signatures)
-        attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
+        attn_path = _DEFAULT_ATTN_PATH
+        if not homogeneous:
+            if attn_path not in ("auto", "mask"):
+                raise ValueError("Heterogeneous Qwen-Image 2.1 batches require attn_path='auto' or 'mask'.")
+            attn_path = "mask"
+        attention_kwargs = {"attn_path": attn_path}
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
@@ -1246,7 +1254,7 @@ class QwenImage21Pipeline(
             true_cfg_scale=sampling.true_cfg_scale if sampling.true_cfg_scale is not None else 1.0,
             max_sequence_length=sampling.max_sequence_length or self._max_length,
             per_request_images=per_request_images,
-            attention_kwargs=kwargs.get("attention_kwargs"),
+            attention_kwargs=kwargs.get("attention_kwargs") or {"attn_path": _DEFAULT_ATTN_PATH},
         )
 
         # prepare_timesteps() has already materialized request-specific timestep

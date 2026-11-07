@@ -913,6 +913,27 @@ class Attention(nn.Module):
             )
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
+        if (
+            current_omni_platform.is_npu()
+            and attn_metadata is not None
+            and attn_metadata.extra.get("npu_flex_attention", False)
+        ):
+            # Ring normally bypasses the selected local backend. Explicit NPU
+            # Flex must preserve its global mask and use MindIE's LSE merger.
+            # Omni already ran Ulysses and owns output resharding; only the
+            # remaining Ring group crosses this optional provider boundary.
+            from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import try_npu_flex_attention
+
+            if self.attn_backend is None or self.attn_backend.get_name() != "FLASH_ATTN":
+                raise ValueError("NPU Ring FlexAttention requires the FLASH_ATTN backend.")
+            if self.ring_pg is None:
+                raise RuntimeError("NPU Ring FlexAttention requires an initialized Ring group.")
+            output = try_npu_flex_attention(
+                query, key, value, attn_metadata, self.softmax_scale, ring_group=self.ring_pg
+            )
+            if output is None:
+                raise ValueError("NPU Ring FlexAttention requires compatible BF16 block-causal prefill metadata.")
+            return output
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             raise ValueError("Ring attention does not support attn_mask; use Ulysses SP or disable mask_sp_padding.")
         backend_name = self.attn_backend.get_name() if self.attn_backend is not None else None
