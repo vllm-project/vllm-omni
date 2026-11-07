@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -13,6 +13,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.autoencoder import AutoencoderKLConv3D
+from vllm_omni.diffusion.models.hunyuan_image3.layers import spatial_vae_forward
 
 logger = init_logger(__name__)
 
@@ -137,6 +138,12 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
         if not self.is_distributed_enabled():
             return super().spatial_tiled_decode(z)
 
+        result = spatial_vae_forward(self, z, "decode")
+        if result is not None:
+            return result
+
+        # Spatial execution exchanges activations and GN statistics per layer;
+        # the tile executor distributes independent overlapping tile tasks.
         logger.debug("Decode running with distributed executor")
         return self.distributed_executor.execute(
             z,
