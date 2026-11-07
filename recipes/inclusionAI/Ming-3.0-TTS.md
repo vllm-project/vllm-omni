@@ -27,6 +27,23 @@ on the device and returns streaming PCM directly. The default deployment is
 - vLLM version: 0.32.0
 - GPU: 1x H100 / H200
 
+### Install the checkout
+
+Follow the [CUDA source installation guide](../../docs/getting_started/installation/gpu.md#build-from-source)
+to create `.venv` and install the matching vLLM dependency. Then, from this
+repository's root, install the checkout into that same environment:
+
+```bash
+uv pip install --python .venv/bin/python -e .
+```
+
+Adding the checkout to `PYTHONPATH` alone does not register the package's vLLM
+plugin entry points. An editable installation supplies that metadata and keeps
+imports tied to the checkout. Use `.venv/bin/vllm` for the commands below.
+Do not add `--no-deps` unless the checkout's dependencies are already installed;
+installing an older Omni release just to obtain plugin metadata can leave a
+mixture of source code and incompatible dependencies.
+
 ### Reference audio
 
 Run from the repository root. These examples use two
@@ -85,6 +102,29 @@ Streaming chunk sizes use Stage 0's `additional_config`. `latent_chunk_size`
 must be positive; `initial_latent_chunk_size` must be between zero and that
 size. Zero skips the initial ramp and uses the regular chunk size. The first
 available audio is still released immediately.
+
+### Decode budget and long utterances
+
+For a single-speaker request, `max_new_tokens` controls the maximum number of
+audio latent decode steps. If omitted, the adapter uses the checkpoint's
+`tts_config.maximum_decode_steps`, falling back to 800 only when that setting
+is absent. The validation ceiling of 800 does **not** replace a smaller
+checkpoint default.
+
+At Ming3's 12.5 latent frames per second, a checkpoint value of 250 allows
+roughly 20 seconds of audio. The voice-cloning example below explicitly uses
+200 steps, roughly 16 seconds. Long text can therefore reach its decode budget
+before the utterance is complete, even when the request completes successfully.
+
+For longer single-speaker utterances, set `"max_new_tokens": 800` in the
+`/v1/audio/speech` JSON request, allowing roughly 64 seconds at most. This is
+an upper bound, not a requested duration: the model can stop earlier. Split
+longer text into separate requests and check the resulting audio for completeness.
+Increasing `max_model_len` alone does not change this decode budget.
+
+Multi-speaker Podcast requests use dialogue-derived decode windows; see the
+[Podcast](#podcast) example and notes below rather than assuming the
+single-speaker checkpoint default applies.
 
 ## Voice cloning
 
