@@ -251,7 +251,7 @@ def test_registry_rejects_unsupported_batch_vae(monkeypatch, vae_type):
 
 
 @pytest.mark.parametrize("mode", ["tile", "batch"])
-def test_klein_uses_distributed_vae_only_for_batch_mode(monkeypatch, tmp_path, mode):
+def test_klein_uses_distributed_vae_for_tile_and_batch_modes(monkeypatch, tmp_path, mode):
     from vllm_omni.diffusion.models.flux2_klein import pipeline_flux2_klein as module
 
     class StopAtVaeLoadError(Exception):
@@ -260,8 +260,7 @@ def test_klein_uses_distributed_vae_only_for_batch_mode(monkeypatch, tmp_path, m
     def load_component(factory, *args, subfolder, **kwargs):
         if subfolder == "text_encoder":
             return nn.Identity()
-        expected = DistributedAutoencoderKLFlux2 if mode == "batch" else AutoencoderKLFlux2
-        assert factory.__self__ is expected
+        assert factory.__self__ is DistributedAutoencoderKLFlux2
         raise StopAtVaeLoadError
 
     monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
