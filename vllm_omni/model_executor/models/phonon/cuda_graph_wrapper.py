@@ -23,9 +23,6 @@ class MimiDecodeRunner:
         )
         self.buckets = {}
 
-    def reset_slots(self, slot: int):
-        self.decoder.reset_slots(slot)
-
     def _bucket(self, batch):
         if batch in self.buckets:
             return self.buckets[batch]

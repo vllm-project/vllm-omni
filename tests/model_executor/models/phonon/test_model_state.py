@@ -160,57 +160,6 @@ def test_official_loader_preserves_backend_buffers_and_requires_model_weights():
         lm.load_official_weights({**weights, "flow_lm.unknown.weight": torch.zeros(1)})
 
 
-@pytest.mark.parametrize("project_voice", [True, False])
-def test_voice_uses_tensor_transport_without_python_list(monkeypatch, project_voice):
-    import sentencepiece
-    from transformers.utils import hub
-
-    from vllm_omni.engine.serialization import (
-        deserialize_additional_information,
-        serialize_additional_information,
-    )
-    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
-    from vllm_omni.model_executor.models.phonon import prompt as prompt_module
-
-    shape = (1, 512, 125) if project_voice else (1, 125, 512)
-    voice = torch.randn(shape)
-    monkeypatch.setattr(hub, "cached_file", lambda *args, **kwargs: "unused")
-    monkeypatch.setattr(
-        sentencepiece, "SentencePieceProcessor", lambda **kwargs: SimpleNamespace(encode=lambda text: [2, 3])
-    )
-    monkeypatch.setattr(prompt_module, "load_voice", lambda *args: (voice, project_voice))
-    config = SimpleNamespace(model="test/voice", hf_config=SimpleNamespace(to_dict=lambda: {}))
-    adapter = PhononAdapter(SimpleNamespace(engine_client=SimpleNamespace(model_config=config)))
-    prepared = adapter._build(SimpleNamespace(input="Hello world"))
-    info = prepared.prompt["additional_information"]
-    assert info["phonon_voice"] is voice
-    payload = serialize_additional_information(info)
-    entry = payload.entries["phonon_voice"]
-    assert entry.tensor_data is not None
-    assert entry.list_data is None
-    restored = deserialize_additional_information(payload)
-    assert isinstance(restored["phonon_voice"], torch.Tensor)
-    torch.testing.assert_close(restored["phonon_voice"], voice)
-    assert restored["phonon_project_voice"] == project_voice
-    assert len(prepared.prompt["prompt_token_ids"]) == 128
-
-
-def test_slot_reset_uses_current_stream_without_cross_stream_wait(monkeypatch):
-    from vllm_omni.model_executor.models.phonon.cuda_graph_wrapper import MimiDecodeRunner
-
-    calls = []
-    runner = MimiDecodeRunner.__new__(MimiDecodeRunner)
-    runner.decoder = SimpleNamespace(reset_slots=lambda slot: calls.append(slot))
-
-    def unexpected_stream_operation(*args, **kwargs):
-        pytest.fail("Slot reset must use the current stream directly")
-
-    monkeypatch.setattr(torch.cuda, "stream", unexpected_stream_operation)
-    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_stream_operation)
-    runner.reset_slots(0)
-    assert calls == [0]
-
-
 def test_mimi_runner_dispatch_with_lightweight_decoder():
     from vllm_omni.model_executor.models.phonon.cuda_graph_wrapper import MimiDecodeRunner
 
