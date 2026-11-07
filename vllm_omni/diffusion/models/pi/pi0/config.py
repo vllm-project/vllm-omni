@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Config surface for the π0 (Pi-Zero) VLA model in vllm-omni.
 
 Only the parameters that actually shape runtime behaviour live here; the
 transformer dimensions (hidden size, head count, ...) are derived from
 ``paligemma_variant`` / ``action_expert_variant`` inside the model via
-``get_gemma_config`` (see ``modeling_pi0``).
+``get_gemma_config`` in the shared Pi-family backbone module.
 
 The resolver reads the **raw LeRobot ``config.json``** (the field surface of
 ``lerobot.policies.pi0.PI0Config``): only the recognized dataclass fields are
@@ -25,6 +25,7 @@ ACTION = "action"
 OBS_STR = "observation"
 OBS_STATE = OBS_STR + ".state"
 OBS_IMAGES = OBS_STR + ".images"
+SUPPORTED_DTYPE_NAMES = frozenset({"float32", "bfloat16"})
 
 
 @dataclass
@@ -86,6 +87,9 @@ class Pi0Config:
         if not isinstance(res, (tuple, list)) or len(res) != 2 or res[0] != res[1]:
             raise ValueError(f"π0 expects a square image_resolution (H == W); got {res!r}.")
         self.image_resolution = (int(res[0]), int(res[1]))
+
+        if self.dtype not in SUPPORTED_DTYPE_NAMES:
+            raise ValueError(f"dtype must be one of {sorted(SUPPORTED_DTYPE_NAMES)}, got {self.dtype!r}.")
 
         # Derive the camera order from input_features if not given explicitly.
         if self.image_feature_keys is None and self.input_features:
