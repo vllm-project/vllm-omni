@@ -37,7 +37,10 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
-from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.decode_graph import (
+    QwenImage21DecodeGraphManager,
+    decode_graph_config_eligible,
+)
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
@@ -944,6 +947,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
+        self._decode_graph_config_eligible = decode_graph_config_eligible(od_config)
         self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
