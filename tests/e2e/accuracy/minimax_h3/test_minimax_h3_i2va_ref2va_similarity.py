@@ -109,6 +109,11 @@ REQUEST_TIMEOUT_SECONDS = 60 * 60
 # retained four-GPU accuracy workload to finish loading.
 ENGINE_INIT_TIMEOUT_SECONDS = 60 * 60
 SERVER_STARTUP_TIMEOUT_SECONDS = 65 * 60
+# By default Inductor benchmarks several reduction-kernel configs on first use
+# and keeps the fastest; those configs sum in different orders. The denoiser
+# amplifies that into per-process SSIM/PSNR modes on both sides of the gate, so
+# the official-reference comparison runs Inductor in its deterministic mode.
+DETERMINISTIC_INDUCTOR_ENV = {"TORCHINDUCTOR_DETERMINISTIC": "1"}
 
 
 def _model_name(model_env_var: str = MODEL_ENV_VAR, component: str = "FL2VA") -> str:
@@ -296,6 +301,7 @@ def test_minimax_h3_i2va_matches_official_reference(
         "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
         "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
         "VLLM_OMNI_STORAGE_PATH": str(output_dir / "storage"),
+        **DETERMINISTIC_INDUCTOR_ENV,
     }
     request_data = {
         "prompt": I2VA_PROMPT,
@@ -381,6 +387,7 @@ def test_minimax_h3_ref2va_matches_official_reference(
         "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
         "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
         "VLLM_OMNI_STORAGE_PATH": str(output_dir / "storage"),
+        **DETERMINISTIC_INDUCTOR_ENV,
     }
     request_data = {
         "prompt": REF2VA_PROMPT,
