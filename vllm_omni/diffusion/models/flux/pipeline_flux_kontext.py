@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, cast
@@ -33,6 +32,7 @@ from vllm_omni.diffusion.models.flux import (
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -51,15 +51,7 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
 
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    if not os.path.exists(vae_config_path):
-        raise FileNotFoundError(
-            f"VAE config not found at {vae_config_path}. "
-            "Please ensure the model path contains a valid VAE configuration."
-        )
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
