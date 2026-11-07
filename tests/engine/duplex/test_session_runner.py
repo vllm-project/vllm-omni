@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
@@ -2160,6 +2161,59 @@ async def test_listen_decision_is_consumed_and_never_forwarded_to_tts() -> None:
         assert events[0].details["model_listen"] is True
         assert events[0].to_realtime()["response"]["status"] == "listening"
         assert h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_committed_input_ack_waits_for_its_actual_model_unit() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio(samples=16001))
+        events = await h.run(commands.Commit())
+        committed = find(events, "input_audio_buffer.committed")
+        assert committed.details["processing_required"] is True
+        assert "duplex.input.processed" not in types(events)
+        payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert payload["realtime_item_id"] == committed.item_id
+        request_id = h.stage0_request_id()
+
+        # Delayed output of a pre-commit unit cannot acknowledge the commit.
+        old_events = await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert types(old_events) == ["response.listen"]
+        metadata = {
+            "meta.listen_token_id": LISTEN_TOKEN_ID,
+            "meta.duplex_input_item_id_utf8": torch.tensor(list(committed.item_id.encode("utf-8")), dtype=torch.uint8),
+        }
+        events = await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_output_metadata=metadata,
+        )
+        assert types(events) == ["duplex.input.processed", "response.listen"]
+        assert events[0].to_realtime()["event"] == {
+            "type": "input.processed",
+            "session_id": SESSION_ID,
+            "epoch": 0,
+            "item_id": committed.item_id,
+            "model_listen": True,
+        }
+        assert h.session.active_response_id is None
+
+        stale = await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            epoch=1,
+            segment_finished=True,
+            segment_output_metadata=metadata,
+        )
+        assert "duplex.input.processed" not in types(stale)
     finally:
         await close_harness(h)
 

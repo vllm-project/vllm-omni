@@ -191,6 +191,7 @@ def audio_committed_payload(
     committed: DuplexCommittedInput | None = None,
     realtime_item_id: object | None = None,
     transcript: object | None = None,
+    processing_required: bool = False,
 ) -> dict[str, object]:
     message = committed.message if committed is not None else None
     if not isinstance(message, dict):
@@ -214,4 +215,6 @@ def audio_committed_payload(
         payload["transcript"] = transcript
     if isinstance(realtime_item_id, str) and realtime_item_id:
         payload["realtime_item_id"] = realtime_item_id
+        if processing_required and session.capabilities.supports_input_processing_ack:
+            payload["processing_required"] = True
     return payload

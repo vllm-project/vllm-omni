@@ -117,6 +117,7 @@ def evaluate_sample(
             parse_error = str(exc)
         _trace({"raw_response": raw_response, "error": parse_error})
         if parse_error is None:
+            assert parsed is not None
             return parsed
         # The judge can answer in prose instead of the required score JSON, or
         # with a malformed value in a field that is present; echo the offending
@@ -254,16 +255,21 @@ def evaluate_sample(
         chunks = normalize_response_chunks(raw)
         # Chunks keep their own boundary whitespace; legacy sentence items are stripped.
         separator = "" if has_response_chunks(raw) else " "
-        event_rows = []
+        event_rows: list[dict[str, Any]] = []
         if task == "correction" or not times:
             response = separator.join(chunk["text"] for chunk in chunks).strip()
-            parsed = judge_result(
-                lambda **kw: judge.chat(
-                    build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
-                ),
-                ("success_score",),
-            )
-            event_rows.append({"response_segment": response, **parsed})
+            if not response:
+                # As with an empty reminder window, silence cannot satisfy the
+                # task. A judge may otherwise award credit for the reference.
+                event_rows.append({"response_segment": "", "success_score": 0})
+            else:
+                parsed = judge_result(
+                    lambda **kw: judge.chat(
+                        build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                    ),
+                    ("success_score",),
+                )
+                event_rows.append({"response_segment": response, **parsed})
         else:
             for start in times:
                 lo, hi = reminder_window(start, window_size)

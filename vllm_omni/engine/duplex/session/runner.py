@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar, cast
 
 import pybase64 as base64
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import (
@@ -368,6 +369,29 @@ class DuplexSessionRunner:
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
                 project = self.model.project_intermediate_output(stage_id, output, context)
+        if (
+            stage_id == 0
+            and context.segment_finished
+            and self.session.capabilities.supports_input_processing_ack
+            and context.identity.fence.epoch == self.session.epoch
+            and not self.run.closing
+            and self.session.state == DuplexSessionState.OPEN
+        ):
+            encoded_item_id = context.segment_output_metadata.get("meta.duplex_input_item_id_utf8")
+            if isinstance(encoded_item_id, torch.Tensor) and encoded_item_id.numel():
+                item_id = bytes(encoded_item_id.reshape(-1).tolist()).decode("utf-8")
+                self._mailbox.put_nowait(
+                    _Internal(
+                        "input_processed",
+                        {
+                            "type": "input.processed",
+                            "session_id": self.session.session_id,
+                            "epoch": self.session.epoch,
+                            "item_id": item_id,
+                            "model_listen": decision is not None and decision.metadata.get("model_listen") is True,
+                        },
+                    )
+                )
         if self.session.capabilities.supports_concurrent_turn_requests and self.model.release_concurrent_turn_requests(
             stage_id, output, context
         ):
@@ -669,6 +693,14 @@ class DuplexSessionRunner:
 
     async def _on_internal(self, item: _Internal) -> None:
         if self.memory.handle_event(item.kind, item.payload):
+            return
+        if item.kind == "input_processed":
+            if (
+                item.payload.get("epoch") == self.session.epoch
+                and not self.run.closing
+                and self.session.state == DuplexSessionState.OPEN
+            ):
+                self.emit(item.payload)
             return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
@@ -2719,6 +2751,7 @@ class DuplexSessionRunner:
             committed=committed,
             realtime_item_id=realtime_item_id,
             transcript=event.get("transcript"),
+            processing_required=retained_payload.get("realtime_item_id") == realtime_item_id,
         )
         committed_payload["overlap_deferred"] = True
         committed_payload["response_create_deferred"] = should_create_response
@@ -2792,6 +2825,9 @@ class DuplexSessionRunner:
                 committed=committed,
                 realtime_item_id=realtime_item_id,
                 transcript=event.get("transcript"),
+                processing_required=(
+                    final_payload is not None and final_payload.get("realtime_item_id") == realtime_item_id
+                ),
             )
         )
         if final_payload is not None:

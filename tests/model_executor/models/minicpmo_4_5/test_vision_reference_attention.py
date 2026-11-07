@@ -26,6 +26,45 @@ def test_scaled_softmax_preserves_bf16_rounding(tokens: int) -> None:
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+def test_scaled_softmax_reuses_kernel_across_video_shapes() -> None:
+    from vllm.triton_utils import triton
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.ops.scaled_softmax import (
+        _scaled_softmax_kernel,
+        scaled_softmax,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(9583)
+    scale = 72**-0.5
+
+    def num_compiled() -> int:
+        # Private Triton JIT layout (3.x): device -> (kernel_cache, ...).
+        caches = getattr(_scaled_softmax_kernel, "device_caches", None)
+        entry = caches.get(triton.runtime.driver.active.get_current_device()) if caches is not None else None
+        if not isinstance(entry, tuple) or not entry or not isinstance(entry[0], dict):
+            pytest.skip(f"Triton {triton.__version__} JIT cache layout differs; cannot count compiled variants")
+        return len(entry[0])
+
+    def check(rows: int, tokens: int) -> None:
+        scores = torch.randn((rows, tokens), device="cuda", dtype=torch.bfloat16, generator=generator) * 8
+        expected = (scores * scale).softmax(-1, dtype=torch.float32).to(scores.dtype)
+        torch.testing.assert_close(scaled_softmax(scores, scale), expected, rtol=0, atol=0)
+
+    check(1, 1025)
+    before = num_compiled()
+    # Different resolutions, batch sizes, alignments and a partial four-row
+    # tile must share one reduction bucket without changing BF16 arithmetic.
+    for rows, tokens in [(3, 1032), (64, 1056), (65, 1040)]:
+        check(rows, tokens)
+    assert num_compiled() == before
+    # The next 32-column bucket compiles exactly one more variant.
+    for rows, tokens in [(5, 1057), (66, 1088)]:
+        check(rows, tokens)
+    assert num_compiled() == before + 1
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("layout", ["transposed", "strided"])
 def test_noncontiguous_scores_use_reference_attention(layout: str) -> None:
     attention = SiglipAttention(SiglipVisionConfig(hidden_size=32, num_attention_heads=4)).eval()

@@ -16,6 +16,7 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
     supports_multi_session = max_sessions > 1
     return DuplexCapabilities(
         supports_model_native_turn_policy=True,
+        supports_input_processing_ack=True,
         supports_barge_in=True,
         supports_input_append=True,
         supports_replace_latest_chunk=False,

@@ -1058,10 +1058,22 @@ class OrchestratorBase:
             # Only streaming requests maintain the per-stage segment snapshot.
             if req_state.streaming.enabled:
                 raw_mm = self._completion_multimodal_output(eco, None)
+                output_metadata = dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}
+                # Prefill identifies the consumed input, but a speaking unit
+                # finishes on a later decode step that may carry no metadata.
+                # Retain only this small identity within the current segment;
+                # never retain activations or inherit it across a boundary.
+                input_key = "meta.duplex_input_item_id_utf8"
+                input_item_id = raw_mm.get(input_key) if isinstance(raw_mm, dict) else None
+                previous_segment = req_state.streaming.segment(stage_id)
+                if input_item_id is None and not previous_segment.finished:
+                    input_item_id = previous_segment.output_metadata.get(input_key)
+                if input_item_id is not None:
+                    output_metadata[input_key] = input_item_id
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
                     finished=segment_finished,
                     token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
-                    output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                    output_metadata=output_metadata,
                 )
                 req_state.streaming.new_prompt_len_snapshot = getattr(
                     eco,
