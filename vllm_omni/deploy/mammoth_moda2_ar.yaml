@@ -1,4 +1,9 @@
 # MammothModa2 AR-only (image/video understanding and summarization).
+#
+# Keep enforce_eager: true (default). Do not enable CUDA-graph capture on
+# und-only AR: FULL and PIECEWISE both hit the dual-expert MoE path whenever
+# the stream is capturing (#9764). For intentional FULL t2i AR graphs see
+# mammoth_moda2_ar_graph_full.yaml.
 
 async_chunk: false
 pipeline: mammoth_moda2_ar

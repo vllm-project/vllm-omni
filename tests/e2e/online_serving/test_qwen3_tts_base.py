@@ -14,7 +14,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 from vllm.platforms import current_platform
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
@@ -51,6 +51,7 @@ tts_server_params = [
             server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
+        marks=hardware_marks(res={"rocm": "MI325"}, num_cards=1),
     ),
     pytest.param(
         OmniServerParams(

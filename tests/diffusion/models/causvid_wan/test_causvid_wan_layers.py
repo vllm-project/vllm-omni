@@ -169,7 +169,6 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     plan, _, _ = pipeline._plan_for(req)
     assert plan.schedule.ordering is Ordering(name)
     assert plan.schedule.ordering.value == name
-    assert plan.schedule.has_clean is True
 
 
 @pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
@@ -264,22 +263,8 @@ def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
         assert plan.schedule.step_replicas == 1
 
 
-def test_causvid_rejects_explicit_has_clean():
-    """Clean derives from the topology; has_clean is no longer a request knob."""
-    pipeline = _bare_pipeline(step_replicas=1, history=6)
-    req = OmniDiffusionRequest(
-        prompt="x",
-        request_id="explicit-has-clean",
-        sampling_params=OmniDiffusionSamplingParams(
-            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2, "has_clean": True}
-        ),
-    )
-    with pytest.raises(ValueError, match="has_clean is derived from the topology"):
-        pipeline._plan_for(req)
-
-
 def test_causvid_rejects_explicit_s_eq_d():
-    """CausVidWan does not accept vertical S=D (Same-Step-only topology)."""
+    """Latest-KV does not accept the S=D Same-Step topology."""
     pipeline = _bare_pipeline(step_replicas=3, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
@@ -320,7 +305,7 @@ def test_causvid_rejects_s1_latest_kv():
         pipeline._plan_for(req)
 
 
-def test_cell_schedule_has_clean_s1_from_history():
+def test_cell_schedule_s1_steps_independent_of_history():
     """S=1 self_forcing always runs the clean step (ordering property)."""
     pipeline = _bare_pipeline(step_replicas=1, history=6)
     sf = OmniDiffusionRequest(
@@ -331,7 +316,6 @@ def test_cell_schedule_has_clean_s1_from_history():
         ),
     )
     plan_sf, _, _ = pipeline._plan_for(sf)
-    assert plan_sf.schedule.has_clean is True
     assert plan_sf.schedule.num_schedule_steps == 4
 
 

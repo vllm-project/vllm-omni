@@ -6,6 +6,7 @@ Model specific tests for CacheDiT enablement.
 """
 
 import ast
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,9 @@ from vllm.distributed import parallel_state
 import vllm_omni.diffusion.cache.cachedit as cd_backend
 import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, CacheDiTBackend, cache_summary
+from vllm_omni.diffusion.cache.cachedit.config import (
+    VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
@@ -631,3 +635,58 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(init_fake_tp_group
 
     assert latents.shape == (1, 4, 8, 8)
     assert torch.isfinite(latents).all()
+
+
+def _taylorseer_warning_logged(caplog) -> bool:
+    return any(
+        "validated cache window" in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    )
+
+
+def test_taylorseer_order_two_long_window_warns(caplog):
+    config = cd_backend.CacheDiTConfig(
+        enable_taylorseer=True,
+        taylorseer_order=2,
+        max_continuous_cached_steps=VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS + 2,
+    )
+    with caplog.at_level("WARNING"):
+        calibrator = config.to_calibrator_config()
+
+    assert calibrator is not None
+    assert _taylorseer_warning_logged(caplog)
+
+
+def test_taylorseer_order_two_validated_window_does_not_warn(caplog):
+    config = cd_backend.CacheDiTConfig(
+        enable_taylorseer=True,
+        taylorseer_order=2,
+        max_continuous_cached_steps=VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+    )
+    with caplog.at_level("WARNING"):
+        calibrator = config.to_calibrator_config()
+
+    assert calibrator is not None
+    assert not _taylorseer_warning_logged(caplog)
+
+
+def test_taylorseer_order_above_two_warns_without_validated_window(caplog):
+    config = cd_backend.CacheDiTConfig(
+        enable_taylorseer=True,
+        taylorseer_order=3,
+        max_continuous_cached_steps=VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+    )
+    with caplog.at_level("WARNING"):
+        calibrator = config.to_calibrator_config()
+
+    assert calibrator is not None
+    assert _taylorseer_warning_logged(caplog)
+
+
+def test_taylorseer_order_one_does_not_warn(caplog):
+    config = cd_backend.CacheDiTConfig(enable_taylorseer=True, taylorseer_order=1)
+    with caplog.at_level("WARNING"):
+        config.to_calibrator_config()
+
+    assert not _taylorseer_warning_logged(caplog)

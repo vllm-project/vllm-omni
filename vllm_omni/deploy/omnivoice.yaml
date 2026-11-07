@@ -11,6 +11,7 @@ stages:
     trust_remote_code: true
     distributed_executor_backend: "mp"
     dtype: "float32"
+    step_execution: true
     additional_config:
       omnivoice_asr:
         # false defers Whisper until ref_audio is sent without ref_text;
@@ -19,4 +20,5 @@ stages:
         asr_model_name: "openai/whisper-large-v3-turbo"
         asr_device: null
     max_num_seqs: 8
-    request_batch_max_wait_ms: 10
+    default_sampling_params:
+      num_inference_steps: 32
