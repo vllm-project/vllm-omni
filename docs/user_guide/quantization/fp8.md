@@ -88,6 +88,31 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 > The PyPI package is `quack-kernels` (imported as `quack`); plain `pip install
 > quack` is an unrelated statistics library. Requires CUDA 12.9+ and Python 3.12.
 
+### FlashInfer autotune for diffusion stages
+
+Where vLLM runs FP8 linears through FlashInfer (SM100+, including workstation
+Blackwell such as RTX PRO 6000 when quack is not used), FlashInfer picks a GEMM
+tactic by heuristic unless it is autotuned. vLLM autotunes FlashInfer only in
+its LLM worker warm-up, so diffusion stages opt in explicitly:
+
+```bash
+vllm serve <your-model> --omni --quantization fp8 --diffusion-flashinfer-autotune
+```
+
+The first request of each new shape (output size, frame count, outputs per
+prompt and CFG on or off) runs under FlashInfer's autotune context, which
+profiles the GEMM shapes it has not seen; with step execution that covers every
+step of the request, since prefill and decode differ. That request is slower,
+so send a warm-up request at the measured shape before timing. Later requests
+run in FlashInfer's normal mode and use the tuned tactics: tune mode is not kept
+on, because it adds host time to every FlashInfer call even when the tactic is
+cached. Tactics are cached per rank under
+`$VLLM_CACHE_ROOT/flashinfer_autotune/diffusion/<key>/rank<N>.json`, keyed on the
+model, quantization, dtype and parallel layout, and are reused after a restart.
+Captured CUDA graphs are compatible: their eager warm-up runs before capture, so
+the capture only sees cached tactics. The flag is a no-op off CUDA or without
+FlashInfer.
+
 ## Model Type Support
 
 ### Diffusion Models

@@ -897,6 +897,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     moe_backend: str = "auto"
     linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
+    diffusion_flashinfer_autotune: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
     supports_multimodal_inputs: bool = False
