@@ -1178,6 +1178,114 @@ steps:
             "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt" \
             2>&1 | tee "$$ROCM_MERGE_ARTIFACT_DIR/process-cleanup.txt"
 
+- group: ":test_tube: ROCm minicpmo-duplex-window MERGE"
+  steps:
+    - label: "MERGE · MiniCPM-o 4.5 Advanced Duplex/Window"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 90
+      source_file_dependencies:
+        - omni_minicpmo_4_5_duplex_function
+        - tests/helpers/
+      artifact_paths:
+        - "artifacts/rocm-merge-minicpmo-duplex-window/**/*"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-minicpmo-duplex-window"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - >-
+          ps -eo pid=,ppid=,lstart=,stat=,comm= >
+          "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_two_sessions_resume_and_takeover[three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[basic-False-three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-False-three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-True-three-stage-single-gpu]"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          timeout --signal=TERM --kill-after=2m 80m \
+            pytest -s -v -ra \
+            'tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_two_sessions_resume_and_takeover[three-stage-single-gpu]' \
+            'tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[basic-False-three-stage-single-gpu]' \
+            'tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-False-three-stage-single-gpu]' \
+            'tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-True-three-stage-single-gpu]' \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-duplex-window" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/duplex-window.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-duplex-window.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 4 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 4 executed minicpmo-duplex-window duplex-window tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/duplex-window.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+        - |
+          set -o pipefail
+          sleep 5
+          ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt"
+          # Compare PID plus process start time so PID reuse cannot hide a leak.
+          # Double dollars preserve awk field references through Buildkite interpolation.
+          awk '
+            NR == FNR {
+              if ($$9 != "ps") {
+                baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+              }
+              next
+            }
+            $$9 != "ps" {
+              identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+              if (!(identity in baseline)) {
+                print
+                leaked = 1
+              }
+            }
+            END {
+              if (leaked) {
+                print "status=FAIL leaked_processes_detected=1"
+                exit 1
+              }
+              print "status=PASS leaked_processes=0"
+            }
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt" \
+            "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt" \
+            2>&1 | tee "$$ROCM_MERGE_ARTIFACT_DIR/process-cleanup.txt"
+
 - group: ":full_moon: MiniCPM-o 4.5 MERGE"
   steps:
     - label: "MERGE · MiniCPM-o 4.5 Offline"
