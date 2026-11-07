@@ -139,6 +139,9 @@ EXCLUDED_MODELS = [
     # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
     # endpoint tests.
     "VideoDepthAnythingPipeline",
+    # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
+    # with a tiny modular checkpoint. Real-checkpoint parity is checked after merge.
+    "PAN2ModularPipeline",
 ]
 
 

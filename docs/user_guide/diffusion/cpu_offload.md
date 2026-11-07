@@ -53,6 +53,7 @@ higher-priority strategy is selected.
 | BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | — | yes | — | `layers`, customized modules |
 | Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | yes | yes | yes | `layers`, `gen_layers` |
 | HyNomasModularPipeline | `tencent/Hy-Nomas-Diffusers` | reference `CPTHYNomasDiffusionTransformer` | yes | — | — | — |
+| PAN2ModularPipeline | `IFM/PAN2` | `PAN2Transformer3DModel` | yes | yes | yes | `transformer_blocks`; distributed layerwise also streams `context_refiner` |
 
 Model-level support requires discoverable DiT and encoder components.
 Layerwise support requires transformer block topology. Distributed support
