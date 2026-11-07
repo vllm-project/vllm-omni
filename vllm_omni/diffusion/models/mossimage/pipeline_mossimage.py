@@ -32,11 +32,12 @@ import math
 import os
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 import torch
 from diffusers.configuration_utils import register_to_config
@@ -72,7 +73,8 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 _DEFAULT_RESOLUTION = 1024
 _DEFAULT_NUM_INFERENCE_STEPS = 50
-_DEFAULT_GUIDANCE_SCALE = 4.0
+# Model-card default for MOSS-Image (recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml); 1.0 would disable CFG.
+_DEFAULT_GUIDANCE_SCALE = 3.0
 _MAX_SEQUENCE_LENGTH = 4096
 
 
@@ -116,6 +118,15 @@ def _sampling_shift(extra_args: dict[str, Any]) -> float | None:
         if extra_args.get(name) is not None:
             return float(extra_args[name])
     return None
+
+
+def _resolve_guidance_scale(sampling: OmniDiffusionSamplingParams) -> float:
+    guidance_scale = (
+        cast(float, sampling.guidance_scale) if sampling.guidance_scale_provided else _DEFAULT_GUIDANCE_SCALE
+    )
+    if not math.isfinite(guidance_scale) or guidance_scale < 0:
+        raise ValueError(f"Invalid guidance scale: {guidance_scale}")
+    return guidance_scale
 
 
 def get_mossimage_pre_process_func(od_config: OmniDiffusionConfig):
@@ -387,7 +398,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         if height <= 0 or width <= 0 or height % 16 or width % 16:
             raise ValueError("height and width must be positive multiples of 16.")
         num_inference_steps = sampling.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale is not None else _DEFAULT_GUIDANCE_SCALE
+        guidance_scale = _resolve_guidance_scale(sampling)
         num_images_per_prompt = max(sampling.num_outputs_per_prompt, 1)
         max_sequence_length = sampling.max_sequence_length or _MAX_SEQUENCE_LENGTH
         max_sequence_length = max(1, min(max_sequence_length, _MAX_SEQUENCE_LENGTH))
@@ -540,9 +551,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         if height <= 0 or width <= 0 or height % 16 or width % 16:
             raise ValueError("height and width must be positive multiples of 16.")
         num_inference_steps = sampling.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale is not None else _DEFAULT_GUIDANCE_SCALE
-        if not math.isfinite(guidance_scale) or guidance_scale < 0:
-            raise ValueError(f"Invalid guidance scale: {guidance_scale}")
+        guidance_scale = _resolve_guidance_scale(sampling)
         num_images_per_prompt = max(sampling.num_outputs_per_prompt, 1)
         max_sequence_length = sampling.max_sequence_length or _MAX_SEQUENCE_LENGTH
         max_sequence_length = max(1, min(max_sequence_length, _MAX_SEQUENCE_LENGTH))
