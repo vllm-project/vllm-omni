@@ -1511,14 +1511,17 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
                 prompt, mm, _, _ = render_candidate(candidate, summary)
                 return self._context_token_count(prompt, mm)
 
-            def count_with_cards(candidate, summary, cards):
-                prompt, mm, _, _ = render_candidate(candidate, summary, cards)
+            def card_block_tokens(cards):
                 block = self.processor.apply_chat_template(
                     [card_message(cards)], tokenize=False, add_generation_prompt=False
                 )
+                return len(self.processor.tokenizer.encode(block, add_special_tokens=False))
+
+            def count_with_cards(candidate, summary, cards):
+                prompt, mm, _, _ = render_candidate(candidate, summary, cards)
                 return CardCost(
                     prompt_tokens=self._context_token_count(prompt, mm),
-                    card_tokens=len(self.processor.tokenizer.encode(block, add_special_tokens=False)),
+                    card_tokens=card_block_tokens(cards),
                 )
 
             cards = (
@@ -1529,6 +1532,11 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
                 if self._context_config.context_memory_tokens
                 else ()
             )
+            # The formatted block is an independent part of the cap. Reject
+            # oversized prefixes before decoding media or processing a full
+            # prompt; the remaining prefixes still get the exact total check.
+            while cards and card_block_tokens(cards) > self._context_config.context_memory_tokens:
+                cards = cards[:-1]
 
             selection = select_history(
                 list(history),

@@ -314,6 +314,36 @@ def test_real_cards_are_historical_data_and_do_not_create_roles_or_media(process
     assert "context_memory_cards" not in plan.prompt and "context_selection" not in plan.prompt
 
 
+@pytest.mark.parametrize("text", ["茶" * 512, "The user prefers green tea."], ids=("over_cap", "fitting_prefix"))
+def test_over_cap_card_prefixes_skip_full_media_processing(processor, monkeypatch, record_property, text):
+    plugin = _plugin(processor)
+    messages = _media_history()
+    calls = []
+    count = plugin._context_token_count
+
+    def counted(*args):
+        calls.append(1)
+        return count(*args)
+
+    monkeypatch.setattr(plugin, "_context_token_count", counted)
+    base = _plan(plugin, messages)
+    base_calls = len(calls)
+    calls.clear()
+    plan = _plan(plugin, messages, cards=_cards(16, text=text))
+    selected = plan.context_selection.card_node_ids
+    record_property("selected_card_ids", json.dumps(selected))
+    record_property("materialized", json.dumps(_fingerprint(processor, plan.prompt), sort_keys=True))
+    if len(text) == 512:
+        assert selected == ()
+        assert _fingerprint(processor, plan.prompt) == _fingerprint(processor, base.prompt)
+        assert len(calls) == base_calls
+    else:
+        assert selected
+        # The largest prefix within the formatted allowance also fits the
+        # generous total context here, so only it needs a full processor pass.
+        assert len(calls) == base_calls + 1
+
+
 def test_actual_format_cap_and_sampling_reserve_boundaries(processor):
     messages = _messages()
     cards = _cards(1, text="喜欢杭州的绿茶。")
