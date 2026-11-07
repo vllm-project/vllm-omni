@@ -431,7 +431,11 @@ def main():
     model_class_name = args.model_class_name
     resolved_model_class_name = model_class_name or resolve_model_class_name(args.model)
     model_class_name_lower = (resolved_model_class_name or "").lower()
-    video_defaults = get_video_generation_defaults(resolved_model_class_name, args.extra_body)
+    video_defaults = get_video_generation_defaults(
+        resolved_model_class_name,
+        args.extra_body,
+        requested_size=(args.width, args.height) if args.width and args.height else None,
+    )
     is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
     is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
     is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
