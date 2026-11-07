@@ -446,9 +446,15 @@ separate from these deterministic validity rules.
 
 Plugins can opt into owner-bound auxiliary work with
 `supports_context_auxiliary_requests` and `context_auxiliary_policy`. The default
-is disabled. The policy gate runs before capturing history; an idle context
-policy does not fall back to legacy memory hooks. Existing auxiliary plugins
-retain their prepare, source-validation and apply contracts.
+is disabled. In context-only mode the policy gate runs before capturing history,
+and an idle policy does not fall back to the other memory hooks. With both
+capabilities and an explicit common account, eligible summary and card work
+alternate on the same private slot. Each kind retains one stable work identity
+and finite retry state across temporary policy idleness, kind switches and pure
+epoch changes. New source or settings identities permit new work. A kind waiting
+for resources retains the next admission opportunity instead of losing it to
+continuously ready work. Existing auxiliary plugins retain their prepare,
+source-validation and apply contracts.
 
 The session captures bounded, detached text evidence, stable source identity and
 revisions. Pending user input and unsettled assistant speech are excluded;
@@ -518,9 +524,8 @@ through the deployment-owned `context_auxiliary_budget`. Summary work then uses
 measured token IDs and records its attempted identity only after resource
 admission. A temporary allowance shortage leaves that work eligible for the
 next window. Legacy summary preparation retains its existing contract when no
-common account is configured. Selection between summary/card work and final card
-prompt consumption remain separate integrations; the L1 view policy below does
-not enable memory extraction.
+common account is configured. Final card prompt consumption remains a separate
+integration; the L1 view policy below does not enable memory extraction.
 
 Qwen's memory codec renders captured text as quoted JSON data with local
 evidence and barrier handles. Its strict output schema accepts upsert/retract

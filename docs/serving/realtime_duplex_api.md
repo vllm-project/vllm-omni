@@ -2148,6 +2148,13 @@ cards retain their existing compute settings. Configuring both policies
 requires the explicit common account, whose output allowance must fit each
 request's reserved generation.
 
+With both summary memory and card extraction enabled, ready work alternates on
+the same private request slot. Each kind keeps its finite retry state across
+policy idleness and input preemption. User interaction takes priority; the next
+private request waits for successful cleanup. Resource-deferred work keeps the
+next admission opportunity, which can leave a small remaining allowance unused
+until the common account or execution permit becomes available.
+
 The most recent complete historical turn takes priority over summary memory.
 A usable summary then takes priority over additional older verbatim turns.
 When all available original context fits, original text takes priority, except

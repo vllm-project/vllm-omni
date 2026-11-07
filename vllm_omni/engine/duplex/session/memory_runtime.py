@@ -34,6 +34,7 @@ from vllm_omni.engine.duplex.memory_types import (
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryPolicy, DuplexAuxiliaryRequest, duplex_text_history
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudget, DuplexAuxiliaryReservation
+from vllm_omni.engine.duplex.session.auxiliary_selection import DuplexAuxiliaryKind, DuplexAuxiliarySelector
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 
@@ -77,6 +78,9 @@ class SessionMemoryRuntime:
         self._resource_waiting = False
         self._resource_timer: asyncio.TimerHandle | None = None
         self._resource_generation = 0
+        self._mixed_mode = False
+        self._auxiliary_kind: DuplexAuxiliaryKind | None = None
+        self._selector = DuplexAuxiliarySelector()
 
     def _clear_resource_wait(self) -> None:
         self._resource_generation += 1
@@ -100,6 +104,8 @@ class SessionMemoryRuntime:
             self.resources_available()
 
     def _defer_resources(self, ready_at: float | None) -> None:
+        if self._mixed_mode and self._auxiliary_kind is not None and self._source is not None:
+            self._selector.release(self._auxiliary_kind, self._source, prefer=True)
         self._clear_resource_wait()
         self._resource_waiting = True
         if ready_at is not None:
@@ -181,7 +187,8 @@ class SessionMemoryRuntime:
             assert isinstance(epoch, int) and isinstance(config_revision, int)
             context = payload.get("context")
             assert context is None or isinstance(context, DuplexContextAuxiliaryInput)
-            if self._context_matches(request, epoch, config_revision, context):
+            matches = self._context_matches(request, epoch, config_revision, context)
+            if matches:
                 output = payload["output"]
                 try:
                     if context is not None:
@@ -201,10 +208,17 @@ class SessionMemoryRuntime:
                     logger.warning("Duplex auxiliary result failed: %s", type(exc).__name__)
                     applied = False
                 if applied:
+                    if self._mixed_mode and self._auxiliary_kind is not None and self._source is not None:
+                        self._selector.succeeded(self._auxiliary_kind, self._source)
                     self._source = None
                     self.cancel_retry()
                 else:
                     self._schedule_retry(request)
+            elif self._mixed_mode and self._auxiliary_kind is not None and self._source is not None:
+                self._selector.release(self._auxiliary_kind, self._source)
+            if self._mixed_mode:
+                self._auxiliary_kind = None
+                self._source = None
             self.maybe_start()
             return True
         return False
@@ -212,6 +226,7 @@ class SessionMemoryRuntime:
     def close(self) -> None:
         self._clear_resource_wait()
         self.cancel_retry()
+        self._selector.clear()
         if self._task is not None and not helpers.task_is_cancelling(self._task):
             self._task.cancel()
 
@@ -310,6 +325,15 @@ class SessionMemoryRuntime:
         if self._retry_timer is not None:
             self._retry_timer.cancel()
             self._retry_timer = None
+        if self._mixed_mode:
+            if (
+                self._auxiliary_kind is not None
+                and self._source is not None
+                and (self._completion_pending or (self._task is not None and not self._task.done()))
+            ):
+                self._selector.release(self._auxiliary_kind, self._source)
+            self._source = None
+            return
         if not self._retry_exhausted or self._retry_source != self._source:
             self._source = None
 
@@ -342,6 +366,15 @@ class SessionMemoryRuntime:
     def _schedule_retry(self, request: DuplexAuxiliaryRequest) -> None:
         """Back off submitted failures without letting traffic reset the budget."""
         source = self._source
+        if self._mixed_mode and self._auxiliary_kind is not None and source is not None:
+            self._retry_source = source
+            self._failures, self._retry_exhausted = self._selector.failed(
+                self._auxiliary_kind,
+                source,
+                delays=request.retry_delays_s,
+                now=asyncio.get_running_loop().time(),
+            )
+            return
         context_mode = request.context_work is not None
         if source is None or (not context_mode and not request.retry_delays_s and request.retry_cooldown_s is None):
             return
@@ -368,7 +401,9 @@ class SessionMemoryRuntime:
         context_mode = self._ctx.plugin.supports_context_auxiliary_requests
         if not (self._ctx.plugin.supports_auxiliary_requests or context_mode) or self._closing:
             return
-        history = () if context_mode else self._current_history()
+        common_limits = self._ctx.plugin.auxiliary_budget_limits()
+        self._mixed_mode = context_mode and self._ctx.plugin.supports_auxiliary_requests and common_limits is not None
+        history = () if context_mode and not self._mixed_mode else self._current_history()
         # Policy also advances model-owned camera chunks while summaries run;
         # unchanged text history alone cannot establish that it is a no-op.
         policy = (
@@ -409,8 +444,11 @@ class SessionMemoryRuntime:
         # an unbounded collection of abandoned background requests behind it.
         if any(duplex_is_auxiliary_request(request_id) for _, request_id in self._ctx.session.request_resources):
             return
+        if self._mixed_mode:
+            assert common_limits is not None
+            self._maybe_start_mixed(history, self._ctx.session.context_compute_budget(common_limits))
+            return
         context = None
-        common_limits = self._ctx.plugin.auxiliary_budget_limits()
         compute_budget = self._ctx.session.context_compute_budget(common_limits) if common_limits is not None else None
         if context_mode:
             if self._interaction_pending or self._interaction_active:
@@ -468,6 +506,69 @@ class SessionMemoryRuntime:
         self._generation += 1
         self._task = asyncio.create_task(
             self._run(duplex_text_history(history), context, compute_budget), name="duplex-auxiliary"
+        )
+        self._ctx.services.spawn(self._task, name="duplex-auxiliary")
+        self._task.add_done_callback(self._wake)
+
+    def _arm_mixed_retry(self, deadline: float | None) -> None:
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+        if deadline is not None:
+            loop = asyncio.get_running_loop()
+            self._retry_timer = loop.call_later(max(0.0, deadline - loop.time()), self._post, "auxiliary_ready", {})
+
+    def _maybe_start_mixed(self, history: tuple[dict[str, object], ...], budget: DuplexAuxiliaryBudget) -> None:
+        self._auxiliary_kind = None
+        if self._interaction_pending or self._interaction_active or self._resource_waiting:
+            return
+        plugin, session = self._ctx.plugin, self._ctx.session
+        busy = session.active_response_id is not None or bool(self._ctx.tasks.append_tasks)
+        policies: dict[DuplexAuxiliaryKind, DuplexAuxiliaryPolicy] = {}
+        summary = plugin.auxiliary_policy(
+            state=self._ctx.model_state, history_revision=session.history_revision, history=history
+        )
+        if summary is not None and (summary.allow_during_response or not busy):
+            policies["summary"] = summary
+        context = None
+        card_policy = plugin.context_auxiliary_policy(runtime_config=session.runtime_config)
+        if card_policy is not None:
+            if not isinstance(card_policy, DuplexContextAuxiliaryPolicy):
+                raise ValueError("invalid_context_auxiliary_policy")
+            if card_policy.allow_during_response or not busy:
+                context = session.capture_memory_context(
+                    max_sources=card_policy.max_sources,
+                    max_chars=card_policy.max_chars,
+                    excluded_item_ids=frozenset(self._pending_user_items),
+                )
+                if context is not None:
+                    policies["card"] = DuplexAuxiliaryPolicy(context.work_key, card_policy.allow_during_response)
+        now = self._ctx.manager._clock()
+        if policies:
+            ready_at = budget.next_ready_at(1, 1, now=now)
+            if ready_at is None or ready_at > now:
+                self._defer_resources(ready_at)
+                return
+        sources: dict[DuplexAuxiliaryKind, Hashable] = {
+            kind: (0, session.config_revision, (kind, policy.source_key)) for kind, policy in policies.items()
+        }
+        loop = asyncio.get_running_loop()
+        selected = self._selector.choose(sources, now=loop.time())
+        if selected is None:
+            self._arm_mixed_retry(self._selector.deadline(sources, now=loop.time()))
+            return
+        self._arm_mixed_retry(None)
+        self._auxiliary_kind = selected
+        self._source = (0, session.config_revision, (selected, policies[selected].source_key))
+        self._epoch = session.epoch
+        self._generation += 1
+        self._task = asyncio.create_task(
+            self._run(
+                duplex_text_history(history) if selected == "summary" else (),
+                context if selected == "card" else None,
+                budget,
+            ),
+            name="duplex-auxiliary",
         )
         self._ctx.services.spawn(self._task, name="duplex-auxiliary")
         self._task.add_done_callback(self._wake)
@@ -572,6 +673,8 @@ class SessionMemoryRuntime:
                     if self._interaction_pending or self._interaction_active:
                         # Preparation is not a dispatched forward. Let cleared
                         # or rejected foreground input resume this same work.
+                        if self._mixed_mode and self._auxiliary_kind is not None and self._source is not None:
+                            self._selector.release(self._auxiliary_kind, self._source, prefer=True)
                         self._source = None
                         return None
                     assert reservation is not None

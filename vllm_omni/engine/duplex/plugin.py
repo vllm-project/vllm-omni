@@ -525,7 +525,7 @@ class DuplexModelPlugin(ABC):
         return config
 
     def context_auxiliary_policy(self, *, runtime_config: Mapping[str, object]) -> DuplexContextAuxiliaryPolicy | None:
-        """Opt into owner-bound text work; None is idle, without legacy fallback."""
+        """Select owner-bound work; a common account may arbitrate both auxiliary policies."""
         return None
 
     async def prepare_context_auxiliary_request(
