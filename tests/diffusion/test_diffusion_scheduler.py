@@ -351,6 +351,7 @@ class TestGetRequestBatchSamplingParamsKey:
         condition_key: tuple | None = None,
         guidance_scale: float | None = None,
         guidance_scale_2: float | None = None,
+        generator_device: str | None = None,
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
@@ -359,6 +360,7 @@ class TestGetRequestBatchSamplingParamsKey:
             extra_args=extra_args or {},
             guidance_scale=guidance_scale,
             guidance_scale_2=guidance_scale_2,
+            generator_device=generator_device,
         )
         return OmniDiffusionRequest(
             prompt="prompt",
@@ -381,6 +383,13 @@ class TestGetRequestBatchSamplingParamsKey:
         assert scheduler._build_sampling_params_key(
             self._make(seed=1, generator=gen_a)
         ) == scheduler._build_sampling_params_key(self._make(seed=2, generator=gen_b))
+
+    def test_distinguishes_generator_device_override(self) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(generator_device="cpu")
+        ) != scheduler._build_sampling_params_key(self._make(generator_device=None))
 
     @pytest.mark.parametrize(
         ("first_extra_args", "second_extra_args"),
@@ -1375,6 +1384,51 @@ class TestRequestScheduler:
         assert _new_ids(first) == [req_id_a, req_id_b]
         assert first.num_running_reqs == 2
         assert first.num_waiting_reqs == 0
+
+    @pytest.mark.parametrize(
+        ("first_device", "second_device"),
+        [("cpu", None), (None, "cpu")],
+    )
+    def test_batches_mixed_generator_devices_separately(
+        self,
+        first_device: str | None,
+        second_device: str | None,
+    ) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        first_id = scheduler.add_request(
+            _make_step_request(
+                "first",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    seed=123,
+                    generator_device=first_device,
+                ),
+            )
+        )
+        second_id = scheduler.add_request(
+            _make_step_request(
+                "second",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    seed=456,
+                    generator_device=second_device,
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [first_id]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(first, _make_request_output(first_id))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [second_id]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 0
 
     @pytest.mark.parametrize(
         ("first_extra_args", "second_extra_args"),
