@@ -28,6 +28,14 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
     _MiniCPMO45Stage0SessionState,
     _MiniCPMO45WindowUnit,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+    MiniCPMO45DuplexSchedulerHelper as Helper,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+    CARRIED_WINDOW_MAX_SESSIONS,
+    CARRIED_WINDOW_OFFER_TTL_S,
+    CARRIED_WINDOW_WORKER_TTL_S,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -207,9 +215,9 @@ def test_abort_keeps_the_window_the_worker_has(scheduled: bool, kept: list[int])
     sched._update_request_as_session(session, update)
     assert update.model_intermediate_buffer["duplex"]["stage0_window"]["drop_units"] == 2
     if scheduled:
-        sched._commit_minicpmo45_window_snapshots(SimpleNamespace(num_scheduled_tokens={request_id: 8}))
+        Helper.commit_window_snapshots(sched, SimpleNamespace(num_scheduled_tokens={request_id: 8}))
 
-    sched._stash_minicpmo45_windows([request_id])
+    Helper.stash_windows(sched, [request_id])
 
     stashed = sched._minicpmo45_carried_windows["s"]
     assert [unit["length"] for unit in stashed["units"]] == kept
@@ -223,10 +231,10 @@ def test_a_second_append_before_booking_keeps_the_first_snapshot() -> None:
     session._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests[request_id] = session
 
-    sched._snapshot_minicpmo45_window(session)
+    Helper.snapshot_window(sched, session)
     session._minicpmo45_window_units = [{"length": 9, "generated_token_ids": []}]
-    sched._snapshot_minicpmo45_window(session)
-    sched._stash_minicpmo45_windows([request_id])
+    Helper.snapshot_window(sched, session)
+    Helper.stash_windows(sched, [request_id])
 
     assert [unit["length"] for unit in sched._minicpmo45_carried_windows["s"]["units"]] == [5, 6]
 
@@ -240,7 +248,7 @@ def test_abort_before_the_first_plan_of_an_empty_window_keeps_nothing() -> None:
     sched._update_request_as_session(session, _second_append("basic"))
     assert session._minicpmo45_window_units
 
-    sched._stash_minicpmo45_windows([request_id])
+    Helper.stash_windows(sched, [request_id])
 
     assert "s" not in (getattr(sched, "_minicpmo45_carried_windows", None) or {})
 
@@ -251,16 +259,16 @@ def test_restash_keeps_the_time_of_the_first_abort(monkeypatch: pytest.MonkeyPat
     old = _new_request(old_id)
     old._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests[old_id] = old
-    sched._stash_minicpmo45_windows([old_id])
+    Helper.stash_windows(sched, [old_id])
     first_time = sched._minicpmo45_carried_windows["s"]["time"]
 
     new_id = _stage0_id("s", 1)
     new = _new_request(new_id)
-    sched._attach_minicpmo45_carried_window(new)
+    Helper.attach_carried_window(sched, new)
     sched.requests[new_id] = new
     later = first_time + 5
     monkeypatch.setattr(time, "monotonic", lambda: later)
-    sched._stash_minicpmo45_windows([new_id])
+    Helper.stash_windows(sched, [new_id])
 
     assert sched._minicpmo45_carried_windows["s"]["time"] == first_time
 
@@ -272,7 +280,7 @@ def test_abort_before_the_first_plan_passes_the_carried_window_on() -> None:
     request._minicpmo45_carried_window = {"units": [dict(unit) for unit in CARRIED], "previous": [33]}
     sched.requests[request_id] = request
 
-    sched._stash_minicpmo45_windows([request_id])
+    Helper.stash_windows(sched, [request_id])
 
     stashed = sched._minicpmo45_carried_windows["s"]
     assert (stashed["units"], stashed["previous"]) == (CARRIED, [33])
@@ -288,7 +296,7 @@ def test_second_barge_in_before_the_carry_is_placed_keeps_the_carried_units() ->
     sched._update_request_as_session(session, _second_append("basic", high=25, low=20))
     assert session._minicpmo45_carried_window is None
 
-    sched._stash_minicpmo45_windows([request_id])
+    Helper.stash_windows(sched, [request_id])
 
     assert [unit["length"] for unit in sched._minicpmo45_carried_windows["s"]["units"]] == [5, 6]
 
@@ -299,17 +307,17 @@ def test_a_carry_older_than_its_ttl_is_not_attached(monkeypatch: pytest.MonkeyPa
     old = _new_request(old_id)
     old._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests[old_id] = old
-    sched._stash_minicpmo45_windows([old_id])
+    Helper.stash_windows(sched, [old_id])
 
-    later = time.monotonic() + OmniARScheduler._MINICPMO45_CARRIED_WINDOW_TTL_S + 1
+    later = time.monotonic() + CARRIED_WINDOW_OFFER_TTL_S + 1
     monkeypatch.setattr(time, "monotonic", lambda: later)
     new = _new_request(_stage0_id("s", 1))
-    sched._attach_minicpmo45_carried_window(new)
+    Helper.attach_carried_window(sched, new)
 
     assert getattr(new, "_minicpmo45_carried_window", None) is None
     assert "s" not in sched._minicpmo45_carried_windows
     # The worker keeps its copy longer, so it never misses units the scheduler places.
-    assert MiniCPMO45Stage0DuplexRuntime._CARRIED_WINDOW_TTL_S > OmniARScheduler._MINICPMO45_CARRIED_WINDOW_TTL_S
+    assert CARRIED_WINDOW_WORKER_TTL_S > CARRIED_WINDOW_OFFER_TTL_S
 
 
 def test_only_duplex_stage0_requests_are_kept_and_attached() -> None:
@@ -317,7 +325,7 @@ def test_only_duplex_stage0_requests_are_kept_and_attached() -> None:
     other = _new_request("chatcmpl-1")
     other._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests["chatcmpl-1"] = other
-    sched._stash_minicpmo45_windows(["chatcmpl-1"])
+    Helper.stash_windows(sched, ["chatcmpl-1"])
     assert not getattr(sched, "_minicpmo45_carried_windows", None)
 
     old_id = _stage0_id("s", 0)
@@ -326,10 +334,10 @@ def test_only_duplex_stage0_requests_are_kept_and_attached() -> None:
     old._minicpmo45_window_open_start = 30
     old.num_computed_tokens = 30
     sched.requests[old_id] = old
-    sched._stash_minicpmo45_windows([old_id])
+    Helper.stash_windows(sched, [old_id])
 
     new = _new_request(_stage0_id("s", 1))
-    sched._attach_minicpmo45_carried_window(new)
+    Helper.attach_carried_window(sched, new)
     assert [unit["length"] for unit in new._minicpmo45_carried_window["units"]] == [5, 6]
     assert "s" not in sched._minicpmo45_carried_windows
 
@@ -474,7 +482,7 @@ def test_worker_finish_hook_stashes_and_a_stale_stash_is_not_restored(monkeypatc
 
     assert helper.sessions == {}
     assert "s" in helper._carried_window_units
-    later = time.monotonic() + MiniCPMO45Stage0DuplexRuntime._CARRIED_WINDOW_TTL_S + 1
+    later = time.monotonic() + CARRIED_WINDOW_WORKER_TTL_S + 1
     monkeypatch.setattr(time, "monotonic", lambda: later)
     state = _state()
     helper.restore_window_units(state)
@@ -631,12 +639,12 @@ def test_an_abort_with_nothing_to_keep_drops_the_sessions_earlier_window() -> No
     old = _new_request(old_id)
     old._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests[old_id] = old
-    sched._stash_minicpmo45_windows([old_id])
+    Helper.stash_windows(sched, [old_id])
     assert "s" in sched._minicpmo45_carried_windows
 
     empty_id = _stage0_id("s", 1)
     sched.requests[empty_id] = _new_request(empty_id)
-    sched._stash_minicpmo45_windows([empty_id])
+    Helper.stash_windows(sched, [empty_id])
 
     assert "s" not in sched._minicpmo45_carried_windows
 
@@ -669,10 +677,10 @@ def test_two_sessions_keep_their_own_windows() -> None:
         request = _new_request(request_id)
         request._minicpmo45_window_units = [dict(unit) for unit in units]
         sched.requests[request_id] = request
-    sched._stash_minicpmo45_windows([_stage0_id("a", 0), _stage0_id("b", 0)])
+    Helper.stash_windows(sched, [_stage0_id("a", 0), _stage0_id("b", 0)])
 
     new_b = _new_request(_stage0_id("b", 1))
-    sched._attach_minicpmo45_carried_window(new_b)
+    Helper.attach_carried_window(sched, new_b)
     assert [unit["length"] for unit in new_b._minicpmo45_carried_window["units"]] == [5, 6]
     assert list(sched._minicpmo45_carried_windows) == ["a"]
 
@@ -683,3 +691,51 @@ def test_two_sessions_keep_their_own_windows() -> None:
     helper.restore_window_units(restored)
     assert [unit.token_ids[0] for unit in restored.carried_window_units] == [200, 300]
     assert list(helper._carried_window_units) == ["a"]
+
+
+def test_both_sides_keep_at_most_the_session_cap_and_drop_the_oldest() -> None:
+    names = [f"s{k}" for k in range(CARRIED_WINDOW_MAX_SESSIONS + 1)]
+
+    # s0 is kept again just before the last one, so it is the newest and s1 is the one dropped.
+    order = [*names[:-1], names[0], names[-1]]
+
+    sched = _scheduler()
+    for epoch, name in enumerate(order):
+        request_id = _stage0_id(name, epoch)
+        request = _new_request(request_id)
+        request._minicpmo45_window_units = [dict(unit) for unit in CARRIED[:1]]
+        sched.requests[request_id] = request
+        Helper.stash_windows(sched, [request_id])
+    assert list(sched._minicpmo45_carried_windows) == [*names[2:-1], names[0], names[-1]]
+
+    helper = _worker()
+    for name in order:
+        helper.stash_window_units(name, _state(session_id=name, window_units=[_unit(100, 2)]))
+    assert list(helper._carried_window_units) == [*names[2:-1], names[0], names[-1]]
+
+
+def test_scheduler_hooks_stay_out_until_a_duplex_stage0_append_was_planned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a duplex Stage-0 request the scheduler hooks never call into the MiniCPM-o helper."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("MiniCPM-o carry helper called")
+
+    for name in ("attach_carried_window", "release_windows", "commit_window_snapshots"):
+        monkeypatch.setattr(Helper, name, classmethod(fail))
+    monkeypatch.setattr(
+        _upstream(OmniARScheduler, "add_request"),
+        "add_request",
+        lambda self, request: self.requests.__setitem__(request.request_id, request),
+    )
+    monkeypatch.setattr(_upstream(OmniARScheduler, "finish_requests"), "finish_requests", lambda self, ids, st: [])
+    monkeypatch.setattr(
+        _upstream(OmniARScheduler, "_update_after_schedule"), "_update_after_schedule", lambda self, out: None
+    )
+    sched = _scheduler()
+    sched._enforce_kstep_span_uniformity = lambda out: None
+    sched._clear_kv_wait_starts = lambda ids: None
+
+    request = _new_request("chatcmpl-1")
+    sched.add_request(request)
+    sched._update_after_schedule(SimpleNamespace(num_scheduled_tokens={"chatcmpl-1": 1}))
+    sched.finish_requests(["chatcmpl-1"], RequestStatus.FINISHED_ABORTED)

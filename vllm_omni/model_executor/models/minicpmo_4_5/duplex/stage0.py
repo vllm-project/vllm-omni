@@ -21,6 +21,10 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+    CARRIED_WINDOW_MAX_SESSIONS,
+    CARRIED_WINDOW_WORKER_TTL_S,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -224,13 +228,6 @@ class MiniCPMO45Stage0DuplexRuntime:
         # session_id -> completed window units of its last finished Stage-0 request.
         self._carried_window_units: dict[str, _MiniCPMO45CarriedWindow] = {}
 
-    #: Seconds a finished request's units wait for the session's next request. The
-    #: worker cannot tell an abort from a normal finish, so it keeps every finished
-    #: request's units, in host memory, for this long. Longer than the scheduler's
-    #: ``_MINICPMO45_CARRIED_WINDOW_TTL_S``, so it never drops units the scheduler
-    #: still plans to place.
-    _CARRIED_WINDOW_TTL_S = 30.0
-
     def stash_window_units(self, session_id: str, state: _MiniCPMO45Stage0SessionState | None) -> None:
         """Keep a finished Stage-0 request's completed window units for its session's next epoch.
 
@@ -241,10 +238,14 @@ class MiniCPMO45Stage0DuplexRuntime:
         model keeps the conversation it had. The unit open at the cut is left
         out on both sides: its closing tokens never reached the KV.
         """
+        # The worker cannot tell an abort from a normal finish, so it keeps every
+        # finished request's units, in host memory, for CARRIED_WINDOW_WORKER_TTL_S
+        # (longer than the scheduler's offer) and for at most
+        # CARRIED_WINDOW_MAX_SESSIONS sessions, the oldest dropped first.
         carried = self._carried_window_units
         carried.pop(session_id, None)
         now = time.monotonic()
-        for stale in [sid for sid, kept in carried.items() if now - kept.time > self._CARRIED_WINDOW_TTL_S]:
+        for stale in [sid for sid, kept in carried.items() if now - kept.time > CARRIED_WINDOW_WORKER_TTL_S]:
             carried.pop(stale)
         if state is None or not state.window_enabled:
             return
@@ -252,15 +253,17 @@ class MiniCPMO45Stage0DuplexRuntime:
         units = [*state.carried_window_units, *state.window_units]
         if units:
             carried[session_id] = _MiniCPMO45CarriedWindow.pack(units, now)
+            while len(carried) > CARRIED_WINDOW_MAX_SESSIONS:
+                carried.pop(next(iter(carried)))
 
     def restore_window_units(self, state: _MiniCPMO45Stage0SessionState) -> None:
         """Give a new request's state the units :meth:`stash_window_units` kept for its session."""
         carried = self._carried_window_units
         kept = carried.pop(state.session_id, None)
         now = time.monotonic()
-        for stale in [sid for sid, other in carried.items() if now - other.time > self._CARRIED_WINDOW_TTL_S]:
+        for stale in [sid for sid, other in carried.items() if now - other.time > CARRIED_WINDOW_WORKER_TTL_S]:
             carried.pop(stale)
-        fresh = kept is not None and now - kept.time <= self._CARRIED_WINDOW_TTL_S
+        fresh = kept is not None and now - kept.time <= CARRIED_WINDOW_WORKER_TTL_S
         state.carried_window_units = kept.unpack() if fresh and state.window_enabled else []
 
     def build_audio_cuda_graph(self) -> bool:

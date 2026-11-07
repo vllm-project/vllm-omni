@@ -62,6 +62,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Barge-in carry: a Stage-0 request a barge-in or cancel aborted leaves its
+# completed window units to the session's next Stage-0 request. The scheduler
+# (MiniCPMO45DuplexSchedulerHelper) and the worker (MiniCPMO45Stage0DuplexRuntime)
+# each keep a copy, and both read these limits.
+
+#: Sessions whose window either side keeps at once; the oldest is dropped first.
+#: The worker also keeps windows of requests that finished normally, so its copy
+#: fills first; this stays safe while far fewer sessions than this finish a Stage-0
+#: request on one engine within the offer TTL.
+CARRIED_WINDOW_MAX_SESSIONS = 256
+#: Seconds the scheduler offers an aborted request's window to the session's
+#: next Stage-0 request. The next append normally follows within a second.
+CARRIED_WINDOW_OFFER_TTL_S = 10.0
+#: Seconds the worker keeps a finished request's units. It must outlast the
+#: offer, plus the wait between the scheduler handing a window to a new request
+#: and that request's first step on the worker: a plan that counts on units the
+#: worker already dropped makes the worker raise. Derived from the offer so the
+#: two cannot be tuned out of order.
+CARRIED_WINDOW_WORKER_TTL_S = 3 * CARRIED_WINDOW_OFFER_TTL_S
+
 
 def align_up(value: int, unit: int) -> int:
     if unit <= 0:

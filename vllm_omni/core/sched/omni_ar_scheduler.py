@@ -30,18 +30,10 @@ from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.duplex.contracts import duplex_session_id_from_request_id
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
 logger = init_logger(__name__)
-
-
-def _duplex_stage0_session_id(request_id: str) -> str | None:
-    """Session id of a duplex Stage-0 resource request (``duplex-s.….r.stage0``), else None."""
-    if not isinstance(request_id, str) or not request_id.endswith(".r.stage0"):
-        return None
-    return duplex_session_id_from_request_id(request_id)
 
 
 class _ChunkSaveKwargs(TypedDict, total=False):
@@ -229,110 +221,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
-        if request.request_id not in self.requests:
-            self._attach_minicpmo45_carried_window(request)
+        if request.request_id not in self.requests and getattr(self, "_minicpmo45_carried_windows", None):
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            # Some session has a window kept from an aborted Stage-0 request; hand it over
+            # if this is that session's next request.
+            MiniCPMO45DuplexSchedulerHelper.attach_carried_window(self, request)
         super().add_request(request)
-
-    #: Sessions whose aborted Stage-0 window is kept for the next epoch; the oldest is dropped first.
-    _MINICPMO45_CARRIED_WINDOW_SESSIONS = 256
-    #: Seconds an aborted window waits for the session's next Stage-0 request.
-    #: The next append normally follows within a second. Shorter than the
-    #: worker's ``_CARRIED_WINDOW_TTL_S``, so a request is never given units the
-    #: worker no longer keeps.
-    _MINICPMO45_CARRIED_WINDOW_TTL_S = 10.0
-
-    def _snapshot_minicpmo45_window(self, session: Request) -> None:
-        """Remember a Stage-0 request's window as the worker has it, before an append changes it.
-
-        The window plan runs when the append arrives, but the worker updates its
-        own units only when it runs that append. Until the append is scheduled,
-        an abort must keep the window as it was before the plan.
-        """
-        if _duplex_stage0_session_id(session.request_id) is None:
-            return
-        if getattr(session, "_minicpmo45_window_snapshot", None) is not None:
-            # An earlier append is still waiting to be booked: the worker has the window from before that one.
-            return
-        # Taken even when the window is empty: the worker has no closed unit before the first plan either.
-        session._minicpmo45_window_snapshot = {
-            "units": [dict(unit) for unit in getattr(session, "_minicpmo45_window_units", None) or ()],
-            "previous": list(getattr(session, "_minicpmo45_window_previous_token_ids", ()) or ()),
-            "carried": getattr(session, "_minicpmo45_carried_window", None),
-        }
-        pending: set[str] | None = getattr(self, "_minicpmo45_window_snapshot_ids", None)
-        if pending is None:
-            pending = set()
-            self._minicpmo45_window_snapshot_ids = pending
-        pending.add(session.request_id)
-
-    def _commit_minicpmo45_window_snapshots(self, scheduler_output: SchedulerOutput) -> None:
-        """Drop the snapshots of requests whose append this step hands to the worker."""
-        pending: set[str] | None = getattr(self, "_minicpmo45_window_snapshot_ids", None)
-        if not pending:
-            return
-        for request_id in pending.intersection(scheduler_output.num_scheduled_tokens):
-            pending.discard(request_id)
-            request = self.requests.get(request_id)
-            if request is not None:
-                request._minicpmo45_window_snapshot = None
-
-    def _stash_minicpmo45_windows(self, request_ids: Iterable[str]) -> None:
-        """Keep an aborted MiniCPM-o Stage-0 request's window for its session's next epoch.
-
-        A barge-in aborts the epoch's Stage-0 request, and the session's next
-        append opens a new request whose context starts from the session
-        template. The worker keeps the same completed units
-        (``stash_window_units``), and the new request's first window plan puts
-        them back ahead of its own (``carried_units``).
-        """
-        sessions = [(rid, sid) for rid in request_ids if (sid := _duplex_stage0_session_id(rid)) is not None]
-        if not sessions or self.vllm_config.model_config.stage_id != 0:
-            return
-        pending: set[str] = getattr(self, "_minicpmo45_window_snapshot_ids", None) or set()
-        now = time.monotonic()
-        carried: dict[str, dict[str, Any]] | None = getattr(self, "_minicpmo45_carried_windows", None)
-        if carried is None:
-            carried = {}
-            self._minicpmo45_carried_windows = carried
-        for stale in [
-            sid for sid, kept in carried.items() if now - kept["time"] > self._MINICPMO45_CARRIED_WINDOW_TTL_S
-        ]:
-            carried.pop(stale)
-        for request_id, session_id in sessions:
-            pending.discard(request_id)
-            request = self.requests.get(request_id)
-            if request is None:
-                continue
-            # Whatever this request leaves, the session's earlier window is gone: the
-            # worker also drops its copy when such a request finishes, so no plan may count on it.
-            carried.pop(session_id, None)
-            # An append the worker never ran leaves the window as it was before that append's plan.
-            window = getattr(request, "_minicpmo45_window_snapshot", None) or {
-                "units": getattr(request, "_minicpmo45_window_units", ()),
-                "previous": getattr(request, "_minicpmo45_window_previous_token_ids", ()),
-                "carried": getattr(request, "_minicpmo45_carried_window", None),
-            }
-            unplaced = window["carried"] or {}
-            units = [*unplaced.get("units", ()), *(window["units"] or ())]
-            if not units:
-                continue
-            previous = list(window["previous"] or ()) or list(unplaced.get("previous", ()))
-            # Units carried from an earlier abort keep that abort's time. The worker's
-            # copy is never older, so it still outlives this one.
-            kept_since = unplaced.get("time", now) if unplaced.get("units") else now
-            carried[session_id] = {"units": units, "previous": previous, "time": kept_since}
-            while len(carried) > self._MINICPMO45_CARRIED_WINDOW_SESSIONS:
-                carried.pop(next(iter(carried)))
-
-    def _attach_minicpmo45_carried_window(self, request: Request) -> None:
-        """Give a new duplex Stage-0 request the window its session's aborted request left."""
-        carried = getattr(self, "_minicpmo45_carried_windows", None)
-        if not carried:
-            return
-        session_id = _duplex_stage0_session_id(request.request_id)
-        window = carried.pop(session_id, None) if session_id is not None else None
-        if window is not None and time.monotonic() - window["time"] <= self._MINICPMO45_CARRIED_WINDOW_TTL_S:
-            request._minicpmo45_carried_window = window
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
         """Release admission fences after an ordered abort, never an eager one."""
@@ -430,10 +327,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_request_ids = ids
             cleanup_ids = tuple(ids)
 
-        if finished_status == RequestStatus.FINISHED_ABORTED:
-            self._stash_minicpmo45_windows(cleanup_ids)
-        if pending_snapshots := getattr(self, "_minicpmo45_window_snapshot_ids", None):
-            pending_snapshots.difference_update(cleanup_ids)
+        if getattr(self, "_minicpmo45_window_snapshot_ids", None) is not None:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            # Set once a duplex Stage-0 append arrived here: an abort keeps its window.
+            MiniCPMO45DuplexSchedulerHelper.release_windows(
+                self, cleanup_ids, aborted=finished_status == RequestStatus.FINISHED_ABORTED
+            )
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
         return finished
@@ -948,7 +850,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         without booking, where there is no accounting to settle.
         """
         self._enforce_kstep_span_uniformity(scheduler_output)
-        self._commit_minicpmo45_window_snapshots(scheduler_output)
+        if getattr(self, "_minicpmo45_window_snapshot_ids", None):
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            MiniCPMO45DuplexSchedulerHelper.commit_window_snapshots(self, scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -1792,7 +1699,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 MiniCPMO45DuplexSchedulerHelper,
             )
 
-            self._snapshot_minicpmo45_window(session)
+            MiniCPMO45DuplexSchedulerHelper.snapshot_window(self, session)
             reanchored = False
             # A carried window is placed by a prompt replacement, never an in-place trim.
             if (
