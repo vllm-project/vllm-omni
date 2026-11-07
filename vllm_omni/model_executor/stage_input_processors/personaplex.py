@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Talker -> Code2Wav input processors for PersonaPlex.
 
 The talker (stage 0) emits, per frame, the ``dep_q`` depformer audio codes under
@@ -153,12 +153,19 @@ def talker2code2wav_async_chunk(
     multimodal_output: Any,
     request: Any,
     is_finished: bool = False,
+    *,
+    flush_prefix: int | None = None,
 ) -> OmniPayloadStruct | None:
     """Streaming: accumulate per-frame agent codes, emit a codebook-major chunk.
 
     Minimal fixed-chunk variant (no left-context / ref-code complexity, which
     PersonaPlex does not use). Frames are buffered on the transfer manager until a
     chunk's worth is ready (or the request finishes), then flushed.
+
+    ``flush_prefix`` requests a nonterminal flush through a frozen number of
+    generated input frames. It does not append codes, invent a successor, or
+    consume later buffered frames. The save queue serializes this control with
+    generation output; these counters describe codec extraction, not delivery.
     """
     request_id = getattr(request, "external_req_id", getattr(request, "request_id", "?"))
     # The adapter passes ``is_finished=True`` for both a resumable segment
@@ -166,6 +173,10 @@ def talker2code2wav_async_chunk(
     # delayed cb1..7 tail across the former; only a non-resumable stop flushes
     # the stream.
     finished = bool(is_finished and not getattr(request, "resumable", False))
+    if flush_prefix is not None and (
+        type(flush_prefix) is not int or flush_prefix <= 0 or is_finished or not getattr(request, "resumable", False)
+    ):
+        raise ValueError("PersonaPlex prefix flush requires a positive integer and a live resumable stream")
     request_payload = getattr(transfer_manager, "request_payload", None)
     if not isinstance(request_payload, dict):
         request_payload = {}
@@ -184,12 +195,16 @@ def talker2code2wav_async_chunk(
 
     # Explicit None fallback: `a or b` would evaluate bool(a) on a multi-element
     # Tensor and raise "Boolean value of Tensor ... is ambiguous".
-    audio = _codes_from(getattr(request, "additional_information", None))
-    if audio is None:
-        audio = _codes_from(multimodal_output)
-    if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-        a = audio if audio.ndim == 2 else audio.reshape(1, -1)
-        frames.append(a[-1].to(torch.long).cpu())  # latest frame's codes
+    if flush_prefix is None:
+        audio = _codes_from(getattr(request, "additional_information", None))
+        if audio is None:
+            audio = _codes_from(multimodal_output)
+        if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+            a = audio if audio.ndim == 2 else audio.reshape(1, -1)
+            frames.append(a[-1].to(torch.long).cpu())  # latest frame's codes
+            state["personaplex_generated_frames"] = state.get("personaplex_generated_frames", 0) + 1
+    elif flush_prefix > state.get("personaplex_generated_frames", 0):
+        raise ValueError("PersonaPlex prefix has not finished codec generation")
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
@@ -206,7 +221,11 @@ def talker2code2wav_async_chunk(
     # De-delay needs one successor raw frame: N output acoustic frames require
     # N + 1 raw depformer rows.
     available_frames = max(0, len(frames) - 1)
-    if available_frames < target_frames and not finished:
+    if flush_prefix is not None:
+        emit_frames = max(flush_prefix - 1 - state.get("personaplex_emitted_frames", 0), 0)
+        if emit_frames > available_frames:
+            raise ValueError("PersonaPlex prefix is missing buffered successor frames")
+    elif available_frames < target_frames and not finished:
         # Each full-duplex input frame is a resumable stage-0 segment. Returning
         # None would make the generic chunk adapter synthesize a
         # segment-finished marker, wake Code2Wav with its one-token placeholder,
@@ -219,7 +238,8 @@ def talker2code2wav_async_chunk(
                 is_segment_finished=pending,
             )
         )
-    emit_frames = available_frames if finished else target_frames
+    else:
+        emit_frames = available_frames if finished else target_frames
     if emit_frames <= 0:
         if finished:
             request_payload.pop(request_id, None)
@@ -228,6 +248,8 @@ def talker2code2wav_async_chunk(
 
     stacked = torch.stack(frames[: emit_frames + 1], dim=0)  # [F+1, dep_q]
     flat = _agent_codes_to_codebook_major(stacked)
+    if flush_prefix is not None and flat.numel() != emit_frames * _NUM_ACTIVE_CODEBOOKS:
+        raise ValueError("PersonaPlex prefix contains incomplete acoustic codebooks")
     if finished:
         request_payload.pop(request_id, None)
     else:
@@ -235,6 +257,9 @@ def talker2code2wav_async_chunk(
         # and the cb0 source for the next frame.
         state["personaplex_frames"] = frames[emit_frames:]
         state["personaplex_emitted"] = True
+        state["personaplex_emitted_frames"] = (
+            state.get("personaplex_emitted_frames", 0) + flat.numel() // _NUM_ACTIVE_CODEBOOKS
+        )
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),
         meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),
