@@ -530,6 +530,9 @@ class DuplexModelPlugin(ABC):
         """Opt into card retrieval using only current text or an available transcript."""
         return None
 
+    def validate_context_prompt(self, *, materialized: object, sampling_params: object) -> None:
+        """Check an opt-in context plan's final stage input synchronously."""
+
     def context_auxiliary_policy(self, *, runtime_config: Mapping[str, object]) -> DuplexContextAuxiliaryPolicy | None:
         """Select owner-bound work; a common account may arbitrate both auxiliary policies."""
         return None

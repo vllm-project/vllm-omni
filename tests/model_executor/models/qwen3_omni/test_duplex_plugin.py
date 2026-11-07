@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 import pytest
-from vllm_omni.outputs import OmniRequestOutput
 
 from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
@@ -42,6 +41,7 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.protocol.realtime.items import normalize_conversation_item
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

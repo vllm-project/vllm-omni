@@ -494,8 +494,16 @@ stage port supports a local synchronous acceptance guard after input
 preprocessing and replica selection, before registration and transport handoff.
 Removed or replaced requests are rejected at that point. Changes after local
 acceptance follow the existing cancellation lifecycle. This interface does not
-provide remote execution atomicity. The Qwen formatter returns selected node
-references separately; wiring its final acceptance checks is a separate step.
+provide remote execution atomicity. Qwen retains receipts on the owner and
+returns selected node references separately from the model prompt. Its final
+guard checks history, settings, epoch, response/request identity and selected
+summary validity, then the materialized input tokens plus generation reserve.
+Only a stale card selection with an unchanged base can trigger one complete
+no-card rebuild, after successful cleanup of the unaccepted attempt. History,
+summary or lifecycle changes remain errors. Empty selections validate the base
+without requiring reconciliation to finish. Cleanup failures and uncertain
+transport outcomes never trigger this retry. Sequence, runtime/tool writeback
+and performance acceptance commit only for the accepted attempt.
 
 Progress covers text fragments and bounded catalogue pages. A successful empty
 result advances only its coverage unit. Own card admissions retain the current

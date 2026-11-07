@@ -1174,6 +1174,23 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             return None
         return session_config.get("_qwen_memory_query")
 
+    def validate_context_prompt(self, *, materialized, sampling_params):
+        ids = getattr(materialized, "prompt_token_ids", None)
+        if not isinstance(ids, (list, tuple)):
+            raise DuplexRuntimeConfigError("Final Qwen input token IDs are unavailable", code="context_budget_exceeded")
+        params = getattr(materialized, "sampling_params", sampling_params)
+        reserve = getattr(params, "max_tokens", None)
+        if type(reserve) is not int or reserve <= 0:
+            raise DuplexRuntimeConfigError(
+                "Final Qwen generation reserve is unavailable", code="context_budget_exceeded"
+            )
+        limit = self._context_config.qwen_context_max_tokens or self.max_model_len
+        if not self.max_model_len or limit > self.max_model_len or len(ids) + reserve > limit:
+            raise DuplexRuntimeConfigError(
+                "Materialized Qwen input and generation reserve exceed the context budget",
+                code="context_budget_exceeded",
+            )
+
     @staticmethod
     def _current_input_text(history):
         start = next((i + 1 for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "assistant"), 0)
@@ -1649,7 +1666,7 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
                 tuple(card.node_id for card in selection.cards),
                 selection.summary.node_id if selection.summary is not None else None,
             )
-            if selection is not None
+            if selection is not None and self._context_config.context_memory_tokens
             else None,
         )
 

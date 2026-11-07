@@ -448,6 +448,21 @@ async def test_real_owner_capture_reaches_qwen_plan_without_receipts(processor, 
         model="Qwen/test",
         model_config=SimpleNamespace(max_model_len=32768, hf_config=SimpleNamespace()),
     )
+    original_submit = h.port.submit
+
+    async def materializing_submit(submission, *, before_accept=None):
+        if before_accept is None:
+            return await original_submit(submission)
+
+        def validate(prompt):
+            ids = _expanded(processor, prompt)["input_ids"][0].tolist()
+            before_accept(
+                SimpleNamespace(prompt_token_ids=ids, sampling_params=submission.context.stage_sampling_params)
+            )
+
+        return await original_submit(submission, before_accept=validate)
+
+    monkeypatch.setattr(h.port, "submit", materializing_submit)
     try:
         h.session.register_history_item("fact", {"role": "user", "content": "I prefer tea."})
         admitted = _admit(h.session, _operation(h.session, "fact", "The user prefers tea.", key="user/self/preference"))

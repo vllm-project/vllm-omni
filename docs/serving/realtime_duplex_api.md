@@ -2159,6 +2159,13 @@ does not run ASR. The default zero allowance adds no capture, retrieval or
 card-counting processor passes. `legacy` permits extraction with consumption
 disabled; positive card consumption requires `budget` or `budget_summary`.
 
+The consumer rechecks context and the actual token budget immediately before
+local stage acceptance. If only selected cards have become stale, it can rebuild
+once without cards. Changed conversation, summary or session settings remain
+`context_changed` errors; an input that exceeds the final context allowance
+remains `context_budget_exceeded`. Pending card reconciliation does not block
+an otherwise valid response without cards.
+
 With both summary memory and card extraction enabled, ready work alternates on
 the same private request slot. Each kind keeps its finite retry state across
 policy idleness and input preemption. User interaction takes priority; the next
