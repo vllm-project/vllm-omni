@@ -10,11 +10,28 @@ import torch.nn.functional as F
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-# Keep the reference regression runnable without importing the GPU runtime.
-_path = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/phonon/mimi_kernels.py"
-_spec = importlib.util.spec_from_file_location("phonon_mimi_kernels", _path)
-_kernels = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_kernels)
+# Keep the attention reference regression runnable without importing Triton.
+_path = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/phonon/mimi_attention.py"
+_spec = importlib.util.spec_from_file_location("phonon_mimi_attention", _path)
+_attention = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_attention)
+
+
+def ring_attention_step(query, key, value, key_pool, value_pool, slots, positions):
+    """Simple incremental reference used to validate chunked ring attention."""
+    window = key_pool.shape[1]
+    write_indices = positions.remainder(window)
+    key_pool[slots, write_indices] = key
+    value_pool[slots, write_indices] = value
+    physical_indices = torch.arange(window, device=positions.device)
+    ages = (positions[:, None] - physical_indices).remainder(window)
+    valid = ages <= positions[:, None]
+    keys = key_pool[slots].transpose(1, 2)
+    values = value_pool[slots].transpose(1, 2)
+    scores = (query.unsqueeze(2) * keys).sum(-1) * query.shape[-1] ** -0.5
+    scores = scores.masked_fill(~valid[:, None], float("-inf"))
+    probabilities = scores.float().softmax(-1).to(values.dtype)
+    return (probabilities.unsqueeze(-1) * values).sum(2)
 
 
 def test_ring_wrap_and_slot_reuse():
@@ -26,7 +43,7 @@ def test_ring_wrap_and_slot_reuse():
     value_pool = torch.zeros_like(pool)
     slots = torch.tensor([3, 1])
     for position in range(13):
-        actual = _kernels.ring_attention_step(
+        actual = ring_attention_step(
             queries[position],
             keys[position],
             values[position],
@@ -43,45 +60,11 @@ def test_ring_wrap_and_slot_reuse():
         ).squeeze(2)
         torch.testing.assert_close(actual, expected)
     # A reused slot at position zero must mask every old ring entry.
-    actual = _kernels.ring_attention_step(
+    actual = ring_attention_step(
         queries[0], keys[0], values[0], pool, value_pool, slots, torch.zeros(2, dtype=torch.long)
     )
     torch.testing.assert_close(actual, values[0])
     assert pool[0].count_nonzero() == 0
-
-
-def test_convolution_chunking_and_history_aliasing():
-    generator = torch.Generator().manual_seed(29)
-    inputs = torch.randn(2, 3, 17, generator=generator)
-    weight = torch.randn(4, 3, 3, generator=generator)
-    bias = torch.randn(4, generator=generator)
-    history = torch.zeros(4, 3, 4)
-    slots = torch.tensor([2, 0])
-    outputs = [
-        _kernels.causal_conv_step(chunk, weight, bias, history, slots, dilation=2)
-        for chunk in inputs.split([1, 3, 2, 11], dim=-1)
-    ]
-    scratch_history = torch.zeros_like(history)
-    scratch_outputs = []
-    for chunk in inputs.split([1, 3, 2, 11], dim=-1):
-        scratch = torch.empty(2, 3, 4 + chunk.shape[-1])
-        scratch_outputs.append(
-            _kernels.causal_conv_step(
-                chunk,
-                weight,
-                bias,
-                scratch_history,
-                slots,
-                dilation=2,
-                scratch=scratch,
-            )
-        )
-    torch.testing.assert_close(torch.cat(scratch_outputs, -1), torch.cat(outputs, -1))
-    torch.testing.assert_close(scratch_history, history)
-    expected = F.conv1d(F.pad(inputs, (4, 0)), weight, bias, dilation=2)
-    torch.testing.assert_close(torch.cat(outputs, -1), expected)
-    torch.testing.assert_close(history[slots], inputs[..., -4:])
-    assert history[1].count_nonzero() == 0
 
 
 def test_chunk_attention_matches_incremental_ring_and_wrap():
@@ -96,7 +79,7 @@ def test_chunk_attention_matches_incremental_ring_and_wrap():
         query, key, value = [torch.randn(2, frames, 2, 4, generator=generator) for _ in range(3)]
         expected = torch.stack(
             [
-                _kernels.ring_attention_step(
+                ring_attention_step(
                     query[:, frame],
                     key[:, frame],
                     value[:, frame],
@@ -109,7 +92,7 @@ def test_chunk_attention_matches_incremental_ring_and_wrap():
             ],
             1,
         )
-        actual = _kernels.ring_attention_chunk(
+        actual = _attention.ring_attention_chunk(
             query, key, value, key_pool, value_pool, slots, torch.full((2,), position)
         )
         torch.testing.assert_close(actual, expected)
@@ -130,14 +113,14 @@ def test_ring_headroom_preserves_window_across_chunks_and_wrap(capacity):
         q, k, v = [torch.randn(2, frames, 2, 4, generator=generator) for _ in range(3)]
         expected = torch.stack(
             [
-                _kernels.ring_attention_step(
+                ring_attention_step(
                     q[:, t], k[:, t], v[:, t], reference_keys, reference_values, slots, torch.full((2,), position + t)
                 )
                 for t in range(frames)
             ],
             1,
         )
-        actual = _kernels.ring_attention_chunk(q, k, v, keys, values, slots, torch.full((2,), position), window=5)
+        actual = _attention.ring_attention_chunk(q, k, v, keys, values, slots, torch.full((2,), position), window=5)
         torch.testing.assert_close(actual, expected)
         position += frames
         absolute = torch.arange(max(0, position - 5), position)
