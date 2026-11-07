@@ -304,10 +304,8 @@ def test_single_stage_control_reaches_denoise_after_local_encoding(pipeline, moc
 
     pipeline.od_config.controlnet_model_path = "control.safetensors"
     request = _request("t2va")
-    request.sampling_params.extra_args["canny"] = {
-        "control_path": "hint.mp4",
-        "control_context_scale": scale,
-    }
+    request.sampling_params.extra_args["canny"] = {"control_context_scale": scale}
+    request.prompts[0]["multi_modal_data"] = {"minimax_h3_control": {"control_path": "hint.mp4"}}
     load_pixels = mocker.patch(
         "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3.load_control_pixels",
         side_effect=lambda _path, *, height, width, num_frames, mask: torch.zeros(1, 3, num_frames, height, width),
