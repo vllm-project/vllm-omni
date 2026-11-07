@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803 - Triton constexpr parameters use kernel-style capitals.
-"""Direct physical-ring attention with deferred KV append."""
+"""Write-then-attend over a ring with chunk headroom."""
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -10,8 +10,6 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def _attend_ring(
     Q,
-    K,
-    V,
     KP,
     VP,
     S,
@@ -21,20 +19,13 @@ def _attend_ring(
     QT: tl.constexpr,
     QH: tl.constexpr,
     QD: tl.constexpr,
-    KB: tl.constexpr,
-    KT: tl.constexpr,
-    KH: tl.constexpr,
-    KD: tl.constexpr,
-    VB: tl.constexpr,
-    VT: tl.constexpr,
-    VH: tl.constexpr,
-    VD: tl.constexpr,
     SS: tl.constexpr,
     PS: tl.constexpr,
     T: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
-    W: tl.constexpr,
+    RING: tl.constexpr,
+    WINDOW: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
 ):
@@ -42,29 +33,22 @@ def _attend_ring(
     head = tl.program_id(1)
     frame = tl.program_id(2)
     slot = tl.load(S + batch * SS)
-    start = tl.load(P + batch * PS)
+    position = tl.load(P + batch * PS) + frame
     j = tl.arange(0, BW)
     d = tl.arange(0, BD)
-    absolute = start + frame - W + 1 + j
-    valid = (j < W) & (absolute >= 0)
-    old = absolute < start
-    ring_index = tl.maximum(absolute, 0) % W
-    new_index = tl.maximum(absolute - start, 0)
-    pool_offset = ((slot * W + ring_index[:, None]) * H + head) * D + d[None, :]
-    old_mask = valid[:, None] & old[:, None] & (d[None, :] < D)
-    new_mask = valid[:, None] & ~old[:, None] & (new_index[:, None] < T) & (d[None, :] < D)
-    old_key = tl.load(KP + pool_offset, old_mask, 0)
-    new_key = tl.load(K + batch * KB + new_index[:, None] * KT + head * KH + d[None, :] * KD, new_mask, 0)
-    keys = tl.where(old[:, None], old_key, new_key).to(tl.float32)
+    absolute = position - j
+    valid = (j < WINDOW) & (absolute >= 0)
+    ring_index = tl.maximum(absolute, 0) % RING
+    offset = ((slot * RING + ring_index[:, None]) * H + head) * D + d[None, :]
+    mask = valid[:, None] & (d[None, :] < D)
+    keys = tl.load(KP + offset, mask, 0).to(tl.float32)
     query = tl.load(Q + batch * QB + frame * QT + head * QH + d * QD, d < D, 0).to(tl.float32)
     scores = tl.sum(keys * query[None, :], 1) * (D**-0.5)
     scores = tl.where(valid, scores, -float("inf"))
-    probabilities = tl.exp(scores - tl.max(scores, 0))
-    probabilities = probabilities / tl.sum(probabilities, 0)
-    old_value = tl.load(VP + pool_offset, old_mask, 0)
-    new_value = tl.load(V + batch * VB + new_index[:, None] * VT + head * VH + d[None, :] * VD, new_mask, 0)
-    values = tl.where(old[:, None], old_value, new_value).to(tl.float32)
-    output = tl.sum(probabilities[:, None] * values, 0)
+    weights = tl.exp(scores - tl.max(scores, 0))
+    weights = weights / tl.sum(weights, 0)
+    values = tl.load(VP + offset, mask, 0).to(tl.float32)
+    output = tl.sum(weights[:, None] * values, 0)
     tl.store(OUTPUT + ((batch * T + frame) * H + head) * D + d, output, d < D)
 
 
@@ -108,50 +92,66 @@ def _append_ring(
     tl.store(VP + target, value, mask)
 
 
-def ring_attention_cuda(query, key, value, key_pool, value_pool, slots, positions):
+def ring_attention_cuda(query, key, value, key_pool, value_pool, slots, positions, window):
     batch, frames, heads, dim = query.shape
-    window = key_pool.shape[1]
+    capacity = key_pool.shape[1]
+    max_chunk = capacity - window + 1
+    if not 0 < window <= capacity:
+        raise ValueError("Attention window must fit inside the ring")
+    if frames > max_chunk:
+        outputs = []
+        for start in range(0, frames, max_chunk):
+            stop = start + max_chunk
+            outputs.append(
+                ring_attention_cuda(
+                    query[:, start:stop],
+                    key[:, start:stop],
+                    value[:, start:stop],
+                    key_pool,
+                    value_pool,
+                    slots,
+                    positions + start,
+                    window,
+                )
+            )
+        return torch.cat(outputs, 1)
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-    _attend_ring[(batch, heads, frames)](
-        query,
+    # Headroom preserves every old key needed by the earliest query in this chunk.
+    _append_ring[(batch, heads, triton.cdiv(frames * dim, 256))](
         key,
         value,
+        key_pool,
+        value_pool,
+        slots,
+        positions,
+        *key.stride(),
+        *value.stride(),
+        slots.stride(0),
+        positions.stride(0),
+        frames,
+        heads,
+        dim,
+        capacity,
+        frames,
+        256,
+    )
+    _attend_ring[(batch, heads, frames)](
+        query,
         key_pool,
         value_pool,
         slots,
         positions,
         output,
         *query.stride(),
-        *key.stride(),
-        *value.stride(),
         slots.stride(0),
         positions.stride(0),
         frames,
         heads,
         dim,
+        capacity,
         window,
         triton.next_power_of_2(window),
         triton.next_power_of_2(dim),
         num_warps=4,
-    )
-    # All queries must finish reading the old ring before any entry is overwritten.
-    retained = min(frames, window)
-    _append_ring[(batch, heads, triton.cdiv(retained * dim, 256))](
-        key,
-        value,
-        key_pool,
-        value_pool,
-        slots,
-        positions,
-        *key.stride(),
-        *value.stride(),
-        slots.stride(0),
-        positions.stride(0),
-        frames,
-        heads,
-        dim,
-        window,
-        retained,
-        256,
     )
     return output
