@@ -227,6 +227,22 @@ Cosmos3-Nano VAE, 1280x720 x 189 frames, bf16, one GB200 GPU, `bench_wan_vae_dec
 Peak decode memory was unchanged (about 13 GiB): it is set by the largest
 activations and the cuDNN workspace, not by the output assembly.
 
+## HunyuanVideo-1.5 decoder
+
+`--vae-fast-path lossless` (default) also installs a bit-exact fast path on the
+`AutoencoderKLHunyuanVideo15` decoder: an exact Triton replicate pad for its causal
+convolutions and the fused RMSNorm epilogue (SiLU fused for bf16/fp16 only).
+`channels_last` installs `lossless`; `off` keeps the reference decoder. The encoder
+is unchanged.
+
+One B300, fp32 VAE (the pipeline default), tiled decode of 121 frames, output
+bit-identical:
+
+| Resolution | `off` | `lossless` | Speedup |
+| --- | --- | --- | --- |
+| 848x480 | 6.04 s | 4.72 s | 1.28x |
+| 1280x720 | 13.97 s | 11.30 s | 1.24x |
+
 ## Decoder benchmarking
 
 `benchmarks/diffusion/bench_wan_vae_decode.py` decodes seeded latents with the

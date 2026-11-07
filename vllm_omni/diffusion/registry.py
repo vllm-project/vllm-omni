@@ -609,8 +609,9 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
-    platforms keep the reference implementation. Failures never abort model loading.
+    ``lossless`` / ``channels_last``). ``vae_fast_path`` also installs the
+    lossless HunyuanVideo-1.5 decoder fast path. Only CUDA and XPU are supported;
+    other platforms keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
@@ -620,8 +621,11 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
         logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
         return
 
-    from diffusers.models.autoencoders import AutoencoderKLWan
+    from diffusers.models.autoencoders import AutoencoderKLHunyuanVideo15, AutoencoderKLWan
 
+    from vllm_omni.diffusion.distributed.autoencoders.hunyuan_video_15_vae_fastpath import (
+        install_hunyuan_video_15_vae_fastpath,
+    )
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
         install_wan_vae_encoder_fastpath,
         install_wan_vae_fastpath,
@@ -638,6 +642,17 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
         candidates = [("vae", model.vae)]
 
     for name, vae in candidates:
+        if isinstance(vae, AutoencoderKLHunyuanVideo15) and level != "off":
+            try:
+                if install_hunyuan_video_15_vae_fastpath(vae, level=level).installed:
+                    logger.info("HunyuanVideo-1.5 VAE decoder fast path active on %s", name)
+            except Exception:
+                logger.warning(
+                    "Failed to install the HunyuanVideo-1.5 VAE fast path on %s; using the reference decoder",
+                    name,
+                    exc_info=True,
+                )
+            continue
         if not isinstance(vae, AutoencoderKLWan):
             continue
         for component, component_level, install in (
