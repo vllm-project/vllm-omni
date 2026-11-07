@@ -573,27 +573,25 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
-0.29.0. MRV2 is an experimental feature for this model: the bundled default
-profile selects it on CUDA only, and its scheduler and delivery paths are
-still being qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+Qwen3-TTS runs the native Model Runner V2 pipeline by default on CUDA on
+vLLM 0.29.0. MRV2 is experimental for this model. NPU stays on V1 in the
+shipped default until hardware acceptance passes; use the explicit MRV2 profile
+to opt in on NPU. XPU, ROCm and MUSA stay on V1. Select one of these profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
-| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
-| `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
-| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
-| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
+| `qwen3_tts.yaml` | CUDA V2; NPU V1 | Existing defaults | Shipped default; experimental |
+| `qwen3_tts_mrv2.yaml` | CUDA/NPU V2 | B1 | Explicit MRV2 profile; opts NPU into V2 |
+| `qwen3_tts_high_concurrency_mrv2.yaml` | CUDA V2; NPU V1 | B1, B2 | Opt-in throughput tuning |
+| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | CUDA V2; NPU V1 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | CUDA V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
 | `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
 ```bash
-# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
+# NPU MRV2 is opt-in; the shipped default continues to select V1 on NPU.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config /path/to/qwen3_tts_v1.yaml
+  --deploy-config vllm_omni/deploy/qwen3_tts_mrv2.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the
@@ -601,8 +599,14 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
-this change does not qualify MRV2 on those backends or enable other model families.
+releasing request state. The shipped base profile retains V1 on NPU, XPU, ROCm and MUSA. The explicit
+MRv2 profile opts both NPU Talker and Code2Wav into MRV2; the generation runner
+keeps eager outer dispatch for structured outputs. The Talker uses PIECEWISE
+graphs; Code2Wav stays eager because its model does not expose a graph-capturable
+submodule on the tested Ascend stack. Norm-quant fusion follows vLLM-Ascend's
+configuration and hardware capability; Omni does not override
+`fuse_norm_quant`. Biasless RMSNorm uses the native CANN AddRmsNorm path in
+vLLM-Ascend. XPU, ROCm and MUSA remain on V1.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
 transport path; the warning does not establish support for that combination.

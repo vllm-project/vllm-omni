@@ -656,8 +656,13 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
 
     monkeypatch.setattr(torch.Tensor, "random_", randomize)
     monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
-    for module in ("omni_model_runner", "omni_generation_model_runner"):
-        monkeypatch.setattr(f"vllm_omni.worker_v2.{module}.set_forward_context", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        "vllm_omni.worker_v2.omni_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm_omni.worker_v2.omni_generation_model_runner.OmniGenerationModelRunner._forward_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
     scheduled = SchedulerOutput.make_empty()
     scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
     scheduled.total_num_scheduled_tokens = 1

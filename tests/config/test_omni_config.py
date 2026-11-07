@@ -1147,6 +1147,38 @@ def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallbac
     assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_mrv2.yaml").model_runner == "v2"
 
 
+def test_qwen3_tts_mrv2_profile_enables_npu_for_both_stages():
+    deploy_path = _DEPLOY_DIR / "qwen3_tts_mrv2.yaml"
+    resolved = resolve_deploy_yaml(deploy_path)
+    assert resolved["model_runner"] == "v2"
+
+    deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+    assert deploy.model_runner == "v2"
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
+    assert [stage.enforce_eager for stage in deploy.stages] == [False, True]
+    assert [stage.compilation_config["cudagraph_mode"] for stage in deploy.stages] == ["PIECEWISE", "NONE"]
+    # NPU remains on V1 for the shipped default until hardware acceptance passes.
+    default_npu = _apply_platform_overrides(
+        load_deploy_config(_DEPLOY_DIR / "qwen3_tts.yaml"),
+        platform="npu",
+    )
+    assert default_npu.model_runner == "v1"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "qwen3_tts_high_concurrency_mrv2.yaml",
+        "qwen3_tts_high_concurrency_mrv2_b4.yaml",
+    ],
+)
+def test_qwen3_tts_high_concurrency_mrv2_profiles_keep_npu_on_v1(filename):
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform="npu")
+    assert deploy.model_runner == "v1"
+
+
 def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
     mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
