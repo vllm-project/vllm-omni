@@ -188,6 +188,87 @@ def test_slice_cached_prefix_inputs_keeps_full_kv_axis() -> None:
     assert sliced_seq_len == 4
 
 
+def test_slice_cached_prefix_inputs_allows_right_padded_rows() -> None:
+    inputs_embeds = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2)
+    attention_mask = torch.arange(64).reshape(1, 1, 8, 8)
+    position_ids = torch.arange(8).reshape(1, 8)
+    custom_pos_emb = (torch.arange(8).reshape(1, 8), torch.arange(10, 18).reshape(1, 8))
+    image_mask = torch.tensor([[False, False, True, True, True, True, False, False]])
+    gen_timestep_scatter_index = torch.tensor([[2]])
+
+    sliced = HunyuanImage3Pipeline._slice_cached_prefix_inputs(
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        custom_pos_emb,
+        image_mask,
+        gen_timestep_scatter_index,
+        [6],
+        [6],
+        2,
+    )
+
+    (
+        sliced_embeds,
+        sliced_mask,
+        sliced_positions,
+        sliced_rope,
+        sliced_image_mask,
+        sliced_scatter,
+        sliced_query_lens,
+        sliced_seq_len,
+    ) = sliced
+    torch.testing.assert_close(sliced_embeds, inputs_embeds[:, 2:])
+    torch.testing.assert_close(sliced_mask, attention_mask[:, :, 2:, :])
+    torch.testing.assert_close(sliced_positions, position_ids[:, 2:])
+    torch.testing.assert_close(sliced_rope[0], custom_pos_emb[0][:, 2:])
+    torch.testing.assert_close(sliced_image_mask, image_mask[:, 2:])
+    torch.testing.assert_close(sliced_scatter, torch.tensor([[0]]))
+    assert sliced_query_lens == [4]
+    assert sliced_seq_len == 6
+
+
+def test_slice_cached_prefix_inputs_cuts_mixed_prefix_rows() -> None:
+    inputs_embeds = torch.arange(32, dtype=torch.float32).reshape(2, 8, 2)
+    attention_mask = torch.arange(128).reshape(2, 1, 8, 8)
+    position_ids = torch.arange(16).reshape(2, 8)
+    custom_pos_emb = (position_ids.clone(), position_ids.clone() + 10)
+    image_mask = torch.zeros(2, 8, dtype=torch.bool)
+    gen_timestep_scatter_index = torch.tensor([[4], [2]])
+
+    sliced = HunyuanImage3Pipeline._slice_cached_prefix_inputs(
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        custom_pos_emb,
+        image_mask,
+        gen_timestep_scatter_index,
+        [6, 8],
+        [6, 8],
+        [2, 0],
+    )
+
+    sliced_embeds, sliced_mask, sliced_positions, _, _, sliced_scatter, sliced_query_lens, sliced_seq_len = sliced
+    assert sliced_query_lens == [4, 8]
+    assert sliced_seq_len == 8
+    torch.testing.assert_close(sliced_embeds[0, :4], inputs_embeds[0, 2:6])
+    torch.testing.assert_close(sliced_embeds[1], inputs_embeds[1])
+    torch.testing.assert_close(sliced_positions[0, :4], position_ids[0, 2:6])
+    torch.testing.assert_close(sliced_mask[0, :, :4, :], attention_mask[0, :, 2:6, :])
+    torch.testing.assert_close(sliced_scatter, torch.tensor([[2], [2]]))
+    # Mixed-prefix pack leaves heterogeneous logical lengths inside padded T;
+    # RoPE / _forward_paged must reshape on T, not query_lens[0].
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        _reshape_width_for_query_batch,
+    )
+
+    batch, pad_width = _reshape_width_for_query_batch(
+        sliced_embeds.shape[0] * sliced_embeds.shape[1],
+        sliced_query_lens,
+    )
+    assert (batch, pad_width) == (2, 8)
+
+
 @pytest.mark.parametrize("local_prefix_hit", [True, False])
 def test_ar_reuse_does_not_consume_local_prefix_hits(local_prefix_hit):
     from vllm_omni.diffusion.forward_context import set_forward_context
@@ -345,15 +426,21 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline._ensure_grouped_attention_backend_supported(2)
 
 
-def test_scheduler_paged_step_execution_is_rejected():
+def test_grouped_denoise_allows_flash_attn_when_paged():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    pipeline.od_config.diffusion_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
+
+    pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_scheduler_paged_allows_step_request_validation():
     pipeline = _pipeline()
     pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
     state = _state("paged-step", 0)
+    state.sampling = _sampling_params()
 
-    with pytest.raises(ValueError, match="request-level execution only"):
-        pipeline.prepare_encode(state)
-    with pytest.raises(ValueError, match="request-level execution only"):
-        pipeline.denoise_step(InputBatch.make_batch([state]))
+    pipeline._validate_step_request(state)
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
@@ -413,6 +500,83 @@ def test_later_step_merge_shifts_spans_without_polluting_request_state():
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (1, 1, 3, 7)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 5)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 7)]]
+
+
+def test_later_step_paged_merge_keeps_per_row_spans_and_seq_lens():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    states = [_state("short", 2), _state("long", 4)]
+    states[0].extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 3, 5, dtype=torch.bool),
+            "full_attn_spans": [[(2, 5)]],
+            "num_image_tokens": 3,
+        }
+    )
+    states[1].extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 3, 7, dtype=torch.bool),
+            "full_attn_spans": [[(4, 7)]],
+            "num_image_tokens": 3,
+        }
+    )
+    states[0].extra[_STEP_PROMPT_KV] = [{"lens": torch.tensor([2])}]
+    states[1].extra[_STEP_PROMPT_KV] = [{"lens": torch.tensor([4])}]
+
+    _, merged = pipeline._merge_step_model_inputs(
+        states,
+        [0, 1],
+        [0, 0],
+        first_step=False,
+    )
+
+    assert merged["attention_mask"] is None
+    assert merged["full_attn_spans"] == [[(2, 5)], [(4, 7)]]
+    assert merged["query_lens"] == [3, 3]
+    assert merged["seq_lens"] == [5, 7]
+
+    pipeline._split_merged_kwargs_to_states(states, merged, [0, 1], [0, 0])
+
+    assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 5)]]
+    assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 7)]]
+    assert states[0].extra[_STEP_MODEL_KWARGS]["query_lens"] == [3]
+    assert states[1].extra[_STEP_MODEL_KWARGS]["query_lens"] == [3]
+    assert states[0].extra[_STEP_MODEL_KWARGS]["seq_lens"] == [5]
+    assert states[1].extra[_STEP_MODEL_KWARGS]["seq_lens"] == [7]
+
+
+def test_later_step_paged_cfg_merge_keeps_cfg_major_per_row_spans():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    states = [_state("short", 2), _state("long", 4)]
+    for state, prefix, seq_len, span in (
+        (states[0], 2, 5, (2, 5)),
+        (states[1], 4, 7, (4, 7)),
+    ):
+        state.extra[_STEP_CFG_FACTOR] = 2
+        state.extra[_STEP_MODEL_KWARGS].update(
+            {
+                "attention_mask": torch.ones(2, 1, 3, seq_len, dtype=torch.bool),
+                "full_attn_spans": [[span], [span]],
+                "num_image_tokens": 3,
+            }
+        )
+        state.extra[_STEP_PROMPT_KV] = [{"lens": torch.tensor([prefix, prefix])}]
+
+    row_state_indexes, row_branches = HunyuanImage3Pipeline._step_row_order(states, cfg_factor=2)
+    assert row_state_indexes == [0, 1, 0, 1]
+    assert row_branches == [0, 0, 1, 1]
+
+    _, merged = pipeline._merge_step_model_inputs(
+        states,
+        row_state_indexes,
+        row_branches,
+        first_step=False,
+    )
+
+    assert merged["full_attn_spans"] == [[(2, 5)], [(4, 7)], [(2, 5)], [(4, 7)]]
+    assert merged["query_lens"] == [3, 3, 3, 3]
+    assert merged["seq_lens"] == [5, 7, 5, 7]
 
 
 def test_later_step_merge_allows_request_local_step_counts_and_guidance_values():
@@ -569,3 +733,355 @@ def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
     torch.testing.assert_close(output, torch.tensor([[1.0]]))
     torch.testing.assert_close(captured["guidance"], torch.tensor([2500.0], dtype=torch.bfloat16))
     torch.testing.assert_close(captured["timesteps_r"], torch.tensor([0.25]))
+
+
+def test_supports_request_batch_enabled():
+    assert HunyuanImage3Pipeline.supports_request_batch is True
+
+
+def _layout_rows(token_rows: list[list[int]], image_start: int) -> HunyuanPreparedLayout:
+    tokens = torch.tensor(token_rows, dtype=torch.long)
+    branches, seq_len = tokens.shape
+    image_span = slice(image_start, seq_len)
+    return HunyuanPreparedLayout(
+        tokenizer_output=TokenizerEncodeOutput(
+            tokens=tokens,
+            gen_image_mask=torch.ones(branches, seq_len, dtype=torch.bool),
+            gen_timestep_scatter_index=torch.tensor([[image_start] for _ in range(branches)]),
+            all_image_slices=[[image_span] for _ in range(branches)],
+            joint_image_slices=[[] for _ in range(branches)],
+            gen_image_slices=[[image_span] for _ in range(branches)],
+            real_pos=torch.tensor([[seq_len] for _ in range(branches)]),
+        ),
+        rope_image_info=[[(image_span, (4, 4))] for _ in range(branches)],
+        generated_image_info=ImageInfo(
+            image_type="gen_image",
+            image_width=512,
+            image_height=512,
+            token_width=4,
+            token_height=4,
+            image_token_length=16,
+        ),
+    )
+
+
+def _omni_request(request_id: str, layout: HunyuanPreparedLayout, **sampling_updates):
+    sampling = _sampling_params()
+    for key, value in sampling_updates.items():
+        setattr(sampling, key, value)
+    return SimpleNamespace(
+        request_id=request_id,
+        prompt=f"prompt-{request_id}",
+        sampling_params=sampling,
+        prepared_layout=layout,
+        kv_computed_tokens=(),
+    )
+
+
+def test_pack_hunyuan_prepared_layouts_is_cfg_major():
+    cond_uncond_a = _layout_rows([[1, 2, 3, 4, 5], [10, 11, 12, 13, 14]], image_start=1)
+    cond_uncond_b = _layout_rows([[21, 22, 23, 24, 25, 26, 27], [31, 32, 33, 34, 35, 36, 37]], image_start=3)
+    packed = hy3_layout_module.pack_hunyuan_prepared_layouts(
+        [cond_uncond_a, cond_uncond_b],
+        pad_token_id=0,
+    )
+
+    assert packed.tokenizer_output.tokens.tolist() == [
+        [1, 2, 3, 4, 5, 0, 0],
+        [21, 22, 23, 24, 25, 26, 27],
+        [10, 11, 12, 13, 14, 0, 0],
+        [31, 32, 33, 34, 35, 36, 37],
+    ]
+    assert packed.num_branches == 4
+    assert packed.generated_image_info.image_token_length == 16
+
+
+def test_pack_then_slice_cached_prefix_keeps_logical_seq_lens():
+    packed = hy3_layout_module.pack_hunyuan_prepared_layouts(
+        [
+            _layout_rows([[1] * 21], image_start=5),
+            _layout_rows([[2] * 25], image_start=9),
+        ],
+        pad_token_id=0,
+    )
+    tokens = packed.tokenizer_output.tokens
+    seq_lens = [int(row[-1].item()) for row in packed.tokenizer_output.real_pos]
+    assert seq_lens == [21, 25]
+    batch, width = tokens.shape
+    sliced = HunyuanImage3Pipeline._slice_cached_prefix_inputs(
+        tokens.unsqueeze(-1).to(torch.float32),
+        torch.ones(batch, 1, width, width),
+        tokens.clone(),
+        (tokens.clone(),),
+        torch.zeros(batch, width, dtype=torch.bool),
+        packed.tokenizer_output.gen_timestep_scatter_index.clone(),
+        list(seq_lens),
+        list(seq_lens),
+        4,
+    )
+    assert sliced[-2] == [17, 21]
+    assert sliced[-1] == width - 4
+    torch.testing.assert_close(sliced[0][0, :17, 0], tokens[0, 4:21].to(torch.float32))
+    torch.testing.assert_close(sliced[0][1, :, 0], tokens[1, 4:].to(torch.float32))
+
+
+def _i2i_layout_rows(token_row: list[int], ref_span: tuple[int, int], image_start: int) -> HunyuanPreparedLayout:
+    tokens = torch.tensor([token_row], dtype=torch.long)
+    seq_len = tokens.shape[1]
+    image_span = slice(image_start, seq_len)
+    ref = slice(ref_span[0], ref_span[1])
+    return HunyuanPreparedLayout(
+        tokenizer_output=TokenizerEncodeOutput(
+            tokens=tokens,
+            gen_image_mask=torch.ones(1, seq_len, dtype=torch.bool),
+            gen_timestep_scatter_index=torch.tensor([[image_start]]),
+            all_image_slices=[[ref, image_span]],
+            joint_image_slices=[[ref]],
+            gen_image_slices=[[image_span]],
+            real_pos=torch.tensor([[seq_len]]),
+        ),
+        rope_image_info=[[(ref, (2, 2)), (image_span, (4, 4))]],
+        generated_image_info=ImageInfo(
+            image_type="gen_image",
+            image_width=512,
+            image_height=512,
+            token_width=4,
+            token_height=4,
+            image_token_length=16,
+        ),
+    )
+
+
+def test_request_groups_pack_same_structure_different_seq_len():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    matching = [
+        _omni_request("match-0", _layout_rows([[1] * 21], image_start=5)),
+        _omni_request("match-1", _layout_rows([[2] * 21], image_start=5)),
+    ]
+    different_seq = _omni_request("long", _layout_rows([[3] * 25], image_start=9))
+    different_prefix = _omni_request("hit", _layout_rows([[4] * 21], image_start=5))
+    different_prefix.kv_computed_tokens = (4,)
+    ar_kv = _omni_request("ar", _layout_rows([[5] * 21], image_start=5))
+    ar_kv.sampling_params.past_key_values = SimpleNamespace(
+        key_cache=[torch.zeros(2, 4, 1, 1)],
+        value_cache=[torch.zeros(2, 4, 1, 1)],
+    )
+
+    groups = pipeline._split_request_groups([*matching, different_seq, different_prefix, ar_kv])
+    group_ids = {frozenset(request.request_id for request in group) for group in groups}
+
+    assert frozenset({"match-0", "match-1", "long", "hit"}) in group_ids
+    assert frozenset({"ar"}) in group_ids
+
+
+def test_request_groups_pack_i2i_reference_spans_at_different_prefix_offsets():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    first = _omni_request("i2i-a", _i2i_layout_rows([1] * 25, (1, 4), 9))
+    first.kv_computed_tokens = (9,)
+    second = _omni_request("i2i-b", _i2i_layout_rows([2] * 21, (2, 4), 5))
+    second.kv_computed_tokens = (5,)
+
+    groups = pipeline._split_request_groups([first, second])
+
+    assert [[request.request_id for request in group] for group in groups] == [["i2i-a", "i2i-b"]]
+
+
+def test_prepare_model_inputs_accepts_packed_request_batch(monkeypatch):
+    pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    monkeypatch.setattr(
+        hy3_module,
+        "build_batch_2d_rope",
+        lambda **_kwargs: (torch.zeros(1), torch.zeros(1)),
+    )
+    pipeline._tkwrapper = SimpleNamespace(
+        apply_chat_template=lambda **_kwargs: pytest.fail("packed execution must not tokenize again"),
+        eos_token_id=2,
+        boi_token_id=3,
+        end_recaption_token_id=4,
+        end_answer_token_id=5,
+        pad_token_id=0,
+    )
+    pipeline.config = SimpleNamespace(attention_head_dim=2, rope_theta=10000.0)
+    packed = hy3_layout_module.pack_hunyuan_prepared_layouts(
+        [
+            _layout_rows([[1] * 21, [11] * 21], image_start=5),
+            _layout_rows([[2] * 21, [12] * 21], image_start=5),
+        ],
+        pad_token_id=0,
+    )
+
+    model_inputs = pipeline.prepare_model_inputs(
+        prompt=["prompt-a", "prompt-b"],
+        mode="gen_image",
+        guidance_scale=2.5,
+        image_size=(512, 512),
+        device=torch.device("cpu"),
+        generator=[torch.Generator().manual_seed(0), torch.Generator().manual_seed(1)],
+        prepared_layout=packed,
+    )
+
+    assert model_inputs["tokenizer_output"].tokens.shape[0] == 4
+    assert model_inputs["batch_gen_image_info"] == [packed.generated_image_info] * 2
+    assert model_inputs["input_ids"].shape == (4, 21)
+
+
+def test_forward_request_batch_returns_list_and_keeps_single_output(monkeypatch):
+    pipeline = _pipeline()
+    captured: dict[str, object] = {}
+
+    def fake_prepare_model_inputs(**kwargs):
+        captured["prepare"] = kwargs
+        layout = kwargs["prepared_layout"]
+        return {
+            "mode": "gen_image",
+            "tokenizer_output": layout.tokenizer_output,
+            "batch_gen_image_info": [layout.generated_image_info],
+            "prepared_layout": layout,
+            "paged_request_ids": kwargs.get("paged_request_ids"),
+        }
+
+    def fake_generate(**kwargs):
+        captured["paged_request_ids"] = kwargs.get("paged_request_ids")
+        captured["prepared_rows"] = int(kwargs["prepared_layout"].num_branches)
+        batch_size = len(kwargs["paged_request_ids"])
+        return torch.arange(batch_size * 2).reshape(batch_size, 2)
+
+    monkeypatch.setattr(pipeline, "prepare_model_inputs", fake_prepare_model_inputs)
+    pipeline._generate = fake_generate
+
+    matching = [
+        _omni_request("req-0", _layout_rows([[1] * 21], image_start=5), guidance_scale=1.0),
+        _omni_request("req-1", _layout_rows([[2] * 21], image_start=5), guidance_scale=1.0),
+    ]
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=matching))
+    assert isinstance(outputs, list)
+    assert [output.output["payload"]["image"].tolist() for output in outputs] == [[0, 1], [2, 3]]
+    assert captured["paged_request_ids"] == ["req-0", "req-1"]
+    assert captured["prepared_rows"] == 2
+    assert captured["prepare"]["paged_request_ids"] == ["req-0", "req-1"]
+
+    single = pipeline.forward(DiffusionRequestBatch(requests=matching[:1]))
+    assert not isinstance(single, list)
+    assert single.output["payload"]["image"].tolist() == [0, 1]
+
+
+def test_forward_request_batch_packs_different_seq_len_under_paged(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    generate_ids: list[list[str]] = []
+
+    def fake_prepare_model_inputs(**kwargs):
+        layout = kwargs["prepared_layout"]
+        return {
+            "mode": "gen_image",
+            "tokenizer_output": layout.tokenizer_output,
+            "batch_gen_image_info": [layout.generated_image_info],
+            "prepared_layout": layout,
+            "paged_request_ids": kwargs.get("paged_request_ids"),
+        }
+
+    def fake_generate(**kwargs):
+        request_ids = list(kwargs["paged_request_ids"])
+        generate_ids.append(request_ids)
+        return torch.tensor([[idx] for idx in range(len(request_ids))])
+
+    monkeypatch.setattr(pipeline, "prepare_model_inputs", fake_prepare_model_inputs)
+    pipeline._generate = fake_generate
+
+    requests = [
+        _omni_request("short", _layout_rows([[1] * 21], image_start=5), guidance_scale=1.0),
+        _omni_request("long", _layout_rows([[2] * 25], image_start=9), guidance_scale=1.0),
+    ]
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=requests))
+
+    assert [output.output["payload"]["image"].tolist() for output in outputs] == [[0], [1]]
+    assert generate_ids == [["short", "long"]]
+    assert requests[1].prepared_layout.tokenizer_output.tokens.shape[1] == 25
+
+
+def test_forward_request_group_publishes_per_row_mixed_prefix(monkeypatch):
+    from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    captured: dict[str, object] = {}
+
+    def fake_prepare_model_inputs(**kwargs):
+        captured["kv_computed_tokens"] = kwargs.get("kv_computed_tokens")
+        layout = kwargs["prepared_layout"]
+        return {
+            "mode": "gen_image",
+            "tokenizer_output": layout.tokenizer_output,
+            "batch_gen_image_info": [layout.generated_image_info],
+            "prepared_layout": layout,
+            "paged_request_ids": kwargs.get("paged_request_ids"),
+        }
+
+    def fake_generate(**kwargs):
+        context = get_forward_context()
+        captured["prefix_len"] = context.paged_kv_cached_prefix_len
+        captured["prefix_lens"] = context.paged_kv_cached_prefix_lens
+        return torch.tensor([[0], [1]])
+
+    monkeypatch.setattr(pipeline, "prepare_model_inputs", fake_prepare_model_inputs)
+    pipeline._generate = fake_generate
+
+    cold = _omni_request("cold", _layout_rows([[1] * 21], image_start=5), guidance_scale=1.0)
+    hit = _omni_request("hit", _layout_rows([[2] * 21], image_start=5), guidance_scale=1.0)
+    hit.kv_computed_tokens = (4,)
+    with set_forward_context():
+        outputs = pipeline._forward_request_group(
+            [cold, hit],
+            prompt="",
+            height=512,
+            width=512,
+            num_inference_steps=4,
+            guidance_scale=1.0,
+            generator=None,
+            kwargs={},
+        )
+
+    assert [output.output["payload"]["image"].tolist() for output in outputs] == [[0], [1]]
+    assert captured["prefix_len"] == 0
+    assert captured["prefix_lens"] == (0, 4)
+    assert captured["kv_computed_tokens"] == ()
+
+
+def test_forward_request_batch_preserves_order_when_groups_split(monkeypatch):
+    pipeline = _pipeline()
+    generate_ids: list[list[str]] = []
+
+    def fake_prepare_model_inputs(**kwargs):
+        layout = kwargs["prepared_layout"]
+        return {
+            "mode": "gen_image",
+            "tokenizer_output": layout.tokenizer_output,
+            "batch_gen_image_info": [layout.generated_image_info],
+            "prepared_layout": layout,
+            "paged_request_ids": kwargs.get("paged_request_ids"),
+        }
+
+    def fake_generate(**kwargs):
+        request_ids = list(kwargs["paged_request_ids"])
+        generate_ids.append(request_ids)
+        return torch.tensor([[ord(request_ids[0][0])]])
+
+    monkeypatch.setattr(pipeline, "prepare_model_inputs", fake_prepare_model_inputs)
+    pipeline._generate = fake_generate
+
+    ar_kv = _omni_request("ar", _layout_rows([[1] * 21], image_start=5), guidance_scale=1.0)
+    ar_kv.sampling_params.past_key_values = SimpleNamespace(
+        key_cache=[torch.zeros(2, 4, 1, 1)],
+        value_cache=[torch.zeros(2, 4, 1, 1)],
+    )
+    requests = [
+        _omni_request("plain", _layout_rows([[2] * 21], image_start=5), guidance_scale=1.0),
+        ar_kv,
+    ]
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=requests))
+
+    assert [output.output["payload"]["image"].tolist() for output in outputs] == [[ord("p")], [ord("a")]]
+    assert generate_ids == [["plain"], ["ar"]]

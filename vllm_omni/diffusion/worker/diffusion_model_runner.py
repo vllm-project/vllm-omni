@@ -196,6 +196,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             od_config=od_config,
             device=device,
         )
+        # Scheduler allocations stay installed across stepwise waves. The
+        # request-mode path rebuilds paged metadata from the current wave's
+        # DiffusionKVMetadata list; the step path looks the same objects up
+        # here after the first admission.
+        self._diffusion_kv_metadata_by_request: dict[str, DiffusionKVMetadata] = {}
         # Compatibility view for callers that inspect the installed config;
         # physical ownership remains in ``diffusion_kv_backend``.
         self.kv_cache_config: KVCacheConfig | None = None
@@ -532,7 +537,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         return wait_for_kv_load(self._kv_connector, scheduler_output, timeout)
 
     def install_diffusion_kv_metadata(self, metadata: DiffusionKVMetadata) -> bool:
-        return self.diffusion_kv_backend.install_diffusion_kv_metadata(metadata)
+        installed = self.diffusion_kv_backend.install_diffusion_kv_metadata(metadata)
+        store = getattr(self, "_diffusion_kv_metadata_by_request", None)
+        if store is None:
+            store = {}
+            self._diffusion_kv_metadata_by_request = store
+        store[metadata.request_id] = metadata
+        return installed
 
     def get_diffusion_kv_row(
         self,
@@ -543,6 +554,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         return self.diffusion_kv_backend.get_diffusion_kv_row(request_id, sequence_id, context_id)
 
     def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
+        store = getattr(self, "_diffusion_kv_metadata_by_request", None)
+        if store is not None:
+            for request_id in request_ids:
+                store.pop(request_id[0] if isinstance(request_id, tuple) else request_id, None)
         return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
@@ -854,13 +869,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
                 paged_kv_cached_prefix_len = 0
                 if not native_kv_transfer:
-                    cached_prefix_lens = {row.kv_start_pos for row in paged_metadata.prefill_rows}
-                    if len(cached_prefix_lens) != 1:
+                    prefixes_by_request: dict[str, set[int]] = {}
+                    for row in paged_metadata.prefill_rows:
+                        prefixes_by_request.setdefault(row.request_id, set()).add(int(row.kv_start_pos))
+                    mixed_cfg_rows = {
+                        request_id: sorted(prefixes)
+                        for request_id, prefixes in prefixes_by_request.items()
+                        if len(prefixes) != 1
+                    }
+                    if mixed_cfg_rows:
                         raise ValueError(
-                            "One paged request-level forward requires a uniform cached prefix boundary; "
-                            f"got {sorted(cached_prefix_lens)}"
+                            "One paged request requires a uniform cached prefix across its CFG rows; "
+                            f"got {mixed_cfg_rows}"
                         )
-                    paged_kv_cached_prefix_len = next(iter(cached_prefix_lens))
+                    cached_prefix_lens = {next(iter(prefixes)) for prefixes in prefixes_by_request.values()}
+                    # Mixed prefixes across public requests are split by Hunyuan
+                    # grouping; the outer context only carries a uniform value.
+                    paged_kv_cached_prefix_len = next(iter(cached_prefix_lens)) if len(cached_prefix_lens) == 1 else 0
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
                 )
@@ -1474,13 +1499,30 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             attn_metadata: dict[str, Any] = {}
 
             kv_backend = getattr(self, "diffusion_kv_backend", None)
-            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-                paged_kv_runtime=paged_kv_runtime,
-                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+            paged_kv_runtime = None
+            paged_kv_context: AbstractContextManager[Any] = nullcontext()
+            if not in_diffusion_kv_memory_profile and getattr(kv_backend, "paged_attention_adapter", None) is not None:
+                store = getattr(self, "_diffusion_kv_metadata_by_request", None) or {}
+                metadatas = []
+                for state in states:
+                    metadata = store.get(state.request_id)
+                    if metadata is None:
+                        raise ValueError(
+                            f"paged_scheduler step request {state.request_id!r} "
+                            "requires installed Diffusion KV metadata"
+                        )
+                    metadatas.append(metadata)
+                paged_metadata = self._build_paged_attention_metadata(metadatas)
+                paged_kv_runtime, paged_kv_context = kv_backend.activate_paged_attention_metadata(paged_metadata)
+            with (
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata=attn_metadata,
+                    paged_kv_runtime=paged_kv_runtime,
+                    in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+                ),
+                paged_kv_context,
             ):
                 clear_pipeline_stage_durations(pipeline)
                 noise_pred = pipeline.denoise_step(input_batch, states=states)
@@ -1603,18 +1645,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             matched_state.peak_memory_mb,
                         )
 
-                terminal_request_ids = [
-                    runner_output.request_id for runner_output in runner_output_list if runner_output.finished
-                ]
-                self._update_states_after(states, input_batch, pipeline_interrupted)
-                if (
-                    getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-                    is DiffusionKVCacheMode.PAGED_SCHEDULER
-                    and terminal_request_ids
-                ):
-                    self.remove_diffusion_kv_requests(terminal_request_ids)
+            terminal_request_ids = [
+                runner_output.request_id for runner_output in runner_output_list if runner_output.finished
+            ]
+            self._update_states_after(states, input_batch, pipeline_interrupted)
+            if (
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                is DiffusionKVCacheMode.PAGED_SCHEDULER
+                and terminal_request_ids
+            ):
+                self.remove_diffusion_kv_requests(terminal_request_ids)
 
-                return BatchRunnerOutput.from_list(runner_output_list)
+            return BatchRunnerOutput.from_list(runner_output_list)
 
     def submit_interaction(
         self,

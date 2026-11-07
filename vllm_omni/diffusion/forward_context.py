@@ -38,6 +38,9 @@ class ForwardContext:
     # Block-aligned prefix already resident in Scheduler-owned pages for the
     # active request-level prefill. Zero keeps the cold/full-prefill path.
     paged_kv_cached_prefix_len: int = 0
+    # Per-row prefix cuts when a packed request group has mixed hit lengths.
+    # None means every row uses ``paged_kv_cached_prefix_len``.
+    paged_kv_cached_prefix_lens: tuple[int, ...] | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
@@ -293,15 +296,30 @@ def override_paged_kv_adapter(adapter: Any | None):
         _forward_context.paged_kv_adapter = previous
 
 
-def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
-    """Set the current diffusion denoise step on the active ForwardContext."""
+def set_forward_context_denoise_step_idx(
+    step_idx: int | None,
+    request_ids: tuple[str, ...] | list[str] | None = None,
+    paged_step_idx: int | None = None,
+) -> None:
+    """Set the current diffusion denoise step on the active ForwardContext.
+
+    ``step_idx`` stays the request's real denoise index for step-gated
+    consumers (KV-quant skip steps, W4A8 fallback steps, RAINFUSION start/end
+    windows). Paged rows are keyed only on first-step prefill versus later
+    denoise, so a caller that batches states with different real indices
+    passes the phase through ``paged_step_idx`` instead of flattening
+    ``step_idx``.
+    """
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
-        if step_idx is not None:
+        if step_idx is not None or paged_step_idx is not None:
             paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
-                ensure_active(step_idx)
+                ensure_active(
+                    paged_step_idx if paged_step_idx is not None else step_idx,
+                    request_ids=request_ids,
+                )
 
 
 def get_paged_kv_computed_tokens() -> tuple[int, ...]:

@@ -796,6 +796,31 @@ class LightProjector(nn.Module):
         return self.layers(x)
 
 
+def _reshape_width_for_query_batch(token_count: int, query_lens: list[int]) -> tuple[int, int]:
+    """Return ``(batch, pad_width)`` for a flat ``[B*T, ...]`` query tensor.
+
+    Packed Hunyuan rows right-pad to a shared tensor width, so logical
+    ``query_lens`` may be shorter than ``T``. Reshape must use the padded
+    width, not ``query_lens[0]``; per-row logical lengths stay with the
+    paged adapter plan / gather.
+    """
+
+    if not query_lens:
+        raise ValueError("Hunyuan query batch requires at least one query length")
+    batch = len(query_lens)
+    if token_count % batch != 0:
+        raise ValueError(
+            f"Hunyuan flat token count must divide evenly across rows: tokens={token_count}, batch={batch}"
+        )
+    pad_width = token_count // batch
+    if any(query_len <= 0 or query_len > pad_width for query_len in query_lens):
+        raise ValueError(
+            "Hunyuan logical query lengths must fit inside the padded tensor width: "
+            f"query_lens={query_lens}, pad_width={pad_width}"
+        )
+    return batch, pad_width
+
+
 class HunYuanRotary2DEmbedder:
     r"""
     A RoPE wrapper specifically designed for HunYuan-Image attention.
@@ -870,11 +895,9 @@ class HunYuanRotary2DEmbedder:
         # 1. Prepare cos/sin
         cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
 
-        # 2. Shape validation
+        # 2. Shape validation — use padded width, not logical query_lens[0].
         query_lens: list[int] = kwargs.get("query_lens")
-        bs = len(query_lens)
-        q_len = query_lens[0]
-        assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
+        bs, q_len = _reshape_width_for_query_batch(hidden_states.shape[0], query_lens)
 
         # 3. Reshape + transpose for apply_rotary_pos_emb
         #    Assume q shape [B*L, H*D] -> [2, L, H, D] -> [2, H, L, D]
@@ -1112,9 +1135,9 @@ class ImageKVCacheManager(nn.Module):
             raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
 
         self.clear_legacy_prompt_kv_cache()
-        bs = len(query_lens)
-        q_len = query_lens[0]
-        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
+        # Packed / mixed-prefix rows right-pad to a shared T; reshape on T, not
+        # logical query_lens[0]. Adapter gather keeps per-row logical lengths.
+        bs, q_len = _reshape_width_for_query_batch(query.shape[0], query_lens)
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
@@ -1167,10 +1190,8 @@ class ImageKVCacheManager(nn.Module):
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
         shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
-        bs = len(query_lens)
-        q_len = query_lens[0]
+        bs, q_len = _reshape_width_for_query_batch(query.shape[0], query_lens)
         seq_len = seq_lens[0]
-        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
@@ -3056,6 +3077,20 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         return input_ids
 
+    @staticmethod
+    def _first_step_query_seq_lens(
+        model_kwargs: dict[str, Any],
+        batch: int,
+        query_len: int,
+        seq_len: int,
+    ) -> tuple[list[int], list[int]]:
+        output = model_kwargs.get("tokenizer_output")
+        real_pos = getattr(output, "real_pos", None) if output is not None else None
+        if real_pos is None or int(real_pos.shape[0]) != batch:
+            return [query_len] * batch, [seq_len] * batch
+        seq_lens = [int(row[-1].item()) for row in real_pos]
+        return list(seq_lens), seq_lens
+
     def _maybe_handle_ar_kv_reuse(
         self,
         input_ids,
@@ -3065,10 +3100,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         cfg_rank,
         device,
     ):
-        if is_forward_context_available() and get_forward_context().paged_kv_cached_prefix_len:
-            # Local hits are sliced after conditional-image embeddings are
-            # prepared in forward_call; the AR path must not truncate them.
-            return input_ids, 0
+        if is_forward_context_available():
+            context = get_forward_context()
+            if context.paged_kv_cached_prefix_len or context.paged_kv_cached_prefix_lens:
+                # Local hits are sliced after conditional-image embeddings are
+                # prepared in forward_call; the AR path must not truncate them.
+                return input_ids, 0
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         computed_tokens = get_paged_kv_computed_tokens()
         if computed_tokens and computed_tokens[0] > 0:
@@ -3287,8 +3324,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
-        query_lens = [q_len1] * b
-        seq_lens = [seq_len] * b
+        query_lens, seq_lens = self._first_step_query_seq_lens(model_kwargs, b, q_len1, seq_len)
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
         model_kwargs["attention_mask"] = attention_mask.to(latents.device)
@@ -3317,7 +3353,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                set_forward_context_denoise_step_idx(i)
+                set_forward_context_denoise_step_idx(
+                    i,
+                    request_ids=model_kwargs.get("paged_request_ids"),
+                    paged_step_idx=0 if i == 0 else 1,
+                )
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -3403,7 +3443,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     attention_mask = model_kwargs.get("attention_mask")
                     b, _, q_len1, seq_len = attention_mask.shape
                     query_lens = [q_len1] * b
-                    seq_lens = [seq_len] * b
+                    prev_seq_lens = model_kwargs.get("seq_lens")
+                    seq_lens = (
+                        list(prev_seq_lens)
+                        if isinstance(prev_seq_lens, list) and len(prev_seq_lens) == b
+                        else [seq_len] * b
+                    )
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
 

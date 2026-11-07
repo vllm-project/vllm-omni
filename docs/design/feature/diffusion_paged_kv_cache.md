@@ -164,9 +164,9 @@ engine modes. The terminology follows the
 | Execution path | Configuration | Scheduler batch unit | Hunyuan `paged_scheduler` status |
 | --- | --- | --- | --- |
 | Request execution | `step_execution=false`, `max_num_seqs=1` | One complete denoising request | Current supported path |
-| Request-level batching | `step_execution=false`, `max_num_seqs>1` | Multiple compatible public requests in one forward | Not supported by the current `paged_scheduler` integration |
-| Step execution | `step_execution=true`, `max_num_seqs=1` | One request advances one denoising step per scheduler tick | Paged path rejects it |
-| Step continuous batching | `step_execution=true`, `max_num_seqs>1` | Compatible active step states advance together | Separate feature; paged Hunyuan is not implemented |
+| Request-level batching | `step_execution=false`, `max_num_seqs>1` | Multiple compatible public requests in one forward | Runtime not implemented; contract in [paged independent batching](diffusion_paged_kv_independent_batching.md) |
+| Step execution | `step_execution=true`, `max_num_seqs=1` | One request advances one denoising step per scheduler tick | Runtime rejects it; contract in [paged independent batching](diffusion_paged_kv_independent_batching.md) |
+| Step continuous batching | `step_execution=true`, `max_num_seqs>1` | Compatible active step states advance together | Runtime not implemented; contract in [paged independent batching](diffusion_paged_kv_independent_batching.md) |
 
 `max_num_seqs` limits public requests. CFG branches are internal rows of one
 request and are controlled by `diffusion_kv_max_rows_per_request`: a request
@@ -313,8 +313,11 @@ and a prepared memory-profile request. The main fields are:
 | `diffusion_attention_backend` | Must resolve to `FLASH_ATTN` for the current paged implementation |
 
 The user guide contains the stage YAML and `vllm serve --omni` example.
-Use request execution for the current Hunyuan integration; the unsupported
-batching and step modes are summarized in [Execution Modes](#execution-modes).
+Use request execution for the current Hunyuan integration. The contract for
+enabling request-level batching and step execution is
+[paged independent batching](diffusion_paged_kv_independent_batching.md);
+those modes are not a runtime support claim until the follow-up pipeline PR
+lands.
 
 The current paged KV format is unquantized BF16 with identity Q/K/V scales.
 Model weight quantization, CPU offload, layerwise offload, and distributed
@@ -324,8 +327,10 @@ required.
 
 ## Limitations
 
-- Hunyuan `paged_scheduler` is request-level only; request batching and step
-  execution are not implemented (see [Execution Modes](#execution-modes)).
+- Hunyuan `paged_scheduler` is request-level only in the current runtime.
+  Request batching and step execution follow the contract in
+  [paged independent batching](diffusion_paged_kv_independent_batching.md)
+  and are not implemented yet (see [Execution Modes](#execution-modes)).
 - Only strict Ulysses SP and the current two-branch CFG layout are supported;
   Ring, AllGather-KV, and independent Hunyuan KV contexts are not implemented.
 - Imported AR-to-DiT page transfer and cross-request canonical prefix caching
