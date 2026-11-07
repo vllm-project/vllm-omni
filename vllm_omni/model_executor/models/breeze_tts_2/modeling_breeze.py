@@ -28,6 +28,11 @@ from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+_PACKED_BACKBONE_PROJECTIONS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
+
 
 class BreezeSampling(TypedDict):
     temperature: float
@@ -381,6 +386,24 @@ class BreezeForConditionalGeneration(nn.Module):
                 loaded.add(name)
             elif not name.startswith(("codec_model.", "backbone_model.embed_tokens.", "embed_text_tokens.")):
                 raise ValueError(f"Unexpected Breeze checkpoint parameter: {name}")
+        # Qwen's loader reports a packed destination after any source shard.
+        # Require every split weight/bias unless the complete packed tensor exists.
+        backbone_sources = {name for name, _ in backbone}
+        missing_sources: set[str] = set()
+        for name, _ in self.model.named_parameters():
+            projection, _, kind = name.rpartition(".")
+            if kind not in ("weight", "bias"):
+                continue
+            for packed, parts in _PACKED_BACKBONE_PROJECTIONS.items():
+                if projection.endswith("." + packed) and name not in backbone_sources:
+                    prefix = projection.removesuffix(packed)
+                    missing_sources.update(
+                        prefix + part + "." + kind
+                        for part in parts
+                        if prefix + part + "." + kind not in backbone_sources
+                    )
+        if missing_sources:
+            raise ValueError(f"Missing Breeze backbone projections: {sorted(missing_sources)}")
         loaded.update("model." + name for name in self.model.load_weights(backbone))
         for target, parameter in self.depth_decoder.named_parameters():
             if target == "codebooks_head":
