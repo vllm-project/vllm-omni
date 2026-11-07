@@ -5,6 +5,8 @@
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.layers.device_gates import TRITON_FASTPATH_DEVICE_TYPES
+
 
 def eligible(*values: torch.Tensor) -> bool:
     first = values[0]
@@ -105,6 +107,7 @@ if HAS_TRITON:
         freq_stride0: tl.constexpr,
         freq_stride1: tl.constexpr,
         block_size: tl.constexpr,
+        fuse_products: tl.constexpr,
     ):
         index = tl.program_id(0) * block_size + tl.arange(0, block_size)
         pair = index % 64
@@ -116,33 +119,34 @@ if HAS_TRITON:
         imag = tl.load(input_ptr + base + 1, index < elements, 0).to(tl.float32)
         cosine = tl.load(freq_ptr + token * freq_stride0 + pair * freq_stride1, index < elements, 0)
         sine = tl.load(freq_ptr + token * freq_stride0 + pair * freq_stride1 + 1, index < elements, 0)
-        # Match CUDA's complex64 multiply: the real leading product and the
-        # imaginary trailing product use FMA. The other products round first.
-        rotated_real = tl.fma(real, cosine, -imag * sine)
-        rotated_imag = tl.fma(imag, cosine, real * sine)
+        if fuse_products:
+            # Match CUDA's complex64 multiply: the real leading product and the
+            # imaginary trailing product use FMA. The other products round first.
+            rotated_real = tl.fma(real, cosine, -imag * sine)
+            rotated_imag = tl.fma(imag, cosine, real * sine)
+        else:
+            # MUSA's complex multiply does not fuse its products, so the
+            # reference rotation is a plain fp32 multiply/add sequence and this
+            # path keeps that order to stay bit-exact.
+            rotated_real = real * cosine - imag * sine
+            rotated_imag = imag * cosine + real * sine
         tl.store(output_ptr + index * 2, rotated_real.to(tl.bfloat16), index < elements)
         tl.store(output_ptr + index * 2 + 1, rotated_imag.to(tl.bfloat16), index < elements)
 
 
-def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
-    if (
-        not HAS_TRITON
-        or torch.version.hip is not None
-        or x.device.type != "cuda"
-        or x.dtype != torch.bfloat16
-        or x.ndim != 4
-        or x.shape[-1] != 128
-        or x.stride(-1) != 1
-        or freqs.dtype != torch.complex64
-        or freqs.device != x.device
-        or freqs.shape != (x.shape[1], 64)
-        or torch.is_grad_enabled()
-        or x.numel() == 0
-        or torch.compiler.is_compiling()
-    ):
-        return None
-    if not supports_exact_rope(x.device):
-        return None
+def rope_fma_products(device: torch.device) -> bool | None:
+    """Whether the interleaved RoPE kernel fuses its products, or None when unqualified."""
+    if device.type == "musa":
+        return False
+    if supports_exact_rope(device):
+        return True
+    return None
+
+
+def _launch_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    fuse_products = rope_fma_products(x.device)
+    if fuse_products is None:
+        raise RuntimeError("interleaved_rope is unqualified on this device")
     output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     real_freqs = torch.view_as_real(freqs)
     _rope_kernel[(triton.cdiv(x.numel() // 2, 256),)](
@@ -155,6 +159,40 @@ def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
         *x.stride()[:3],
         *real_freqs.stride()[:2],
         256,
+        fuse_products,
         enable_fp_fusion=False,
     )
     return output
+
+
+if HAS_TRITON:
+
+    @torch.library.custom_op("vllm_omni::interleaved_rope", mutates_args=())
+    def _interleaved_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """Interleaved RoPE as an opaque op, so a compiled region calls the kernel."""
+        return _launch_rope(x, freqs)
+
+    @_interleaved_rope.register_fake
+    def _(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        return torch.empty(x.shape, dtype=x.dtype, device=x.device)
+
+
+def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
+    if (
+        not HAS_TRITON
+        or torch.version.hip is not None
+        or x.device.type not in TRITON_FASTPATH_DEVICE_TYPES
+        or x.dtype != torch.bfloat16
+        or x.ndim != 4
+        or x.shape[-1] != 128
+        or x.stride(-1) != 1
+        or freqs.dtype != torch.complex64
+        or freqs.device != x.device
+        or freqs.shape != (x.shape[1], 64)
+        or torch.is_grad_enabled()
+        or x.numel() == 0
+    ):
+        return None
+    if rope_fma_products(x.device) is None:
+        return None
+    return _interleaved_rope(x, freqs)

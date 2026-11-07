@@ -154,6 +154,60 @@ def test_persistent_staging_makes_model_level_offload_graph_eligible():
     assert manager._offload_reason() is not None
 
 
+class _FakeDevice:
+    def __init__(self, device_type):
+        self.type = device_type
+
+
+class _FakeParameter:
+    def __init__(self, device_type):
+        self.device = _FakeDevice(device_type)
+
+
+class DeviceDecodeModel(DecodeModel):
+    """DecodeModel with one parameter on ``device_type``, so the gate can be probed."""
+
+    def __init__(self, device_type):
+        super().__init__()
+        self._device_type = device_type
+        self.transformer_blocks = []
+
+    def parameters(self):
+        return iter([_FakeParameter(self._device_type)])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("device_type", ["cuda", "musa"])
+def test_capture_capable_device_is_eligible(monkeypatch, device_type):
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1)
+    # The device gate and the build gate are independent: this asserts the device
+    # half, so hold the build capable regardless of what torch is installed here.
+    monkeypatch.setattr(decode_graph, "_graph_capture_capable", lambda: True)
+    manager = decode_graph.QwenImage21DecodeGraphManager(DeviceDecodeModel(device_type))
+    assert manager.eligible() is True
+
+
+@pytest.mark.cpu
+def test_build_without_capture_support_falls_back_to_eager(monkeypatch):
+    """A build that cannot capture must refuse once, not fail per request.
+
+    MUSA has no torch._C._cuda_clearCublasWorkspaces, so accepting the device and
+    then failing the capture re-attempts it for every request, which costs more
+    than staying on the eager path.
+    """
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(decode_graph, "_graph_capture_capable", lambda: False)
+    manager = decode_graph.QwenImage21DecodeGraphManager(DeviceDecodeModel("musa"))
+    assert manager.eligible() is False
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("device_type", ["cpu", "xpu"])
+def test_non_capture_device_falls_back_to_eager(device_type):
+    manager = decode_graph.QwenImage21DecodeGraphManager(DeviceDecodeModel(device_type))
+    assert manager.eligible() is False
+
+
 @pytest.mark.cpu
 def test_allocation_oom_releases_partial_buffers_and_remembers_failure(graph_case, monkeypatch):
     manager, device, cleanup = graph_case

@@ -28,7 +28,9 @@ The model runner regionally torch.compile's the transformer blocks even when
 decode graphs are enabled, so capture records the compiled (fused) kernels;
 inductor's own cudagraphs stay off so the two graph layers never stack.
 
-Fallbacks (all logged, all eager): CUDA unavailable, model-level CPU offload
+Fallbacks (all logged, all eager): a device type other than CUDA or MUSA, a
+torch build without ``torch._C._cuda_clearCublasWorkspaces``, model-level CPU
+offload
 without persistent weight staging, sequence/ring/tensor parallelism,
 HSDP/offload hooks, KV-cache quantization, dynamic LoRA wrappers, padded text
 masks (the masked attention path branches on mask contents, which cannot be
@@ -46,6 +48,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.diffusion.layers.device_gates import TRITON_FASTPATH_DEVICE_TYPES
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -54,6 +57,22 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+# Device types this decode path runs on: CUDA (ROCm reports the same device
+# type) and MUSA, where torchada provides the CUDA entry points it calls.
+_DECODE_GRAPH_DEVICE_TYPES = TRITON_FASTPATH_DEVICE_TYPES
+
+
+def _graph_capture_capable() -> bool:
+    """Whether this torch build exposes what capture needs.
+
+    Capture clears cuBLAS workspaces through ``torch._C`` before it starts. A
+    build without that symbol cannot capture at all (MUSA today), and a device
+    that is accepted and then fails still pays for the attempt on every request:
+    the failed key is dropped from ``entries`` and re-tried. Refusing up front
+    costs one warning instead.
+    """
+    return hasattr(torch._C, "_cuda_clearCublasWorkspaces")
 
 
 def _dynamic_lora_wrappers_present(module: torch.nn.Module) -> bool:
@@ -218,8 +237,13 @@ class QwenImage21DecodeGraphManager:
         model = self.model
         reason = self._offload_reason()
         param = next(model.parameters(), None)
-        if reason is None and (param is None or param.device.type != "cuda"):
-            reason = f"model is not on CUDA (device={None if param is None else param.device})"
+        # Check the device type, not the platform's device type: on CPU they
+        # agree, and an empty graph would replay there as a stale no-op.
+        if reason is None and (param is None or param.device.type not in _DECODE_GRAPH_DEVICE_TYPES):
+            device = None if param is None else param.device
+            reason = f"decode graph capture is not supported on device={device}"
+        elif reason is None and not _graph_capture_capable():
+            reason = "this torch build lacks torch._C._cuda_clearCublasWorkspaces, which graph capture needs"
         elif reason is None:
             parallel_config = getattr(model, "parallel_config", None)
             if parallel_config is not None:
@@ -403,10 +427,11 @@ class QwenImage21DecodeGraphManager:
                 return None
         first = kv_cache[0][cache_branch]
         cached_key = first["key"]
-        if cached_key.device.type != "cuda":
+        if cached_key.device.type not in _DECODE_GRAPH_DEVICE_TYPES:
             # Registration is device-agnostic (unit tests exercise the buffer
-            # machinery on CPU), but capture/replay is CUDA-only: an empty
-            # graph over CPU ops would replay as a stale no-op.
+            # machinery on CPU), but capture/replay is limited to
+            # _DECODE_GRAPH_DEVICE_TYPES: an empty graph over CPU ops would
+            # replay as a stale no-op.
             return None
         key = (
             cache_branch,

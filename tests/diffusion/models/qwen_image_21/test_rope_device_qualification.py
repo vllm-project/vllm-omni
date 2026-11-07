@@ -15,6 +15,22 @@ from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer a
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+class _CudaDevice:
+    """A device that still reports ``cuda`` where torchada remaps ``torch.device``.
+
+    On a MUSA build ``torch.device("cuda", 1)`` becomes ``musa:1``, so these
+    unqualified-CUDA cases would silently exercise the MUSA branch instead. The
+    code under test only reads ``type``/``index`` and hands the object to a mocked
+    ``torch.get_device_module``, so a stand-in keeps the CUDA coverage portable.
+    """
+
+    type = "cuda"
+    index = 1
+
+    def __repr__(self) -> str:
+        return "device(type='cuda', index=1)"
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     "version,hip,device,expected",
@@ -31,9 +47,10 @@ def test_exact_rope_stack_and_input_device(monkeypatch, version, hip, device, ex
     monkeypatch.setattr(torch, "get_device_module", Mock(return_value=backend))
     monkeypatch.setattr(torch, "__version__", version)
     monkeypatch.setattr(torch.version, "hip", hip)
-    assert pointwise.supports_exact_rope(torch.device(device)) is expected
+    resolved = _CudaDevice() if device.startswith("cuda") else torch.device(device)
+    assert pointwise.supports_exact_rope(resolved) is expected
     if expected:
-        backend.get_device_capability.assert_called_once_with(torch.device(device))
+        backend.get_device_capability.assert_called_once_with(resolved)
     else:
         backend.get_device_capability.assert_not_called()
 
@@ -43,7 +60,7 @@ def test_exact_rope_stack_and_input_device(monkeypatch, version, hip, device, ex
 @pytest.mark.parametrize("path", ["rotary", "qk_rotary"])
 @torch.no_grad()
 def test_unqualified_device_declines_before_allocation(monkeypatch, capability, path):
-    device = torch.device("cuda", 1)
+    device = _CudaDevice()
 
     def tensor(shape, dtype=torch.bfloat16):
         value = Mock(device=device, dtype=dtype, shape=shape, ndim=len(shape))
@@ -150,3 +167,83 @@ def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
     result = attention(torch.empty(2, sequence, 4096, device="cuda", dtype=torch.bfloat16), freqs)
     assert observed == [True]
     torch.testing.assert_close(result, projection[:, :, 2].flatten(2), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_rope_qualifies_musa_with_unfused_products():
+    """MUSA's complex multiply does not fuse its products, so its reference
+    rotation is a plain multiply/add; the fused kernel keeps that order (no FMA)
+    to stay bit-exact."""
+    assert pointwise.rope_fma_products(torch.device("musa")) is False
+    assert pointwise.rope_fma_products(torch.device("cpu")) is None
+
+
+@pytest.mark.cpu
+def test_rope_is_a_registered_custom_op():
+    """A compiled region can only call the kernel through a real custom op."""
+    assert torch.ops.vllm_omni.interleaved_rope.default is not None
+
+
+@pytest.mark.cpu
+def test_qk_rope_qualifies_musa_with_unfused_products():
+    """The fused Q/K norm+RoPE keeps MUSA's reference rotation order (no FMA)."""
+    assert fused_qk.qk_fma_products(torch.device("musa")) is False
+    assert fused_qk.qk_fma_products(torch.device("cpu")) is None
+
+
+@pytest.mark.cpu
+def test_qk_rope_is_a_registered_custom_op():
+    """A compiled region can only reach the fused kernel through a real custom op."""
+    assert torch.ops.vllm_omni.qk_norm_rope.default is not None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "value, expected", [("", False), ("0", False), ("1", True), ("true", True), ("on", True), ("no", False)]
+)
+def test_musa_qk_fusion_is_opt_in(monkeypatch, value, expected):
+    """MUSA keeps the bit-exact reference path unless the env asks for the fusion."""
+    monkeypatch.setenv(fused_qk.MUSA_QK_FUSION_ENV, value)
+    assert fused_qk._musa_qk_fusion_enabled() is expected
+
+
+@pytest.mark.cpu
+def test_musa_qk_fusion_defaults_off(monkeypatch):
+    monkeypatch.delenv(fused_qk.MUSA_QK_FUSION_ENV, raising=False)
+    assert fused_qk._musa_qk_fusion_enabled() is False
+
+
+_requires_musa = pytest.mark.skipif(
+    not (hasattr(torch, "musa") and torch.musa.is_available()), reason="needs MUSA hardware"
+)
+
+
+@_requires_musa
+def test_musa_fused_qk_dispatch_is_opt_in(monkeypatch):
+    """MUSA never dispatches the fused kernel unless the env asks for it.
+
+    The positive direction needs a complex64 ``freqs`` tensor. MUSA can build one
+    (``torch.complex64``, ``torch.polar`` and complex multiply all work; only the
+    ``Tensor.view_as_complex`` method binding is missing), so this gap is about
+    coverage rather than capability, and the direction is covered by the
+    qualification assertions and by the measured runs instead.
+    """
+    dev = torch.device("musa", torch.musa.current_device())
+    q = torch.randn(1, 64, 32, 128, device=dev, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    w = torch.ones(128, device=dev, dtype=torch.bfloat16)
+    f = torch.zeros(q.shape[1], 64, dtype=torch.complex64, device=dev)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("fused kernel dispatched while disabled")
+
+    monkeypatch.delenv(fused_qk.MUSA_QK_FUSION_ENV, raising=False)
+    monkeypatch.setattr(fused_qk, "_qk_norm_rope", _boom)
+    with torch.no_grad():
+        assert fused_qk.qk_rotary(q, k, w, w, f, 1e-6) is None
+
+    # The arithmetic is qualified on MUSA, so the env is the only thing holding
+    # the fusion back; if it ever stops qualifying this assertion is the signal.
+    assert fused_qk.qk_fma_products(dev) is False
+    monkeypatch.setenv(fused_qk.MUSA_QK_FUSION_ENV, "1")
+    assert fused_qk._musa_qk_fusion_enabled() is True
