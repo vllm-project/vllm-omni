@@ -1,0 +1,13 @@
+--- a/sglang/multimodal_gen/runtime/pipelines/diffusers_pipeline.py
++++ b/sglang/multimodal_gen/runtime/pipelines/diffusers_pipeline.py
+@@ -407,7 +407,9 @@
+         """
+
+         original_model_path = model_path  # Keep original for custom_pipeline
+-        model_path = maybe_download_model(model_path, force_diffusers_model=True)
++        model_path = maybe_download_model(
++            model_path, force_diffusers_model=True, revision=server_args.revision
++        )
+         self.model_path = model_path
+
+         dtype = self._get_dtype(server_args)

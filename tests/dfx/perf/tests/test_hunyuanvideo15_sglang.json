@@ -1,0 +1,94 @@
+[
+  {
+    "test_name": "test_sglang_hunyuanvideo15_t2v_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "SGLang Diffusers fallback on one H100. Same video workload as vLLM nightly #18955; fallback VAE loads BF16 while the vLLM VAE uses FP32.",
+    "server_params": {
+      "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+      "serve_args": {
+        "backend": "diffusers",
+        "num-gpus": 1,
+        "revision": "286be7ce72277246578a3e3cc2487e95ddae5bcf",
+        "dit-precision": "bf16",
+        "dit-cpu-offload": true,
+        "warmup-mode": "off",
+        "output-path": "tests/dfx/perf/results/hunyuanvideo-videos"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "832x480_frames33_steps4",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 832,
+          "height": 480,
+          "num_inference_steps": 4,
+          "num_frames": 33,
+          "fps": 24,
+          "seed": 42,
+          "guidance_scale": 6.0,
+          "flow_shift": 5.0,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "seed": 0,
+        "num_warmups": 2
+      }
+    ],
+    "server_type": "sglang-diffusion",
+    "model_audit": {
+      "config_values": {
+        "model_index.json": {
+          "_class_name": "HunyuanVideo15Pipeline",
+          "guider": [
+            "diffusers",
+            "ClassifierFreeGuidance"
+          ],
+          "scheduler": [
+            "diffusers",
+            "FlowMatchEulerDiscreteScheduler"
+          ]
+        },
+        "guider/guider_config.json": {
+          "guidance_scale": 6.0,
+          "guidance_rescale": 0.0,
+          "enabled": true,
+          "start": 0.0,
+          "stop": 1.0,
+          "use_original_formulation": false
+        },
+        "scheduler/scheduler_config.json": {
+          "shift": 5.0,
+          "use_dynamic_shifting": false,
+          "stochastic_sampling": false,
+          "use_karras_sigmas": false,
+          "use_exponential_sigmas": false,
+          "use_beta_sigmas": false
+        }
+      },
+      "precision": {
+        "load_dtype": "bf16",
+        "vae": "bf16",
+        "vllm_reference_vae": "fp32",
+        "evidence": "SGLang DiffusersPipeline passes the DiT dtype as torch_dtype for all components; no VAE upcast is applied."
+      }
+    }
+  }
+]
