@@ -26,6 +26,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.seeded_isolation import isolation_plan, request_is_seeded
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
@@ -835,6 +836,81 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    @staticmethod
+    def _request_is_runnable(request: Any) -> bool:
+        """Whether upstream would consider this request runnable now.
+
+        A resumable session parked in ``WAITING_FOR_STREAMING_REQ`` is skipped by
+        upstream until its client sends the next segment, so it must not drive
+        the solo decision: an idle seeded session would otherwise hide every
+        other queue while the engine has free capacity (review P2 on #9937).
+        It is counted again as soon as the update lands and makes it runnable.
+        """
+        return getattr(request, "status", None) != RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def _parked_running_requests(self) -> tuple[Any, ...]:
+        """Running requests parked in the chunk-transfer layer for this step.
+
+        ``_process_pending_omni_inputs`` runs before the isolation scan and can
+        move a running request into the adapter's (or native coordinator's)
+        chunk-waiting deques until the step ends. Those rows are still running
+        for admission purposes: the engine has no free capacity, and a request
+        admitted now would be co-batched once the step restores them (review
+        P2 on #9937).
+        """
+        parked: tuple[Any, ...] = ()
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            parked += (
+                *getattr(adapter, "waiting_for_chunk_running_requests", ()),
+                *getattr(adapter, "_held_non_active", ()),
+            )
+        coordinator = getattr(self, "input_coordinator", None)
+        if coordinator is not None:
+            # Native-coordinator path: same park/restore contract as the adapter.
+            parked += tuple(getattr(coordinator, "_waiting_for_chunk_running", ()))
+        return parked
+
+    def _seeded_isolation_plan(self) -> tuple[bool, bool]:
+        """Whether to defer admission and/or admit only a waiting seeded request."""
+        parked_running = self._parked_running_requests()
+        return isolation_plan(
+            # Adapter/coordinator-parked runners still occupy the engine this
+            # step; counting only ``self.running`` would solo-admit a seeded
+            # request and then co-batch it on restore (review P2 on #9937).
+            has_running=bool(self.running) or bool(parked_running),
+            seeded_running=any(
+                request_is_seeded(getattr(r, "sampling_params", None)) for r in (*self.running, *parked_running)
+            ),
+            seeded_waiting=any(
+                request_is_seeded(getattr(r, "sampling_params", None)) and self._request_is_runnable(r)
+                for r in (*self.waiting, *self.kv_holding_waiting)
+            ),
+        )
+
+    def _promote_seeded_request(self) -> str | None:
+        """Move the oldest seeded request to the front of its queue.
+
+        Returns the queue that was promoted (``"waiting"`` or
+        ``"kv_holding"``), or ``None`` when no seeded request is waiting.
+        """
+        for name, queue in (("waiting", self.waiting), ("kv_holding", self.kv_holding_waiting)):
+            target = next(
+                (
+                    r
+                    for r in queue
+                    if request_is_seeded(getattr(r, "sampling_params", None)) and self._request_is_runnable(r)
+                ),
+                None,
+            )
+            if target is None:
+                continue
+            if queue.peek_request() is not target:
+                queue.remove_request(target)
+                queue.prepend_request(target)
+            return name
+        return None
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -851,27 +927,53 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
 
+        seeded_defer, seeded_solo = self._seeded_isolation_plan()
+        solo_queue = self._promote_seeded_request() if seeded_solo else None
+
+        # A solo step admits exactly one request: the promoted seeded one. Empty
+        # the *other* queue for this step so it cannot be admitted alongside.
         original_wait_queues = None
-        if self._should_defer_waiting_admission():
+        deferred = seeded_defer or self._should_defer_waiting_admission()
+        if deferred or solo_queue is not None:
             original_wait_queues = self.waiting, self.kv_holding_waiting
-            self.waiting = create_request_queue(self.policy)
-            self.kv_holding_waiting = create_request_queue(self.policy)
+            if deferred:
+                self.waiting = create_request_queue(self.policy)
+                self.kv_holding_waiting = create_request_queue(self.policy)
+            elif solo_queue == "waiting":
+                self.kv_holding_waiting = create_request_queue(self.policy)
+            else:
+                self.waiting = create_request_queue(self.policy)
 
         original_max_num_active_reqs = self.max_num_active_reqs
+        # One limit, computed once: the solo cap must survive the async-chunk
+        # reservation below (review on #9937). Paused streaming sessions are not
+        # in ``running`` but upstream counts them against this limit, so the
+        # solo budget is one executing slot on top of the parked ones -- without
+        # that, an unrelated parked session would consume the slot and the
+        # seeded request would never be admitted (review P2 on #9937).
+        parked_streaming_sessions = int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
+        limit = (
+            min(original_max_num_active_reqs, 1 + parked_streaming_sessions)
+            if seeded_solo
+            else original_max_num_active_reqs
+        )
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
         if reserved_running_slots:
-            self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+            limit = min(limit, max(0, original_max_num_active_reqs - reserved_running_slots))
+        self.max_num_active_reqs = limit
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
-                original_waiting.prepend_requests(self.waiting)
-                original_kv_holding.prepend_requests(self.kv_holding_waiting)
+                if self.waiting is not original_waiting:
+                    original_waiting.prepend_requests(self.waiting)
+                if self.kv_holding_waiting is not original_kv_holding:
+                    original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
