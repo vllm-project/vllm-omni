@@ -124,6 +124,7 @@ class DuplexSessionManager:
         tracer: trace.Tracer | None = None,
     ) -> None:
         validate_duplex_plugin_sampling(plugin, sampling_defaults=tuple(stage_port.sampling_defaults()))
+        plugin.configure_server(runtime_config)
         self.plugin = plugin
         self.tracer = tracer
         self.session_traces: dict[str, SessionTrace] = {}

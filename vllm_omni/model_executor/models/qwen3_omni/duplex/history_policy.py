@@ -1,0 +1,339 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Qwen history selection, bounded source retention, and incremental memory.
+
+Policies select source ranges; the plugin owns rendering and validates every
+result against effective Session history. No policy can edit Session records.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+from abc import ABC, abstractmethod
+from collections import Counter, deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+
+Message = Mapping[str, object]
+AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
+
+
+@dataclass(frozen=True)
+class HistoryLimits:
+    """Positive per-request and per-session strategy limits; not a total RSS cap."""
+
+    recent_messages: int = 8
+    chunk_messages: int = 8
+    summary_tokens: int = 512
+    max_audio_items: int = 64
+    max_audio_bytes: int = 32 * 1024 * 1024
+    max_context_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject nonintegral or unbounded deployment settings at initialization."""
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if name == "max_context_tokens" and value is None:
+                continue
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"history policy {name} must be a positive integer")
+
+
+def has_audio(message: Message) -> bool:
+    """Identify an effective Session message containing a user audio source."""
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "audio_url" for part in content
+    )
+
+
+def source_digest(history: Sequence[Message]) -> str:
+    """Include media identity as well as text: two empty audio items differ."""
+    digest = hashlib.sha256()
+    for message in history:
+        content = message.get("content")
+        digest.update(json.dumps(dict(message), sort_keys=True, ensure_ascii=False).encode())
+        if has_audio(message):
+            digest.update(str(id(content)).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def turn_ranges(history: Sequence[Message]) -> list[tuple[int, int]]:
+    """Return ordered half-open turns, keeping consecutive user items together."""
+    starts = []
+    for i, message in enumerate(history):
+        if (
+            not starts
+            or message.get("role") == "system"
+            or (message.get("role") == "user" and history[i - 1].get("role") != "user")
+        ):
+            starts.append(i)
+    return list(zip(starts, [*starts[1:], len(history)]))
+
+
+@dataclass(frozen=True)
+class RetainedAudio:
+    """One encoded payload bound to its effective Session content objects."""
+
+    # Content objects are retained only within the bounded media pool; keeping
+    # them also prevents Python object-id reuse from attaching different audio.
+    contents: tuple[object, ...]
+    encoded: str
+    key: str
+
+    def belongs_to(self, message: Message) -> bool:
+        """Match identity, never PCM equality between distinct user turns."""
+        return any(message.get("content") is content for content in self.contents)
+
+
+@dataclass(frozen=True)
+class HistoryWork:
+    """Source range and memory generation that must still match at commit."""
+
+    start: int
+    end: int
+    digest: str
+    generation: int
+    previous_summary: str
+
+
+@dataclass
+class QwenHistoryState:
+    """Runner-owned memory; source records are borrowed and never edited here.
+
+    Only the session loop mutates this object. Worker inputs are immutable
+    snapshots. ``preparing`` charges encoded sources until a CPU worker joins,
+    including on cancellation; it must not be cleared while that worker runs.
+    """
+
+    summary: str = ""
+    processed: int = 0
+    processed_digest: str = ""
+    generation: int = 0
+    audio: list[RetainedAudio] = field(default_factory=list)
+    # A borrowed Session view, not another accumulated transcript.
+    history: tuple[Message, ...] = ()
+    omissions: deque[tuple[int, int, str]] = field(default_factory=lambda: deque(maxlen=64))
+    counts: Counter[str] = field(default_factory=Counter)
+    preparing: dict[int, RetainedAudio] = field(default_factory=dict)
+    media_revision: int = 0
+    policy_cache_key: tuple[object, int, int, int] | None = None
+    cached_work: HistoryWork | None = None
+
+    def reconcile(self, history: Sequence[Message]) -> None:
+        """Bind effective history and invalidate memory whose prefix was edited.
+
+        Caller must use current Session records, including playback truncation.
+        This scans history; unchanged stream events use the policy cache instead.
+        """
+        self.policy_cache_key = None
+        self.cached_work = None
+        if self.processed and (
+            len(history) < self.processed or source_digest(history[: self.processed]) != self.processed_digest
+        ):
+            self.summary = ""
+            self.processed = 0
+            self.processed_digest = ""
+            self.generation += 1
+            self.omissions.clear()
+            self.counts["invalidations"] += 1
+        self.history = tuple(history)
+        live = {id(m.get("content")) for m in history if has_audio(m)}
+        self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in live for c in a.contents)]
+
+    def retain(self, entries: Sequence[AudioEntry], limits: HistoryLimits) -> None:
+        """Retain eligible sources, evicting the oldest by Session order.
+
+        Re-reading a foreground cache entry must not make an old source newer.
+        Rebinding replaces the association, but in-flight references stay charged.
+        """
+        self.media_revision += 1
+        for contents, payload in entries:
+            encoded = payload.get("audio")
+            if not isinstance(encoded, str) or not encoded:
+                continue
+            if self.processed and not any(
+                message.get("content") is content for message in self.history[self.processed :] for content in contents
+            ):
+                continue
+            if any(
+                a.encoded is encoded
+                and len(a.contents) == len(contents)
+                and all(x is y for x, y in zip(a.contents, contents))
+                for a in self.audio
+            ):
+                continue
+            key = hashlib.sha256(encoded.encode("ascii")).hexdigest() + ":" + ",".join(str(id(c)) for c in contents)
+            # A merged commit replaces its previous binding, never other turns.
+            self.audio = [a for a in self.audio if not any(c is old for c in contents for old in a.contents)]
+            if len(encoded) > limits.max_audio_bytes:
+                self.counts["oversize_audio"] += 1
+                continue
+            self.audio.append(RetainedAudio(contents, encoded, key))
+        positions = {id(m.get("content")): i for i, m in enumerate(self.history)}
+        self.audio.sort(
+            key=lambda a: min((positions.get(id(c), len(self.history)) for c in a.contents), default=len(self.history))
+        )
+        self.trim_audio(limits)
+
+    def trim_audio(self, limits: HistoryLimits) -> None:
+        """Evict oldest idle references; preparing sources have already been admitted."""
+        while len(self.held_audio) > limits.max_audio_items or self.audio_bytes > limits.max_audio_bytes:
+            victim = next((a for a in self.audio if id(a) not in self.preparing), None)
+            if victim is None:
+                break  # The preparing batch was already admitted within limits.
+            self.audio.remove(victim)
+            self.counts["audio_evictions"] += 1
+        self.counts["peak_audio_bytes"] = max(self.counts["peak_audio_bytes"], self.audio_bytes)
+
+    @property
+    def held_audio(self) -> tuple[RetainedAudio, ...]:
+        """Unique encoded allocations charged to this strategy, including workers."""
+        # A binding may be replaced while feature extraction still owns its
+        # original payload. Charge both until the worker releases its source.
+        return tuple({id(a.encoded): a for a in [*self.audio, *self.preparing.values()]}.values())
+
+    @property
+    def audio_bytes(self) -> int:
+        """Encoded bytes only; decoded features and Session records are separate."""
+        return sum(len(a.encoded) for a in self.held_audio)
+
+    def audio_for(self, message: Message) -> RetainedAudio | None:
+        """Return the currently retained binding, or None after eviction/rebinding."""
+        return next((a for a in self.audio if a.belongs_to(message)), None)
+
+    def matches(self, work: HistoryWork, history: Sequence[Message]) -> bool:
+        """Check progress and source content before applying an asynchronous result."""
+        return (
+            work.generation == self.generation
+            and work.start == self.processed
+            and work.previous_summary == self.summary
+            and len(history) >= work.end
+            and source_digest(history[: work.end]) == work.digest
+        )
+
+    def advance(self, work: HistoryWork, *, summary: str | None = None, omission: str | None = None) -> None:
+        """Commit a summary or explicit omission and release completed sources.
+
+        Raises ValueError for stale work. Omissions advance progress without
+        claiming that the missing source was included in the summary.
+        """
+        if not self.matches(work, self.history):
+            raise ValueError("History source changed before commit")
+        if summary is not None:
+            self.summary = summary
+            self.counts["summaries"] += 1
+        if omission is not None:
+            self.omissions.append((work.start, work.end, omission))
+            self.counts["omissions"] += 1
+        self.processed = work.end
+        self.processed_digest = work.digest
+        self.generation += 1
+        self.policy_cache_key = None
+        self.cached_work = None
+        needed = {id(m.get("content")) for m in self.history[self.processed :] if has_audio(m)}
+        self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in needed for c in a.contents)]
+        # This releases only the strategy's references, never Session records
+        # or the independent foreground cache.
+
+
+class QwenHistoryPolicy(ABC):
+    """Server-loaded, stateless policy. Ranges refer to effective Session items.
+
+    Implementations must return ordered complete-turn ranges. The plugin
+    enforces source validity, media/input limits and memory output size.
+    """
+
+    @abstractmethod
+    def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
+        """Select ordered whole turns for foreground input, including the current turn."""
+
+    @abstractmethod
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits) -> tuple[int, int] | None:
+        """Select the next prefix starting at processed, or None when no work is due."""
+
+
+class BoundedRecentPolicy(QwenHistoryPolicy):
+    """Equal-budget clipping control: retain media, but never summarize it."""
+
+    def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
+        """Offer all turns; the renderer fits the most recent ones to context."""
+        # The equal-budget control uses the available context rather than the
+        # legacy 16-message cap. Rendering removes oldest complete turns.
+        return turn_ranges(state.history)
+
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits) -> tuple[int, int] | None:
+        """The clipping control never generates memory."""
+        return None
+
+
+class IncrementalHistoryPolicy(BoundedRecentPolicy):
+    """Summarize old text or media approaching its configured retention limit."""
+
+    def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
+        """Offer only the unsummarized suffix alongside the existing memory."""
+        return [(max(a, state.processed), b) for a, b in super().select(state, limits) if b > state.processed]
+
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits) -> tuple[int, int] | None:
+        """Prioritize completed media turns before either cache reaches capacity."""
+        history = state.history
+        cutoff = max(0, len(history) - limits.recent_messages)
+        # Raw audio needs consolidation before it leaves the foreground audio
+        # window, independently of the text-message threshold.
+        audio_positions, seen = [], set()
+        for i in range(state.processed, len(history)):
+            message = history[i]
+            if not has_audio(message):
+                continue
+            retained = state.audio_for(message)
+            key = retained.key if retained else str(id(message.get("content")))
+            if key not in seen:
+                seen.add(key)
+                audio_positions.append(i)
+        audio_limit = min(4, limits.max_audio_items)
+        if len(audio_positions) >= audio_limit:
+            cutoff = max(cutoff, audio_positions[len(audio_positions) - audio_limit] + 1)
+        # Leave room for another utterance as large as the largest retained one.
+        # Checking only equality misses byte limits between two item sizes.
+        next_audio_bytes = max((len(a.encoded) for a in state.audio), default=0)
+        if state.audio_bytes + next_audio_bytes > min(8 * 1024 * 1024, limits.max_audio_bytes) and audio_positions:
+            cutoff = max(cutoff, audio_positions[0] + 1)
+        end = state.processed
+        for start, stop in turn_ranges(history):
+            if stop <= state.processed:
+                continue
+            if start >= cutoff:
+                break
+            # Do not consolidate an unanswered user input.
+            if stop == len(history) and history[-1].get("role") == "user":
+                break
+            if end > state.processed and stop - state.processed > limits.chunk_messages:
+                break
+            end = stop
+            if end - state.processed >= limits.chunk_messages:
+                break
+        return (state.processed, end) if end > state.processed else None
+
+
+def load_history_policy(name: str) -> QwenHistoryPolicy | None:
+    """Load a server-selected ABC implementation, rejecting incomplete classes.
+
+    ``recent`` preserves the legacy path. External imports and constructor
+    failures propagate at configuration time; clients cannot select import paths.
+    """
+    if name == "recent":
+        return None  # Preserve the existing default exactly.
+    if name == "bounded_recent":
+        return BoundedRecentPolicy()
+    if name == "incremental":
+        return IncrementalHistoryPolicy()
+    module, separator, attribute = name.partition(":")
+    if not separator:
+        raise ValueError("history policy must be recent, bounded_recent, incremental, or module:Class")
+    policy = getattr(importlib.import_module(module), attribute)()
+    if not isinstance(policy, QwenHistoryPolicy):
+        raise TypeError("history policy must inherit QwenHistoryPolicy and implement select and next_batch")
+    return policy

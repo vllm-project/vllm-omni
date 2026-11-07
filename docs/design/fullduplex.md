@@ -98,6 +98,43 @@ hard-capped replies remain in its bounded cache for prefix correction. Every
 completion path preserves that evidence until calibration retires it. Sessions
 without calibration release stopped output immediately.
 
+## Experimental Qwen history policy
+
+Qwen can opt into a bounded history policy through server-owned
+`duplex_session.model_options`. `recent` preserves the default clipping path;
+`bounded_recent` provides an equal-context/media-budget clipping control;
+`incremental` folds older text and original audio into a bounded text memory.
+Model-specific selection, source retention, prompt construction and validation
+remain in the Qwen plugin. `SessionMemoryRuntime` executes private requests
+with the Thinker as both entry and final stage.
+
+Each Session holds `QwenDuplexSessionState.history_policy_state`. Source
+fingerprints include effective text and media identity. Deletion or playback
+changes revoke affected memory; late results cannot restore an older source.
+A missing source records an omission and does not block later work. Media
+eligibility is independent of the recent text window. Original Session records
+are retained, so this policy does not bound total Session storage.
+
+External policies inherit the `QwenHistoryPolicy` ABC; incomplete implementations
+fail at server initialization. Selection is stateless and may be cached while
+the Session history revision, memory generation and retained-media revision are
+unchanged. Source checks still run before submitting or applying a summary.
+Media compression follows the smaller of configured pool and foreground-cache
+limits. A still-valid foreground source can be recovered for compression, but
+its worker references must fit the strategy limits and remain charged until
+feature preparation finishes. Current text/audio is preserved independently of
+background retention capacity; unavailable current audio is an explicit error.
+
+Foreground rendering emits one debug record per successful prompt build with
+`degraded`, `trimmed_turns` and `summary_dropped`. These count preparation-time
+clipping, including plans cancelled before submission, rather than completed
+responses. Worker logging does not mutate Session state.
+
+The prototype accepts only text/audio when selected. The default policy
+retains existing image/tool support. Implementation, configuration, evaluation
+scope and commands are in the
+[history experiment guide](../../benchmarks/duplex_history/README.md).
+
 ## Architecture
 
 ```text
