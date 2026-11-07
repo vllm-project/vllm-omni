@@ -589,6 +589,7 @@ class HiFTGenerator(nn.Module):
     ):
         super().__init__()
 
+        self.ups0_fp32: bool = False
         self.out_channels = 1
         self.nb_harmonics = nb_harmonics
         self.sampling_rate = sampling_rate
@@ -843,7 +844,15 @@ class HiFTGenerator(nn.Module):
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, self.lrelu_slope)
-            x = self.ups[i](x)
+            if i == 0 and getattr(self, "ups0_fp32", False):
+                prev_tf32 = torch.backends.cudnn.allow_tf32
+                torch.backends.cudnn.allow_tf32 = False
+                try:
+                    x = self.ups[i](x)
+                finally:
+                    torch.backends.cudnn.allow_tf32 = prev_tf32
+            else:
+                x = self.ups[i](x)
 
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)

@@ -743,7 +743,6 @@ steps:
         env:
           SEED_TTS_WER_EVAL: "1"
           SEED_TTS_SIM_EVAL: "1"
-          VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S: "60"
         artifact_paths:
           - artifacts/rocm-minicpmo-accuracy/**/*
         commands:
