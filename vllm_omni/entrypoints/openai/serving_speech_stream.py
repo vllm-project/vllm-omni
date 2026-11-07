@@ -220,7 +220,9 @@ class OmniStreamingSpeechHandler:
                     if config is None:
                         await self._send_error(websocket, "Timeout waiting for session.config")
                     else:
-                        await self._send_error(websocket, "Idle timeout: no message received")
+                        await self._send_error(
+                            websocket, f"Idle timeout: no message received for the last {self._idle_timeout} seconds"
+                        )
                     return
 
                 msg = await self._parse_message(websocket, raw)
@@ -249,6 +251,8 @@ class OmniStreamingSpeechHandler:
                         if config is None:
                             return  # Error already sent, connection closing
                         continue  # Keep serving with the previous config
+                    else:
+                        logger.info("Streaming speech session configured: %s", new_config)
                     config = new_config
                     splitter = SpeechTextSplitter(config.split_granularity)
 
@@ -337,6 +341,7 @@ class OmniStreamingSpeechHandler:
                     await self._cleanup_commitment_utterance(commitment)
                     commitment = None
                     await websocket.close()
+                    logger.info("Streaming speech session closed")
                     return
 
                 else:

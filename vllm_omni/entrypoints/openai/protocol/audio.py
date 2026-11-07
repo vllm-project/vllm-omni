@@ -748,3 +748,17 @@ class StreamingSpeechSessionConfig(BaseModel):
                     "native speed control is only available through HTTP streaming."
                 )
         return self
+
+    def __str__(self):
+        pretty_dict = {}
+
+        for k, v in self.__dict__.items():
+            if v is not None:
+                if k in ["instructions", "ref_text"] and len(v) > 100:
+                    v = f"{v[:100]}..."
+                elif k in ["speaker_embedding", "ref_audio"]:
+                    v = True
+
+            pretty_dict[k] = v
+
+        return str(pretty_dict)
