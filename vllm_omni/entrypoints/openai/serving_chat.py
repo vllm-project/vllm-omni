@@ -156,6 +156,7 @@ from vllm_omni.entrypoints.openai.utils import (
     parse_lora_requests,
     resolve_diffusion_od_config,
 )
+from vllm_omni.entrypoints.transcription import SameModelTranscriber
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
@@ -222,6 +223,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
+    # Realtime connections share the server's transcriber through this handler.
+    input_audio_transcriber: SameModelTranscriber | None = None
 
     @property
     def tool_call_id_type(self) -> str:

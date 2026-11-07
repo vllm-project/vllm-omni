@@ -1712,10 +1712,22 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ming3", [False, True, "tts"])
-@pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
+@pytest.mark.parametrize(
+    ("supported_tasks", "transcription_stage_state"),
+    [
+        pytest.param(("generate",), "missing", id="generate"),
+        pytest.param(("embed",), "missing", id="embed"),
+        pytest.param(("transcription",), "missing", id="native-without-stage-attribute"),
+        pytest.param(("transcription",), "unavailable", id="native-without-stage"),
+        pytest.param(("generate", "transcription"), "unavailable", id="native-with-chat"),
+        pytest.param(("transcription",), "available", id="same-model-without-chat"),
+        pytest.param(("generate", "transcription"), "available", id="same-model-with-chat"),
+        pytest.param(("generate",), "available", id="stage-without-transcription-task"),
+    ],
+)
 @pytest.mark.parametrize("policy_server", [False, True])
 async def test_multistage_app_state_key_snapshot(
-    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+    monkeypatch, mocker, tmp_path, supported_tasks, transcription_stage_state, ming3, policy_server
 ) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
@@ -1733,6 +1745,10 @@ async def test_multistage_app_state_key_snapshot(
         ),
     )
     mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
+    if transcription_stage_state != "missing":
+        engine.transcription_stage = (
+            mocker.sentinel.transcription_stage if transcription_stage_state == "available" else None
+        )
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -1781,8 +1797,10 @@ async def test_multistage_app_state_key_snapshot(
     monkeypatch.setattr(api_server, "ServingClassification", _FakeCtor)
     monkeypatch.setattr(api_server, "ServingScores", _FakeCtor)
     monkeypatch.setattr(api_server, "ServingTokenization", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _FakeCtor)
+    same_model_transcriber = mocker.patch.object(api_server, "SameModelTranscriber")
+    omni_transcription = mocker.patch.object(api_server, "OmniServingTranscription")
+    native_transcription = mocker.patch.object(api_server, "OpenAIServingTranscription")
+    native_translation = mocker.patch.object(api_server, "OpenAIServingTranslation")
     monkeypatch.setattr(api_server, "AnthropicServingMessages", _FakeCtor)
     monkeypatch.setattr(api_server, "ServingTokens", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _FakeSpeech)
@@ -1802,7 +1820,40 @@ async def test_multistage_app_state_key_snapshot(
         )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
+    await api_server.omni_init_app_state(
+        engine, state, _minimal_args(log_error_stack=True, enable_force_include_usage=True)
+    )
+    transcriber = None
+    if "transcription" not in supported_tasks:
+        same_model_transcriber.assert_not_called()
+        omni_transcription.assert_not_called()
+        native_transcription.assert_not_called()
+        native_translation.assert_not_called()
+        assert state.openai_serving_transcription is None
+        assert state.openai_serving_translation is None
+    elif transcription_stage_state == "available":
+        transcriber = same_model_transcriber.return_value
+        same_model_transcriber.assert_called_once_with(
+            engine, engine.transcription_stage, {model.name for model in state.openai_serving_models.base_model_paths}
+        )
+        omni_transcription.assert_called_once_with(
+            transcriber, state.openai_serving_models, request_logger=None, enable_force_include_usage=True
+        )
+        native_transcription.assert_not_called()
+        native_translation.assert_not_called()
+        assert state.openai_serving_transcription is omni_transcription.return_value
+        assert state.openai_serving_translation is None
+    else:
+        same_model_transcriber.assert_not_called()
+        omni_transcription.assert_not_called()
+        for constructor in (native_transcription, native_translation):
+            constructor.assert_called_once_with(
+                engine, state.openai_serving_models, request_logger=None, enable_force_include_usage=True
+            )
+        assert state.openai_serving_transcription is native_transcription.return_value
+        assert state.openai_serving_translation is native_translation.return_value
+    if state.openai_serving_chat is not None:
+        assert state.openai_serving_chat.input_audio_transcriber is transcriber
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
