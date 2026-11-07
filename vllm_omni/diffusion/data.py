@@ -774,6 +774,9 @@ def resolve_model_class_name(
         "ming_flash_omni",
         "ming_flash_omni_thinker",
     ):
+        transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision) or {}
+        if transformer_config.get("_class_name") == "DiffusionTransformer":
+            return "MingImageDiffusionPipeline"
         return "MingImagePipeline"
     if model_type == "nextstep":
         return "NextStep11Pipeline"
