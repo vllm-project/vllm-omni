@@ -398,7 +398,7 @@
       ],
       "size": [
         330,
-        82
+        106
       ],
       "flags": {},
       "order": 6,
@@ -421,6 +421,14 @@
             "name": "flow_shift"
           },
           "link": null
+        },
+        {
+          "name": "audio_mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_mode"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -438,12 +446,14 @@
       },
       "widgets_values": [
         3.0,
-        12.0
+        12.0,
+        "native"
       ],
       "title": "MiniMax-H3 parameters",
       "widgets_values_named": {
         "audio_flow_shift": 3.0,
-        "flow_shift": 12.0
+        "flow_shift": 12.0,
+        "audio_mode": "native"
       }
     },
     {
@@ -455,7 +465,7 @@
       ],
       "size": [
         510,
-        620
+        700
       ],
       "flags": {},
       "order": 7,
@@ -469,16 +479,25 @@
           "link": null
         },
         {
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
           "localized_name": "references",
           "name": "references",
           "shape": 7,
           "type": "VIDEO_REFERENCES",
           "link": null
-        },
-        {
-          "name": "control",
-          "type": "MINIMAX_H3_CONTROL",
-          "link": 5
         },
         {
           "localized_name": "sampling_params",
@@ -507,6 +526,25 @@
           "shape": 7,
           "type": "FASTH3_DEPLOYMENT",
           "link": null
+        },
+        {
+          "localized_name": "latent_edit",
+          "name": "latent_edit",
+          "shape": 7,
+          "type": "LATENT_MASK_EDITING",
+          "link": null
+        },
+        {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
+          "link": null
+        },
+        {
+          "name": "control",
+          "type": "MINIMAX_H3_CONTROL",
+          "link": 5
         },
         {
           "localized_name": "url",
@@ -1092,7 +1130,7 @@
       5,
       0,
       8,
-      2,
+      10,
       "MINIMAX_H3_CONTROL"
     ],
     [
@@ -1100,7 +1138,7 @@
       6,
       0,
       8,
-      3,
+      4,
       "SAMPLING_PARAMS"
     ],
     [
@@ -1108,7 +1146,7 @@
       7,
       0,
       8,
-      5,
+      6,
       "VIDEO_PARAMS"
     ],
     [

@@ -57,7 +57,9 @@ def test_default_canny_generation_path(workflow):
 
 def test_shared_h3_defaults_and_portable_inputs(workflow):
     generate = _node(workflow, "VLLMOmniGenerateVideo")
-    fields = VLLMOmniGenerateVideo.INPUT_TYPES()["required"]
+    schema = VLLMOmniGenerateVideo.INPUT_TYPES()
+    fields = schema["required"]
+    assert [port["name"] for port in generate["inputs"] if "widget" not in port] == list(schema["optional"])
     assert len(generate["widgets_values"]) == len(fields)
     values = dict(zip(fields, generate["widgets_values"]))
     assert values["model"] == "MiniMaxAI/MiniMax-H3"
@@ -72,7 +74,7 @@ def test_shared_h3_defaults_and_portable_inputs(workflow):
     assert sampling["widgets_values"][-2:] == [43, "fixed"]
     params, _ = _source(workflow, generate, "model_params")
     assert params["type"] == "VLLMOmniMiniMaxH3Params"
-    assert params["widgets_values"] == [3.0, 12.0]
+    assert params["widgets_values"] == [3.0, 12.0, "native"]
     assert len(params["widgets_values"]) == len(VLLMOmniMiniMaxH3Params.INPUT_TYPES()["required"])
     assert all(
         port["link"] is None for port in generate["inputs"] if port["name"] in {"frame", "references", "fast_h3"}
@@ -153,6 +155,7 @@ async def test_workflow_duration_and_dimensions_reach_the_h3_request(workflow, c
     assert (request["width"], request["height"], request["fps"], request["num_frames"]) == (1344, 768, 24, 124)
     assert (request["num_frames"] - 5) % 17 == 0
     assert request["control"] == control
+    assert request["model_params"]["audio_mode"] == "native"
     extra: dict[str, object] = {"task": "t2va"}
     if controlled:
         extra["canny"] = {"control_context_scale": 1.0}
