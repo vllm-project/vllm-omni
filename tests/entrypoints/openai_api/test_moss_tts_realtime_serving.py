@@ -19,6 +19,21 @@ from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class _RealtimeCodec(torch.nn.Module):
+    """Small codec double with the same parameter/device/dtype contract."""
+
+    def __init__(self, encode):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float64), requires_grad=False)
+        self._encode = encode
+
+    def batch_encode(self, wavs, *, num_quantizers):
+        for wav in wavs:
+            assert wav.device == self.weight.device
+            assert wav.dtype == self.weight.dtype
+        return self._encode(wavs, num_quantizers=num_quantizers)
+
+
 @pytest.mark.parametrize(
     ("hf_config", "expected_codec_path"),
     [
@@ -209,7 +224,7 @@ def test_realtime_reference_cache_reuses_codes(voice_name):
         return SimpleNamespace(audio_codes=expected.T.unsqueeze(1), audio_codes_lengths=torch.tensor([4]))
 
     encoder = reference_encoder.build_reference_encoder(
-        SimpleNamespace(batch_encode=batch_encode), variant="realtime", speaker_cache=cache
+        _RealtimeCodec(batch_encode), variant="realtime", speaker_cache=cache
     )
 
     async def run():
@@ -259,7 +274,7 @@ def test_realtime_reference_batch_trims_each_item():
         return SimpleNamespace(audio_codes=codes, audio_codes_lengths=torch.tensor([3, 5]))
 
     encoder = reference_encoder.build_reference_encoder(
-        SimpleNamespace(batch_encode=batch_encode), variant="realtime", speaker_cache=cache
+        _RealtimeCodec(batch_encode), variant="realtime", speaker_cache=cache
     )
 
     async def resolve(ref):
@@ -287,9 +302,7 @@ def test_failed_realtime_reference_encoding_does_not_populate_cache():
     def fail(*args, **kwargs):
         raise ValueError("invalid reference")
 
-    encoder = reference_encoder.build_reference_encoder(
-        SimpleNamespace(batch_encode=fail), variant="realtime", speaker_cache=cache
-    )
+    encoder = reference_encoder.build_reference_encoder(_RealtimeCodec(fail), variant="realtime", speaker_cache=cache)
 
     async def run():
         try:
