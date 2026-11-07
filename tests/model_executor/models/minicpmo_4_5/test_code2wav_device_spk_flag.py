@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -35,6 +36,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _FakeToken2Wav:
     def __init__(self, path, **kwargs):
+        self.device = (
+            "cuda"
+            if current_omni_platform.is_cuda()
+            else "npu"
+            if current_omni_platform.is_npu()
+            else current_omni_platform.device_type or "cpu"
+        )
         self.path = path
         self.kwargs = kwargs
         self.device_spk_calls = 0
@@ -57,8 +65,9 @@ class _FakeToken2Wav:
     def flow(self):
         estimator = SimpleNamespace()
         decoder = SimpleNamespace(estimator=estimator)
+        device = torch.device("privateuseone" if self.device == "npu" else self.device)
         return SimpleNamespace(
-            parameters=lambda: iter([SimpleNamespace(device="cuda")]),
+            parameters=lambda: iter([SimpleNamespace(device=device)]),
             decoder=decoder,
         )
 
@@ -79,6 +88,7 @@ def tensorrt_importable(monkeypatch):
 @pytest.fixture(params=["cuda", "npu"])
 def device_platform(monkeypatch, request):
     """Exercise each device speaker backend without loading model assets."""
+    monkeypatch.setattr(current_omni_platform, "device_type", request.param)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: request.param == "npu")
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: request.param == "cuda")
 
@@ -129,6 +139,36 @@ def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, devic
 def test_invalid_value_is_rejected(tmp_path, monkeypatch, device_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):
         _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": value})
+
+
+@pytest.mark.parametrize("value", [None, False, True])
+def test_other_torch_accelerator_honors_device_speaker_flag(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(current_omni_platform, "device_type", "mps")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    extra = {} if value is None else {"token2wav_device_spk": value}
+    _, token2wav = _build_backend(tmp_path, monkeypatch, extra)
+    assert token2wav.device_spk_calls == int(value is True)
+    assert token2wav.trt_spk_calls == 0
+
+
+def test_device_speaker_cache_reuses_unindexed_mps(tmp_path, monkeypatch):
+    """An unindexed MPS device and mps:0 share one loaded speaker."""
+    from vllm_omni.model_executor.models.cosyvoice3 import speaker_embedding_torch
+
+    device = torch.device("mps:0")
+    build = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(speaker_embedding_torch, "_CAMPPLUS_TORCH_CACHE", {})
+    monkeypatch.setattr(speaker_embedding_torch, "_build_campplus_fp32", build)
+    monkeypatch.setattr(torch, "empty", Mock(return_value=Mock(spec=torch.Tensor, device=device)))
+    path = str(tmp_path / "campplus.onnx")
+
+    speaker = speaker_embedding_torch.get_campplus_torch(path, "mps")
+
+    assert speaker.device == device
+    assert speaker_embedding_torch.get_campplus_torch(path, torch.device("mps")) is speaker
+    assert speaker_embedding_torch.get_campplus_torch(path, "mps:0") is speaker
+    build.assert_called_once_with(path)
 
 
 def test_invalid_value_is_rejected_off_device_too(tmp_path, monkeypatch):
