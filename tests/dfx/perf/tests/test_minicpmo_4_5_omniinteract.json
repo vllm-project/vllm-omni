@@ -38,17 +38,17 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          2
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1q1a",
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a",
+        "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
@@ -65,17 +65,17 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          2
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1q1a_math",
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a_math",
+        "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
@@ -92,17 +92,17 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          2
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1qna",
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1qna",
+        "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
