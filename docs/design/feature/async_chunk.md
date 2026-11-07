@@ -3,10 +3,11 @@
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Performance](#performance)
-3. [Architecture](#architecture)
-4. [Configuration](#configuration)
-5. [Related Files](#related-files)
+2. [MRv2 token-only producers](#mrv2-token-only-producers)
+3. [Performance](#performance)
+4. [Architecture](#architecture)
+5. [Configuration](#configuration)
+6. [Related Files](#related-files)
 
 ## Overview
 
@@ -30,6 +31,26 @@ With `async_chunk`:
 - Reduced latency and improved throughput
 - Better resource utilization
 - Async scheduling: Chunk IO (get/put) overlaps with compute via background threads so the scheduler is not blocked waiting for chunks
+
+## MRv2 token-only producers
+
+On the native MRv2 data plane, a stage input processor declaring
+`requires_token_updates = True` also receives accepted sampled-token updates
+when the model emits no tensor payload. Snapshots expose `sampled_token_ids`
+and `output_token_count`; complete token history is generally omitted after
+the first emitted chunk. Processors must advance their token cursor across
+control tokens as well as codec tokens. The transport fences tokens beyond
+the sampled stop before publishing updates.
+
+CosyVoice3 uses this contract to assemble cumulative Flow prefixes and marks
+the already consumed prefix with `meta.left_context_size`. The decoder emits
+PCM deltas. A normal terminal payload retains the prefix even at an exact
+chunk boundary so HiFT can release withheld tail samples; cancellation does
+not flush buffered speech. MRv2 generation slots can be released after each
+chunk, so reference conditioning and HiFT caches belong to the runner request
+ID and are released by the model's request-finish hook. See the opt-in
+`cosyvoice3_mrv2.yaml` profile and the [CosyVoice3 serving guide](../../user_guide/examples/online_serving/text_to_speech.md#cosyvoice3)
+for its output-streaming support and duplex/input-streaming limits.
 
 ## Performance
 

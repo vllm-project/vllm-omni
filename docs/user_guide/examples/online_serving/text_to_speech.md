@@ -173,6 +173,44 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+The packed-streaming profiles preallocate a shared Flow prefix pool:
+`cosyvoice3_packed_streaming.yaml` budgets 8 GiB and
+`cosyvoice3_packed_streaming_optimized_standard.yaml` budgets 16 GiB.
+Override `COSYVOICE3_FLOW_PREFIX_CACHE_GIB` in the codec stage's `env` mapping
+of a copied deploy YAML; `0` disables the prefix cache. The budget is rounded
+down to whole pages, including one reserved scratch page; a positive budget
+must hold at least two pages. Request completion returns pages to this pool,
+not to the device allocator. Pool exhaustion falls back to full Flow
+recomputation without CUDA graphs and can reduce throughput. Layouts that
+startup did not record are recorded on demand; each Flow graph cache keeps at
+most `COSYVOICE3_FLOW_GRAPH_MAX` graphs (default 128) and retires all of them
+when a new layout arrives at that limit. Startup logs distinguish the actual
+pool tensor allocation from the configured budget; neither is total GPU memory.
+Weights, solver temporaries and CUDA graphs require additional headroom.
+
+For an experimental CUDA deployment with both Talker and Code2Wav on Model
+Runner V2, select the explicit streaming profile:
+
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni \
+  --deploy-config cosyvoice3_mrv2.yaml --port 8091 --trust-remote-code
+```
+
+This profile retains the generic RAS sampling policy and concurrency of 8,
+disables chunked prefill, and enables cross-request Flow batching. MRv2
+schedules complete ready codec chunks together; Flow groups compatible
+conditioning shapes and finalization states before decoding. Audio outputs
+remain PCM deltas, and request-owned reference and HiFT state survive between
+chunks and are released on finish or cancellation. Throughput and first-audio
+latency require measurement on the target GPU; this profile supplies no
+benchmark claim. Non-CUDA platform overrides retain V1.
+
+Streaming here means incremental **audio output from a complete text
+request** (`stream=true`). CosyVoice3 has no native duplex model plugin;
+resumable text input and `session_mode: duplex` are not supported on this
+MRv2 path. A duplex application can submit and cancel independent TTS
+requests, with a new request for the next utterance.
+
 ### Ascend Stage-1 graph regions
 
 On Ascend NPU, Stage 1 can capture the complete Flow Euler solve and the
