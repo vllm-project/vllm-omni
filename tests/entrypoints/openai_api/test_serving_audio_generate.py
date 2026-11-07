@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
+from argparse import Namespace
 from inspect import Signature, signature
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import torch
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
+from vllm.entrypoints.serve.exception_handling.handlers.validation import validation_exception_handler
 from vllm.v1.engine.exceptions import EngineGenerateError
 
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
@@ -210,6 +215,18 @@ class TestRequestValidation:
         assert req.num_frames == 121
         assert req.frame_rate == 24.0
 
+    @pytest.mark.parametrize("field", ["audio_length", "audio_start", "frame_rate"])
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), -float("inf"), "NaN", "Infinity", "-Infinity", "1e400"]
+    )
+    def test_duration_fields_reject_nonfinite(self, field, value):
+        with pytest.raises(ValidationError):
+            OpenAICreateAudioGenerateRequest(input="test", **{field: value})
+
+    def test_audio_end_must_be_finite(self):
+        with pytest.raises(ValidationError, match="audio_start.*audio_length.*finite"):
+            OpenAICreateAudioGenerateRequest(input="test", audio_start=1e308, audio_length=1e308)
+
     def test_model_specific_audio_parameters_are_accepted(self):
         sigmas = [1.0, 0.5, 0.0]
         req = OpenAICreateAudioGenerateRequest(
@@ -230,6 +247,84 @@ class TestRequestValidation:
             "audio_stg_blocks": [28],
             "sigmas": sigmas,
         }
+
+
+class TestAudioGenerateValidationAPI:
+    """Exercise validation through the production route without model weights."""
+
+    @pytest.fixture
+    async def validation_client_and_engine(self):
+        engine = _make_engine_client()
+        app = _make_api_server_test_app(_make_server(engine))
+        app.state.args = Namespace(log_error_stack=False)
+        app.add_exception_handler(RequestValidationError, validation_exception_handler)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            yield client, engine
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["audio_length", "audio_start", "frame_rate"])
+    @pytest.mark.parametrize("json_value", ['"NaN"', '"Infinity"', '"-Infinity"', '"1e400"', "1e400"])
+    async def test_nonfinite_rejected_before_engine(self, validation_client_and_engine, field, json_value):
+        client, engine = validation_client_and_engine
+        response = await client.post(
+            "/v1/audio/generate",
+            content=f'{{"input": "rain", "{field}": {json_value}}}',
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == f"body.{field}"
+        engine.generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_audio_end_overflow_rejected_before_engine(self, validation_client_and_engine):
+        client, engine = validation_client_and_engine
+        response = await client.post(
+            "/v1/audio/generate", json={"input": "rain", "audio_start": 1e308, "audio_length": 1e308}
+        )
+
+        assert response.status_code == 400
+        assert "audio_start + audio_length must be finite" in response.json()["error"]["message"]
+        engine.generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fields, expected_extra_args, expected_frame_rate",
+        [
+            ({}, {}, None),
+            ({"audio_start": None, "audio_length": None, "frame_rate": None}, {}, None),
+            (
+                {"audio_start": None, "audio_length": 1.0},
+                {"audio_start_in_s": 0.0, "audio_end_in_s": 1.0, "audio_length": 1.0},
+                None,
+            ),
+            (
+                {"audio_start": 2.0, "audio_length": 3.0},
+                {"audio_start_in_s": 2.0, "audio_end_in_s": 5.0, "audio_length": 3.0},
+                None,
+            ),
+            (
+                {"audio_start": 0.0, "audio_length": 48.0},
+                {"audio_start_in_s": 0.0, "audio_end_in_s": 48.0, "audio_length": 48.0},
+                None,
+            ),
+            ({"num_frames": 121, "frame_rate": 24.0}, {"num_frames": 121}, 24.0),
+        ],
+        ids=["defaults", "nulls", "null-start", "start-and-length", "model-specific-limit", "frame-duration"],
+    )
+    async def test_valid_duration_reaches_engine(
+        self, validation_client_and_engine, fields, expected_extra_args, expected_frame_rate
+    ):
+        client, engine = validation_client_and_engine
+        response = await client.post("/v1/audio/generate", json={"input": "rain", **fields})
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        assert response.content.startswith(b"RIFF")
+        engine.generate.assert_called_once()
+        sampling = engine.generate.call_args.kwargs["sampling_params_list"][0]
+        assert sampling.extra_args == expected_extra_args
+        assert sampling.frame_rate == expected_frame_rate
 
 
 # Constructor & Class Methods

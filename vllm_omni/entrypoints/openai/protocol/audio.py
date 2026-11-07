@@ -460,10 +460,12 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     audio_length: float | None = Field(
         default=None,
         gt=0,
+        allow_inf_nan=False,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
         default=0.0,
+        allow_inf_nan=False,
         description="Audio start time in seconds",
     )
     num_frames: int | None = Field(
@@ -474,6 +476,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     frame_rate: float | None = Field(
         default=None,
         gt=0,
+        allow_inf_nan=False,
         description="Frame rate used with num_frames by pipelines that support frame-based duration",
     )
     negative_prompt: str | None = Field(
@@ -506,6 +509,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         default=True,
         description="Whether the server's configured watermarking applies to this request.",
     )
+
+    @model_validator(mode="after")
+    def validate_audio_end(self) -> "OpenAICreateAudioGenerateRequest":
+        if self.audio_length is not None:
+            audio_start = self.audio_start if self.audio_start is not None else 0.0
+            if not math.isfinite(audio_start + self.audio_length):
+                raise ValueError("audio_start + audio_length must be finite")
+        return self
 
     @field_validator("stream_format")
     @classmethod
