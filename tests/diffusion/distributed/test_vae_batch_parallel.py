@@ -206,6 +206,41 @@ def test_batch_mode_rejects_implicitly_resolved_data_parallelism():
         config.resolve_data_parallel_size(2)
 
 
+@pytest.mark.parametrize("config_type", [DiffusionParallelConfig, OmniStageDiffusionParallelConfig])
+@pytest.mark.parametrize("shard_size,replicate_size", [(2, 1), (1, 2)])
+def test_batch_mode_rejects_hsdp_data_parallelism(config_type, shard_size, replicate_size):
+    with pytest.raises(ValueError, match="batch.*DP, PP, and CFG"):
+        config_type(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=shard_size,
+            hsdp_replicate_size=replicate_size,
+            vae_parallel_mode="batch",
+        )
+
+
+@pytest.mark.parametrize("config_type", [DiffusionParallelConfig, OmniStageDiffusionParallelConfig])
+@pytest.mark.parametrize("hsdp_data_parallel,shard_size", [(False, 2), (True, 1)])
+def test_batch_mode_accepts_hsdp_with_single_data_parallel_lane(config_type, hsdp_data_parallel, shard_size):
+    config = config_type(
+        use_hsdp=True,
+        hsdp_data_parallel=hsdp_data_parallel,
+        hsdp_shard_size=shard_size,
+        vae_parallel_mode="batch",
+    )
+    if isinstance(config, DiffusionParallelConfig):
+        config.resolve_data_parallel_size(shard_size)
+    assert config.data_parallel_size == 1
+    assert config.world_size == shard_size
+
+
+def test_batch_mode_rejects_hsdp_data_parallelism_during_resolution():
+    config = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=2)
+    config.vae_parallel_mode = "batch"
+    with pytest.raises(ValueError, match="batch.*DP, PP, and CFG"):
+        config.resolve_data_parallel_size(2)
+
+
 @pytest.mark.parametrize("tiling", [False, True])
 def test_registry_preserves_requested_tiling_in_batch_mode(monkeypatch, mocker, tiling):
     vae = _make_vae()

@@ -965,8 +965,8 @@ def test_async_request_output_preserves_error_metadata(status_code, error_type):
 @pytest.mark.parametrize("status_code", [400, 422, None])
 def test_request_rpc_exception_keeps_metadata_for_every_request(monkeypatch, mocker, dp_wave, status_code):
     executor = _make_executor()
-    monkeypatch.setattr(executor_module, "any_selected_component_uses_allgather", lambda config: dp_wave)
-    monkeypatch.setattr(executor_module, "_uses_text_encoder_allgather", lambda config: False)
+    monkeypatch.setattr(executor_module, "uses_rank_local_dp_concurrency", lambda config: dp_wave)
+    monkeypatch.setattr(executor_module, "uses_text_encoder_allgather", lambda config: False)
     error = (
         OmniClientError("invalid schedule", status_code=status_code, error_type="ScheduleError")
         if status_code is not None
