@@ -18,5 +18,17 @@ def _configure_vllm_omni_root_logger():
     vllm_omni_root.setLevel(logging.NOTSET)
 
 
+def configure_subprocess_logging() -> None:
+    """Apply vLLM's logging config in a ``spawn`` child.
+
+    Since vLLM 0.31, importing ``vllm.logger`` no longer configures logging; each
+    process must do it. The config is rebuilt from the inherited ``VLLM_*`` env.
+    """
+    from vllm.config.logging import LoggingConfig
+    from vllm.logger import configure_logging_if_needed
+
+    configure_logging_if_needed(LoggingConfig())
+
+
 _configure_vllm_omni_root_logger()
 init_logger(__name__)
