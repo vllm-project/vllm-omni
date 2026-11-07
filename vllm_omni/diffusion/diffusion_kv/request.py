@@ -16,10 +16,11 @@ from vllm.v1.request import RequestStatus
 class DiffusionKVContext:
     """An independently managed K/V context outside the primary sequence.
 
-    ``context_id`` identifies the logical context within one execution
-    sequence. ``cache_role`` binds it to a logical attention cache role exposed
-    by the Worker. Physical cache geometry remains native ``KVCacheSpec`` /
-    ``KVCacheConfig`` state and is deliberately absent here.
+    ``context_id`` identifies the logical context within one public request.
+    Multiple execution sequences may reference the same context, but must give
+    it the same definition. ``cache_role`` binds it to a logical attention
+    cache role exposed by the Worker. Physical cache geometry remains native
+    ``KVCacheSpec`` / ``KVCacheConfig`` state and is deliberately absent here.
     """
 
     context_id: str
