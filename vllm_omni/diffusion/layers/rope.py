@@ -41,35 +41,50 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     )
 
 
-def apply_rotary_emb_mindiesd(
+def apply_rotary_emb_torch_npu(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
     half_head_dim: bool = True,  # if true, size of sin and cos is (B, S, D/2), otherwise (B, S, D)
 ) -> torch.Tensor:
-    from mindiesd import rotary_position_embedding
+    import torch_npu
 
     x, squeezed = _ensure_batch_dim(x)
 
-    if cos.dim() == 3:
-        # (B, S, D/2) -> (S, D/2)
-        cos = cos[0]
-        sin = sin[0]
+    if cos.dim() > 2:
+        # Shared-angle layouts arrive as (1, S, D/2) or (1, S, 1, D/2) (Wan
+        # passes the 4-D form); flatten the singleton axes down to (S, D/2)
+        # — the layout the expansions below build on. This mirrors the
+        # normalization the Wan NPU path performed before it inherited this
+        # implementation. The flatten assumes shared (leading-singleton)
+        # angles: a true per-batch table (B, S, ..., D/2) with B > 1 would
+        # silently merge batch into sequence and must not be routed through
+        # this helper.
+        cos = cos.reshape(-1, cos.shape[-1])
+        sin = sin.reshape(-1, sin.shape[-1])
+
+    if not half_head_dim and cos.dim() == 2:
+        # The fused kernel broadcasts cos/sin against x's BSND axes (every
+        # axis but the last must be 1 or equal to the same axis of x), so a
+        # 2D (S, D) table must be lifted to (1, S, 1, D).
+        cos = cos.unsqueeze(0).unsqueeze(2)
+        sin = sin.unsqueeze(0).unsqueeze(2)
 
     if interleaved:
-        # if last dim of sin and cos is D/2, expand to (S, D) to adapt to mindiesd operators
+        # if last dim of sin and cos is D/2, interleave-expand to (S, D) to
+        # match the fused kernel's interleaved mode
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        out = torch_npu.npu_rotary_mul(x, cos, sin, "interleave")
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        out = torch_npu.npu_rotary_mul(x, cos, sin)
     return _restore_batch_dim(out, squeezed)
 
 
@@ -103,7 +118,6 @@ class RotaryEmbedding(CustomOp):
         self.half_head_dim = half_head_dim
         self.apply_rotary_emb_flash_attn = None
         self.apply_rotary_emb_vllm_flash_attn = None
-        self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
         # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
         # only ``flash_attn.cute`` and no ``flash_attn.ops``. Guard the import
@@ -127,8 +141,6 @@ class RotaryEmbedding(CustomOp):
                 ).apply_rotary_emb
             except ImportError:
                 pass
-        if find_spec("mindiesd") is not None:
-            self.has_mindie = True
 
     def _prepare_half_head_dim_cos_sin(
         self,
@@ -196,10 +208,7 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
-        else:
-            return self.forward_native(x, cos, sin)
+        return apply_rotary_emb_torch_npu(x, cos, sin, self.interleaved, self.half_head_dim)
 
     def forward_musa(
         self,
@@ -226,7 +235,7 @@ class RotaryEmbedding(CustomOp):
     ) -> torch.Tensor:
         # All batch elements share the same rotary position encoding.
         # Strip the batch dim so the underlying op broadcasts over the batch,
-        # consistent with forward_cuda / forward_hip / apply_rotary_emb_mindiesd.
+        # consistent with forward_cuda / forward_hip / apply_rotary_emb_torch_npu.
         cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
         return apply_rotary_emb_torch(
             x,
@@ -286,20 +295,6 @@ class RotaryEmbeddingWan(RotaryEmbedding):
             sin,
             interleaved=self.interleaved,
         )
-
-    def forward_npu(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.has_mindie:
-            if cos.dim() > 2:
-                cos = cos.reshape(-1, cos.shape[-1])
-                sin = sin.reshape(-1, sin.shape[-1])
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
-        else:
-            return self.forward_native(x, cos, sin)
 
     def forward_native(
         self,
