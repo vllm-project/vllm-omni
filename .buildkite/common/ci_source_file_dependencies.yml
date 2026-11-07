@@ -278,6 +278,11 @@ source_file_dependencies:
     - tests/model_tests/diffusion/
     - vllm_omni/diffusion/models/
 
+  diffusion_flux_kontext_function:
+    - vllm_omni/diffusion/models/flux/
+    - tests/model_tests/diffusion/
+    - tests/e2e/online_serving/test_flux_kontext_expansion.py
+
   diffusion_offloader:
     - tests/diffusion/offloader/
     - vllm_omni/diffusion/offloader/
