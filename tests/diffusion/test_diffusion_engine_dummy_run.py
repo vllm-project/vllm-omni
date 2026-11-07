@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -26,10 +27,13 @@ def test_observation_conditioned_startup_skips_generic_warmup(model_class_name: 
     engine.od_config.diffusion_load_format = "default"
     engine.add_req_and_wait_for_response = Mock(side_effect=AssertionError("generic text warmup submitted"))
     engine.close = Mock()
+    engine.collective_rpc = Mock()
 
     engine.run_startup_warmup()
 
     engine.add_req_and_wait_for_response.assert_not_called()
+    # A skipped warmup enqueues no dummy device work, so no drain barrier runs.
+    engine.collective_rpc.assert_not_called()
     engine.close.assert_not_called()
 
 
@@ -46,6 +50,7 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     )()
     engine.step_execution = step_execution
     engine.pre_process_func = None
+    engine.collective_rpc = Mock()
     captured_requests = []
 
     monkeypatch.setattr(
@@ -67,6 +72,74 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
 
     assert len(captured_requests) == 1
     assert captured_requests[0].sampling_params.num_inference_steps == 2
+    engine.collective_rpc.assert_called_once_with("synchronize_device", timeout=None, kwargs={"timeout": None})
+
+
+def _engine_for_dummy_run(monkeypatch: pytest.MonkeyPatch) -> DiffusionEngine:
+    """Minimal engine whose dummy-run path runs without real scheduling."""
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = type(
+        "Config",
+        (),
+        {"model_class_name": "mock_model", "diffusion_load_format": "default"},
+    )()
+    engine.step_execution = False
+    engine.pre_process_func = None
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda od_config: (False, False),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
+        lambda model_class_name, supports_audio_input: 1,
+    )
+    return engine
+
+
+def test_dummy_run_waits_for_worker_device_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warmup must not complete while any worker still has device work queued."""
+    engine = _engine_for_dummy_run(monkeypatch)
+    engine.add_req_and_wait_for_response = lambda request: type("Output", (), {"error": None})()
+
+    device_done = threading.Event()
+    warmup_done = threading.Event()
+
+    def collective_rpc(method, timeout=None, args=(), kwargs=None, unique_reply_rank=None):
+        assert method == "synchronize_device"
+        assert kwargs == {"timeout": None}
+        # The (simulated) worker's queued device work finishes late; the
+        # drain RPC blocks on the worker side until then.
+        assert device_done.wait(timeout=10), "drain never observed device completion"
+        return [True]
+
+    engine.collective_rpc = collective_rpc
+
+    def run_warmup() -> None:
+        engine._dummy_run()
+        warmup_done.set()
+
+    thread = threading.Thread(target=run_warmup)
+    thread.start()
+    try:
+        assert not warmup_done.wait(timeout=0.2), "warmup completed before workers drained"
+        device_done.set()
+        assert warmup_done.wait(timeout=10), "warmup never completed after workers drained"
+    finally:
+        thread.join(timeout=10)
+
+
+def test_failed_dummy_run_skips_device_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed warmup aborts startup instead of draining worker queues."""
+    engine = _engine_for_dummy_run(monkeypatch)
+    engine.add_req_and_wait_for_response = lambda request: type("Output", (), {"error": "boom"})()
+    engine.close = Mock()
+    engine.collective_rpc = Mock()
+
+    with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
+        engine.run_startup_warmup()
+
+    engine.close.assert_called_once_with()
+    engine.collective_rpc.assert_not_called()
 
 
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:
