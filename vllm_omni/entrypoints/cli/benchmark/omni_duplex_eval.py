@@ -117,6 +117,15 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     evaluate.add_argument("--window-size", type=float, default=10.0)
     evaluate.add_argument("--allow-invalid-clock", action="store_true")
     evaluate.add_argument("--eval-workers", type=int, default=1)
+    evaluate.add_argument(
+        "--judge-samples",
+        type=int,
+        default=1,
+        help=(
+            "Judge calls per measurement (temporal sentence, content, PR event). Each score field takes the "
+            "lower median of the calls, i.e. the majority value when one exists. 1 keeps single-call scoring."
+        ),
+    )
     evaluate.add_argument("--overwrite", action="store_true")
     summarize = actions.add_parser("summarize")
     summarize.add_argument("--score-root", required=True)
@@ -188,6 +197,8 @@ def run(args: argparse.Namespace) -> int:
 
     if args.eval_workers < 1:
         raise ValueError("--eval-workers must be at least 1")
+    if args.judge_samples < 1:
+        raise ValueError("--judge-samples must be at least 1")
     judge = DuplexJudge(args.judge_base_url, args.judge_model, api_key=args.judge_api_key)
 
     def evaluate_one(sample: DuplexSample) -> None:
@@ -204,6 +215,7 @@ def run(args: argparse.Namespace) -> int:
             judge_video_mode=args.judge_video_mode,
             window_size=args.window_size,
             allow_invalid_clock=args.allow_invalid_clock,
+            judge_samples=args.judge_samples,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.eval_workers) as executor:

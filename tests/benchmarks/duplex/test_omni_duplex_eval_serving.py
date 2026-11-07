@@ -226,6 +226,7 @@ def test_evaluation_requires_a_judge_model(tmp_path):
         ("--duplex-eval-judge-fps", "0"),
         ("--duplex-eval-window-size", "-1"),
         ("--duplex-eval-eval-workers", "0"),
+        ("--duplex-eval-judge-samples", "0"),
     ],
 )
 def test_evaluation_rejects_invalid_options(tmp_path, option, value):
@@ -251,6 +252,8 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
         "0.5",
         "--duplex-eval-eval-workers",
         "2",
+        "--duplex-eval-judge-samples",
+        "3",
     )
     preprocess_serve_args(args)
     samples = patch.get_samples(args, None)
@@ -268,10 +271,15 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
     output.duplex_eval_result = _result(samples[0])
     summary = adapter.finalize_duplex_eval(samples, [output])
     accuracy = summary["accuracy"]
-    assert observed == [("1", 0.5, {"judge_fps": 3, "judge_video_mode": "frame-sample", "window_size": 12.0})]
+    assert observed == [
+        ("1", 0.5, {"judge_fps": 3, "judge_video_mode": "frame-sample", "window_size": 12.0, "judge_samples": 3})
+    ]
     assert accuracy["status"] == "completed" and accuracy["evaluated"] == accuracy["total"] == 1
+    assert accuracy["judge_samples"] == 3
     score_root = Path(accuracy["score_root"])
     assert not (score_root / "PR_correction/0.json").exists()
+    score = json.loads((score_root / "PR_correction/1.json").read_text())
+    assert score["judge_samples"] == 3 and len(score["pr"]["events"][0]["judge_votes"]) == 3
     assert adapter.summarize_scores(score_root)["pr"] == accuracy["pr"]
     assert accuracy["pr"]["mean_all_success"] == 1
     assert json.loads((score_root / "evaluation_summary.json").read_text()) == accuracy

@@ -141,6 +141,50 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
     assert summary["pr"]["mean_all_success"] == 1.0
 
 
+def _evaluate_args(tmp_path: Path, *extra: str) -> argparse.Namespace:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps([{"id": "sample-1", "split": "PR_correction", "question_text": "What changed?"}]),
+        encoding="utf-8",
+    )
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    return parser.parse_args(
+        [
+            "evaluate",
+            "--dataset",
+            str(manifest),
+            "--family",
+            "pr",
+            "--response-root",
+            str(tmp_path / "responses"),
+            "--score-root",
+            str(tmp_path / "scores"),
+            "--judge-model",
+            "mock-judge",
+            *extra,
+        ]
+    )
+
+
+@pytest.mark.parametrize(("extra", "expected"), [((), 1), (("--judge-samples", "3"), 3)], ids=["default", "three"])
+def test_cli_evaluate_forwards_judge_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra, expected):
+    observed = []
+    monkeypatch.setattr(cli, "DuplexJudge", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        cli, "evaluate_sample", lambda sample, response, score, judge, **kwargs: observed.append(kwargs)
+    )
+    assert cli.run(_evaluate_args(tmp_path, *extra)) == 0
+    assert [kwargs["judge_samples"] for kwargs in observed] == [expected]
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cli_evaluate_rejects_non_positive_judge_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value):
+    monkeypatch.setattr(cli, "evaluate_sample", lambda *args, **kwargs: pytest.fail("evaluate_sample must not run"))
+    with pytest.raises(ValueError, match="--judge-samples"):
+        cli.run(_evaluate_args(tmp_path, "--judge-samples", value))
+
+
 def _cached_sample(tmp_path: Path, meta: str | None, split: str = "PR_correction") -> DuplexSample:
     sample = DuplexSample.from_row({"id": "sample", "split": split})
     output = tmp_path / sample.split / f"{sample.id}.json"
