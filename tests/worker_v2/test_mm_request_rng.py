@@ -35,6 +35,7 @@ def v2(runner, mocker):
     model._timestep_encode = lambda value: torch.zeros(3, device=value.device, dtype=value.dtype)
     result = object.__new__(omni_model_runner.OmniGPUModelRunner)
     result.model, result.device = model, runner.device
+    result.vllm_config = None
     result.encoder_cache = EncoderCache()
     result._staged_writes = staged_writes.StagedWrites()
     result.jit_warmup_registry = JitWarmupRegistry(None)

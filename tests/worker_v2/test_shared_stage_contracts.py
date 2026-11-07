@@ -101,6 +101,7 @@ def test_load_model_binds_request_rng_model(monkeypatch, mocker):
     runner = object.__new__(module.OmniGPUModelRunner)
     runner.jit_warmup_registry = JitWarmupRegistry(None)
     runner.use_aux_hidden_state_outputs = False
+    runner.vllm_config = None
     model = RequestRNGModel()
     model.bind_mm_rng_provider = mocker.Mock()
     model.advance_mm_rng = mocker.Mock(side_effect=AssertionError("Loading must not draw request RNG"))

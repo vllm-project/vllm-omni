@@ -34,11 +34,11 @@ def runner_class(request, monkeypatch, mocker):
         "vllm_ascend.attention.utils": {"using_paged_attention": mocker.Mock()},
         "vllm_ascend.ops.rotary_embedding": {"update_cos_sin": mocker.Mock()},
         "vllm_ascend.utils": {"enable_sp": mocker.Mock(), "lmhead_tp_enable": mocker.Mock()},
-        "vllm_ascend.worker.model_runner_v1": {
+        "vllm_ascend.worker.v1.model_runner": {
             "SEQ_LEN_WITH_MAX_PA_WORKSPACE": 0,
             "NPUModelRunner": HardwareRunner,
         },
-        "vllm_ascend._310p.model_runner_310p": {"NPUModelRunner310": HardwareRunner},
+        "vllm_ascend.worker.v1._310p.model_runner_310p": {"NPUModelRunner310": HardwareRunner},
         "vllm_omni.platforms.npu._310p": {"is_310p": lambda: request.param == "npu310"},
         "vllm_omni.platforms.npu._310p.patch": {"apply_model_patches": mocker.Mock()},
         "vllm_omni.platforms.npu.native_rejection_sampler": {"restore_native_rejection_sampler": mocker.Mock()},
