@@ -71,6 +71,7 @@ MINIMAX_MUSIC3_PIPELINE = PipelineConfig(
             # more to the point, stage 0 produces chunks rather than parking on
             # them, so it never holds a runner slot while waiting for one.
             extras={"tts_args": {"max_instructions_length": _MAX_INSTRUCTIONS_LENGTH}},
+            supports_native_mrv2_data_plane=True,
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -93,6 +94,7 @@ MINIMAX_MUSIC3_PIPELINE = PipelineConfig(
             retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.ar2acoustic",
             sampling_constraints={"detokenize": True},
+            supports_native_mrv2_data_plane=True,
         ),
     ),
 )

@@ -3282,6 +3282,8 @@ class TestPlatformOverrides:
             ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", (1,)),
             ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v1", (0, 1, 2)),
             ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v2", ()),
+            ("minimax_music3.yaml", "minimax_music3", "v2", ()),
+            ("minimax_music3_2gpu.yaml", "minimax_music3", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
