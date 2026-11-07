@@ -2561,6 +2561,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}
+        # Every codec row this step emits is a real output row, so the
+        # validity mask is all-True with one entry per emitted row. The
+        # full-payload accumulator pairs ``codes.audio`` with this mask;
+        # without it the eager K-step path ships codec rows with no mask
+        # entries at all, and the accumulated audio outgrows its mask
+        # whenever CUDA-graph steps ship full-width padded rows alongside.
+        meta_outputs["codec_frame_valid"] = [
+            torch.ones(int(delta.shape[0]), dtype=torch.bool) if delta.numel() else torch.empty(0, dtype=torch.bool)
+            for delta in codec_deltas
+        ]
         if emit_duplex_metadata:
             meta_outputs.update(
                 {
@@ -2627,6 +2637,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if key == "finished":
                 meta_outputs[key] = [
                     self._merge_frame_finished([frame[index] for frame in per_frame]) for index in range(num_reqs)
+                ]
+            elif key == "codec_frame_valid":
+                # Each frame carries its own validity rows, so this mask is not
+                # constant across the step's frames. Concatenate it the same way
+                # ``codec_deltas`` is concatenated above; keeping only the last
+                # frame would drop the mask rows of every earlier frame and
+                # leave the accumulated audio longer than its mask.
+                meta_outputs[key] = [
+                    torch.cat([frame[index] for frame in per_frame], dim=0) for index in range(num_reqs)
                 ]
             else:
                 # Duplex metadata is per request and constant across the step's
@@ -3434,7 +3453,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mask_eos_rows = mask_eos_rows
         self._penalty_histories = penalty_histories
         meta_outputs: dict[str, Any] = {"finished": terminal_flags}
-        if gpu_rows:
+        # The validity mask must travel with the codec rows it describes even
+        # when no codec-state row was queued this step. The prefill step emits
+        # its first sampled frame through ``codec_deltas`` (taken from
+        # ``info["codes"]["audio"]``) while ``gpu_rows`` is still empty; with
+        # the old ``if gpu_rows`` gate that frame shipped without a mask, and
+        # the full-payload accumulator then concatenated 265 audio rows
+        # against 264 mask entries, breaking the stage consumer's
+        # ``reshape(rows.numel(), -1)`` on long TTS requests.
+        if gpu_rows or any(isinstance(item, torch.Tensor) and item.numel() > 0 for item in frame_valid):
             meta_outputs["codec_frame_valid"] = frame_valid
         if emit_duplex_metadata:
             meta_outputs.update(

@@ -246,7 +246,28 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
             rows = valid.detach().to(device="cpu").reshape(-1).bool()
             if rows.numel() == 0 and audio.numel() == 0:
                 return []
-            audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)[rows]
+            audio = audio.detach().to(device="cpu")
+            if rows.numel() and audio.shape[0] != rows.numel():
+                # The sender accumulated codec rows without a matching mask
+                # entry (the classic case: a step that shipped codec rows but
+                # no codec_frame_valid, leaving the mask one short). Align
+                # from the tail: the accumulator appends per step, so the
+                # newest codec rows and mask entries belong together, while a
+                # prefix crop would pair old audio rows with newer mask
+                # entries and misapply validity. Stay loud instead of letting
+                # reshape fail and take the whole stage request down.
+                keep = min(audio.shape[0], rows.numel())
+                logger.error(
+                    "[codec] audio/mask row mismatch for request %s: "
+                    "audio.shape=%s valid.shape=%s; keeping the last %d rows",
+                    request_id,
+                    tuple(audio.shape),
+                    tuple(valid.shape),
+                    keep,
+                )
+                audio = audio[-keep:]
+                rows = rows[-keep:]
+            audio = audio.reshape(rows.numel(), -1)[rows]
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(
         pooling_output,

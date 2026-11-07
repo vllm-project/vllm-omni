@@ -1965,3 +1965,36 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
         "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 3 rows",
         "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 5 rows",
     ]
+
+
+def test_kstep_emits_validity_mask_matching_delta_rows():
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._request_audio_states["r1"] = {"step": 0, "codes": torch.tensor([10, 11])}
+
+    out = _frame_call(model, torch.zeros(1, 8))
+    mm = out.multimodal_outputs
+    audio = mm["codes"]["audio"][0]
+    valid = mm["meta"]["codec_frame_valid"][0]
+
+    assert valid.dtype == torch.bool
+    assert valid.shape[0] == audio.shape[0]
+    assert valid.tolist() == [True] * audio.shape[0]
+
+
+def test_merge_frame_outputs_concatenates_validity_masks():
+    model = _make_talker(k_step_frames=8, scripted_samples=[42, 43])
+    model._request_audio_states["r1"] = {"step": 0, "codes": torch.tensor([10, 11])}
+
+    frames, stops = [], []
+    for _ in range(2):
+        frames.append(_frame_call(model, torch.zeros(1, 8)))
+        stops.append(model.take_batch_stop_logits())
+
+    merged = model.merge_frame_outputs(frames, stops).multimodal_outputs
+    audio = merged["codes"]["audio"][0]
+    valid = merged["meta"]["codec_frame_valid"][0]
+
+    assert audio.shape[0] == 2
+    assert valid.dtype == torch.bool
+    assert valid.shape[0] == audio.shape[0]
+    assert valid.all()
