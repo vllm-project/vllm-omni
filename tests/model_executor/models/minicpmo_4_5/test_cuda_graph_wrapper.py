@@ -2507,6 +2507,7 @@ def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest
     device = SimpleNamespace(type="npu")
     wrapper = SimpleNamespace(
         enabled=True,
+        npu_mixed_history=False,
         device=device,
         _stats={"calls": 0},
         max_graph_batch=8,
