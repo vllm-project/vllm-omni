@@ -5,6 +5,7 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
+import logging
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -541,6 +542,31 @@ class TestStageConfigFactory:
 
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
+
+    def test_build_stage_runtime_overrides_warns_when_stage_key_is_internal(self, caplog):
+        cli_overrides = {
+            "stage_0_default_sampling_params": {"temperature": 0.2},
+            "stage_0_env": {"TEST_ENV": "1"},
+            "stage_0_gpu_memory_utilization": 0.5,
+        }
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+            overrides = build_stage_runtime_overrides(0, cli_overrides)
+
+        assert overrides == {
+            "env": {"TEST_ENV": "1"},
+            "gpu_memory_utilization": 0.5,
+        }
+        assert "default_sampling_params" in caplog.text
+
+    def test_build_stage_runtime_overrides_can_suppress_internal_key_warnings(self, caplog):
+        cli_overrides = {"stage_0_default_sampling_params": {"temperature": 0.2}}
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+            overrides = build_stage_runtime_overrides(0, cli_overrides, warn_dropped=False)
+
+        assert overrides == {}
+        assert "default_sampling_params" not in caplog.text
 
     def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self):
         # Pass the same filter set the function uses by default

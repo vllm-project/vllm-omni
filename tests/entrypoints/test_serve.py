@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
@@ -861,15 +862,23 @@ def test_parse_stage_overrides_rejects_invalid_stage_ids(payload: str) -> None:
         _parse_stage_overrides(payload)
 
 
-def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
-    parsed = _parse_stage_overrides(
-        '{"0": {"extras": {"ltx2_use_conv_vae": true}, "kv_cache_dtype": "fp8", "typo_field_xyz": 1}}'
-    )
+def test_parse_stage_overrides_preserves_supported_override_fields() -> None:
+    parsed = _parse_stage_overrides('{"0": {"extras": {"ltx2_use_conv_vae": true}, "kv_cache_dtype": "fp8"}}')
     assert parsed["0"] == {
         "extras": {"ltx2_use_conv_vae": True},
         "kv_cache_dtype": "fp8",
-        "typo_field_xyz": 1,
     }
+
+
+def test_parse_stage_overrides_warns_and_skips_non_stage_fields(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+        parsed = parse_stage_overrides(
+            '{"0": {"session_mode": "duplex", "duplex_session.idle_ttl_s": 60, "env": {"TEST_ENV": "1"}}}'
+        )
+
+    assert parsed == {"0": {"env": {"TEST_ENV": "1"}}}
+    assert "session_mode" in caplog.text
+    assert "duplex_session.idle_ttl_s" in caplog.text
 
 
 def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
@@ -902,7 +911,7 @@ def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
 
 
 def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
-    """Three classes of keys pass through the shape-only parser:
+    """Two classes of keys pass through the shape-only parser:
 
     - ``extras`` is read by the default-diffusion fallback
       (``async_omni_engine.py``); registered pipelines carry it on
@@ -910,17 +919,11 @@ def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> N
     - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
       are forwarded as ``stage_<id>_<key>`` and applied via
       ``OmniEngineArgs``.
-    - Unknown keys parse through and are dropped with a warning at
-      ``filter_dataclass_kwargs`` (see
-      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
-
-    ``typo_field_xyz`` in the payload exercises the third case.
     """
     parsed = parse_stage_overrides(
         '{"0": {"extras": {"ltx2_use_conv_vae": true},'
         ' "kv_cache_dtype": "fp8", "seed": 42,'
-        ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},'
-        ' "typo_field_xyz": 1}}'
+        ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}}}}'
     )
     assert parsed == {
         "0": {
@@ -928,7 +931,6 @@ def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> N
             "kv_cache_dtype": "fp8",
             "seed": 42,
             "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
-            "typo_field_xyz": 1,
         },
     }
     # Already-parsed mapping path carries the same trust.
