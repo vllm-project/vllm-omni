@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Noisy KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
+"""Noisy PP versioned KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     PRIOR_HANDOFF_SLOT,
     Cell,
     CellPlan,

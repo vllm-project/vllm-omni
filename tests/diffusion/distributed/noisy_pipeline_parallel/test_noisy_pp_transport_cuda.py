@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tests.diffusion.ar_diffusion.test_noisy_kv_transport import _sink_pipeline_worker, get_open_port
+from tests.diffusion.distributed.noisy_pipeline_parallel.test_noisy_pp_transport import _sink_pipeline_worker, get_open_port
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]

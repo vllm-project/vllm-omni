@@ -25,10 +25,10 @@ from vllm_omni.diffusion.models.physis.common import (
 from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanCell
 from vllm_omni.diffusion.models.physis.wan.sampler import WAN22_5B, WanFourStepSampler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import get_wan22_post_process_func as get_wan22_post_process_func
-from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
-from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
-from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import resolve_pp_rank_and_group, run_cell_pipeline
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import cfg_step_replicas
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_timing import CellTiming
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import ARDiffusionNoisyKVSpec
 
 from .positions import output_frames
 from .transformer import PhysisStageH3Transformer

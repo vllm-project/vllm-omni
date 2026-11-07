@@ -13,6 +13,9 @@ from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import (
     _async_host_copy,
     _start_local,
 )
+from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -70,3 +73,46 @@ def test_local_sidepath_does_not_decode_inside_on_finished():
     assert video is not None
     assert decoder.chunks == 2
     assert video.shape[1] == 3
+
+
+def test_local_cancel_stops_consumer_without_join():
+    vae = _FakeVae()
+    decoder = _FakeDecoder()
+    job = _start_local(vae=vae, decoder=decoder, session_id="req-cancel")
+    assert job.on_finished is not None
+    job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
+    job.cancel()
+    # Second cancel is a no-op.
+    job.cancel()
+    # Thread should exit via stop sentinel; do not call join() after cancel.
+    assert decoder.chunks <= 1
+
+
+def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch):
+    """Creating a stream job then failing in the cell loop must cancel the job."""
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline._chunk_ctx = SimpleNamespace()
+    cancelled: list[bool] = []
+    job = SimpleNamespace(cancel=lambda: cancelled.append(True))
+
+    monkeypatch.setattr(
+        pipeline,
+        "admit_cell_request",
+        lambda _req: (SimpleNamespace(), "kv-1", False, job),
+    )
+    def _boom_cell(**_kwargs):
+        raise RuntimeError("compute boom")
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
+        _boom_cell,
+    )
+
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="stream-fail",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"stream_decode": True}),
+    )
+    with pytest.raises(RuntimeError, match="compute boom"):
+        pipeline.forward(req)
+    assert cancelled == [True]

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU contracts for Noisy KV session_id / chunk_base continuity."""
+"""CPU contracts for Noisy PP session_id / chunk_base continuity."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.experimental.ar_diffusion.cell_executor import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellAdapter,
     CellRunSpec,
     CellTopology,
     run_cell_pipeline,
 )
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     PRIOR_HANDOFF_SLOT,
     CellSchedule,
     Ordering,
@@ -26,7 +26,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     expected_prior_cells,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
     NoisyKVState,

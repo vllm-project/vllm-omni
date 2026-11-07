@@ -22,7 +22,7 @@ from vllm_omni.diffusion.models.physis.common import (
     validate_physis_request,
 )
 from vllm_omni.diffusion.postprocess.device_reduction import reduce_video_to_uint8_frames
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import CellSchedule, Ordering, build_cell_plan
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]

@@ -17,10 +17,10 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -156,7 +156,7 @@ def test_cell_schedule_rejects_unknown_values():
 
 @pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
 def test_cell_schedule_accepts_known_values(name, step_replicas):
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 
     pipeline = _bare_pipeline(step_replicas=step_replicas, history=6)
     req = OmniDiffusionRequest(
