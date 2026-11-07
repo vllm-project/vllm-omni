@@ -108,6 +108,9 @@ stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
 
+`DuplexOmni` supports an optional session-only process runtime. See
+[process runtime usage, ownership, and limits](../../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
+
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.
 `entrypoints/openai/errors.py` is an explicit primary-path exception owned by
