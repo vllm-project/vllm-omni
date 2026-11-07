@@ -7,7 +7,6 @@ import math
 import pytest
 import torch
 from pytest_mock import MockerFixture
-from vllm.model_executor.kernels.linear import MxFp4LinearKernel, Mxfp8LinearKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
@@ -17,6 +16,8 @@ from vllm_omni.quantization.convrot_config import (
     ConvRotInt8OnlineLinearMethod,
     ConvRotMxfp4OnlineLinearMethod,
     ConvRotMxfp8OnlineLinearMethod,
+    DiffusionConvRotMxfp4Config,
+    DiffusionConvRotMxfp8Config,
     pack_int4,
     quantize_int4,
     regular_hadamard,
@@ -26,6 +27,19 @@ from vllm_omni.quantization.convrot_config import (
 )
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
+try:
+    from vllm.model_executor.kernels.linear import MxFp4LinearKernel, Mxfp8LinearKernel
+except ImportError:
+    _MXFP_KERNELS_AVAILABLE = False
+
+    class MxFp4LinearKernel:  # type: ignore[no-redef]
+        pass
+
+    class Mxfp8LinearKernel:  # type: ignore[no-redef]
+        pass
+else:
+    _MXFP_KERNELS_AVAILABLE = True
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
@@ -33,6 +47,7 @@ accelerator_available = pytest.mark.skipif(
     not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
     reason="GPU platform not available.",
 )
+mxfp_available = pytest.mark.skipif(not _MXFP_KERNELS_AVAILABLE, reason="vLLM MXFP kernels not available.")
 
 
 def accelerator_device() -> str:
@@ -132,6 +147,31 @@ def test_factory_builds_all_methods():
     )
     with pytest.raises(ValueError, match="int8_layers"):
         build_quant_config({"method": "convrot_mxfp8", "int8_layers": ["to_out"]})
+
+
+@pytest.mark.parametrize("config_cls", [DiffusionConvRotMxfp4Config, DiffusionConvRotMxfp8Config])
+def test_mxfp_from_config_rejects_int8_layers(config_cls):
+    with pytest.raises(ValueError, match="int8_layers"):
+        config_cls.from_config({"int8_layers": ["to_out"]})
+
+
+def test_missing_mxfp_support_only_disables_mxfp_methods(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    import vllm_omni.quantization.convrot_config as convrot_config
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    mocker.patch.object(convrot_config, "_MXFP_AVAILABLE", False)
+    mocker.patch.object(ConvRotMxfp4OnlineLinearMethod, "__init__", lambda self, quant_config: None)
+    mocker.patch.object(ConvRotMxfp8OnlineLinearMethod, "__init__", lambda self, quant_config: None)
+    mocker.patch.object(ConvRotInt8OnlineLinearMethod, "__init__", lambda self, quant_config: None)
+    layer = mocker.Mock(spec=LinearBase)
+
+    for method in ("convrot_mxfp4", "convrot_mxfp8"):
+        config = build_quant_config(method)
+        with pytest.raises(ImportError, match="MXFP"):
+            config.get_quant_method(layer, "blocks.0.ff.net.2")
+
+    int8 = build_quant_config("convrot_int8")
+    assert isinstance(int8.get_quant_method(layer, "blocks.0.ff.net.2"), ConvRotInt8OnlineLinearMethod)
 
 
 def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
@@ -241,18 +281,24 @@ class TestCudaConvRot:
         assert layer.weight.dtype == torch.int8 and error < 0.02
 
 
+@mxfp_available
 @accelerator_available
 class TestGpuConvRotMxfp4:
     """Real MXFP4 kernels selected by vLLM for the current accelerator."""
 
     @staticmethod
-    def _layer(weight):
+    def _layer(weight, bias=None):
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
         layer.logical_widths = [weight.shape[0]]
         layer.input_size_per_partition = weight.shape[1]
         layer.output_size_per_partition = weight.shape[0]
+        layer.output_partition_sizes = [weight.shape[0]]
         layer.orig_dtype = weight.dtype
+        layer.params_dtype = weight.dtype
+        layer.has_bias = bias is not None
+        if bias is not None:
+            layer.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
         return layer
 
     @staticmethod
@@ -270,7 +316,7 @@ class TestGpuConvRotMxfp4:
         return ((out.float() - ref.float()).norm() / ref.float().norm()).item()
 
     def _quantized_error(self, method, weight, x, bias):
-        layer = self._layer(weight)
+        layer = self._layer(weight, bias)
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x, bias)
         assert out.shape == (*x.shape[:-1], weight.shape[0]) and out.dtype == torch.bfloat16
@@ -279,7 +325,7 @@ class TestGpuConvRotMxfp4:
     def test_selects_a_vllm_mxfp4_kernel(self):
         x, weight, bias = self._inputs()
         method = ConvRotMxfp4OnlineLinearMethod(build_quant_config("convrot_mxfp4"))
-        layer = self._layer(weight)
+        layer = self._layer(weight, bias)
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x, bias)
         assert isinstance(method.kernel, MxFp4LinearKernel)
@@ -298,18 +344,24 @@ class TestGpuConvRotMxfp4:
         assert rotated < 0.3 and rotated < plain / 1.8
 
 
+@mxfp_available
 @accelerator_available
 class TestGpuConvRotMxfp8:
     """Real MXFP8 kernels selected by vLLM for the current accelerator."""
 
     @staticmethod
-    def _layer(weight):
+    def _layer(weight, bias=None):
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
         layer.logical_widths = [weight.shape[0]]
         layer.input_size_per_partition = weight.shape[1]
         layer.output_size_per_partition = weight.shape[0]
+        layer.output_partition_sizes = [weight.shape[0]]
         layer.orig_dtype = weight.dtype
+        layer.params_dtype = weight.dtype
+        layer.has_bias = bias is not None
+        if bias is not None:
+            layer.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
         return layer
 
     @staticmethod
@@ -327,7 +379,7 @@ class TestGpuConvRotMxfp8:
         return ((out.float() - ref.float()).norm() / ref.float().norm()).item()
 
     def _quantized_error(self, method, weight, x, bias):
-        layer = self._layer(weight)
+        layer = self._layer(weight, bias)
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x, bias)
         assert out.shape == (*x.shape[:-1], weight.shape[0]) and out.dtype == torch.bfloat16
@@ -347,11 +399,17 @@ class TestGpuConvRotMxfp8:
         rotated_x = rotate(x, h).reshape(-1, x.shape[-1]).contiguous()
         x_dequant = dequant_mxfp8_to_bf16(*mxfp8_e4m3_quantize(rotated_x))
 
-        layer = self._layer(weight)
+        layer = self._layer(weight, bias)
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x, bias)
-        ref = x_dequant @ weight_dequant.T + bias
-        assert self._error(out.reshape(-1, weight.shape[0]), ref) < 5e-3
+        weight_only_ref = rotated_x @ weight_dequant.T + bias
+        activation_quantized_ref = x_dequant @ weight_dequant.T + bias
+        errors = {
+            "weight_only": self._error(out.reshape(-1, weight.shape[0]), weight_only_ref),
+            "activation_quantized": self._error(out.reshape(-1, weight.shape[0]), activation_quantized_ref),
+        }
+        # Backends may quantize activations (W8A8) or keep them in BF16 (W8A16).
+        assert min(errors.values()) < 5e-3, errors
 
     def test_rotation_keeps_mxfp8_error_bounded_on_outliers(self):
         x, weight, bias = self._inputs()

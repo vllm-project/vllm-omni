@@ -3,7 +3,7 @@
 ConvRot ([arXiv:2512.03673](https://arxiv.org/abs/2512.03673)) is a
 training-free, rotation-based quantization method for diffusion transformers.
 vLLM-Omni implements it as four online methods that quantize a BF16/FP16
-checkpoint while loading:
+checkpoint while loading (`convrot_mxfp4` and `convrot_mxfp8` require BF16):
 
 | Method | Weights | Activations | GEMM |
 | --- | --- | --- | --- |
@@ -114,6 +114,8 @@ after unpacking; it saves memory but is not faster than `convrot_int8` there.
   currently available on Blackwell and Intel XPU, while other backends may use
   weight-only or emulated kernels. Weights are quantized online; ConvRot
   checkpoints are not serialized.
+- `convrot_mxfp4` and `convrot_mxfp8` require BF16 activations and an input
+  size divisible by 32; `convrot_int8` and `convrot_int4` also accept FP16.
 - Rotation, activation quantization and, for `convrot_int4`, weight unpacking
   run as separate operations around the GEMM; they are not fused.
 - INT4 activations have a coarse per-token resolution. Compare against BF16 on

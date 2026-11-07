@@ -29,7 +29,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.quantization import build_quant_config
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
 def _make_marlin_kernel(quant_method):

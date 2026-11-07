@@ -36,18 +36,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
-from vllm.model_executor.kernels.linear import (
-    MxFp4LinearKernel,
-    Mxfp8LinearKernel,
-    init_mxfp4_linear_kernel,
-    init_mxfp8_linear_kernel,
-)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize
-from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
@@ -62,7 +53,43 @@ from vllm_omni.quantization.int8_config import (
 )
 
 if TYPE_CHECKING:
+    from vllm.model_executor.kernels.linear import MxFp4LinearKernel, Mxfp8LinearKernel
     from vllm.model_executor.models.utils import WeightsMapper
+
+_MXFP_IMPORT_ERROR: ImportError | None = None
+
+try:
+    from vllm.model_executor.kernels.linear import (
+        init_mxfp4_linear_kernel,
+        init_mxfp8_linear_kernel,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize
+except ImportError as mxfp_import_error:
+    _MXFP_AVAILABLE = False
+    _MXFP_IMPORT_ERROR = mxfp_import_error
+
+    def _missing_mxfp_support(*args: Any, **kwargs: Any) -> Any:
+        raise ImportError(
+            "vLLM MXFP4/MXFP8 support is not available in this build. "
+            "Install a vLLM build with MXFP linear kernels, or use convrot_int8/convrot_int4."
+        ) from _MXFP_IMPORT_ERROR
+
+    init_mxfp4_linear_kernel = _missing_mxfp_support
+    init_mxfp8_linear_kernel = _missing_mxfp_support
+    mxfp4_quantize = _missing_mxfp_support
+    mxfp8_e4m3_quantize = _missing_mxfp_support
+else:
+    _MXFP_AVAILABLE = True
+
+
+def _require_mxfp_support(method: str) -> None:
+    if not _MXFP_AVAILABLE:
+        raise ImportError(
+            f"{method} requires vLLM MXFP linear kernel support; install a compatible "
+            "vLLM build or use convrot_int8/convrot_int4."
+        ) from _MXFP_IMPORT_ERROR
+
 
 DEFAULT_ROTATION_GROUP_SIZE = 256
 INT4_MAX = 7
@@ -294,6 +321,7 @@ class DiffusionConvRotMxfp4Config(DiffusionConvRotConfig):
         return cls(
             rotation_group_size=cls.get_from_keys_or(config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE),
             ignored_layers=ignored_layers,
+            int8_layers=cls.get_from_keys_or(config, ["int8_layers"], None),
             mxfp8_layers=cls.get_from_keys_or(config, ["mxfp8_layers"], None),
         )
 
@@ -302,6 +330,7 @@ class DiffusionConvRotMxfp4Config(DiffusionConvRotConfig):
             return None
         if self._matches(prefix, self.ignored_layers):
             return UnquantizedLinearMethod()
+        _require_mxfp_support("convrot_mxfp4")
         if self._matches(prefix, self.mxfp8_layers):
             return ConvRotMxfp8OnlineLinearMethod(self)
         return ConvRotMxfp4OnlineLinearMethod(self)
@@ -346,6 +375,7 @@ class DiffusionConvRotMxfp8Config(DiffusionConvRotConfig):
         return cls(
             rotation_group_size=cls.get_from_keys_or(config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE),
             ignored_layers=ignored_layers,
+            int8_layers=cls.get_from_keys_or(config, ["int8_layers"], None),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
@@ -353,6 +383,7 @@ class DiffusionConvRotMxfp8Config(DiffusionConvRotConfig):
             return None
         if self._matches(prefix, self.ignored_layers):
             return UnquantizedLinearMethod()
+        _require_mxfp_support("convrot_mxfp8")
         return ConvRotMxfp8OnlineLinearMethod(self)
 
 
@@ -423,6 +454,8 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         weight = _rotated_weight(layer, self.rotation_group_size).to(torch.bfloat16).contiguous()
         if weight.shape[-1] % 32:
             raise ValueError(f"convrot_mxfp4 needs an input size divisible by 32, got {weight.shape[-1]}")
+
+        from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
 
         kernel = init_mxfp4_linear_kernel(activation_quant_key=kMxfp4Dynamic)
         self.kernel = kernel
