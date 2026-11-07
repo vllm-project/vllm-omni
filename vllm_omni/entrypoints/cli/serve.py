@@ -504,12 +504,6 @@ class OmniServeCommand(CLISubcommand):
             help="The timeout for initializing the stages.",
         )
         omni_config_group.add_argument(
-            "--shm-threshold-bytes",
-            type=int,
-            default=65536,
-            help="The threshold for the shared memory size.",
-        )
-        omni_config_group.add_argument(
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
