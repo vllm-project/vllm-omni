@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import queue
+import threading
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -1727,3 +1728,119 @@ def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.Monke
         assert not app.request_states
     finally:
         app.shutdown()
+
+
+# ───────── AsyncOmni.shutdown() fails in-flight requests ─────────
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_ends_in_flight_streams(monkeypatch: pytest.MonkeyPatch):
+    """A shutdown after partial output must terminate every active stream."""
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(
+                msg["request_id"],
+                0,
+                payload="partial",
+                output_finished=False,
+            )
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in streaming.values())),
+            timeout=5,
+        )
+
+        app.shutdown()
+        results = await asyncio.wait_for(
+            asyncio.gather(*streams, return_exceptions=True),
+            timeout=5,
+        )
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert engine.shutdown_called
+        assert app.request_states == {}
+    finally:
+        app.shutdown()
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_from_foreign_thread_wakes_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The launcher runs shutdown() on an executor thread while the serving loop
+    is alive; the terminal error must be enqueued via call_soon_threadsafe so
+    the waiter wakes in its own loop (#8912).  The assertion checks the enqueue
+    itself, not just the wakeup: executor completion also calls
+    call_soon_threadsafe, so a direct queue.put_nowait from the worker would
+    still wake the waiter and mask the bug.  Recording the scheduled callback
+    and rejecting a bare put_nowait keeps the regression honest."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    generate_task = asyncio.ensure_future(_consume_async(app.generate(prompt="hello", request_id="req-foreign")))
+    await asyncio.sleep(0.05)
+    assert not generate_task.done()
+
+    # Capture the request's queue and the live output pump while the request is
+    # still in flight; request_states is cleared once the request resolves.
+    req_queue = app.request_states["req-foreign"].queue
+    pump_task = app.final_output_task
+    assert pump_task is not None, "the output pump should be live while a request is in flight"
+
+    loop = asyncio.get_running_loop()
+    scheduled: list[tuple[Any, tuple[Any, ...], threading.Thread]] = []
+    real_call_soon_threadsafe = loop.call_soon_threadsafe
+
+    def spy_call_soon_threadsafe(callback, *args, **kwargs):
+        scheduled.append((callback, args, threading.current_thread()))
+        return real_call_soon_threadsafe(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", spy_call_soon_threadsafe)
+
+    # Call shutdown from a thread outside the event loop, like the launcher does.
+    await loop.run_in_executor(None, app.shutdown)
+
+    with pytest.raises(OmniEngineDeadError, match="shutting down"):
+        await asyncio.wait_for(generate_task, timeout=2)
+
+    assert app.final_output_task is None, "shutdown must tear down the output pump"
+
+    # The fatal error must reach this request's queue via call_soon_threadsafe
+    # from the foreign executor thread.  Excluding the executor-completion
+    # bookkeeping means a direct put_nowait mutant cannot satisfy this.
+    foreign_fatal_enqueues = [
+        (callback, args, thread)
+        for callback, args, thread in scheduled
+        if getattr(callback, "__self__", None) is req_queue
+        and getattr(callback, "__func__", None) is type(req_queue).put_nowait
+        and args
+        and isinstance(args[0], ErrorMessage)
+        and args[0].fatal
+        and args[0].request_id == "req-foreign"
+        and thread is not threading.main_thread()
+    ]
+    assert foreign_fatal_enqueues, (
+        "the fatal error was not scheduled on this request's queue from the "
+        "foreign thread via call_soon_threadsafe; a direct queue.put_nowait is "
+        "not sufficient"
+    )
+
+
+async def _consume_async(gen) -> None:
+    """Drain an async generator so the test only observes the exception."""
+    async for _ in gen:
+        pass
