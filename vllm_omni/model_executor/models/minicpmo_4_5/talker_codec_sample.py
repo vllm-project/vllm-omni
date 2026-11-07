@@ -717,6 +717,10 @@ def _topk_topp_fused(
     global _TAIL_FUSION_OK
     if not _TAIL_FUSION_OK or logits.device.type != "npu":
         return None
+    # The kernel's grid is (1,): it masks exactly one row, and every other row
+    # of ``out`` would stay uninitialised. Batched logits go to the eager chain.
+    if logits.dim() != 2 or int(logits.shape[0]) != 1:
+        return None
     keep = min(int(logits.shape[-1]), int(top_k))
     if keep > _TAIL_MAX_CANDIDATES:
         return None
