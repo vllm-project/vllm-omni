@@ -198,3 +198,74 @@ def test_decode_without_the_no_op_mask_is_closer_to_float64(kv_len):
         f"kv_len={kv_len}: maskless mean error {new_mean:.4e} is worse than masked {old_mean:.4e} "
         f"({wins}/{trials} per-trial wins)"
     )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.parametrize("platform", ["cpu", "cuda", "npu"])
+@pytest.mark.cpu
+def test_constructor_uses_rank_local_heads_and_preserves_backend_choice(monkeypatch, tp_size, kv_heads, platform):
+    """Real QKV/row layers and Attention construction, with rank discovery isolated.
+
+    A distinguishable CPU SDPA implementation stands in for the selected
+    platform backend. This checks model-to-dispatcher wiring on CPU, without
+    claiming execution of CUDA/NPU kernels or launching distributed workers.
+    """
+    from types import SimpleNamespace
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    import vllm_omni.diffusion.attention.layer as attention_layer
+    import vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer as transformer
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+
+    class SelectedImpl(SDPAImpl):
+        pass
+
+    class SelectedBackend(SDPABackend):
+        @staticmethod
+        def get_impl_cls():
+            return SelectedImpl
+
+    monkeypatch.setattr(transformer, "current_omni_platform", SimpleNamespace(is_npu=lambda: platform == "npu"))
+    monkeypatch.setattr(attention_layer, "get_attn_backend_for_role", lambda **_kwargs: (SelectedBackend, None))
+    monkeypatch.setattr(attention_layer, "get_current_diffusion_config_or_none", lambda: None)
+    monkeypatch.setattr(attention_layer, "build_parallel_attention_strategy", lambda **_kwargs: NoParallelAttention())
+    monkeypatch.setattr(
+        linear,
+        "dispatch_unquantized_gemm",
+        lambda *_args, **_kwargs: lambda _layer, x, weight, bias=None: torch.nn.functional.linear(x, weight, bias),
+    )
+    config = SimpleNamespace(
+        hidden_size=32,
+        head_dim=8,
+        num_attention_heads=4,
+        num_key_value_heads=kv_heads,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+    )
+    for tp_rank in range(tp_size):
+        for module in (linear, parameter):
+            monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
+            monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: tp_rank)
+        with set_current_vllm_config(VllmConfig()):
+            model = SenseNovaU1Attention(config, layer_idx=0, prefix="layers.0.self_attn")
+        assert isinstance(model.qkv_proj, linear.QKVParallelLinear)
+        assert model.num_heads == model.qkv_proj.num_heads == model.qkv_proj_mot_gen.num_heads == 4 // tp_size
+        assert model.num_kv_heads == model.qkv_proj.num_kv_heads == max(1, kv_heads // tp_size)
+        assert model.num_kv_heads == model.qkv_proj_mot_gen.num_kv_heads
+        assert model.q_size == model.num_heads * config.head_dim
+        assert model.kv_size == model.num_kv_heads * config.head_dim
+        assert model.qkv_proj.weight.shape[0] == model.q_size + 2 * model.kv_size
+        assert model.o_proj.weight.shape[1] == model.q_size
+        assert model.attn.num_heads == model.num_heads
+        assert model.attn.num_kv_heads == model.num_kv_heads
+        assert model.attn.qkv_layout == "BSND"
+        if platform == "npu":
+            assert isinstance(model.attn.attention, SelectedImpl)
+            assert model.attn.attention is not model.attn.sdpa_fallback
+        else:
+            assert model.attn.attention is model.attn.sdpa_fallback
