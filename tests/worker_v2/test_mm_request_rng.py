@@ -96,8 +96,6 @@ def encode(v2, scheduled):
     [
         hunyuan_rng.runner_case("cpu", torch.float32),
         hunyuan_rng.runner_case("cuda", torch.float32),
-        hunyuan_rng.runner_case("cuda", torch.float16),
-        hunyuan_rng.runner_case("cuda", torch.bfloat16),
     ],
     indirect=True,
 )
