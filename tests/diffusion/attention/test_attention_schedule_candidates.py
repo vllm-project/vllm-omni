@@ -1,0 +1,499 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""CPU contracts for per-layer schedule candidate preparation and startup validation.
+
+Calibration stamping is tested in test_trtllm_calibration.py.
+
+No backend touches a GPU and no model weights load; backends and impls are fakes
+resolved from the supplied AttentionConfig, mirroring test_attention_config.py.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+import torch.nn as nn
+
+import vllm_omni.diffusion.attention.layer as layer_mod
+from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
+from vllm_omni.diffusion.attention.capabilities import AttentionComputation
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+    SkipSoftmaxSpec,
+)
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    request_denoise_progress,
+    set_forward_context,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+class _FakeImpl:
+    """Records construction kwargs; optionally accepts layer calibration."""
+
+    _kv_cache_dtypes_ok: tuple[str, ...] = ()
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calibration = None
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype, platform_key) -> bool:
+        del platform_key
+        return kv_cache_dtype is None or kv_cache_dtype in cls._kv_cache_dtypes_ok
+
+    def forward(self, query, key, value, attn_metadata=None):
+        return query
+
+    def set_layer_calibration(self, a, b):
+        self.calibration = (a, b)
+
+
+class _MetadataOnlyImpl(_FakeImpl, AttentionImpl[AttentionMetadata]):
+    def forward(self, *args, **kwargs):
+        raise AssertionError("metadata-only fixture must not execute attention")
+
+
+def _make_metadata_candidate(backend_cls: type, spec: AttentionSpec | None = None) -> ScheduleCandidate:
+    impl = _MetadataOnlyImpl()
+    return ScheduleCandidate(
+        backend_cls=backend_cls,
+        spec=spec,
+        impl=impl,
+        backend_explicit=spec is not None,
+    )
+
+
+_BACKEND_CACHE: dict[str, type] = {}
+_BACKEND_IMPLS: dict[str, type[_FakeImpl]] = {}
+
+
+def _fake_backend(name: str) -> type:
+    """A distinct fake backend (and impl subclass) per backend name."""
+    cached = _BACKEND_CACHE.get(name)
+    if cached is not None:
+        return cached
+    impl_cls = type(f"Fake{name}Impl", (_FakeImpl,), {})
+    _BACKEND_IMPLS[name] = impl_cls
+
+    class _Backend:
+        supports_paged_kv = False
+        supports_piecewise_spans = False
+
+        @staticmethod
+        def get_name() -> str:
+            return name
+
+        @staticmethod
+        def get_impl_cls():
+            return impl_cls
+
+        @staticmethod
+        def supports_attention_mask(spec) -> bool:
+            return True
+
+    _Backend.__name__ = f"Fake{name}Backend"
+    _BACKEND_CACHE[name] = _Backend
+    return _Backend
+
+
+def _fake_resolve(*, role, head_size, attention_config=None, role_category=None, allow_trtllm_default=True):
+    """Resolve a fake backend from the supplied AttentionConfig, like the real selector."""
+    spec = None
+    if attention_config is not None:
+        spec, _source = attention_config.resolve_with_source(role=role, role_category=role_category)
+    if spec is None:
+        return _fake_backend("PLATFORM_DEFAULT"), None
+    return _fake_backend(spec.backend.upper()), spec
+
+
+def _make_config(
+    *,
+    baseline: AttentionConfig | None = None,
+    schedule: AttentionScheduleConfig | None = None,
+    kv_mode: layer_mod.DiffusionKVCacheMode | None = None,
+    allgather_degree: int = 1,
+    kv_dtype: str | None = None,
+    sp_size: int = 1,
+    ring_degree: int = 1,
+    mask_sp_padding: bool = False,
+) -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(
+        diffusion_attention_config=baseline if baseline is not None else AttentionConfig(),
+        diffusion_attention_schedule=schedule,
+        diffusion_kv_mode=kv_mode if kv_mode is not None else layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
+        parallel_config=DiffusionParallelConfig(
+            ring_degree=ring_degree,
+            allgather_degree=allgather_degree,
+            ulysses_degree=sp_size,
+            mask_sp_padding=mask_sp_padding,
+        ),
+        diffusion_kv_cache_dtype=kv_dtype,
+        diffusion_kv_max_rows_per_request=64 if kv_mode is layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER else None,
+    )
+
+
+@pytest.fixture
+def attention_env(monkeypatch):
+    """Patch the layer module so Attention constructs against fake backends."""
+    monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+    calls: list[dict] = []
+
+    def _counting(*, role, head_size, attention_config=None, role_category=None, allow_trtllm_default=True):
+        calls.append({"role": role, "attention_config": attention_config})
+        return _fake_resolve(
+            role=role,
+            head_size=head_size,
+            attention_config=attention_config,
+            role_category=role_category,
+            allow_trtllm_default=allow_trtllm_default,
+        )
+
+    monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _counting)
+
+    def build(config, **kwargs):
+        with set_current_diffusion_config(config):
+            return Attention(num_heads=4, head_size=64, causal=False, softmax_scale=1.0, **kwargs)
+
+    return SimpleNamespace(build=build, calls=calls, monkeypatch=monkeypatch)
+
+
+def test_identical_effective_profiles_dedup_to_shared_record(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "a": AttentionConfig(default=AttentionSpec(backend="SDPA")),
+            "b": AttentionConfig(default=AttentionSpec(backend="SDPA")),
+        },
+        default=[{"start": 0, "end": None, "profile": "a"}],
+    )
+    attention = attention_env.build(_make_config(schedule=schedule))
+
+    assert attention._schedule_profiles == ("a", "b")
+    assert attention._schedule_candidates["a"] is attention._schedule_candidates["b"]
+    assert attention._schedule_candidates["a"].impl is attention._schedule_candidates["b"].impl
+
+
+def test_candidate_with_the_baseline_identity_reuses_the_baseline_impl(attention_env):
+    """A profile resolving to the baseline's backend, flag, impl class and kwargs builds no second impl."""
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "same": AttentionConfig(default=AttentionSpec(backend="SDPA")),
+            "auto": AttentionConfig(),
+            "calibrated": AttentionConfig(default=AttentionSpec(backend="SDPA", skip_calibration={"a": 1.0})),
+        },
+        default=[{"start": 0, "end": None, "profile": "same"}],
+    )
+    layer = attention_env.build(
+        _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
+    )
+
+    assert layer._schedule_candidates["same"].impl is layer.attention
+    # A profile that leaves the role on the platform default is a different identity.
+    assert layer._schedule_candidates["auto"].impl is not layer.attention
+    # Its own calibration is stamped onto its own impl, so it never shares the baseline's.
+    assert layer._schedule_candidates["calibrated"].impl is not layer.attention
+
+
+def test_reused_baseline_impl_keeps_its_fields_and_fallback_calibration_after_stamping(attention_env):
+    """Preparing and stamping candidates leaves the shared baseline impl as the baseline configured it.
+
+    ``skip_calibration={}`` canonicalizes like ``None`` and stamping treats both as "no curve of its
+    own", so that profile reuses the baseline impl too. Stamping writes the fallback curve onto the
+    shared impl once; a candidate with its own curve is stamped on its own impl.
+    """
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "same": AttentionConfig(default=AttentionSpec(backend="SDPA")),
+            "empty": AttentionConfig(default=AttentionSpec(backend="SDPA", skip_calibration={})),
+            "calibrated": AttentionConfig(default=AttentionSpec(backend="SDPA", skip_calibration={"a": 2.0, "b": 3.0})),
+        },
+        default=[{"start": 0, "end": None, "profile": "same"}],
+    )
+    layer = attention_env.build(
+        _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
+    )
+    baseline = layer.attention
+    fields_before = dict(vars(baseline))
+
+    assert layer._schedule_candidates["same"].impl is baseline
+    assert layer._schedule_candidates["empty"].impl is baseline
+    assert fields_before["calibration"] is None  # preparation stamps nothing
+
+    stamped = apply_to_pipeline(nn.ModuleDict({"attn": layer}), {"a": 0.5, "b": 1.0})
+
+    assert stamped == 2  # the shared baseline impl once, the calibrated candidate once
+    # Stamping replaces only the shared impl's curve; every other field keeps its prepared value.
+    assert vars(baseline) == {**fields_before, "calibration": (0.5, 1.0)}
+    assert baseline.kwargs is fields_before["kwargs"]
+    assert layer._schedule_candidates["calibrated"].impl.calibration == (2.0, 3.0)
+
+
+def test_candidates_are_built_with_the_baseline_impl_arguments(attention_env):
+    """A candidate impl gets every argument the baseline impl gets, except its own backend selection."""
+    schedule = AttentionScheduleConfig(
+        profiles={"sdpa": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
+        default=[{"start": 0, "end": None, "profile": "sdpa"}],
+    )
+    layer = attention_env.build(_make_config(schedule=schedule), role="cross", prefix="blocks.0.attn2")
+
+    baseline = layer.attention.kwargs
+    candidate = layer._schedule_candidates["sdpa"].impl.kwargs
+    assert candidate["computation"] is AttentionComputation.CROSS
+    assert {key for key in baseline.keys() | candidate.keys() if baseline.get(key) != candidate.get(key)} <= {
+        "backend_kwargs",
+        "backend_explicit",
+    }
+
+
+def test_allgather_trtllm_candidate_is_rejected(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"trt": AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN"))},
+        default=[{"start": 0, "end": None, "profile": "trt"}],
+    )
+    config = _make_config(schedule=schedule, allgather_degree=2)
+    with pytest.raises(ValueError, match="AllGather-KV sequence parallelism"):
+        attention_env.build(config)
+
+
+def test_constructed_layer_routes_a_dense_4d_mask_by_the_step_profile(attention_env):
+    """Construction flags reach the dense 4D routing.
+
+    A backend the profile names is explicit and fails closed; a role the profile leaves on the
+    platform default falls back to SDPA; a call outside a scheduled step runs the baseline.
+    """
+    for name, capable in (("SDPA", True), ("PLATFORM_DEFAULT", False), ("FLASH_ATTN", False)):
+        attention_env.monkeypatch.setattr(
+            _fake_backend(name),
+            "supports_dense_4d_mask",
+            staticmethod(lambda spec=None, capable=capable: capable),
+            raising=False,
+        )
+    schedule = AttentionScheduleConfig(
+        profiles={"auto": AttentionConfig(), "pinned": AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))},
+        default=[{"start": 0, "end": None, "profile": "auto"}],
+    )
+    layer = attention_env.build(
+        _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
+    )
+    assert layer.backend_explicit is True
+    assert layer._schedule_candidates["auto"].backend_explicit is False
+    assert layer._schedule_candidates["pinned"].backend_explicit is True
+    forwards = {
+        "baseline": Mock(return_value=torch.ones(1)),
+        "sdpa": Mock(return_value=torch.zeros(1)),
+        "auto": Mock(return_value=torch.full((1,), 2.0)),
+        "pinned": Mock(return_value=torch.full((1,), 3.0)),
+    }
+    layer.attention.forward = forwards["baseline"]
+    layer.sdpa_fallback.forward = forwards["sdpa"]
+    for profile in ("auto", "pinned"):
+        layer._schedule_candidates[profile].impl.forward = forwards[profile]
+    query = key = value = torch.zeros(2, 4, 4, 64)
+    metadata = AttentionMetadata(attn_mask=torch.zeros(2, 1, 4, 4, dtype=torch.bool))
+
+    def run(profile):
+        schedule = (AttentionScheduleRange(start=1, end=None, profile=profile),)
+        with set_forward_context(), bind_attention_schedule(schedule), request_denoise_progress(1, 2):
+            return layer._run_local_attention(query, key, value, metadata)
+
+    assert run("auto") is forwards["sdpa"].return_value
+    with pytest.raises(
+        NotImplementedError, match=r"'FLASH_ATTN' does not support a dense 4D attn_mask.*backend_explicit=True"
+    ):
+        run("pinned")
+    assert layer._run_local_attention(query, key, value, metadata) is forwards["baseline"].return_value
+    assert {name: forward.call_count for name, forward in forwards.items()} == {
+        "baseline": 1,
+        "sdpa": 1,
+        "auto": 0,
+        "pinned": 0,
+    }
+
+
+def _pipeline(layer, *, sp_plan=None, name="attn1"):
+    """A minimal loaded-pipeline stand-in exposing named_modules() and an optional _sp_plan."""
+    transformer = nn.Module()
+    setattr(transformer, name, layer)
+    if sp_plan is not None:
+        transformer._sp_plan = sp_plan
+    root = nn.Module()
+    root.transformer = transformer
+    return root
+
+
+def _flat_auto_pad_plan():
+    """auto_pad on the plan entry itself, one level below the plan root."""
+    return {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True)}
+
+
+def test_startup_validation_rejects_candidate_without_paged_support(attention_env):
+    attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    schedule = AttentionScheduleConfig(
+        profiles={"nopaged": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "nopaged"}],
+    )
+    config = _make_config(schedule=schedule, kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER)
+    layer = attention_env.build(config, paged_kv_cache_role="primary")
+
+    with pytest.raises(ValueError, match=r"profile 'nopaged'.*does not support Scheduler-managed paged KV"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_paged_capable_candidate_that_differs_from_baseline(attention_env):
+    attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    attention_env.monkeypatch.setattr(_fake_backend("BLOCK_SPARSE"), "supports_paged_kv", True)
+    schedule = AttentionScheduleConfig(
+        profiles={"paged": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "paged"}],
+    )
+    config = _make_config(schedule=schedule, kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER)
+    layer = attention_env.build(config, paged_kv_cache_role="primary")
+
+    with pytest.raises(ValueError, match=r"profile 'paged'.*native implementation bound to the baseline"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_auto_pad_incompatible_candidate(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "nomask"}],
+    )
+    attention_env.monkeypatch.setattr(
+        _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
+    )
+    config = _make_config(schedule=schedule, sp_size=2, mask_sp_padding=True)
+    layer = attention_env.build(config)
+
+    with pytest.raises(ValueError, match=r"profile 'nomask'.*attention_mask"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer, sp_plan=_flat_auto_pad_plan()), config)
+
+
+def test_startup_validation_accepts_mask_free_candidate_when_sp_padding_is_unmasked(attention_env):
+    """Without mask_sp_padding the model passes no padding mask, so the candidate needs no mask support."""
+    schedule = AttentionScheduleConfig(
+        profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "nomask"}],
+    )
+    attention_env.monkeypatch.setattr(
+        _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
+    )
+    config = _make_config(schedule=schedule, sp_size=2)
+    layer = attention_env.build(config)
+
+    assert (
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer, sp_plan=_flat_auto_pad_plan()), config) == 1
+    )
+
+
+def _ring_config(schedule, **kwargs):
+    """An od_config for the traversal only."""
+    return _make_config(schedule=schedule, ring_degree=2, **kwargs)
+
+
+def test_startup_validation_rejects_skip_softmax_candidate_under_ring(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "sparse": AttentionConfig(
+                default=AttentionSpec(backend="TRTLLM_ATTN", skip_softmax=SkipSoftmaxSpec(threshold=0.2))
+            )
+        },
+        default=[{"start": 0, "end": None, "profile": "sparse"}],
+    )
+    layer = attention_env.build(_make_config(schedule=schedule))
+
+    with pytest.raises(ValueError, match=r"profile 'sparse'.*[Rr]ing"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), _ring_config(schedule))
+
+
+def test_startup_validation_rejects_candidate_backend_divergence_under_ring(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"other": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "other"}],
+    )
+    layer = attention_env.build(_make_config(schedule=schedule))
+
+    assert layer.backend_pref != layer._schedule_candidates["other"].backend_cls.get_name()
+    with pytest.raises(ValueError, match=r"profile 'other'.*ring"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), _ring_config(schedule))
+
+
+@pytest.mark.parametrize(("candidate_topk", "accepted"), [(8, False), (4, True)], ids=["different", "same"])
+def test_startup_validation_compares_backend_kwargs_under_ring(attention_env, candidate_topk, accepted):
+    baseline = AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=4))
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "vsa": AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=candidate_topk))
+        },
+        default=[{"start": 0, "end": None, "profile": "vsa"}],
+    )
+    layer = attention_env.build(_make_config(baseline=baseline, schedule=schedule))
+    config = _ring_config(schedule, baseline=baseline)
+
+    assert layer._schedule_candidates["vsa"].backend_cls is layer.attn_backend
+    if accepted:
+        assert layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config) == 1
+    else:
+        with pytest.raises(ValueError, match=r"profile 'vsa'.*backend kwargs"):
+            layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def _fake_impl(name: str) -> type[_FakeImpl]:
+    """Typed accessor for the impl class a fake backend resolves to.
+
+    ``_fake_backend`` is annotated as a bare ``type`` because the backend class is built
+    per name, so assertions that need the impl class go through here rather than calling
+    ``.get_impl_cls()`` on an untyped class object.
+    """
+    _fake_backend(name)
+    return _BACKEND_IMPLS[name]
+
+
+def test_startup_validation_rejects_candidate_without_kv_cache_dtype_support(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"quant": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
+        default=[{"start": 0, "end": None, "profile": "quant"}],
+    )
+    config = _make_config(schedule=schedule, kv_dtype="fp8")
+    attention_env.monkeypatch.setattr(_fake_impl("PLATFORM_DEFAULT"), "_kv_cache_dtypes_ok", ("fp8",))
+    layer = attention_env.build(config)
+
+    with pytest.raises(ValueError, match=r"profile 'quant'.*kv_cache_dtype='fp8'"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_candidate_without_resolvable_calibration(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "sparse": AttentionConfig(
+                default=AttentionSpec(
+                    backend="TRTLLM_ATTN",
+                    skip_softmax=SkipSoftmaxSpec(target_sparsity=0.5),
+                    skip_calibration={"by_expert": {"other_expert": {"a": 1.0, "b": 2.0}}},
+                )
+            )
+        },
+        default=[{"start": 0, "end": None, "profile": "sparse"}],
+    )
+    config = _make_config(schedule=schedule)
+    layer = attention_env.build(config)
+
+    with pytest.raises(ValueError, match=r"profile 'sparse'.*calibration"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)

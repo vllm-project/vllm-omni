@@ -18,6 +18,7 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_sigma,
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
@@ -44,12 +45,15 @@ def minimax_h3_publish_denoise_progress(
 ) -> None:
     """Publish denoise progress for step-gated attention features.
 
-    Both execution modes must publish the same trio: the step index drives the
+    Both execution modes must publish the same four values: the step index drives the
     dense warmup of RAINFUSION_ATTN, the normalized descending timestep
     drives the TRTLLM_ATTN skip gate (which stays dense while it is unset),
-    and the total step count enables the ``end_step`` tail fallback.
+    the total step count enables the ``end_step`` tail fallback, and the
+    video sigma selects the profile when sigma windows are bound.
     """
     set_forward_context_denoise_step_idx(step)
+    # H3's shifted rectified-flow video sigma is already normalized noise; only bound sigma windows read it.
+    set_forward_context_denoise_sigma(sigma_video)
     set_forward_context_denoise_timestep(sigma_video)
     set_forward_context_denoise_total_steps(total_steps)
 
@@ -368,6 +372,15 @@ def minimax_h3_denoise_loop(
 
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
+    # Each call denoises one sequence and publishes its steps from 0 with its
+    # own num_steps. forward() runs one call per output seed and per
+    # continuation window, all with the main num_steps, and with latent_refine
+    # one more call per output seed over the tail of the sigma list, which has
+    # its own num_steps. Step ranges select profiles on each call from step 0.
+    # The pipeline checks them against the main num_steps before the first call
+    # and rejects them together with latent_refine, so a request with step
+    # ranges runs only calls with the main num_steps. Sigma windows select from
+    # the sigma each call publishes, including the refine call.
     num_steps = len(sigmas_video) - 1
     reference_kv_state = None
     create_reference_kv_state = getattr(model, "create_reference_kv_state", None)

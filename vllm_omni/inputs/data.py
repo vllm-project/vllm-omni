@@ -15,6 +15,13 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    AttentionSigmaSchedule,
+    InvalidAttentionScheduleError,
+    parse_attention_schedule,
+    parse_attention_sigma_schedule,
+)
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -284,6 +291,9 @@ class OmniDiffusionSamplingParams:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
     boundary_ratio: float | None = None
+    # None inherits the service default; an empty schedule disables it.
+    attention_schedule: AttentionSchedule | list[dict[str, Any]] | None = None
+    attention_sigma_schedule: AttentionSigmaSchedule | list[dict[str, Any]] | None = None
 
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
@@ -400,6 +410,14 @@ class OmniDiffusionSamplingParams:
             raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+        # Request dicts become params here (chat sampling_params_list, the process stage client),
+        # so a malformed schedule must surface as a client error (HTTP 400), not a TypeError.
+        try:
+            self.attention_schedule = parse_attention_schedule(self.attention_schedule)
+            self.attention_sigma_schedule = parse_attention_sigma_schedule(self.attention_sigma_schedule)
+            absorb_attention_schedule_extra_args(self)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
 
     @property
     def batch_size(self):
@@ -469,6 +487,40 @@ class OmniDiffusionSamplingParams:
         if lora_request is not None and not isinstance(lora_request, LoRARequest):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
         return cls(**params)
+
+
+# Request schedule fields that extra_args may carry, with the parser for each.
+_SCHEDULE_FIELD_PARSERS = (
+    ("attention_schedule", parse_attention_schedule),
+    ("attention_sigma_schedule", parse_attention_sigma_schedule),
+)
+
+
+def absorb_attention_schedule_extra_args(params: OmniDiffusionSamplingParams, *, override: bool = False) -> None:
+    """Move extra_args schedules onto their typed fields without dropping other extra args.
+
+    ``__post_init__`` calls this at construction; ``clone()`` and pickling do not re-run it, so a
+    value written into ``extra_args`` afterwards needs another call. Entrypoints pass
+    ``override=True``: the request value then replaces a schedule that stage default sampling params
+    put on the typed field. Without it both values come from one caller, so a mismatch is rejected.
+    A null value means the same as leaving the key out, so the typed field keeps its value.
+    """
+    extra = params.extra_args or {}
+    consumed = set()
+    for name, parse in _SCHEDULE_FIELD_PARSERS:
+        if name not in extra:
+            continue
+        consumed.add(name)
+        extra_schedule = parse(extra[name])
+        if extra_schedule is None:
+            continue
+        if not override:
+            current = parse(getattr(params, name))
+            if current is not None and current != extra_schedule:
+                raise ValueError(f"conflicting {name} values in sampling params and extra_args")
+        setattr(params, name, extra_schedule)
+    if consumed:
+        params.extra_args = {key: value for key, value in extra.items() if key not in consumed}
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams

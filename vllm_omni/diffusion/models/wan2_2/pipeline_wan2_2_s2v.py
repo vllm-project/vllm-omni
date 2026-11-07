@@ -28,7 +28,12 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    check_scheduler_sigmas,
+    clear_scheduled_denoise_step_on_exit,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -1066,10 +1071,13 @@ class Wan22S2VPipeline(
         """
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
 
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Each clip restarts at step 0, so a bound attention schedule applies to each clip's sequence and is
+        # checked against it here, per clip. None without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 latent_model_input = latents.to(device)
                 timestep = t.expand(latents.shape[0]).to(device)
@@ -1405,6 +1413,8 @@ class Wan22S2VPipeline(
                 self.scheduler.set_timesteps(num_steps, device=device, shift=self._flow_shift)
                 timesteps = self.scheduler.timesteps
                 self._num_timesteps = len(timesteps)
+                # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+                check_scheduler_sigmas(self.scheduler, len(timesteps))
 
                 # -- Slice audio for this clip --
                 left_idx = r * infer_frames

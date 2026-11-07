@@ -189,7 +189,14 @@ def test_encoder_preparation_routes_edit_sources_without_qwen_inputs(
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda _plan: None)
     context = pipeline._prepare_encoder_conditioning_inputs(
         round_trip,
-        SimpleNamespace(extra_args={}, quality=None, seed=17, num_outputs_per_prompt=1),
+        SimpleNamespace(
+            extra_args={},
+            quality=None,
+            seed=17,
+            num_outputs_per_prompt=1,
+            attention_schedule=None,
+            attention_sigma_schedule=None,
+        ),
     )
     torch.testing.assert_close(context["video_edit_clean_rows"], video_clean)
     torch.testing.assert_close(context["video_edit_mask_rows"], torch.zeros(42))

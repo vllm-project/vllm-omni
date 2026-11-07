@@ -116,7 +116,17 @@ per request. Cache refresh, homogeneous LoRA activation, and
 
 `RequestBatchSamplingParamsKey` contains fields that affect the tensor contract,
 including shape, guidance, output count, and LoRA identity. Only compatible
-requests can share a fused forward call.
+requests can share a fused forward call. The key also holds the request's
+`attention_schedule` resolved against the service default, because the runner
+binds one schedule per batch, plus whether the request sent it. An omitted
+schedule does not share a key with the same ranges sent explicitly, because an
+explicit schedule is checked against the step count while an inherited default
+is not. `[]` never shares a batch with an omitted schedule, and different
+ranges never share. The key also holds the request's `attention_sigma_schedule`
+resolved against the service default, because the runner binds one set of
+sigma windows per batch. Sigma windows have no source bit: nothing checks
+explicit windows differently from inherited ones, so an inherited default and
+the same windows sent explicitly share a key, while different windows never do.
 
 Admission is FIFO and conservative. An incompatible request at the front of the
 waiting queue can prevent later compatible requests from joining the current
@@ -187,8 +197,9 @@ denoise forward, then applies scheduler updates per request:
 
 `StepBatchSamplingParamsKey` protects the batched tensor contract. Requests can
 have different total step counts and current step indices, but shape-sensitive,
-CFG-sensitive, and LoRA fields must be compatible. FIFO head-of-line blocking
-also applies here.
+CFG-sensitive, LoRA, `attention_schedule` (with its source), and
+`attention_sigma_schedule` fields must be compatible, resolved as in the
+request-batch key. FIFO head-of-line blocking also applies here.
 
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.

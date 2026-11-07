@@ -25,7 +25,14 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    check_scheduler_sigmas,
+    clear_scheduled_denoise_step_on_exit,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -704,10 +711,26 @@ class Wan22Pipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
+        # length; None without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        sigma_scheduled = is_forward_context_available() and bool(get_forward_context().attention_sigma_schedule)
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(
+                    step_idx,
+                    t,
+                    total_steps=total_steps,
+                    # DMD bypasses set_timesteps, and its fixed timesteps are not on the
+                    # scheduler's sigma grid. Publish t / num_train_timesteps; the grid sigma
+                    # the step uses differs from it by less than 3e-4.
+                    normalized_sigma=(
+                        float(t) / self.scheduler.config.num_train_timesteps
+                        if self.is_dmd and sigma_scheduled
+                        else None
+                    ),
+                )
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -1373,6 +1396,8 @@ class Wan22Pipeline(
             else:
                 self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
+            # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+            check_scheduler_sigmas(self.scheduler, len(timesteps))
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
