@@ -279,11 +279,13 @@ class OmniEngineBase:
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
             # If a stage is being served by itself (i.e., no master server, and only
-            # taking Run requests), 0 out replicas of the nonselected stages.
+            # taking Run requests), 0 out replicas of the nonselected stages. We also
+            # clear their devices, since they'd be sized for replicas that won't run here.
             if not self.single_stage_mode:
                 for stage_cfg in self.stage_configs:
                     if stage_cfg.stage_id != self._single_stage_id_filter:
                         stage_cfg.runtime_config.num_replicas = 0
+                        stage_cfg.runtime_config.devices = None
 
         if self._config_resolution is None:
             # Same model, trust_remote_code and deploy path as the resolution
