@@ -105,6 +105,8 @@ class OmniBagelProcessingInfo(BaseProcessingInfo):
         return {"image": 1, "img2img": 1}
 
     def get_hf_processor(self, **kwargs: object):
+        for key in ("target_h", "target_w", "modalities"):
+            kwargs.pop(key, None)
         return self.ctx.get_hf_processor(OmniBagelProcessor, **kwargs)
 
     def get_hf_config(self):
