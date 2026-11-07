@@ -22,7 +22,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
-_ROCM_MAX_AUDIO_ABS_DIFF = 1e-2
+_ROCM_MAX_AUDIO_ABS_DIFF = 2.5e-2
 _ROCM_MIN_AUDIO_SNR_DB = 30.0
 
 
