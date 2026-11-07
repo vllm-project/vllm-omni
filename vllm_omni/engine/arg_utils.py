@@ -815,6 +815,7 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0

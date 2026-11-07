@@ -818,7 +818,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
         # counters, which inference tensors do not track.
         use_hsdp = od_config.parallel_config.use_hsdp
-        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        use_distributed_offload = resolve_offload_strategy(self.od_config) in (
+            OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            OffloadStrategy.SUBMODULE,
+        )
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
             for req in reqs:

@@ -141,7 +141,10 @@ class OffloadConfig:
         resolved = resolve_offload(od_config)
         strategy = resolved.strategy
         public_config = resolved.public
-        enable_distributed_layerwise_offload = strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        enable_distributed_layerwise_offload = strategy in (
+            OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            OffloadStrategy.SUBMODULE,
+        )
         pin_cpu_memory = resolved.pin_memory
 
         parallel_config = getattr(od_config, "parallel_config", None)
