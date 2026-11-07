@@ -41,6 +41,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.utils import denormalize_latents
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
     resolve_wan_preencode_batch_frames,
@@ -886,15 +887,7 @@ class Wan22Pipeline(
             raise RuntimeError("Wan decode requires a loaded VAE.")
 
         latents = latents.to(device=self.device, dtype=self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        return self.vae.decode(latents / latents_std + latents_mean, return_dict=False)[0]
+        return self.vae.decode(denormalize_latents(latents, self.vae.config), return_dict=False)[0]
 
     def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
         latents_per_request: list[torch.Tensor] = []
@@ -1498,15 +1491,7 @@ class Wan22Pipeline(
             output = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            latents = denormalize_latents(latents, self.vae.config)
             if preencode_mp4:
                 output = decode_to_mp4(
                     self.vae,
