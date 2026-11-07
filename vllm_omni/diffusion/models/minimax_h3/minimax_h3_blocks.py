@@ -27,6 +27,7 @@ from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBack
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.indexed_modulation import (
@@ -44,6 +45,7 @@ from .vdnh3 import VDNConfig, VDNH3HybridAttention
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+    from .reference_isolation import MiniMaxH3ReferenceIsolation
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 _BF16_DTYPE = torch.bfloat16
@@ -289,6 +291,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
@@ -338,7 +341,8 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                self.attention.attn_backend.supports_packed_mask_free()
+                reference_isolation is not None
+                or self.attention.attn_backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
                     and self.attention.attn_backend.get_name() == "RAINFUSION_ATTN"
@@ -371,6 +375,8 @@ class MiniMaxH3Attention(nn.Module):
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:
                 extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
+        if reference_isolation is not None and reference_isolation.reference_rows:
+            extra[REFERENCE_ISOLATION] = (reference_isolation, reference_kv_compact)
         if vdn_window is not None:
             extra["vdn_window"] = vdn_window
         if reference_kv_compact:
@@ -453,6 +459,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
@@ -506,6 +513,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
+            reference_isolation=reference_isolation,
             vdn_window=vdn_window,
         )
         if self.vdn is not None:
@@ -740,6 +748,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
@@ -780,6 +789,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=self.layer_index,
             reference_kv_compact=reference_kv_compact,
+            reference_isolation=reference_isolation,
             vdn_window=vdn_window,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
