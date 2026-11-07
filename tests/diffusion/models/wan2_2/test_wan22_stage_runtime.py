@@ -106,7 +106,7 @@ def test_full_and_e_g_match_conditioning_noise_masks_and_rng(count, outputs, ima
         torch.testing.assert_close(req.sampling_params.generator.get_state(), state)
         # Exercise the actual connector-delivered nested prompt convention.
         req.prompt["additional_information"] = payload.custom_output
-    staged_outputs = generate.forward(staged)
+    staged_outputs = generate.run_stage(staged)
     for key in ("latents", "prompt_embeds", "negative_prompt_embeds", "latent_condition", "first_frame_mask"):
         expected, actual = full.captured[key], generate.captured[key]
         if expected is None:
@@ -165,7 +165,7 @@ def test_g_rejects_bad_handoff_before_rng_or_encoder_fallback(damage, match):
     batch.requests[0].prompt["additional_information"] = payload
     state = batch.requests[0].sampling_params.generator.get_state().clone()
     with pytest.raises(ValueError, match=match):
-        generate.forward(batch)
+        generate.run_stage(batch)
     torch.testing.assert_close(batch.requests[0].sampling_params.generator.get_state(), state)
 
 
@@ -212,7 +212,7 @@ def test_handoff_preserves_dimensions_and_image_batch_identity(height, width, co
     if connector:
         target.prompt["additional_information"].update(transferred)
     generate = _image_pipeline(DiffusionStageRole.DENOISE)
-    assert len(generate.forward(DiffusionRequestBatch(requests=[target]))) == 1
+    assert len(generate.run_stage(DiffusionRequestBatch(requests=[target]))) == 1
 
 
 @pytest.mark.parametrize("field,value", [("version", 2), ("has_image", 1), ("height", 0), ("width", "32")])
@@ -251,7 +251,7 @@ def test_cfg_disabled_does_not_require_negative_embeddings():
     payload = encode.encode_batch(batch)[0].custom_output
     assert "negative_prompt_embeds" not in payload
     batch.requests[0].prompt["additional_information"] = payload
-    assert len(generate.forward(batch)) == 1
+    assert len(generate.run_stage(batch)) == 1
 
 
 @pytest.mark.parametrize(
@@ -329,7 +329,7 @@ def test_generation_rejects_common_setting_mismatch_before_compute(role, expand,
     pipeline.prepare_latents = lambda **kwargs: pytest.fail("validation must precede latent preparation")
     states = [req.sampling_params.generator.get_state().clone() for req in batch.requests]
     with pytest.raises(ValueError, match=match):
-        pipeline.forward(batch)
+        pipeline.run_stage(batch)
     assert not pipeline.scheduler.set_timesteps_calls
     assert not pipeline.captured
     for req, state in zip(batch.requests, states):
@@ -346,7 +346,7 @@ def test_generation_rejects_different_output_types(role):
             req.prompt["additional_information"] = output.custom_output
     batch.requests[1].sampling_params.output_type = "np"
     with pytest.raises(ValueError, match="output_type"):
-        pipeline.forward(batch)
+        pipeline.run_stage(batch)
     assert not pipeline.scheduler.set_timesteps_calls
 
 
@@ -364,10 +364,10 @@ def test_full_checks_text_length_only_when_encoding(precomputed, negative, cfg):
                 req.prompt["negative_prompt_embeds"] = -torch.ones(3, 8)
     if not precomputed or (cfg > 1.0 and not negative):
         with pytest.raises(ValueError, match="max_sequence_length"):
-            pipeline.forward(batch)
+            pipeline.run_stage(batch)
     else:
         pipeline.encode_prompt = lambda **kwargs: pytest.fail("precomputed embeddings must not be re-encoded")
-        assert len(pipeline.forward(batch)) == 2
+        assert len(pipeline.run_stage(batch)) == 2
 
 
 @pytest.mark.parametrize(
@@ -397,7 +397,7 @@ def test_generation_accepts_effective_defaults_rounding_and_request_local_values
         batch.requests[1].sampling_params.max_sequence_length = 256  # G consumes embeddings, not this setting.
     if role == DiffusionStageRole.DENOISE:
         batch.requests[1].sampling_params.output_type = "np"  # D, not G, consumes this.
-    assert len(pipeline.forward(batch)) == 2
+    assert len(pipeline.run_stage(batch)) == 2
 
 
 def test_dmd_batch_ignores_request_step_count_solver_and_shift():
@@ -407,7 +407,7 @@ def test_dmd_batch_ignores_request_step_count_solver_and_shift():
     vars(batch.requests[1].sampling_params).update(
         num_inference_steps=99, extra_args={"sample_solver": "unused", "flow_shift": "unused"}
     )
-    assert len(pipeline.forward(batch)) == 2
+    assert len(pipeline.run_stage(batch)) == 2
     assert not pipeline.scheduler.set_timesteps_calls
 
 
@@ -423,7 +423,7 @@ def test_g_rejects_incompatible_request_batch(mismatch):
     for req, output in zip(batch.requests, encode.encode_batch(batch)):
         req.prompt["additional_information"] = output.custom_output
     with pytest.raises(ValueError, match="mix of provided|matching effective"):
-        generate.forward(batch)
+        generate.run_stage(batch)
 
 
 @pytest.mark.parametrize("image", [True, False])
@@ -432,7 +432,7 @@ def test_ti2v_dummy_has_valid_conditioning_without_vae(image):
     pipeline.transformer_config.text_dim = 8
     batch = _requests(2, image=image)
     pipeline._prepare_dummy_stage_payload(batch)
-    outputs = pipeline.forward(batch)
+    outputs = pipeline.run_stage(batch)
     assert len(outputs) == 2
 
 

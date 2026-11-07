@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
-from vllm_omni.config.stage_config import DiffusionStageRole
+from vllm_omni.config.stage_config import DiffusionStageOperator, DiffusionStageRole
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     create_transformer_from_config,
@@ -330,10 +330,6 @@ def test_wan_denoise_dummy_run_synthesizes_prompt_embeds(stage_role: DiffusionSt
     pipeline.device = torch.device("cpu")
     pipeline.transformer = SimpleNamespace(dtype=torch.float32)
     pipeline.transformer_config = SimpleNamespace(text_dim=8)
-    pipeline.forward = lambda batch: (
-        batch.requests[0].prompt["prompt_embeds"],
-        batch.requests[0].prompt["negative_prompt_embeds"],
-    )
     request = SimpleNamespace(
         request_id=DUMMY_DIFFUSION_REQUEST_ID,
         is_dummy_run_request_id=lambda request_id: request_id == DUMMY_DIFFUSION_REQUEST_ID,
@@ -341,7 +337,10 @@ def test_wan_denoise_dummy_run_synthesizes_prompt_embeds(stage_role: DiffusionSt
         sampling_params=SimpleNamespace(max_sequence_length=4),
     )
 
-    prompt_embeds, negative_prompt_embeds = pipeline.run_stage(DiffusionRequestBatch(requests=[request]))
+    batch = DiffusionRequestBatch(requests=[request])
+    pipeline._prepare_dummy_stage_payload(batch, operator=DiffusionStageOperator.DIFFUSE)
+    prompt_embeds = batch.requests[0].prompt["prompt_embeds"]
+    negative_prompt_embeds = batch.requests[0].prompt["negative_prompt_embeds"]
 
     # Per-request payloads are unbatched; the batch dim is added by the
     # stack-based prompt collation in ``forward``.

@@ -980,36 +980,36 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         try_set_result(fut, msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
                 batch_id = msg.async_output_id
-                with self._futures_lock:
-                    per_req_map = self._batch_split_map.pop(batch_id, None) if batch_id else None
-                if per_req_map is not None:
-                    # Batch result: split into per-request DiffusionOutputs.
+                # Do not claim the split map until SHM unpack has finished.
+                # ``execute_batch`` can register the map while this receive
+                # thread is unpacking; claiming it before the unpack created
+                # a window where a whole batch was cached under ``batch_id``
+                # and its per-request waiters could never be resolved.
+                output_result: DiffusionOutput | None = None
+                exc: Exception | None = None
+                if msg.error:
+                    exc = RuntimeError(msg.error)
+                else:
                     try:
                         unpack_diffusion_output_shm(msg.output)
-                    except Exception:
-                        logger.exception("SHM unpack failed for batch %s", batch_id)
-                    self._deliver_batch_split(per_req_map, msg.output, msg.error)
-                else:
-                    # Single-request result: unpack SHM first, then resolve or cache atomically.
-                    output_result: DiffusionOutput | None = None
-                    exc: Exception | None = None
-                    if msg.error:
-                        exc = RuntimeError(msg.error)
-                    else:
-                        try:
-                            unpack_diffusion_output_shm(msg.output)
-                            output_result = msg.output
-                        except Exception as e:
-                            logger.exception("SHM unpack failed in result pump")
-                            exc = e
+                        output_result = msg.output
+                    except Exception as e:
+                        logger.exception("SHM unpack failed in result pump")
+                        exc = e
 
-                    if batch_id:
-                        with self._futures_lock:
-                            if self._closed:
-                                # shutdown() cleared _completed_outputs while
-                                # we were unpacking; drop this delivery.
-                                continue
-                            self._finish_output(batch_id, output_result, exc)
+                with self._futures_lock:
+                    if self._closed:
+                        # shutdown() cleared _completed_outputs while we were
+                        # unpacking; drop this delivery.
+                        continue
+                    per_req_map = self._batch_split_map.pop(batch_id, None) if batch_id else None
+                    if per_req_map is None and batch_id:
+                        self._finish_output(batch_id, output_result, exc)
+                if per_req_map is not None:
+                    # Batch result: split into per-request DiffusionOutputs.
+                    self._deliver_batch_split(
+                        per_req_map, output_result, msg.error or (str(exc) if exc is not None else None)
+                    )
 
     def _finish_output(
         self,

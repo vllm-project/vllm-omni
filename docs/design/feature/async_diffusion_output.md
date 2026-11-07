@@ -126,6 +126,12 @@ the previous video; the engine must not force that storage to be released.
 
 When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_id` for the entire batch, the executor splits it into per-request `async_output_id`s (format `{batch_id}/{request_id}`) via `_batch_split_map`. When `OUTPUT_READY` arrives, the pump extracts per-request results from the batch output and resolves each request's output future independently. If `OUTPUT_READY` arrives before `execute_batch` registers the split map, `execute_batch` directly adopts the early output.
 
+The pump checks the split map and caches an unmatched output in one critical
+section **after** SHM unpack. A split map registered during unpack is therefore
+consumed by the pump; a result cached before registration is adopted by
+`execute_batch`. Neither ordering may leave a cached batch alongside an
+unconsumed split map and pending per-request futures.
+
 ### Reliability, Lifecycle & Timeout Behavior
 
 1. **Drain Before Memory Release (`drain_async_outputs` / `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S`)**:

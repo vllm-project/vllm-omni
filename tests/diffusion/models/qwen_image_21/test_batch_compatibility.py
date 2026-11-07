@@ -82,6 +82,7 @@ def test_text_input_forms_share_compatibility_key(preprocess, prompt):
     empty_list_request = preprocess(make_request("empty-list", []))
     assert processed.batch_compatibility_key is not None
     assert processed.batch_compatibility_key == empty_list_request.batch_compatibility_key
+    assert "negative_prompt" not in processed.prompt
 
 
 @pytest.mark.parametrize("image_type", ["numpy", "tensor"])
@@ -138,6 +139,19 @@ def test_preprocess_normalizes_tuple_images_like_a_list(preprocess):
     assert len(info["input_image_sizes"]) == 1
 
 
+def test_preprocess_accepts_multistage_single_image_alias(preprocess):
+    request = make_request("img2img", [])
+    image = Image.new("RGB", (64, 64), "red")
+    request.prompt["multi_modal_data"] = {"img2img": image}
+
+    processed = preprocess(request)
+
+    info = processed.prompt["additional_information"]
+    assert len(info["prompt_image"]) == 1
+    assert len(info["vae_images"]) == 1
+    assert len(info["input_image_sizes"]) == 1
+
+
 def test_preprocess_rejects_more_images_than_the_model_supports(preprocess):
     from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
         MAX_QWEN_IMAGE_21_INPUT_IMAGES,
@@ -159,6 +173,132 @@ def test_preprocess_defaults_true_cfg_scale(preprocess):
     assert preprocess(request).sampling_params.true_cfg_scale == 4.0
 
 
+@pytest.mark.parametrize("true_cfg_scale", [None, 0.0, 1.0])
+@pytest.mark.parametrize("negative_prompt", ["blurry", [], [None], ("placeholder",), 1, {"unserializable"}])
+def test_preprocess_clears_unused_negative_prompt(preprocess, true_cfg_scale, negative_prompt):
+    request = make_request("cfg-off", [])
+    request.sampling_params.true_cfg_scale = true_cfg_scale
+    request.prompt["negative_prompt"] = negative_prompt
+    original_prompt = request.prompt
+
+    processed = preprocess(request)
+    reference = preprocess(make_request("no-negative", []))
+
+    assert processed.prompt["negative_prompt"] is None
+    assert original_prompt["negative_prompt"] is negative_prompt
+    assert processed.batch_compatibility_key == reference.batch_compatibility_key
+    # Even non-serializable placeholders must disappear before role handoff.
+    json.dumps(processed.prompt)
+
+
+@pytest.mark.parametrize("order", [("off", "on"), ("on", "off")])
+def test_preprocess_preserves_negative_prompt_shared_by_cfg_requests(preprocess, order):
+    shared_prompt = {"prompt": "A ceramic teapot", "negative_prompt": "blurry"}
+    requests = {name: make_request(name, []) for name in order}
+    for name, request in requests.items():
+        request.prompt = shared_prompt
+        request.sampling_params.true_cfg_scale = 1.0 if name == "off" else 3.0
+
+    processed = {name: preprocess(requests[name]) for name in order}
+
+    assert shared_prompt == {"prompt": "A ceramic teapot", "negative_prompt": "blurry"}
+    assert processed["off"].prompt["negative_prompt"] is None
+    assert processed["on"].prompt["negative_prompt"] == "blurry"
+    assert processed["off"].batch_compatibility_key[-1] is False
+    assert processed["on"].batch_compatibility_key[-1] is True
+
+
+@pytest.mark.parametrize("negative_prompt", [["blurry"], ["blurry", "artifacts"]])
+def test_preprocess_rejects_negative_prompt_batches_for_a_single_request(preprocess, negative_prompt):
+    request = make_request("negative-batch", [])
+    request.sampling_params.true_cfg_scale = 3.0
+    request.prompt["negative_prompt"] = negative_prompt
+
+    with pytest.raises(ValueError, match="single request.*negative_prompt"):
+        preprocess(request)
+
+
+def test_preprocess_isolates_shared_additional_information(preprocess):
+    import torch
+
+    payload = torch.ones(1, 2, 4)
+    shared_info = {"custom_payload": payload}
+    first = make_request("square", [(64, 64)], color="red")
+    second = make_request("wide", [(128, 64)], color="blue")
+    first.prompt["additional_information"] = shared_info
+    second.prompt["additional_information"] = shared_info
+
+    first, second = preprocess(first), preprocess(second)
+
+    first_info = first.prompt["additional_information"]
+    second_info = second.prompt["additional_information"]
+    assert first_info is not second_info
+    assert first_info is not shared_info and second_info is not shared_info
+    assert set(shared_info) == {"custom_payload"}
+    assert first_info["custom_payload"] is second_info["custom_payload"] is payload
+    assert first_info["prompt_image"][0].getpixel((0, 0)) == (255, 0, 0)
+    assert second_info["prompt_image"][0].getpixel((0, 0)) == (0, 0, 255)
+    assert tuple(first_info["input_image_sizes"]) == first.batch_compatibility_key[1]
+    assert tuple(second_info["input_image_sizes"]) == second.batch_compatibility_key[1]
+    assert first_info["input_image_sizes"] != second_info["input_image_sizes"]
+
+
+@pytest.mark.parametrize("handoff_uses_original_prompt", [False, True])
+@pytest.mark.parametrize(
+    "payload_key", ["qwen_image_21_metadata", "qwen_image_21_conditioning", "_stage_payload_transfer"]
+)
+def test_cfg_off_negative_prompt_is_cleared_across_role_handoff(preprocess, handoff_uses_original_prompt, payload_key):
+    from vllm_omni.model_executor.stage_input_processors.diffusion_disagg import diffusion_stage_handoff
+
+    request = make_request("encode", [])
+    request.prompt["negative_prompt"] = {"unserializable"}
+    original_prompt = dict(request.prompt)
+    encoded = preprocess(request)
+    payload = {"height": 1024, "width": 1024, "input_image_sizes": [], "has_negative_conditioning": False}
+    source = SimpleNamespace(custom_output={payload_key: payload})
+    next_prompt = diffusion_stage_handoff(
+        [source], prompt=original_prompt if handoff_uses_original_prompt else encoded.prompt
+    )[0]
+    if not handoff_uses_original_prompt:
+        assert "negative_prompt" not in next_prompt
+        json.dumps(next_prompt)
+    downstream = make_request("downstream", [])
+    downstream.prompt = next_prompt
+
+    processed = preprocess(downstream)
+
+    assert processed.prompt.get("negative_prompt") is None
+    assert ("negative_prompt" in processed.prompt) is handoff_uses_original_prompt
+    assert processed.prompt[payload_key] is payload
+    assert processed.batch_compatibility_key == encoded.batch_compatibility_key
+    json.dumps(processed.prompt)
+
+
+@pytest.mark.parametrize(
+    "true_cfg_scale",
+    [
+        "bad",
+        "1.0",
+        [],
+        {},
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        pytest.param(10**400, id="huge-int"),
+        pytest.param(-(10**400), id="huge-negative-int"),
+    ],
+)
+@pytest.mark.parametrize("encoded", [False, True])
+def test_preprocess_rejects_invalid_cfg_scale(preprocess, true_cfg_scale, encoded):
+    request = make_request("bad-cfg", [])
+    request.sampling_params.true_cfg_scale = true_cfg_scale
+    if encoded:
+        request.prompt["qwen_image_21_metadata"] = {"height": 1024, "width": 1024}
+
+    with pytest.raises(ValueError, match="true_cfg_scale"):
+        preprocess(request)
+
+
 @pytest.mark.parametrize("size,expected_wider", [((128, 64), True), ((64, 128), False)])
 def test_preprocess_derives_output_size_from_condition_aspect(preprocess, size, expected_wider):
     request = make_request("aspect", [size])
@@ -176,17 +316,67 @@ def test_preprocess_derives_output_size_from_condition_aspect(preprocess, size, 
     assert info["calculated_width"] == width
 
 
-def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess):
-    processed = preprocess(make_request("staged", [(96, 64)]))
+@pytest.mark.parametrize("with_prepopulated_info", [False, True])
+def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess, with_prepopulated_info):
+    request = make_request("staged", [(96, 64)])
+    caller_list = ["caller-owned"]
+    caller_mapping = {"items": ["unchanged"]}
+    caller_info = {"caller_list": caller_list, "caller_mapping": caller_mapping}
+    if with_prepopulated_info:
+        request.prompt["additional_information"] = caller_info
+    original_prompt = request.prompt
+    processed = preprocess(request)
     info = processed.prompt["additional_information"]
 
     (vae_image,) = info["vae_images"]
     # RGB input gains an opaque alpha channel for the RGBA VAE; the frame dim is
     # inserted for the 3D (video-capable) VAE.
+    assert info["vae_images_are_latents"] is False
     assert vae_image.shape[1] == 4
     assert vae_image.shape[2] == 1
     (prompt_image,) = info["prompt_image"]
     assert isinstance(prompt_image, Image.Image)
     (width, height) = info["input_image_sizes"][0]
     assert prompt_image.size == (width, height)
-    assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),))
+    if with_prepopulated_info:
+        # Nested values intentionally remain shared; this checks preprocessing,
+        # not whether downstream consumers preserve them.
+        assert original_prompt["additional_information"] is caller_info
+        assert caller_info == {"caller_list": ["caller-owned"], "caller_mapping": {"items": ["unchanged"]}}
+        assert caller_info["caller_list"] is caller_list
+        assert caller_info["caller_mapping"] is caller_mapping
+        assert info is not caller_info
+        assert info["caller_list"] is caller_list
+        assert info["caller_mapping"] is caller_mapping
+    else:
+        assert "additional_information" not in original_prompt
+    assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),), None, False)
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+@pytest.mark.parametrize(
+    "field,value",
+    [("height", 512), ("width", 768), ("true_cfg_scale", 3.0), ("max_sequence_length", 128)],
+)
+def test_scheduler_separates_stage_sampling_settings(preprocess, scheduler_class, field, value):
+    first = preprocess(make_request("first", []))
+    second = make_request("second", [])
+    setattr(second.sampling_params, field, value)
+    second = preprocess(second)
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    assert scheduler.schedule().scheduled_request_ids == ["first"]
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+def test_scheduler_separates_missing_negative_conditioning(preprocess, scheduler_class):
+    first, second = make_request("first", []), make_request("second", [])
+    first.sampling_params.true_cfg_scale = second.sampling_params.true_cfg_scale = 3.0
+    second.prompt["negative_prompt"] = "blurry"
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+    scheduler.add_request(preprocess(first))
+    scheduler.add_request(preprocess(second))
+    assert scheduler.schedule().scheduled_request_ids == ["first"]

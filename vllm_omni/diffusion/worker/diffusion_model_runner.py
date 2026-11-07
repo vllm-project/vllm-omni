@@ -25,6 +25,9 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_omni.config.stage_config import (
+    DiffusionStageOperator,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -397,8 +400,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
-                "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "step_execution=True requires a pipeline supporting step execution for the configured stage; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
@@ -964,6 +966,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output.completed_event_ids = list(meta.completed_event_ids)
             output.coalesced_event_ids = list(meta.coalesced_event_ids)
 
+    def _run_stage_operator(self, payload: Any, operator: DiffusionStageOperator, **kwargs: Any) -> Any:
+        pipeline = self.pipeline
+        assert pipeline is not None, "Model not loaded. Call load_model() first."
+        run_stage = getattr(pipeline, "run_stage", None)
+        if callable(run_stage) and getattr(pipeline, "supports_stage_operator_dispatch", False):
+            return run_stage(payload, operator=operator, **kwargs)
+        if operator is DiffusionStageOperator.STEP_PREPARE:
+            method = getattr(pipeline, "prepare_encode", None) or getattr(pipeline, "prepare_denoise")
+            return method(payload, **kwargs)
+        if operator is DiffusionStageOperator.STEP_FINALIZE:
+            method = getattr(pipeline, "post_decode", None) or getattr(pipeline, "step_output")
+            return method(payload, **kwargs)
+        return getattr(pipeline, operator.primitive_name)(payload, **kwargs)
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
@@ -1076,8 +1092,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Execute scheduled request-mode requests through the batch forward path.
 
         Builds a ``DiffusionRequestBatch`` from scheduled new requests, runs
-        per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
-        must declare ``supports_request_batch = True``.
+        per-request setup, and dispatches the batch through ``run_stage`` when
+        supported, otherwise ``forward``. Pipelines must declare
+        ``supports_request_batch = True`` for scheduled request batches.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
@@ -1116,8 +1133,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     # ------------------------------------------------------------------
 
     def _supports_step_mode(self) -> bool:
-        """Return whether current pipeline supports step execution."""
-        return self.pipeline is not None and supports_step_execution(self.pipeline)
+        """Return whether the pipeline validated the configured step contract."""
+        pipeline = self.pipeline
+        if pipeline is None:
+            return False
+        if getattr(pipeline, "supports_stage_operator_dispatch", False):
+            return bool(
+                getattr(pipeline, "_stage_execution_initialized", False)
+                and getattr(pipeline, "_stage_execution_step_mode", False)
+            )
+        return supports_step_execution(pipeline)
 
     def release_step_requests(self, request_ids: Sequence[str]) -> None:
         """Drop request-owned state after execution/output preparation has returned.
@@ -1251,7 +1276,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         ) is not None and not supports_interaction_apply(pipeline):
                             raise ValueError("playback feedback requires an interactive chunked pipeline")
                         self._initialize_generator(state.sampling)
-                        pipeline.prepare_encode(state)
+                        self._run_stage_operator(state, DiffusionStageOperator.STEP_PREPARE)
                 except Exception as exc:
                     per_req_exc = exc
                 # Pipelines that do rank-0-only work (e.g. MiniMax H3
@@ -1341,6 +1366,28 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             record_output_peak_memory=True,
         )
 
+    def _execute_atomic_step_stage(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Run an encode/decode role once while preserving step-mode routing."""
+        if scheduler_output.scheduled_cached_reqs.request_ids:
+            raise ValueError("An atomic diffusion stage cannot contain cached stepwise requests.")
+
+        # Atomic stages use the same compatible batch and transport setup as
+        # request mode; only their terminal step bookkeeping differs.
+        try:
+            output = self.execute_model_batch(scheduler_output, self.od_config)
+        except Exception as exc:
+            logger.error("Atomic step-stage batch execution failed", exc_info=True)
+            output = BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(request_id=request.request_id, result=DiffusionOutput.from_exception(exc))
+                    for request in scheduler_output.scheduled_new_reqs
+                ]
+            )
+        for request_output in output.runner_outputs:
+            request_output.step_index = 0
+            request_output.finished = True
+        return output
+
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""
         if scheduler_output.scheduled_cached_reqs.request_ids:
@@ -1416,11 +1463,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, editing inputs, and
-        # similar features are not supported here yet.
+        # Stepwise mode supports the state-driven denoise path and the
+        # request-shaped atomic ENCODE/DECODE roles. Request-mode extras such
+        # as cache backends remain unsupported here.
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
+
+        if getattr(self.pipeline, "stage_uses_step_execution", True) is False:
+            return self._execute_atomic_step_stage(scheduler_output)
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
@@ -1483,7 +1533,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                noise_pred = self._run_stage_operator(
+                    input_batch,
+                    DiffusionStageOperator.DENOISE_STEP,
+                    states=states,
+                )
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
@@ -1510,8 +1564,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                            self._run_stage_operator(
+                                req,
+                                DiffusionStageOperator.STEP_SCHEDULER,
+                                noise_pred=noise_pred[offset : offset + row_num] if noise_pred is not None else None,
                             )
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
@@ -1526,7 +1582,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         cast(SupportsInteractionApply, pipeline).peek_chunk_media(req).duration_s
                                     )
                                 clear_pipeline_stage_durations(pipeline)
-                                result = pipeline.post_decode(req)
+                                result = self._run_stage_operator(req, DiffusionStageOperator.STEP_FINALIZE)
                                 if result is not None:
                                     result = self._prepare_output_for_transport(result, req.sampling)
                                     self._attach_stepwise_metadata(

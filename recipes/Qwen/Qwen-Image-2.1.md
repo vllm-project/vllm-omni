@@ -199,6 +199,41 @@ Start the server:
 vllm serve Qwen/Qwen-Image-2.1 --omni --port 8091
 ```
 
+### Separate encoder, generator, and decoder workers
+
+The opt-in deployment files select two or three diffusion workers:
+
+| Deployment | Workers | Components |
+| --- | --- | --- |
+| `vllm_omni/deploy/qwen_image_21_eg.yaml` | 2 | Qwen3-VL + VAE encoder → DiT + VAE decoder |
+| `vllm_omni/deploy/qwen_image_21_egd.yaml` | 3 | Qwen3-VL + VAE encoder → DiT → VAE decoder |
+
+These YAMLs are deployment templates, and neither has been smoke-tested
+with its shipped settings. Both default to `max_num_seqs: 1`; the EGD template
+requires three devices (`0/1/2`). The recorded two-A100 matrix used custom
+placements with `max_num_seqs=4`, so those results do not validate either YAML
+as shipped. In particular, the three-device EGD template remains unverified
+on a three-GPU host.
+
+```bash
+vllm serve Qwen/Qwen-Image-2.1 --omni \
+  --deploy-config vllm_omni/deploy/qwen_image_21_eg.yaml --port 8091
+```
+
+The encoder emits prompt embeddings, attention/image masks, and normalized
+condition-image latents. The generator consumes these values and samples the
+target noise using the request's seed and sampling schedule. Geometry remains
+inline for downstream scheduling; tensors use the shared-memory connector.
+The generator's step mode reuses the existing per-request scheduler and prefix
+KV cache. Encoder and decoder workers execute once per compatible scheduled
+batch in either mode. G batching has a
+[position-encoding limitation](#stage-batching-and-position-encoding): a fixed
+seed does not guarantee the same output when other requests change the padded
+text length.
+
+These deployment paths have not yet been validated with model weights on
+accelerator hardware.
+
 To enable the step-wise runtime:
 
 ```bash
@@ -213,7 +248,9 @@ pipeline tags every request with a `batch_compatibility_key` (conditioning
 mode plus condition-image layout), so a newly arriving request that would
 otherwise join a batch already past its first denoising step is isolated by
 the scheduler and deferred until the in-flight batch drains — it no longer
-fails the whole batch. `--max-num-seqs` controls batch capacity.
+fails the whole batch. `--max-num-seqs` controls batch capacity. The
+[position-encoding limitation](#stage-batching-and-position-encoding) also
+applies when mixed text lengths are padded for step batches.
 
 ### CUDA Graph decode
 
@@ -283,6 +320,56 @@ OpenAI-compatible multimodal endpoint (`/v1/chat/completions` with
 `image_url` content parts, or `/v1/images/edits`), same as
 [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md).
 
+The Qwen-Image 2.1 preprocessor accepts condition images under either
+`multi_modal_data["image"]` or `multi_modal_data["img2img"]`. The latter is
+the single-reference form used by the multistage OpenAI image-edit path;
+both forms must produce the same VLM and VAE conditioning before stage handoff.
+
+### Stage batching and position encoding
+
+Stage batches must share output geometry, CFG scale, maximum text length,
+output count and the operation's other shared sampling settings. Request-mode
+scheduling already compares the public sampling fields; Qwen's condition key
+also includes maximum text length and negative-conditioning availability for
+step-mode atomic stages. Direct incompatible stage batches fail before model
+computation rather than inheriting the first request's settings.
+
+ENCODE encodes compatible requests together and splits conditioning with each
+request's geometry. DENOISE right-pads upstream text conditions and calls the
+native DiT path once for the compatible batch; DECODE concatenates packed
+latents and calls the VAE once, then splits outputs in request order. Atomic
+E/D stages under step scheduling also preserve the scheduled batch. This
+supports batch execution when the scheduler actually admits multiple compatible
+requests; `max_num_seqs` alone does not guarantee a full batch.
+
+**Known limitation:** mixed text lengths share a padded sequence layout. The
+current Transformer counts those padding slots when positioning image tokens
+with RoPE. A shorter request can therefore receive different image-token
+positions when batched with a longer request, even with the same seed and
+valid conditioning. Attention masks exclude padding keys but do not restore
+the positions from standalone execution. This is a change in positional
+inputs, beyond floating-point rounding, and also affects native FULL batching.
+Batch composition can therefore change an individual request's output.
+
+The [per-request RoPE follow-up](../../docs/design/module/diffusion/diffusion_runtime.md#follow-up-per-request-qwen-rope-positions)
+tracks deriving row-specific positions from `prompt_embeds_mask`, including
+the equivalent negative mask. This limitation remains unresolved; mixed-length
+batching is not claimed to preserve standalone position semantics.
+
+A generator-only worker has no encoder during its local warmup. Its dummy
+conditioning intentionally uses the configured `max_sequence_length` (or the
+pipeline maximum, normally 8192) for both positive and negative branches. This
+is a conservative memory profile and can exceed a FULL worker's profile using
+real encoded text. It does not pad every real request to that length; lowering
+the supported request length requires setting an appropriate explicit limit.
+
+Preprocessed `vae_images` are raw RGBA pixels unless the internal conditioning
+input explicitly sets `vae_images_are_latents: true`. That flag means the
+values are already normalized VAE latents; channel count is only validated,
+never used to infer representation. The ENCODE output `image_latents` always
+contains normalized latents, and G passes them to `prepare_latents()` with
+`image_is_latent=True` to avoid a second VAE encode.
+
 ## Parameters
 
 | Parameter | Default | Notes |
@@ -290,7 +377,7 @@ OpenAI-compatible multimodal endpoint (`/v1/chat/completions` with
 | `true_cfg_scale` | 1.0 | Disables the negative-prompt branch by default. Set above 1 with a `negative_prompt` to enable true CFG. Qwen-Image 2.1 supports true CFG only — there is no `guidance_scale` parameter. |
 | `num_inference_steps` | 50 | Number of denoising steps. |
 | `height` / `width` | 1024×1024 | Must be multiples of 32. For image-conditioned requests, leaving them unset derives the output size from the last condition image's aspect ratio at ~1024×1024. |
-| `negative_prompt` | None | Ignored at the default CFG scale of 1.0; used only when `true_cfg_scale > 1`. |
+| `negative_prompt` | None | When `true_cfg_scale <= 1`, model preprocessing clears a supplied value to `None` in a shallow copy of the prompt, before admission, cache preparation and role handoff. An absent field stays absent. Used and validated only when `true_cfg_scale > 1`. HTTP request schemas still apply. |
 | condition images | — | Up to 4 input images per request; more than 4 raises an error. |
 | `seed` | — | Fix for reproducible outputs. |
 
@@ -298,6 +385,17 @@ The default CFG scale of 1.0 runs only the positive-prompt branch at each
 denoising step. To enable negative-prompt guidance, explicitly set
 `--cfg-scale` (offline) or `true_cfg_scale` (API) above 1 and provide a
 negative prompt. This changes the generated output as well as compute cost.
+
+The image HTTP API validates `true_cfg_scale` as a numeric field. Direct Python
+callers must pass a finite real scalar or `None`; model preprocessing rejects
+non-numeric values, NaN, infinity and tensor scalars with `ValueError`, including
+when receiving an encoded stage payload. An omitted scale defaults to 1.0.
+
+With CFG enabled, a single request's `negative_prompt` must be a string or
+`None`; the internal batch encoder accepts one string per request. Preprocessing
+shallow-copies both the prompt and its `additional_information` container so
+shared caller dictionaries cannot overwrite another request's negative prompt
+or prepared image conditions. Tensor payloads remain shared by reference.
 
 ### Prefix KV cache
 

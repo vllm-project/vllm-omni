@@ -43,6 +43,7 @@ validation_paths:
   - tests/diffusion/test_diffusion_streaming_output.py
   - tests/diffusion/test_stage_diffusion_proc.py
   - tests/diffusion/test_inline_stage_diffusion_client.py
+  - tests/diffusion/models/test_stage_mixin.py
 upstream_refs:
   - diffusers.DiffusionPipeline
 last_reviewed: 2026-09-02
@@ -224,6 +225,22 @@ single-request wave is the conservative path. A multi-request wave usually
 uses fused `execute_model_batch()` and requires the pipeline to declare
 request-batch support.
 
+The runner preserves the scheduler's request batch for every diffusion stage
+role and passes it to `run_stage()`. Role permissions do not force a batch into
+single-request calls. Each pipeline operation consumes the batch and returns
+one output per request under the same request-batch support contract. Atomic
+encode/decode stages under step scheduling reuse `execute_model_batch()` and
+mark each result terminal; they do not run `execute_model()` separately for
+each admitted request. An exception from shared batch validation or execution
+fails every request in that batch, matching request-mode failure isolation;
+the runner does not retry batch members individually. Per-request errors
+returned by the pipeline remain attached to their own outputs.
+
+`execute_model_batch()` validates and installs each new request's
+`diffusion_kv_metadata` from `scheduled_new_reqs`, passes the metadata in
+request order to the shared forward path, and removes the installed rows
+after execution. This also applies to atomic stages under step scheduling.
+
 **Distributed layerwise offload with AllGather (DLO DP concurrency)** is a
 separate dispatch path supported by `mp` and `ray`. It activates when
 `data_parallel_size > 1`, `enable_distributed_layerwise_offload` is set, and
@@ -247,9 +264,11 @@ worker rank then picks one envelope from the wave:
 computing different requests.
 
 **Step mode** keeps `StepRequestState` in the runner. New requests run
-`prepare_encode()` once; every tick runs `denoise_step()` and
-`step_scheduler()`; completed requests run `post_decode()`. The scheduler keeps
-only lifecycle and progress metadata—it does not hold model tensors.
+`prepare_encode()` for a full pipeline, or `prepare_denoise()` when consuming
+upstream conditioning. Every tick runs `denoise_step()` and `step_scheduler()`;
+completed requests run `post_decode()` or emit latents for a downstream decoder.
+The scheduler keeps only lifecycle and progress metadata—it does not hold model
+tensors.
 
 **Step mode is also the path for streaming diffusion output**. Enabling
 `streaming_output` turns on step execution if needed. Chunk-capable pipelines
@@ -263,6 +282,96 @@ step execution, initialization fails.
     [Diffusion execution modes](../../../user_guide/diffusion/execution_modes.md).
     That guide explains how to select a mode; this page explains what happens
     after the choice is made.
+
+### Stage roles and operators
+
+For pipelines using `DiffusionStageMixin`, `stage_role` determines which
+operations are allowed and which model components are loaded. The `operator`
+argument to `run_stage()` selects the work for that call. A `FULL` pipeline may
+therefore execute only `ENCODE`, `DIFFUSE`, `DECODE`, or an implemented step
+operator. Loading a VAE does not make a `DIFFUSE` call decode its result.
+
+| Explicit operator | Input | Operation |
+| --- | --- | --- |
+| `ENCODE` | `DiffusionRequestBatch` | Produce conditioning for a generator |
+| `DIFFUSE` | `DiffusionRequestBatch` | Consume conditioning, prepare and run the denoise loop, and return latents |
+| `DECODE` | `DiffusionRequestBatch` | Decode supplied latents |
+| `DIFFUSE_DECODE` | `DiffusionRequestBatch` | Compose `DIFFUSE` then `DECODE`, consuming upstream conditioning |
+| `FORWARD` | `DiffusionRequestBatch` | Run the full pipeline, using its native forward or composing encode, diffuse, and decode |
+| `PREPARE_ENCODE` | `StepRequestState` | Encode conditioning and initialize denoise state; requires encoder and generator permissions |
+| `PREPARE_DENOISE` | `StepRequestState` | Initialize denoise state from supplied conditioning |
+| `DENOISE_STEP` | `InputBatch` | Predict noise for one runner-assembled batch |
+| `STEP_SCHEDULER` | `StepRequestState` | Update one request's latents and step progress |
+| `STEP_OUTPUT` / `POST_DECODE` | `StepRequestState` | Emit one request's latents / decode one request's latents |
+
+For compatibility, omitting `operator` on a request batch selects the role's
+default: `FULL` uses `FORWARD`, `ENCODE` uses `ENCODE`, `DENOISE` uses `DIFFUSE`,
+`DECODE` uses `DECODE`, and `DENOISE_DECODE` uses `DIFFUSE_DECODE`. This default
+does not change an explicit operator's meaning or limit the other operations
+allowed by that role. Initialization checks the methods required by the selected
+execution mode; another allowed operator still needs an implementation before
+it can be called.
+
+The mixin owns role checks, dispatch, and composition. Model methods perform
+their named computation without inspecting roles or deciding whether to run
+another stage. Composed request operations hand intermediate conditioning and
+latents to the next operation through a copied request's
+`prompt.additional_information`; original requests and sampling parameters stay
+unchanged, and intermediate tensors keep their device and identity. Step state
+and its scheduler remain local to the runner rather than becoming a transport
+payload.
+
+Qwen-Image 2.1 uses the same mixin for the opt-in `qwen_image_21_eg` and
+`qwen_image_21_egd` topologies. Its encoder owns both Qwen3-VL and the VAE
+encoder. A versioned `qwen_image_21_conditioning` dictionary carries embeddings,
+prompt/image masks, normalized condition latents, and condition-image sizes.
+The generator expands conditioning for output fan-out and prepares target noise
+and timesteps. Its request and step paths share this preparation. Lightweight
+`qwen_image_21_metadata` stays inline alongside connector handles so downstream
+preprocessing can recover output dimensions and batch compatibility before the
+worker receives tensors. A denoise-only stage emits packed target latents plus
+this geometry; the decoder reuses the native unpack/denormalize/decode path.
+Qwen preprocessing shallow-copies the prompt and its mutable
+`additional_information` container, retaining references to tensor payloads.
+Its preparation contract replaces complete fields rather than mutating nested
+caller-owned lists or dictionaries in place.
+It clears unused supplied negative prompts to `None` before batch compatibility
+and cache-input preparation, including on downstream stages. Missing
+negative-prompt fields stay absent. CFG-enabled single requests require a string
+negative prompt; internal batched encoding accepts one string per request.
+This preserves CFG-off ignore semantics across role handoffs without clearing
+another request's shared raw negative prompt or overwriting its image conditions.
+
+Native Qwen generator batches share a padded joint sequence layout. The current
+Transformer counts padded prefix slots when positioning image tokens with RoPE,
+so attention masks alone do not preserve the positions used by separate
+requests with shorter text. This also applies to native FULL batching; output
+differences across batch compositions can include position changes as well as
+floating-point rounding.
+
+### Follow-up: per-request Qwen RoPE positions
+
+The desired contract is that padding introduced for batching does not change
+the positional inputs of an individual request. This remains unresolved.
+Derive per-request text offsets from `prompt_embeds_mask` (and
+`negative_prompt_embeds_mask` for CFG), excluding invalid padding positions.
+Map those offsets through the interleaved text/condition-image layout before
+positioning the target image. The current shared one-dimensional RoPE table
+must support row-specific positions, including prefix-cache reuse and step
+execution; changing the attention mask alone is insufficient.
+
+`test_batched_rope_preserves_positions_from_each_requests_text_mask` in
+`tests/diffusion/models/qwen_image_21/test_transformer_numerics.py` is a
+helper-level tracking test, rather than a batched Transformer or pipeline
+acceptance test. It derives standalone reference offsets from each request's
+mask. Its strict expected failures for padded rows track this gap; the
+unpadded controls guard the existing helper path. A row-aware helper signature
+will require rewriting the test, not simply removing its xfail markers. A
+repair must add integration coverage for those positional checks and cover
+condition-image layouts, positive/negative branches, request/step execution,
+and cache reuse before
+claiming that padding preserves standalone semantics. BF16 numerical
+equivalence requires separate validation even once positions agree.
 
 ## Request state and identity
 
@@ -340,6 +449,11 @@ The worker queues background packing work before it enqueues `COMPUTE_DONE`,
 but either message may reach the executor first. The result pump and
 `execute_batch()` must handle both orderings. Step mode keeps the synchronous
 result path and does not start those pumps.
+
+For request batches, the pump unpacks SHM before atomically checking the split
+map or caching the whole output under the batch ID. This also covers split-map
+registration during unpack: each request must receive its own output even when
+the batch result and compute notification race.
 
 See [Async diffusion output](../../feature/async_diffusion_output.md) for the
 multiproc request-mode timeline.

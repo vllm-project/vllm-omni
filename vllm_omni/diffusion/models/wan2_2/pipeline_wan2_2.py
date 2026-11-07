@@ -19,7 +19,10 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
+from vllm_omni.config.stage_config import (
+    DiffusionStageOperator,
+    DiffusionStageRole,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -41,6 +44,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.stage_mixin import DiffusionStageMixin
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
     resolve_wan_preencode_batch_frames,
@@ -431,6 +435,7 @@ _WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
 
 
 class Wan22Pipeline(
+    DiffusionStageMixin,
     nn.Module,
     PipelineParallelMixin,
     CFGParallelMixin,
@@ -441,6 +446,11 @@ class Wan22Pipeline(
     WanLoraLoaderMixin,
 ):
     supports_request_batch = True
+    _stage_dummy_methods = {
+        DiffusionStageOperator.DIFFUSE: "_prepare_dummy_denoise_payload",
+        DiffusionStageOperator.DECODE: "_prepare_dummy_decode_payload",
+    }
+    _stage_operator_validators = {DiffusionStageOperator.DECODE: "_validate_decode_batch_options"}
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -456,8 +466,7 @@ class Wan22Pipeline(
         od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
-        super().__init__()
-        self.od_config = od_config
+        super().__init__(od_config=od_config)
 
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
@@ -497,25 +506,16 @@ class Wan22Pipeline(
 
         self.boundary_ratio = od_config.boundary_ratio
 
-        # Diffusion stage role (Encode/Generation (EG) disaggregation and
-        # beyond). ``resolve_diffusion_stage_role`` maps the structured
-        # ``stage_role`` (falling back to the legacy ``model_stage`` string) to
-        # a ``DiffusionStageRole``. ``role_loads_component`` then decides, model
-        # -agnostically, which component groups this stage instantiates. Wan's
-        # TI2V ENCODE stage additionally owns the image VAE encoder below.
-        # ``forward`` is never called on an encode-only stage.
-        self.stage_role = resolve_diffusion_stage_role(
-            getattr(od_config, "stage_role", None),
-            getattr(od_config, "model_stage", None),
-        )
-        role = self.stage_role.value
-        self.encode_only = not role_loads_component(role, "dit")
-        load_encoder = role_loads_component(role, "encoder")
-        load_dit = role_loads_component(role, "dit")
+        # DiffusionStageMixin resolves the role and dispatches execution.
+        # Component loading uses that role; native forward performs E/G/D.
+        role = self.stage_role
+        load_encoder = role_loads_component(role, "encoder") and bool(self._encoder_modules)
+        load_dit = role_loads_component(role, "dit") and bool(self._dit_modules)
+        self.encode_only = not load_dit
         # Wan-specific capability; do not broaden the generic role groups for
         # other models. TI2V E owns image encoding, while G owns only DiT(s).
         load_image_encoder = self.stage_role == DiffusionStageRole.ENCODE and self.expand_timesteps
-        load_vae = role_loads_component(role, "vae") or load_image_encoder
+        load_vae = (role_loads_component(role, "vae") and bool(self._vae_modules)) or load_image_encoder
         self._conditioning_patch_size = (1, 2, 2)
         if load_image_encoder:
             config = load_transformer_config(model, "transformer", local_files_only)
@@ -800,45 +800,36 @@ class Wan22Pipeline(
 
         return latents
 
-    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
-        """Dispatch to the computation for this pipeline's stage role.
-
-        Centralizes diffusion disaggregation dispatch so the model runner stays
-        stage-agnostic: E encodes text and optional TI2V image conditioning, G
-        consumes conditioning without text/VAE encoding, and D decodes latents.
-        """
-        if self.stage_role == DiffusionStageRole.ENCODE:
-            return self.encode_batch(batch)
-        if batch.is_dummy_run():
-            self._prepare_dummy_stage_payload(batch)
-        if self.stage_role == DiffusionStageRole.DECODE:
-            return self.decode_batch(batch)
-        return self.forward(batch)
-
-    def _prepare_dummy_stage_payload(self, batch: DiffusionRequestBatch) -> None:
-        """Supply the upstream payload omitted by the engine's local warmup."""
-        if self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
-            text_dim = self.transformer_config.text_dim
-            transformer = self.transformer if self.transformer is not None else self.transformer_2
-            for req in batch.requests:
-                sequence_length = req.sampling_params.max_sequence_length or 512
-                prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
-                # Per-request payloads are stacked into the batch dim downstream.
-                prompt["prompt_embeds"] = torch.zeros(
+    def _prepare_dummy_denoise_payload(self, batch: DiffusionRequestBatch) -> None:
+        """Supply conditioning omitted by a local denoise warmup."""
+        text_dim = self.transformer_config.text_dim
+        transformer = self.transformer if self.transformer is not None else self.transformer_2
+        for req in batch.requests:
+            sequence_length = req.sampling_params.max_sequence_length or 512
+            prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
+            # Per-request payloads are stacked into the batch dim downstream.
+            prompt_embeds = DiffusionRequestBatch.get_prompt_field(prompt, "prompt_embeds")
+            if not isinstance(prompt_embeds, torch.Tensor):
+                prompt_embeds = torch.zeros(
                     sequence_length,
                     text_dim,
                     device=self.device,
                     dtype=transformer.dtype,
                 )
-                prompt["negative_prompt_embeds"] = torch.zeros_like(prompt["prompt_embeds"])
-                if self.expand_timesteps:
-                    height, width, frames = effective_wan_dimensions(
-                        req.sampling_params,
-                        self.vae_scale_factor_spatial,
-                        self.vae_scale_factor_temporal,
-                        self.transformer_config.patch_size,
-                    )
-                    has_image = self._request_image(prompt) is not None
+                prompt["prompt_embeds"] = prompt_embeds
+            negative_prompt_embeds = DiffusionRequestBatch.get_prompt_field(prompt, "negative_prompt_embeds")
+            if not isinstance(negative_prompt_embeds, torch.Tensor):
+                prompt["negative_prompt_embeds"] = torch.zeros_like(prompt_embeds)
+            if self.expand_timesteps:
+                height, width, frames = effective_wan_dimensions(
+                    req.sampling_params,
+                    self.vae_scale_factor_spatial,
+                    self.vae_scale_factor_temporal,
+                    self.transformer_config.patch_size,
+                )
+                has_image = self._request_image(prompt) is not None
+                metadata = DiffusionRequestBatch.get_prompt_field(prompt, "wan_conditioning_metadata")
+                if metadata is None:
                     prompt["wan_conditioning_metadata"] = conditioning_metadata(
                         height,
                         width,
@@ -847,35 +838,40 @@ class Wan22Pipeline(
                         self.vae_scale_factor_temporal,
                         has_image,
                     )
-                    if has_image:
-                        prompt["wan_image_condition"] = torch.zeros(
-                            1,
-                            self.transformer_config.out_channels,
-                            1,
-                            height // self.vae_scale_factor_spatial,
-                            width // self.vae_scale_factor_spatial,
-                            device=self.device,
-                            dtype=torch.float32,
-                        )
-                req.prompt = prompt
-        elif self.stage_role == DiffusionStageRole.DECODE:
-            height = batch.sampling_params.height or 512
-            width = batch.sampling_params.width or 512
-            num_frames = batch.sampling_params.num_frames or 1
-            latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-            for req in batch.requests:
-                prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
-                # ``decode_batch`` concatenates per-request BCTHW latents.
-                prompt["latents"] = torch.zeros(
-                    1,
-                    self.vae.config.z_dim,
-                    latent_frames,
-                    height // self.vae_scale_factor_spatial,
-                    width // self.vae_scale_factor_spatial,
-                    device=self.device,
-                    dtype=self.vae.dtype,
-                )
-                req.prompt = prompt
+                image_condition = DiffusionRequestBatch.get_prompt_field(prompt, "wan_image_condition")
+                if has_image and not isinstance(image_condition, torch.Tensor):
+                    prompt["wan_image_condition"] = torch.zeros(
+                        1,
+                        self.transformer_config.out_channels,
+                        1,
+                        height // self.vae_scale_factor_spatial,
+                        width // self.vae_scale_factor_spatial,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+            req.prompt = prompt
+
+    def _prepare_dummy_decode_payload(self, batch: DiffusionRequestBatch) -> None:
+        """Supply latents omitted by a local decoder warmup."""
+        height = batch.sampling_params.height or 512
+        width = batch.sampling_params.width or 512
+        num_frames = batch.sampling_params.num_frames or 1
+        latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        for req in batch.requests:
+            prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
+            if isinstance(DiffusionRequestBatch.get_prompt_field(prompt, "latents"), torch.Tensor):
+                continue
+            # ``decode_batch`` concatenates per-request BCTHW latents.
+            prompt["latents"] = torch.zeros(
+                1,
+                self.vae.config.z_dim,
+                latent_frames,
+                height // self.vae_scale_factor_spatial,
+                width // self.vae_scale_factor_spatial,
+                device=self.device,
+                dtype=self.vae.dtype,
+            )
+            req.prompt = prompt
 
     def _decode_latents(self, latents: torch.Tensor, output_type: str | None = "np") -> torch.Tensor:
         if latents.ndim != 5:
@@ -897,6 +893,7 @@ class Wan22Pipeline(
         return self.vae.decode(latents / latents_std + latents_mean, return_dict=False)[0]
 
     def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        self._validate_decode_batch_options(batch)
         latents_per_request: list[torch.Tensor] = []
         output_types: list[str] = []
         for req in batch.requests:
@@ -909,13 +906,9 @@ class Wan22Pipeline(
                 raise ValueError(f"Wan decode expects 5-D BCTHW latents, got shape {tuple(latents.shape)}.")
             latents_per_request.append(latents)
             output_types.append(getattr(req.sampling_params, "output_type", None) or "np")
-            if resolve_wan_preencode_mp4(req.sampling_params, output_type=output_types[-1]):
-                raise ValueError("preencode_mp4 is not supported by the Wan EGD decode stage yet.")
 
         if not latents_per_request:
             return []
-        if len(set(output_types)) != 1:
-            raise ValueError("Wan decode request batch requires the same output_type for all requests.")
         latent_shape = latents_per_request[0].shape[1:]
         if any(latents.shape[1:] != latent_shape for latents in latents_per_request[1:]):
             raise ValueError("Wan decode request batch requires matching latent CTHW shapes.")
@@ -958,6 +951,16 @@ class Wan22Pipeline(
         return outputs
 
     @staticmethod
+    def _validate_decode_batch_options(batch: DiffusionRequestBatch) -> None:
+        """Validate decoder options before a composed G->D operation starts."""
+        output_types = [getattr(req.sampling_params, "output_type", None) or "np" for req in batch.requests]
+        if len(set(output_types)) > 1:
+            raise ValueError("Wan decode request batch requires the same output_type for all requests.")
+        for request, output_type in zip(batch.requests, output_types, strict=True):
+            if resolve_wan_preencode_mp4(request.sampling_params, output_type=output_type):
+                raise ValueError("preencode_mp4 is not supported for the Wan decoder operator yet.")
+
+    @staticmethod
     def _denoise_outputs(
         batch: DiffusionRequestBatch,
         latents: torch.Tensor,
@@ -975,7 +978,6 @@ class Wan22Pipeline(
             DiffusionOutput(
                 output=None,
                 custom_output={"latents": latents[idx * num_outputs_per_prompt : (idx + 1) * num_outputs_per_prompt]},
-                to_cpu=True,
             )
             for idx in range(batch.num_reqs)
         ]
@@ -1182,7 +1184,12 @@ class Wan22Pipeline(
         # without pinning a CUDA/XPU context on the receiver.
         return DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
 
-    def _validate_generation_batch(self, batch: DiffusionRequestBatch, *, uses_text_encoder: bool) -> None:
+    def _validate_generation_batch(
+        self,
+        batch: DiffusionRequestBatch,
+        *,
+        uses_text_encoder: bool,
+    ) -> None:
         # Do not reuse the scheduler's raw/global key: FULL also supports direct
         # SimpleNamespace callers, rounded-equivalent dimensions and precomputed
         # embeddings. Only settings consumed from the first request belong here.
@@ -1206,8 +1213,6 @@ class Wan22Pipeline(
             }
             if uses_text_encoder:
                 current["max_sequence_length"] = sampling.max_sequence_length or 512
-            if self.stage_role != DiffusionStageRole.DENOISE:
-                current["output_type"] = sampling.output_type or "np"
             if not self.is_dmd:
                 current["num_inference_steps"] = (
                     40 if sampling.num_inference_steps is None else sampling.num_inference_steps
@@ -1217,20 +1222,30 @@ class Wan22Pipeline(
             settings.append(current)
         validate_wan_batch_settings(settings, stage="generation")
 
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def diffuse_batch(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Consume encoded conditioning and produce final latents, without E/D."""
+        self._validate_generation_batch(req, uses_text_encoder=False)
+        if self.expand_timesteps:
+            self._stage_image_condition(req)
+        for request in req.requests:
+            positive = DiffusionRequestBatch.get_prompt_field(request.prompt, "prompt_embeds")
+            negative = DiffusionRequestBatch.get_prompt_field(request.prompt, "negative_prompt_embeds")
+            if not isinstance(positive, torch.Tensor) or positive.ndim != 2:
+                raise ValueError("Wan generation stage requires 2-D 'prompt_embeds' from the encode stage.")
+            if negative is not None and (not isinstance(negative, torch.Tensor) or negative.shape != positive.shape):
+                raise ValueError("Wan 'negative_prompt_embeds' must match the per-request prompt_embeds shape.")
+            guidance = resolve_wan_guidance_scales(
+                request.sampling_params, default_guidance_scale=1.0 if getattr(self, "is_dmd", False) else 4.0
+            )
+            if max(guidance) > 1.0 and negative is None:
+                raise ValueError("Wan generation stage requires 'negative_prompt_embeds' when CFG is enabled.")
+        latents = self._generate_latents(req)
+        return self._denoise_outputs(req, latents, req.sampling_params_list[0].num_outputs_per_prompt or 1)
+
+    def _generate_latents(self, req: DiffusionRequestBatch) -> torch.Tensor:
+        """Shared native generation, retaining FULL's encoding and RNG order."""
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
-        disaggregated = self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE)
-        if disaggregated:
-            for request_prompt in req.prompts:
-                positive = DiffusionRequestBatch.get_prompt_field(request_prompt, "prompt_embeds")
-                negative = DiffusionRequestBatch.get_prompt_field(request_prompt, "negative_prompt_embeds")
-                if not isinstance(positive, torch.Tensor) or positive.ndim != 2:
-                    raise ValueError("Wan generation stage requires 2-D 'prompt_embeds' from the encode stage.")
-                if negative is not None and (
-                    not isinstance(negative, torch.Tensor) or negative.shape != positive.shape
-                ):
-                    raise ValueError("Wan 'negative_prompt_embeds' must match the per-request prompt_embeds shape.")
         prompt_texts = [prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts]
         negative_prompts = [
             None if isinstance(prompt, str) else prompt.get("negative_prompt") for prompt in req.prompts
@@ -1246,12 +1261,12 @@ class Wan22Pipeline(
         negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
         guidance_low, guidance_high = resolve_wan_guidance_scales(
             common,
-            default_guidance_scale=1.0 if self.is_dmd else 4.0,
+            default_guidance_scale=1.0 if getattr(self, "is_dmd", False) else 4.0,
         )
         self._validate_generation_batch(
             req,
-            uses_text_encoder=not disaggregated
-            and (prompt_embeds is None or (negative_prompt_embeds is None and max(guidance_low, guidance_high) > 1.0)),
+            uses_text_encoder=prompt_embeds is None
+            or (negative_prompt_embeds is None and max(guidance_low, guidance_high) > 1.0),
         )
         prompt: list[str] | None = prompt_texts if prompt_embeds is None else None
         negative_prompt: list[str] | None = None
@@ -1276,15 +1291,14 @@ class Wan22Pipeline(
                 self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
             )
 
-        output_type = common.output_type or "np"
-        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
-        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
-        if disaggregated and (guidance_low > 1.0 or guidance_high > 1.0) and negative_prompt_embeds is None:
-            raise ValueError("Wan generation stage requires 'negative_prompt_embeds' when CFG is enabled.")
-        stage_condition = self._stage_image_condition(req) if disaggregated and self.expand_timesteps else None
+        has_image_payload = self.expand_timesteps and any(
+            DiffusionRequestBatch.get_prompt_field(prompt, "wan_conditioning_metadata") is not None
+            for prompt in req.prompts
+        )
+        stage_condition = self._stage_image_condition(req) if has_image_payload else None
 
         # record guidance for properties
         self._guidance_scale = guidance_low
@@ -1312,10 +1326,7 @@ class Wan22Pipeline(
         elif self.transformer_2 is not None:
             dtype = self.transformer_2.dtype
         else:
-            if disaggregated:
-                raise RuntimeError("Wan generation stage requires a loaded DiT.")
-            # Fallback to text_encoder dtype if no transformer loaded
-            dtype = self.text_encoder.dtype
+            raise RuntimeError("Wan generation requires a loaded DiT.")
 
         generator = req.collate_request_generators(num_outputs_per_prompt, None)
         request_latents = req.collate_request_tensors("latents", None)
@@ -1323,10 +1334,11 @@ class Wan22Pipeline(
         if DEBUG_PERF:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
-            _t_pipeline_start = time.perf_counter()
-            _t_text_enc_start = _t_pipeline_start
+            _t_text_enc_start = time.perf_counter()
         do_classifier_free_guidance = guidance_low > 1.0 or guidance_high > 1.0
         if prompt_embeds is None:
+            if self.text_encoder is None:
+                raise ValueError("Wan generation requires 'prompt_embeds' when the text encoder is not loaded.")
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -1343,6 +1355,8 @@ class Wan22Pipeline(
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
                 negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
             elif do_classifier_free_guidance:
+                if self.text_encoder is None:
+                    raise ValueError("Wan generation requires 'negative_prompt_embeds' when CFG is enabled.")
                 _, negative_prompt_embeds = self.encode_prompt(
                     prompt=[""] * req.num_reqs,
                     negative_prompt=negative_prompt,
@@ -1383,15 +1397,15 @@ class Wan22Pipeline(
             _t_latent_prep_start = time.perf_counter()
         # G never opens media or invokes a VAE encoder; original controls may
         # remain on the request for handoff/debugging without being consumed.
-        images = [] if disaggregated else [self._request_image(prompt) for prompt in req.prompts]
+        images = [] if has_image_payload else [self._request_image(prompt) for prompt in req.prompts]
 
         latent_condition = None
         first_frame_mask = None
 
         if self.expand_timesteps and (stage_condition is not None or any(image is not None for image in images)):
-            if not disaggregated and not all(image is not None for image in images):
+            if not has_image_payload and not all(image is not None for image in images):
                 raise ValueError("Cannot batch Wan requests with a mix of provided and missing image conditions.")
-            if not disaggregated:
+            if not has_image_payload:
                 image_tensor = prepare_wan_image_tensor(images, height, width, self.vae_scale_factor_spatial)
                 # Preserve FULL's batch/fan-out and RNG order: noise first,
                 # then posterior mode on the repeated image batch.
@@ -1414,7 +1428,7 @@ class Wan22Pipeline(
                 latents=request_latents,
             )
 
-            if disaggregated:
+            if has_image_payload:
                 latent_condition = stage_condition.repeat_interleave(num_outputs_per_prompt, dim=0)
                 expected_shape = (
                     batch_size,
@@ -1488,9 +1502,28 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-        if self.stage_role == DiffusionStageRole.DENOISE:
-            return self._denoise_outputs(req, latents, num_outputs_per_prompt)
+        if DEBUG_PERF and _is_rank_zero():
+            logger.info(
+                "Wan generation timing: TextEncoding=%.2f ms, LatentPreparation=%.2f ms, Denoising=%.2f ms (%d steps)",
+                _t_text_enc_ms,
+                _t_latent_prep_ms,
+                _t_denoise_ms,
+                len(timesteps),
+            )
+        return latents
 
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Complete E/G/D computation; role selection is owned by run_stage."""
+        common = req.sampling_params_list[0]
+        validate_wan_batch_settings(
+            [{"output_type": sampling.output_type or "np"} for sampling in req.sampling_params_list],
+            stage="generation",
+        )
+        output_type = common.output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
+        num_outputs_per_prompt = common.num_outputs_per_prompt or 1
+        latents = self._generate_latents(req)
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
         media = None
@@ -1538,27 +1571,9 @@ class Wan22Pipeline(
                 else:
                     output = decoded
 
-        if DEBUG_PERF:
+        if DEBUG_PERF and _is_rank_zero():
             current_omni_platform.synchronize()
-            _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
-            _t_pipeline_wall_ms = (time.perf_counter() - _t_pipeline_start) * 1000
-            _t_stages_sum = _t_text_enc_ms + _t_latent_prep_ms + _t_denoise_ms + _t_decode_ms
-
-            if _is_rank_zero():
-                logger.info(
-                    "Pipeline stage timing summary: "
-                    "TextEncoding=%.2f ms, LatentPreparation=%.2f ms, "
-                    "Denoising=%.2f ms (%d steps), Decoding=%.2f ms, "
-                    "StagesSum=%.2f ms, PipelineWall=%.2f ms, Unaccounted=%.2f ms",
-                    _t_text_enc_ms,
-                    _t_latent_prep_ms,
-                    _t_denoise_ms,
-                    len(timesteps),
-                    _t_decode_ms,
-                    _t_stages_sum,
-                    _t_pipeline_wall_ms,
-                    _t_pipeline_wall_ms - _t_stages_sum,
-                )
+            logger.info("Wan decoding timing: Decoding=%.2f ms", (time.perf_counter() - _t_decode_start) * 1000)
 
         return split_diffusion_output_by_request(
             DiffusionOutput(
