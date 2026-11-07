@@ -89,8 +89,9 @@ def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatc
     assert upstream.init_model_state is original_initializer
 
 
-def test_load_model_rejects_request_rng_before_serving(monkeypatch):
+def test_load_model_allows_request_rng_model(monkeypatch):
     import vllm.v1.worker.gpu.model_runner as upstream
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     from vllm_omni.worker_v2 import omni_model_runner as module
 
@@ -98,20 +99,18 @@ def test_load_model_rejects_request_rng_before_serving(monkeypatch):
         supports_mm_request_rng = True
 
     runner = object.__new__(module.OmniGPUModelRunner)
+    runner.jit_warmup_registry = JitWarmupRegistry(None)
+    runner.use_aux_hidden_state_outputs = False
     model = RequestRNGModel()
     original_initializer = upstream.init_model_state
-
-    def unexpected_model_state(*args):
-        pytest.fail("Unsupported request RNG reached MRv2 model state initialization")
-
-    monkeypatch.setattr(module, "init_omni_model_state", unexpected_model_state)
+    model_state = object()
+    monkeypatch.setattr(module, "init_omni_model_state", lambda *args: model_state)
 
     def load(parent):
         parent.model = model
-        upstream.init_model_state(None, model, None, None)
-        pytest.fail("Unsupported request RNG reached MRv2 sampler initialization")
+        parent.model_state = upstream.init_model_state(None, model, None, None)
 
     monkeypatch.setattr(upstream.GPUModelRunner, "load_model", load)
-    with pytest.raises(NotImplementedError, match="model_runner: v1"):
-        runner.load_model()
+    runner.load_model()
+    assert runner.model is model and runner.model_state is model_state
     assert upstream.init_model_state is original_initializer

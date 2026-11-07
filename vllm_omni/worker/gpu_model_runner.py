@@ -147,8 +147,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
     def shutdown(self) -> None:
         if self._mm_rng_provider is not None:
-            self._mm_rng_provider.handles.clear()
-            self._mm_rng_provider.streams.clear()
+            self._mm_rng_provider.clear()
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
@@ -656,6 +655,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             seed_field = model.mm_rng_seed_field
             for new_req in scheduler_output.scheduled_new_reqs:
                 if new_req.req_id in self.requests and new_req.req_id not in scheduler_output.finished_req_ids:
+                    # Admission validates user inputs. Preserving the seed and
+                    # references of a live request is an internal state invariant.
                     old_features = self.requests[new_req.req_id].mm_features
                     seeds = [
                         next(

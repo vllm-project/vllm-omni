@@ -51,6 +51,8 @@ class RequestRNGProvider:
     Checkpoints denote *logical* image positions, not executed encoder calls.
     They survive preemption and encoder eviction, but never request completion.
     All access runs on the worker's serialized eager encoder execution path.
+    Seeds and metadata are validated at admission. Plan/posterior mismatches
+    below are internal invariants; they must fail rather than corrupt conditioning.
     """
 
     def __init__(self, advance: Callable[[torch.Generator, RandomDrawSpec], None]):
@@ -79,6 +81,11 @@ class RequestRNGProvider:
         handle = self.handles.pop(req_id, None)
         if handle is not None:
             self.streams.pop(handle, None)
+
+    def clear(self) -> None:
+        """Release every request's RNG state without reusing old handles."""
+        self.handles.clear()
+        self.streams.clear()
 
     @contextmanager
     def sample(self, handle: int, mm_index: int, actual: RandomDrawSpec) -> Iterator[torch.Generator]:

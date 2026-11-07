@@ -1055,6 +1055,14 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
         seed = inputs.hf_processor_mm_kwargs.get("vae_generator_seed")
         if seed is not None:
             self._validate_vae_generator_seed(seed)
+            # MRv2 lacks request RNG tagging. Reject before any cache access,
+            # while allowing seedless inputs and model-profiling dummy images.
+            if inputs.mm_data_items.get_count("image", strict=False) and getattr(
+                self.info.ctx.model_config, "use_v2_model_runner", False
+            ):
+                raise VLLMValidationError(
+                    "Hunyuan seeded image requests are not supported by MRv2. Set model_runner: v1 for this stage."
+                )
         return super().apply(inputs, timing_ctx)
 
     def _get_mm_hashes(self, inputs: ProcessorInputs) -> MultiModalHashes:

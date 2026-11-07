@@ -124,12 +124,44 @@ def test_seedless_references_reuse_images_across_prefixes(cached_request):
     assert hits[1] is items[0] and "vae_generator_seed" not in hits[1]
 
 
-def test_profile_dummy_inputs_do_not_inherit_configured_request_seed(real_processor):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_profile_dummy_inputs_do_not_inherit_configured_request_seed(real_processor, use_v2):
     processor, image_counts = real_processor
+    processor.info.ctx.model_config.use_v2_model_runner = use_v2
     processor.info.ctx.model_config.multimodal_config.mm_processor_kwargs = {"vae_generator_seed": 42}
     result = processor.get_dummy_mm_inputs({"image": 1})
     assert image_counts == [1]
     assert "vae_generator_seed" not in result["mm_kwargs"]["image"][0]
+
+
+@pytest.mark.parametrize("seed", [0, 42])
+@pytest.mark.parametrize("cached", [False, True])
+def test_mrv2_rejects_seeded_images_before_cache_access(real_processor, processor_cache, mocker, seed, cached):
+    processor, image_counts = real_processor
+    model_config = processor.info.ctx.model_config
+    inputs = make_inputs(processor, [Image.new("RGB", (4, 4), "red")], ["image-uuid"], seed, processor_cache)
+    if cached:
+        processor.apply(inputs, TimingContext(enabled=False))
+        inputs = replace(inputs, mm_data_items=processor.info.get_data_parser().parse_mm_data({"image": [None]}))
+    image_counts.clear()
+    cache_access = mocker.spy(processor_cache, "get_and_update_item")
+    model_config.use_v2_model_runner = True
+    with pytest.raises(VLLMValidationError, match="MRv2.*model_runner: v1"):
+        processor.apply(inputs, TimingContext(enabled=False))
+    assert image_counts == []
+    cache_access.assert_not_called()
+    # Reject only this request; the same processor still accepts seedless images.
+    valid = make_inputs(processor, [Image.new("RGB", (4, 4), "blue")], ["next-image"], None, processor_cache)
+    result = processor.apply(valid, TimingContext(enabled=False))
+    assert "vae_generator_seed" not in result["mm_kwargs"]["image"][0]
+
+
+def test_mrv2_allows_seed_without_images(real_processor):
+    processor, _ = real_processor
+    processor.info.ctx.model_config.use_v2_model_runner = True
+    inputs = make_inputs(processor, [], [], 42, None)
+    result = processor.apply(inputs, TimingContext(enabled=False))
+    assert not result["mm_kwargs"].get("image")
 
 
 @pytest.mark.parametrize("seed", [-(2**63) - 1, 2**63, 1.5, "42", True])

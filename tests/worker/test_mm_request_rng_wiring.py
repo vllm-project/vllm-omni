@@ -11,7 +11,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_omni.model_executor.mm_request_rng import RequestRNGProvider
+from vllm_omni.model_executor.mm_request_rng import RandomDrawSpec, RequestRNGProvider
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -81,3 +81,14 @@ def test_load_model_binds_request_rng_only_for_opted_in_models(runner_class, moc
         assert runner._mm_rng_provider is None
         model.bind_mm_rng_provider.assert_not_called()
     model.advance_mm_rng.assert_not_called()
+    provider = runner._mm_rng_provider
+    if provider is not None:
+        spec = RandomDrawSpec((1,), torch.float32, torch.device("cpu"))
+        for req_id in ("A", "B"):
+            provider.register(req_id, 42, {0: spec})
+    mocker.patch.object(runner, "_shutdown_omni_prefix_cache")
+    mocker.patch.object(GPUModelRunner, "shutdown")
+    runner.shutdown()
+    runner.shutdown()
+    if provider is not None:
+        assert not provider.handles and not provider.streams

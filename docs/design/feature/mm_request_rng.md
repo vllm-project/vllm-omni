@@ -41,10 +41,15 @@ Preemption retains state; completion/abort/shutdown release it. Reused request I
 get new handles; live updates must preserve references, seed and draw plan.
 All-prefix hits need no generator until encoding becomes necessary.
 
-GPU/NPU `load_model` binds the provider. MRv2 rejects this unsupported capability
-at startup; use `model_runner: v1`. Execution is serialized eager encoding;
+GPU/NPU v1 `load_model` binds the provider. MRv2 allows model loading and seedless
+inputs, but rejects seeded image requests during preprocessing before cache access;
+use `model_runner: v1` for those requests. Execution is serialized eager encoding;
 encoder CUDA graph capture is outside scope. Seed zero enables request sampling.
-Seedless AR retains global-RNG sampling and image-based cache reuse.
+Seedless AR (no effective `vae_generator_seed`) intentionally retains global-RNG
+sampling and image-based cache reuse. Multiple requests may share the encoder
+output from one VAE posterior sample. Re-encoding after eviction may produce a
+new sample; it does not replace KV already materialized from an earlier sample.
+Seeded requests retain the sequential sampling and cache identity contract above.
 
 ## Separate DiT questions
 
@@ -58,16 +63,21 @@ Suggested validation compares initial noise and final RNG state across miss,
 hit and import paths, including unequal/repeated references and supported CFG modes.
 
 DiT identity uses an explicit generator's state ahead of a numeric seed, falling
-back to request ID without either. AR's seedless reuse policy differs. A shared
-seedless policy, cross-stage identity alignment and missing-only transfer remain
-separate integration work, per the [original scope](https://github.com/vllm-project/vllm-omni/issues/9192#issuecomment-6407797456).
-These are open questions, not an agreed export protocol or import-rejection policy.
-Matching RNG consumption alone does not establish compatible conditioning or KV.
+back to request ID without either. This conservative DiT policy remains in place;
+retaining AR's seedless reuse does not require a common default seed or identical
+seedless cache policies. The pipeline currently rejects combining AR-KV imports
+with local prefix hits. Future KV substitution or concatenation must establish
+equivalent sampled conditioning and prefix context; image identity or matching
+RNG consumption alone is insufficient. Cross-stage cache identity alignment and
+missing-only transfer remain integration work under the
+[original scope](https://github.com/vllm-project/vllm-omni/issues/9192#issuecomment-6407797456).
 
 ## Validation
 
 Tests cover processor/cache paths, scheduler/runner batching, replay and lifecycle.
-Load-hook tests replace hardware dependencies; they are not NPU inference evidence.
+CPU load-hook tests replace hardware dependencies. The NPU dispatch test uses the
+real Ascend runner and a weight-free Hunyuan VAE on CPU to verify tagging and replay;
+it requires Ascend dependencies and is included in NPU CI. It is not NPU inference evidence.
 Real random-weight VAE tests use smaller CPU widths/images and the
 [complete official encoder config](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct/blob/2ec2c78bee7d4b94157341fba86c4c2c7b1858b2/config.json)
 on CUDA at 1024x1024, 768x1024 and 1024x768 with native 384-pixel spatial tiling.
@@ -75,6 +85,7 @@ They check posterior specs, samples and RNG state; CUDA request tests also cover
 No pretrained quality, distributed TP, NPU hardware or AR-to-DiT E2E claim is made.
 
 ```bash
-python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py tests/worker/test_mm_request_rng_wiring.py -m 'core_model and cpu' -q
+python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py tests/worker/test_mm_request_rng_wiring.py tests/worker_v2/test_shared_stage_contracts.py -m 'core_model and cpu' -q
+python -m pytest tests/platforms/npu/test_mm_request_rng.py -m 'core_model and npu and A3' --run-level=core_model -q
 python -m pytest tests/model_executor/models/test_hunyuan_request_rng.py -m 'core_model and cuda and L4' --run-level=core_model -q
 ```
