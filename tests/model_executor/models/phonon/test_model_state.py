@@ -95,6 +95,7 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
             output = state.prepare_streaming_audio_output(batch, None, marker)
             assert output.get_output()[0] is not None
             assert bool(model._continue[0]) == (step == 0)
+        old_histories = [module.history.clone() for module in model.mimi.modules() if hasattr(module, "history")]
         old_audio = output.audio.clone()
         state.remove_request(0)
         torch.testing.assert_close(output.audio, old_audio)
@@ -105,9 +106,9 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch):
         assert state.tail_frames[0] == 3
         assert state.next_embeddings.count_nonzero() == 0
         assert state.active[0]
-        for module in model.mimi.modules():
-            if hasattr(module, "history"):
-                assert module.history.count_nonzero() == 0
+        histories = [module.history for module in model.mimi.modules() if hasattr(module, "history")]
+        for actual, previous in zip(histories, old_histories, strict=True):
+            torch.testing.assert_close(actual, previous)
     with pytest.raises(RuntimeError, match="preempted"):
         state.on_request_preempted("second", 0)
 

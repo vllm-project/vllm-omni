@@ -81,4 +81,15 @@ def test_official_checkpoint_streaming_smoke():
         for name, value in decoder.named_buffers():
             if "scratch" not in name:
                 torch.testing.assert_close(value, expected_state[name])
+        decoder.reset_slots(slots)
+        reference = [
+            decoder(latent, slots, torch.tensor([step * decoder.upsample_ratio]))
+            for step, latent in enumerate(latents[:2])
+        ]
+        for name, buffer in decoder.named_buffers():
+            if name.endswith(("history", "key_pool", "value_pool")):
+                buffer.fill_(float("nan"))
+        for step, latent in enumerate(latents[:2]):
+            reused = compiled(latent, slots, torch.tensor([step * decoder.upsample_ratio]))
+            torch.testing.assert_close(reused, reference[step])
     sys.modules.pop(spec.name)

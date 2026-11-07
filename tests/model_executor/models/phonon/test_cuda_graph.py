@@ -60,7 +60,10 @@ def test_graph_stream_handoff_and_slot_reset():
         tail_positions = positions + eager.upsample_ratio
         expected_tail = eager(codec_latent, slot, tail_positions)
         old_tail, tail_event = runner.decode(codec_latent, slot, tail_positions)
-        runner.reset_slots(1)
+        with torch.cuda.stream(runner.stream):
+            for name, buffer in captured.named_buffers():
+                if name.endswith(("history", "key_pool", "value_pool")):
+                    buffer.fill_(float("nan"))
         eager.reset_slots(slot)
         positions.zero_()
         actual, event = runner.decode(codec_latent, slot, positions)
