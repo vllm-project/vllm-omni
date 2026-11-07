@@ -40,7 +40,7 @@ ARCH = "VibeVoiceForConditionalGeneration"
 
 
 @pytest.fixture
-def processor(tmp_path, mocker):
+def processor(tmp_path, mocker, request):
     config = VibeVoiceConfig(
         text_config={"hidden_size": 32, "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": 8},
         audio_bos_token_id=1,
@@ -56,7 +56,7 @@ def processor(tmp_path, mocker):
             WordLevel({"<unk>": 0, AUDIO_BOS: 1, AUDIO_EOS: 2, AUDIO_TOKEN: 3, "<|endoftext|>": 4}, unk_token="<unk>")
         )
     )
-    mm_config = MultiModalConfig(limit_per_prompt={"audio": 1})
+    mm_config = MultiModalConfig(limit_per_prompt={"audio": getattr(request, "param", 1)})
     model_config = mocker.Mock(
         spec=ModelConfig,
         model=str(tmp_path),
@@ -155,6 +155,26 @@ def test_reference_resampling_and_rejection(processor):
     for array in (np.empty(0), np.array([np.nan]), np.zeros(60 * 24000 + 1)):
         with pytest.raises(ValueError):
             _apply(processor, ids, (array, 24000))
+
+
+@pytest.mark.parametrize("processor", [4], indirect=True)
+@pytest.mark.parametrize("count", [2, 4])
+def test_multiple_references(processor, count):
+    audios = [(np.linspace(-0.1, 0.1, 3200 * n + 1, dtype=np.float32), 24000) for n in range(count)]
+    ids = [1, 3, 2] * count + [1]
+    cache = MultiModalProcessorOnlyCache(processor.info.ctx.model_config)
+    for _ in range(2):  # expansion also works on processor-cache hits
+        result = _apply(processor, ids, audios, cache)
+        data = result["mm_kwargs"].get_data()
+        assert data["audio_num_tokens"].tolist() == list(range(1, count + 1))
+        assert data["audio_num_tokens"].dtype == torch.int64
+        assert [p.length for p in result["mm_placeholders"]["audio"]] == list(range(1, count + 1))
+    with pytest.raises(ValueError, match="unexpanded placeholder"):
+        _apply(processor, ids + [3], audios)
+    with pytest.raises(ValueError, match="unexpanded placeholder"):
+        _apply(processor, [1, 3, 2], audios)
+    with pytest.raises(VLLMValidationError, match="At most 4"):
+        _apply(processor, [1, 3, 2] * 5, [audios[0]] * 5)
 
 
 def test_startup_rejects_unsupported_runtime(mocker):
