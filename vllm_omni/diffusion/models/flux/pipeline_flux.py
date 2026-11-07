@@ -493,13 +493,14 @@ class FluxPipeline(
                 negative_kwargs = None
 
             # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg,
-                true_cfg_scale,
-                positive_kwargs,
-                negative_kwargs,
-                cfg_normalize,
-            )
+            with self._cache_step_metadata(i, len(timesteps)):
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg,
+                    true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    cfg_normalize,
+                )
 
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)

@@ -164,6 +164,45 @@ def _apply_test_hook(
     )
 
 
+def test_hook_consumes_cfg_branch_stamps() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    for step, branch, value in (
+        (0, "positive", 1.0),
+        (0, "negative", 10.0),
+        (1, "positive", 1.0),  # A non-CFG step must not flip the next branch.
+        (2, "positive", 1.0),
+        (2, "negative", 10.0),
+    ):
+        metadata.step = step
+        transformer.cfg_branch = branch
+        output = _run_step(transformer, 500, value)
+        torch.testing.assert_close(output, torch.full((1, 8, 2), 2 * value), rtol=0, atol=0)
+        assert hook.state_manager._current_context is None
+
+    assert set(hook.state_manager._states) == {"cond", "uncond"}
+    assert hook.full_count == 3  # The negative branch refreshes after its missing step.
+    assert hook.skip_count == 2
+
+
+def test_hook_inferred_context_restored_on_error(monkeypatch) -> None:
+    transformer = TinyCosmos3Transformer()
+    transformer.cfg_branch = "negative"
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+
+    def fail_negative(hidden):
+        assert hook.state_manager._current_context == "uncond"
+        raise RuntimeError("negative forward failed")
+
+    monkeypatch.setattr(transformer, "_run_gen_layers", fail_negative)
+    with pytest.raises(RuntimeError, match="negative forward failed"):
+        _run_step(transformer, 500, 1.0)
+
+    assert hook.state_manager._current_context is None
+
+
 def test_config_validation() -> None:
     assert SeaCacheConfig().threshold == 0.25
     with pytest.raises(ValueError, match="residual_order"):
@@ -172,10 +211,10 @@ def test_config_validation() -> None:
         SeaCacheConfig(max_consecutive_cached=-1)
 
 
-def test_sea_filter_matches_reference_equation() -> None:
+@pytest.mark.parametrize("power_exp", [2.0, 3.0])
+def test_sea_filter_matches_reference_equation(power_exp: float) -> None:
     hidden = torch.randn(3, 4, 5, 2, dtype=torch.float32)
     sigma = 0.4
-    power_exp = 3.0
 
     spectrum = torch.fft.fftn(hidden, dim=(0, 1, 2))
     gain = None
@@ -225,24 +264,25 @@ def test_indicator_distance_and_linear_extrapolation() -> None:
     )
 
 
-def test_hook_skips_middle_steps_and_forces_endpoints() -> None:
+@pytest.mark.parametrize("cap, full_count, skip_count, history", [(2, 3, 3, [3, 5]), (0, 2, 4, [0, 5])])
+def test_hook_skips_middle_steps_and_forces_endpoints(cap, full_count, skip_count, history) -> None:
     transformer = TinyCosmos3Transformer()
-    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=4)
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=6)
     hook = _apply_test_hook(
         transformer,
         metadata,
-        SeaCacheConfig(threshold=100.0, max_consecutive_cached=2),
+        SeaCacheConfig(threshold=100.0, max_consecutive_cached=cap),
     )
     hook.refresh(transformer)
 
-    for step, timestep in enumerate((1000, 750, 500, 250)):
+    for step, timestep in enumerate((1000, 850, 700, 550, 400, 250)):
         metadata.step = step
         metadata.sigma = timestep / 1000
         _run_step(transformer, timestep, 1.0 - step * 0.01, hook=hook)
 
-    assert hook.full_count == 2
-    assert hook.skip_count == 2
-    assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
+    assert hook.full_count == full_count
+    assert hook.skip_count == skip_count
+    assert [step for step, _ in hook.state_manager._states["cond"].history] == history
 
 
 def test_parameter_sharded_hook_skips_when_all_shard_ranks_agree(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -480,6 +520,7 @@ def test_parameter_sharded_hook_fails_open_without_distributed_state(
 
 def test_hook_keeps_three_transfer_branches_separate() -> None:
     transformer = TinyCosmos3Transformer()
+    transformer.cfg_branch = "negative"  # Explicit transfer contexts take precedence.
     metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
     hook = _apply_test_hook(transformer, metadata)
     hook.refresh(transformer)
@@ -497,6 +538,7 @@ def test_hook_keeps_three_transfer_branches_separate() -> None:
     assert hook.skip_count == 3
     assert len(hook.state_manager._states["cond"].previous_indicator) == 2
     assert len(hook.state_manager._states["cond_no_control"].previous_indicator) == 1
+    assert hook.state_manager._current_context is None
 
 
 def test_hook_fails_open_without_noisy_vision() -> None:
@@ -536,13 +578,19 @@ def test_conditioning_only_model_failure_runs_forward_once(monkeypatch: pytest.M
     assert forward_calls == 1
 
 
-def test_hook_fails_open_without_explicit_context() -> None:
+@pytest.mark.parametrize("branch", [None, "unknown"])
+def test_hook_fails_open_without_context_or_valid_branch(branch) -> None:
     transformer = TinyCosmos3Transformer()
-    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=2)
+    transformer.cfg_branch = branch
+    transformer.do_true_cfg = True
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=3)
     hook = _apply_test_hook(transformer, metadata)
     hook.refresh(transformer)
 
-    _run_step(transformer, 1000, 1.0)
+    for step, value in enumerate((1.0, 2.0)):
+        metadata.step = step
+        output = _run_step(transformer, 500, value)
+        torch.testing.assert_close(output, torch.full((1, 8, 2), 2 * value), rtol=0, atol=0)
 
     assert hook.full_count == 0
     assert hook.skip_count == 0
@@ -591,6 +639,7 @@ def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     backend.enable(pipeline)
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
     assert isinstance(hook, SeaCacheRootHook)
+    assert (hook.config.power_exp, hook.config.max_consecutive_cached) == (3.0, 2)
     assert callable(getattr(pipeline, "_cache_context_factory", None))
     for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
         assert not hasattr(pipeline.transformer, name)
@@ -633,5 +682,5 @@ def test_shared_config_defaults() -> None:
     config = DiffusionCacheConfig()
     assert config.sea_threshold == 0.25
     assert config.sea_residual_order == 1
-    assert config.sea_max_consecutive_cached == 2
-    assert config.sea_power_exp == 3.0
+    assert config.sea_max_consecutive_cached is None
+    assert config.sea_power_exp is None
