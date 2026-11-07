@@ -323,15 +323,22 @@ class Attention(nn.Module):
                     attn_backend_explicit=self.backend_explicit,
                 )
 
-        self.parallel_strategy = build_parallel_attention_strategy(
-            scatter_idx=scatter_idx,
-            gather_idx=gather_idx,
-            use_sync=use_sync,
-            causal=causal,
-            cross_parallel_layout=self.cross_parallel_layout if self._explicit_cross_contract else None,
-        )
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
+        if skip_sequence_parallel:
+            # A layer that opts out of SP never runs a strategy, so it is not
+            # held to strategy-specific constraints either -- e.g. the
+            # AllGather-KV non-causal requirement on a model's causal prefill
+            # layer that only ever sees the full sequence replicated per rank.
+            self.parallel_strategy = self._no_parallel_strategy
+        else:
+            self.parallel_strategy = build_parallel_attention_strategy(
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+                use_sync=use_sync,
+                causal=causal,
+                cross_parallel_layout=self.cross_parallel_layout if self._explicit_cross_contract else None,
+            )
 
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
