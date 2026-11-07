@@ -36,7 +36,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
+from vllm_omni.diffusion.layers.indexed_modulation import (
+    indexed_scale_shift_,
+    indexed_scale_shift_to_fp32,
+)
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.platforms import current_omni_platform
@@ -584,9 +587,12 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = indexed_scale_shift_(h, shift, scale, inverse_indices)
-        # Preserve full precision through both final output projections.
-        h = h.to(_FP32_DTYPE)
+        if current_omni_platform.is_cuda():
+            # Keep BF16 affine rounding while eliminating the separate FP32
+            # cast launch and its BF16 intermediate write/read.
+            h = indexed_scale_shift_to_fp32(h, shift, scale, inverse_indices)
+        else:
+            h = indexed_scale_shift_(h, shift, scale, inverse_indices).to(_FP32_DTYPE)
         if self.pdd_steps is not None:
             return self.video_out(h, pdd_step), self.audio_out(h, pdd_step)
         video, _ = self.video_out(h)
