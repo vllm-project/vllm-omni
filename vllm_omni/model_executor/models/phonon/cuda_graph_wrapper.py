@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fixed-address codec graphs and single-in-flight side-stream handoff."""
+"""Fixed-address codec graphs with main-stream Mimi execution."""
 
 import torch
 
@@ -9,7 +9,7 @@ class MimiDecodeRunner:
     def __init__(self, decoder, *, capture=True):
         self.decoder = decoder
         device = next(decoder.parameters()).device
-        self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
         self.capture = capture and self.stream is not None
         self._forward = (
             torch.compile(
@@ -22,16 +22,9 @@ class MimiDecodeRunner:
             else decoder.forward
         )
         self.buckets = {}
-        if self.stream is not None:
-            self.stream.wait_stream(torch.cuda.current_stream(device))
 
     def reset_slots(self, slot: int):
-        if self.stream is None:
-            self.decoder.reset_slots(slot)
-            return
-        # Decode, owned PCM snapshot and slot reset share the same stream order.
-        with torch.cuda.stream(self.stream):
-            self.decoder.reset_slots(slot)
+        self.decoder.reset_slots(slot)
 
     def _bucket(self, batch):
         if batch in self.buckets:
@@ -47,7 +40,7 @@ class MimiDecodeRunner:
             for _ in range(3):
                 self._forward(latent, slots, positions)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=self.stream):
+            with torch.cuda.graph(graph):
                 output = self._forward(latent, slots, positions)
             for name, value in self.decoder.named_buffers():
                 value.copy_(state[name])
@@ -61,26 +54,17 @@ class MimiDecodeRunner:
         if self.stream is None:
             return self._forward(latent, slots, positions), None
         main = torch.cuda.current_stream(latent.device)
-        ready = torch.cuda.Event()
-        ready.record(main)
-        with torch.cuda.stream(self.stream):
-            self.stream.wait_event(ready)
-            static_latent, static_slots, static_positions, graph, output = self._bucket(latent.shape[0])
-            static_latent.copy_(latent)
-            static_slots.copy_(slots)
-            static_positions.copy_(positions)
-            copied = torch.cuda.Event()
-            copied.record(self.stream)
-            if graph is None:
-                output = self._forward(static_latent, static_slots, static_positions)
-            else:
-                graph.replay()
-            # Own output storage before the next replay overwrites the graph output.
-            output = output.clone()
-            finished = torch.cuda.Event()
-            finished.record(self.stream)
-        # The producer may reuse Flow's output once the side-stream copy completes.
-        main.wait_event(copied)
+        static_latent, static_slots, static_positions, graph, output = self._bucket(latent.shape[0])
+        static_latent.copy_(latent)
+        static_slots.copy_(slots)
+        static_positions.copy_(positions)
+        if graph is None:
+            output = self._forward(static_latent, static_slots, static_positions)
+        else:
+            graph.replay()
+        output = output.clone()
+        finished = torch.cuda.Event()
+        finished.record(main)
         return output, finished
 
 

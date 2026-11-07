@@ -189,28 +189,17 @@ def test_voice_uses_tensor_transport_without_python_list(monkeypatch, project_vo
     assert len(prepared.prompt["prompt_token_ids"]) == 128
 
 
-def test_slot_reset_is_enqueued_on_codec_stream_without_main_wait(monkeypatch):
-    from contextlib import contextmanager
-
+def test_slot_reset_uses_current_stream_without_cross_stream_wait(monkeypatch):
     from vllm_omni.model_executor.models.phonon.cuda_graph_wrapper import MimiDecodeRunner
 
     calls = []
-    stream = object()
     runner = MimiDecodeRunner.__new__(MimiDecodeRunner)
-    runner.stream = stream
-    runner.decoder = SimpleNamespace(reset_slots=lambda slot: calls.append(("reset", slot)))
+    runner.decoder = SimpleNamespace(reset_slots=lambda slot: calls.append(slot))
 
-    @contextmanager
-    def use_stream(selected):
-        assert selected is stream
-        calls.append("enter")
-        yield
-        calls.append("exit")
+    def unexpected_stream_operation(*args, **kwargs):
+        pytest.fail("Slot reset must use the current stream directly")
 
-    def unexpected_main_stream(*args, **kwargs):
-        pytest.fail("Slot reset must not insert a main-stream wait")
-
-    monkeypatch.setattr(torch.cuda, "stream", use_stream)
-    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_main_stream)
+    monkeypatch.setattr(torch.cuda, "stream", unexpected_stream_operation)
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_stream_operation)
     runner.reset_slots(0)
-    assert calls == ["enter", ("reset", 0), "exit"]
+    assert calls == [0]
