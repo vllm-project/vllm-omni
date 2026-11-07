@@ -197,6 +197,71 @@ def test_chunk_waiting_removes_request_from_running_list():
     assert list(coord._waiting_for_chunk_running) == [req]
 
 
+@pytest.mark.parametrize("queue_size", [127, 128, 129])
+def test_chunk_waiting_partitions_running_list_without_remove_scans(queue_size, monkeypatch):
+    class CountingList(list):
+        def __init__(self, items):
+            super().__init__(items)
+            self.remove_calls = 0
+
+        def remove(self, item):
+            self.remove_calls += 1
+            super().remove(item)
+
+    coord = OmniSchedulingCoordinator(
+        scheduler_max_num_seqs=queue_size,
+        stage_id=1,
+        async_chunk=True,
+    )
+    # Exercise the former 128-entry boundary without overriding queue policy.
+    # Only the clock is fixed, to distinguish new waits from existing waits.
+    monkeypatch.setattr(coord_mod.time, "monotonic", lambda: 100.0)
+    statuses = [
+        RequestStatus.RUNNING,  # newly parked
+        RequestStatus.RUNNING,  # ready
+        RequestStatus.WAITING_FOR_INPUT,  # owned by the input coordinator
+        RequestStatus.WAITING_FOR_CHUNK,  # already parked
+        RequestStatus.WAITING_FOR_CHUNK,  # restored by a ready chunk
+        RequestStatus.RUNNING,  # parked with an existing timeout timestamp
+    ]
+    requests = [_make_request(f"request-{i}", status=statuses[i % 6]) for i in range(queue_size)]
+    groups = [requests[offset::6] for offset in range(6)]
+    for request in requests:
+        request.external_req_id = f"external-{request.request_id}"
+    for request in groups[2] + groups[3] + groups[4] + groups[5]:
+        coord._waiting_since[request.request_id] = 90.0
+    ready_ids = {request.request_id for request in groups[1] + groups[4]}
+    running = CountingList(requests)
+    running_alias = running
+    waiting = MockQueue()
+
+    coord.process_pending_chunks(waiting, running, ready_ids, set())
+
+    retained = [request for i, request in enumerate(requests) if i % 6 in (1, 2, 4)]
+    parked = [request for i, request in enumerate(requests) if i % 6 in (0, 3, 5)]
+    newly_registered = [request for i, request in enumerate(requests) if i % 6 in (0, 5)]
+    assert running is running_alias
+    assert running == retained
+    assert list(coord._waiting_for_chunk_running) == parked
+    assert list(waiting) == []
+    assert running.remove_calls == 0
+    assert [request.status for request in requests] == [
+        RequestStatus.WAITING_FOR_INPUT
+        if i % 6 == 2
+        else RequestStatus.RUNNING
+        if i % 6 in (1, 4)
+        else RequestStatus.WAITING_FOR_CHUNK
+        for i in range(queue_size)
+    ]
+    assert [(handle.request_id, handle.external_req_id) for handle in coord.pending_chunk_registrations] == [
+        (request.request_id, request.external_req_id) for request in newly_registered
+    ]
+    assert coord.requests_with_ready_chunks == ready_ids
+    assert coord._waiting_since == {
+        request.request_id: 100.0 if i % 6 == 0 else 90.0 for i, request in enumerate(requests) if i % 6 in (0, 2, 3, 5)
+    }
+
+
 class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
     """Test update_request_metadata applies scheduling metadata to requests."""
 
