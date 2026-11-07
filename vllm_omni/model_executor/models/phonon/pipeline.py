@@ -18,7 +18,7 @@ PHONON_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="audio",
             recompute_preemption="fail",
-            sampling_constraints={"detokenize": False, "stop_token_ids": [1]},
+            sampling_constraints={"detokenize": False},
         ),
     ),
 )
