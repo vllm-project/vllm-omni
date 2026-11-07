@@ -72,6 +72,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
+from vllm_omni.diffusion.torch_tweak import serve_with_torch_tweak
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.stage_payload import DiffusionStagePayloadMixin
@@ -415,8 +416,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             device=self.device,
         )
 
-        # Apply torch.compile if not in eager mode
-        if not self.od_config.enforce_eager:
+        # Apply torch.compile if not in eager mode and Torch Tweak does not serve the stage
+        if not self.od_config.enforce_eager and not serve_with_torch_tweak(self.pipeline, self.od_config, self.device):
             if current_omni_platform.supports_torch_inductor():
                 if hasattr(self.pipeline, "setup_compile"):
                     try:
