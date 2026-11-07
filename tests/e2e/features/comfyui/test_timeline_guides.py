@@ -46,6 +46,7 @@ GUIDE_WORKFLOW = PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Timeli
 SCHEMA_COMPLETE_WORKFLOWS = {
     GUIDE_WORKFLOW,
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Character Replacement.json",
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Fun ControlNet Union.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 All-in-One.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Music Video.json",
 }
