@@ -87,13 +87,14 @@ def _make_output(prompt_len: int, output_tokens: int = 10) -> MixRequestFuncOutp
     return output
 
 
-def _calculate_test_metrics(outputs, goodput=None):
+def _calculate_test_metrics(outputs, goodput=None, *, aggregation="session"):
     return calculate_metrics(
         input_requests=[],
         outputs=outputs,
         dur_s=1.0,
         tokenizer=None,
-        selected_percentiles=[50.0],
+        selected_percentiles=[50.0, 95.0],
+        duplex_metric_aggregation=aggregation,
         goodput_config_dict=goodput or {},
         task_type=TaskType.GENERATION,
         selected_percentile_metrics=[],
@@ -709,6 +710,68 @@ def test_profiler_stage_durations_print_without_print_stage(capsys) -> None:
     assert "Stage 0 Gen" not in shown
     assert metrics.stage_durations_mean["Wan22I2VPipeline.diffuse"] == pytest.approx(1.25)
     assert "stage_0_gen_ms" not in metrics.stage_durations_mean
+
+
+def test_duplex_response_aggregation_pools_turns_and_excludes_missing_measurements():
+    first, second = _make_output(100), _make_output(100)
+    first.ttft, second.ttft = 0.2, 0.8
+    for output in (first, second):
+        output.duplex_session_metrics = {"ttft_ms": output.ttft * 1000, "ttfp_ms": 500.0, "rtf": 0.5}
+    first.duplex_request_metrics = [
+        {"ttft_ms": 100.0, "ttfp_ms": 200.0, "rtf": 0.2},
+        {"ttft_ms": 300.0, "ttfp_ms": 400.0, "rtf": 0.4},
+        {"ttft_ms": None, "ttfp_ms": float("nan"), "rtf": -1.0},
+    ]
+    second.duplex_request_metrics = [{"ttft_ms": 800.0, "ttfp_ms": 900.0, "rtf": 0.9}]
+
+    metrics = _calculate_test_metrics([first, second], aggregation="response")
+    assert metrics.mean_ttft_ms == pytest.approx(400.0)
+    assert metrics.median_ttft_ms == pytest.approx(300.0)
+    assert dict(metrics.percentiles_ttft_ms)[95] == pytest.approx(750.0)
+    assert metrics.mean_audio_ttfp_ms == pytest.approx(500.0)
+    assert metrics.mean_audio_rtf == pytest.approx(0.5)
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (3, 3, 3)
+    assert _calculate_test_metrics([first, second]).mean_ttft_ms == pytest.approx(500.0)
+
+
+def test_duplex_response_aggregation_does_not_fall_back_to_session_means():
+    output = _make_output(100)
+    output.ttft = 0.1
+    output.duplex_session_metrics = {"ttft_ms": 100.0, "ttfp_ms": 200.0, "rtf": 0.5}
+    output.duplex_request_metrics = []
+    metrics = _calculate_test_metrics([output], aggregation="response")
+    assert metrics.num_ttft_samples == 0
+    assert math.isnan(metrics.mean_ttft_ms)
+
+
+@pytest.mark.parametrize("aggregation", ["session", "response"])
+def test_duplex_zero_measurements_are_distinct_from_missing_timings(aggregation):
+    from vllm_omni.clients.duplex import EventCollector, summarize_session_request_metrics
+
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "r"}}, received_at_s=10.0)
+    collector.add(
+        {"type": "response.output_audio_transcript.delta", "response_id": "r", "delta": "hello"},
+        received_at_s=10.0,
+    )
+    collector.add(
+        {"type": "response.output_audio.delta", "response_id": "r", "delta": "AAAA", "sample_rate_hz": 24_000},
+        received_at_s=10.0,
+    )
+    row = collector.timing_summary(after_s=10.0, response_id="r")["request_metrics"]
+    assert row["ttft_ms"] == row["ttfp_ms"] == 0.0
+    row["rtf"] = 0.0
+    measured, missing = _make_output(1), _make_output(1)
+    measured.ttft = measured.audio_ttfp = measured.audio_rtf = 0.0
+    measured.duplex_request_metrics = [row]
+    missing.duplex_request_metrics = [{"ttft_ms": None, "ttfp_ms": None, "rtf": None}]
+    for output in (measured, missing):
+        output.duplex_session_metrics = summarize_session_request_metrics(output.duplex_request_metrics, session_id="s")
+    metrics = _calculate_test_metrics([measured, missing], aggregation=aggregation)
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (1, 1, 1)
+    assert metrics.mean_ttft_ms == metrics.mean_audio_ttfp_ms == metrics.mean_audio_rtf == 0.0
+    # Other backends still use audio_ttfp == 0.0 to mean no observed packet.
+    assert _calculate_test_metrics([_make_output(1)], aggregation=aggregation).num_audio_ttfp_samples == 0
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
@@ -899,6 +900,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
+    duplex_metric_aggregation: str = "session",
 ) -> tuple[MultiModalsBenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
@@ -1009,12 +1011,32 @@ def calculate_metrics(
             else:
                 audio_ttfp_measured = audio_ttfp_value > 0
             audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("rtf") is not None
-            if ttft_measured:
-                ttfts.append(outputs[i].ttft)
-            if audio_ttfp_measured:
-                audio_ttfps.append(audio_ttfp_value)
-            if audio_rtf_measured:
-                audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            if duplex_metric_aggregation == "response" and isinstance(session_metrics, dict):
+                # Pool responses rather than giving short and long sessions equal weight.
+                # Goodput below remains request/session based.
+                # Duplex rows use None for missing timings; a measured zero is
+                # valid here, unlike the legacy audio_ttfp == 0.0 sentinel.
+                for row in getattr(outputs[i], "duplex_request_metrics", None) or []:
+                    for field, samples, scale in (
+                        ("ttft_ms", ttfts, 0.001),
+                        ("ttfp_ms", audio_ttfps, 0.001),
+                        ("rtf", audio_rtfs, 1.0),
+                    ):
+                        value = row.get(field)
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(value)
+                            and value >= 0
+                        ):
+                            samples.append(value * scale)
+            else:
+                if ttft_measured:
+                    ttfts.append(outputs[i].ttft)
+                if audio_ttfp_measured:
+                    audio_ttfps.append(audio_ttfp_value)
+                if audio_rtf_measured:
+                    audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
             goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
             goodput_audio_ttfps.append(audio_ttfp_value if audio_ttfp_measured else None)
             audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
