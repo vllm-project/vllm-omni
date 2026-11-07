@@ -1512,3 +1512,21 @@ class TestDense4DMaskRouting:
         # above cannot become dead code after a platform check regresses.
         monkeypatch.setattr(flash_attn_mod.current_omni_platform, "is_npu", lambda: is_npu)
         assert FlashAttentionBackend.supports_dense_4d_mask() is is_npu
+
+
+def test_head_overlap_is_a_valid_spec_key():
+    from vllm_omni.diffusion.data import parse_attention_config
+
+    config = parse_attention_config({"default": {"backend": "RAINFUSION_ATTN", "head_overlap": 7}})
+
+    assert config.default is not None
+    assert config.default.head_overlap == 7
+
+
+def test_head_overlap_rejects_negative_values():
+    with pytest.raises(ValueError, match="head_overlap"):
+        AttentionSpec(backend="RAINFUSION_ATTN", head_overlap=-1)
+
+
+def test_head_overlap_defaults_to_off():
+    assert AttentionSpec(backend="RAINFUSION_ATTN").head_overlap == 0

@@ -7,6 +7,7 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import os
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import cast
@@ -54,6 +55,42 @@ def _try_extract_layer_index(prefix: str) -> int | None:
         return extract_layer_index(prefix)
     except (AssertionError, ValueError):
         return None
+
+
+def _head_overlap_debug_budget() -> int:
+    """How many head-split self-checks to run (``VLLM_OMNI_HEAD_OVERLAP_DEBUG``).
+
+    0 disables it. A bare ``1`` means "every call this run", which is what
+    matters: a cross-stream hazard can pass on the first step and only corrupt
+    once the allocator has churned, so a one-shot check would call it clean.
+    """
+    raw = os.environ.get("VLLM_OMNI_HEAD_OVERLAP_DEBUG", "").strip()
+    if raw in ("", "0", "false", "False"):
+        return 0
+    if raw in ("1", "true", "True"):
+        return 1 << 30
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+# Metadata features that own the packed-row or head coordinates the head split
+# would rearrange. Each is refused rather than approximated.
+_HEAD_OVERLAP_UNSUPPORTED_EXTRA = frozenset(
+    {
+        "gate_compress",
+        "minimax_h3_compact_reference_rows",
+        "minimax_h3_reference_kv_post_parallel",
+        "minimax_h3_reference_kv_video_layout",
+        "pdd_step_indices",
+        "pdd_steps",
+        "preserve_vsa_all_blocks",
+        "vdn_window",
+        "vsa_dit_seq_shape",
+        "vsa_h3_prefix_segments",
+    }
+)
 
 
 class Attention(nn.Module):
@@ -335,6 +372,14 @@ class Attention(nn.Module):
 
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
+        # Head-split Ulysses pipeline: cut the QKV all-to-all into per-head-group
+        # collectives and run each group's attention behind its own completion
+        # event, so group N's attention overlaps group N+1's all-to-all. 0 = off.
+        self._head_overlap_groups = int(getattr(self.attn_spec, "head_overlap", 0) or 0)
+        self._head_overlap_stream_cache = None
+        self._head_overlap_events_cache: dict | None = None
+        self._head_overlap_debug_left = _head_overlap_debug_budget()
+
         self._kv_cache_dtype: str | None = None
         self._kv_cache_skip_steps: set[int] | None = None
         self._kv_cache_skip_layers: set[int] | None = None
@@ -506,10 +551,12 @@ class Attention(nn.Module):
             reason = self._cross_backend_limitation(attn_metadata)
             if reason is not None:
                 blocked = self._cross_fallback_blocker(attn_metadata)
-                result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
+                result = cast(SDPAImpl, self.sdpa_fallback).resolve_execution_path(
+                    resolved_context, query, key, value, attn_metadata
+                )
                 return replace(
                     result,
-                    backend=self.attn_backend.get_name() if blocked else "SDPA",
+                    backend=cast(type[AttentionBackend], self.attn_backend).get_name() if blocked else "SDPA",
                     path="cross_unsupported" if blocked else "cross_sdpa_fallback",
                     support=CapabilityResult.unsupported(blocked) if blocked else CapabilityResult.unmigrated(reason),
                 )
@@ -585,6 +632,12 @@ class Attention(nn.Module):
                 )
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+
+        # Head-split Ulysses pipeline. Refused (returns 0) whenever another path
+        # owns the packed-row or head coordinates of this forward.
+        head_groups = self._head_overlap_plan(query, key, value, attn_metadata, strategy, use_paged_attention)
+        if head_groups > 1:
+            return self._forward_impl_head_overlap(query, key, value, attn_metadata, strategy, head_groups)
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
@@ -679,6 +732,203 @@ class Attention(nn.Module):
 
         return out
 
+    def _head_overlap_plan(self, query, key, value, attn_metadata, strategy, use_paged_attention) -> int:
+        """Head-group count to pipeline this call with, or 0 for the plain path."""
+        groups = self._head_overlap_groups
+        if groups <= 1 or use_paged_attention or self.use_ring or self._scheduler_paged_kv:
+            return 0
+        if getattr(self, "_explicit_cross_contract", False):
+            return 0
+        if strategy is self._no_parallel_strategy or strategy.name != "ulysses":
+            return 0
+        if attn_metadata is not None and _HEAD_OVERLAP_UNSUPPORTED_EXTRA.intersection(attn_metadata.extra):
+            return 0
+        return strategy.plan_head_overlap(query, key, value, attn_metadata, groups)
+
+    def _head_overlap_comm_stream(self):
+        stream = self._head_overlap_stream_cache
+        if stream is None:
+            stream = current_omni_platform.Stream()
+            self._head_overlap_stream_cache = stream
+        return stream
+
+    def _head_overlap_events(self, kind: str, groups: int) -> list:
+        """Cached per-layer event set, so the hot path allocates nothing."""
+        cache = self._head_overlap_events_cache
+        if cache is None:
+            cache = {}
+            self._head_overlap_events_cache = cache
+        events = cache.get(kind)
+        if events is None or len(events) < groups:
+            events = [current_omni_platform.Event() for _ in range(groups)]
+            cache[kind] = events
+        return events
+
+    def _forward_impl_head_overlap(self, query, key, value, attn_metadata, strategy, groups: int):
+        """Pipeline the Ulysses all-to-all against the attention by head group.
+
+        The rank-local QKV is cut along the head axis into ``groups`` slices.
+        Every slice gets its own all-to-all, and they are all submitted back to
+        back on a dedicated stream while the per-slice attention runs on the
+        compute stream behind the matching slice's completion event. Slice N's
+        attention therefore overlaps slice N+1's all-to-all, which is the point:
+        the all-to-all stops being a serial prefix on the block's critical path.
+
+        The reverse all-to-all is split the same way. It cannot be left whole:
+        a group's forward all-to-all hands each rank a *strided* subset of the
+        head axis, so reassembling the group outputs and running one reverse
+        would feed the heads back in the wrong order and misalign ``out_proj``.
+        Reversing each group on its own stream and concatenating restores the
+        rank-local head axis exactly, so the result matches the unsplit path.
+        """
+        heads = int(query.shape[2])
+        step = heads // groups
+        logger.info_once(
+            "Ulysses head-split overlap active: %d head groups of %d over %d ranks (heads=%d)",
+            groups,
+            step,
+            max(strategy.ulysses_world_size, 1),
+            heads,
+        )
+        if self._head_overlap_debug_left:
+            self._head_overlap_debug_compare(query, key, value, attn_metadata, strategy, groups)
+        return self._run_head_overlap_region(query, key, value, attn_metadata, strategy, groups)
+
+    def _head_overlap_debug_compare(self, query, key, value, attn_metadata, strategy, groups: int):
+        """One-shot: does the head split reproduce the unsplit path, per group?
+
+        Diagnostic only (``VLLM_OMNI_HEAD_OVERLAP_DEBUG=1``). The end-to-end A/B
+        can only say that the split changes the video; it cannot say whether the
+        split itself is wrong or whether a per-group difference is upstream of
+        it. This runs both paths on the same rank-local Q/K/V and reports the
+        largest disagreement, split out per head group, so a wrong group can be
+        told apart from a uniform drift.
+        """
+        if self._head_overlap_debug_left <= 0:
+            return
+        self._head_overlap_debug_left -= 1
+        try:
+            q, k, v, meta, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+            whole = strategy.post_attention(self._run_local_attention(q, k, v, meta), ctx)
+            # The same head split, driven serially on the compute stream: no
+            # second stream, no ping-pong. Comparing against this separates "the
+            # split is wrong" from "the kernel reads a narrower head axis
+            # differently", which is the only way to tell an orchestration bug
+            # from a numeric one.
+            serial_parts = []
+            group_step = int(query.shape[2]) // groups
+            for index in range(groups):
+                lo = index * group_step
+                hi = lo + group_step
+                gq, gk, gv, gmeta, gctx = strategy.pre_attention(
+                    query[:, :, lo:hi], key[:, :, lo:hi], value[:, :, lo:hi], attn_metadata
+                )
+                serial_parts.append(strategy.post_attention(self._run_local_attention(gq, gk, gv, gmeta), gctx))
+            serial = torch.cat(serial_parts, dim=2) if groups > 1 else serial_parts[0]
+            split = self._run_head_overlap_region(query, key, value, attn_metadata, strategy, groups)
+            current_omni_platform.synchronize()
+            if whole.shape != split.shape:
+                logger.warning(
+                    "head-overlap debug: shape mismatch whole=%s split=%s",
+                    tuple(whole.shape),
+                    tuple(split.shape),
+                )
+                return
+            step = int(query.shape[2]) // groups
+            per_group = []
+            for index in range(groups):
+                lo, hi = index * step, (index + 1) * step
+                delta = (whole[:, :, lo:hi].float() - split[:, :, lo:hi].float()).abs().max().item()
+                per_group.append(f"g{index}={delta:.2e}")
+            total = (whole.float() - split.float()).abs().max().item()
+            serial_delta = (whole.float() - serial.float()).abs().max().item()
+            scale = whole.float().abs().max().item() or 1.0
+            step_idx = None
+            if is_forward_context_available():
+                step_idx = get_forward_context().denoise_step_idx
+            logger.warning(
+                "head-overlap debug: phase=%d step=%s layer=%s split=%.3e serial=%.3e "
+                "(reference scale %.3e, relative %.2e) | %s",
+                self._head_overlap_phase(attn_metadata),
+                step_idx,
+                self.layer_idx,
+                total,
+                serial_delta,
+                scale,
+                total / scale,
+                " ".join(per_group),
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the run
+            logger.warning("head-overlap debug failed: %s: %s", type(exc).__name__, exc)
+
+    def _head_overlap_phase(self, attn_metadata) -> int:
+        """Graph key tag for this forward, as reported by the backend.
+
+        Non-negative tags name a kernel the backend is willing to replay;
+        negative means "do not capture this forward". Backends that switch
+        kernels on the denoise step override ``graph_phase``; everything else is
+        one capturable phase.
+        """
+        probe = getattr(self.attention, "graph_phase", None)
+        if not callable(probe):
+            return 0
+        try:
+            return int(probe(attn_metadata))
+        except Exception:  # noqa: BLE001 - an unusable probe must not break the forward
+            return -1
+
+    def _run_head_overlap_region(self, query, key, value, attn_metadata, strategy, groups: int):
+        """The ping-pong itself; a pure function of Q/K/V for graph capture."""
+        step = int(query.shape[2]) // groups
+        compute = current_omni_platform.current_stream()
+        comm = self._head_overlap_comm_stream()
+        forwarded = self._head_overlap_events("forward", groups)
+        computed = self._head_overlap_events("computed", groups)
+        reversed_ = self._head_overlap_events("reversed", groups)
+
+        # Fork: the collective stream must not start before the producers of
+        # the rank-local Q/K/V have finished on the compute stream.
+        comm.wait_stream(compute)
+        prepared = []
+        ctx = None
+        with current_omni_platform.stream(comm):
+            for index in range(groups):
+                lo = index * step
+                hi = lo + step
+                q, k, v, meta, ctx = strategy.pre_attention(
+                    query[:, :, lo:hi], key[:, :, lo:hi], value[:, :, lo:hi], attn_metadata
+                )
+                forwarded[index].record(comm)
+                prepared.append((q, k, v, meta))
+                if index == 0:
+                    gate = getattr(self, "_collective_gate", None)
+                    if gate is not None:
+                        # The first slice carries the all-to-all the offload
+                        # gather must queue behind; the later slices are
+                        # already behind it.
+                        gate.signal()
+
+        # The unsplit path runs the backend on the per-forward metadata that
+        # carries this step's KV policy; every group of this call shares one
+        # policy, so resolve it once rather than letting each group fall back to
+        # the backend's own default and diverge from the unsplit result.
+        local_meta = self._with_kv_cache_dtype(attn_metadata)
+        pieces = []
+        for index, ((q, k, v, _meta), ready) in enumerate(zip(prepared, forwarded)):
+            compute.wait_event(ready)
+            part = self._run_local_attention(q, k, v, local_meta)
+            computed[index].record(compute)
+            # Reverse slice N on the collective stream while slice N+1's
+            # attention runs on the compute stream.
+            with current_omni_platform.stream(comm):
+                comm.wait_event(computed[index])
+                pieces.append(strategy.post_attention(part, ctx))
+                reversed_[index].record(comm)
+
+        for event in reversed_[:groups]:
+            compute.wait_event(event)
+        return pieces[0] if groups == 1 else torch.cat(pieces, dim=2)
+
     def _validate_cross_inputs(
         self,
         query: torch.Tensor,
@@ -760,7 +1010,7 @@ class Attention(nn.Module):
     def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
         if self.backend_explicit:
             return (
-                f"Explicit backend {self.attn_backend.get_name()} does not support "
+                f"Explicit backend {cast(type[AttentionBackend], self.attn_backend).get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata)}"
             )
         if attn_metadata is not None and attn_metadata.extra.get("kv_cache_dtype") not in (None, "float"):
@@ -793,7 +1043,7 @@ class Attention(nn.Module):
                 blocked = self._cross_fallback_blocker(attn_metadata)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
-                return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+                return cast(SDPAImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the
         # dense mask (e.g. HunyuanImage3, which sends both), so there is nothing to divert.
