@@ -377,6 +377,21 @@ class LTX2AudioTransformerModel(nn.Module):
             rotary_emb=audio_rotary_emb,
         )
 
+    def prepare_audio_cuda_graph_compile(self) -> None:
+        """Keep eager RMSNorm numerics without splitting the compiled graph."""
+        for block in self.transformer_blocks:
+            norms = (
+                block.audio_norm1,
+                block.audio_norm2,
+                block.audio_norm3,
+                block.audio_attn1.norm_q,
+                block.audio_attn1.norm_k,
+                block.audio_attn2.norm_q,
+                block.audio_attn2.norm_k,
+            )
+            for norm in norms:
+                _prepare_rms_norm_for_compile(norm)
+
     def forward(
         self,
         audio_hidden_states: torch.Tensor,

@@ -5,6 +5,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -589,6 +590,21 @@ class GroupCoordinator:
         device. Use the CPU group instead.
         """
         torch.distributed.barrier(group=self.cpu_group)
+
+    @contextmanager
+    def graph_capture(self, graph_capture_context=None):
+        """Enter the stream shared by vLLM's distributed capture context."""
+        if graph_capture_context is None:
+            from vllm.distributed.parallel_state import GraphCaptureContext
+
+            graph_capture_context = GraphCaptureContext(torch.cuda.Stream(device=self.device))
+
+        stream = graph_capture_context.stream
+        current_stream = torch.cuda.current_stream(self.device)
+        if current_stream != stream:
+            stream.wait_stream(current_stream)
+        with torch.cuda.stream(stream):
+            yield graph_capture_context
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a non-blocking way"""
