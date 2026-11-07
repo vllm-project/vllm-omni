@@ -134,7 +134,7 @@ def _mlp(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
 
 @functools.cache
 def tiled_attention_supported(device_index: int) -> bool:
-    """``cfm_attention`` TF32 dots need NVIDIA tensor cores (SM80+)."""
+    """Use tiled FP32/FP16 attention on NVIDIA tensor cores (SM80+)."""
     return torch.version.hip is None and torch.cuda.get_device_capability(device_index) >= (8, 0)
 
 
@@ -172,7 +172,10 @@ def _attention(
     head_dim = int(q.shape[-1])
     keys, values = kv[..., :head_dim], kv[..., head_dim:]
     if rows is not None or (
-        kv.is_cuda and kv.dtype == q.dtype == torch.float32 and tiled_attention_supported(kv.get_device())
+        kv.is_cuda
+        and kv.dtype == q.dtype
+        and kv.dtype in (torch.float32, torch.float16)
+        and tiled_attention_supported(kv.get_device())
     ):
         from .cfm_attention import cfm_attention
 
