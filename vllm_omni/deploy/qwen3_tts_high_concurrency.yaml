@@ -118,5 +118,17 @@ stages:
 platforms:
   npu:
     stages:
+      # Graphs on, aligned with the base qwen3_tts.yaml NPU override. Forcing
+      # eager on NPU halved throughput and broke the 100 ms streaming SLO at
+      # concurrency 8+ on 910B4 (#7993): as shipped RTF 1.079 with 733/782
+      # samples over SLO; with graphs enabled RTF 0.604 with 0 violations.
+      # Stage 0 inherits the graph-enabled default from its own definition;
+      # stage 1 overrides this file's CUDA-tuned eager setting.
       - stage_id: 0
-        enforce_eager: true
+        enforce_eager: false
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        enforce_eager: false
+        compilation_config:
+          cudagraph_mode: PIECEWISE
