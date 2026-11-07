@@ -32,8 +32,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
-_L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=3)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=2)
+_L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=3)
 
 
 def _set_random_seeds(seed: int) -> None:
@@ -974,23 +974,23 @@ def _run_two_branch_gpu_parity(
     }
 
     mp_context = torch.multiprocessing.get_context("spawn")
-    manager = mp_context.Manager()
-    baseline_queue = manager.Queue()
-    cfg_parallel_queue = manager.Queue()
+    with mp_context.Manager() as manager:
+        baseline_queue = manager.Queue()
+        cfg_parallel_queue = manager.Queue()
 
-    torch.multiprocessing.spawn(
-        _test_cfg_sequential_worker,
-        args=(1, dtype, test_config, baseline_queue),
-        nprocs=1,
-    )
-    torch.multiprocessing.spawn(
-        _test_cfg_parallel_worker,
-        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
-        nprocs=cfg_parallel_size,
-    )
+        torch.multiprocessing.spawn(
+            _test_cfg_sequential_worker,
+            args=(1, dtype, test_config, baseline_queue),
+            nprocs=1,
+        )
+        torch.multiprocessing.spawn(
+            _test_cfg_parallel_worker,
+            args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+            nprocs=cfg_parallel_size,
+        )
 
-    baseline_output = baseline_queue.get()
-    cfg_parallel_outputs = [cfg_parallel_queue.get() for _ in range(cfg_parallel_size)]
+        baseline_output = baseline_queue.get(timeout=30)
+        cfg_parallel_outputs = [cfg_parallel_queue.get(timeout=30) for _ in range(cfg_parallel_size)]
     cfg_parallel_outputs.sort(key=lambda item: item[0])
     cfg_parallel_output = cfg_parallel_outputs[0][1]
 
@@ -1036,23 +1036,23 @@ def _run_multi_branch_gpu_parity(
     }
 
     mp_context = torch.multiprocessing.get_context("spawn")
-    manager = mp_context.Manager()
-    baseline_queue = manager.Queue()
-    cfg_parallel_queue = manager.Queue()
+    with mp_context.Manager() as manager:
+        baseline_queue = manager.Queue()
+        cfg_parallel_queue = manager.Queue()
 
-    torch.multiprocessing.spawn(
-        _test_multi_branch_sequential_worker,
-        args=(1, dtype, test_config, baseline_queue),
-        nprocs=1,
-    )
-    torch.multiprocessing.spawn(
-        _test_multi_branch_parallel_worker,
-        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
-        nprocs=cfg_parallel_size,
-    )
+        torch.multiprocessing.spawn(
+            _test_multi_branch_sequential_worker,
+            args=(1, dtype, test_config, baseline_queue),
+            nprocs=1,
+        )
+        torch.multiprocessing.spawn(
+            _test_multi_branch_parallel_worker,
+            args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+            nprocs=cfg_parallel_size,
+        )
 
-    baseline_output = baseline_queue.get()
-    cfg_parallel_outputs = [cfg_parallel_queue.get() for _ in range(cfg_parallel_size)]
+        baseline_output = baseline_queue.get(timeout=30)
+        cfg_parallel_outputs = [cfg_parallel_queue.get(timeout=30) for _ in range(cfg_parallel_size)]
     cfg_parallel_outputs.sort(key=lambda item: item[0])
     cfg_parallel_output = cfg_parallel_outputs[0][1]
 
@@ -1079,7 +1079,7 @@ def _run_multi_branch_gpu_parity(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 @pytest.mark.parametrize("extra_kwargs", [None, {"step_i": 1}])
