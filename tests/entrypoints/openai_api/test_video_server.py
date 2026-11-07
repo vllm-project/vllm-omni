@@ -4067,7 +4067,7 @@ def test_h3_control_cleanup_preserves_client_named_file(endpoint, path_source, t
         assert response.status_code == 200, response.text
         if not endpoint.endswith("/sync"):
             _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
-        path = engine.captured_sampling_params_list[0].extra_args["canny"]["control_path"]
+        path = engine.captured_prompt["multi_modal_data"]["minimax_h3_control"]["control_path"]
         assert path != str(sentinel)
         assert not Path(path).exists()
     assert sentinel.read_bytes() == b"unrelated server file"
