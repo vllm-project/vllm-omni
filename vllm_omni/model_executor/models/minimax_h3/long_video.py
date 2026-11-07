@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Shared long-video request limits for encoder and diffusion entry points."""
+"""Shared long-video request validation for encoder and diffusion entry points."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -21,6 +21,25 @@ def resolve_long_video_mode(extra: Mapping[str, Any], task: str) -> str:
     if mode == "continuation" and task != "ref2va":
         raise OmniClientError("MiniMax H3 continuation requires Ref2VA request execution (not step execution)")
     return mode
+
+
+def resolve_continuation(
+    extra: Mapping[str, Any], *, task: str, step_execution: bool = False
+) -> tuple[int, int] | None:
+    """Validate continuation options before loading or encoding reference media."""
+    mode = resolve_long_video_mode(extra, task)
+    if mode == "full":
+        return None
+    if task != "ref2va" or step_execution:
+        raise OmniClientError("MiniMax H3 continuation requires Ref2VA request execution (not step execution)")
+    window = extra.get("continuation_window_frames", 277)
+    overlap = extra.get("continuation_overlap_frames", 22)
+    for name, value in (("window", window), ("overlap", overlap)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 5 or value % 17 != 5:
+            raise OmniClientError(f"MiniMax H3 continuation {name} must be an integer on the 17n+5 frame grid")
+    if not 107 <= window <= 345 or overlap >= window:
+        raise OmniClientError("MiniMax H3 continuation window must be 107..345 frames and exceed its overlap")
+    return window, overlap
 
 
 def max_output_seconds(extra: Mapping[str, Any], task: str) -> float:
