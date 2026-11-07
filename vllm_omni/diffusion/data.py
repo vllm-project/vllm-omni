@@ -595,6 +595,8 @@ class DiffusionCacheConfig:
     # None defers to the model-specific TeaCache default (0.2 fallback).
     rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
+    # Explicit experimental Wan stage profile; no qualified default is registered.
+    wan_profile: dict[str, Any] | None = None
 
     # SeaCache parameters [sea_cache only]
     sea_threshold: float = 0.25
