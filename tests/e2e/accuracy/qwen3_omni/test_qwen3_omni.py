@@ -52,13 +52,23 @@ from vllm_omni.platforms import current_omni_platform
 _E2E_ROOT = Path(__file__).resolve().parent.parent.parent
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+# A cold ROCm cache can spend more than 14 minutes loading weights before
+# engine warmup, so the generic 900-second stage deadline is too tight.
+QWEN3_OMNI_INIT_TIMEOUT_S = 1200
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 stage_configs = [get_deploy_config_path("qwen3_omni_moe.yaml")]
 
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    OmniServerParams(
+        model=model,
+        stage_config_path=stage_config,
+        init_timeout=QWEN3_OMNI_INIT_TIMEOUT_S,
+        startup_timeout=QWEN3_OMNI_INIT_TIMEOUT_S + 300,
+    )
+    for model in models
+    for stage_config in stage_configs
 ]
 
 

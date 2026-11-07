@@ -18,6 +18,9 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+# A cold ROCm cache can spend more than 14 minutes loading weights before
+# engine warmup, so the generic 900-second stage deadline is too tight.
+QWEN3_OMNI_INIT_TIMEOUT_S = 1200
 
 AUDIO_KEY = ["test"]
 IMAGE_KEY = ["square", "quadrate", "rectangle"]
@@ -71,6 +74,8 @@ test_params = [
             model=model,
             stage_config_path=default_path,
             use_stage_cli=True,
+            init_timeout=QWEN3_OMNI_INIT_TIMEOUT_S,
+            startup_timeout=QWEN3_OMNI_INIT_TIMEOUT_S + 300,
             server_args=[
                 "--no-async-chunk",
             ],
@@ -82,6 +87,8 @@ test_params = [
             model=model,
             stage_config_path=default_path,
             use_stage_cli=True,
+            init_timeout=QWEN3_OMNI_INIT_TIMEOUT_S,
+            startup_timeout=QWEN3_OMNI_INIT_TIMEOUT_S + 300,
             server_args=["--async-chunk"],
         ),
         id="async_chunk",
@@ -94,6 +101,8 @@ reduced_token_params = [
             model=model,
             stage_config_path=get_batch_token_config(default_path),
             use_stage_cli=True,
+            init_timeout=QWEN3_OMNI_INIT_TIMEOUT_S,
+            startup_timeout=QWEN3_OMNI_INIT_TIMEOUT_S + 300,
             server_args=["--async-chunk"],
         ),
         id="batch_token_2048",
