@@ -367,7 +367,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         from vllm.platforms import current_platform
 
         if current_omni_platform.is_npu():
-            from vllm_ascend.worker.model_runner_v1 import graph_capture
+            from vllm_ascend.worker.v1.model_runner import graph_capture
 
         # Match capture_model: NONE never captures an encoder manager either.
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
@@ -2459,12 +2459,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     # __class__ cell inside this nested function. `narrow.context`
                     # is None once a narrow step was restored (fused graph
                     # declined); only a live step owns the one-query buffers.
-                    active = narrow is not None and narrow.context is not None
+                    live = narrow if narrow is not None and narrow.context is not None else None
                     return super(OmniGPUModelRunner, self)._model_forward(
-                        input_ids=None if active else input_ids,
-                        positions=narrow.positions if active else positions,
+                        input_ids=None if live is not None else input_ids,
+                        positions=live.positions if live is not None else positions,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
+                        inputs_embeds=live.inputs_embeds if live is not None else inputs_embeds,
                         **model_kwargs,
                         **model_kwargs_extra,
                     )
@@ -2483,7 +2483,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     frames=frames,
                     model_kwargs=model_kwargs,
                     model_kwargs_extra=model_kwargs_extra,
-                    narrow=narrow,
+                    narrow=cast(Any, narrow),
                 )
             finally:
                 if narrow is not None:
