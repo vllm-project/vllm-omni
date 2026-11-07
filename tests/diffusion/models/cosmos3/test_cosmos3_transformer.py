@@ -33,6 +33,14 @@ def _single_rank_tensor_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(transformer_cosmos3, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(transformer_cosmos3_edge, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_diffusion_attn_backend_cls",
+        lambda **kwargs: "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend",
+    )
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
+    monkeypatch.setattr(SDPAImpl, "forward", SDPAImpl.forward_cuda)
 
 
 @pytest.fixture
@@ -805,6 +813,82 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+def _process_linear_weights(model: nn.Module) -> None:
+    from vllm.model_executor.layers.linear import LinearBase
+
+    for layer in model.modules():
+        if isinstance(layer, LinearBase):
+            layer.quant_method.process_weights_after_loading(layer)
+
+
+@torch.no_grad()
+def test_encode_und_kv_matches_regular_forward_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=1), dtype=torch.float32)
+    )
+    for parameter in model.parameters():
+        nn.init.normal_(parameter, std=0.1)
+    _process_linear_weights(model)
+    text_ids = torch.tensor([[1, 2, 0, 0], [3, 4, 0, 0]])
+    text_mask = torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0]])
+    kv, length = model.encode_und_kv(text_ids, text_mask)
+    assert length == 2
+    assert model.cached_kv is None
+    model(
+        hidden_states=torch.zeros(2, 2, 1, 2, 2),
+        timestep=torch.ones(2),
+        text_ids=text_ids,
+        text_mask=text_mask,
+        video_shape=(1, 2, 2),
+    )
+    torch.testing.assert_close(kv, model.cached_kv, rtol=0, atol=0)
+    assert kv[0][0].shape == (2, 2, 2, 4)
+    with pytest.raises(ValueError, match="identical real text lengths"):
+        model.encode_und_kv(text_ids, torch.tensor([[1, 1, 0, 0], [1, 0, 0, 0]]))
+
+
+@torch.no_grad()
+def test_und_k_normalization_is_opt_in() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3LanguageModel
+
+    options = dict(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=32,
+        rms_norm_eps=1e-6,
+        rope_theta=10000,
+        mrope_section=[1, 1, 0],
+    )
+    default = Cosmos3LanguageModel(**options)
+    enabled = Cosmos3LanguageModel(**options, use_und_k_norm_for_gen=True)
+    for parameter in default.parameters():
+        nn.init.normal_(parameter, std=0.1)
+    missing, unexpected = enabled.load_state_dict(default.state_dict(), strict=False)
+    assert missing == ["layers.0.self_attn.k_norm_und_for_gen.weight"]
+    assert not unexpected
+    _process_linear_weights(default)
+    _process_linear_weights(enabled)
+    default_attention = default.layers[0].self_attn
+    enabled_attention = enabled.layers[0].self_attn
+    assert default_attention.k_norm_und_for_gen is None
+    hidden = torch.arange(16, dtype=torch.float32).reshape(1, 2, 8)
+    cos, sin = torch.ones(1, 2, 1, 4), torch.zeros(1, 2, 1, 4)
+    _, key, value = default_attention(hidden, cos, sin)
+    _, normalized_key, enabled_value = enabled_attention(hidden, cos, sin)
+    norm = enabled_attention.k_norm_und_for_gen
+    expected = torch.nn.functional.rms_norm(key, (4,), norm.weight, eps=norm.variance_epsilon)
+    torch.testing.assert_close(normalized_key, expected)
+    torch.testing.assert_close(enabled_value, value)
 
 
 def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
