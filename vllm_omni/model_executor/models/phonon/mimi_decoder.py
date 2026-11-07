@@ -77,7 +77,10 @@ class MimiAttention(nn.Module):
         self.heads = config["transformer_num_heads"]
         self.in_proj = nn.Linear(width, width * 3, bias=False)
         self.out_proj = nn.Linear(width, width, bias=False)
-        shape = (slots, config["transformer_context"], self.heads, width // self.heads)
+        self.window = config["transformer_context"]
+        chunk_frames = round(config["sample_rate"] / math.prod(config["ratios"]) / config["frame_rate"])
+        ring_capacity = self.window + max(50, chunk_frames - 1)
+        shape = (slots, ring_capacity, self.heads, width // self.heads)
         self.register_buffer("key_pool", torch.zeros(shape), persistent=False)
         self.register_buffer("value_pool", torch.zeros(shape), persistent=False)
 
@@ -93,7 +96,7 @@ class MimiAttention(nn.Module):
             return rotated.flatten(-2).to(tensor.dtype)
 
         attended = ring_attention_chunk(
-            rotate(query), rotate(key), value, self.key_pool, self.value_pool, slots, positions
+            rotate(query), rotate(key), value, self.key_pool, self.value_pool, slots, positions, self.window
         )
         return self.out_proj(attended.flatten(2))
 

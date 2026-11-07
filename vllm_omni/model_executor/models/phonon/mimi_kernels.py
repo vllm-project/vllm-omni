@@ -71,17 +71,20 @@ def causal_conv_step(
     return output
 
 
-def ring_attention_chunk(query, key, value, key_pool, value_pool, slots, positions):
+def ring_attention_chunk(query, key, value, key_pool, value_pool, slots, positions, window=None):
     """Attend a complete chunk against the physical ring and current keys."""
+    capacity = key_pool.shape[1]
+    window = capacity if window is None else window
+    if not 0 < window <= capacity:
+        raise ValueError("Attention window must fit inside the ring")
     if query.is_cuda:
         from .mimi_attention import ring_attention_cuda
 
-        return ring_attention_cuda(query, key, value, key_pool, value_pool, slots, positions)
+        return ring_attention_cuda(query, key, value, key_pool, value_pool, slots, positions, window)
     frames = query.shape[1]
-    window = key_pool.shape[1]
     offsets = torch.arange(frames, device=positions.device)
-    physical = torch.arange(window, device=positions.device)
-    old_positions = positions[:, None] - 1 - (positions[:, None] - 1 - physical).remainder(window)
+    physical = torch.arange(capacity, device=positions.device)
+    old_positions = positions[:, None] - 1 - (positions[:, None] - 1 - physical).remainder(capacity)
     current_positions = positions[:, None] + offsets
     key_positions = torch.cat((old_positions, current_positions), -1)
     delta = current_positions[:, :, None] - key_positions[:, None, :]
@@ -95,8 +98,8 @@ def ring_attention_chunk(query, key, value, key_pool, value_pool, slots, positio
         values.transpose(1, 2),
         attn_mask=mask[:, None],
     ).transpose(1, 2)
-    retained = min(frames, window)
-    indices = current_positions[:, -retained:].remainder(window)
+    retained = min(frames, capacity)
+    indices = current_positions[:, -retained:].remainder(capacity)
     key_pool[slots[:, None], indices] = key[:, -retained:]
     value_pool[slots[:, None], indices] = value[:, -retained:]
     return output

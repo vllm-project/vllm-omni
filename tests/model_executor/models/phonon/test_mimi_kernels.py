@@ -117,3 +117,34 @@ def test_chunk_attention_matches_incremental_ring_and_wrap():
         torch.testing.assert_close(value_pool, reference_values)
         position += frames
     assert key_pool[1].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("capacity", [8, 9])
+def test_ring_headroom_preserves_window_across_chunks_and_wrap(capacity):
+    generator = torch.Generator().manual_seed(97)
+    slots = torch.tensor([2, 0])
+    keys, values = torch.zeros(3, capacity, 2, 4), torch.zeros(3, capacity, 2, 4)
+    reference_keys, reference_values = torch.zeros(3, 5, 2, 4), torch.zeros(3, 5, 2, 4)
+    position = 0
+    for frames in (3, 4, 4, 9, 1):
+        q, k, v = [torch.randn(2, frames, 2, 4, generator=generator) for _ in range(3)]
+        expected = torch.stack(
+            [
+                _kernels.ring_attention_step(
+                    q[:, t], k[:, t], v[:, t], reference_keys, reference_values, slots, torch.full((2,), position + t)
+                )
+                for t in range(frames)
+            ],
+            1,
+        )
+        actual = _kernels.ring_attention_chunk(q, k, v, keys, values, slots, torch.full((2,), position), window=5)
+        torch.testing.assert_close(actual, expected)
+        position += frames
+        absolute = torch.arange(max(0, position - 5), position)
+        torch.testing.assert_close(
+            keys[slots[:, None], absolute % capacity], reference_keys[slots[:, None], absolute % 5]
+        )
+        torch.testing.assert_close(
+            values[slots[:, None], absolute % capacity], reference_values[slots[:, None], absolute % 5]
+        )
+    assert keys[1].count_nonzero() == 0
