@@ -264,6 +264,7 @@ class LongCatImageEditPipeline(
             subfolder="text_encoder",
             prefetch_list=longcat_subfolders,
             local_files_only=local_files_only,
+            dtype=self.od_config.dtype,
         )
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
