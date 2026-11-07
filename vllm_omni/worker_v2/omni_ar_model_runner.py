@@ -16,6 +16,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -40,7 +41,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
@@ -1118,10 +1119,17 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 num_output_rows,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
-            self.model_runner_output.pooler_output = pooler_payload
-            self.model_runner_output.inter_stage_outputs = pooler_payload
+            # Partition the flat payload once instead of mirroring it into both
+            # channels: MultimodalOutputProcessor accumulates pooler_output and
+            # multimodal_output independently, so a mirror doubles every
+            # per-request tensor row (e.g. Higgs v2 codes frames decoded twice).
+            pooler_inter, pooler_client = partition_payload_list(
+                cast("Sequence[Mapping[str, object]]", pooler_payload or [])
+            )
+            self.model_runner_output.pooler_output = pooler_inter
+            self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
+                [_ensure_tensor_values(p) if p else {} for p in pooler_client] if pooler_client else None
             )
 
         if self._request_errors is not None:

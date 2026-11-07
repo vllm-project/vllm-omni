@@ -1241,3 +1241,50 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+def test_full_payload_fallback_codes_accumulate_once(monkeypatch):
+    """The full-payload fallback must partition, not mirror.
+
+    Mirroring put codes.audio on both the pooling bridge and
+    multimodal_output; MultimodalOutputProcessor accumulates both channels,
+    so every per-step row entered the request ledger twice and the codec
+    decoded each frame twice (Higgs v2 MRV2 legacy transport).
+    """
+    from tests.engine.test_output_processor_mrv2_text import (
+        _Detokenizer,
+        _make_processor,
+        _rehydrated_output,
+    )
+    from vllm_omni.outputs.output_modality import OutputModality
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+    row = torch.full((1, 8), 7, dtype=torch.int32)
+    output = _async_output(
+        req_ids=["r"],
+        text_hidden=torch.ones(1, 4),
+        multimodal_outputs={"codes": {"audio": row.clone()}},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+    # codes is not a client root key: it must ride exactly one channel.
+    if output.multimodal_outputs is not None and output.multimodal_outputs[0]:
+        assert (
+            "codes.audio" not in output.multimodal_outputs[0] or "codes.audio" not in (output.pooler_output or [{}])[0]
+        ), "codes mirrored on both channels"
+    engine_output = _rehydrated_output(pooling_output=(output.pooler_output or [None])[0])
+    if output.multimodal_outputs is not None:
+        engine_output.multimodal_output = output.multimodal_outputs[0]
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    processed = processor.process_outputs([engine_output])
+    payload = processed.request_outputs[0].outputs[0].multimodal_output
+    audio = payload.get("codes", {}).get("audio")
+    assert audio is not None and audio.shape[0] == 1, (
+        f"codes accumulated more than once: {audio.shape if audio is not None else None}"
+    )
