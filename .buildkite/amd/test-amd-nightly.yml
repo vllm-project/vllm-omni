@@ -133,30 +133,6 @@ steps:
         commands:
           - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
 
-      - label: "Qwen3-Omni Multi-Replica Perf"
-        # The AMD CI cluster has 1-, 2-, and 4-GPU queues, but no 3-GPU
-        # queue. Run the three-device topology on the existing 4-GPU queue;
-        # the config and cards_3 mark keep the fourth GPU out of the workload.
-        agent_pool: mi300_4
-        depends_on: amd-build
-        mirror_hardwares: [amdproduction]
-        grade: NonBlocking
-        timeout_in_minutes: 180
-        source_file_dependencies: omni_qwen3_omni_perf
-        env:
-          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-multi-replica-perf"
-          QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
-          QWEN3_OMNI_EXPECTED_GPUS: "4"
-          QWEN3_OMNI_EXPECTED_RESULTS: "7"
-          QWEN3_OMNI_EXPECTED_TESTS: "4"
-          QWEN3_OMNI_MARK_EXPRESSION: "slow and omni and rocm and MI325 and cards_3"
-          QWEN3_OMNI_TEST_TARGET: tests/dfx/perf/scripts/run_benchmark.py
-          QWEN3_OMNI_TIMEOUT: 165m
-        artifact_paths:
-          - artifacts/rocm-qwen3-omni-multi-replica-perf/**/*
-        commands:
-          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
-
   # The seven ROCm nodes in tests/examples/online_serving/test_qwen2_5_omni.py
   # already select Qwen/Qwen2.5-Omni-7B on MI325 with two cards. Keep AITER off
   # so this documentation lane does not pay for a cold JIT build.
@@ -1383,6 +1359,60 @@ steps:
               fi
             fi
             (exit "$$status")
+
+  - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
+    steps:
+      - label: "Diffusion Exchange, Ring and CFG Parity · 2 GPUs"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_collective_parity
+        artifact_paths:
+          - artifacts/rocm-diffusion-collectives-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 20 45m rocm-diffusion-collectives-2gpu
+            tests/diffusion/distributed/test_comm.py
+            tests/diffusion/distributed/test_cfg_parallel.py
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
+      - label: "Diffusion Exchange and Ring Parity · 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_collective_parity
+        artifact_paths:
+          - artifacts/rocm-diffusion-collectives-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 10 45m rocm-diffusion-collectives-4gpu
+            tests/diffusion/distributed/test_comm.py
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
+
+      # There is no three-GPU pool. Reserve four devices explicitly; each test
+      # spawns exactly three RCCL ranks on local devices 0, 1, 2. The fourth
+      # device is reserved and unused. Do not relabel cards_3 as cards_4.
+      - label: "Diffusion CFG Parity · 3 Ranks on 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_collective_parity
+        artifact_paths:
+          - artifacts/rocm-diffusion-cfg-3rank/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 45m rocm-diffusion-cfg-3rank
+            tests/diffusion/distributed/test_cfg_parallel.py::test_predict_noise_with_multi_branch_cfg_parity
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_3"
 
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     steps:

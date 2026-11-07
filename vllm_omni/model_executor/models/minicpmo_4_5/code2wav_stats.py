@@ -19,6 +19,7 @@ import logging
 import os
 import time
 from collections import Counter
+from collections.abc import Callable
 
 CODE2WAV_STATS_ENV = "VLLM_OMNI_CODE2WAV_STATS"
 
@@ -42,9 +43,16 @@ class Code2WavSolveStats:
     bounds throughput; a low duty means it is waiting on its upstream.
     """
 
-    def __init__(self, label: str = "code2wav", flush_every: int = _FLUSH_EVERY) -> None:
+    def __init__(
+        self,
+        label: str = "code2wav",
+        flush_every: int = _FLUSH_EVERY,
+        *,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
         self._label = label
         self._flush_every = max(int(flush_every), 1)
+        self._clock = clock
         self._enabled = _env_flag(CODE2WAV_STATS_ENV)
         self._solves = 0
         self._frames: Counter[tuple[str, int]] = Counter()
@@ -75,7 +83,7 @@ class Code2WavSolveStats:
         """
         if not self._enabled:
             return
-        now = time.perf_counter()
+        now = self._clock()
         if self._last_ts is not None:
             if duration is not None:
                 self._window_busy += duration
