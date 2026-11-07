@@ -3366,6 +3366,37 @@ class TestPlatformOverrides:
         # Neutral sampling defaults pass the v2 startup validation unchanged.
         assert deploy.stages[0].default_sampling_params["repetition_penalty"] == 1.0
 
+        # The mrv2 file is a pure alias of the default: base_config
+        # inheritance must resolve to the same deploy config so the two
+        # cannot drift (ignoring the empty ``stages: []`` entries that
+        # _merge_platforms normalization adds to inherited platforms).
+        def _platforms(deploy):
+            return {
+                plat: {k: v for k, v in section.items() if k != "stages" or v}
+                for plat, section in (deploy.platforms or {}).items()
+            }
+
+        assert _platforms(load_deploy_config(deploy_path)) == _platforms(
+            load_deploy_config(Path(get_deploy_config_path("higgs_audio_v2.yaml")))
+        )
+
+    def test_higgs_audio_v2_v2_default_does_not_warn_unvalidated(self, caplog):
+        """The flipped default declares its legacy-transport v2 path validated.
+
+        Without the pipeline declaration, every default boot logged the
+        generic "MRV2 support ... has not been validated" warning that tells
+        users to go back to model_runner: v1 — contradicting the shipped
+        default. The codec stage stays on v1 and never warns.
+        """
+        deploy_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
+        pipeline = resolve_pipeline_config("higgs_audio_v2")
+        assert pipeline.stages[0].mrv2_legacy_transport_validated is True
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        with caplog.at_level("WARNING", logger="vllm_omni.config.stage_config"):
+            merge_pipeline_deploy(pipeline, cuda)
+        assert not any("has not been validated" in record.getMessage() for record in caplog.records)
+
     def test_higgs_audio_v2_default_falls_back_to_v1_off_cuda(self):
         """The flipped default keeps the v1 runner on non-CUDA platforms.
 

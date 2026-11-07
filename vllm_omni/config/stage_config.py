@@ -395,6 +395,11 @@ class StagePipelineConfig:
     # instead of on every request. Keys whose engine-default value is neutral
     # (e.g. repetition_penalty=1.0) pass; any non-neutral value fails.
     mrv2_unsupported_sampling_params: tuple[str, ...] = ()
+    # Declares the ``model_runner: v2`` + legacy-transport combination
+    # validated for this stage, silencing the unvalidated-integration
+    # warning at deploy merge. Set only after e2e evidence exists for the
+    # pipeline on the v2 runner without ``supports_native_mrv2_data_plane``.
+    mrv2_legacy_transport_validated: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -1450,7 +1455,7 @@ def _build_engine_args(
     _validate_mrv2_default_sampling_params(ps, ds, stage_runner)
     engine_args["use_v2_model_runner"] = stage_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane and not ps.mrv2_legacy_transport_validated:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "

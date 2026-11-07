@@ -1,61 +1,9 @@
-# Higgs-audio v2 explicit MRV2 profile: the talker (stage 0) runs on
-# model_runner v2; the codec stage (stage 1) has no MRV2 path and stays on
-# v1, so the talker's outputs ride the legacy transport. This pins the same
-# selection the default profile (higgs_audio_v2.yaml) ships. Sampling under
-# v2 delegates to the native staged sampler, so the full request surface —
-# penalties included — keeps working.
-async_chunk: false
-
-connectors:
-  connector_of_shared_memory:
-    name: SharedMemoryConnector
-    extra:
-      codec_streaming: true
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 5000
-      connector_get_max_wait: 500
-      codec_chunk_frames: 25
-      codec_left_context_frames: 25
-      initial_codec_chunk_frames: 1
-
-stages:
-  - stage_id: 0
-    model_runner: v2
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.6
-    enforce_eager: true
-    trust_remote_code: true
-    enable_prefix_caching: false
-    async_scheduling: false
-    max_num_batched_tokens: 2048
-    max_model_len: 4096
-    devices: "0"
-    output_connectors:
-      to_stage_1: connector_of_shared_memory
-    default_sampling_params:
-      temperature: 1.0
-      top_p: 0.95
-      top_k: 50
-      max_tokens: 1024
-      seed: 42
-      repetition_penalty: 1.0
-
-  - stage_id: 1
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.25
-    enforce_eager: true
-    trust_remote_code: true
-    enable_prefix_caching: false
-    async_scheduling: false
-    max_num_batched_tokens: 65536
-    max_model_len: 65536
-    devices: "0"
-    input_connectors:
-      from_stage_0: connector_of_shared_memory
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 65536
-      seed: 42
-      repetition_penalty: 1.0
+# Higgs-audio v2 explicit MRV2 profile: an alias that pins the default
+# profile's runner selection — the talker (stage 0) runs on model_runner v2;
+# the codec stage (stage 1) has no MRV2 path and stays on v1, so the talker's
+# outputs ride the legacy transport. Sampling under v2 delegates to the
+# native staged sampler, so the full request surface — penalties included —
+# keeps working. Everything is inherited from the shipped default via
+# base_config so the two files cannot drift; unlike the default, this file
+# keeps stage 0 on v2 even if the default's selection ever flips back.
+base_config: higgs_audio_v2.yaml
