@@ -22,7 +22,8 @@
         "dit-cpu-offload": true,
         "text-encoder-cpu-offload": true,
         "warmup-mode": "off",
-        "output-path": "tests/dfx/perf/results/wan-videos"
+        "output-path": "tests/dfx/perf/results/wan-videos",
+        "flow-shift": 5.0
       }
     },
     "benchmark_params": [
@@ -52,7 +53,12 @@
           "num_frames": 81,
           "fps": 16,
           "seed": 42,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "negative_prompt": "Negative prompt for benchmarking diffusion models",
+          "guidance_scale": 5.0,
+          "guidance_scale_2": 5.0,
+          "boundary_ratio": 0.875,
+          "flow_shift": 5.0,
+          "max_sequence_length": 512
         },
         "seed": 0,
         "num_warmups": 2

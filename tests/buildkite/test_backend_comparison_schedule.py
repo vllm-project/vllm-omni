@@ -277,6 +277,8 @@ def test_wan_performance_runs_only_the_selected_video_workload(comparison_runner
     assert calls == ["buildkite-agent pipeline upload"]
     (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
     assert job["key"] == "perf-sglang-wan22-i2v"
+    assert job["concurrency"] == 2
+    assert job["concurrency_group"] == "vllm-omni/pr1994/sglang-smoke"
     assert "depends_on" not in job
     (container,) = next(iter(job["plugins"][0].values()))["podSpec"]["containers"]
     assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
@@ -286,7 +288,22 @@ def test_wan_performance_runs_only_the_selected_video_workload(comparison_runner
     (config,) = json.loads((ROOT / job["env"]["COMPARISON_CONFIG"]).read_text())
     reference = json.loads((ROOT / "tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json").read_text())[0]
     daily = {key: value for key, value in reference["benchmark_params"][0].items() if key != "baseline"}
-    assert config["benchmark_params"] == [{**daily, "seed": 0, "num_warmups": 2}]
+    assert config["benchmark_params"] == [
+        {
+            **daily,
+            "seed": 0,
+            "num_warmups": 2,
+            "extra_body": {
+                **daily["extra_body"],
+                # Resolved from nightly #18955's Wan I2V defaults.
+                "guidance_scale": 5.0,
+                "guidance_scale_2": 5.0,
+                "boundary_ratio": 0.875,
+                "flow_shift": 5.0,
+                "max_sequence_length": 512,
+            },
+        }
+    ]
     assert config["server_params"]["model"] == reference["server_params"]["model"]
 
 

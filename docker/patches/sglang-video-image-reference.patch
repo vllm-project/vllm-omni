@@ -42,3 +42,16 @@
 
      # Parse model-specific multipart metadata before creating request-owned
      # directories or saving uploads, so malformed JSON leaves no resources.
+--- a/sglang/multimodal_gen/configs/sample/wan.py
++++ b/sglang/multimodal_gen/configs/sample/wan.py
+@@ -256,6 +256,10 @@
+
+ @dataclass
+ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
++    @classmethod
++    def video_request_extra_fields(cls) -> frozenset[str]:
++        return frozenset({"boundary_ratio"})
++
+     guidance_scale: float = 3.5  # high_noise
+     guidance_scale_2: float = 3.5  # low_noise
+     num_inference_steps: int = 40

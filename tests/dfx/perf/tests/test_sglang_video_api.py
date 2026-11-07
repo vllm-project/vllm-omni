@@ -13,12 +13,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture(scope="module")
-def video_api():
+def sglang_source():
     spec = importlib.util.find_spec("sglang")
     if spec is None or spec.origin is None:
         pytest.skip("Run in the pinned SGLang comparison environment")
     assert spec is not None and spec.origin is not None
-    source = Path(spec.origin).parent / "multimodal_gen/runtime/entrypoints/openai/video_api.py"
+    return Path(spec.origin).parent
+
+
+@pytest.fixture(scope="module")
+def video_api(sglang_source):
+    source = sglang_source / "multimodal_gen/runtime/entrypoints/openai/video_api.py"
     return ast.parse(source.read_text())
 
 
@@ -46,3 +51,17 @@ def test_common_client_form_encoding_uses_form_path(video_api, content_type):
     namespace: dict[str, object] = {"content_type": content_type}
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), "video_api", "exec"), namespace)
     assert namespace["is_multipart"] is True
+
+
+def test_wan_request_declares_its_expert_boundary(sglang_source):
+    tree = ast.parse((sglang_source / "multimodal_gen/configs/sample/wan.py").read_text())
+    sampling = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Wan2_2_I2V_A14B_SamplingParam")
+    declaration = next(
+        n for n in sampling.body if isinstance(n, ast.FunctionDef) and n.name == "video_request_extra_fields"
+    )
+    declaration.decorator_list = []
+    namespace: dict[str, object] = {}
+    exec(compile(ast.Module(body=[declaration], type_ignores=[]), "wan_sampling", "exec"), namespace)
+    fields = namespace["video_request_extra_fields"]
+    assert callable(fields)
+    assert fields(None) == frozenset({"boundary_ratio"})

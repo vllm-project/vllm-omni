@@ -68,6 +68,8 @@ def wan_performance_job(benchmark: dict) -> dict:
     job.update(
         key="perf-sglang-wan22-i2v",
         label=":movie_camera: SGLang · Wan2.2 I2V · 832x480 · 81 frames · 4 steps · C1/10",
+        concurrency=2,
+        concurrency_group="vllm-omni/pr1994/sglang-smoke",
         env={"COMPARISON_CONFIG": config, "COMPARISON_IMAGE_DIGEST": QWEN_IMAGE_DIGEST},
         artifact_paths=[
             "tests/dfx/perf/results/wan-smoke/*.json",
