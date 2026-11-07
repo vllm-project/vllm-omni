@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
-    from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment, ToolCallOrigin, ToolCallSettlement
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -44,6 +44,31 @@ class DuplexRuntimeConfigError(ValueError):
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
         super().__init__(message)
         self.code = code
+
+
+def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping[str, object]) -> None:
+    """Refuse tool settings this model would otherwise silently ignore.
+
+    It is not part of ``validate_client_extra_body``, which plugins override
+    and which does not see the top-level ``tools`` of a ``session.update``.
+    """
+    tools = extra_body.get("realtime_tools")
+    if not tools:
+        return
+    if capabilities.tool_mode == "none":
+        raise DuplexRuntimeConfigError("This duplex model does not support tools", code="tools_unsupported")
+    max_tools = capabilities.max_tools
+    if max_tools is not None and isinstance(tools, list | tuple) and len(tools) > max_tools:
+        raise DuplexRuntimeConfigError(
+            f"This duplex model supports at most {max_tools} tools per session",
+            code="too_many_tools",
+        )
+    tool_choice = extra_body.get("realtime_tool_choice")
+    if tool_choice not in (None, "auto"):
+        raise DuplexRuntimeConfigError(
+            "Duplex sessions only support tool_choice auto",
+            code="unsupported_tool_choice",
+        )
 
 
 class DuplexInputCapacityError(ValueError):
@@ -863,28 +888,31 @@ class DuplexModelPlugin(ABC):
         """
         del origins
 
-    def runtime_config_for_tool_call_timeout(
+    def runtime_config_for_abandoned_tool_call(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
-        settlement: ToolCallSettlement,
+        abandonment: ToolCallAbandonment,
+        *,
+        history_len: int,
     ) -> dict[str, object] | None:
-        """Prepare model recovery for one newly timed-out call on the mailbox.
+        """Tell the model one call is over, in this model's own format.
 
-        This is called only for a timeout still in the current epoch,
-        never during speculative result conversion. Cached metadata cleanup
-        belongs in ``on_tool_call_settled`` and runs even if an epoch changed.
-        Plugins may prepare call-scoped model recovery here. Returning ``None``
-        requests no runtime-config change; it is
-        not an acknowledgement that the worker consumed anything. A timeout
+        Called for a timed-out or cancelled call still in the current epoch,
+        and for a repeat the session refused to expose (``suppressed``, which
+        has no ledger record). Show ``abandoned_tool_call_notice``, never client
+        text. A plugin may skip a reason it cannot deliver, so a suppressed
+        repeat can be the first notice the model gets for an epoch-cancelled
+        call. Cached metadata cleanup belongs in ``on_tool_call_settled`` and
+        runs even if an epoch changed. Returning ``None`` requests no change; it
+        is not an acknowledgement that the worker consumed anything. The notice
         must not reset the session or retire another call's queued result.
 
         Raising closes the session: the owner cannot safely retry partial
         model/bookkeeping effects. Closed or superseded decisions are skipped.
-        Accepted and cancelled calls never enter this hook. Their prepared
-        delivery or epoch-wide cancellation path remains the only model effect.
+        Accepted calls never enter this hook.
         """
-        del config, current, settlement
+        del config, current, abandonment, history_len
         return None
 
     def runtime_config_after_model_output(

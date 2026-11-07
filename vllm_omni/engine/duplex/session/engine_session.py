@@ -35,6 +35,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexTurnEventType,
     DuplexTurnState,
     ResponseCreateOptions,
+    effective_function_call_retry_policy,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
@@ -137,6 +138,8 @@ class ConversationHistory:
     #: answered yet. A turn can start from these alone, the way the Realtime
     #: protocol allows, without any audio having been committed.
     unanswered_user_items: int = 0
+    #: User turns that entered the session. Never rewinds.
+    user_turn_seq: int = 0
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
@@ -751,6 +754,11 @@ class DuplexEngineSession:
     def notify_new_user_item(self) -> None:
         """Record a user item that a later ``response.create`` may answer."""
         self._conversation.unanswered_user_items += 1
+        self._conversation.user_turn_seq += 1
+
+    def user_turn_seq(self) -> int:
+        """How many user turns have entered this session."""
+        return self._conversation.user_turn_seq
 
     def unanswered_user_items(self) -> int:
         """How many user items are waiting for a response."""
@@ -827,6 +835,7 @@ class DuplexEngineSession:
         if transcript:
             message["transcript"] = transcript
         self.append_history_message(message)
+        self._conversation.user_turn_seq += 1
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
             message=message,
@@ -2026,6 +2035,9 @@ class DuplexEngineSession:
             "watermarking": self.config.watermarking,
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
+            "function_call_retry_policy": effective_function_call_retry_policy(
+                self.capabilities, self.config.extra_body
+            ),
         }
         extra_body = self.config.extra_body
         realtime_tools = _copy_list(extra_body.get("realtime_tools"))

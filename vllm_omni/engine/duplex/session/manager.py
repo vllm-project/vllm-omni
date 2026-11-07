@@ -58,7 +58,12 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
+from vllm_omni.engine.duplex.plugin import (
+    DuplexModelPlugin,
+    DuplexRuntimeConfigError,
+    validate_duplex_plugin_sampling,
+    validate_session_tools,
+)
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
@@ -624,6 +629,7 @@ class DuplexSessionManager:
             capabilities = apply_session_stats_capability(
                 self.plugin.capabilities(max_sessions=max_sessions), collect_stats
             )
+            validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,

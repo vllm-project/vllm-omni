@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -32,6 +33,8 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputAction,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
+    abandoned_tool_call_notice,
 )
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
@@ -42,6 +45,7 @@ from vllm_omni.engine.duplex.plugin import (
     reject_private_runtime_keys,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.capabilities import (
+    MAX_SESSION_TOOLS,
     nemotron_voicechat_capabilities,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import (
@@ -57,6 +61,8 @@ from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are an AI voice assistant developed by NVIDIA. "
@@ -85,6 +91,8 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     }
 )
 
+logger = init_logger(__name__)
+
 
 class NemotronVoiceChatClientRuntimeConfigError(DuplexRuntimeConfigError):
     pass
@@ -112,8 +120,10 @@ def _normalized_tools(config: DuplexSessionConfig) -> tuple[list[dict[str, objec
         return [], "[]"
     if not isinstance(raw_tools, list):
         raise NemotronVoiceChatClientRuntimeConfigError("Nemotron VoiceChat tools must be a list")
-    if len(raw_tools) > 5:
-        raise NemotronVoiceChatClientRuntimeConfigError("Nemotron VoiceChat supports at most 5 tools per session")
+    if len(raw_tools) > MAX_SESSION_TOOLS:
+        raise NemotronVoiceChatClientRuntimeConfigError(
+            f"Nemotron VoiceChat supports at most {MAX_SESSION_TOOLS} tools per session"
+        )
 
     normalized: list[dict[str, object]] = []
     for index, tool in enumerate(raw_tools):
@@ -482,6 +492,33 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
                 "function_call_output requires a string output",
                 code="invalid_function_call_output",
             )
+        return self._queue_function_response(current, output)
+
+    def runtime_config_for_abandoned_tool_call(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        abandonment: ToolCallAbandonment,
+        *,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Close the call on the function channel of the open request.
+
+        A batch belongs to one request, and an epoch cancellation replaced that
+        request. A full queue skips the notice: raising here closes the session,
+        and the session still refuses a repeat of this call.
+        """
+        del config, history_len
+        if abandonment.reason is ToolCallAbandonReason.EPOCH_CANCELLED:
+            return None
+        try:
+            return self._queue_function_response(current, abandoned_tool_call_notice(abandonment.reason))
+        except NemotronVoiceChatClientRuntimeConfigError as exc:
+            logger.warning("Skipping notice for abandoned tool call %s: %s", abandonment.origin.call_id, exc)
+            return None
+
+    def _queue_function_response(self, current: Mapping[str, object], output: str) -> dict[str, object]:
+        """Tokenize one function-channel response and queue it for a later frame."""
         tokenizer_ref = current.get("nvc_tokenizer_ref")
         cached = self._tokenizers.get(str(tokenizer_ref)) if tokenizer_ref else None
         tokenizer = cached[1] if cached is not None else None

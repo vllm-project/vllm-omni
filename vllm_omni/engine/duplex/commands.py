@@ -9,7 +9,7 @@
 The *wire* half of each command --- which client event it decodes from and what
 fields survive decoding --- now lives in ``vllm_omni.protocol.duplex.commands``,
 which carries the whole vocabulary: the eight Tier 1 classes re-exported from
-``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the eight
+``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the nine
 Tier 3 ones. The engine imports that module and never the Tier 1 one directly,
 so a command that later grows a duplex extension changes one file
 (RFC #6592 P0a).
@@ -219,6 +219,11 @@ class CancelInput(DuplexCommand, _duplex_wire.CancelInput):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class CancelFunctionCall(DuplexCommand, _duplex_wire.CancelFunctionCall):
+    type: ClassVar[str] = "function_call.cancel"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BargeIn(DuplexCommand, _duplex_wire.BargeIn):
     type: ClassVar[str] = "barge_in"
 
@@ -274,6 +279,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "turn.signal",
         "input.text.append",
         "input.cancel",
+        "function_call.cancel",
         "barge_in",
     }
 )
@@ -305,6 +311,7 @@ __all__ = [
     "BargeIn",
     "CancelInput",
     "CancelResponse",
+    "CancelFunctionCall",
     "ClearInput",
     "ClearOutputAudio",
     "CloseSession",

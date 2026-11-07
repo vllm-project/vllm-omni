@@ -34,15 +34,25 @@ Bounded bookkeeping: one session may track at most
 terminal together, until close). Exceeding the budget is an explicit failure,
 never an eviction -- evicting a tombstone is exactly the reuse the tombstones
 exist to prevent.
+
+The ledger also stops the model repeating a call that is still pending or did
+not complete. Each call has a fingerprint (name plus canonical arguments), and
+``blocked_by`` answers whether a new call repeats a pending or abandoned one.
+A model that cannot see a pending call in its prompt asks again on the next
+turn, so that block holds until the call settles. Whether a later user turn
+lifts the block on an abandoned call is the owner's choice, made by passing
+``user_turn_seq``. Exposing the repeat, or not, stays with the caller.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
 
+from vllm_omni.engine.duplex.contracts import ToolCallAbandonReason
 from vllm_omni.engine.duplex.session.timers import (
     LoopTimerScheduler,
     ScheduledTimer,
@@ -54,6 +64,8 @@ __all__ = [
     "TERMINAL_TOOL_CALL_STATES",
     "TimerScheduler",
     "ToolCall",
+    "ToolCallAbandonReason",
+    "ToolCallAbandonment",
     "ToolCallAcceptance",
     "ToolCallLedger",
     "ToolCallOrigin",
@@ -62,6 +74,7 @@ __all__ = [
     "ToolCallSettlement",
     "ToolCallState",
     "ToolCallTimer",
+    "tool_call_fingerprint",
 ]
 
 
@@ -75,6 +88,16 @@ class ToolCallState(str, Enum):
 
 
 TERMINAL_TOOL_CALL_STATES = frozenset({ToolCallState.ACCEPTED, ToolCallState.TIMED_OUT, ToolCallState.CANCELLED})
+
+
+def tool_call_fingerprint(name: str, arguments: str | None) -> str:
+    """Identify a call by what it asks for, so key order cannot hide a repeat."""
+    text = arguments or ""
+    try:
+        canonical = json.dumps(json.loads(text), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (ValueError, RecursionError):
+        canonical = text
+    return f"{name}\0{canonical}"
 
 
 class ToolCallRejection(str, Enum):
@@ -117,6 +140,16 @@ class ToolCallSettlement:
     origin: ToolCallOrigin
     state: ToolCallState
     settled_epoch: int
+    #: ``None`` only for an accepted call.
+    reason: ToolCallAbandonReason | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallAbandonment:
+    """One call the model should stop waiting for or repeating, for its plugin."""
+
+    origin: ToolCallOrigin
+    reason: ToolCallAbandonReason
 
 
 @dataclass(slots=True)
@@ -131,6 +164,14 @@ class ToolCall:
     settled_epoch: int | None = None
     #: Scheduled expiry, owned by this record until it settles.
     timer: ToolCallTimer | None = None
+    #: Why the call ended without a usable result (``None`` otherwise).
+    reason: ToolCallAbandonReason | None = None
+    #: Epoch a result may be admitted in. It only differs from ``origin.epoch``
+    #: when the owner keeps pending calls across an epoch advance.
+    admission_epoch: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.admission_epoch = self.origin.epoch
 
     @property
     def is_pending(self) -> bool:
@@ -184,6 +225,8 @@ class ToolCallLedger:
         timeout_s: float | None = None,
         on_expire: Callable[[str], None] | None = None,
         on_settle: Callable[[ToolCallSettlement], None] | None = None,
+        keep_on_epoch_advance: bool = False,
+        user_turn_seq: Callable[[], int] | None = None,
     ) -> None:
         # A record budget is a count, so only an integer will do: ``True`` would
         # become a limit of one and ``0.5`` a silently truncated zero.
@@ -201,6 +244,14 @@ class ToolCallLedger:
         # Enqueue-only notification: the owner must not mutate this ledger or
         # perform plugin/model work synchronously from the callback.
         self._on_settle = on_settle
+        self._keep_on_epoch_advance = keep_on_epoch_advance
+        #: Monotonic user-turn counter. ``None`` means a block lasts the session.
+        self._user_turn_seq = user_turn_seq
+        #: Fingerprint -> abandoned call id and the user turn it was abandoned in.
+        #: Bounded by ``max_calls``: only a recorded call can add an entry.
+        self._abandoned: dict[str, tuple[str, int]] = {}
+        #: Fingerprint -> pending call id, for the same reason and the same bound.
+        self._pending: dict[str, str] = {}
         self._scheduler: TimerScheduler | None = None
         self._closed = False
 
@@ -226,6 +277,21 @@ class ToolCallLedger:
     def origins(self) -> tuple[ToolCallOrigin, ...]:
         """Immutable identities for final plugin disposal when the session closes."""
         return tuple(call.origin for call in self._calls.values())
+
+    def blocked_by(self, name: str, arguments: str | None) -> str | None:
+        """The pending or abandoned call this one repeats, if a block applies."""
+        fingerprint = tool_call_fingerprint(name, arguments)
+        pending = self._pending.get(fingerprint)
+        if pending is not None:
+            return pending
+        entry = self._abandoned.get(fingerprint)
+        if entry is None:
+            return None
+        call_id, abandoned_seq = entry
+        if self._user_turn_seq is not None and self._user_turn_seq() != abandoned_seq:
+            del self._abandoned[fingerprint]
+            return None
+        return call_id
 
     # -- exposure ------------------------------------------------------- #
 
@@ -257,6 +323,8 @@ class ToolCallLedger:
         now = self._clock()
         call = ToolCall(origin=origin, deadline=None if self._timeout_s is None else now + self._timeout_s)
         self._calls[origin.call_id] = call
+        if origin.name is not None:
+            self._pending[tool_call_fingerprint(origin.name, origin.arguments)] = origin.call_id
         self._arm(call, now=now)
         return call
 
@@ -299,11 +367,11 @@ class ToolCallLedger:
             return ToolCallRejection.NOT_PENDING
         instant = self._clock() if now is None else now
         if call.deadline is not None and instant >= call.deadline:
-            self._settle(call, ToolCallState.TIMED_OUT, epoch=None)
+            self._settle(call, ToolCallState.TIMED_OUT, epoch=None, reason=ToolCallAbandonReason.TIMEOUT)
             return ToolCallRejection.EXPIRED
         return ToolCallAcceptance(
             call_id=call_id,
-            epoch=call.origin.epoch,
+            epoch=call.admission_epoch,
             turn_id=call.origin.turn_id,
             deadline=call.deadline,
         )
@@ -324,14 +392,16 @@ class ToolCallLedger:
         call = self._calls.get(acceptance.call_id)
         if call is None or not call.is_pending:
             return ToolCallRejection.NOT_PENDING
-        if call.origin.epoch != epoch or call.origin.epoch != acceptance.epoch:
+        stale_acceptance = not self._keep_on_epoch_advance and call.admission_epoch != acceptance.epoch
+        if call.admission_epoch != epoch or stale_acceptance:
             # Defensive: ``invalidate_epoch`` already settles these, this only
-            # covers an epoch bump that bypassed it.
-            self._settle(call, ToolCallState.CANCELLED, epoch=epoch)
+            # covers an epoch bump that bypassed it. A kept call follows the
+            # epoch, so a bump during the await does not void its acceptance.
+            self._settle(call, ToolCallState.CANCELLED, epoch=epoch, reason=ToolCallAbandonReason.EPOCH_CANCELLED)
             return ToolCallRejection.NOT_PENDING
         instant = self._clock() if now is None else now
         if call.deadline is not None and instant >= call.deadline:
-            self._settle(call, ToolCallState.TIMED_OUT, epoch=epoch)
+            self._settle(call, ToolCallState.TIMED_OUT, epoch=epoch, reason=ToolCallAbandonReason.TIMEOUT)
             return ToolCallRejection.EXPIRED
         return None
 
@@ -371,8 +441,24 @@ class ToolCallLedger:
             # cannot consume the only wakeup for an otherwise pending call.
             self._arm(call, now=instant)
             return False
-        self._settle(call, ToolCallState.TIMED_OUT, epoch=None)
+        self._settle(call, ToolCallState.TIMED_OUT, epoch=None, reason=ToolCallAbandonReason.TIMEOUT)
         return True
+
+    def cancel(
+        self,
+        call_id: object,
+        *,
+        reason: ToolCallAbandonReason,
+        epoch: int,
+    ) -> ToolCallRejection | None:
+        """Settle one pending call because the client ended it; ``None`` means done."""
+        call = self.record(call_id)
+        if call is None:
+            return ToolCallRejection.UNKNOWN
+        if not call.is_pending:
+            return ToolCallRejection.NOT_PENDING
+        self._settle(call, ToolCallState.CANCELLED, epoch=epoch, reason=reason)
+        return None
 
     def invalidate_epoch(self, epoch: int) -> tuple[ToolCallOrigin, ...]:
         """Cancel every call left over from an earlier epoch.
@@ -380,23 +466,43 @@ class ToolCallLedger:
         A cancellation advances the session epoch, which is the one place that
         means "everything the model already committed to is void". Terminal
         records are deliberately *not* touched: they are the tombstones that
-        keep a late result from binding to a newer call.
+        keep a late result from binding to a newer call. An owner that keeps
+        calls across an epoch advance moves them to the new epoch instead.
         """
         invalidated: list[ToolCallOrigin] = []
         for call in self._calls.values():
-            if call.is_pending and call.origin.epoch < epoch:
-                invalidated.append(call.origin)
-                self._settle(call, ToolCallState.CANCELLED, epoch=epoch)
+            if not call.is_pending or call.admission_epoch >= epoch:
+                continue
+            if self._keep_on_epoch_advance:
+                call.admission_epoch = epoch
+                continue
+            invalidated.append(call.origin)
+            self._settle(call, ToolCallState.CANCELLED, epoch=epoch, reason=ToolCallAbandonReason.EPOCH_CANCELLED)
         return tuple(invalidated)
 
-    def _settle(self, call: ToolCall, state: ToolCallState, *, epoch: int | None) -> None:
+    def _settle(
+        self,
+        call: ToolCall,
+        state: ToolCallState,
+        *,
+        epoch: int | None,
+        reason: ToolCallAbandonReason | None = None,
+    ) -> None:
         call.state = state
-        call.settled_epoch = call.origin.epoch if epoch is None else epoch
+        call.reason = reason
+        call.settled_epoch = call.admission_epoch if epoch is None else epoch
+        if call.origin.name is not None:
+            fingerprint = tool_call_fingerprint(call.origin.name, call.origin.arguments)
+            if self._pending.get(fingerprint) == call.origin.call_id:
+                del self._pending[fingerprint]
+            if reason is not None:
+                seq = self._user_turn_seq() if self._user_turn_seq is not None else 0
+                self._abandoned[fingerprint] = (call.origin.call_id, seq)
         timer, call.timer = call.timer, None
         if timer is not None:
             timer.cancel()
         if self._on_settle is not None:
-            self._on_settle(ToolCallSettlement(call.origin, state, call.settled_epoch))
+            self._on_settle(ToolCallSettlement(call.origin, state, call.settled_epoch, reason))
 
     def close(self) -> None:
         """Drop every record and timer: the session is gone, nothing can settle.
@@ -414,4 +520,6 @@ class ToolCallLedger:
             if timer is not None:
                 timer.cancel()
         self._calls.clear()
+        self._abandoned.clear()
+        self._pending.clear()
         self._closed = True
