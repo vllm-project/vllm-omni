@@ -5,6 +5,7 @@
 Chunked vs end-to-end mode is dispatched from ``deploy.async_chunk``.
 """
 
+from vllm_omni.config.endpoint_policy import speech_only_endpoint_restrictions
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -31,6 +32,7 @@ register_key_accumulation_strategy("codec_frames", TensorAccumulationStrategy.CO
 
 QWEN3_TTS_PIPELINE = PipelineConfig(
     model_type="qwen3_tts",
+    endpoint_restrictions=speech_only_endpoint_restrictions("Qwen3-TTS"),
     default_deploy_config_name="qwen3_tts.yaml",
     # Pipeline-level default; the code2wav stage overrides per-stage below.
     model_arch="Qwen3TTSTalkerForConditionalGeneration",
@@ -84,6 +86,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
 # ``talker_stream_decode`` model option). No Code2Wav stage, no connector.
 QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
     model_type="qwen3_tts_fused",
+    endpoint_restrictions=speech_only_endpoint_restrictions("Qwen3-TTS"),
     default_deploy_config_name="qwen3_tts_fused_single_gpu.yaml",
     single_stage_async_chunk=True,
     model_arch="Qwen3TTSTalkerForConditionalGeneration",
