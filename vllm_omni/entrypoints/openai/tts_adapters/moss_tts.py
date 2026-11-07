@@ -7,8 +7,10 @@ handles each); they are registered under distinct model-type names.
 """
 
 import asyncio
+import copy
 import hashlib
 import threading
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from transformers import AutoModel, AutoTokenizer
@@ -32,6 +34,21 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+
+MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_moss_tts_effective_max_tokens"
+MOSS_TTS_AUTO_BUDGET_KEY = "_moss_tts_auto_budget"
+_MIN_CODEC_FRAMES = 192
+_MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
+# MOSS-SoundEffect emits ~12.5 codec frames per second; ``tokens`` in the
+# build_user_message payload is the target frame count for the requested audio.
+_SOUND_EFFECT_FRAMES_PER_SECOND = 12.5
+
+
+class MossTTSCodecLimitError(TTSGenerationError):
+    """MOSS-TTS exhausted its codec budget without emitting EOS."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=True)
 
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
@@ -107,6 +124,7 @@ def _code_grid_cache_salt(audio_codes: Any) -> str:
 
 class _MossTTSAdapterBase(ARTTSAdapter):
     accumulate_nonstreaming: bool = False
+    validates_generation: bool = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
@@ -499,7 +517,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             user_kwargs["text"] = request.input or ""  # may be empty
             user_kwargs["ambient_sound"] = request.ambient_sound or ""
             if request.duration_seconds is not None:
-                user_kwargs["tokens"] = max(1, int(float(request.duration_seconds) * 12.5))
+                user_kwargs["tokens"] = max(1, int(float(request.duration_seconds) * _SOUND_EFFECT_FRAMES_PER_SECOND))
             elif request.max_new_tokens is not None:
                 user_kwargs["tokens"] = int(request.max_new_tokens)
         elif v == "voice_generator":
@@ -681,7 +699,151 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         prompt: dict | None = None,
         request_id: str | None = None,
     ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)
+        """Apply a text-scaled dynamic codec token budget.
+
+        MOSS-TTS can rarely enter a repetitive sampling state in which codec
+        EOS is never reached. A fixed ceiling (default 4096 frames ≈ 5.5 min)
+        turns that into minutes of unusable audio occupying a GPU decode slot.
+        Bound the default budget by text length, while preserving an explicit
+        caller ``max_new_tokens`` override.
+
+        Mirrors the Qwen3-TTS pattern: ``dynamic_cap = max(192, text_tokens × 12)``,
+        clamped to the configured ``max_tokens``.
+
+        Excluded variants (configured budget preserved, no cap key written):
+
+        - Nano (``_moss_variant is None``): its outer scheduler steps represent
+          audio chunks, not codec frames, and the frame count is controlled via
+          ``additional_information["max_new_frames"]`` (default 375), not
+          ``SamplingParams.max_tokens``.
+        - ``sound_effect``: ``input`` is optional free text and the sound is
+          described in ``ambient_sound``, so text length does not predict output
+          length. The 12 frames/token ratio is calibrated for speech, not for
+          these fields, and an explicit ``duration_seconds`` pins a target audio
+          length whose scheduler-step cost (16 delayed codebooks + audio-end +
+          EOS) exceeds the frame count. Capping here would either truncate a
+          valid request or false-reject a length finish, so the configured server
+          budget is preserved.
+        """
+        del request_id
+
+        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
+
+        # Shallow-copy stage 0 so the shared defaults stay immutable.
+        sampling_params_list = [copy.copy(params) for params in sampling_params_list]
+        stage0_params = sampling_params_list[0]
+
+        # Nano and SoundEffect are excluded from the text-scaled ceiling (see
+        # docstring): the cap would not govern their actual generation and could
+        # only false-reject a length finish. Keep the configured budget untouched.
+        if self._moss_variant is None or self._moss_variant == "sound_effect":
+            return sampling_params_list
+
+        configured_cap = getattr(stage0_params, "max_tokens", None)
+        effective_cap: int | None
+        auto_budget = False
+        text_tokens: int | None = None
+        dynamic_cap: int | None = None
+
+        if request.max_new_tokens is not None:
+            # An explicit request budget is an opt-out from the dynamic ceiling.
+            # A length finish under a caller budget returns the audio, matching
+            # the Qwen3-TTS contract for explicit max_new_tokens.
+            effective_cap = int(request.max_new_tokens)
+        else:
+            text_tokens = self.ctx.server._count_usage_text_tokens(request.input)
+            if text_tokens > 0:
+                dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
+                if configured_cap is not None:
+                    effective_cap = min(dynamic_cap, int(configured_cap))
+                    # Only the server-derived ceiling that actually bound the
+                    # request is treated as a degenerate-generation signal.
+                    # When the dynamic cap reaches or exceeds the configured
+                    # limit, the request is long-form and a length finish at the
+                    # configured budget must return the audio (otherwise two
+                    # full configured-budget decodes end in a 500).
+                    auto_budget = dynamic_cap < int(configured_cap)
+                else:
+                    effective_cap = dynamic_cap
+                    auto_budget = True
+            else:
+                # Token counting is best-effort. If the tokenizer is missing or
+                # rejects the input, preserve the configured budget instead of
+                # truncating an otherwise valid request at the minimum ceiling.
+                effective_cap = int(configured_cap) if configured_cap is not None else None
+
+        if effective_cap is not None:
+            effective_cap = max(1, effective_cap)
+            stage0_params.max_tokens = effective_cap
+            stage0_params.min_tokens = min(
+                int(getattr(stage0_params, "min_tokens", 0) or 0),
+                effective_cap,
+            )
+
+        if isinstance(prompt, dict):
+            additional_information = prompt.get("additional_information")
+            if isinstance(additional_information, dict) and effective_cap is not None:
+                additional_information[MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+                if auto_budget:
+                    additional_information[MOSS_TTS_AUTO_BUDGET_KEY] = [True]
+
+        logger.debug(
+            "MOSS-TTS codec budget: text_tokens=%s dynamic_cap=%s configured_cap=%s "
+            "request_cap=%s effective_cap=%s auto_budget=%s",
+            text_tokens,
+            dynamic_cap,
+            configured_cap,
+            request.max_new_tokens,
+            effective_cap,
+            auto_budget,
+        )
+        return sampling_params_list
+
+    def validate_generation(
+        self,
+        tts_params: Any,
+        *,
+        stage0_finish_reason: str | None,
+        output_tokens: int,
+    ) -> None:
+        """Reject a generation that hit the token budget without emitting EOS.
+
+        A ``length`` finish reason means the talker exhausted ``max_tokens``
+        without producing codec EOS — the audio is incomplete and likely
+        degenerate (repetitive sampling). Surface it as a retryable error so
+        the client can retry with a fresh sampling seed.
+
+        Only the server-derived text-scaled budget (``MOSS_TTS_AUTO_BUDGET_KEY``)
+        is rejected on a length finish. An explicit caller ``max_new_tokens``
+        (or a pinned ``duration_seconds``) is the caller's own budget, so a
+        length finish returns the generated audio unchanged — matching the
+        Qwen3-TTS contract for explicit caller budgets.
+        """
+        if not isinstance(tts_params, Mapping):
+            return
+        if MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
+            return
+        if stage0_finish_reason != "length":
+            return
+        # An explicit caller budget keeps returning the audio; only the
+        # server-derived text-scaled cap is rejected as a degenerate generation.
+        auto_budget = tts_params.get(MOSS_TTS_AUTO_BUDGET_KEY)
+        if isinstance(auto_budget, (list, tuple)):
+            auto_budget = auto_budget[0] if auto_budget else None
+        if not auto_budget:
+            return
+
+        raw_limit = tts_params.get(MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY)
+        if isinstance(raw_limit, (list, tuple)):
+            raw_limit = raw_limit[0] if raw_limit else None
+        try:
+            limit = int(raw_limit) if isinstance(raw_limit, (str, bytes, bytearray, int, float)) else 0
+        except (TypeError, ValueError):
+            limit = 0
+        raise MossTTSCodecLimitError(
+            "MOSS-TTS did not emit codec EOS before its token budget "
+            f"({output_tokens}/{limit} codec tokens); the generated audio is incomplete."
+        )
 
 
 @register_tts_adapter
@@ -689,6 +851,9 @@ class MossTTSNanoAdapter(_MossTTSAdapterBase):
     stage_keys = frozenset({"moss_tts_nano"})
     name = "moss_tts_nano"
     accumulate_nonstreaming = True
+    # Nano never writes a cap key, so there is nothing to validate and no
+    # reason to charge the streaming generation counter.
+    validates_generation = False
 
 
 @register_tts_adapter
