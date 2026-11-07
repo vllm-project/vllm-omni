@@ -25,8 +25,6 @@ See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 
 from __future__ import annotations
 
-import base64
-import binascii
 import os
 import tempfile
 import threading
@@ -39,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import httpx
 import numpy as np
+import pybase64 as base64
 import torch
 from PIL import Image, UnidentifiedImageError
 from vllm import envs
@@ -52,6 +51,13 @@ from vllm.multimodal.video import (
 )
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.media_input import (
+    MAX_AUDIO_INPUT_BYTES,
+    MAX_IMAGE_INPUT_BYTES,
+    MAX_VIDEO_INPUT_BYTES,
+    decode_base64_media,
+    download_media_bytes,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     FileImageReference,
     FileVideoReference,
@@ -277,10 +283,7 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
         else:
             b64_data = input_reference
 
-        try:
-            image_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
-            raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
+        image_bytes = decode_base64_media(b64_data, max_bytes=MAX_IMAGE_INPUT_BYTES, source=source)
         return _decode_image_bytes(image_bytes, source=source)
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
@@ -291,24 +294,25 @@ async def decode_image_url(image_url: str) -> Image.Image:
 
     if image_url.startswith(("http://", "https://")):
         allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
-        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
-            try:
-                response = await client.get(image_url)
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.has_redirect_location and not allow_redirects:
-                    raise InvalidInputReferenceError(
-                        "Invalid image_reference.image_url: redirect response was rejected because "
-                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
-                    ) from exc
+        try:
+            image_bytes = await download_media_bytes(
+                image_url,
+                max_bytes=MAX_IMAGE_INPUT_BYTES,
+                source="image_reference.image_url",
+                follow_redirects=allow_redirects,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.has_redirect_location and not allow_redirects:
                 raise InvalidInputReferenceError(
-                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                    "Invalid image_reference.image_url: redirect response was rejected because "
+                    "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
                 ) from exc
-            except httpx.RequestError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid image_reference.image_url: failed to download image."
-                ) from exc
-        return _decode_image_bytes(response.content, source="image_reference.image_url")
+            raise InvalidInputReferenceError(
+                f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise InvalidInputReferenceError("Invalid image_reference.image_url: failed to download image.") from exc
+        return _decode_image_bytes(image_bytes, source="image_reference.image_url")
 
     raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
 
@@ -327,10 +331,7 @@ def _decode_base64_video(
         else:
             b64_data = video_reference
 
-        try:
-            video_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
-            raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
+        video_bytes = decode_base64_media(b64_data, max_bytes=MAX_VIDEO_INPUT_BYTES, source=source)
         if source_path is not None:
             with open(source_path, "wb") as output:
                 output.write(video_bytes)
@@ -366,25 +367,25 @@ async def decode_video_url(
             raise
 
     if video_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                response = await client.get(video_url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid video_reference.video_url: failed to download video."
-                ) from exc
+        try:
+            video_bytes = await download_media_bytes(
+                video_url,
+                max_bytes=MAX_VIDEO_INPUT_BYTES,
+                source="video_reference.video_url",
+            )
+        except httpx.HTTPError as exc:
+            raise InvalidInputReferenceError("Invalid video_reference.video_url: failed to download video.") from exc
         path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         try:
             with open(path, "wb") as output:
-                output.write(response.content)
+                output.write(video_bytes)
         except Exception:
             if os.path.exists(path):
                 os.unlink(path)
             raise
         try:
             return _decode_video_bytes(
-                response.content,
+                video_bytes,
                 source="video_reference.video_url",
                 max_frames=max_frames,
                 keep=keep,
@@ -406,22 +407,22 @@ async def decode_audio_url(audio_url: str) -> str:
 
     if audio_url.startswith("data:audio"):
         _, b64_data = audio_url.split(",", 1)
-        try:
-            audio_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:
-            raise InvalidInputReferenceError(
-                "Invalid audio_reference.audio_url: audio data is not valid base64."
-            ) from exc
+        if not b64_data:
+            raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
+        audio_bytes = decode_base64_media(
+            b64_data,
+            max_bytes=MAX_AUDIO_INPUT_BYTES,
+            source="audio_reference.audio_url",
+        )
     elif audio_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                response = await client.get(audio_url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid audio_reference.audio_url: failed to download audio."
-                ) from exc
-        audio_bytes = response.content
+        try:
+            audio_bytes = await download_media_bytes(
+                audio_url,
+                max_bytes=MAX_AUDIO_INPUT_BYTES,
+                source="audio_reference.audio_url",
+            )
+        except httpx.HTTPError as exc:
+            raise InvalidInputReferenceError("Invalid audio_reference.audio_url: failed to download audio.") from exc
     else:
         raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
 

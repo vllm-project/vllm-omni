@@ -29,6 +29,20 @@ def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     return buffer.getvalue()
 
 
+class _ChunkedStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.started = False
+
+    async def __aiter__(self):
+        self.started = True
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        pass
+
+
 def _install_http_transport(monkeypatch, handler, client_kwargs):
     async_client = httpx.AsyncClient
 
@@ -109,6 +123,85 @@ async def test_decode_image_url_reports_connection_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decode_image_url_rejects_declared_response_size_before_read(monkeypatch):
+    stream = _ChunkedStream([b"too large"])
+
+    def _handler(request):
+        return httpx.Response(200, headers={"content-length": "5"}, stream=stream)
+
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", 4)
+    _install_http_transport(monkeypatch, _handler, [])
+
+    with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+        await video_api_utils.decode_image_url("https://example.com/large.png")
+
+    assert not stream.started
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_rejects_chunked_response_after_limit(monkeypatch):
+    stream = _ChunkedStream([b"1234", b"5"])
+
+    def _handler(request):
+        return httpx.Response(200, stream=stream)
+
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", 4)
+    _install_http_transport(monkeypatch, _handler, [])
+
+    with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+        await video_api_utils.decode_image_url("https://example.com/stream.png")
+
+    assert stream.started
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_reads_bounded_chunked_image(monkeypatch):
+    image_bytes = _png_bytes()
+    stream = _ChunkedStream([image_bytes[:3], image_bytes[3:]])
+
+    def _handler(request):
+        return httpx.Response(200, stream=stream)
+
+    _install_http_transport(monkeypatch, _handler, [])
+
+    image = await video_api_utils.decode_image_url("https://example.com/stream.png")
+
+    assert image.size == (2, 1)
+    assert stream.started
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_rejects_compressed_response_before_read(monkeypatch):
+    stream = _ChunkedStream([_png_bytes()])
+
+    def _handler(request):
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=stream)
+
+    _install_http_transport(monkeypatch, _handler, [])
+
+    with pytest.raises(InvalidInputReferenceError, match="compressed responses"):
+        await video_api_utils.decode_image_url("https://example.com/compressed.png")
+
+    assert not stream.started
+
+
+@pytest.mark.asyncio
+async def test_decode_video_url_rejects_declared_response_size_before_tempfile(monkeypatch):
+    stream = _ChunkedStream([b"too large"])
+
+    def _handler(request):
+        return httpx.Response(200, headers={"content-length": "5"}, stream=stream)
+
+    monkeypatch.setattr(video_api_utils, "MAX_VIDEO_INPUT_BYTES", 4)
+    _install_http_transport(monkeypatch, _handler, [])
+
+    with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+        await video_api_utils.decode_video_url("https://example.com/large.mp4")
+
+    assert not stream.started
+
+
+@pytest.mark.asyncio
 async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
     def _unexpected_http_client(*args, **kwargs):
         pytest.fail("data URLs must not create an HTTP client")
@@ -120,6 +213,28 @@ async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
 
     assert image.size == (2, 1)
     assert image.mode == "RGB"
+
+
+def test_decode_base64_image_rejects_oversized_data_url_before_decode(monkeypatch):
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", 4)
+    encoded = base64.b64encode(b"12345").decode()
+
+    with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+        video_api_utils._decode_base64_image(
+            f"data:image/png;base64,{encoded}",
+            source="image_reference.image_url",
+        )
+
+
+def test_decode_base64_video_rejects_oversized_data_url_before_decode(monkeypatch):
+    monkeypatch.setattr(video_api_utils, "MAX_VIDEO_INPUT_BYTES", 4)
+    encoded = base64.b64encode(b"12345").decode()
+
+    with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+        video_api_utils._decode_base64_video(
+            f"data:video/mp4;base64,{encoded}",
+            source="video_reference.video_url",
+        )
 
 
 def test_decode_image_bytes_rejects_image_over_pixel_limit_before_conversion(monkeypatch):

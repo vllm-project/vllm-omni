@@ -14,6 +14,7 @@ from argparse import Namespace
 from http import HTTPStatus
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -24,11 +25,13 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai import media_input
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.images import helpers as image_helpers
 from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -1701,6 +1704,35 @@ def test_image_edit_images_processing(async_omni_test_client):
     assert isinstance(processed_images[1], Image.Image)
     assert processed_images[0].size == (16, 16)
     assert processed_images[1].size == (24, 24)
+
+
+def test_image_edit_rejects_oversized_http_url_before_decode(async_omni_test_client, monkeypatch):
+    async_client = media_input.httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        return async_client(
+            *args,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-length": "5"},
+                    content=b"12345",
+                )
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(image_helpers, "MAX_IMAGE_INPUT_BYTES", 4)
+    monkeypatch.setattr(media_input.httpx, "AsyncClient", _client_factory)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        data={"prompt": "reject oversized input", "url": "https://example.com/large.png"},
+    )
+
+    assert response.status_code == 400
+    assert "exceeds" in response.json()["detail"]
+    assert async_omni_test_client.app.state.engine_client.captured_prompt is None
 
 
 def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(async_omni_test_client):
