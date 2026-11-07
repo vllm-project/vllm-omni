@@ -58,6 +58,7 @@ nav:
       - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
       - Independent Stage Execution (experimental): features/independent_stage_execution.md
       - Sleep Mode: features/sleep_mode.md
+      - Response Judge Stage: features/response_judge.md
       - HF Numerics for RL Rollouts: features/hf_numerics.md
     - Watermarking: features/watermarking.md
     - Quantization:

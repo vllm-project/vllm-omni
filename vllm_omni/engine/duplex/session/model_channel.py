@@ -642,7 +642,12 @@ class ModelChannel:
     # ------------------------------------------------------------------ #
 
     def decide_output(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+        self,
+        stage_id: int,
+        output: RequestOutput,
+        context: DuplexOutputContext,
+        *,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         """Pure plugin decision (no session mutation: this runs inline on the orchestrator loop)."""
         decision = self._ctx.plugin.decide_output(
@@ -652,6 +657,7 @@ class ModelChannel:
             segment_token_ids=context.segment_token_ids,
             segment_output_metadata=dict(context.segment_output_metadata),
             output=output,
+            streaming_context=streaming_context,
         )
         if decision is not None and not isinstance(decision, DuplexOutputDecision):
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
@@ -666,7 +672,12 @@ class ModelChannel:
         )
 
     def release_concurrent_turn_requests(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+        self,
+        stage_id: int,
+        output: RequestOutput,
+        context: DuplexOutputContext,
+        *,
+        streaming_context: object | None = None,
     ) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
         return self._ctx.plugin.release_concurrent_turn_requests(
@@ -674,6 +685,7 @@ class ModelChannel:
             segment_finished=context.segment_finished,
             output=output,
             context=context,
+            streaming_context=streaming_context,
         )
 
     def stage_metrics_snapshot(
@@ -1667,6 +1679,9 @@ class ModelChannel:
             value = model_result.get(name)
             if isinstance(value, bool):
                 metadata[name] = value
+        listen_source = model_result.get("listen_source")
+        if isinstance(listen_source, str) and listen_source:
+            metadata["listen_source"] = listen_source
         effective_stage_metrics = stage_metrics if stage_metrics is not None else model_result.get("stage_metrics")
         if isinstance(effective_stage_metrics, Mapping):
             metadata["stage_metrics"] = {

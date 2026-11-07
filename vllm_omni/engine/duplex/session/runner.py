@@ -336,6 +336,7 @@ class DuplexSessionRunner:
         *,
         request_id: str,
         context: DuplexOutputContext,
+        streaming_context: object | None = None,
         input_transcript: str | None = None,
         input_item_id: str | None = None,
     ) -> bool:
@@ -364,12 +365,12 @@ class DuplexSessionRunner:
         decision: DuplexOutputDecision | None = None
         project = False
         if stage_id < context.final_stage_id:
-            decision = self.model.decide_output(stage_id, output, context)
+            decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
                 project = self.model.project_intermediate_output(stage_id, output, context)
         if self.session.capabilities.supports_concurrent_turn_requests and self.model.release_concurrent_turn_requests(
-            stage_id, output, context
+            stage_id, output, context, streaming_context=streaming_context
         ):
             self.run.concurrent_turn_requests_released = True
         consume = decision is not None or stage_id >= context.final_stage_id

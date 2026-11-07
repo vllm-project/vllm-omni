@@ -258,6 +258,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_metrics,
             request_id=request_id,
             context=context,
+            streaming_context=req_state.streaming,
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )

@@ -6,6 +6,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm.outputs import PoolingOutput, PoolingRequestOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.metrics.utils import (
@@ -15,9 +17,34 @@ from vllm_omni.metrics.utils import (
     count_tokens_from_outputs,
     count_video_frames,
     extract_diffusion_vae_decode_ms,
+    extract_mm_output,
+    iter_mm_outputs,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_pooling_output_has_no_multimodal_metrics() -> None:
+    output = PoolingRequestOutput(
+        request_id="judge",
+        outputs=PoolingOutput(torch.tensor([0.1, 0.9])),
+        prompt_token_ids=[1],
+        num_cached_tokens=0,
+        finished=True,
+    )
+    assert iter_mm_outputs(output) == []
+    assert extract_mm_output(output) == {}
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_multimodal_metrics_preserve_completion_outputs(container) -> None:
+    first = {"audio": [1.0]}
+    second = {"audio": [2.0]}
+    output = SimpleNamespace(
+        outputs=container([SimpleNamespace(multimodal_output=first), SimpleNamespace(multimodal_output=second)])
+    )
+    assert iter_mm_outputs(output) == [first, second]
+    assert extract_mm_output(output) == first
 
 
 @pytest.mark.parametrize(

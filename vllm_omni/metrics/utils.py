@@ -5,13 +5,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prettytable import PrettyTable
 
 from vllm_omni.metrics import definitions as metric_defs
 
 if TYPE_CHECKING:
+    from typing import SupportsFloat, SupportsIndex, SupportsInt
+
+    from _typeshed import SupportsTrunc
+
     from vllm_omni.metrics.modality import OmniModalityMetrics
     from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
     from vllm_omni.metrics.stats import StageRequestStats
@@ -250,10 +254,10 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(value)
+        converted = int(cast("str | bytes | bytearray | SupportsInt | SupportsIndex | SupportsTrunc", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def coerce_positive_float_scalar(value: object) -> float | None:
@@ -278,10 +282,10 @@ def coerce_positive_float_scalar(value: object) -> float | None:
         except Exception:
             return None
     try:
-        value = float(value)
+        converted = float(cast("str | bytes | bytearray | SupportsFloat | SupportsIndex", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def resolve_int_by_sequential_keys(
@@ -326,7 +330,7 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     if isinstance(mm, Mapping) and mm:
         return mm
     outs = getattr(mm_source, "outputs", None)
-    if outs:
+    if isinstance(outs, Sequence) and outs:
         nested = getattr(outs[0], "multimodal_output", None)
         if isinstance(nested, Mapping) and nested:
             return nested
@@ -356,7 +360,12 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in getattr(mm_source, "outputs", None) or []:
+    outputs = getattr(mm_source, "outputs", None)
+    # PoolingRequestOutput.outputs is a single PoolingOutput, not a sequence
+    # of CompletionOutputs, and carries no multimodal payload.
+    if not isinstance(outputs, Sequence):
+        return multimodal_outputs
+    for output in outputs:
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
@@ -509,16 +518,24 @@ def _build_field_defs(
         List of (display_name, getter_fn) tuples for table generation.
     """
     transforms = transforms or {}
-    result = []
+    result: list[tuple[str, Callable[[Any], Any]]] = []
     for f in fields(cls):
         if f.name in exclude:
             continue
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
+
             # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+            def transformed(e: Any, fn: Callable = transform_fn, n: str = f.name) -> Any:
+                return fn(getattr(e, n))
+
+            result.append((display_name, transformed))
         else:
-            result.append((f.name, lambda e, n=f.name: getattr(e, n)))
+
+            def unchanged(e: Any, n: str = f.name) -> Any:
+                return getattr(e, n)
+
+            result.append((f.name, unchanged))
     return result
 
 

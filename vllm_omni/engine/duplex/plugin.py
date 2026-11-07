@@ -587,6 +587,7 @@ class DuplexModelPlugin(ABC):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None: ...
 
     def project_intermediate_output(
@@ -662,6 +663,7 @@ class DuplexModelPlugin(ABC):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """Return True when the next user commit may start while prior TTS drains.
 
