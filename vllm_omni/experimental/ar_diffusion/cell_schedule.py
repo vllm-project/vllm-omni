@@ -378,7 +378,12 @@ def _completions(slots: tuple[tuple[Cell | None, ...], ...]) -> dict[Cell, int]:
 
 
 def expected_prior_cells(schedule: CellSchedule) -> frozenset[Cell]:
-    """Logical prior clean cells implied by ``chunk_base`` / ``H`` / ordering.
+    """Logical prior cells implied by ``chunk_base`` / ``H`` / ordering.
+
+    Must agree with what :func:`clean_history_cells` retained for the request that
+    produced chunk ``chunk_base - 1``: the plan reads these versions and the caller
+    checks residency against them, so declaring a cell the previous request never
+    produced (or never kept) fails the continuation closed.
 
     This is independent of which ranks currently hold the versions. Callers that
     need residency checks must verify owners separately and schedule handoffs.
@@ -389,11 +394,23 @@ def expected_prior_cells(schedule: CellSchedule) -> frozenset[Cell]:
     t_clean = schedule.num_denoise_steps
     cells: set[Cell] = set()
     h = schedule.kv_history_chunks
-    if h >= 1:
-        start = max(0, schedule.chunk_base - h)
-        cells |= {(chunk, t_clean, block) for chunk in range(start, schedule.chunk_base) for block in range(num_blocks)}
+    start = max(0, schedule.chunk_base - h)
     if schedule.ordering is Ordering.SAME_STEP:
+        # A Same-Step consumer reads the version matching its own denoise step, so
+        # the window is per-step. Only chunk 0 runs the extra clean forward (the
+        # session sink); a non-zero chunk never produces its clean step, so
+        # demanding it here would fail every continuation closed.
+        if h >= 1:
+            cells |= {
+                (chunk, step, block)
+                for chunk in range(start, schedule.chunk_base)
+                for step in range(schedule.num_denoise_steps)
+                for block in range(num_blocks)
+            }
         cells |= {(0, t_clean, block) for block in range(num_blocks)}
+        return frozenset(cells)
+    if h >= 1:
+        cells |= {(chunk, t_clean, block) for chunk in range(start, schedule.chunk_base) for block in range(num_blocks)}
     return frozenset(cells)
 
 

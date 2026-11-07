@@ -53,8 +53,20 @@ class ARDiffusionNoisyKVSpec:
     block_size: int
     max_chunk_tokens: int
     max_history_chunks: int
+    # History versions per layer one rank may hold at once. The default (H) is the
+    # live request's window. Same-Step also retains, per rank, its own step of a
+    # parked session's window plus the sink (H + 1) next to another request's
+    # live history, so it declares more.
+    max_history_versions: int | None = None
+
+    @property
+    def history_versions(self) -> int:
+        """History versions per layer one rank may hold at once."""
+        return int(self.max_history_versions or self.max_history_chunks)
 
     def __post_init__(self) -> None:
+        if self.max_history_versions is not None and self.max_history_versions <= 0:
+            raise ValueError(f"max_history_versions must be positive, got {self.max_history_versions}")
         for name in (
             "num_layers",
             "num_kv_heads",
@@ -471,6 +483,10 @@ class NoisyKVCache:
         # chunk 0 is deduplicated while inside the recent window. The G/step
         # margins below also cover pipeline overlap and transfers.
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
+        # Retention shares this pool: a parked session's retained versions stay
+        # resident while another request runs, so a spec that retains more than the
+        # live window declares it and the pool is sized for both.
+        per_req = max(per_req, spec.history_versions + 2 + layer_groups)
         desired = self.max_batch_size * per_req
         bytes_per_version = (
             2
@@ -531,14 +547,29 @@ class NoisyKVCache:
     def clear_session_structure(self, kv_id: str) -> None:
         self._session_structural_keys.pop(kv_id, None)
 
+    def session_usage(self, kv_id: str) -> tuple[int, int]:
+        """(versions, bytes) the pool key ``kv_id`` currently holds.
+
+        ``versions`` is the logical retained-version count and the second value the
+        footprint of those versions. A pool key holds one block's layer, so each
+        version costs ``bytes_per_version``; ``reserved_bytes`` is the same unit
+        summed over every layer's slots. Both are what the scheduler's ledger
+        needs to reconcile a grant against reality; the physical layout stays
+        private to this pool.
+        """
+        versions = sum(1 for key in self.pool.keys if key[0] == kv_id)
+        return versions, versions * self.bytes_per_version
+
 
 def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
-    """Clean cells to retain across requests for ``schedule``.
+    """History cells to retain across requests for ``schedule``.
 
-    Always keeps the trailing ``H`` window ``[chunk_end-H, chunk_end)``.
-    Same-Step additionally keeps absolute chunk-0 clean sink cells for the
-    whole session — later plans still demand ``(0, D, *)`` even after the
-    trailing window has moved past chunk 0.
+    Keeps the trailing ``H`` window ``[chunk_end-H, chunk_end)``. The diagonal
+    orderings read the clean KV of each retained chunk, so one version per chunk
+    is enough; a Same-Step consumer reads the version matching its own step, so
+    every denoise step of the window has to survive. Same-Step additionally keeps
+    absolute chunk-0 clean sink cells for the whole session — later plans still
+    demand ``(0, D, *)`` even after the trailing window has moved past chunk 0.
     """
     if num_blocks < 1:
         return set()
@@ -548,7 +579,8 @@ def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]
     if h >= 1:
         end = schedule.chunk_end
         start = max(0, end - h)
-        cells |= {(chunk, t_clean, block) for chunk in range(start, end) for block in range(num_blocks)}
+        steps = range(schedule.num_denoise_steps) if schedule.ordering is Ordering.SAME_STEP else (t_clean,)
+        cells |= {(chunk, step, block) for chunk in range(start, end) for step in steps for block in range(num_blocks)}
     if schedule.ordering is Ordering.SAME_STEP:
         cells |= {(0, t_clean, block) for block in range(num_blocks)}
     return cells
@@ -742,9 +774,12 @@ class NoisyKVState:
         spec = self.cache.spec
         pool = self.cache.pool
         h = spec.max_history_chunks
+        # A continuation (chunk_base > 0) always reads chunk 0's sink from prior
+        # history, even when it schedules a single chunk.
         sink = int(
             any(
-                plan.schedule.ordering is Ordering.SAME_STEP and plan.schedule.chunks > 1
+                plan.schedule.ordering is Ordering.SAME_STEP
+                and (plan.schedule.chunks > 1 or plan.schedule.chunk_base > 0)
                 for plan in self._plans.values()
             )
         )
