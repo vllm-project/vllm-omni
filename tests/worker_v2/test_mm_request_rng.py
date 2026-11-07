@@ -161,6 +161,8 @@ def test_mrv2_readmits_after_input_release_and_preemption(v2, make_request, cons
     provider = v2.model._mm_rng_provider
     handle, plan = provider.handles["A"], v2._mm_rng_state.plans["A"]
 
+    # Pins vLLM 0.33 behavior: _get_encoder_input_updates reads only the four
+    # attributes set below. Revisit this stub on upstream scheduler changes.
     scheduler = object.__new__(Scheduler)
     scheduler.use_v2_model_runner, scheduler.is_encoder_decoder = True, False
     scheduler.requests, scheduler._pending_encoder_input_ids = {"A": req}, {}
@@ -179,7 +181,7 @@ def test_mrv2_readmits_after_input_release_and_preemption(v2, make_request, cons
     # Re-admit independent Request/feature objects using schedule()'s actual
     # serialization entry point, with either retained prefix KV or recompute.
     resumed = copy(req)
-    resumed.mm_features = [replace(f) for f in req.mm_features]
+    resumed.mm_features = [replace(f, data=copy(f.data)) for f in req.mm_features]
     resumed.num_computed_tokens = req.num_computed_tokens if prefix_hit else 0
     new = NewRequestData.from_request(resumed, ([],), resumed.all_token_ids, uses_mrope=True)
     for feature in new.mm_features:
