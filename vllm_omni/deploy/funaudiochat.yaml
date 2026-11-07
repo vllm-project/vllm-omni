@@ -1,0 +1,59 @@
+# FunAudioChat AR speech sidecar -> CosyVoice3 codec decoder.
+pipeline: funaudiochat
+async_chunk: true
+trust_remote_code: true
+dtype: bfloat16
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_pre_lookahead_frames: 3
+      codec_left_context_frames: 25
+      codec_vocab_size: 6561
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 4
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    gpu_memory_utilization: 0.55
+    enforce_eager: true
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    engine_extras:
+      hf_overrides:
+        audio_config:
+          max_source_positions: 100
+      limit_mm_per_prompt:
+        audio: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      repetition_penalty: 1.2
+      max_tokens: 2048
+      stop_token_ids: [151645]
+      detokenize: true
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 4
+    max_num_batched_tokens: 32768
+    max_model_len: 32768
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    engine_extras:
+      model: FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
