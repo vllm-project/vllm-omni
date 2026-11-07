@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the Self-Forcing checkpoint assembly script.
 
 The script links or copies the base model's components into the output directory, removing
