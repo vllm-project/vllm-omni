@@ -171,7 +171,9 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
+# ``same_step`` is a supported schedule (S=D); its topology rules are covered by
+# tests/diffusion/ar_diffusion/test_cell_schedule.py.
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -261,6 +263,55 @@ def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
     else:
         plan, _, _ = pipeline._plan_for(req)
         assert plan.schedule.step_replicas == 1
+
+
+@pytest.mark.parametrize(("step_replicas", "expected"), [(3, 2 * 2 + 1), (4, 2), (1, 2)])
+def test_noisy_kv_spec_declares_the_same_step_retention(step_replicas, expected):
+    """Only the S=D (Same-Step) topology retains a parked session next to a live one."""
+    pipeline = _bare_pipeline(step_replicas=step_replicas, history=2)
+    pipeline.transformer = SimpleNamespace(local_num_layers=1, num_heads=1, head_dim=4)
+    pipeline.block_size = 4
+    pipeline.max_chunk_tokens = 4
+
+    spec = pipeline.ar_diffusion_noisy_kv_spec()
+
+    assert spec.max_history_chunks == 2
+    assert spec.history_versions == expected
+
+
+@pytest.mark.parametrize("pp_rank", [0, 2])
+def test_same_step_session_must_start_with_a_sink(monkeypatch, pp_rank):
+    """A one-chunk cold Same-Step request never runs chunk 0's clean forward.
+
+    Every continuation reads that sink, and only its owner rank would notice it is
+    missing, so the session is refused up front on every rank.
+    """
+    from vllm_omni.diffusion.models.causvid_wan import pipeline_causvid_wan as module
+
+    monkeypatch.setattr(module, "resolve_pp_rank_and_group", lambda: (pp_rank, None))
+    pipeline = _bare_pipeline(step_replicas=3, history=2)
+    pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1, parameters=lambda: iter([torch.zeros(1)]))
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=1, num_kv_heads=1, head_size=1, block_size=4, max_chunk_tokens=4, max_history_chunks=2
+    )
+    cache = NoisyKVCache(
+        spec, dtype=torch.float32, device=torch.device("cpu"), layer_groups=1, max_batch_size=1, step_replicas=3
+    )
+    pipeline._chunk_ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=3, layer_groups=1), rank=pp_rank),
+        kv=NoisyKVState(cache),
+    )
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="r0",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 3, "num_chunks": 1, "session_id": "s"}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="num_chunks >= 2"):
+        pipeline.forward(req)
+    assert not cache.pool.keys
 
 
 def test_causvid_rejects_explicit_s_eq_d():
