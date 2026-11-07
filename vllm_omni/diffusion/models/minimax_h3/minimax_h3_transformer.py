@@ -1274,10 +1274,18 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError("MiniMax H3 reference-KV offload does not support VDN-H3 hybrid attention")
         if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
             raise ValueError("MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention")
-        from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
+        from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import (
+            MiniMaxH3ReferenceKVDeviceState,
+            MiniMaxH3ReferenceKVTier2State,
+        )
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
 
-        return MiniMaxH3ReferenceKVTier2State.from_config(
+        state_cls = (
+            MiniMaxH3ReferenceKVDeviceState
+            if config.kv_cache_location == "device"
+            else MiniMaxH3ReferenceKVTier2State
+        )
+        return state_cls.from_config(
             config=config,
             num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
             global_reference_rows=global_reference_rows,

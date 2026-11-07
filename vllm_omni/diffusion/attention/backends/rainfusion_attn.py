@@ -104,6 +104,7 @@ class RainFusionConfig:
     sparsity: float = 0.0
     start_step: int = 0
     end_step: int = 0
+    window_sparsity: float | None = None
     precision: str = "bf16"
     skip_layers: frozenset[int] = frozenset()
 
@@ -114,6 +115,7 @@ class RainFusionConfig:
             sparsity=float(bk.get("sparsity", 0.0)),
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
+            window_sparsity=(None if bk.get("window_sparsity") is None else float(bk["window_sparsity"])),
             precision=str(bk.get("precision", "bf16")),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
@@ -344,17 +346,25 @@ class RainFusionAttentionImpl(AttentionImpl):
             or query.ndim != 4
             or query.shape[0] != 1
             or self.qkv_layout != _INPUT_LAYOUT
-            or self.rainfusion.precision != "bf16"
-            or metadata.attn_mask is not None
+            or self.rainfusion.precision not in ("bf16", "mix")
             or metadata.extra.get("kv_cache_dtype", "bf16") not in ("float", "bf16")
             or not metadata.extra.get("npu_attn_varlen", False)
         ):
+            return False
+        # The rectangular path slices Q and KV to their valid lengths itself, so a
+        # padding-only boolean mask carries no constraint it does not already honour.
+        # Any richer mask does, and the sparse runtime cannot represent it.
+        mask = metadata.attn_mask
+        if mask is not None and not (mask.ndim == 2 and mask.dtype == torch.bool):
             return False
         try:
             from mindiesd.utils.get_platform import is_a5_device
         except ImportError:
             return False
-        return not is_a5_device()
+        if not is_a5_device():
+            return True
+        # A5 has no bf16 rf_v2 kernel, so only the EagleQBSA ('mix') form is available.
+        return self.rainfusion.precision == "mix"
 
     def _forward_hybrid_npu(self, query, key, value, metadata, sparse_plan, reference_rows, *, q_spans):
         from vllm_omni.diffusion.attention.ops.rainfusion_hybrid import get_hybrid_plan, hybrid_attention
@@ -388,14 +398,16 @@ class RainFusionAttentionImpl(AttentionImpl):
             )
             return self.dense_fallback.forward_npu(q, k, v, dense_metadata)
 
+        precision = self.rainfusion.precision
+        kernel_dtype = "bf16" if precision == "mix" else "fp16"
         logger.info_once(
             "RAINFUSION_ATTN hybrid active: dense_q_rows=%d, sparse_q_rows=%d, kv_rows=%d, kernel=%s, dtype=%s; "
             "dense guards use Flash, geometry indices cached across layers.",
             plan.dense_query_rows,
             plan.sparse_query_rows,
             plan.key_rows,
-            "bsa",
-            "fp16",
+            "eagle_qbsa" if precision == "mix" else "bsa",
+            kernel_dtype,
         )
         if reference_rows:
             logger.info_once(
@@ -410,17 +422,44 @@ class RainFusionAttentionImpl(AttentionImpl):
             value[:, :used_kv],
             plan,
             dense_forward,
-            sparsity=self.rainfusion.sparsity,
+            sparsity=self._effective_sparsity(),
             scale=self.softmax_scale,
-            inner_precise=_INNER_PRECISE,
-            kernel_dtype="fp16",
+            inner_precise=4 if precision == "mix" else _INNER_PRECISE,
+            kernel_dtype=kernel_dtype,
             input_scale=float(metadata.extra.get("laser_input_scale", 256.0)),
+            precision=precision,
         )
         if used_q == query.shape[1]:
             return out
         padded = torch.zeros_like(query)
         padded[:, :used_q] = out
         return padded
+
+    def _in_dense_window(self) -> bool | None:
+        """Whether this denoise step falls in the head/tail window.
+
+        Returns None when the step gate cannot be evaluated at all, which keeps the
+        caller dense: a configured window must never be silently ignored.
+        """
+        rf = self.rainfusion
+        if not (rf.start_step or rf.end_step):
+            return False
+        if not is_forward_context_available():
+            return None
+        context = get_forward_context()
+        step_idx, total_steps = context.denoise_step_idx, context.total_denoise_steps
+        if step_idx is None or (rf.end_step and total_steps is None):
+            return None
+        if step_idx < rf.start_step:
+            return True
+        return bool(rf.end_step and step_idx >= total_steps - rf.end_step)
+
+    def _effective_sparsity(self) -> float:
+        """Window steps use ``window_sparsity``; every other step uses ``sparsity``."""
+        rf = self.rainfusion
+        if rf.window_sparsity is None:
+            return rf.sparsity
+        return rf.window_sparsity if self._in_dense_window() else rf.sparsity
 
     def _resolve_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:
         """Return the rf_v2 geometry, or None when this forward must stay dense."""
@@ -429,18 +468,13 @@ class RainFusionAttentionImpl(AttentionImpl):
             return None
         if self.layer_idx is not None and self.layer_idx in rf.skip_layers:
             return None
-        step_idx = total_steps = None
-        if is_forward_context_available():
-            step_idx = get_forward_context().denoise_step_idx
-            total_steps = get_forward_context().total_denoise_steps
-        if (rf.start_step and step_idx is None) or (rf.end_step and (step_idx is None or total_steps is None)):
+        in_window = self._in_dense_window()
+        if in_window is None:
             return None
-        if step_idx is not None:
-            if step_idx < rf.start_step:
-                return None
-            # Tail fallback: keep the last ``end_step`` denoise steps dense.
-            if rf.end_step > 0 and total_steps is not None and step_idx >= total_steps - rf.end_step:
-                return None
+        # Head and tail steps stay fully dense unless a window sparsity is configured,
+        # in which case they run sparse at that gentler rate rather than not at all.
+        if in_window and rf.window_sparsity is None:
+            return None
         if self.qkv_layout is None:
             # The sparse path reads the sequence off dim 1, which the tensors alone
             # do not establish, and the dense fallback resolves an absent layout its
@@ -672,7 +706,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             "input_layout": _INPUT_LAYOUT,
             "inner_precise": 4 if precision != "bf16" else _INNER_PRECISE,
             "block_size": _BLOCK_SIZE,
-            "sparsity": self.rainfusion.sparsity,
+            "sparsity": self._effective_sparsity(),
             "precision": precision,
         }
         if plan.video_spans is not None:
