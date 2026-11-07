@@ -2115,6 +2115,7 @@ duplex_session:
 | `qwen_summary_input_max_tokens` | `8192` | Maximum summary input, additionally capped by the deployment context allowance |
 | `qwen_summary_timeout_s` | `30` | Auxiliary model request deadline in seconds |
 | `context_auxiliary_budget` | `null` | Optional common auxiliary allowance; all five fields must be provided |
+| `context_memory_tokens` | `0` | Experimental card block allowance, including formatting, from 0 to 256 tokens within the total prompt budget |
 
 These settings are deployment-owned, not client session overrides. Set the
 context allowance no higher than the deployed Thinker's `max_model_len`.
@@ -2147,6 +2148,16 @@ common account, summaries keep their existing scheduling and extraction-only
 cards retain their existing compute settings. Configuring both policies
 requires the explicit common account, whose output allowance must fit each
 request's reserved generation.
+
+Card consumption additionally requires `context_memory` extraction and a
+positive `context_memory_tokens`. It preserves the history/summary selection
+and uses only the remaining prompt space, dropping lower-ranked cards first.
+The single historical-data block follows configured instructions and precedes
+summary/history. Retrieval uses only the current text or an available current
+transcript. Audio-only input with no transcript gets no cards; this setting
+does not run ASR. The default zero allowance adds no capture, retrieval or
+card-counting processor passes. `legacy` permits extraction with consumption
+disabled; positive card consumption requires `budget` or `budget_summary`.
 
 With both summary memory and card extraction enabled, ready work alternates on
 the same private request slot. Each kind keeps its finite retry state across

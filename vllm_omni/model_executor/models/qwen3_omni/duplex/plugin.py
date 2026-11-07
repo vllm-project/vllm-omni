@@ -27,7 +27,11 @@ from vllm.sampling_params import RequestOutputKind
 from vllm_omni.config.context_memory import DuplexContextMemoryConfig
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.contracts import (
+    DuplexAppendPlan,
+    DuplexContextSelection,
+    duplex_resource_request_belongs_to_session,
+)
 from vllm_omni.engine.duplex.memory_types import DuplexContextAuxiliaryPolicy, DuplexContextAuxiliaryRechunk
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudgetLimits
@@ -38,6 +42,9 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.context_budget import (
     CONTEXT_SUMMARY,
     CONTEXT_TOOL_INPUT,
     CONTEXT_TOOL_SOURCES,
+    CardCost,
+    ContextCard,
+    card_message,
     select_history,
     whole_turns,
 )
@@ -352,7 +359,13 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
     private_runtime_config_keys = frozenset(
-        {"context_memory", "duplex_session", "memory_compute_budget", "context_auxiliary_budget"}
+        {
+            "context_memory",
+            "context_memory_tokens",
+            "duplex_session",
+            "memory_compute_budget",
+            "context_auxiliary_budget",
+        }
     )
 
     def __init__(self, encode_audio):
@@ -372,6 +385,10 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
         self._supported_speakers: set[str] | None = None
 
     def configure_session_runtime(self, runtime_config):
+        if runtime_config.context_memory_tokens and (
+            runtime_config.qwen_context_policy == "legacy" or runtime_config.context_memory is None
+        ):
+            raise ValueError("context_memory_tokens requires a budget policy and context_memory")
         self._context_config = runtime_config
         self._memory_config = runtime_config.context_memory
         self.supports_context_auxiliary_requests = self._memory_config is not None
@@ -1135,6 +1152,11 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             # Re-encoding only history here makes Qwen answer an old question.
             messages.append({"role": "user", "audio_payload": payload, "_src": len(history)})
         result = {**config, "qwen_messages": messages}
+        if self._context_config.context_memory_tokens:
+            # An unbound new audio payload must not retrieve with an old query.
+            result["_qwen_memory_query"] = (
+                self._current_input_text(history) if not has_audio or current_is_in_history else None
+            )
         if self.uses_context_ledger:
             memory = state.context_memory
             if memory.snapshot is not None:
@@ -1146,6 +1168,38 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
                 )
             result[CONTEXT_SUMMARY] = memory.summary
         return result
+
+    def memory_prompt_query(self, *, session_config, payload):
+        if not self._context_config.context_memory_tokens:
+            return None
+        return session_config.get("_qwen_memory_query")
+
+    @staticmethod
+    def _current_input_text(history):
+        start = next((i + 1 for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "assistant"), 0)
+        parts = []
+        for message in history[start:]:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                parts.extend(
+                    part["text"]
+                    for part in content
+                    if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                )
+            transcript = message.get("transcript")
+            if isinstance(transcript, str) and transcript not in parts:
+                parts.append(transcript)
+        query = "\n".join(parts).strip()
+        if not query or len(query) > 4096:
+            return None
+        try:
+            return query if len(query.encode("utf-8")) <= 16384 else None
+        except UnicodeEncodeError:
+            return None
 
     @staticmethod
     def _view_text_parts(message):
@@ -1277,10 +1331,12 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             spliced.extend(turn["messages"])
         return spliced, [], waiting
 
-    def _render_context(self, history, *, runtime_config, session_config, summary=None):
+    def _render_context(self, history, *, runtime_config, session_config, summary=None, cards=()):
         messages = []
         if runtime_config.get("instructions"):
             messages.append({"role": "system", "content": runtime_config["instructions"]})
+        if cards:
+            messages.append(card_message(cards))
         if summary is not None:
             messages.append(summary.message())
         audios = []
@@ -1422,17 +1478,40 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             if not isinstance(reserve, int):
                 raise DuplexRuntimeConfigError("Budget policy requires a finite generation max_tokens")
 
-            def count(candidate, summary):
+            def render_candidate(candidate, summary, cards=()):
                 spliced, _, _ = self._splice_tool_turns(candidate, folded)
                 if has_audio and runtime_config.get("initial_user_text"):
                     spliced.append({"role": "user", "content": runtime_config["initial_user_text"]})
-                prompt, mm, _, _ = self._render_context(
+                return self._render_context(
                     spliced,
                     runtime_config=runtime_config,
                     session_config=session_config,
                     summary=summary,
+                    cards=cards,
                 )
+
+            def count(candidate, summary):
+                prompt, mm, _, _ = render_candidate(candidate, summary)
                 return self._context_token_count(prompt, mm)
+
+            def count_with_cards(candidate, summary, cards):
+                prompt, mm, _, _ = render_candidate(candidate, summary, cards)
+                block = self.processor.apply_chat_template(
+                    [card_message(cards)], tokenize=False, add_generation_prompt=False
+                )
+                return CardCost(
+                    prompt_tokens=self._context_token_count(prompt, mm),
+                    card_tokens=len(self.processor.tokenizer.encode(block, add_special_tokens=False)),
+                )
+
+            cards = (
+                tuple(
+                    ContextCard(card.node_id, card.fact_key, card.text)
+                    for card in session_config.get("context_memory_cards", ())
+                )
+                if self._context_config.context_memory_tokens
+                else ()
+            )
 
             selection = select_history(
                 list(history),
@@ -1442,6 +1521,9 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
                 sources=session_config.get(CONTEXT_SOURCES, ()),
                 summary=session_config.get(CONTEXT_SUMMARY),
                 tool_turns=folded,
+                cards=cards,
+                card_token_limit=self._context_config.context_memory_tokens,
+                count_with_cards=count_with_cards,
             )
             history = selection.messages
             logger.info(
@@ -1460,6 +1542,7 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             runtime_config=runtime_config,
             session_config=session_config,
             summary=selection.summary if selection is not None else None,
+            cards=selection.cards if selection is not None else (),
         )
         logger.info(
             "Qwen duplex visual input request=%s images=%d sizes=%s audios=%d",
@@ -1560,7 +1643,15 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
         voice = runtime_config.get("voice")
         if isinstance(voice, str) and voice.strip():
             prompt_payload.setdefault("additional_information", {})["speaker"] = [voice]
-        return DuplexAppendPlan(prompt=prompt_payload)
+        return DuplexAppendPlan(
+            prompt=prompt_payload,
+            context_selection=DuplexContextSelection(
+                tuple(card.node_id for card in selection.cards),
+                selection.summary.node_id if selection.summary is not None else None,
+            )
+            if selection is not None
+            else None,
+        )
 
     def decide_output(self, **kwargs):
         return None

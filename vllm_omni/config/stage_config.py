@@ -747,6 +747,8 @@ class DuplexSessionRuntimeConfig:
     context_keep_media_turns: int | None = None
     # Experimental text-only extraction; configured only by the deployment.
     context_memory: DuplexContextMemoryConfig | None = None
+    # Optional formatted card block, within the existing total prompt budget.
+    context_memory_tokens: int = 0
     # Shared summary/card allowance; mixed execution requires explicit limits.
     context_auxiliary_budget: DuplexAuxiliaryBudgetConfig | None = None
     qwen_context_policy: Literal["legacy", "budget", "budget_summary"] = "legacy"
@@ -760,6 +762,8 @@ class DuplexSessionRuntimeConfig:
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.context_memory_tokens) is not int or not 0 <= self.context_memory_tokens <= 256:
+            raise ValueError("duplex_session.context_memory_tokens must be an integer from 0 to 256")
         if isinstance(self.context_memory, Mapping):
             try:
                 memory = DuplexContextMemoryConfig(**self.context_memory)

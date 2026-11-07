@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from vllm_omni.outputs import OmniRequestOutput
 
 from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
@@ -41,7 +42,6 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.protocol.realtime.items import normalize_conversation_item
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -530,6 +530,7 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
         hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1})),
         model="qwen",
         trust_remote_code=True,
+        max_model_len=4096,
     )
 
     with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'nova'") as exc_info:

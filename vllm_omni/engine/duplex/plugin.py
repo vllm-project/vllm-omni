@@ -471,6 +471,8 @@ class DuplexModelPlugin(ABC):
         """Bind deployment-owned policy before sessions can be admitted."""
         if runtime_config.context_memory is not None:
             raise ValueError("context_memory is unsupported by this duplex plugin")
+        if runtime_config.context_memory_tokens:
+            raise ValueError("context_memory_tokens is unsupported by this duplex plugin")
         if runtime_config.context_auxiliary_budget is not None:
             raise ValueError("context_auxiliary_budget is unsupported by this duplex plugin")
 
@@ -523,6 +525,10 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    def memory_prompt_query(self, *, session_config: Mapping[str, object], payload: Mapping[str, object]) -> str | None:
+        """Opt into card retrieval using only current text or an available transcript."""
+        return None
 
     def context_auxiliary_policy(self, *, runtime_config: Mapping[str, object]) -> DuplexContextAuxiliaryPolicy | None:
         """Select owner-bound work; a common account may arbitrate both auxiliary policies."""

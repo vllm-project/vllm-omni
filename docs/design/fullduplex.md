@@ -471,8 +471,15 @@ disables extraction before history capture; clients cannot enable it through
 bounds captured sources and characters, request input/output tokens, deadlines
 and the session's rolling auxiliary compute allowance. Token counts include the
 real Thinker template and are checked against the deployed model context limit.
-Extraction uses only private stage-0 requests; cards are not yet inserted into
-ordinary conversation prompts.
+Extraction uses only private stage-0 requests. A separate, default-zero
+`context_memory_tokens` allowance enables Qwen's experimental prompt consumer
+with `budget` or `budget_summary` and enabled extraction. It fits a ranked card
+prefix after the original history/summary selection, within both its formatted
+block allowance (at most 256 tokens) and the existing total input/output budget.
+Cards follow configured instructions and precede summaries/history. Their text
+is encoded as historical data; node references remain outside the model prompt.
+Retrieval uses current text or an already available transcript. Audio-only
+input without a transcript gets no cards and triggers no additional ASR.
 
 If captured work cannot fit, the plugin asks the owner to recapture a smaller
 range. Resizing neither admits nodes nor advances coverage. Every new range
@@ -487,7 +494,8 @@ stage port supports a local synchronous acceptance guard after input
 preprocessing and replica selection, before registration and transport handoff.
 Removed or replaced requests are rejected at that point. Changes after local
 acceptance follow the existing cancellation lifecycle. This interface does not
-provide remote execution atomicity; the Qwen card consumer remains unconnected.
+provide remote execution atomicity. The Qwen formatter returns selected node
+references separately; wiring its final acceptance checks is a separate step.
 
 Progress covers text fragments and bounded catalogue pages. A successful empty
 result advances only its coverage unit. Own card admissions retain the current

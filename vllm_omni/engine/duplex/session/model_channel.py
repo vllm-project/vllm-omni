@@ -454,14 +454,19 @@ class ModelChannel:
                 prompt_session["conversation_view"] = list(
                     session.render_history_view(view_policy, snapshot=snapshot).messages
                 )
+            prepared_session = self._ctx.plugin.prepare_prompt_config(
+                prompt_session,
+                state=self._ctx.model_state,
+                payload=prompt_payload,
+            )
+            memory_query = self._ctx.plugin.memory_prompt_query(session_config=prepared_session, payload=prompt_payload)
+            if memory_query is not None:
+                memory_capture = session.capture_memory_prompt(query=memory_query)
+                prepared_session["context_memory_cards"] = memory_capture.cards
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
-                session_config=self._ctx.plugin.prepare_prompt_config(
-                    prompt_session,
-                    state=self._ctx.model_state,
-                    payload=prompt_payload,
-                ),
+                session_config=prepared_session,
                 runtime_config=dict(request_context.runtime_config),
                 seq=reservation.update.seq,
                 turn_seq=reservation.update.turn_seq,

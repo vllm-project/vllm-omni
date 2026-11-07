@@ -33,8 +33,17 @@ class DuplexOutputAction(str, Enum):
 
 
 @dataclass(frozen=True)
+class DuplexContextSelection:
+    """References selected by a formatter; owner receipts never cross this boundary."""
+
+    card_node_ids: tuple[int, ...]
+    summary_node_id: int | None
+
+
+@dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, object]
+    context_selection: DuplexContextSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -268,6 +277,7 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 __all__ = [
     "DuplexFence",
     "DuplexAppendPlan",
+    "DuplexContextSelection",
     "DuplexOutputAction",
     "DuplexOutputContext",
     "DuplexOutputDecision",
