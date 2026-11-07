@@ -18,9 +18,6 @@ SERVER_CASES = [
     )
     for name, extra in [("request", []), ("step", ["--step-execution"])]
 ]
-# Runs per PR in the CUDA ready pipeline ("Diffusion · Qwen Image 2.1 Test"), selected by
-# file path. Not tagged core_model yet, per maintainer guidance on #8586.
-# QWEN_IMAGE_21_TEST_MODEL overrides the public checkpoint (e.g. a local path).
 pytestmark = [
     pytest.mark.advanced_model,
     pytest.mark.diffusion,
