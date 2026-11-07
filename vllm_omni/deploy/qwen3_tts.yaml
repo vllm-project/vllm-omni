@@ -31,10 +31,6 @@ connectors:
       # and may change WER. Validate quality on your workload before enabling.
       decode_streaming: false
       talker_first_audio: true
-      codec_streaming: true
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
