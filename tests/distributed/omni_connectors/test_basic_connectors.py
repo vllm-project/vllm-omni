@@ -33,6 +33,44 @@ def test_tensor_serialization():
     assert torch.equal(tensor, deserialized)
 
 
+def test_serialize_into_matches_serialize():
+    """The caller-owned buffer path produces the same wire bytes."""
+    data = {"key": "value", "nested": [1, 2, {"x": True}]}
+    expected = OmniSerializer.serialize(data)
+
+    buffer = bytearray()
+    size = OmniSerializer.serialize_into(data, buffer)
+
+    assert size == len(expected)
+    assert bytes(buffer) == expected
+    assert OmniSerializer.deserialize(buffer) == data
+
+
+def test_tensor_serialize_into_round_trip():
+    """The tensor fast path preserves dtype, shape, and values."""
+    import torch
+
+    tensor = torch.tensor([[1.0, -2.5], [3.25, 4.5]], dtype=torch.bfloat16)
+    expected = OmniSerializer.serialize({"embeds": tensor})
+    buffer = bytearray()
+
+    size = OmniSerializer.serialize_into({"embeds": tensor}, buffer)
+    deserialized = OmniSerializer.deserialize(buffer[:size])
+
+    assert bytes(buffer) == expected
+    assert deserialized["embeds"].dtype == torch.bfloat16
+    assert torch.equal(deserialized["embeds"], tensor)
+
+
+def test_shared_memory_connector_owns_serde():
+    """The connector must not share the module-level encoder/decoder state."""
+    connector = SharedMemoryConnector({})
+    try:
+        assert connector._serde is not OmniSerializer
+    finally:
+        connector.close()
+
+
 def test_bfloat16_tensor_serialization():
     """The raw tensor serializer preserves the Mammoth BF16 wire dtype."""
     import torch
