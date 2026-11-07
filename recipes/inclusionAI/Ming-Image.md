@@ -94,6 +94,61 @@ curl -sS http://127.0.0.1:8091/v1/chat/completions \
 Use the Design-Layer checkpoint and set `INPUT_IMAGE` to a local flattened design image.
 Note that the prompt should better depict each layer to be decomposed, we will refine with more example inputs soon.
 
+The default `ming_image.yaml` uses two GPUs and decodes without tiling. For
+1024x1024 output with six layers, choose one of these VAE configurations:
+
+```bash
+# Two GPUs: Stage 0 on GPU 0, Stage 1 and tiled VAE on GPU 1.
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image_layer_tiled.yaml --port 8091
+
+# Three GPUs: Stage 0 on GPU 0, Stage 1 on GPUs 1 and 2;
+# the VAE distributes spatial tiles across the two Stage 1 ranks.
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image_layer_tile_parallel.yaml --port 8091
+
+# Three GPUs: Stage 0 on GPU 0, Stage 1 on GPUs 1 and 2;
+# the VAE shards decoder features along height and exchanges boundary halos.
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image_layer_spatial_shard.yaml --port 8091
+```
+
+The spatial-shard configuration uses `tensor_parallel_size: 1`,
+`ulysses_degree: 2`, and `vae_patch_parallel_size: 2` for Stage 1. The VAE
+parallel size must equal the VAE executor process-group size (two ranks here),
+and distributed initialization is required for multiple ranks. Invalid
+configurations raise an error without falling back to tile decoding. To shard
+along width, copy this YAML and change `vae_parallel_mode` from
+`spatial_shard_height` to `spatial_shard_width`; keep the same GPU layout and
+parallel sizes. A VAE instance is bound to its spatial-shard direction, process
+group, and parallel size after its first multi-rank spatial-shard decode;
+restart with a fresh instance to change them or return to tile mode.
+
+Tile mode decodes overlapping spatial tiles independently and blends their
+boundaries. Spatial-shard mode exchanges boundary features between decoder
+layers and gathers the complete valid feature map for global attention. It
+preserves the full decoding algorithm for the same latent, including small
+inputs below the tiling threshold, with floating-point numerical differences
+allowed. It does not introduce tile cropping or blending approximations.
+Single-rank spatial-shard mode performs full, non-tiled decoding without
+collectives. These equivalence claims apply to latent decoding, not reference
+image encoding. The existing tiled configurations remain separate options.
+
+Run one command at a time, then use the request below with the same input
+image, prompt, seed, `num_layers=6`, 1024x1024 dimensions, and 12 steps.
+Warm up the same shape and layer count before timing. Record request latency,
+`vae.decode` stage duration with `enable_diffusion_pipeline_profiler`, and peak
+GPU memory for each configuration. Check all seven returned images in order:
+composite first, then layers 1 through 6. Compare tiled outputs numerically
+between the two deployments; report untiled differences separately because
+tile-boundary blending can change individual pixels. Compare spatial-shard and
+full decoding using the same latent when checking decode equivalence.
+`vae_patch_parallel_size` controls the VAE parallel size for both distributed
+tile and spatial-shard modes. Large-model spatial-shard performance and image
+quality have not yet been evaluated; multi-GPU speedup has not been measured.
+Set `enable_diffusion_pipeline_profiler: true` under Stage 1 in a temporary
+copy of each deployment config when collecting decode durations.
+
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
 INPUT_IMAGE=/path/to/input.png
