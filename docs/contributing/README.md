@@ -53,8 +53,14 @@ vLLM-Omni's `pre-commit` hooks will now run automatically every time you commit.
     `check-spdx-header`, and `mypy-3.10`. Those hooks still run on **your
     commit** for changed files. A passing GitHub pre-commit check does not mean
     they passed locally. Hooks **not** on that list (forbidden imports,
-    `torch.cuda`, TTS adapter ratchet, Buildkite schema, Ruff, typos, …) run in
-    both places.
+    `torch.cuda`, TTS adapter ratchet, Buildkite schema, `sync-example-docs`,
+    Ruff, typos, …) run in both places.
+
+    `sync-example-docs` is the one hook here that rewrites staged content: it
+    writes the example pages and their nav block, then stages what it wrote. If
+    your commit fails because of it, `SKIP=sync-example-docs git commit …`
+    commits without it — useful mid-rebase, or when it conflicts with an
+    unstaged edit to `docs/.nav.yml`.
 
 The hooks below are new relative to the previous Omni config (Ruff, typos,
 actionlint, YAML/whitespace, DCO sign-off, and the pickle-only checker were
@@ -73,6 +79,7 @@ already there). `check-pickle-imports` is gone: pickle is now one rule inside
 | `check-forbidden-imports` | pickle, stdlib `re`/`base64`, Triton, TileLang, Hugging Face Hub download/API | runs |
 | `check-torch-cuda-call` | Direct `torch.cuda.*` helpers outside platform adapters | runs |
 | `check-buildkite` | `.buildkite/*.yml` against the Buildkite schema | runs |
+| `sync-example-docs` | Regenerates `docs/user_guide/examples/` and the `User Guide -> Examples` nav block from `examples/`, stages the pages it wrote, and removes a page whose example is gone. Needs `examples/` staged to do anything | runs |
 
 Related config (not a new hook id): Ruff `TID251` also bans `librosa` and several
 `torch.cuda.*` names; typos is pinned and ignores git-describe hashes (`+g` +
