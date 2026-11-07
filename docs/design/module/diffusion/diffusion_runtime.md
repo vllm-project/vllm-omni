@@ -418,6 +418,11 @@ ownership of scheduler cleanup.
 
 ### Shutdown and worker failure
 
+For shared-weight consumers, the worker closes and drops its LoRA manager
+before detaching the runner and closing imported weights. The default manager
+retains the pipeline even when no adapter is loaded. A cleanup failure poisons
+the consumer session; it does not authorize the provider to release its weights.
+
 `DiffusionEngine.close()` is idempotent. It stops the busy loop, wakes pending
 streams with an error, closes scheduler state, and shuts down the executor.
 

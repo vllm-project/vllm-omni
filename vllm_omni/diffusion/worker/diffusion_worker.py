@@ -530,11 +530,20 @@ class DiffusionWorker:
         # When load_format is "dummy", pipeline will init with custom pipeline later
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
+
+        def detach_shared_model() -> None:
+            # Even without an adapter, the default manager owns the pipeline.
+            # close() unbinds its consumers but retains its pipeline reference.
+            if self.lora_manager is not None:
+                self.lora_manager.close()
+                self.lora_manager = None
+            detach_diffusion_runner(self.model_runner)
+
         install_runner_session(
             self.model_runner,
             self.od_config,
             device_index=current_omni_platform.current_device(),
-            detach=lambda: detach_diffusion_runner(self.model_runner),
+            detach=detach_shared_model,
         )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:

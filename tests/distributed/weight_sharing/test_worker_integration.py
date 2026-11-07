@@ -137,7 +137,8 @@ def test_shared_stage_memory_envelope_preserves_fixed_kv(weight_sharing, role, k
         worker.sharing_memory_request(budget, **(args | {"free_bytes": 100 + kv_bytes - 1}))
 
 
-def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, monkeypatch, mocker):
+@pytest.mark.parametrize("manager_mode", ["none", "default", "close_error"])
+def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, monkeypatch, mocker, manager_mode):
     runtime = importlib.import_module(f"{weight_sharing.__name__}.runtime")
     worker = importlib.import_module(f"{weight_sharing.__name__}.worker_session")
     api = importlib.import_module(f"{weight_sharing.__name__}.contracts")
@@ -188,7 +189,59 @@ def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, m
         vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context={})),
         release_captured_graphs=lambda: events.append("graphs"),
     )
-    worker.install_runner_session(dit, config, device_index=0, detach=lambda: worker.detach_diffusion_runner(dit))
+
+    # Exercise the worker's actual callback registration, including its default
+    # no-adapter manager, which owns the pipeline independently of the runner.
+    class RetainingManager:
+        def __init__(self, pipeline, **kwargs):
+            self.pipeline = pipeline
+
+        def close(self):
+            events.append("lora_close")
+            # The real manager also keeps self.pipeline after close().
+            if manager_mode == "close_error":
+                raise RuntimeError("LoRA cleanup failed")
+
+    monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing.worker_session", worker)
+    cls = load_class_methods(
+        "vllm_omni/diffusion/worker/diffusion_worker.py",
+        "DiffusionWorker",
+        ["load_model", "init_lora_manager"],
+        dict(
+            nullcontext=nullcontext,
+            set_forward_context=lambda **kwargs: nullcontext(),
+            set_current_vllm_config=lambda cfg: nullcontext(),
+            current_omni_platform=mocker.Mock(current_device=lambda: 0),
+            gc=mocker.Mock(),
+            get_process_gpu_memory=lambda device: None,
+            DiffusionLoRAManager=RetainingManager,
+            LoRABackend=SimpleNamespace(PEFT="peft"),
+        ),
+    )
+    owner = cls()
+    owner.model_runner = dit
+    owner.lora_manager = None
+    owner.device = "cpu"
+    owner.local_rank = 0
+    owner.vllm_config = dit.vllm_config
+    owner._maybe_get_memory_pool_context = nullcontext
+    owner.od_config = config
+    config.lora_path = None
+    config.lora_backend = "peft"
+    config.lora_scale = 1.0
+    config.max_cpu_loras = 1
+    config.dtype = torch.bfloat16
+    config.lora_application = "runtime"
+
+    def load_model(*, initialize_lora, **kwargs):
+        if manager_mode != "none":
+            initialize_lora()
+
+    dit.load_model = load_model
+    owner.load_model()
+    if manager_mode != "none":
+        assert owner.lora_manager is not None
+        assert owner.lora_manager.pipeline is dit.pipeline
     status = worker.control_runner(dit, "status", ())
     assert status["private_bytes"] == 512  # Never subtract imported bytes.
     memory.update(reserved_peak=768, resident=600)
@@ -201,17 +254,27 @@ def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, m
     provider.confirm_import(imported.receipt)
     # Teardown needs receipts, not memory telemetry from a failing device.
     dit.weight_sharing.memory_usage = mocker.Mock(side_effect=AssertionError("memory query"))
+    if manager_mode == "close_error":
+        with pytest.raises(RuntimeError, match="LoRA cleanup failed"):
+            worker.control_runner(dit, "close", ())
+        assert owner.lora_manager is not None
+        assert owner.lora_manager.pipeline is dit.pipeline
+        assert consumer.session_status(imported).state == api.SessionState.POISONED
+        assert provider.release_export(exported).status == "HELD"
+        return
     external = imported["first"]
     result = worker.control_runner(dit, "close", ())
     assert result["state"] == api.SessionState.RELEASING.value
     assert dit.pipeline is None and not dit.state_cache
-    assert events == ["sync", "graphs"]
+    assert owner.lora_manager is None
+    expected_events = (["lora_close"] if manager_mode != "none" else []) + ["sync", "graphs"]
+    assert events == expected_events
     del external
     result = msgspec.convert(worker.control_runner(dit, "close", ()), type=runtime.RankResult)
     assert result.state == api.SessionState.CLOSED
     provider.confirm_release(result.receipt)
     assert provider.release_export(exported).status == "CLOSED"
-    assert events == ["sync", "graphs"]
+    assert events == expected_events
 
 
 def test_failed_loader_backend_can_be_poisoned_without_pipeline(weight_sharing):

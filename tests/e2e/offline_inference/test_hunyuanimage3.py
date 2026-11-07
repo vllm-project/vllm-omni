@@ -458,38 +458,25 @@ def _generate_image(omni: Omni, use_system_prompt: str | None, image_size: int =
 
 
 @pytest.fixture
-def sharing_tp2_config(tmp_path):
-    """Override only test topology; keep the production TP4 example unchanged."""
-    config = tmp_path / "sharing-tp2.yaml"
-    config.write_text(
-        yaml.safe_dump(
-            {
-                "base_config": str(Path(get_deploy_config_path("hunyuan-image-3-weight-sharing.yaml")).resolve()),
-                "stages": [
-                    {"stage_id": 0, "devices": "0,1", "tensor_parallel_size": 2},
-                    {"stage_id": 1, "devices": "0,1", "parallel_config": {"tensor_parallel_size": 2}},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    return config
+def sharing_tp4_config():
+    """Use production TP4: BF16 backbone plus both KV caches exceeds two H100s."""
+    return Path(get_deploy_config_path("hunyuan-image-3-weight-sharing.yaml")).resolve()
 
 
 @pytest.mark.full_model
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
-def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp2_config):
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
+def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp4_config):
     """Real model/connector test; CPU backend tests cannot establish this result."""
     with OmniRunner(
         MODEL_NAME,
-        deploy_config=str(sharing_tp2_config),
+        deploy_config=str(sharing_tp4_config),
         stage_init_timeout=1800,
         init_timeout=3600,
     ) as runner:
         omni = runner.omni
         sharing = omni.engine._runtime.sharing
         assert sharing is not None and sharing.state == "READY"
-        assert len(sharing.identities) == 2
+        assert len(sharing.identities) == 4
         for _ in range(2):
             image = _generate_image(omni, "en_think_recaption", image_size=512)
             assert image.size == (512, 512)
@@ -506,12 +493,12 @@ def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp2_confi
 
 
 @pytest.mark.full_model
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
-def test_shared_backbone_matches_ordinary_loading(tmp_path, record_property, sharing_tp2_config):
+@hardware_test(res={"cuda": "H100"}, num_cards=8)
+def test_shared_backbone_matches_ordinary_loading(tmp_path, record_property, sharing_tp4_config):
     """Sequential A/B on exclusive GPUs; ordinary loading needs room for two backbones.
 
-    Ordinary AR/DiT use GPUs 0-1/2-3; sharing colocates both on GPUs 0-1.
-    Both stages remain TP2 on the same hardware. NVML measures whole-device resident bytes, while
+    Ordinary AR/DiT use GPUs 0-3/4-7; sharing colocates both on GPUs 0-3.
+    Both stages remain TP4 on the same hardware. NVML measures whole-device resident bytes, while
     sharing status reports allocator startup peaks. These are distinct metrics;
     neither a single NVML sample nor resettable peaks prove absence of every
     transient allocation. Native backend no-copy tests remain complementary.
@@ -520,11 +507,11 @@ def test_shared_backbone_matches_ordinary_loading(tmp_path, record_property, sha
 
     from tests.e2e.accuracy.helpers import assert_similarity
 
-    base = sharing_tp2_config
+    base = sharing_tp4_config
     # Initialize the test client's generator context before either memory baseline.
     torch.Generator(device=current_omni_platform.device_type or "cuda")
-    devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3").split(",")[:4]
-    assert len(devices) == 4, "The TP2 ordinary/shared comparison requires four visible GPUs"
+    devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",")[:8]
+    assert len(devices) == 8, "The TP4 ordinary/shared comparison requires eight visible GPUs"
     nvml = import_pynvml()
     nvml.nvmlInit()
     try:
@@ -550,7 +537,7 @@ def test_shared_backbone_matches_ordinary_loading(tmp_path, record_property, sha
                         {
                             "base_config": str(base),
                             "weight_sharing": None,
-                            "stages": [{"stage_id": 1, "devices": "2,3"}],
+                            "stages": [{"stage_id": 1, "devices": "4,5,6,7"}],
                         }
                     ),
                     encoding="utf-8",
@@ -562,16 +549,16 @@ def test_shared_backbone_matches_ordinary_loading(tmp_path, record_property, sha
                 omni = runner.omni
                 sharing = omni.engine._runtime.sharing
                 resident = [used - initial for used, initial in zip(used_memory(), before, strict=True)]
-                # Pair AR rank i on GPU i with DiT rank i on GPU i+2 in the
+                # Pair AR rank i on GPU i with DiT rank i on GPU i+4 in the
                 # ordinary run; shared rank i already includes both stages.
-                paired = [resident[i] + resident[i + 2] for i in range(2)] if mode == "ordinary" else resident[:2]
+                paired = [resident[i] + resident[i + 4] for i in range(4)] if mode == "ordinary" else resident[:4]
                 measurements[mode] = {
                     "startup_resident_bytes": resident,
                     "rank_pair_resident_bytes": paired,
                 }
                 assert all(value > 0 for value in paired), measurements[mode]
                 if mode == "shared":
-                    assert all(abs(value) <= 1024**3 for value in resident[2:]), "Shared run used GPUs 2-3"
+                    assert all(abs(value) <= 1024**3 for value in resident[4:]), "Shared run used GPUs 4-7"
                     assert sharing is not None and sharing.state == "READY"
                     ranks = asyncio.run_coroutine_threadsafe(
                         sharing._rpc(sharing.plan.consumer_stage, "status"), omni.engine.orchestrator_loop
