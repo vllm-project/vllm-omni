@@ -52,8 +52,9 @@ RUN cd "$(/opt/sglang/bin/python3 -c 'import sysconfig; print(sysconfig.get_path
     git apply "${APP_DIR}/docker/patches/sglang-omni-ignore-eos.patch"
 
 # The base image may install native SGLang editably, outside site-packages.
-RUN cd "$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; print(Path(sglang.__file__).resolve().parent.parent)')" && \
-    git apply "${APP_DIR}/docker/patches/sglang-diffusion-config-only-guider.patch"
+RUN sglang_source_root="$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; print(Path(sglang.__file__).resolve().parent.parent)')" && \
+    git -C /tmp apply --unsafe-paths --directory="${sglang_source_root}" \
+      "${APP_DIR}/docker/patches/sglang-diffusion-config-only-guider.patch"
 
 RUN CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -c \
       "from sglang_omni.models.minicpm_o.components.token2wav.speech_tokenizer_weights import load_tokenizer_weights" && \
