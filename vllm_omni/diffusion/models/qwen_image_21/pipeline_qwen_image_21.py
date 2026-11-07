@@ -22,7 +22,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
@@ -120,7 +120,8 @@ def _resolve_text_encoder_quant_config(
 
 # Subtrees of the HF Qwen3-VL text encoder that must stay in checkpoint
 # precision: the vision tower (condition-image encoding is numerically
-# sensitive) and the LM head (unused — the pipeline reads hidden states).
+# sensitive) and the LM head (replaced with Identity right after construction,
+# so it is never quantized or loaded).
 _TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES = ("model.visual", "lm_head")
 
 
@@ -376,7 +377,7 @@ class QwenImage21Pipeline(
                 subfolder="text_encoder",
                 prefetch_list=qwen_subfolders,
                 local_files_only=local_files_only,
-            ).to(self.device)
+            )
         else:
             # Quantized path: build the HF model on meta, swap its nn.Linear
             # modules for vLLM quantizable linears, and stream the weights
@@ -394,7 +395,7 @@ class QwenImage21Pipeline(
                 AutoModelForImageTextToText,
                 encoder_od_config,
                 hf_config=text_encoder_config,
-            ).to(self.device)
+            )
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=model,
@@ -403,6 +404,10 @@ class QwenImage21Pipeline(
                     prefix="text_encoder.",
                 )
             )
+        # Prompt embeddings come from hidden states; drop the unused LM head before moving to GPU.
+        # Identity keeps the full forward (and any offload hook on it) without computing logits.
+        self.text_encoder.lm_head = nn.Identity()
+        self.text_encoder = self.text_encoder.to(self.device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage21.from_pretrained,
             model,
@@ -1652,4 +1657,6 @@ class QwenImage21Pipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        # The quantized text encoder streams through here; its LM head is Identity, so skip the checkpoint copy.
+        mapper = WeightsMapper(orig_to_new_prefix={"text_encoder.lm_head.": None})
+        return loader.load_weights(weights, mapper=mapper)
