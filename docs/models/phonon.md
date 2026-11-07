@@ -50,37 +50,32 @@ emitted immediately, including the final frame.
 
 ## Local regression
 
-From the repository root, run the focused tests directly. The checkpoint tests
-use `gradium/phonon-31m-en` and resolve each required file through the standard
-HF cache. An incomplete snapshot containing the required files is sufficient.
-`HF_HOME`, `HF_HUB_CACHE`, `HF_ENDPOINT` and offline settings retain their usual
-Hugging Face behavior. A missing required file produces a loading error.
+Run the lightweight model-state, sampler and kernel regressions from the
+repository root. These tests use synthetic inputs or fake modules and require
+no checkpoint download.
 
 ```bash
 pytest -v --noconftest -o addopts='' tests/model_executor/models/phonon
 ```
 
-`--noconftest` avoids unrelated global diffusion fixtures. In a fully provisioned
-repository test environment, the CI-style command is also available.
+Full-weight CPU generation, compiled decoder and CUDA Graph output-lifecycle
+checks are in the offline e2e suite. They resolve the four required files from
+`gradium/phonon-31m-en` through the standard HF cache. An optional
+`PHONON_CHECKPOINT_DIR` overrides the model source.
 
 ```bash
-pytest -v -o addopts='' --run-level core_model tests/model_executor/models/phonon
+pytest -v --noconftest -o addopts='' tests/e2e/offline_inference/test_phonon.py
 ```
 
-A local directory or another explicit model source can optionally be supplied
-with `PHONON_CHECKPOINT_DIR`. An unset or empty value uses the default model ID.
+In a fully provisioned CI environment, use the advanced-model routing.
 
 ```bash
-PHONON_CHECKPOINT_DIR=/path/to/phonon-31m-en \
-  pytest -v --noconftest -o addopts='' tests/model_executor/models/phonon
+pytest -v --run-level advanced_model -m 'advanced_model and tts' \
+  tests/e2e/offline_inference/test_phonon.py
 ```
 
-The CUDA graph comparison runs automatically when CUDA is available. To run it
-alone on the server, use the following command.
-
-```bash
-pytest -v --noconftest -o addopts='' tests/model_executor/models/phonon/test_cuda_graph.py
-```
+The CUDA e2e case requires a CUDA GPU and the compile/Triton dependencies.
+`--noconftest` supports isolated local runs without global diffusion fixtures.
 
 ## Validation status
 
