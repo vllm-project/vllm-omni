@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm_omni.engine.orchestrator import StreamingInputState
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
@@ -134,25 +135,87 @@ def test_plain_chat_handoff_warns_when_rows_stop_before_the_last_token(mocker) -
     assert warning.call_args.args[1] == "req-1"
 
 
-def test_plain_chat_handoff_logs_a_ledger_of_the_wrong_length_once(mocker) -> None:
+def test_plain_chat_handoff_reports_a_wrong_token_id_at_the_last_position(mocker) -> None:
+    """A missing last row is expected; a row for another token is not."""
     from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
 
-    warning_once = mocker.patch.object(module.logger, "warning_once")
-    debug = mocker.patch.object(module.logger, "debug")
+    warning = mocker.patch.object(module.logger, "warning")
+    prompt_ids, output_ids = [101, 102], [11, 12]
+    forwarded = [(101, 0), (102, 1), (11, 2), (99, 3)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11]
+    warning.assert_called_once()
+    assert "row has token 99, reply has 12" in warning.call_args.args
+
+
+def test_plain_chat_handoff_does_not_warn_for_the_unforwarded_last_token(mocker) -> None:
+    from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
+
+    warning = mocker.patch.object(module.logger, "warning")
     prompt_ids, output_ids = [101, 102], [11, 12]
     forwarded = [(101, 0), (102, 1), (11, 2)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11]
+    warning.assert_not_called()
+
+
+def test_plain_chat_handoff_drops_rows_past_a_position_rewind(mocker) -> None:
+    """(13, 4) followed the rejected 99, so it is stale even though the reply ends with 13 at position 4."""
+    from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
+
+    warning = mocker.patch.object(module.logger, "warning")
+    prompt_ids, output_ids = [101, 102], [11, 12, 13]
+    forwarded = [(101, 0), (102, 1), (11, 2), (99, 3), (13, 4), (12, 3)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 2), _row(12, 3)]))
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"latent_positions": torch.tensor([0, 1]).reshape(-1, 1)},
+        {"latent_input_ids": torch.tensor([101]).reshape(-1, 1)},
+        {"latent_positions": None},
+        {"latent_input_ids": [101, 102, 11, 11, 12, 12]},
+    ],
+    ids=["short_positions", "short_ids", "positions_missing", "ids_not_a_tensor"],
+)
+def test_plain_chat_handoff_fails_the_request_on_a_malformed_ledger(broken) -> None:
+    """Index slicing a duplicated payload would give the Talker prompt rows for reply tokens."""
+    prompt_ids, output_ids = [101, 102], [11, 12]
+    # The MRv2 full payload: every step's rows twice.
+    forwarded = [(101, 0), (102, 1), (101, 0), (102, 1), (11, 2), (11, 2)]
     source = _ledger_output(prompt_ids, output_ids, forwarded)
-    source.outputs[0].multimodal_output["latent_positions"] = torch.tensor([0, 1]).reshape(-1, 1)
+    mm_output = source.outputs[0].multimodal_output
+    for key, value in broken.items():
+        if value is None:
+            del mm_output[key]
+        else:
+            mm_output[key] = value
+
+    with pytest.raises(OmniClientError, match="malformed Thinker row ledger for request_id=req-1") as raised:
+        llm2tts([source], prompt=[{}])
+
+    assert raised.value.status_code == 500
+
+
+def test_plain_chat_handoff_without_a_ledger_takes_rows_by_index() -> None:
+    latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    source = _output(prompt_ids=[101, 102], output_ids=[11, 12, 13], latent=latent)
 
     info = llm2tts([source], prompt=[{}])[0]["model_intermediate_buffer"]
 
-    # Without a usable ledger the rows are taken by index.
-    assert info["ids"]["tts"] == [11]
-    warning_once.assert_called_once()
-    assert "row ledger" in warning_once.call_args.args[0]
-    # The counts go to the debug log, one line per mismatching output.
-    debug.assert_called_once()
-    assert debug.call_args.args[1:] == ("req-1", 3, 2, 3)
+    assert info["ids"]["tts"] == [11, 12, 13]
+    torch.testing.assert_close(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[2:5])
 
 
 def test_llm2tts_carries_request_ref_audio() -> None:
