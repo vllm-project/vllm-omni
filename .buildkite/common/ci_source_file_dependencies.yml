@@ -52,6 +52,14 @@ x-fish-omni: &fish_omni
   - vllm_omni/deploy/fish_omni.yaml
   - vllm_omni/entrypoints/openai/tts_adapters/fish_omni.py
 
+x-lfm3: &lfm3
+  - vllm_omni/model_executor/models/lfm3_omni/
+  - vllm_omni/model_executor/models/lfm3_audio/
+  - vllm_omni/model_executor/stage_input_processors/lfm3_omni.py
+  - vllm_omni/deploy/lfm3_omni.yaml
+  - vllm_omni/deploy/lfm3_audio.yaml
+  - vllm_omni/entrypoints/openai/tts_adapters/lfm3_omni.py
+
 x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
@@ -568,6 +576,13 @@ source_file_dependencies:
     # that builds Ascend attention metadata, must run the Drama 3 jobs.
     - vllm_omni/worker_v2/
     - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
+
+  tts_lfm3_function:
+    - *lfm3
+    - tests/e2e/online_serving/test_lfm3_omni.py
+    - tests/e2e/online_serving/test_lfm3_audio.py
+    - tests/assets/semantic_vad/complete.wav
+    - tests/helpers/assertions.py
 
   tts_qwen3_tts_perf:
     - *qwen3_tts

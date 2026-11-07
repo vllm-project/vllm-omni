@@ -19,6 +19,8 @@ th {
 
 | Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | Ascend NPU | Intel GPU | Recipe |
 | -------------- | -------- | ------------------- | ------------ | --------- | ----- | ----------- | -------- |
+| `Lfm3AudioForConditionalGeneration` | LFM3-Audio-2B | `LiquidAI/LFM3-Audio-2B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LiquidAI/LFM3-Audio-2B.md) |
+| `Lfm3OmniForConditionalGeneration` | LFM3-Omni-2B | `LiquidAI/LFM3-Omni-2B` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LiquidAI/LFM3-Omni-2B.md) |
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-Omni.md) |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `MingFlashOmniForConditionalGeneration` + `MingImagePipeline` | Ming-flash-omni-2.0 (omni-speech + imagegen<sup>1</sup>) | `Jonathan1909/Ming-flash-omni-2.0` | ✅︎ | | | ✅︎ | — |
