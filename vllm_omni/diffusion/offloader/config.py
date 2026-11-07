@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -63,12 +64,19 @@ class DLOTransfer(str, Enum):
     RANK_LOCAL = "rank-local"
 
 
+# Block lists given by the user: one tuple applies to every module of the
+# component; a mapping names them per discovered component path.
+BlockPaths = tuple[str, ...] | Mapping[str, tuple[str, ...]]
+
+
 @dataclass(frozen=True)
 class LayerOffloadOptions:
     """Layer-mode settings for one selected diffusion component."""
 
     weight_transfer: DLOTransfer | None = None
     resident_layers: int = 0
+    # Overrides the model-declared streamable block lists for this component.
+    block_paths: BlockPaths | None = None
 
 
 @dataclass(frozen=True)
@@ -94,9 +102,11 @@ class ResolvedOffload:
     transfers: Mapping[str, DLOTransfer]
     pin_memory: bool
     resident_layers: int
+    block_paths: Mapping[str, BlockPaths] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "transfers", _FrozenMapping(self.transfers))
+        object.__setattr__(self, "block_paths", _FrozenMapping(self.block_paths))
 
     def offloads(self, component: str) -> bool:
         return component in self.components
@@ -146,17 +156,44 @@ def _validate_string_keys(value: Mapping[Any, Any], label: str) -> None:
         raise TypeError(f"{label} keys must be strings")
 
 
+def _parse_block_path_list(component: str, value: Any, label: str) -> tuple[str, ...]:
+    if isinstance(value, (str, Mapping)) or not isinstance(value, Collection) or not value:
+        raise TypeError(f"{label} must be a non-empty list of attribute paths")
+    paths = tuple(value)
+    if any(not isinstance(path, str) or not path or path != path.strip() for path in paths):
+        raise ValueError(f"{label} entries must be non-empty attribute paths without surrounding spaces")
+    if len(set(paths)) != len(paths):
+        raise ValueError(f"{label} must not repeat a path")
+    if component == DIT_COMPONENT and any("." in path for path in paths):
+        # DiT stacks name direct children: the backend skips those children
+        # when it places the non-streamed remainder of the DiT.
+        raise ValueError(f"{label} for 'dit' must name direct DiT attributes, not dotted paths")
+    return paths
+
+
+def _parse_block_paths(component: str, value: Any) -> BlockPaths:
+    label = f"diffusion_offload_config.layer_options[{component!r}].block_paths"
+    if not isinstance(value, Mapping):
+        return _parse_block_path_list(component, value, label)
+    if not value:
+        raise ValueError(f"{label} must name at least one component path")
+    _validate_string_keys(value, label)
+    return _FrozenMapping(
+        {path: _parse_block_path_list(component, paths, f"{label}[{path!r}]") for path, paths in value.items()}
+    )
+
+
 def _parse_layer_options(component: str, value: Any) -> LayerOffloadOptions:
     if not isinstance(value, Mapping):
         raise TypeError(
             f"diffusion_offload_config.layer_options[{component!r}] must be a mapping, got {type(value).__name__}"
         )
     _validate_string_keys(value, f"diffusion_offload_config.layer_options[{component!r}]")
-    unknown = sorted(set(value) - {"weight_transfer", "resident_layers"})
+    unknown = sorted(set(value) - {"weight_transfer", "resident_layers", "block_paths"})
     if unknown:
         raise ValueError(
             f"Unknown diffusion offload setting(s) for {component}: {', '.join(unknown)}; "
-            "choose from: weight_transfer, resident_layers"
+            "choose from: weight_transfer, resident_layers, block_paths"
         )
     weight_transfer = (
         _parse_enum(value["weight_transfer"], DLOTransfer, "offload transfer") if "weight_transfer" in value else None
@@ -165,9 +202,11 @@ def _parse_layer_options(component: str, value: Any) -> LayerOffloadOptions:
 
     if type(resident_layers) is not int or resident_layers < 0:
         raise ValueError(f"resident_layers for {component} must be a non-negative integer")
+    block_paths = _parse_block_paths(component, value["block_paths"]) if "block_paths" in value else None
     parsed = LayerOffloadOptions(
         weight_transfer=weight_transfer,
         resident_layers=resident_layers,
+        block_paths=block_paths,
     )
     if component != DIT_COMPONENT and parsed.resident_layers:
         raise ValueError("resident_layers currently supports only the 'dit' component")
@@ -317,6 +356,11 @@ def resolve_offload(config: Any) -> ResolvedOffload:
                 public.pin_memory if public.pin_memory is not None else bool(getattr(config, "pin_cpu_memory", True))
             ),
             resident_layers=0 if dit_options is None else dit_options.resident_layers,
+            block_paths={
+                component: options.block_paths
+                for component, options in public.layer_options.items()
+                if options.block_paths is not None
+            },
         )
 
     parallel_config = getattr(config, "parallel_config", None)

@@ -511,7 +511,7 @@ def test_decode_audio_preserves_batch_for_released_preview_shape(monkeypatch):
     decoder = ShapeCheckingDecoder()
     stager = Mock()
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.magi2.pipeline_magi2.PinnedModuleStager",
+        "vllm_omni.diffusion.offloader.component_utils.PinnedModuleStager",
         Mock(return_value=stager),
     )
     component = _Magi2StagedComponent(
@@ -563,7 +563,7 @@ def _offload_pipeline(monkeypatch):
         Mock(return_value=Mock()),
     )
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.magi2.pipeline_magi2.PinnedModuleStager",
+        "vllm_omni.diffusion.offloader.component_utils.PinnedModuleStager",
         stager_factory,
     )
     pipeline = object.__new__(Magi2Pipeline)
@@ -637,8 +637,12 @@ def test_dlo_no_allgather_enable_preserves_staged_aux_and_streams_blocks(
     assert backend.enabled
     assert backend.dp_size == 1
     assert len(hooks) == len(pipeline.transformer.block)
-    assert all(stager.offload.call_count == 1 for stager in stagers)
+    # Auxiliaries snapshot lazily on first load, so enabling the backend
+    # neither pins nor materializes any of them.
+    assert all(stager.offload.call_count == 0 for stager in stagers)
     assert all(stager.load.call_count == 0 for stager in stagers)
+    pipeline.text_encoder.load_to_device()
+    stagers[0].load.assert_called_once_with()
     # First prefetch stays lazy so ranks with different local groups cannot
     # enter collectives in a different order during startup.
     for hook in hooks:

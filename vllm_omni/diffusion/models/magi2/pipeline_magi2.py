@@ -43,7 +43,8 @@ from vllm_omni.diffusion.models.interface import (
     SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.offloader import OffloadPlan, PinnedModuleStager
+from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader.component_utils import LayerwiseAwareStager
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     OffloadStrategy,
@@ -456,6 +457,8 @@ class _Magi2StagedComponent(nn.Module):
     co-residing roughly 60 GiB of auxiliary weights on the output rank.
     """
 
+    _omni_supports_layerwise_staging: ClassVar[bool] = True
+
     def __init__(
         self,
         module: nn.Module,
@@ -465,11 +468,19 @@ class _Magi2StagedComponent(nn.Module):
     ) -> None:
         super().__init__()
         self.module = module
-        self._stager = PinnedModuleStager(
+        # The stager follows whether a layerwise backend hooked block lists
+        # declared for this component (for example through block_paths).
+        self._stager = LayerwiseAwareStager(
+            self,
             module,
             torch.device(device),
             pin_memory=pin_memory,
         )
+
+    @property
+    def is_loaded(self) -> bool:
+        """Non-output ranks hold an identity stub that never executes."""
+        return not isinstance(self.module, nn.Identity)
 
     def load_to_device(self) -> None:
         self._stager.load()
