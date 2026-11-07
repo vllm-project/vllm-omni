@@ -45,6 +45,7 @@ def scheduler(request):
     sched.aux_output_connector = None
     sched._inflight_prefills = set()
     sched.encoder_cache_manager = MagicMock()
+    sched._pending_encoder_input_ids = {}
     sched._free_request_blocks = MagicMock()
     sched.finished_req_ids = set()
     sched.finished_req_ids_dict = None
@@ -162,17 +163,6 @@ def test_execute_discards_abort_without_flushing_other_pending_requests(schedule
     assert set(runner._pending_full_payload_send) == {"active"}
 
 
-@pytest.mark.parametrize("aborted", [False, True])
-def test_cleanup_fallback_discards_only_aborted_payload(runner, aborted):
-    req = Request(
-        request_id="cancel", prompt_token_ids=[1], sampling_params=SamplingParams(max_tokens=8), pooling_params=None
-    )
-    runner.accumulate_full_payload_output("cancel", {"codes": torch.tensor([[1]])}, req)
-    runner.cleanup_finished_request("cancel", discard_payload=aborted)
-    assert not runner._pending_full_payload_send
-    assert runner.send_full_payload_outputs.call_count == (0 if aborted else 1)
-
-
 def test_abort_all_ignores_already_completed_requests(scheduler):
     add_request(scheduler, "running")
     add_request(scheduler, "waiting", waiting=True)
@@ -182,7 +172,7 @@ def test_abort_all_ignores_already_completed_requests(scheduler):
     assert take_output(scheduler).discarded_req_ids == set()
 
 
-def test_update_states_discards_aborted_payload_before_removing_request(scheduler, runner):
+def test_execute_discards_aborted_payload_before_removing_request(scheduler, runner):
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
     req = add_request(scheduler, "cancel")
@@ -195,7 +185,8 @@ def test_update_states_discards_aborted_payload_before_removing_request(schedule
         on_requests_finished=MagicMock(side_effect=StopBeforeForwardError),
     )
     with pytest.raises(StopBeforeForwardError):
-        OmniGPUModelRunner._update_states(runner, take_output(scheduler))
+        runner._update_states = lambda output: OmniGPUModelRunner._update_states(runner, output)
+        runner.execute_model(take_output(scheduler))
     assert not runner._pending_full_payload_send
     assert not runner.requests
     runner.send_full_payload_outputs.assert_not_called()

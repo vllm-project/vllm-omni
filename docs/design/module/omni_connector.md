@@ -60,18 +60,12 @@ from a request disappearing from the active batch.
 - **Cancellation or failure:** aborted, errored and ignored requests discard
   pending payloads without invoking the downstream processor. Already
   submitted connector writes are outside the pending accumulator's ownership.
-- **Preemption and resume:** keep accumulated AR outputs. Each payload key
-  tracks its emitted input-token boundary. Recomputed prefixes do not append
-  a second copy or overwrite the accepted prefix; an overlapping token-aligned
-  tensor contributes only its new suffix. This also handles recovered cached
-  prefixes. Snapshot/replace fields and scalar metadata update only when the
-  logical boundary advances. A partially overlapping non-token-aligned tensor
-  raises an explicit error because its rows cannot safely be sliced by token
-  position. One-shot generation payloads retain their existing append/replace
-  policy and do not use AR token positions.
-- **Retry:** a fresh request starts with empty payload and position state.
-  Reusing an internal ID is safe only after terminal cleanup; overlapping live
-  attempts must have distinct internal IDs. Preemption is continuation of the
-  same request, not a fresh retry.
+- **Preemption and resume:** keep accepted AR outputs. The scheduler owns
+  `delivered_upto`; the runner clips declared token fields before accumulation.
+  After pending builders complete, resume truncates an unaccepted accumulated
+  suffix to that boundary. The accumulator then appends the recovered or newly
+  computed rows. Fixed embeddings use the processor's replacement policy and
+  are never sliced by token count. One-shot generation payloads retain their
+  existing append/replace policy.
 
 Lifecycle regressions live in `tests/worker/test_full_payload_lifecycle.py`.

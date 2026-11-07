@@ -27,9 +27,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm_omni.core.prefix_cache import ModelCachePolicy
 from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
-from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import gpu_ar_model_runner, sparse_audio
 from vllm_omni.worker.gpu_ar_model_runner import (
@@ -239,6 +236,10 @@ def test_post_sample_talker_mtp_before_bookkeeping_gathers_the_kept_rows() -> No
 
 
 def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
     requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
     request = OpenAICreateSpeechRequest.model_validate(
         {"input": "Hello", "extra_params": requested},
@@ -597,13 +598,10 @@ def test_prefix_delivery_builder_clips_selected_downstream_payload(monkeypatch, 
     runner._async_chunk = False
     runner.omni_prefix_cache = _delivery_test_manager()
     raw = StageCacheOutputs(
-        hidden_states={"r1": torch.arange(6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)},
+        hidden_states={"r1": torch.arange(4, 6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)},
         mm_outputs={
-            "codes.audio": {"r1": torch.arange(6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)}
+            "codes.audio": {"r1": torch.arange(4, 6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)}
         },
-        token_ranges={"r1": (0, 6), "r2": (0, 2)},
-        cached_mm_keys=frozenset({"codes.audio"}),
-        token_mm_keys=frozenset({"codes.audio"}),
     )
     seen = []
     monkeypatch.setattr(
@@ -662,7 +660,6 @@ def test_prefix_delivery_builder_propagates_failure(monkeypatch):
     raw = StageCacheOutputs(
         hidden_states={"r1": torch.tensor([[1.0], [2.0]]), "r2": torch.tensor([[3.0], [4.0]])},
         mm_outputs={},
-        token_ranges={"r1": (0, 2), "r2": (0, 2)},
     )
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
     monkeypatch.setattr(
@@ -688,7 +685,6 @@ def test_prefix_delivery_clips_scheduled_hidden_when_cached_hidden_disabled(monk
     raw = StageCacheOutputs(
         hidden_states=None,
         mm_outputs={},
-        token_ranges={"r1": (0, 6), "r2": (0, 2)},
     )
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
     monkeypatch.setattr(
@@ -716,7 +712,6 @@ def test_sparse_list_only_audio_keeps_later_payload_after_empty_step(monkeypatch
     raw = StageCacheOutputs(
         hidden_states=None,
         mm_outputs={"codes.audio": {"r1": [torch.tensor([9])], "r2": []}},
-        token_ranges={"r1": (5, 6), "r2": (0, 2)},
     )
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
     monkeypatch.setattr(
@@ -758,9 +753,6 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch, cache_
                 StageCacheOutputs(
                     hidden_states=combined_hidden,
                     mm_outputs=combined_mm,
-                    token_ranges={"r1": (10, 11), "r2": (20, 22)},
-                    cached_mm_keys=frozenset({"foo"}),
-                    token_mm_keys=frozenset({"foo"}),
                 ),
             ),
         )
@@ -1586,7 +1578,6 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     raw = StageCacheOutputs(
         hidden_states=None,
         mm_outputs=combined_mm,
-        token_ranges={r: (0, 1) for r in ("r1", "r2", "r3")},
     )
     runner.omni_prefix_cache = _delivery_test_manager()
 
@@ -2205,6 +2196,13 @@ class TestPreferModelSamplerNoneFallback:
             def emit(self, record):
                 records.append(record)
 
+        import vllm.logger as vllm_logger
+
+        # warning_once is cached for the whole worker process. Another test on
+        # the same xdist worker can consume this message before we attach a handler.
+        vllm_logger._print_warning_once.cache_clear()
+        previous_level = ar_module.logger.level
+        ar_module.logger.setLevel(logging.INFO)
         handler = _Capture(level=logging.WARNING)
         ar_module.logger.addHandler(handler)
         try:
@@ -2213,6 +2211,8 @@ class TestPreferModelSamplerNoneFallback:
                 assert out is sentinel
         finally:
             ar_module.logger.removeHandler(handler)
+            ar_module.logger.setLevel(previous_level)
+            vllm_logger._print_warning_once.cache_clear()
 
         fallback_records = [r for r in records if "falling back to the default sampler" in r.getMessage()]
         assert len(fallback_records) == 1
@@ -2538,9 +2538,6 @@ def test_full_payload_cache_recovery_appends_only_scheduler_suffix(monkeypatch, 
     raw = StageCacheOutputs(
         hidden_states={"r1": torch.arange(origin, end).reshape(-1, 1)},
         mm_outputs={"codes.audio": {"r1": torch.arange(origin, end).reshape(-1, 1)}},
-        token_ranges={"r1": (origin, end)},
-        cached_mm_keys=frozenset({"codes.audio"}),
-        token_mm_keys=frozenset({"codes.audio"}),
     )
     runner.requests["r1"].num_computed_tokens = 99
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
@@ -2612,7 +2609,7 @@ def full_payload_steps(mocker):
         from vllm_omni.core.sched.output import OmniSchedulerOutput
 
         scheduler = OmniSchedulerOutput(**vars(SchedulerOutput.make_empty()))
-        scheduler.scheduled_token_ranges = {rid: (start + 2, start + 3) for rid in ("r1", "r2")}
+        scheduler._scheduled_token_ranges = {rid: (start + 2, start + 3) for rid in ("r1", "r2")}
         runner._scheduled_token_ranges = {rid: (start, start + 1) for rid in ("r1", "r2")}
         scheduler.delivered_upto = {rid: 8 for rid in ("r1", "r2")}
         scheduler.num_scheduled_tokens = {"r1": 1, "r2": 1}
@@ -2628,9 +2625,22 @@ def full_payload_steps(mocker):
         runner.execute_model_state = ExecuteModelState(
             scheduler, None, None, None, hidden, None, None, None, None, None, {}, None, start if cache else None
         )
+        completion: Future[None] = Future()
+        constructor.return_value._background_future = completion
         runner.sample_tokens(None)
+        builder = constructor.call_args.kwargs["model_runner_output_builder"]
+
+        def run_builder():
+            try:
+                output = builder()
+            except BaseException as exc:
+                completion.set_exception(exc)
+                raise
+            completion.set_result(None)
+            return output
+
         scheduler.delivered_upto.update({"r1": 99, "r2": 99})
-        return constructor.call_args.kwargs["model_runner_output_builder"]
+        return run_builder
 
     return runner, step
 
@@ -2647,41 +2657,39 @@ def test_full_payload_cache_off_keeps_executed_positions(full_payload_steps):
 
 
 @pytest.mark.parametrize("cache", [False, True])
-def test_full_payload_builders_prepare_concurrently_but_accumulate_in_order(full_payload_steps, mocker, cache):
+def test_full_payload_builders_accumulate_in_executor_order(full_payload_steps, mocker, cache):
     runner, step = full_payload_steps
     if cache:
         runner.omni_prefix_cache = _delivery_test_manager()
 
         def sources(**kwargs):
             start = kwargs["step_id"]
-            ranges = {rid: (start, start + 1) for rid in runner.requests}
             return None, StageCacheOutputs(
                 hidden_states={rid: torch.tensor([[start]]) for rid in runner.requests},
                 mm_outputs={},
-                token_ranges=ranges,
             )
 
         mocker.patch.object(runner, "_prepare_prefix_cache_pooler_payload_sources", side_effect=sources)
     first, second = step(8, cache=cache), step(9, cache=cache)
-    release_first, second_prepared, second_done = threading.Event(), threading.Event(), threading.Event()
+    first_started, release_first, second_started = threading.Event(), threading.Event(), threading.Event()
     build_payload = runner._build_omni_pooler_payload
 
     def prepare(**kwargs):
         payload = build_payload(**kwargs)
         if kwargs["rid"] == "r2":
             if payload["hidden"].item() == 8:
+                first_started.set()
                 assert release_first.wait(5)
             else:
-                second_prepared.set()
+                second_started.set()
         return payload
 
     mocker.patch.object(runner, "_build_omni_pooler_payload", side_effect=prepare)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         a, b = pool.submit(first), pool.submit(second)
-        b.add_done_callback(lambda _: second_done.set())
         try:
-            assert second_prepared.wait(5), "later payload preparation must not wait for the earlier builder"
-            finished_early = second_done.wait(0.2)
+            assert first_started.wait(5)
+            assert not second_started.is_set()
         finally:
             release_first.set()
         a.result(timeout=5)
@@ -2689,7 +2697,6 @@ def test_full_payload_builders_prepare_concurrently_but_accumulate_in_order(full
     for entry in runner._pending_full_payload_send.values():
         payload, _ = runner._materialize_full_payload_entry(entry)
         assert payload["hidden"].flatten().tolist() == list(range(10))
-    assert not finished_early
 
 
 @pytest.mark.parametrize("aborted", [False, True])
@@ -2750,18 +2757,15 @@ def test_full_payload_builder_failure_reaches_later_output(full_payload_steps, m
     runner, step = full_payload_steps
     first, second = step(8), step(9)
     build_payload = runner._build_omni_pooler_payload
-    second_prepared = threading.Event()
 
     def prepare(**kwargs):
         payload = build_payload(**kwargs)
         if payload["hidden"].item() == 8:
-            assert second_prepared.wait(5)
             raise RuntimeError("payload preparation failed")
-        second_prepared.set()
         return payload
 
     mocker.patch.object(runner, "_build_omni_pooler_payload", side_effect=prepare)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         outputs = [pool.submit(first), pool.submit(second)]
         for output in outputs:
             with pytest.raises(RuntimeError, match="payload preparation failed"):
@@ -2769,6 +2773,14 @@ def test_full_payload_builder_failure_reaches_later_output(full_payload_steps, m
     for entry in runner._pending_full_payload_send.values():
         payload, _ = runner._materialize_full_payload_entry(entry)
         assert payload["hidden"].flatten().tolist() == list(range(8))
+
+    terminal = SchedulerOutput.make_empty()
+    terminal.finished_req_ids = {"r1", "r2"}
+    runner._warmup_state_cleared = True
+    flush = mocker.patch.object(runner, "flush_full_payload_outputs")
+    with pytest.raises(RuntimeError, match="payload preparation failed"):
+        runner.execute_model(terminal)
+    flush.assert_not_called()
 
 
 def test_async_output_reuses_worker_and_survives_builder_failure(mocker):
@@ -2859,3 +2871,22 @@ def test_shutdown_drains_output_builder_before_releasing_runner_state(mocker):
         stopped.result(timeout=5)
     assert order == ["built", "clear", "shutdown"]
     assert runner._omni_output_executor is None
+
+
+@pytest.mark.parametrize("shape", [(), (1, 1), (2, 3), (0, 1)])
+@pytest.mark.parametrize("is_tuple", [False, True])
+def test_unpack_equal_shape_snapshot_preserves_rows_and_container(shape, is_tuple):
+    count = 16
+    size = torch.Size(shape)
+    flat = torch.arange(count * size.numel())
+    packed = gpu_ar_model_runner._PackedTensorPayload(flat, [size] * count, is_tuple)
+    rows = gpu_ar_model_runner._copy_tensor_payload_to_cpu(packed, pin_memory=False)
+    assert type(rows) is (tuple if is_tuple else list)
+    assert len(rows) == count
+    for index, row in enumerate(rows):
+        expected = torch.arange(index * size.numel(), (index + 1) * size.numel()).reshape(shape)
+        torch.testing.assert_close(row, expected)
+    if flat.numel():
+        # Unpacking preserves views of the owned snapshot, without row copies.
+        flat.fill_(-1)
+        assert all(torch.all(row == -1) for row in rows)

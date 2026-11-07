@@ -93,6 +93,7 @@ def _replace_streaming_session(session: Request) -> None:
 
 def _make_drain_sched(session: Request) -> MagicMock:
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -123,7 +124,7 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     scheduler_output.num_scheduled_tokens = {session.request_id: num_scheduled}
     scheduler_output.scheduled_spec_decode_tokens = {session.request_id: spec} if spec else {}
     scheduler_output.num_invalid_spec_tokens = 0
-    scheduler_output.scheduled_token_ranges = {session.request_id: (start, start + num_scheduled)}
+    scheduler_output._scheduled_token_ranges = {session.request_id: (start, start + num_scheduled)}
 
     model_runner_output = MagicMock(spec=ModelRunnerOutput)
     model_runner_output.sampled_token_ids = [[token]]

@@ -53,11 +53,17 @@ class PrefixCacheRunnerMixin:
     their instance fields as before.
     """
 
+    if TYPE_CHECKING:
+        _pending_full_payload_send: dict[str, tuple[Any, ...]]
+
+        def _should_accumulate_full_payload_output(self) -> bool: ...
+
+        def resume_full_payload_output(self, req_id: str, delivered_upto: int) -> None: ...
+
     # Host-class fields (annotation only; the runner initializes them).
     input_batch: Any
     kv_cache_config: Any
     is_pooling_model: bool
-    requests: dict[str, Any]
 
     omni_prefix_cache: OmniPrefixCacheManager | None = None
     _omni_prefix_cache_cfg: PrefixCacheConfig | None = None
@@ -113,11 +119,8 @@ class PrefixCacheRunnerMixin:
         self._omni_prefix_cache_cfg = None
         if cfg is None or not get_pp_group().is_last_rank:
             return
-        view = get_prefix_cache_group_view(
-            self.input_batch,
-            cfg.block_size,
-            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
-        )
+        adapter = self._new_prefix_cache_adapter()
+        view = self._build_prefix_cache_group_view(cfg, adapter)
         if view is None:
             raise OmniPrefixCacheUnmatchError(
                 "omni prefix caching requires a block table on the input batch; "
@@ -126,12 +129,23 @@ class PrefixCacheRunnerMixin:
         manager = OmniPrefixCacheManager(cfg)
         manager.register_policy(self._omni_cache_policy)
         self.omni_prefix_cache = manager
-        self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+        self._prefix_cache_adapter = adapter
         self._prefix_cache_group_view = view
         policy = self._omni_cache_policy
         if self._prefix_cache_coalesce_decode and policy.needs_full_hidden_states and not policy.deferred_keys:
             self._prefix_cache_decode_cfg = cfg
             self._prefix_cache_decode_steps = []
+
+    def _new_prefix_cache_adapter(self) -> PrefixCacheSchedulerAdapter:
+        return PrefixCacheSchedulerAdapter()
+
+    def _build_prefix_cache_group_view(self, cfg: PrefixCacheConfig, adapter: PrefixCacheSchedulerAdapter) -> Any:
+        """Group view over this runner's block table; None when it has none."""
+        return get_prefix_cache_group_view(
+            self.input_batch,
+            cfg.block_size,
+            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
+        )
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
         """Per-step lifecycle entry; must run before ``_update_states``
@@ -155,6 +169,7 @@ class PrefixCacheRunnerMixin:
                 and bool(step.scheduled_tokens)
                 and all(count == 1 for _, count in step.scheduled_tokens)
                 and not step.events
+                and not step.deliveries
                 and not getattr(scheduler_output, "scheduled_new_reqs", ())
                 and not getattr(scheduler_output, "preempted_req_ids", ())
             )
@@ -197,7 +212,6 @@ class PrefixCacheRunnerMixin:
                 if token_ranges is not None
                 else dict(self._prefix_cache_step.scheduled_tokens)
             ),
-            token_ranges=self._scheduled_token_ranges,
         )
         mm = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
         n = num_tokens_unpadded
@@ -244,12 +258,7 @@ class PrefixCacheRunnerMixin:
         if n > cfg.staging_capacity_tokens:
             return False
         if steps and (
-            len(writes) != len(steps[-1][0])
-            or any(
-                (w.req_id, w.row_start, w.row_end, w.token_start)
-                != (prev.req_id, prev.row_start, prev.row_end, prev.token_end)
-                for w, prev in zip(writes, steps[-1][0])
-            )
+            writes != steps[0][0]
             or rows.keys() != steps[0][2].keys()
             or (len(steps) + 1) * n > cfg.staging_capacity_tokens
         ):
@@ -271,10 +280,7 @@ class PrefixCacheRunnerMixin:
         count = len(steps)
         first = steps[0][0]
         n = len(first) * count
-        writes = tuple(
-            PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count, w.token_start, last.token_end)
-            for w, last in zip(first, steps[-1][0])
-        )
+        writes = tuple(PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count) for w in first)
         slots_cpu = torch.stack([slots for _, slots, _ in steps], dim=1).flatten()
         rows = {key: torch.stack([tensors[key] for _, _, tensors in steps], dim=1).flatten(0, 1) for key in steps[0][2]}
         steps.clear()
@@ -314,7 +320,7 @@ class PrefixCacheRunnerMixin:
             self._prefix_cache_pure_decode = False
 
     def _prefix_cache_materialize(self, step_id: int | None, req_ids: list[str]) -> StageCacheOutputs | None:
-        """Per-request merged outputs with delivery metadata for a saved step.
+        """Per-request merged outputs for a saved step.
 
         ``req_ids`` must be the save-time snapshot, never the live
         ``input_batch`` (under async output this runs a step late).

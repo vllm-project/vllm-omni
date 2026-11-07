@@ -128,9 +128,8 @@ def _run_npu_pooler_loop(scope):
 
 def test_npu_output_builder_uses_delivery_snapshot_without_advancing_it():
     raw = StageCacheOutputs(
-        hidden_states={"r1": torch.arange(4, 10).reshape(-1, 1)},
+        hidden_states={"r1": torch.arange(6, 10).reshape(-1, 1)},
         mm_outputs={},
-        token_ranges={"r1": (4, 10)},
     )
     scheduler_output = SimpleNamespace(delivered_upto={"r1": 8})
     scope = {
@@ -149,13 +148,15 @@ def test_npu_output_builder_uses_delivery_snapshot_without_advancing_it():
     payloads = _run_npu_pooler_loop(scope)
     assert payloads[0]["hidden"].flatten().tolist() == [8, 9]
     assert scheduler_output.delivered_upto == {"r1": 8}
-    assert raw.hidden_states["r1"].flatten().tolist() == list(range(4, 10))
+    assert raw.hidden_states["r1"].flatten().tolist() == list(range(6, 10))
 
 
 def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():
+    hidden = {"r1": torch.tensor([[40.0], [50.0]])}
+    scheduler_output = SimpleNamespace(delivered_upto={"r1": 5})
     scope = {
-        "req_hidden_states_cpu": {"r1": torch.tensor([[40.0], [50.0]])},
-        "scheduler_output": SimpleNamespace(delivered_upto={"r1": 5}),
+        "req_hidden_states_cpu": hidden,
+        "scheduler_output": scheduler_output,
         "scheduled_token_ranges": {"r1": (4, 6)},
         "cache_outputs": None,
         "req_ids_output_copy": ["r0", "r1"],
@@ -168,9 +169,13 @@ def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():
     payloads = _run_npu_pooler_loop(scope)
     assert payloads[0] == {}
     assert payloads[1]["hidden"].flatten().tolist() == [50.0]
-    assert scope["req_hidden_states_cpu"]["r1"].flatten().tolist() == [40.0, 50.0]
+    assert hidden["r1"].flatten().tolist() == [40.0, 50.0]
 
-    scope["scheduler_output"].delivered_upto = {}
+    scheduler_output.delivered_upto = {}
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[1]["hidden"].flatten().tolist() == [40.0, 50.0]
+
+    scope["scheduled_token_ranges"] = None
     payloads = _run_npu_pooler_loop(scope)
     assert payloads[1]["hidden"].flatten().tolist() == [40.0, 50.0]
 

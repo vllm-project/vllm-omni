@@ -93,8 +93,8 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[str, list[int]]
-    additional_information: dict[str, dict | None]
+    prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
+    additional_information: dict[str, dict | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +140,6 @@ class OmniSchedulerOutput(SchedulerOutput):
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
     discarded_req_ids: set[str] = field(default_factory=set)
-    scheduled_token_ranges: dict[str, tuple[int, int]] = field(default_factory=dict)
+    _scheduled_token_ranges: dict[str, tuple[int, int]] = field(default_factory=dict)
     delivered_upto: dict[str, int] = field(default_factory=dict)
     replaced_req_ids: set[str] = field(default_factory=set)

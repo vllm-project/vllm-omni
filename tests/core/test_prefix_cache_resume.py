@@ -143,11 +143,9 @@ class _CPUCacheRun:
         delivered = {
             rid: slice_token_payload(
                 {"hidden": raw.hidden_states[rid]},
-                token_range=output.scheduled_token_ranges[rid],
+                token_range=output._scheduled_token_ranges[rid],
                 delivered_upto=output.delivered_upto[rid],
                 token_keys=frozenset({"hidden"}),
-                cached_token_range=raw.token_ranges[rid],
-                cached_keys=frozenset({"hidden"}),
             ).get("hidden", raw.hidden_states[rid][:0])
             for rid in req_ids
         }

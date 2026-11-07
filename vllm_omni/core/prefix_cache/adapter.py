@@ -44,12 +44,30 @@ class PrefixCacheRequestEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class PrefixCacheDelivery:
+    """Rows a re-entering request must replay or drop to keep its output gapless.
+
+    ``[read_start, read_end)`` is replayed from the cache ahead of this step's
+    rows; ``trim`` leading rows of this step's slice were already delivered.
+    At most one of the two is non-empty.
+    """
+
+    req_id: str
+    read_start: int = 0
+    read_end: int = 0
+    block_ids: tuple[tuple[int, ...], ...] = ()
+    trim: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class PrefixCacheStep:
     events: tuple[PrefixCacheRequestEvent, ...]
     scheduled_tokens: tuple[tuple[str, int], ...]
     # EXTENDED has no payload beyond counts already captured above. Avoid
     # allocating one event per running request on every decode step.
     extended_req_ids: tuple[str, ...] = ()
+    # Only produced by an adapter that tracks delivery.
+    deliveries: tuple[PrefixCacheDelivery, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,8 +75,6 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
-    token_start: int
-    token_end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +96,47 @@ class PrefixCacheSchedulerAdapter:
     ABORTED requires an explicit optional cancellation field:
     ``discarded_req_ids`` from the Omni scheduler or ``aborted_req_ids``.
     Cancellation is never inferred from ordinary completion.
+
+    ``track_requests`` keeps group-0 block ids for runners without a host
+    block table and translates the scheduler's accepted-output boundary
+    into replay or trim instructions.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, track_requests: bool = False) -> None:
         self._observed_req_ids: set[str] = set()
+        self._track = track_requests
+        self._block_ids: dict[str, list[int]] = {}
+
+    def block_ids(self, req_id: str) -> list[int]:
+        """Group-0 block ids of a live request (``track_requests`` only)."""
+        ids = self._block_ids.get(req_id)
+        if ids is None:
+            raise OmniPrefixCacheUnmatchError(f"no block ids recorded for req {req_id}")
+        return ids
+
+    @staticmethod
+    def _group0(blocks: Any) -> list[int]:
+        groups = PrefixCacheSchedulerAdapter._blocks_value(blocks)
+        return list(groups[0]) if groups else []
+
+    def _track_delivery(
+        self,
+        req_id: str,
+        start: int,
+        count: int,
+        done: int,
+        deliveries: list[PrefixCacheDelivery],
+    ) -> None:
+        if count <= 0:
+            return
+        if start > done:
+            deliveries.append(
+                PrefixCacheDelivery(
+                    req_id, read_start=done, read_end=start, block_ids=(tuple(self._block_ids.get(req_id, ())),)
+                )
+            )
+        elif start < done:
+            deliveries.append(PrefixCacheDelivery(req_id, trim=min(count, done - start)))
 
     @staticmethod
     def _req_id(data: Any) -> str:
@@ -113,11 +166,19 @@ class PrefixCacheSchedulerAdapter:
         aborted.update(str(req_id) for req_id in (getattr(scheduler_output, "discarded_req_ids", ()) or ()))
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         terminal_ids = finished | aborted
+        delivered = getattr(scheduler_output, "delivered_upto", {})
+        deliveries: list[PrefixCacheDelivery] = []
 
         self._observed_req_ids.difference_update(terminal_ids)
         for req_id in sorted(terminal_ids):
             kind = PrefixCacheEventKind.ABORTED if req_id in aborted else PrefixCacheEventKind.FINISHED
             events.append(PrefixCacheRequestEvent(req_id, kind))
+        if self._track:
+            for req_id in terminal_ids:
+                self._block_ids.pop(req_id, None)
+            # Preemption frees the blocks; the delivered watermark survives.
+            for req_id in getattr(scheduler_output, "preempted_req_ids", None) or ():
+                self._block_ids.pop(str(req_id), None)
 
         emitted: set[str] = set()
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
@@ -125,11 +186,21 @@ class PrefixCacheSchedulerAdapter:
             if req_id in emitted:
                 continue
             emitted.add(req_id)
+            computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
+            if self._track:
+                self._block_ids[req_id] = self._group0(getattr(data, "block_ids", None))
             if req_id in self._observed_req_ids and req_id not in replaced:
                 extended.append(req_id)
+                if self._track:
+                    self._track_delivery(
+                        req_id,
+                        computed_tokens,
+                        max(0, int(scheduled_tokens.get(req_id, 0))),
+                        delivered.get(req_id, 0),
+                        deliveries,
+                    )
                 continue
             self._observed_req_ids.add(req_id)
-            computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
             blocks = self._blocks_value(getattr(data, "block_ids", None)) if computed_tokens > 0 else ()
             events.append(
                 PrefixCacheRequestEvent(
@@ -160,7 +231,7 @@ class PrefixCacheSchedulerAdapter:
                     block_ids=self._blocks_value(new_blocks[index]) if index < len(new_blocks) else (),
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                     num_output_tokens=int(output_tokens[index]) if index < len(output_tokens) else 0,
-                    delivered_upto=getattr(scheduler_output, "delivered_upto", {}).get(req_id, 0),
+                    delivered_upto=delivered.get(req_id, 0),
                 )
             )
             emitted.add(req_id)
@@ -176,6 +247,20 @@ class PrefixCacheSchedulerAdapter:
             )
             emitted.add(req_id)
 
+        if self._track:
+            for index, raw_req_id in enumerate(getattr(cached, "req_ids", ()) or ()):
+                req_id = str(raw_req_id)
+                new = new_blocks[index] if index < len(new_blocks) else None
+                if req_id in resumed:
+                    self._block_ids[req_id] = self._group0(new)
+                elif new is not None:
+                    self._block_ids.setdefault(req_id, []).extend(self._group0(new))
+                start = int(computed[index]) if index < len(computed) else 0
+                done = delivered.get(req_id, 0)
+                # Ordinary async steps may run ahead of accepted output.
+                if req_id in resumed or start < done:
+                    self._track_delivery(req_id, start, max(0, int(scheduled_tokens.get(req_id, 0))), done, deliveries)
+
         counts: list[tuple[str, int]] = []
         for raw_req_id, raw_count in scheduled_tokens.items():
             req_id, count = str(raw_req_id), int(raw_count)
@@ -188,14 +273,13 @@ class PrefixCacheSchedulerAdapter:
             counts.append((req_id, count))
             if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:
                 extended.append(req_id)
-        return PrefixCacheStep(tuple(events), tuple(counts), tuple(extended))
+        return PrefixCacheStep(tuple(events), tuple(counts), tuple(extended), tuple(deliveries))
 
     def build_write_layout(
         self,
         group_view: Any,
         *,
         num_scheduled_tokens: Mapping[str, int],
-        token_ranges: Mapping[str, tuple[int, int]] | None = None,
     ) -> PrefixCacheWriteLayout:
         req_order = tuple(group_view.batch_req_ids())
         writes: list[PrefixCacheWrite] = []
@@ -204,10 +288,7 @@ class PrefixCacheSchedulerAdapter:
             count = int(num_scheduled_tokens.get(req_id, 0))
             if count < 0:
                 raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
-            token_start, token_end = (
-                token_ranges[req_id] if token_ranges is not None else group_view.token_range(req_id, count)
-            )
-            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count, token_start, token_end))
+            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count))
             cursor += count
         slots = group_view.step_slots_cpu(list(req_order), dict(num_scheduled_tokens))
         return PrefixCacheWriteLayout(tuple(writes), cursor, slots)

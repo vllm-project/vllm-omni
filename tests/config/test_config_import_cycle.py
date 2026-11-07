@@ -27,17 +27,17 @@ def _top_level_import_modules(path: Path) -> set[str]:
     return modules
 
 
-def _assert_isolated_import_succeeds(script: str) -> None:
+def _assert_isolated_import_succeeds(script: str, *, timeout: int = 120) -> None:
     env = os.environ.copy()
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=timeout,
         check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -118,4 +118,43 @@ pipeline = resolve_pipeline_config("pi0")
 if pipeline is None or pipeline.model_type != "pi0":
     raise SystemExit("expected the registered pi0 pipeline config")
 """
+    )
+
+
+def test_pipeline_registry_imports_without_pyav() -> None:
+    """Building stage config must not require PyAV.
+
+    The registry imports Physis pipeline configs. Those packages must not
+    re-export the runtime pipelines, which load MiniMax-H3 and then ``av``.
+    Non-video ``AsyncOmni`` users hit this on every engine import.
+    See https://github.com/vllm-project/vllm-omni/issues/9939.
+    """
+    _assert_isolated_import_succeeds(
+        """
+import sys
+
+sys.modules["av"] = None
+
+from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+
+for model_type in ("physis_h3", "physis_ltx", "physis_wan"):
+    pipeline = resolve_pipeline_config(model_type)
+    if pipeline is None or pipeline.model_type != model_type:
+        raise SystemExit(f"expected the registered {model_type} pipeline config")
+
+eager = (
+    "vllm_omni.diffusion.models.physis.h3.pipeline_physis_h3",
+    "vllm_omni.diffusion.models.physis.ltx.pipeline_physis_ltx",
+    "vllm_omni.diffusion.utils.media_utils",
+)
+loaded = [name for name in eager if name in sys.modules]
+if loaded:
+    raise SystemExit("pipeline registry eagerly imported " + ", ".join(loaded))
+
+import vllm_omni
+
+if vllm_omni.AsyncOmni is None:
+    raise SystemExit("expected AsyncOmni")
+""",
+        timeout=180,
     )

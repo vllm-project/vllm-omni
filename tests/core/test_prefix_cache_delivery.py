@@ -64,9 +64,7 @@ def consume(mgr, saved_step, req_id="a"):
         payload,
         token_range=saved_step.token_range,
         delivered_upto=saved_step.delivered_upto,
-        token_keys=raw.token_mm_keys | {"hidden"},
-        cached_token_range=raw.token_ranges[req_id],
-        cached_keys=raw.cached_mm_keys | {"hidden"},
+        token_keys=frozenset({"hidden", "codes"}),
     )
 
 
@@ -161,16 +159,14 @@ def test_cached_mm_is_clipped_but_global_metadata_is_preserved():
 def test_delivery_clips_current_only_fields_relative_to_scheduled_origin():
     out = slice_token_payload(
         {
-            "hidden": torch.arange(6, 14).reshape(-1, 1),
-            "cached": torch.arange(6, 14).reshape(-1, 1),
+            "hidden": torch.arange(12, 14).reshape(-1, 1),
+            "cached": torch.arange(12, 14).reshape(-1, 1),
             "current": torch.tensor([[12], [13]]),
             "global": torch.tensor([[90], [91]]),
         },
         token_range=(12, 14),
         delivered_upto=13,
         token_keys=frozenset({"hidden", "cached", "current"}),
-        cached_token_range=(6, 14),
-        cached_keys=frozenset({"hidden", "cached"}),
     )
     assert out["hidden"].tolist() == [[13]]
     assert out["cached"].tolist() == [[13]]
@@ -190,7 +186,7 @@ def test_repeated_resume_preserves_deferred_mm_positions():
     from vllm_omni.core.prefix_cache.interface import ModelCachePolicy
 
     mgr, view = make_manager(policy=ModelCachePolicy(deferred_keys=frozenset({"codes"})))
-    emitted = []
+    emitted: list[float] = []
     for start, end, kind, hit in [(0, 8, Kind.STARTED, 0), (4, 10, Kind.RESUMED, 4), (8, 12, Kind.RESUMED, 8)]:
         sid = step(
             mgr,

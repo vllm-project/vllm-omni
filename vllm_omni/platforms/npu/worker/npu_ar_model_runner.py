@@ -42,7 +42,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
-from vllm_ascend.worker.model_runner_v1 import graph_capture
+from vllm_ascend.worker.v1.model_runner import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -52,6 +52,7 @@ from vllm_omni.model_executor.models.interfaces import supports_multi_frame_deco
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, slice_token_payload, to_payload_element
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -131,7 +132,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
@@ -339,9 +343,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return drafts
         return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
 
+    def initialize_kv_cache(self, *args, **kwargs) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        validate_duplex_kv_cache(self)
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        # The parent installs the scheduler's compacted block table and token
+        # counts. Apply the matching worker-side rotation/history eviction before
+        # forward, without compacting or decrementing the logical state again.
+        apply_duplex_window_reanchor(self, scheduler_output)
         return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -1409,22 +1421,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             )
                     payload.update(mm_payload)
                 payload = flatten_payload(payload)
-                if rid in scheduled_token_ranges and not audio_sparse_output:
+                if scheduled_token_ranges is not None and rid in scheduled_token_ranges and not audio_sparse_output:
                     token_keys = frozenset(key for key in payload if self._is_full_payload_token_key(key))
-                    cached_keys = frozenset()
-                    if cache_outputs is not None:
-                        token_keys |= cache_outputs.token_mm_keys
-                        cached_keys = cache_outputs.cached_mm_keys
-                        if cache_outputs.hidden_states is not None:
-                            cached_keys |= {"hidden"}
                     token_keys -= self._resolve_full_payload_replace_keys()
                     payload = slice_token_payload(
                         payload,
                         token_range=scheduled_token_ranges[rid],
                         delivered_upto=getattr(scheduler_output, "delivered_upto", {}).get(rid, 0),
                         token_keys=token_keys,
-                        cached_token_range=cache_outputs.token_ranges[rid] if cache_outputs is not None else None,
-                        cached_keys=cached_keys,
                     )
                 pooler_output.append(payload)
 
@@ -1440,10 +1444,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                for rid, payload in zip(req_ids_output_copy, pooler_inter):
+                for rid, request_payload in zip(req_ids_output_copy, pooler_inter):
                     request = self.requests.get(rid)
-                    if request is not None and payload:
-                        self.accumulate_full_payload_output(rid, payload, request)
+                    if request is not None and request_payload:
+                        self.accumulate_full_payload_output(rid, request_payload, request)
 
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = (

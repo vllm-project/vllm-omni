@@ -40,11 +40,6 @@ class FullAttentionGroupView:
     def batch_req_ids(self) -> list[str]:
         return list(self._input_batch.req_ids)
 
-    def token_range(self, req_id: str, num_scheduled: int) -> tuple[int, int]:
-        index = self._input_batch.req_id_to_index[req_id]
-        start = int(self._input_batch.num_computed_tokens_cpu[index])
-        return start, start + num_scheduled
-
     def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor:
         """This step's slot mapping, computed on CPU from the block table.
 
@@ -70,6 +65,77 @@ class FullAttentionGroupView:
             keep = blocks < table.shape[1]
             pos, row, blocks = pos[keep], row[keep], blocks[keep]
         return torch.from_numpy(table[row, blocks].astype(np.int64) * bs + pos % bs)
+
+
+class MRv2FullAttentionGroupView:
+    """View for Model Runner V2, whose block table has no host copy.
+
+    Block ids come from the adapter's per-request ledger (built from the
+    scheduler output it already translates); positions and batch order from
+    the ``InputBatch`` bound for the step being saved. Nothing is read back
+    from the device and the runner's ``BlockTables`` is not touched.
+    """
+
+    def __init__(self, adapter: Any, block_size: int):
+        self._adapter = adapter
+        self.block_size = block_size
+        self._input_batch: Any = None
+
+    def bind(self, input_batch: Any) -> None:
+        self._input_batch = input_batch
+
+    def _batch(self) -> Any:
+        if self._input_batch is None:
+            raise OmniPrefixCacheUnmatchError("MRv2 prefix-cache view has no bound input batch")
+        return self._input_batch
+
+    def batch_req_ids(self) -> list[str]:
+        batch = self._batch()
+        return list(batch.req_ids[: batch.num_reqs])
+
+    def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor:
+        batch = self._batch()
+        row_of = {req_id: row for row, req_id in enumerate(batch.req_ids[: batch.num_reqs])}
+        bs = self.block_size
+        parts: list[np.ndarray] = []
+        for req_id in req_ids:
+            count = int(num_scheduled.get(req_id, 0))
+            if count <= 0:
+                continue
+            row = row_of.get(req_id)
+            if row is None or int(batch.num_scheduled_tokens[row]) != count:
+                raise OmniPrefixCacheUnmatchError(
+                    f"req {req_id}: scheduled {count} tokens, bound input batch disagrees"
+                )
+            blocks = self._adapter.block_ids(req_id)
+            pos = np.arange(count, dtype=np.int64) + int(batch.num_computed_tokens_np[row])
+            idx = pos // bs
+            if int(idx[-1]) >= len(blocks):
+                raise OmniPrefixCacheUnmatchError(
+                    f"req {req_id}: position {int(pos[-1])} lies past its {len(blocks)} recorded blocks"
+                )
+            parts.append(np.asarray(blocks, dtype=np.int64)[idx] * bs + pos % bs)
+        if not parts:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.from_numpy(np.concatenate(parts))
+
+
+def check_mrv2_prefix_cache_layout(*, block_sizes: list[int], block_size: int, dcp_size: int) -> None:
+    """Reject MRv2 layouts the ledger slot math cannot mirror.
+
+    MRv2 block tables hold allocator block ids and its slot mapping uses the
+    allocator block size; kernel-block splitting stays inside attention
+    metadata, so only DCP striping and a size mismatch need refusing.
+    """
+    if dcp_size != 1:
+        raise OmniPrefixCacheUnmatchError(
+            f"omni prefix caching does not support decode context parallel (dcp_world_size={dcp_size}); "
+            "disable enable_prefix_caching"
+        )
+    if not block_sizes or int(block_sizes[0]) != int(block_size):
+        raise OmniPrefixCacheUnmatchError(
+            f"omni prefix caching block_size {block_size} does not match the kv-cache block table ({block_sizes})"
+        )
 
 
 def check_prefix_cache_block_layout(block_table: object, block_size: int) -> None:

@@ -196,7 +196,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
     r._prefix_cache_adapter = SimpleNamespace(
-        build_write_layout=lambda view, *, num_scheduled_tokens, token_ranges: PrefixCacheWriteLayout((), 0)
+        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
     )
     r._prefix_cache_group_view = SimpleNamespace()
     r._prefix_cache_step = PrefixCacheStep((), ())
@@ -462,16 +462,16 @@ def test_decode_batching_limits_and_prefix_hits(decode_runners, config, expected
     assert step_id is None
 
 
-def test_decode_flush_preserves_absolute_ranges(decode_runners):
+def test_decode_flush_preserves_request_row_layout(decode_runners):
     r = decode_runners()
     r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 8)}, new=["a", "z"])
     for offset in range(4):
         r.step({"a": (A_BLOCKS, 4 + offset, 1), "z": (Z_BLOCKS, 8 + offset, 1)})
     assert r.save_sizes == [12, 8]
     writes = r.save.call_args.kwargs["write_layout"].writes
-    assert [(w.req_id, w.row_start, w.row_end, w.token_start, w.token_end) for w in writes] == [
-        ("a", 0, 4, 4, 8),
-        ("z", 4, 8, 8, 12),
+    assert [(w.req_id, w.row_start, w.row_end) for w in writes] == [
+        ("a", 0, 4),
+        ("z", 4, 8),
     ]
 
 

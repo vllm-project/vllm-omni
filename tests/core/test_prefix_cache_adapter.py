@@ -235,7 +235,6 @@ def test_write_layout_uses_post_order_batch_and_slots():
     layout = PrefixCacheSchedulerAdapter().build_write_layout(FakeView(), num_scheduled_tokens={"b": 2, "a": 1})
     assert layout.total_rows == 3
     assert [(w.req_id, w.row_start, w.row_end) for w in layout.writes] == [("b", 0, 2), ("a", 2, 3)]
-    assert [(w.token_start, w.token_end) for w in layout.writes] == [(12, 14), (7, 8)]
     assert torch.equal(layout.slots_cpu, torch.tensor([20, 21, 7]))
     with pytest.raises(AttributeError):
         layout.writes = ()
