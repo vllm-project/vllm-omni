@@ -611,7 +611,7 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     mocker.patch.object(serve_module, "_build_multi_api_stage_runtime", return_value=runtime)
     mocker.patch.object(serve_module, "_wait_for_multi_api_server_completion")
     mocker.patch("signal.signal")
-    mocker.patch("vllm.entrypoints.openai.api_server.setup_server", return_value=("127.0.0.1:8000", socket))
+    mocker.patch("vllm.entrypoints.launchers.launcher.setup_server", return_value=("127.0.0.1:8000", socket))
     mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
     start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", return_value=manager)
 
