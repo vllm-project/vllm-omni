@@ -1385,8 +1385,8 @@ def test_tracking_namespace_copy_preserves_tracking(deep):
 
 
 def test_serve_parser_rejects_removed_shm_threshold_bytes() -> None:
-    """``--shm-threshold-bytes`` was dropped from the configs in #7522; the
-    serve parser must no longer accept it (it used to parse and be ignored)."""
+    """``--shm-threshold-bytes`` has no reader left in the tree; the serve
+    parser must reject it instead of accepting a value that is dropped."""
     args = _parse_serve_args(["serve", "fake-model", "--omni"])
     assert not hasattr(args, "shm_threshold_bytes")
 
