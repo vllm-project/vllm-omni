@@ -5,8 +5,9 @@
 import multiprocessing
 import uuid
 from contextlib import closing
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -41,14 +42,8 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 pytestmark = [pytest.mark.core_model]
 
 
-@dataclass
-class TinyVAEConfig:
-    shift_factor: float = 0.25
-    scaling_factor: float = 0.5
-
-
 class TinyVAE:
-    config = TinyVAEConfig()
+    config = SimpleNamespace(shift_factor=0.25, scaling_factor=0.5)
     ffactor_spatial = 1
 
     def __init__(self, device, dtype):
@@ -293,7 +288,12 @@ def test_missing_predecessor_replays_rng_without_pixels(runner, make_request):
     req = make_request("A", refs)
     req.num_computed_tokens = req.mm_features[1].mm_position.offset
     admit(runner, req)
-    assert "vae_pixel_values" not in runner.requests["A"].mm_features[0].data
+    stripped = runner.requests["A"].mm_features[0].data
+    assert set(stripped) == {"vae_generator_seed", "vae_token_grid_hw"}
+    assert stripped["vae_token_grid_hw"] is req.mm_features[0].data["vae_token_grid_hw"]
+    assert stripped["vae_generator_seed"].data.item() == 42
+    assert "vae_pixel_values" in req.mm_features[0].data
+    assert runner.requests["A"].mm_features[1].data is req.mm_features[1].data
     expected, state = reference(runner, refs, 42)
     output = runner._execute_mm_encoder(schedule({"A": [2]}))
     assert_latents(output, [expected[2]])
@@ -302,20 +302,15 @@ def test_missing_predecessor_replays_rng_without_pixels(runner, make_request):
     assert_latents(runner._execute_mm_encoder(schedule({"A": [1]})), [expected[1]])
 
 
-def scheduler(cache):
-    instance = object.__new__(Scheduler)
-    instance.encoder_cache_manager = cache
-    instance.is_encoder_decoder = False
-    instance.scheduler_config = SchedulerConfig(max_model_len=128, is_multimodal_model=True, is_encoder_decoder=False)
-    instance.ec_connector = None
-    return instance
-
-
 @pytest.mark.cpu
 def test_real_scheduler_cache_subset_and_duplicate_images(runner, make_request):
     refs = images()
     cache = EncoderCacheManager(128)
-    sched = scheduler(cache)
+    sched = object.__new__(Scheduler)
+    sched.encoder_cache_manager = cache
+    sched.is_encoder_decoder = False
+    sched.scheduler_config = SchedulerConfig(max_model_len=128, is_multimodal_model=True, is_encoder_decoder=False)
+    sched.ec_connector = None
     warm = make_request("warm", refs[:1])
     admit(runner, warm)
     runner._execute_mm_encoder(schedule({"warm": [0]}))
@@ -546,122 +541,68 @@ def test_sparse_image_indices_restore_after_reverse_order_and_failure():
     assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())
 
 
-@pytest.mark.cpu
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_real_vae_posterior_matches_draw_plan_and_replay(runner, make_request, monkeypatch, dtype):
-    # HunyuanImage-3.0-Instruct config.json uses spatial/temporal factors 16/4,
-    # 32 latent channels and five encoder levels with two residual blocks each.
-    # Keep that topology, shrinking only hidden channels and image dimensions
-    # for CPU coverage. These are random weights, not pretrained-image evidence.
-    monkeypatch.setattr(autoencoder_kl_3d, "get_local_device", lambda: torch.device("cpu"))
-    vae = (
-        autoencoder_kl_3d.AutoencoderKLConv3D(
-            in_channels=3,
-            out_channels=3,
-            latent_channels=32,
-            block_out_channels=(32, 32, 32, 64, 64),
-            layers_per_block=2,
-            ffactor_spatial=16,
-            ffactor_temporal=4,
-            sample_size=384,
-            sample_tsize=96,
-            scaling_factor=0.562679178327931,
-            only_encoder=True,
-        )
-        .to(dtype=dtype)
-        .eval()
-    )
-    model = runner.model
-    model.vae = vae
-    model.config = PretrainedConfig(vae_downsample_factor=(16, 16), patch_size=1, vae={"latent_channels": 32})
-    refs = [torch.zeros((3, h, w), dtype=dtype) for h, w in ((64, 64), (64, 96), (96, 64))]
-    req = make_request("real-vae", refs)
-    for feature, pixels in zip(req.mm_features, refs, strict=True):
-        grid = feature.data["vae_token_grid_hw"]
-        feature.data["vae_token_grid_hw"] = replace(
-            grid, data=torch.tensor([pixels.shape[-2] // 16, pixels.shape[-1] // 16])
-        )
-    specs = model.get_mm_rng_specs(req.mm_features, 42)
-    posteriors = [vae.encode(pixels.unsqueeze(0)).latent_dist for pixels in refs]
-    for index, posterior in enumerate(posteriors):
-        assert specs[index] == RandomDrawSpec(
-            tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device
-        )
-
-    reference_generator = torch.Generator(device="cpu").manual_seed(42)
-    expected = [posterior.sample(reference_generator) for posterior in posteriors]
-    provider = runner._mm_rng_provider
-    handle = provider.register(req.request_id, 42, specs)
-    # Starting at the last image requires replay of two differently sized
-    # predecessors. Revisiting earlier images must restore their own draws.
-    for index in (2, 0, 1, 2):
-        with provider.sample(handle, index, specs[index]) as generator:
-            actual = posteriors[index].sample(generator)
-        assert torch.equal(actual, expected[index])
-    assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())
-
-
 @pytest.mark.parametrize(
-    "runner", [runner_case("cuda", dtype) for dtype in (torch.float32, torch.bfloat16)], indirect=True
+    "runner",
+    [runner_case(device, dtype) for device in ("cpu", "cuda") for dtype in (torch.float32, torch.bfloat16)],
+    indirect=True,
 )
-def test_full_vae_config_production_buckets_match_draw_plan(runner, make_request):
-    # Exact VAE config, with random weights and no unused decoder:
+def test_real_vae_posterior_matches_draw_plan_and_replay(runner, make_request, monkeypatch):
+    # Exact official encoder config on CUDA; CPU shrinks only widths/image sizes.
     # https://huggingface.co/tencent/HunyuanImage-3.0-Instruct/blob/
     # 2ec2c78bee7d4b94157341fba86c4c2c7b1858b2/config.json
-    vae_config = {
-        "_class_name": "AutoencoderKLConv3D",
-        "block_out_channels": [128, 256, 512, 1024, 1024],
-        "in_channels": 3,
-        "out_channels": 3,
-        "latent_channels": 32,
-        "layers_per_block": 2,
-        "ffactor_spatial": 16,
-        "ffactor_temporal": 4,
-        "sample_size": 384,
-        "sample_tsize": 96,
-        "downsample_match_channel": True,
-        "upsample_match_channel": True,
-        "scaling_factor": 0.562679178327931,
-    }
-    model = runner.model
-    dtype = model.vae.dtype
+    cuda = runner.device.type == "cuda"
+    widths = [128, 256, 512, 1024, 1024] if cuda else [32, 32, 32, 64, 64]
+    sizes = ((1024, 1024), (768, 1024), (1024, 768)) if cuda else ((64, 64), (64, 96), (96, 64))
+    config = dict(
+        block_out_channels=widths,
+        in_channels=3,
+        out_channels=3,
+        latent_channels=32,
+        layers_per_block=2,
+        ffactor_spatial=16,
+        ffactor_temporal=4,
+        sample_size=384,
+        sample_tsize=96,
+        downsample_match_channel=True,
+        upsample_match_channel=True,
+        scaling_factor=0.562679178327931,
+    )
+    monkeypatch.setattr(autoencoder_kl_3d, "get_local_device", lambda: runner.device)
+    model, dtype = runner.model, runner.model.vae.dtype
     model.vae = (
-        autoencoder_kl_3d.AutoencoderKLConv3D.from_config(vae_config, only_encoder=True)
+        autoencoder_kl_3d.AutoencoderKLConv3D.from_config(config, only_encoder=True)
         .to(device=runner.device, dtype=dtype)
         .eval()
     )
-    # Native tiling bounds activation memory; widths and image buckets are unchanged.
-    model.vae.enable_spatial_tiling()
-    model.config = PretrainedConfig(vae_downsample_factor=(16, 16), patch_size=1, vae=vae_config)
-    resolutions = hunyuan.HunyuanImage3Processor.ResolutionGroup(
-        base_size=1024,
-        extra_resolutions=[hunyuan.HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
-    )
-    refs = []
-    for height, width in ((1024, 1024), (768, 1024), (1024, 768)):
-        assert resolutions.get_target_size(width, height) == (width, height)
-        refs.append(torch.zeros((3, height, width)))
-    req = make_request("full-vae", refs)
-    for feature, pixels in zip(req.mm_features, refs, strict=True):
-        grid = feature.data["vae_token_grid_hw"]
-        feature.data["vae_token_grid_hw"] = replace(
-            grid, data=torch.tensor([pixels.shape[-2] // 16, pixels.shape[-1] // 16])
+    if cuda:
+        model.vae.enable_spatial_tiling()
+        buckets = hunyuan.HunyuanImage3Processor.ResolutionGroup(
+            base_size=1024,
+            extra_resolutions=[hunyuan.HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
         )
+        assert all(buckets.get_target_size(w, h) == (w, h) for h, w in sizes)
+    model.config = PretrainedConfig(vae_downsample_factor=(16, 16), patch_size=1, vae=config)
+    refs = [torch.zeros((3, h, w)) for h, w in sizes]
+    req = make_request("real-vae", refs)
+    for feature, (h, w) in zip(req.mm_features, sizes, strict=True):
+        grid = feature.data["vae_token_grid_hw"]
+        feature.data["vae_token_grid_hw"] = replace(grid, data=torch.tensor([h // 16, w // 16]))
     specs = model.get_mm_rng_specs(req.mm_features, 42)
     provider = runner._mm_rng_provider
     handle = provider.register(req.request_id, 42, specs)
     reference_generator = torch.Generator(device=runner.device).manual_seed(42)
     with torch.inference_mode():
+        posteriors, expected = [], []
         for index, pixels in enumerate(refs):
             posterior = model.vae.encode(pixels.unsqueeze(0).to(device=runner.device, dtype=dtype)).latent_dist
             assert specs[index] == RandomDrawSpec(
                 tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device
             )
-            expected = posterior.sample(reference_generator)
-            assert torch.isfinite(expected).all()
-            if index == len(refs) - 1:
-                # The first scheduled image needs replay of two real-size draws.
-                with provider.sample(handle, index, specs[index]) as generator:
-                    assert torch.equal(posterior.sample(generator), expected)
-            del posterior, expected
+            posteriors.append(posterior)
+            expected.append(posterior.sample(reference_generator))
+            assert torch.isfinite(expected[-1]).all()
+        # Start after two skipped draws, then reorder and recompute.
+        for index in (2, 0, 1, 2):
+            with provider.sample(handle, index, specs[index]) as generator:
+                assert torch.equal(posteriors[index].sample(generator), expected[index])
     assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())

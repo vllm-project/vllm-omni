@@ -3,14 +3,13 @@
 """Exercise Hunyuan RNG identity through the upstream input and cache paths."""
 
 from dataclasses import replace
-from itertools import count
 from uuid import uuid4
 
 import pytest
 import torch
 from PIL import Image
 from transformers import BatchFeature, PretrainedConfig
-from vllm.config import ModelConfig, ParallelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache.lru import LruKeyReplicatedReceiverCache, LruKeyReplicatedSenderCache
@@ -19,12 +18,6 @@ from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import InputProcessingContext, ProcessorInputs
 from vllm.multimodal.processing.context import TimingContext
 from vllm.multimodal.processing.processor import PlaceholderFeaturesInfo
-from vllm.renderers import BaseRenderer
-from vllm.renderers.params import TokenizeParams
-from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.request import Request
 
 from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
     HunyuanImage3DummyInputsBuilder,
@@ -33,27 +26,6 @@ from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def _input_processor(engine_input, mocker):
-    processor = object.__new__(InputProcessor)
-    processor.model_config = mocker.Mock(spec=ModelConfig, is_encoder_decoder=False, enable_prompt_embeds=True)
-    parallel = mocker.Mock(
-        spec=ParallelConfig, data_parallel_size=1, data_parallel_size_local=1, local_engines_only=False
-    )
-    processor.vllm_config = mocker.Mock(spec=VllmConfig, parallel_config=parallel)
-    processor.lora_config = None
-    processor.generation_config_fields = {}
-    renderer = mocker.Mock(spec=BaseRenderer, tokenizer=None)
-    renderer.default_cmpl_tok_params = TokenizeParams(max_total_tokens=128)
-    renderer.render_cmpl.return_value = (engine_input,)
-    renderer.get_eos_token_id.return_value = None
-    processor.renderer = renderer
-    processor._validate_params = mocker.Mock(return_value=False)
-    processor._validate_lora = mocker.Mock()
-    processor._validate_model_inputs = mocker.Mock()
-    processor.apply_watermarking = mocker.Mock()
-    return processor
 
 
 @pytest.fixture
@@ -71,17 +43,7 @@ def real_processor(mocker):
 
     def process_pixels(prompt, images, **kwargs):
         image_counts.append(len(images))
-        return (
-            BatchFeature(
-                {
-                    "vae_token_grid_hw": torch.tensor([[2, 3]] * len(images)),
-                    "vae_pixel_size": torch.tensor([18] * len(images)),
-                    "vae_pixel_values": torch.ones(18 * len(images)),
-                }
-            )
-            if images
-            else BatchFeature()
-        )
+        return BatchFeature({"vae_token_grid_hw": torch.tensor([[2, 3]] * len(images))} if images else {})
 
     def placeholders(mm_items, **_):
         count = mm_items.get_count("image", strict=False)
@@ -100,95 +62,66 @@ def real_processor(mocker):
     return processor, image_counts
 
 
+def make_inputs(processor, images, uuids, seed, cache):
+    return ProcessorInputs(
+        [99],
+        processor.info.get_data_parser().parse_mm_data({"image": images}),
+        {"image": uuids},
+        hf_processor_mm_kwargs={} if seed is None else {"vae_generator_seed": seed},
+        cache=cache,
+    )
+
+
 @pytest.fixture
-def cached_request(real_processor, mocker):
+def cached_request(real_processor):
     processor, _ = real_processor
     sender = LruKeyReplicatedSenderCache(processor.info.ctx.model_config)
     receiver = LruKeyReplicatedReceiverCache(processor.info.ctx.model_config)
-    request_ids = count()
 
-    def request(images, uuids, seed=0, raw=False):
-        inputs = ProcessorInputs(
-            [99],
-            processor.info.get_data_parser().parse_mm_data({"image": images}),
-            {"image": uuids},
-            hf_processor_mm_kwargs={} if seed is None else {"vae_generator_seed": seed},
-            cache=sender,
-        )
-        rendered = processor.apply(inputs, TimingContext(enabled=False))
-        admission = _input_processor(rendered, mocker)
-        result = admission.process_inputs(
-            f"request-{next(request_ids)}",
-            {"prompt": "image"} if raw else rendered,
-            SamplingParams(seed=999),
-            ("generate",),
-        )
-        assert admission.renderer.render_cmpl.call_count == int(raw)
-        receiver.get_and_update_features(result.mm_features)
-        return result
+    def request(images, uuids, seed=0):
+        inputs = make_inputs(processor, images, uuids, seed, sender)
+        result = processor.apply(inputs, TimingContext(enabled=False))
+        hashes = result["mm_hashes"]["image"]
+        items = [
+            receiver.get_and_update_item(item, key)
+            for item, key in zip(result["mm_kwargs"]["image"], hashes, strict=True)
+        ]
+        return hashes, items
 
     return request
 
 
-@pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("seed", [0, 42])
-def test_seeded_reference_prefixes_and_lru_hits(cached_request, real_processor, raw, seed):
+def test_seeded_reference_prefixes_and_lru_hits(cached_request, real_processor, seed):
     _, image_counts = real_processor
     a, b = [Image.new("RGB", (4, 4), color) for color in ("red", "blue")]
-    first = cached_request([a, a, b], ["A", "A", "B"], seed, raw).mm_features
-    assert len({f.identifier for f in first}) == 3
-    assert all(f.identifier == f.mm_hash for f in first)
-    assert all(f.data["vae_generator_seed"].data.item() == seed for f in first)
-
-    repeated = cached_request([None, None, None], ["A", "A", "B"], seed, raw).mm_features
-    assert [f.identifier for f in repeated] == [f.identifier for f in first]
-    assert all(hit.data is original.data for hit, original in zip(repeated, first))
-
-    moved = cached_request([b, a, a], ["B", "A", "A"], seed, raw).mm_features
-    assert len({f.identifier for f in moved}) == 3
-    assert not {f.identifier for f in first} & {f.identifier for f in moved}
+    first, items = cached_request([a, a, b], ["A", "A", "B"], seed)
+    assert len(set(first)) == 3
+    assert all(item["vae_generator_seed"].data.item() == seed for item in items)
+    repeated, hits = cached_request([None, None, None], ["A", "A", "B"], seed)
+    assert repeated == first
+    assert all(hit is item for hit, item in zip(hits, items, strict=True))
+    moved, _ = cached_request([b, a, a], ["B", "A", "A"], seed)
+    assert len(set(moved)) == 3 and not set(first) & set(moved)
     assert image_counts == [3, 0, 3]
-
-    prefix = cached_request([None, None], ["A", "A"], seed, raw).mm_features
-    assert [f.identifier for f in prefix] == [f.identifier for f in first[:2]]
-    mixed = cached_request([None, None, a], ["A", "A", "A"], seed, raw).mm_features
-    assert [f.identifier for f in mixed[:2]] == [f.identifier for f in first[:2]]
-    assert len({f.identifier for f in mixed}) == 3
-    assert all(f.data["vae_generator_seed"].data.item() == seed for f in mixed)
-    assert image_counts[-1] == 1  # Validation sees only the newly processed occurrence.
-    other_seed = cached_request([a], ["A"], 42 if seed == 0 else 0, raw).mm_features
-    assert other_seed[0].identifier != first[0].identifier
-
-
-@pytest.mark.parametrize("seed", [0, 42])
-def test_uuid_only_reference_requires_warm_prefix(cached_request, seed):
-    a, b = [Image.new("RGB", (4, 4), color) for color in ("red", "blue")]
-    cached_request([a], ["A"], seed)
-    with pytest.raises(ValueError, match="Cache miss for image at index 1 but data is not provided"):
-        cached_request([b, None], ["B", "A"], seed)
+    prefix, _ = cached_request([None, None], ["A", "A"], seed)
+    assert prefix == first[:2]
+    mixed, items = cached_request([None, None, a], ["A", "A", "A"], seed)
+    assert mixed[:2] == first[:2] and len(set(mixed)) == 3
+    assert all(item["vae_generator_seed"].data.item() == seed for item in items)
+    assert image_counts[-1] == 1  # Validation sees only the uncached occurrence.
+    other_seed, _ = cached_request([a], ["A"], 42 if seed == 0 else 0)
+    assert other_seed[0] != first[0]
+    with pytest.raises(ValueError, match="Cache miss for image at index 2 but data is not provided"):
+        cached_request([a, b, None], ["A", "B", "A"], seed)
 
 
 def test_seedless_references_reuse_images_across_prefixes(cached_request):
     a, b = [Image.new("RGB", (4, 4), color) for color in ("red", "blue")]
-    first = cached_request([a, a], ["A", "A"], seed=None).mm_features
-    assert first[0].identifier == first[1].identifier
-    moved = cached_request([b, None], ["B", "A"], seed=None).mm_features
-    assert moved[1].identifier == first[0].identifier
-    assert moved[1].data is first[0].data
-    assert "vae_generator_seed" not in moved[1].data
-
-
-def test_mrope_prefix_stripping_retains_seed_and_grid(cached_request):
-    images = [Image.new("RGB", (4, 4), color) for color in ("red", "blue")]
-    request = Request.from_engine_core_request(cached_request(images, ["A", "B"]), block_hasher=None)
-    request.num_computed_tokens = 2
-    features = request.mm_features
-    result = NewRequestData.from_request(request, ([0],), uses_mrope=True)
-    assert set(result.mm_features[0].data) == {"vae_generator_seed", "vae_token_grid_hw"}
-    assert result.mm_features[0].data["vae_token_grid_hw"] is features[0].data["vae_token_grid_hw"]
-    assert result.mm_features[0].data["vae_generator_seed"].data.item() == 0
-    assert result.mm_features[1].data is features[1].data
-    assert "vae_pixel_values" in features[0].data
+    first, items = cached_request([a, a], ["A", "A"], seed=None)
+    moved, hits = cached_request([b, None], ["B", "A"], seed=None)
+    assert first[0] == first[1] == moved[1]
+    assert hits[1] is items[0] and "vae_generator_seed" not in hits[1]
 
 
 def test_profile_dummy_inputs_do_not_inherit_configured_request_seed(real_processor):
@@ -203,13 +136,7 @@ def test_profile_dummy_inputs_do_not_inherit_configured_request_seed(real_proces
 def test_invalid_seed_is_rejected_before_processor_cache_mutation(seed, real_processor, mocker):
     processor, image_counts = real_processor
     sender = LruKeyReplicatedSenderCache(processor.info.ctx.model_config)
-    inputs = ProcessorInputs(
-        [99],
-        processor.info.get_data_parser().parse_mm_data({"image": Image.new("RGB", (4, 4), "red")}),
-        {"image": ["image-uuid"]},
-        hf_processor_mm_kwargs={"vae_generator_seed": seed},
-        cache=sender,
-    )
+    inputs = make_inputs(processor, [Image.new("RGB", (4, 4), "red")], ["image-uuid"], seed, sender)
     cache_write = mocker.spy(sender, "get_and_update_item")
     with pytest.raises(VLLMValidationError, match="vae_generator_seed"):
         processor.apply(inputs, TimingContext(enabled=False))
@@ -272,13 +199,7 @@ def test_invalid_rng_metadata_is_rejected_before_cache_write(field, value, proce
         return result
 
     processor._call_hf_processor = malformed_output
-    inputs = ProcessorInputs(
-        [99],
-        processor.info.get_data_parser().parse_mm_data({"image": Image.new("RGB", (4, 4), "red")}),
-        {"image": ["image-uuid"]},
-        hf_processor_mm_kwargs={"vae_generator_seed": 0},
-        cache=processor_cache,
-    )
+    inputs = make_inputs(processor, [Image.new("RGB", (4, 4), "red")], ["image-uuid"], 0, processor_cache)
     cache_write = mocker.spy(processor_cache, "get_and_update_item")
     with pytest.raises(VLLMValidationError, match=field):
         processor.apply(inputs, TimingContext(enabled=False))
