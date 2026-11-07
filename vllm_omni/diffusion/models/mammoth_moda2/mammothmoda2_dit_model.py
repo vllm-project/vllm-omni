@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -603,6 +603,9 @@ class TransformerBlock(nn.Module):
 
 class Transformer2DModel(ModelMixin, ConfigMixin):
     """MammothModa2 DiT transformer"""
+
+    # Target class for ``regionally_compile``.
+    _repeated_blocks: ClassVar[list[str]] = ["TransformerBlock"]
 
     @register_to_config
     def __init__(
