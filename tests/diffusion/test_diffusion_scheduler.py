@@ -28,6 +28,7 @@ from vllm_omni.diffusion.sched import (
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -425,6 +426,25 @@ class TestGetRequestBatchSamplingParamsKey:
 
         assert key.sample_solver is None
         assert key.flow_shift is None
+
+    @pytest.mark.parametrize("flow_shift", ["nan", "inf", "-inf", float("nan"), float("inf")])
+    def test_rejects_non_finite_flow_shift(self, flow_shift: object) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
+
+        with pytest.raises(OmniClientError, match="flow_shift must be finite"):
+            scheduler.add_request(self._make(extra_args={"flow_shift": flow_shift}))
+
+        assert scheduler.num_waiting_requests() == 0
+
+    def test_rejects_non_numeric_flow_shift_as_client_error(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
+
+        with pytest.raises(OmniClientError, match="flow_shift must be a float"):
+            scheduler.add_request(self._make(extra_args={"flow_shift": "abc"}))
+
+        assert scheduler.num_waiting_requests() == 0
 
     def test_distinguishes_pipeline_condition_structure(self) -> None:
         scheduler = RequestScheduler()

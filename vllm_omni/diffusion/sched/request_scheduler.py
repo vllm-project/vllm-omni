@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerRequestState,
     _AdmissionWaitDecision,
 )
+from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -37,7 +39,13 @@ def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
     """Normalize an explicitly provided flow shift without selecting a default."""
     if value is None:
         return None
-    return float(value)
+    try:
+        flow_shift = float(value)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(f"Invalid flow_shift={value!r}. flow_shift must be a float.") from exc
+    if not math.isfinite(flow_shift):
+        raise OmniClientError(f"Invalid flow_shift={value!r}. flow_shift must be finite.")
+    return flow_shift
 
 
 def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
