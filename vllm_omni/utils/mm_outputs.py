@@ -215,6 +215,11 @@ def split_mapping_outputs(
     return batch_payloads
 
 
+# Returned by ``to_payload_element`` for a per-request list that lost alignment with the
+# batch; callers drop the key (same policy as ``unwrap_combined_payload_value``).
+DROPPED_PAYLOAD = object()
+
+
 def to_payload_element(
     element: object,
     idx: int,
@@ -223,6 +228,9 @@ def to_payload_element(
     pass_lists_through: bool = False,
     seq_len: int | None = None,
     scheduled_seq_len: int | None = None,
+    *,
+    rid: str | None = None,
+    mm_key: str | None = None,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -244,6 +252,11 @@ def to_payload_element(
             mm tensors (e.g. batched ``codes.audio`` with tail-only hidden states)
             are laid out by scheduled tokens instead of the hidden tail shape.
             When omitted, ``seq_len`` is reused for backward compatibility.
+        rid: Optional request id, only used to report a dropped value.
+        mm_key: Optional top-level payload key, only used to report a dropped value.
+
+    Returns ``DROPPED_PAYLOAD`` for a non-singleton per-request list too short
+    for ``idx``; nested dict entries in that state are omitted.
     """
     if scheduled_seq_len is None:
         scheduled_seq_len = seq_len
@@ -263,8 +276,9 @@ def to_payload_element(
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
-        return {
-            sk: to_payload_element(
+        nested = {}
+        for sk, sv in element.items():
+            value = to_payload_element(
                 sv,
                 idx,
                 start,
@@ -272,14 +286,33 @@ def to_payload_element(
                 pass_lists_through=pass_lists_through,
                 seq_len=seq_len,
                 scheduled_seq_len=scheduled_seq_len,
+                rid=rid,
+                mm_key=mm_key,
             )
-            for sk, sv in element.items()
-        }
+            if value is not DROPPED_PAYLOAD:
+                nested[sk] = value
+        return nested
     elif isinstance(element, list):
         # For lists, clone tensors to avoid cross-request aliasing
         if pass_lists_through:
             return [elem.clone() if isinstance(elem, torch.Tensor) else elem for elem in element]
-        element = element[idx] if idx < len(element) else element[0]
+        if idx < len(element):
+            element = element[idx]
+        elif len(element) == 1:
+            # A singleton list is request-invariant data shared by the whole batch.
+            element = element[0]
+        else:
+            # Never substitute another request's entry. Not a raise: v1 runners do not
+            # catch per-request exceptions, so drop the key loudly instead.
+            logger.error(
+                "Multimodal payload misaligned for request %s: index %d out of range for "
+                "per-request list of length %d; dropping key %s.",
+                rid,
+                idx,
+                len(element),
+                mm_key,
+            )
+            return DROPPED_PAYLOAD
         if isinstance(element, torch.Tensor):
             element = element.clone()
         return element

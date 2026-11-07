@@ -1749,6 +1749,24 @@ class TestSparseAudioMarkerRobustness:
         assert "codes.audio" not in payload
         assert payload["sr"] == 22050
 
+    def test_direct_path_misalignment_drops_key_not_request_zero(self):
+        # Non-prefix-cache counterpart of the policy above: a short per-request list drops
+        # the key instead of shipping request 0's entry, while singletons stay shared.
+        payload = payload_build.build_omni_mm_payload(
+            combined_multimodal_outputs=None,
+            mm_cpu={"codes.ref": [torch.zeros(1), torch.ones(1)], "embed.tts_bos": [torch.full((1,), 3.0)]},
+            rid="r2",
+            idx=2,
+            start=2,
+            end=3,
+            audio_sparse_output=False,
+            sparse_mm_index={},
+            hidden_seq_len=3,
+            scheduled_seq_len=3,
+        )
+        assert payload.keys() == {"embed.tts_bos"}
+        assert torch.equal(payload["embed.tts_bos"], torch.full((1,), 3.0))
+
     def test_direct_path_sparse_mismatch_drops_key_and_keeps_payload_shape(self):
         # Mirror of the combined-path policy on the non-prefix-cache path:
         # a sparse index beyond the per-request list drops that key (error

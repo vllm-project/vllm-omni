@@ -181,3 +181,42 @@ def test_to_payload_element_shares_0d_tensor_with_every_request():
     for idx in range(2):
         payload = to_payload_element(sr, idx=idx, start=idx, end=idx + 1, seq_len=2, scheduled_seq_len=2)
         assert torch.equal(payload, sr)
+
+
+def test_to_payload_element_indexes_aligned_per_request_lists():
+    refs = [torch.tensor([idx]) for idx in range(3)]
+    for idx, ref in enumerate(refs):
+        payload = to_payload_element(refs, idx=idx, start=idx, end=idx + 1)
+        assert torch.equal(payload, ref)
+        assert payload is not ref
+
+
+def test_to_payload_element_shares_singleton_list_with_every_request():
+    shared = [torch.tensor([7.0])]
+    for idx in range(3):
+        assert torch.equal(to_payload_element(shared, idx=idx, start=idx, end=idx + 1), shared[0])
+
+
+@pytest.mark.parametrize("entries", [2, 0], ids=["short", "empty"])
+def test_to_payload_element_drops_misaligned_list_instead_of_reusing_request_zero(entries, mocker):
+    error = mocker.patch.object(mm_outputs_mod.logger, "error")
+    refs = [torch.tensor([idx]) for idx in range(entries)]
+
+    payload = to_payload_element(refs, idx=2, start=2, end=3, rid="req-2", mm_key="codes.ref")
+
+    assert payload is mm_outputs_mod.DROPPED_PAYLOAD
+    error.assert_called_once()
+    assert error.call_args.args[1:] == ("req-2", 2, entries, "codes.ref")
+
+
+def test_to_payload_element_drops_only_the_misaligned_nested_entry(mocker):
+    mocker.patch.object(mm_outputs_mod.logger, "error")
+    payload = to_payload_element(
+        {"audio": torch.arange(3), "ref": [torch.tensor([0]), torch.tensor([1])]},
+        idx=2,
+        start=2,
+        end=3,
+        seq_len=3,
+    )
+    assert payload.keys() == {"audio"}
+    assert torch.equal(payload["audio"], torch.tensor([2]))
