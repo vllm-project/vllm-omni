@@ -7,6 +7,7 @@ owners:
   - "@Bounty-hunter"
   - "@wtomin"
   - "@RuixiangMa"
+  - "@timzsu"
 primary_code_paths:
   - vllm_omni/diffusion/models/**
   - vllm_omni/diffusion/model_loader/**
@@ -83,8 +84,60 @@ quality, or request-level validation through the normal model entry.
 For HunyuanImage3 ResBlocks, the initial evidence at `fa3d24d6` covers eager
 execution on A100 80GB PCIe; an independent H200 eager reproduction was reported
 by the reviewer on PR #7421. Neither establishes `torch.compile` or CUDA Graph
-qualification. The added production-sized BF16 fixtures also require fresh GPU
-qualification; the original smaller-fixture results do not cover them.
+qualification. The production-sized BF16 fixtures failed the unchanged
+`rtol=atol=0.02` gate at `e055a2d8` (33 passed, 2 failed in the full matrix).
+The original smaller-fixture results do not qualify those geometries.
+
+The production up/down cases cover the corresponding control-flow branches.
+Both implementations use identity samplers there, so these cases do not
+establish spatial upsampling or downsampling equivalence.
+
+The qualification module's single-L4 resource marks match the CUDA ready lane's
+model-test selection. They describe the CI target, not successful L4
+qualification. L4 and current-source production-sized BF16 qualification remain
+pending; A100 or H200 evidence must not be extrapolated to L4. The unchanged
+numerical gate still applies to both production cases.
+
+For numerical attribution without changing the benchmark's correctness gate:
+
+```bash
+python -m benchmarks.kernels.hunyuan_image3_resblock_benchmarks \
+  --diagnose --dtype bfloat16 --case production_patch_embed \
+  --output-json patch-embed-diagnostic.json
+python -m benchmarks.kernels.hunyuan_image3_resblock_benchmarks \
+  --diagnose --dtype bfloat16 --case production_final_layer \
+  --output-json final-layer-diagnostic.json
+```
+
+These CUDA-only, untimed diagnostics reuse the qualification's original
+geometry, parameter/input seeds, nonzero shared weights and tolerances. A failed
+uninstrumented final comparison writes its JSON before exiting with status 1;
+neither it nor intermediate agreement authorizes performance acceptance.
+Ordinary benchmark mode still asserts correctness before timing.
+
+The JSON separates propagated error in actual forwards from same-native-input
+replays at GN/SiLU, conv1, embedding, adaptive GN/SiLU, conv2, skip and final
+addition. It records native GN/modulation/scale/shift summaries and captured
+cuDNN policies. GN and modulation inside fused kernels are not separately
+materialized: the FP32 arithmetic probe is mechanism evidence, not a capture of
+those internal values or an automatic explanation of the historical failures.
+Convolution replays compare original policies, matched NVIDIA policy, and a
+native-only policy change. TF32 settings are recorded but not changed for BF16.
+CPU copies and hooks make these runs unsuitable for timing; bitwise comparison
+against uninstrumented forwards exposes capture/repeatability differences.
+Use a dedicated process because cuDNN policies are process-global, although
+temporary flags and hooks are restored on errors. Investigate mismatches and
+rerun the unchanged GPU qualification matrix on the recorded source revision.
+
+## Weight reloading
+
+Pipelines that support live RL weight updates opt in with
+`supports_weight_reload`. The shared loader integration records upstream vLLM
+reload metadata before external checkpoint loading and postprocessing. Their
+`load_weights` implementation must dispatch through parameter weight loaders so
+upstream WTE can track layer completion and preserve live storage. See the
+[weight-transfer contract](../../feature/weight_transfer.md#diffusion-loading-contract)
+for support limits and validation requirements.
 
 ## Exact conditioning projection reuse
 

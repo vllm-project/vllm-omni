@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "t2i": {
+      "case": "t2i",
+      "captured_at": "2026-10-10T18:46:28.065250+00:00",
+      "contract": {
+        "model_id": "SenseNova/SenseNova-U1-8B-MoT",
+        "model_revision": "bfa9b436503cb8aed4f2bc60e3236710cc77468d",
+        "prompt": "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light, emotional documentary look. The portrait should feel polished and natural, with sharp eyes, realistic skin texture, accurate facial anatomy, and premium lighting that keeps the face as the main focus.",
+        "sampling_params": {
+          "height": 2720,
+          "width": 1536,
+          "seed": 42,
+          "num_inference_steps": 50,
+          "extra_args": {
+            "cfg_scale": 4.0,
+            "cfg_norm": "none",
+            "timestep_shift": 3.0,
+            "cfg_interval": [
+              0.0,
+              1.0
+            ],
+            "batch_size": 1,
+            "think": true,
+            "t_eps": 0.02
+          }
+        },
+        "output_size": [
+          1536,
+          2720
+        ],
+        "input_image": null
+      },
+      "reference_pixels": [
+        {
+          "position": [
+            100,
+            100
+          ],
+          "rgb": [
+            249,
+            249,
+            249
+          ]
+        },
+        {
+          "position": [
+            768,
+            200
+          ],
+          "rgb": [
+            95,
+            78,
+            55
+          ]
+        },
+        {
+          "position": [
+            400,
+            600
+          ],
+          "rgb": [
+            72,
+            37,
+            12
+          ]
+        },
+        {
+          "position": [
+            1200,
+            2000
+          ],
+          "rgb": [
+            44,
+            37,
+            30
+          ]
+        },
+        {
+          "position": [
+            750,
+            500
+          ],
+          "rgb": [
+            151,
+            130,
+            102
+          ]
+        },
+        {
+          "position": [
+            300,
+            1360
+          ],
+          "rgb": [
+            238,
+            223,
+            204
+          ]
+        },
+        {
+          "position": [
+            1000,
+            1800
+          ],
+          "rgb": [
+            70,
+            32,
+            15
+          ]
+        },
+        {
+          "position": [
+            500,
+            2400
+          ],
+          "rgb": [
+            85,
+            70,
+            64
+          ]
+        },
+        {
+          "position": [
+            768,
+            1360
+          ],
+          "rgb": [
+            123,
+            71,
+            45
+          ]
+        },
+        {
+          "position": [
+            200,
+            900
+          ],
+          "rgb": [
+            163,
+            169,
+            143
+          ]
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "driver": [
+          "595.91.07"
+        ],
+        "python": "3.12.3",
+        "cuda": "13.0",
+        "packages": {
+          "torch": "2.13.0+cu130",
+          "vllm": "0.31.0",
+          "transformers": "5.14.1",
+          "diffusers": "0.40.0",
+          "cache-dit": "1.5.0"
+        },
+        "ci_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo@sha256:ab814e29befacd74134a5a5eb0a31718d9716c494801ac0eed0333be1cc665db",
+        "build_url": null
+      },
+      "source": {
+        "git_commit": null,
+        "declared_commit": "e4af781dc71ffdf6962c469aaa6a8b87ab7908f6",
+        "git_diff_sha256": null,
+        "test_source_sha256": {
+          "tests/e2e/accuracy/sensenova_u1.py": "d5c90b8e4ecdc9a5ab5668f41a332dfd3cac004607c8b7d12850a54aa79203e4",
+          "tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py": "42959b9ac2c08fdcbb2c0a5eb91817690c0e39ff7a1373ce1d21d75bb963cfd6",
+          "tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py": "a78c3e643834c2ac6a9b80c26ef2a8fdb2c1ca31ef47a34f549da18f46de94ec"
+        }
+      },
+      "output_png_sha256": "ead7584606c12ad79f9be2194863963f6dfc4b4b3298f4ce0b4ba6f8aac2ede4"
+    },
+    "i2i": {
+      "case": "i2i",
+      "captured_at": "2026-10-10T18:47:30.330998+00:00",
+      "contract": {
+        "model_id": "SenseNova/SenseNova-U1-8B-MoT",
+        "model_revision": "bfa9b436503cb8aed4f2bc60e3236710cc77468d",
+        "prompt": "Turn this into an oil painting",
+        "sampling_params": {
+          "height": 1669,
+          "width": 2560,
+          "seed": 42,
+          "num_inference_steps": 50,
+          "extra_args": {
+            "cfg_scale": 4.0,
+            "img_cfg_scale": 1.0,
+            "cfg_norm": "none",
+            "timestep_shift": 3.0,
+            "cfg_interval": [
+              0.0,
+              1.0
+            ],
+            "batch_size": 1,
+            "think": true,
+            "t_eps": 0.02
+          }
+        },
+        "output_size": [
+          2560,
+          1664
+        ],
+        "input_image": {
+          "size": [
+            2560,
+            1669
+          ],
+          "rgb_sha256": "9df3acd8d65a7b6758b80d73f1f79833ea53529b73733b3cda4cb5f081391a6b"
+        }
+      },
+      "reference_pixels": [
+        {
+          "position": [
+            100,
+            100
+          ],
+          "rgb": [
+            85,
+            124,
+            168
+          ]
+        },
+        {
+          "position": [
+            400,
+            50
+          ],
+          "rgb": [
+            137,
+            151,
+            175
+          ]
+        },
+        {
+          "position": [
+            700,
+            100
+          ],
+          "rgb": [
+            123,
+            147,
+            173
+          ]
+        },
+        {
+          "position": [
+            150,
+            400
+          ],
+          "rgb": [
+            89,
+            136,
+            183
+          ]
+        },
+        {
+          "position": [
+            512,
+            336
+          ],
+          "rgb": [
+            184,
+            177,
+            165
+          ]
+        },
+        {
+          "position": [
+            700,
+            400
+          ],
+          "rgb": [
+            96,
+            133,
+            170
+          ]
+        },
+        {
+          "position": [
+            100,
+            600
+          ],
+          "rgb": [
+            167,
+            168,
+            152
+          ]
+        },
+        {
+          "position": [
+            400,
+            600
+          ],
+          "rgb": [
+            157,
+            167,
+            165
+          ]
+        },
+        {
+          "position": [
+            700,
+            600
+          ],
+          "rgb": [
+            135,
+            170,
+            186
+          ]
+        },
+        {
+          "position": [
+            256,
+            256
+          ],
+          "rgb": [
+            126,
+            152,
+            178
+          ]
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "driver": [
+          "595.91.07"
+        ],
+        "python": "3.12.3",
+        "cuda": "13.0",
+        "packages": {
+          "torch": "2.13.0+cu130",
+          "vllm": "0.31.0",
+          "transformers": "5.14.1",
+          "diffusers": "0.40.0",
+          "cache-dit": "1.5.0"
+        },
+        "ci_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo@sha256:ab814e29befacd74134a5a5eb0a31718d9716c494801ac0eed0333be1cc665db",
+        "build_url": null
+      },
+      "source": {
+        "git_commit": null,
+        "declared_commit": "e4af781dc71ffdf6962c469aaa6a8b87ab7908f6",
+        "git_diff_sha256": null,
+        "test_source_sha256": {
+          "tests/e2e/accuracy/sensenova_u1.py": "d5c90b8e4ecdc9a5ab5668f41a332dfd3cac004607c8b7d12850a54aa79203e4",
+          "tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py": "42959b9ac2c08fdcbb2c0a5eb91817690c0e39ff7a1373ce1d21d75bb963cfd6",
+          "tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py": "a78c3e643834c2ac6a9b80c26ef2a8fdb2c1ca31ef47a34f549da18f46de94ec"
+        }
+      },
+      "output_png_sha256": "4e217f7e7c2902d05ff8e65f150cfc2326d7e43e43164b37ce57a750d80c8141"
+    }
+  }
+}

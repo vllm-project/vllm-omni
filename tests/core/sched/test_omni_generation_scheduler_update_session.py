@@ -52,10 +52,11 @@ class _SchedulerStub(OmniGenerationScheduler):
         self.num_waiting_for_streaming_input = 0
         self.log_stats = log_stats
         self.chunk_transfer_adapter = _ChunkTransferAdapterStub()
-        self.skipped_waiting = _SkippedWaitingStub()
+        self.kv_holding_waiting = _SkippedWaitingStub()
+        self.deferred_waiting: set[Request] = set()
 
     def _enqueue_waiting_request(self, session: Request) -> None:
-        raise AssertionError("unexpected enqueue for skipped_waiting miss")
+        raise AssertionError("unexpected enqueue for kv_holding_waiting miss")
 
 
 class _AsyncChunkStopSchedulerStub(OmniGenerationScheduler):
@@ -125,6 +126,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.chunk_transfer_adapter = SimpleNamespace(
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
+        mark_chunk_consumed=lambda _request_id: None,
     )
 
     def rearm_resumable_request(request: Request) -> bool:
@@ -134,7 +136,8 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched._handle_stopped_request.side_effect = rearm_resumable_request
     sched.running = [session]
     sched.waiting = MagicMock()
-    sched.skipped_waiting = MagicMock()
+    sched.kv_holding_waiting = MagicMock()
+    sched.deferred_waiting = set()
     sched.structured_output_manager.accept_tokens.return_value = True
     # Async scheduling can observe the segment boundary in the next schedule()
     # before this model output is applied and defer the same request for finish.
@@ -194,6 +197,7 @@ def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete:
     sched.chunk_transfer_adapter = SimpleNamespace(
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
+        mark_chunk_consumed=lambda _request_id: None,
     )
 
     sched._async_chunk_transport_enabled.return_value = False
@@ -206,7 +210,8 @@ def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete:
         OmniSchedulerMixin._remove_stopped_requests_from_queues(sched, running, preempted)
     )
     sched.waiting = MagicMock()
-    sched.skipped_waiting = MagicMock()
+    sched.kv_holding_waiting = MagicMock()
+    sched.deferred_waiting = set()
     sched.structured_output_manager.accept_tokens.return_value = False
     sched._pending_finish_reqs = []
     sched.recompute_kv_load_failures = False
@@ -350,6 +355,8 @@ class _RealignSchedulerStub(OmniSchedulerMixin):
         self.requests = requests
         self.running = running
         self.waiting = waiting
+        self.kv_holding_waiting: list[Request] = []
+        self.deferred_waiting: set[Request] = set()
 
 
 class TestRealignRequestStatusToQueues:

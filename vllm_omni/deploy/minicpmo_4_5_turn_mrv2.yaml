@@ -1,8 +1,8 @@
 # Opt-in CUDA Model Runner V2 profile for MiniCPM-o 4.5 turn serving: the
 # Thinker (stage 0), Talker (stage 1) and Code2Wav (stage 2) run on MRv2.
 # The Thinker uses native multimodal encoding and tensor-only FULL graphs;
-# downstream stages use the native data plane. These stages support
-# turn-based sessions only (duplex needs the V1 chunk adapter).
+# downstream stages use the native data plane. This profile serves
+# turn-based sessions; duplex on MRv2 uses minicpmo_4_5_duplex_mrv2.yaml.
 #
 # On MRv2 the Talker keeps its sampled codec id, 16-frame penalty history and
 # EOS state on the device (no per-step D2H wait), and Code2Wav schedules
@@ -14,14 +14,24 @@ connectors:
   connector_of_shared_memory:
     extra:
       hift_graph_capture_batch_sizes: [1, 2, 4, 8]
-      # TF32 tensor cores for the vocoder's fp32 flow GEMMs: ~25% less GPU
-      # time per chunk (batch 1-8). A numerics change: the HiFT input mel moves
-      # by ~3e-4 relative L2; dev-short WER/UTMOS unchanged (64 prompts).
+      # Ordinary TF32 for CFM DiT GEMMs (~25% less GPU time per chunk at
+      # batch 1-8): cuBLAS allow_tf32 on dense QKV/MLP and Triton
+      # input_precision=tf32 on tiled attention. HiFT stays IEEE FP32.
+      # Numerics: HiFT input mel moves by ~3e-4 relative L2; dev-short
+      # WER/UTMOS unchanged.
       token2wav_allow_tf32: true
+      # Decode waiting first chunks in their own step, but only while every
+      # stream with a later chunk ready still holds 0.5 s of unplayed audio,
+      # so first packets do not come at the cost of playback underruns.
+      generation_first_chunk_express: true
+      generation_first_chunk_express_min_slack_s: 0.5
 
 stages:
   - stage_id: 0
     model_runner: v2
+    # MRv2 does not merge cached Thinker rows yet; keep the turn profile's
+    # stage-0 prefix cache off here.
+    enable_prefix_caching: false
     # llm2tts consumes the completed Thinker payload via the orchestrator.
     # Only Talker -> Code2Wav is a streaming connector edge. Keep the latent
     # rows on the full-payload output channel instead of partitioning them
@@ -34,12 +44,6 @@ stages:
     model_runner: v2
     max_num_seqs: 8
     async_scheduling: false
-    env:
-      # Decode waiting first chunks in their own step, but only while every
-      # stream with a later chunk ready still holds 0.5 s of unplayed audio,
-      # so first packets do not come at the cost of playback underruns.
-      VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS: "1"
-      VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS_SLACK_S: "0.5"
 
 platforms:
   cuda:

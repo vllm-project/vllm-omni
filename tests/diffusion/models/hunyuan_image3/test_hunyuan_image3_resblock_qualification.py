@@ -12,6 +12,7 @@ from types import ModuleType
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.hunyuan_image3 import layers as selected_layers
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.transformer_blocks import (
     ResBlock as NativeResBlock,
@@ -27,7 +28,7 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(
         not current_omni_platform.is_cuda(),
         reason="HunyuanImage3 NVIDIA ResBlock qualification requires CUDA",
@@ -68,6 +69,8 @@ _CASES = (
     BlockCase("production_down_branch", 1, 128, 128, 32, 32, down=True),
     BlockCase("production_up_branch", 1, 128, 128, 16, 16, up=True),
 )
+_IDENTITY_CASE = next(case for case in _CASES if case.name == "identity")
+_BATCHED_IDENTITY_CASE = next(case for case in _CASES if case.name == "batched_identity")
 _PRODUCTION_BF16_CASES = (
     BlockCase("production_patch_embed", 1, 1024, 4096, 64, 64, emb_channels=4096),
     BlockCase("production_final_layer", 1, 4096, 1024, 64, 64, emb_channels=4096),
@@ -222,7 +225,7 @@ def test_native_and_nvidia_resblocks_match(case: BlockCase, dtype: torch.dtype) 
 
 @pytest.mark.parametrize("autocast_dtype", (torch.float16, torch.bfloat16))
 def test_native_and_nvidia_resblocks_match_under_autocast(autocast_dtype: torch.dtype) -> None:
-    case = _CASES[1]
+    case = _BATCHED_IDENTITY_CASE
     native, nvidia = _make_blocks(case, torch.float32)
     x, emb = _make_inputs(case, torch.float32)
 
@@ -266,7 +269,7 @@ def test_cuda_dispatch_selects_nvidia_resblock() -> None:
 @pytest.mark.parametrize(
     ("case", "dtype"),
     (
-        pytest.param(_CASES[0], torch.float32, id="identity-float32"),
+        pytest.param(_IDENTITY_CASE, torch.float32, id="identity-float32"),
         *(pytest.param(case, torch.bfloat16, id=case.name) for case in _PRODUCTION_BF16_CASES),
     ),
 )
@@ -299,7 +302,7 @@ def test_nvidia_resblock_calls_both_fused_operations(
 
 @pytest.mark.parametrize("benchmark,deterministic", ((False, False), (True, False)))
 def test_nvidia_resblock_restores_cudnn_state(benchmark: bool, deterministic: bool) -> None:
-    case = _CASES[0]
+    case = _IDENTITY_CASE
     _, nvidia = _make_blocks(case, torch.float32)
     x, emb = _make_inputs(case, torch.float32)
     original_benchmark = torch.backends.cudnn.benchmark
@@ -321,7 +324,7 @@ def test_nvidia_resblock_restores_cudnn_state_after_failure(monkeypatch: pytest.
     class SentinelError(RuntimeError):
         pass
 
-    case = _CASES[0]
+    case = _IDENTITY_CASE
     _, nvidia = _make_blocks(case, torch.float32)
     x, emb = _make_inputs(case, torch.float32)
     original_benchmark = torch.backends.cudnn.benchmark

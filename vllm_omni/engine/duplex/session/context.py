@@ -32,7 +32,9 @@ if TYPE_CHECKING:
     )
     from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallLedger
     from vllm_omni.metrics.stats import StageRequestStats
 
 _OffloadT = TypeVar("_OffloadT")
@@ -67,8 +69,8 @@ class DuplexRunState:
 class RunnerServices(Protocol):
     """The only things a component may ask the runner for.
 
-    Deliberately two methods. A component that needs more than task scheduling
-    from the runner is reaching for orchestration that belongs in the runner.
+    Scheduling and terminal bookkeeping stay in the runner; components do not
+    acquire their own delivery queue or call-lifecycle authority.
     """
 
     def spawn(self, coro: Awaitable[None], *, name: str) -> None:
@@ -77,6 +79,10 @@ class RunnerServices(Protocol):
 
     async def offload(self, fn: Callable[..., _OffloadT], *args: object, **kwargs: object) -> _OffloadT:
         """Run a blocking call off the orchestrator loop."""
+        ...
+
+    def finalize_tool_call(self, call_id: str) -> bool:
+        """Finalize terminal plugin bookkeeping before acknowledging a result."""
         ...
 
 
@@ -96,6 +102,11 @@ class DuplexSessionContext:
     tasks: DuplexSessionTasks
     run: DuplexRunState
     services: RunnerServices
+    #: Admission authority for ``function_call_output`` items (see
+    #: ``session.tool_calls``): the calls this session exposed and their one
+    #: terminal state each.
+    tool_calls: ToolCallLedger
+    history_calibration: HistoryCalibration | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +153,8 @@ class DuplexSessionTasks:
         return task is not None and task in self.runner_cancelled
 
     def has_response_bound_append_tasks(self) -> bool:
-        return any(meta.response_bound for meta in self.append_tasks.values())
+        # A finished task can remain tracked until its done callback runs.
+        return any(meta.response_bound and not task.done() for task, meta in self.append_tasks.items())
 
     async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
         """Cancel the tracked appends; the caller owns their responses from here on.
@@ -174,6 +186,14 @@ class DuplexSessionTasks:
 
 
 @dataclass(frozen=True, slots=True)
+class CommittedInputContinuation:
+    """Server-owned remainder of a batch, fenced to its original audio parts."""
+
+    payload: dict[str, object]
+    audio_parts: dict[str, dict[str, object] | None]
+
+
+@dataclass(frozen=True, slots=True)
 class StageOutput:
     """One stage result, queued for the session that owns the request."""
 
@@ -183,3 +203,6 @@ class StageOutput:
     request_id: str
     context: DuplexOutputContext
     decision: DuplexOutputDecision | None
+    input_transcript: str | None = None
+    input_item_id: str | None = None
+    project_output: bool = True

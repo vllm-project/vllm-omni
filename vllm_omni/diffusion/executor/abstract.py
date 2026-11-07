@@ -49,7 +49,9 @@ class DiffusionExecutor(ABC):
                 )
             executor_class = distributed_executor_backend
         elif distributed_executor_backend == "ray":
-            raise NotImplementedError("ray backend is not yet supported.")
+            from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
+
+            executor_class = RayDiffusionExecutor
         elif distributed_executor_backend == "mp":
             from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
@@ -138,8 +140,7 @@ class DiffusionExecutor(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
 
     def drop_output(self, async_output_id: str) -> None:
-        """Reclaim an async output that will never be waited on (e.g. an
-        aborted request).
+        """Reclaim an async output whose consumer is no longer available.
 
         Only executors with an async output path (result pump) cache outputs
         that a consumer must later claim; executors without one have nothing to

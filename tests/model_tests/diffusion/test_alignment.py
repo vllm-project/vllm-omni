@@ -25,6 +25,16 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
     "QwenImageLayeredPipeline",
+    # Uses a custom multi-image editing contract; covered by the dedicated
+    # JoyImage tiny-pipeline tests and real-checkpoint E2E accuracy test.
+    "JoyImageEditPipeline",
+    # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
+    # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
+    "QwenImage21Pipeline",
+    # Custom DiT/scheduler with a Qwen3.5 encoder; no tiny builder yet.
+    # Covered by tests/diffusion/test_mossimage_*.py and
+    # test_mossimage_registry.py.
+    "MOSSImagePipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
@@ -44,6 +54,9 @@ EXCLUDED_MODELS = [
     "LTX2I2VDMD2Pipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
+    # Decoder-only stage consumes upstream latents; covered by H3 decoder
+    # handoff tests and real-checkpoint disaggregated E2E validation.
+    "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
@@ -73,18 +86,28 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated CPU contract tests and manual real-checkpoint smoke tests instead.
+    "ABotWorldCausalPipeline",
+    # Requires full MiniMax-H3 FL2VA weights, the TaoMate LoRA, and AR sessions;
+    # covered by tests/diffusion/models/taomate_h3 and manual real-checkpoint E2E.
+    "TaoMateH3Pipeline",
     # The 270+ GiB multimodal checkpoint needs 4/8-way native sequence/head
     # parallel execution; covered by focused native contract and GPU tests.
     "Magi2Pipeline",
+    # Pro DiT is ~56 GiB bf16 and the Hub checkpoint is gated. Covered by
+    # tests/diffusion/models/kandinsky6 and the real-checkpoint E2E smoke.
+    "Kandinsky6TI2VAPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
-    "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
-    "StableDiffusionXLPipeline",
+    # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
+    # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
+    "CausVidWanPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "Pi05Pipeline",
@@ -93,6 +116,11 @@ EXCLUDED_MODELS = [
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Segmentation, not generation: the tiny-model suite checks generated
+    # images/videos. Covered by tests/diffusion/models/sam3 and the
+    # /v1/images/segmentations endpoint tests.
+    "Sam3Model",
+    "Sam3VideoModel",
 ]
 
 

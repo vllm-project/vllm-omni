@@ -68,7 +68,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--diagnose", action="store_true", help="Capture untimed production BF16 intermediates, even on mismatch"
+    )
     args = parser.parse_args()
+    if args.diagnose and (
+        args.dtype != "bfloat16" or args.case not in ("production_patch_embed", "production_final_layer")
+    ):
+        parser.error("--diagnose requires an original production BF16 case")
     if args.warmups <= 0:
         parser.error("--warmups must be positive")
     if args.iterations <= 0:
@@ -320,14 +327,41 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _run_diagnostic(args: argparse.Namespace) -> dict[str, object]:
+    from benchmarks.kernels.hunyuan_image3_resblock_diagnostics import diagnose, source_metadata
+
+    dtype = _DTYPES[args.dtype]
+    case = CASES[args.case]
+    native, nvidia, current_omni_platform = _make_blocks(case, dtype)
+    inputs, embedding = _make_inputs(case, dtype)
+    result = diagnose(native, nvidia, inputs, embedding)
+    return {
+        **result,
+        **_source_provenance(),
+        **source_metadata(native, nvidia),
+        "gpu": current_omni_platform.get_device_name(),
+        "accelerator_version": current_omni_platform.get_device_version(),
+        "triton_fused_ops": True,
+        "case": args.case,
+        "case_config": asdict(case),
+        "dtype": args.dtype,
+        "parameter_seed": _SEED,
+        "input_seed": _SEED + 1,
+        "rtol": _TOLERANCES[dtype][0],
+        "atol": _TOLERANCES[dtype][1],
+    }
+
+
 def main() -> None:
     args = _parse_args()
-    result = _run(args)
-    rendered = json.dumps(result, indent=2, sort_keys=True)
+    result = _run_diagnostic(args) if args.diagnose else _run(args)
+    rendered = json.dumps(result, indent=2, sort_keys=True, allow_nan=False)
     print(rendered)
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(f"{rendered}\n", encoding="utf-8")
+    if args.diagnose and not result["qualification_passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

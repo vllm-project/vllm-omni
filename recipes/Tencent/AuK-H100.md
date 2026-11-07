@@ -165,6 +165,24 @@ Inductor cache, about 30 s less warm).
   unchunked condition to bf16 rounding (per-token cosine 0.99999) and leaves
   request walls unchanged, because the encoder is about 3% of a base request,
   while concurrent runs stop being bit-identical to sequential ones.
+- FP8 DiT (opt-in): `diffusion_quantization_config: fp8` on the diffusion
+  stage runs the token-wise linears of the DiT blocks (QKV, attention output
+  and feed-forward projections, 160 in total) as FP8 E4M3 GEMMs; the
+  embeddings, the adaLN modulations and the output projection keep bf16. Ada
+  and Hopper GPUs only: elsewhere the stage logs a warning and stays bf16.
+  Against bf16 on the same GPU, base request latency drops 8 to 10% on an
+  H200-class GPU (zero-shot 0.19 / 0.25 / 0.34 s to 0.17 / 0.23 / 0.31 s for
+  3 / 6 / 12 s of audio) and about 30% on an H20 (0.50 / 0.71 / 1.01 s to
+  0.35 / 0.49 / 0.71 s), where the GEMMs are a larger share of a step, and
+  saturated base throughput on the H20 rises from 1.27 to 1.80 requests per
+  second at 6 s clips. Flash, with 4 steps, gains about 12% on the H20 and
+  nothing on the H200-class GPU. FP8
+  keeps three mantissa bits, so each guided velocity moves by about 7%
+  relative to bf16 and the waveforms differ (log-mel L1 0.15 to bf16, under
+  the VAE-resampling noise floor above). On 100 seed-tts English prompts with
+  the same seeds: base WER 0.0189 to 0.0211 with one prompt worse and none
+  better, speaker similarity -0.0002 (95% CI -0.0009 to +0.0006); Flash WER
+  unchanged, speaker similarity +0.0002 (-0.0008 to +0.0012).
 - Known limitations: the encoder's audio tower runs without `flash_attn` in a
   plain vLLM install, which shifts the encoder output on audio token positions
   (per-token cosine 0.96 vs the upstream fp32 fusion; text positions 0.9999)

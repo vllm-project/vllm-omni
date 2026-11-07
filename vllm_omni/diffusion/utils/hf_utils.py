@@ -158,7 +158,13 @@ def is_diffusion_model(model_name: str) -> bool:
                 logger.debug("Failed to read local %s: %s", filename, e)
 
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
-    config_dict = get_diffusion_model_index(model_name)
+    # get_hf_file_to_dict can raise for local paths that don't resolve to a Hub
+    # repo id (see resolve_model_class_name's identical guard for the same call).
+    try:
+        config_dict = get_diffusion_model_index(model_name)
+    except Exception as e:
+        logger.debug("Failed to fetch diffusion model index via vllm utility: %s", e)
+        config_dict = None
     if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
         logger.debug("Detected diffusion model via a standard Diffusers index")
         return True
