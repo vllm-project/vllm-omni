@@ -3,7 +3,6 @@
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
-import gzip
 import threading
 from io import BytesIO
 from typing import Any
@@ -172,15 +171,18 @@ async def test_decode_image_url_reads_bounded_chunked_image(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_decode_image_url_reads_compressed_response_with_limit(monkeypatch):
+async def test_decode_image_url_rejects_compressed_response_before_read(monkeypatch):
+    stream = _ChunkedStream([_png_bytes()])
+
     def _handler(request):
-        return httpx.Response(200, headers={"content-encoding": "gzip"}, content=gzip.compress(_png_bytes()))
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=stream)
 
     _install_http_transport(monkeypatch, _handler, [])
 
-    image = await video_api_utils.decode_image_url("https://example.com/compressed.png")
+    with pytest.raises(InvalidInputReferenceError, match="compressed responses"):
+        await video_api_utils.decode_image_url("https://example.com/compressed.png")
 
-    assert image.size == (2, 1)
+    assert not stream.started
 
 
 @pytest.mark.asyncio

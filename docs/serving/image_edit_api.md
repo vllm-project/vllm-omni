@@ -110,7 +110,8 @@ Content-Type: multipart/form-data
 URL and base64 data-URL inputs are bounded before image decoding. Each image
 input is limited to 30 MiB; oversized or continuously streamed HTTP responses
 are rejected with a client error. Remote downloads also have a 60-second total
-time limit. Response bytes are counted after HTTP content decoding.
+time limit. Responses with non-identity `Content-Encoding` are rejected before
+decoding.
 
 ### Response Format
 

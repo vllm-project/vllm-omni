@@ -239,7 +239,7 @@ read incrementally and rejected when they exceed the applicable limit, including
 responses without `Content-Length`. The same limits apply to the URL fields in
 `image_reference`, `video_reference`, and `audio_reference`. Each remote
 download also has a 60-second total time limit.
-Response bytes are counted after HTTP content decoding.
+Responses with non-identity `Content-Encoding` are rejected before decoding.
 
 ### MiniMax H3 control and inpainting
 

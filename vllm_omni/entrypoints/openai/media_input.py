@@ -84,8 +84,8 @@ async def download_media_bytes(
     ``Content-Length`` is checked before the body is read. Responses without a
     trustworthy length are counted incrementally, so chunked and streaming
     responses cannot exceed ``max_bytes``. The request advertises identity
-    encoding when possible; HTTPX counts decoded response chunks, so content
-    encoding does not bypass the limit.
+    encoding and rejects non-identity responses before HTTPX can decompress
+    them, so compressed payloads cannot bypass the limit.
 
     Args:
         url: HTTP(S) media URL.
@@ -112,6 +112,10 @@ async def download_media_bytes(
             async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=follow_redirects) as client:
                 async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as response:
                     response.raise_for_status()
+                    content_encoding = response.headers.get("content-encoding", "").strip().lower()
+                    if content_encoding and content_encoding != "identity":
+                        raise InvalidInputReferenceError(f"Invalid {source}: compressed responses are not supported.")
+
                     content_length = response.headers.get("content-length")
                     if content_length is not None:
                         try:
