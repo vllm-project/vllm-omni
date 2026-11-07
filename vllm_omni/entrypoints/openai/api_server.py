@@ -2308,7 +2308,7 @@ async def generate_images(
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
-                width, height = parse_size(request.size)
+                width, height = parse_size(request.size, allow_ratio=True)
                 app_state_args = getattr(raw_request.app.state, "args", None)
                 _check_max_generated_image_size(app_state_args, width, height)
                 extra_body["size"] = request.size
@@ -2390,7 +2390,7 @@ async def generate_images(
 
         # Parse and add size if provided
         if request.size:
-            width, height = parse_size(request.size)
+            width, height = parse_size(request.size, allow_ratio=True)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
@@ -2662,7 +2662,7 @@ async def edit_images(
                 width, height = pil_images[0].size
             # else: let pipeline calculate dimensions based on resolution
         else:
-            width, height = parse_size(size)
+            width, height = parse_size(size, allow_ratio=True)
 
         _check_max_generated_image_size(app_state_args, width, height, resolution)
 
