@@ -1401,23 +1401,39 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 pointwise_validated = pointwise_eligible(
                     joint_hidden_states, prepared_modulation[1], prepared_modulation[3]
                 )
-        for index_block, block in enumerate(self.transformer_blocks):
-            block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
-            joint_hidden_states = block(
-                hidden_states=joint_hidden_states,
+        cache_proxies = getattr(self, "_cache_dit_decode_proxies", None)
+        if is_decode and cache_proxies is not None:
+            joint_hidden_states = cache_proxies[cache_branch](
+                joint_hidden_states,
                 modulation=modulation,
                 freqs=freqs,
                 target_token_mask=local_mask,
                 attn_metadata=attn_metadata,
                 sp_prefix_len=sp_prefix_len,
-                sp_decode=sp_active and is_decode,
-                kv_cache=block_kv_cache,
+                sp_decode=sp_active,
+                kv_cache=kv_cache,
                 cache_branch=cache_branch,
-                cache_write_len=cache_write_len,
+                cache_write_len=None,
                 prepared_modulation=prepared_modulation,
                 _pointwise_validated=pointwise_validated,
             )
-
+        else:
+            for index_block, block in enumerate(self.transformer_blocks):
+                block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
+                joint_hidden_states = block(
+                    hidden_states=joint_hidden_states,
+                    modulation=modulation,
+                    freqs=freqs,
+                    target_token_mask=local_mask,
+                    attn_metadata=attn_metadata,
+                    sp_prefix_len=sp_prefix_len,
+                    sp_decode=sp_active and is_decode,
+                    kv_cache=block_kv_cache,
+                    cache_branch=cache_branch,
+                    cache_write_len=cache_write_len,
+                    prepared_modulation=prepared_modulation,
+                    _pointwise_validated=pointwise_validated,
+                )
         if (
             not is_decode
             and cache_write_len is not None
