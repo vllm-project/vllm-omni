@@ -7,6 +7,7 @@ import asyncio
 import binascii
 import io
 import json
+import time
 import warnings
 import wave
 from dataclasses import dataclass
@@ -89,6 +90,9 @@ MAX_OUTPUT_SPEED = 1.5
 # Application safety caps for one append and the complete pending input turn.
 MAX_AUDIO_APPEND_BYTES = 15 * 1024 * 1024
 MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
+# History bounds audio bytes; also bound task overhead for many tiny commits.
+MAX_PENDING_TRANSCRIPTIONS = 32
+TRANSCRIPTION_TIMEOUT_S = 300
 
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
@@ -157,6 +161,7 @@ class _ResolvedResponse:
     metadata: Any
     reasoning_effort: str | None = None
     voice: str | None = None
+    input_item_id: str | None = None
 
 
 class OpenAIFullDuplexConnection:
@@ -190,6 +195,10 @@ class OpenAIFullDuplexConnection:
         self._response_cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._session_trace: SessionTrace | None = None
+        self._transcriber = getattr(chat_handler, "input_audio_transcriber", None)
+        self._transcription_tasks: dict[str, asyncio.Task[None]] = {}
+        # FIFO acquisition preserves commit order without serializing other sessions.
+        self._transcription_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                          #
@@ -216,13 +225,31 @@ class OpenAIFullDuplexConnection:
                 except WebSocketDisconnect:
                     break
                 try:
-                    event = _CLIENT_EVENT_ADAPTER.validate_json(text, extra="ignore")
+                    payload = json.loads(text)
+                    event = _CLIENT_EVENT_ADAPTER.validate_python(payload, extra="ignore")
                 except Exception:
                     await self._send_error(
                         "Invalid or unrecognized client event",
                         "invalid_event",
                     )
                     continue
+                if isinstance(event, types.SessionUpdateEvent):
+                    audio = payload["session"].get("audio") or {}
+                    transcription = (audio.get("input") or {}).get("transcription")
+                    # The SDK parser ignores unknown fields. Check this extension
+                    # before that can turn unsupported ASR options into an ACK.
+                    if isinstance(transcription, dict) and transcription.keys() - {"model", "language", "prompt"}:
+                        logger.warning(
+                            "[realtime] Unsupported transcription settings session_id=%s event_id=%s",
+                            self.session.session_id,
+                            event.event_id,
+                        )
+                        await self._send_error(
+                            "Input transcription supports model, language and prompt only",
+                            "invalid_request_error",
+                            event_id=event.event_id,
+                        )
+                        continue
                 await self._dispatch_event(event)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -242,7 +269,15 @@ class OpenAIFullDuplexConnection:
 
     async def _cleanup(self):
         self._connected = False
+        tasks = list(self._transcription_tasks.values())
+        logger.debug("[realtime] ASR cleanup session_id=%s pending=%d", self.session.session_id, len(tasks))
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._transcription_tasks.clear()
         await self._cancel_active_response()
+        self.session.input_audio_buffer.clear()
+        self.session.items.clear()
         logger.info("[realtime] connection closed, session_id=%s", self.session.session_id)
 
     # ------------------------------------------------------------------ #
@@ -314,6 +349,7 @@ class OpenAIFullDuplexConnection:
             )
             return
         except ValueError as exc:
+            logger.warning("[realtime] Session settings rejected session_id=%s reason=%s", s.session_id, exc)
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
         try:
@@ -362,6 +398,8 @@ class OpenAIFullDuplexConnection:
         sanitized.model = self.model_name
 
         self._reject_mcp(sanitized, prefix="session")
+        if "item.input_audio_transcription.logprobs" in (sanitized.include or []):
+            raise ValueError("Input transcription log probabilities are not supported")
 
         audio = sanitized.audio
         if audio is None:
@@ -369,8 +407,11 @@ class OpenAIFullDuplexConnection:
 
         audio_input = audio.input
         if audio_input is not None:
-            # These options are accepted for compatibility but are not implemented.
-            audio_input.transcription = None
+            if audio_input.transcription is not None:
+                if self._transcriber is None:
+                    raise ValueError("Input audio transcription is unavailable for this pipeline")
+                self._transcriber.validate_settings(audio_input.transcription)
+            # Noise reduction remains unimplemented.
             audio_input.noise_reduction = None
             if not self._is_pcm16_24khz_format(audio_input.format):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 input audio is supported")
@@ -526,6 +567,12 @@ class OpenAIFullDuplexConnection:
                 limit_mib = MAX_INPUT_AUDIO_BUFFER_BYTES // (1024 * 1024)
                 raise ValueError(f"Input audio buffer exceeds the {limit_mib} MiB limit")
         except ValueError as exc:
+            logger.warning(
+                "[realtime] Audio append rejected session_id=%s event_id=%s reason=%s",
+                self.session.session_id,
+                event.event_id,
+                exc,
+            )
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
 
@@ -654,6 +701,7 @@ class OpenAIFullDuplexConnection:
             s = self.session
             if len(s.input_audio_buffer) == 0:
                 return None
+            audio_bytes = len(s.input_audio_buffer)
             audio = base64.b64encode(s.input_audio_buffer).decode("ascii")
             item = types.RealtimeConversationItemUserMessage(
                 type="message",
@@ -665,10 +713,13 @@ class OpenAIFullDuplexConnection:
             try:
                 s.insert_item(item)
             except HistoryLimitError as exc:
+                logger.warning("[realtime] Audio commit rejected session_id=%s reason=%s", s.session_id, exc)
                 s.input_audio_buffer.clear()
                 await self._send_error(str(exc), "invalid_request_error", event_id=event_id)
                 return None
             s.input_audio_buffer.clear()
+            transcription = s.config.audio.input.transcription if s.config.audio and s.config.audio.input else None
+            settings = self._transcriber.validate_settings(transcription) if transcription is not None else None
             idx = self.session.find_item_index(item.id)
             previous_item_id = self.session.items[idx - 1].id if idx else None
             await self._send_event(
@@ -682,6 +733,15 @@ class OpenAIFullDuplexConnection:
             # Do not echo the client's potentially large audio payload.
             wire_item = item.model_copy(update={"content": []})
             await self._send_conversation_item_added_and_done(wire_item, previous_item_id)
+            if settings is not None and self._connected:
+                await self._schedule_transcription(item, settings)
+            logger.info(
+                "[realtime] Audio committed session_id=%s item_id=%s audio_bytes=%d transcription_scheduled=%s",
+                s.session_id,
+                item.id,
+                audio_bytes,
+                item.id in self._transcription_tasks,
+            )
             return item
         finally:
             self._reset_turn_detection()
@@ -699,6 +759,15 @@ class OpenAIFullDuplexConnection:
         await self._commit_audio_buffer(event.event_id, item_id=self._speech_item_id)
 
     async def _handle_audio_clear(self, event: types.InputAudioBufferClearEvent):
+        if self.session.input_audio_buffer:
+            logger.info(
+                "[realtime] Audio buffer cleared by client session_id=%s event_id=%s "
+                "discarded_bytes=%d speech_active=%s",
+                self.session.session_id,
+                event.event_id,
+                len(self.session.input_audio_buffer),
+                self._speech_item_id is not None,
+            )
         self.session.input_audio_buffer.clear()
         self._reset_turn_detection()
         await self._send_event(
@@ -707,6 +776,104 @@ class OpenAIFullDuplexConnection:
                 type="input_audio_buffer.cleared",
             )
         )
+
+    async def _schedule_transcription(self, item: types.RealtimeConversationItemUserMessage, settings: Any) -> None:
+        if item.id in self._transcription_tasks:
+            return
+        if len(self._transcription_tasks) >= MAX_PENDING_TRANSCRIPTIONS:
+            logger.warning(
+                "[realtime] ASR queue full session_id=%s item_id=%s pending=%d limit=%d",
+                self.session.session_id,
+                item.id,
+                len(self._transcription_tasks),
+                MAX_PENDING_TRANSCRIPTIONS,
+            )
+            await self._send_transcription_failure(item, "transcription_queue_full", "Too many pending transcriptions")
+            return
+        request_id = f"asr-{self.session.session_id}-{item.id}"
+        logger.debug("[realtime] ASR queued request_id=%s item_id=%s", request_id, item.id)
+        self._transcription_tasks[item.id] = asyncio.create_task(self._run_transcription(item, settings, request_id))
+
+    async def _run_transcription(
+        self, item: types.RealtimeConversationItemUserMessage, settings: Any, request_id: str
+    ) -> None:
+        queued_at = time.monotonic()
+        try:
+            async with self._transcription_lock:
+                if not self._connected or self.session.find_item(item.id) is not item:
+                    return
+                started_at = time.monotonic()
+                logger.info(
+                    "[realtime] ASR submit request_id=%s queue_ms=%.1f", request_id, (started_at - queued_at) * 1000
+                )
+                # The item retains immutable encoded PCM; later appends use a different buffer.
+                audio = self._decode_pcm16(item.content[0].audio, MAX_INPUT_AUDIO_BUFFER_BYTES)
+                transcript = await asyncio.wait_for(
+                    self._transcriber.transcribe_pcm(audio, SAMPLE_RATE_HZ, settings, request_id),
+                    timeout=TRANSCRIPTION_TIMEOUT_S,
+                )
+                if not self._connected or self.session.find_item(item.id) is not item:
+                    return
+                if not transcript.strip():
+                    logger.warning("[realtime] ASR empty result request_id=%s item_id=%s", request_id, item.id)
+                    await self._send_transcription_failure(
+                        item, "transcription_empty", "No speech was recognized in the committed audio"
+                    )
+                    return
+                updated = item.model_copy(deep=True)
+                updated.content[0].transcript = transcript
+                event = types.ConversationItemInputAudioTranscriptionCompletedEvent(
+                    event_id=_gen_id("evt"),
+                    type="conversation.item.input_audio_transcription.completed",
+                    item_id=item.id,
+                    content_index=0,
+                    transcript=transcript,
+                    usage={"type": "duration", "seconds": len(audio) / (2 * SAMPLE_RATE_HZ)},
+                )
+                self.session.replace_item(updated)
+                await self._send_payload(event.model_dump(mode="json", exclude_none=True), event.type, item=updated)
+                logger.info(
+                    "[realtime] ASR completed request_id=%s item_id=%s elapsed_ms=%.1f",
+                    request_id,
+                    item.id,
+                    (time.monotonic() - started_at) * 1000,
+                )
+        except asyncio.CancelledError:
+            logger.info("[realtime] ASR cancelled request_id=%s", request_id)
+            raise
+        except Exception as exc:
+            if isinstance(exc, (asyncio.TimeoutError, HistoryLimitError)):
+                logger.warning(
+                    "[realtime] ASR did not complete request_id=%s item_id=%s reason=%s elapsed_ms=%.1f",
+                    request_id,
+                    item.id,
+                    type(exc).__name__,
+                    (time.monotonic() - queued_at) * 1000,
+                )
+            else:
+                # Runtime ValueError can be an internal bug, not just invalid input.
+                # Log once here; keep the protocol error independent of exception details.
+                logger.exception(
+                    "[realtime] ASR failed request_id=%s session_id=%s item_id=%s",
+                    request_id,
+                    self.session.session_id,
+                    item.id,
+                )
+            await self._send_transcription_failure(item, "transcription_failed", "Input audio transcription failed")
+        finally:
+            self._transcription_tasks.pop(item.id, None)
+
+    async def _send_transcription_failure(
+        self, item: types.RealtimeConversationItemUserMessage, code: str, message: str
+    ) -> None:
+        event = types.ConversationItemInputAudioTranscriptionFailedEvent(
+            event_id=_gen_id("evt"),
+            type="conversation.item.input_audio_transcription.failed",
+            item_id=item.id,
+            content_index=0,
+            error={"type": "server_error", "code": code, "message": message},
+        )
+        await self._send_payload(event.model_dump(mode="json", exclude_none=True), event.type, item=item)
 
     # ------------------------------------------------------------------ #
     #  response.create                                                    #
@@ -774,6 +941,22 @@ class OpenAIFullDuplexConnection:
             reasoning_effort = None
 
         resolved_input = self._resolve_response_input(response_input) if response_input is not None else None
+        input_item_id = metadata.get("input_item_id") if metadata and response_input is None else None
+        if input_item_id is not None:
+            items = s.model_context_items()
+            target_index = next((i for i, item in enumerate(items) if item.id == input_item_id), None)
+            if target_index is None:
+                raise ValueError("Response input_item_id is not in the retained model context")
+            target = items[target_index]
+            if getattr(target, "role", None) != "user" or not any(
+                part.type == "input_audio" for part in (target.content or [])
+            ):
+                raise ValueError("Response input_item_id must identify a user audio item")
+            # Open WebUI can request an older turn after later audio is committed.
+            # Keep its latest injected system context, but never answer future audio.
+            resolved_input = [
+                item for i, item in enumerate(items) if i <= target_index or getattr(item, "role", None) == "system"
+            ]
         return _ResolvedResponse(
             input=resolved_input,
             instructions=instructions,
@@ -784,6 +967,7 @@ class OpenAIFullDuplexConnection:
             metadata=metadata,
             reasoning_effort=reasoning_effort,
             voice=response_voice,
+            input_item_id=input_item_id,
         )
 
     async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
@@ -870,7 +1054,7 @@ class OpenAIFullDuplexConnection:
             items = all_items[low:]
             engine_input, total = await probe_prompt(items)
 
-        if total > limit:
+        if total > limit or (response.input_item_id and not any(item.id == response.input_item_id for item in items)):
             return None
         return items
 
@@ -1104,7 +1288,7 @@ class OpenAIFullDuplexConnection:
         )
 
     async def _run_response_inner(self, response_id, response, s, active, engine_input: EngineInput):
-        previous_item_id = s.items[-1].id if s.items else None
+        previous_item_id = response.input_item_id or (s.items[-1].id if s.items else None)
         modalities = response.modalities
         is_audio = "audio" in modalities
         tools, tool_choice = response.tools, response.tool_choice
@@ -1753,6 +1937,11 @@ class OpenAIFullDuplexConnection:
             )
             return
 
+        task = self._transcription_tasks.get(item_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
         await self._send_event(
             types.ConversationItemDeletedEvent(
                 event_id=_gen_id("evt"),
@@ -2208,11 +2397,15 @@ class OpenAIFullDuplexConnection:
     async def _send_json(self, payload: dict) -> None:
         await self._send_payload(payload, payload.get("type"))
 
-    async def _send_payload(self, payload: Any, event_type: str | None) -> None:
+    async def _send_payload(
+        self, payload: Any, event_type: str | None, *, item: types.ConversationItem | None = None
+    ) -> None:
         if not self._connected:
             return
         try:
             async with self._send_lock:
+                if not self._connected or (item is not None and self.session.find_item(item.id) is not item):
+                    return
                 await self.ws.send_text(json.dumps(payload))
         except Exception:
             logger.warning("[realtime] send failed, marking connection dead: %s", event_type, exc_info=True)

@@ -34,6 +34,31 @@ from vllm_omni.entrypoints.openai.realtime.session import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.asyncio
+async def test_audio_transcript_metadata_does_not_replace_recording():
+    connection, renderer = _make_connection(max_model_len=1000)
+    audio = b"\x01\x02" * 100
+    item = types.RealtimeConversationItemUserMessage(
+        type="message",
+        role="user",
+        id="spoken-question",
+        content=[{"type": "input_audio", "audio": base64.b64encode(audio).decode(), "transcript": "Wie geht es dir?"}],
+    )
+    context = types.RealtimeConversationItemSystemMessage(
+        type="message", role="system", id="chat-context", content=[{"type": "input_text", "text": "Existing chat"}]
+    )
+    await connection._build_full_prompt(items=[context, item])
+    messages = renderer.conversations[-1]
+    assert messages[0] == {"role": "system", "content": "Existing chat"}
+    assert len(messages) == 2
+    content = messages[1]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "input_audio"
+    with wave.open(io.BytesIO(base64.b64decode(content[0]["input_audio"]["data"]))) as recording:
+        assert recording.getframerate() == 24000
+        assert recording.readframes(recording.getnframes()) == audio
+
+
 class _FakeRenderer:
     def get_tokenizer(self) -> object:
         return object()
@@ -156,6 +181,35 @@ def _assistant_item(item_id: str, text: str) -> types.RealtimeConversationItemAs
         status="completed",
         content=[{"type": "output_text", "text": text}],
     )
+
+
+@pytest.mark.asyncio
+async def test_correlated_response_keeps_context_but_excludes_later_audio():
+    connection, _ = _make_connection(max_model_len=1000)
+    first = _audio_item("first", b"\x01\x02")
+    second = _audio_item("second", b"\x03\x04")
+    context = types.RealtimeConversationItemSystemMessage(
+        type="message", role="system", id="context", content=[{"type": "input_text", "text": "Current chat"}]
+    )
+    for item in (first, second, context):
+        connection.session.insert_item(item)
+    event = types.ResponseCreateEvent.model_validate(
+        {"type": "response.create", "response": {"metadata": {"input_item_id": "first"}}}
+    )
+    response = connection._resolve_response(event.response)
+    assert response.input_item_id == "first"
+    assert response.metadata == {"input_item_id": "first"}
+    assert await connection._truncate_prompt_items(response) == [first, context]
+    assert connection.session.items == [first, second, context]
+
+
+def test_correlated_response_rejects_deleted_audio():
+    connection, _ = _make_connection()
+    event = types.ResponseCreateEvent.model_validate(
+        {"type": "response.create", "response": {"metadata": {"input_item_id": "deleted"}}}
+    )
+    with pytest.raises(ValueError, match="retained model context"):
+        connection._resolve_response(event.response)
 
 
 def _websocket_events(websocket: _FakeWebSocket) -> list[dict[str, Any]]:
