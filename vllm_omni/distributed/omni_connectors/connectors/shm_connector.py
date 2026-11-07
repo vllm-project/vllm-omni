@@ -22,6 +22,30 @@ from .base import OmniConnectorBase
 logger = get_connector_logger(__name__)
 
 
+_SAFE_SEGMENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+# "shm_{name}_lockfile.lock" must fit in NAME_MAX (255). The limit is in bytes;
+# comparing it with len(key) is valid only because every character in
+# _SAFE_SEGMENT_CHARS is ASCII (one byte each).
+_MAX_SEGMENT_NAME = 255 - len("shm__lockfile.lock")
+_HASHED_SEGMENT_PREFIX = "omni_shm_key_"
+
+
+def _segment_name(key: str) -> str:
+    """Map a transfer key to a valid POSIX SHM name.
+
+    Keys embed client-supplied request ids, which may contain ``/`` or exceed
+    the file-name limit. Safe keys are used unchanged; others are hashed.
+    """
+    if (
+        key
+        and len(key) <= _MAX_SEGMENT_NAME
+        and not key.startswith((".", _HASHED_SEGMENT_PREFIX))
+        and set(key) <= _SAFE_SEGMENT_CHARS
+    ):
+        return key
+    return _HASHED_SEGMENT_PREFIX + hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
 
@@ -46,7 +70,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _shm_name(self, key: str) -> str:
         """Map a logical key to an OS segment name."""
-        return key
+        return _segment_name(key)
 
     def _shm_exists(self, key: str) -> bool:
         """Return True while a published payload remains unread.
@@ -228,6 +252,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         put_key: str,
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
+        name = None
         try:
             # Keep per-send housekeeping small when unread chunks accumulate.
             # Explicit sweeps retain a larger budget to drain stale records.
@@ -254,7 +279,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             return True, size, metadata
 
         except Exception as e:
-            logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
+            # Reuse the name from the try block: recomputing it here could raise again.
+            # It is still None if the failure happened before the name was derived.
+            segment = name if name is not None else "<not computed>"
+            logger.error("SharedMemoryConnector put failed for req %s (segment %s): %s", put_key, segment, e)
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
@@ -325,18 +353,19 @@ class SharedMemoryConnector(OmniConnectorBase):
         Returns True when an unconsumed segment was actually unlinked.
         """
         key = request_id
+        name = self._shm_name(key)
         unlinked = False
         with self._pending_keys_lock:
             self._pending_keys.pop(key, None)
             try:
-                self._unlink_segment(self._shm_name(key))
-                logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                self._unlink_segment(name)
+                logger.debug("cleanup: unlinked unconsumed SHM segment %s (key %s)", name, key)
                 unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
-                logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
-            lock_file = self._lock_file(self._shm_name(key))
+                logger.debug("cleanup: failed to unlink SHM segment %s (key %s): %s", name, key, e)
+            lock_file = self._lock_file(name)
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)
