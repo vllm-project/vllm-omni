@@ -925,10 +925,13 @@ class OrchestratorAggregator:
             if e2e_evt:
                 parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
             if "preprocess_ms" in pt:
-                parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
+                parts.append(f"preprocess_ms={pt['preprocess_ms']:.3f}")
             if e2e_evt:
                 engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
-                parts.append(f"engine={engine_ms / 1000.0:.2f}s")
+                parts.append(f"engine_ms={engine_ms:.3f}")
+            for key in sorted(pt):
+                if key.endswith("_ms") and key not in {"preprocess_ms"}:
+                    parts.append(f"{key}={float(pt[key]):.3f}")
             stage_parts = []
             for evt in stage_evts:
                 sid = evt.stage_id if evt.stage_id is not None else "?"
