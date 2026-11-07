@@ -191,7 +191,7 @@ def test_lance_video_edit_normalizes_decoded_frame_sequences(monkeypatch, video_
                 "extra_args": {"origin_fps": 12.0},
             }
         ],
-        sampling_params=SimpleNamespace(extra_args={}, num_inference_steps=1),
+        sampling_params=SimpleNamespace(extra_args={}, num_inference_steps=1, return_trajectory_latents=False),
     )
 
     with pytest.raises(StopAfterVideoPreprocessError):
