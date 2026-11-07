@@ -1192,6 +1192,59 @@ async def test_stage_work_reaches_the_ledger_before_any_session_output() -> None
         await orchestrator.session_manager.shutdown()
 
 
+def test_forwarded_inputs_carry_the_source_chunk_with_or_without_an_envelope() -> None:
+    state = DuplexOrchestratorRequestState(request_id="r", session_owned=True)
+    shared_duplex = {"data_plane": True}
+    talker_info = {"tts_text": "hi"}
+    next_inputs: list[dict[str, Any]] = [
+        # Native duplex models forward an envelope; it is copied, never mutated.
+        {"prompt_token_ids": [0], "model_intermediate_buffer": {"duplex": shared_duplex}},
+        # Turn-commit pipelines (JoyAI -> Qwen3-TTS) forward only additional_information.
+        {"prompt_token_ids": [0], "additional_information": talker_info},
+    ]
+    # No chunk for the source stage (stats off or no span yet): inputs are unchanged.
+    DuplexOrchestrator._annotate_next_stage_inputs(None, 0, state, next_inputs)
+    assert "model_intermediate_buffer" not in next_inputs[1]
+
+    state.stage_output_chunks[0] = (2, 7)
+    DuplexOrchestrator._annotate_next_stage_inputs(None, 0, state, next_inputs)
+    assert next_inputs[0]["model_intermediate_buffer"]["duplex"] == {"data_plane": True, "perf_chunk": [2, 7]}
+    assert shared_duplex == {"data_plane": True}
+    assert next_inputs[1]["model_intermediate_buffer"] == {"duplex": {"perf_chunk": [2, 7]}}
+    assert next_inputs[1]["additional_information"] is talker_info
+
+
+@pytest.mark.asyncio
+async def test_processed_turn_commit_request_keeps_only_the_perf_chunk() -> None:
+    from tests.engine.test_orchestrator import _processed_request, _sampling_params
+    from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+    from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
+    from vllm_omni.engine.serialization import deserialize_additional_information
+
+    # A turn-commit plugin's text/image prompt goes through the multimodal input
+    # processor, which drops model_intermediate_buffer (e.g. JoyAI).
+    orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio))
+    try:
+        info = {"tts_language": "English"}
+        raw = with_perf_chunk({"prompt": "hi", "additional_information": info}, (0, 4))
+        upgraded = orchestrator._upgrade_processed_stage_request(_processed_request("r", _sampling_params()), raw)
+        assert perf_chunk_from_buffer(upgraded.model_intermediate_buffer) == (0, 4)
+        assert deserialize_additional_information(upgraded.additional_information) == info
+
+        # Only the chunk id is carried back; other raw buffer contents stay dropped.
+        raw = {"prompt": "hi", "model_intermediate_buffer": {"other": 1, "duplex": {"perf_chunk": [0, 5], "x": 2}}}
+        upgraded = orchestrator._upgrade_processed_stage_request(_processed_request("r", _sampling_params()), raw)
+        assert upgraded.model_intermediate_buffer == {"duplex": {"perf_chunk": [0, 5]}}
+
+        # Stats off: no chunk id, so nothing is added.
+        upgraded = orchestrator._upgrade_processed_stage_request(
+            _processed_request("r", _sampling_params()), {"prompt": "hi", "additional_information": info}
+        )
+        assert getattr(upgraded, "model_intermediate_buffer", None) is None
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
 def test_default_plugin_declares_no_draining_stages() -> None:
     plugin = MiniCPMO45DuplexPlugin(_encode_audio)
     assert plugin.draining_stage_ids(stage_count=4) == frozenset()

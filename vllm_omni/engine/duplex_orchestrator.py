@@ -23,7 +23,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY, stage_work_rows
+from vllm_omni.core.sched.duplex_stage_work import buffer_with_perf_chunk, perf_chunk_from_buffer, stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -307,14 +307,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if chunk is None:
             return
         for next_input in next_inputs:
-            buffer = next_input.get("model_intermediate_buffer") if isinstance(next_input, dict) else None
-            duplex = buffer.get("duplex") if isinstance(buffer, dict) else None
-            if isinstance(buffer, dict) and isinstance(duplex, dict):
-                # Copy both levels: the stage-input processor may share them with bridge state.
-                next_input["model_intermediate_buffer"] = {
-                    **buffer,
-                    "duplex": {**duplex, PERF_CHUNK_KEY: list(chunk)},
-                }
+            if not isinstance(next_input, dict):
+                continue
+            # Inputs built only from ``additional_information`` (e.g. JoyAI's Talker and
+            # Code2Wav) get a minimal envelope; the helper copies both levels, since
+            # the stage-input processor may share them with bridge state.
+            buffer = buffer_with_perf_chunk(next_input.get("model_intermediate_buffer"), chunk)
+            if buffer is not None:
+                next_input["model_intermediate_buffer"] = buffer
 
     async def _report_duplex_session_request_error(
         self,
@@ -552,6 +552,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             max_sessions=self.duplex_session_config.max_sessions
         ).supports_core_resumable_request and not isinstance(request, OmniEngineCoreRequest):
             request = OmniEngineCoreRequest.from_request(request)
+        # Prompts that go through the multimodal input processor (turn-commit plugins
+        # such as JoyAI) lose ``model_intermediate_buffer`` there. Carry back only the
+        # session-stats chunk id (RFC #8325), so the stage scheduler times the request;
+        # the rest of the raw buffer is still not forwarded.
+        raw_buffer = raw_prompt.get("model_intermediate_buffer") if isinstance(raw_prompt, dict) else None
+        chunk = perf_chunk_from_buffer(raw_buffer)
+        current = getattr(request, "model_intermediate_buffer", None)
+        if chunk is not None and perf_chunk_from_buffer(current) is None:
+            buffer = buffer_with_perf_chunk(current, chunk)
+            if buffer is not None:
+                request = OmniEngineCoreRequest.from_request(request, model_intermediate_buffer=buffer)
         return request
 
     async def _build_next_stage_request(self, req_id, next_stage_id, next_input, params, **kwargs):
