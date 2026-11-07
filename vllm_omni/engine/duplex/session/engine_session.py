@@ -512,8 +512,22 @@ class DuplexEngineSession:
 
     @property
     def history(self) -> tuple[dict[str, object], ...]:
+        return tuple(dict(message) for message in self._visible_history_messages())
+
+    def _visible_history_messages(self) -> tuple[dict[str, object], ...]:
         placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
-        return tuple(dict(message) for message in self._conversation.messages if id(message) not in placeholders)
+        return tuple(message for message in self._conversation.messages if id(message) not in placeholders)
+
+    def history_for_prompt(self) -> tuple[tuple[dict[str, object], ...], tuple[str | None, ...]]:
+        """Capture aligned prompt history/IDs, preserving nested media identity.
+
+        Unlike ``history_snapshot``, only the top-level message dictionaries
+        are copied. Callers must treat their shared nested contents as read-only.
+        This runs synchronously on the owner loop, without yielding.
+        """
+        messages = self._visible_history_messages()
+        item_ids = tuple(self._history_source(message).item_id for message in messages)
+        return tuple(dict(message) for message in messages), item_ids
 
     @property
     def history_revision(self) -> int:
@@ -521,8 +535,7 @@ class DuplexEngineSession:
 
     def history_snapshot(self) -> DuplexHistorySnapshot:
         """Capture content and identities together, without yielding ownership."""
-        placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
-        messages = tuple(message for message in self._conversation.messages if id(message) not in placeholders)
+        messages = self._visible_history_messages()
         sources = tuple(self._history_source(message) for message in messages)
         return DuplexHistorySnapshot(
             messages=tuple(copy_history_message(message) for message in messages),

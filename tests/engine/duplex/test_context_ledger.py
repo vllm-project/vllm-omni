@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 
 import pytest
 
@@ -59,6 +59,96 @@ def _summary(
         parents=tuple(parent.node_id for parent in parents),
         message={"role": "system", "content": "summary"},
     )
+
+
+@pytest.mark.parametrize("admission", ["single_l1", "single_summary", "batch_l1"])
+def test_admission_detaches_caller_message_containers(session, admission):
+    session.register_history_item("source", _user("authoritative"))
+    snapshot = session.history_snapshot()
+    ledger = DuplexContextLedger()
+    opaque = object()
+    parts = [{"type": "text", "text": "derived"}]
+    labels = ["original"]
+    message = {
+        "role": "user",
+        "content": parts,
+        "metadata": ({"labels": labels},),
+        "opaque": opaque,
+    }
+    if admission == "batch_l1":
+        (node,) = ledger.add_l1_nodes(snapshot, messages={snapshot.source_ids[0]: message})
+    else:
+        node = ledger.add_node(
+            snapshot,
+            level=L1 if admission == "single_l1" else SUMMARY,
+            sources=source_refs(snapshot, snapshot.source_ids[0]),
+            message=message,
+        )
+    dependent = _summary(ledger, snapshot, node)
+
+    message["role"] = "assistant"
+    parts[0]["text"] = "changed"
+    parts.append({"type": "text", "text": "injected"})
+    labels.append("changed")
+
+    assert node.message["role"] == "user"
+    assert node.message["content"] == [{"type": "text", "text": "derived"}]
+    assert node.message["metadata"] == ({"labels": ["original"]},)
+    assert node.message["opaque"] is opaque
+    assert ledger.refresh(snapshot) == ()
+    assert ledger.valid(dependent.node_id)
+    assert session.history_snapshot() == snapshot
+
+
+class UnreadableMessage(Mapping[str, object]):
+    """A plugin message whose container cannot be copied."""
+
+    def __getitem__(self, key: str) -> object:
+        raise RuntimeError("message_copy_failed")
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("message_copy_failed")
+
+    def __len__(self) -> int:
+        return 1
+
+
+def test_l1_batch_copy_failure_does_not_admit_prefix_or_consume_ids(session):
+    for item_id in ("first", "second", "existing"):
+        session.register_history_item(item_id, _user(item_id))
+    snapshot = session.history_snapshot()
+    first, second, existing_source = snapshot.source_ids
+    ledger = DuplexContextLedger()
+    existing = _l1(ledger, snapshot, 2)
+
+    with pytest.raises(RuntimeError, match="message_copy_failed"):
+        ledger.add_l1_nodes(snapshot, messages={first: _user("derived"), second: UnreadableMessage()})
+
+    assert ledger.nodes() == (existing,)
+    assert ledger.l1_node_for(first) is None
+    assert ledger.l1_node_for(second) is None
+    assert ledger.l1_node_for(existing_source) is existing
+    (admitted,) = ledger.add_l1_nodes(snapshot, messages={first: _user("derived")})
+    assert admitted.node_id == 2
+
+
+@pytest.mark.parametrize("rejection", ["unknown_source_id", "source_already_has_media_dropped_node"])
+def test_l1_batch_preflight_rejection_does_not_read_messages(session, rejection):
+    session.register_history_item("first", _user("first"))
+    session.register_history_item("second", _user("second"))
+    snapshot = session.history_snapshot()
+    first, second = snapshot.source_ids
+    ledger = DuplexContextLedger()
+    if rejection == "unknown_source_id":
+        second = -1
+    else:
+        _l1(ledger, snapshot, 1)
+    before = ledger.nodes()
+
+    with pytest.raises(DuplexContextNodeRejectedError, match=rejection):
+        ledger.add_l1_nodes(snapshot, messages={first: UnreadableMessage(), second: _user("derived")})
+
+    assert ledger.nodes() == before
 
 
 def test_node_valid_while_source_revisions_match(session):

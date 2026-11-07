@@ -39,7 +39,7 @@ def render_history_view(
     messages = snapshot.messages
     rendered: list[dict[str, object]] = list(messages)
     node_ids: list[int | None] = [None] * len(messages)
-    pending: dict[int, dict[str, object]] = {}
+    pending: dict[int, Mapping[str, object]] = {}
     tail_start = _verbatim_tail_start(messages, policy.keep_media_user_turns)
     for run in _user_runs(messages[:tail_start]):
         derived: dict[int, Mapping[str, object]] = {}
@@ -55,7 +55,7 @@ def render_history_view(
             source_id = snapshot.source_ids[index]
             node = ledger.l1_node_for(source_id)
             if node is None:
-                pending[index] = copy_history_message(dict(message))
+                pending[index] = message
                 continue
             rendered[index] = copy_history_message(dict(node.message))
             node_ids[index] = node.node_id

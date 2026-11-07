@@ -394,6 +394,12 @@ L1 nodes for the same source revision are rejected through either admission
 API. Callers refresh against a current authoritative snapshot before reading
 valid nodes.
 
+Admission detaches message dictionaries, lists and tuples from the caller while
+sharing opaque payloads. Batch admission prepares every message before writing
+nodes, so a preparation failure leaves the graph and next node ID unchanged.
+The ledger owns admitted message containers; node readers must treat them and
+opaque payloads as read-only. Rendered views are detached from ledger messages.
+
 `discard(node_id)` explicitly retires a derived node and all of its descendants,
 returning their IDs in insertion order. Unknown or already retired IDs are a
 no-op. Retirement clears affected L1 lookups and card terms, leaves tombstones
