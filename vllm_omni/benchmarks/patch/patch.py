@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlparse
 
 import aiohttp
@@ -3691,7 +3691,7 @@ CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "d
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
+from vllm.benchmarks.serve import BenchmarkMetrics, TaskType, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
@@ -4121,10 +4121,9 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
-        # ``make_dataclass`` types this class as ``type``, so isinstance()
-        # narrows to ``object`` and attribute access fails. Keep the runtime
-        # check and read fields through ``Any``.
-        mm_metrics: Any = metrics
+        # make_dataclass builds this subclass dynamically; all direct field
+        # accesses below belong to its statically declared upstream base.
+        mm_metrics = cast(BenchmarkMetrics, metrics)
 
         def measured_ttft(output: RequestFuncOutput) -> float | None:
             session_metrics = getattr(output, "duplex_session_metrics", None)
