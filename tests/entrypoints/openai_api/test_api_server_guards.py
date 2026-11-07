@@ -710,7 +710,11 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     async def inner(scope, receive, send):
         called[scope["type"]] = True
 
-    middleware._inner = inner
+    # The wrapper dispatches through the callable it captured in __init__ as
+    # `_asgi` (a TraceContextMiddleware when a tracing provider is configured,
+    # otherwise the app itself), so replacing `_inner` never intercepts the
+    # HTTP/websocket calls. Replace the dispatch target instead.
+    middleware._asgi = inner
     await middleware(http_scope, _receive, _send)
     await middleware(ws_scope, _receive, _send)
 
