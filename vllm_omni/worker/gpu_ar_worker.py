@@ -35,8 +35,16 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     model_runner_cls = GPUARModelRunner
 
+    def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
+        from vllm_omni.distributed.weight_sharing.worker_session import control_runner
+
+        return control_runner(self.model_runner, operation, messages)
+
     @instrument(span_name="Init device")
     def init_device(self):
+        from vllm_omni.distributed.weight_sharing.worker_session import configure_worker, sharing_memory_request
+
+        sharing_budget = configure_worker(self.vllm_config, role="provider", rank=self.rank)
         if self.device_config.device_type in ("cuda", "musa"):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -107,7 +115,15 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
+            self.requested_memory = sharing_memory_request(
+                sharing_budget,
+                role="provider",
+                rank=self.rank,
+                kv_cache_bytes=self.cache_config.kv_cache_memory_bytes,
+                free_bytes=init_snapshot.free_memory,
+            )
+            if self.requested_memory is None:
+                self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
         else:
@@ -136,9 +152,24 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.use_v2_model_runner = False
             self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
+        if getattr(self.vllm_config, "weight_sharing", None) is not None and not self.use_v2_model_runner:
+            raise ValueError("weight sharing requires model_runner: v2")
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def load_model(self, *args, **kwargs):
+        result = super().load_model(*args, **kwargs)
+        from vllm_omni.distributed.weight_sharing.worker_session import install_runner_session
+
+        install_runner_session(
+            self.model_runner,
+            self.vllm_config,
+            device_index=self.device.index,
+            detach=lambda: None,
+        )
+        return result
 
     def compile_or_warm_up_model(self):
         # Runs before the upstream warmup so the prefill fused-MoE configs and

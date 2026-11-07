@@ -62,6 +62,7 @@ from vllm_omni.config.stage_config import (
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
 )
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 logger = init_logger(__name__)
@@ -2324,6 +2325,7 @@ class VllmOmniConfig:
     pipeline_config: PipelineConfig
     stage_configs: tuple[StageConfigType, ...]
     orchestrator_config: VllmOmniOrchestratorConfig = field(default_factory=VllmOmniOrchestratorConfig)
+    weight_sharing: WeightSharingConfig | None = None
     # Keep strategy provenance separate from the effective orchestrator value:
     # an explicit CLI policy may be present even when the strategy declares no
     # stage-replica axis.
@@ -2468,6 +2470,7 @@ class VllmOmniConfig:
             pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,
+            weight_sharing=deploy.weight_sharing,
             strategy_omni_lb_policy=(strategy_result.omni_lb_policy if strategy_result is not None else None),
         )
 

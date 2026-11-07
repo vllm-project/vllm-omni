@@ -376,6 +376,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         wake_events: list[Event],
     ) -> tuple[list[mp.Process], list[Handle]]:
         od_config = self.od_config
+        # The shared registry is only valid as a spawn argument. Request RPCs
+        # serialize od_config with ordinary pickle, which cannot carry it.
+        sharing_registry = vars(od_config).pop("_sharing_worker_registry", None)
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
@@ -408,6 +411,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
+                kwargs={"sharing_registry": sharing_registry},
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )

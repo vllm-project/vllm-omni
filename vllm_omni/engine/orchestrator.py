@@ -49,6 +49,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
+from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine import (
     AdditionalInformationEntry,
     AdditionalInformationPayload,
@@ -390,6 +391,7 @@ class OrchestratorBase:
 
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when transfer / counter emit paths access them.
+    weight_sharing: SharingRuntime | None = None
     _running_counter: OmniRequestCounter | None = None
     _engines_waiting_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
@@ -568,6 +570,10 @@ class OrchestratorBase:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        if self.weight_sharing is not None:
+            tasks.append(
+                asyncio.create_task(self.weight_sharing.monitor(self._shutdown_event), name="weight-sharing-health")
+            )
         for index, coro in enumerate(self._background_tasks()):
             tasks.append(asyncio.create_task(coro, name=f"orchestrator-background-{index}"))
         if membership_watcher is not None:
@@ -615,7 +621,16 @@ class OrchestratorBase:
                 self._membership.shutdown()
 
             self._orch_monitor.flush()
-            self._shutdown_stages()
+            if self.weight_sharing is not None:
+                # Request handlers have stopped before shared views are detached.
+                try:
+                    await self.weight_sharing.close()
+                finally:
+                    # SharingRuntime owns consumer-first termination. Never fall
+                    # through to independent pool shutdown after a failed close.
+                    self._stages_shutdown = True
+            else:
+                self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
             pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task() and not t.done()]
@@ -693,6 +708,8 @@ class OrchestratorBase:
             msg = await self.request_async_queue.get()
             msg_type = msg.type
 
+            if self.weight_sharing is not None and self.weight_sharing.state != "READY":
+                raise RuntimeError("sharing group is unavailable; stopping request admission")
             if await self._dispatch_message(msg):
                 continue
             if msg_type == "abort":
@@ -895,6 +912,26 @@ class OrchestratorBase:
         args = tuple(msg.args)
         kwargs = dict(msg.kwargs or {})
         requested_stage_ids = msg.stage_ids
+
+        if self.weight_sharing is not None and method not in (
+            "check_health",
+            "get_memory_usage",
+            "get_post_warmup_memory",
+        ):
+            # Arbitrary administrative worker methods can replace shared storage
+            # or bypass its lifetime. Internal lifecycle RPCs use stage clients.
+            await self.rpc_async_queue.put(
+                CollectiveRPCResultMessage(
+                    rpc_id=rpc_id,
+                    method=method,
+                    stage_ids=list(range(self.num_stages)),
+                    results=[
+                        {"supported": False, "error": "administrative mutation is disabled while weights are shared"}
+                        for _ in self.stage_pools
+                    ],
+                )
+            )
+            return
 
         target_pools: list[StagePool] = []
         if requested_stage_ids is None:
@@ -1698,6 +1735,9 @@ class OrchestratorBase:
         keep running and can be (re)dispatched. If the stage has no live replica
         left, every request routed through it must fail since none can be served.
         """
+        if self.weight_sharing is not None:
+            self.weight_sharing.fail(f"stage {stage_id}, replica {replica_id}: {error}")
+            raise RuntimeError("shared-weight stage failed; terminating the sharing group") from error
         pool = self.stage_pools[stage_id]
         logger.error(
             "[Orchestrator] Stage-%s replica-%s is dead; evicting it and failing its in-flight requests: %s",

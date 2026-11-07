@@ -300,6 +300,30 @@ steps:
             --run-level full_model
             --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
 
+      - label: ":full_moon: HunyuanImage3 · Shared TP4 Smoke"
+        source_file_dependencies: diffusion_hunyuan_image3_weight_sharing
+        mirror_hardwares: h100_4
+        timeout_in_minutes: 120
+        commands:
+          - >-
+            pytest -sv tests/e2e/offline_inference/test_hunyuanimage3.py
+            -k shared_backbone_ar_kv -m "full_model and cuda and H100 and cards_4"
+            --run-level full_model
+
+      - label: ":full_moon: HunyuanImage3 · Weight Sharing TP4 E2E"
+        source_file_dependencies: diffusion_hunyuan_image3_weight_sharing
+        mirror_hardwares: h100_weight_sharing_tp4
+        timeout_in_minutes: 180
+        artifact_paths:
+          - artifacts/hunyuan-weight-sharing/**/*
+        commands:
+          - >-
+            pytest -sv tests/e2e/offline_inference/test_hunyuanimage3.py
+            -k shared_backbone_matches_ordinary_loading -m "full_model and cuda and H100 and cards_8"
+            --run-level full_model
+            --basetemp=artifacts/hunyuan-weight-sharing/runs
+            --junitxml=artifacts/hunyuan-weight-sharing/pytest.xml
+
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180

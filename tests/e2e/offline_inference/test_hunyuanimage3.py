@@ -2,16 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # ruff: noqa: E501
+import asyncio
 import copy
 import importlib.util
+import json
 import os
 import sys
+import time
 from collections.abc import Generator
 from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
@@ -413,7 +417,7 @@ def compare_semantic(
     return torch.dot(expected, features).item()
 
 
-def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
+def _generate_outputs(omni: Omni, use_system_prompt: str | None, image_size: int, *, include_text: bool = False):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -424,7 +428,9 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
         bot_task="think",
         sys_type=use_system_prompt or "None",
     )
-    stop_token_ids = resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tokenizer, image_size="1024x1024")
+    stop_token_ids = resolve_stop_token_ids(
+        task="t2i", bot_task="think", tokenizer=tokenizer, image_size=f"{image_size}x{image_size}"
+    )
     params_list = copy.deepcopy(omni.default_sampling_params_list)
     generator_device = current_omni_platform.device_type or "cuda"
     for params in params_list:
@@ -432,6 +438,7 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
             params.seed = 1234
             params.generator = torch.Generator(device=generator_device).manual_seed(1234)
             params.num_outputs_per_prompt = 1
+            params.height = params.width = image_size
         elif hasattr(params, "stop_token_ids"):
             params.stop_token_ids = stop_token_ids
 
@@ -439,12 +446,178 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
         "prompt": PROMPT,
         "prompt_token_ids": prompt_tokens.token_ids,
         "use_system_prompt": prompt_tokens.system_prompt_type,
-        "modalities": ["image"],
-        "height": 1024,
-        "width": 1024,
+        "modalities": ["text", "image"] if include_text else ["image"],
+        "height": image_size,
+        "width": image_size,
     }
-    outputs = omni.generate(prompt, params_list)
-    return _extract_generated_image(outputs)
+    return omni.generate(prompt, params_list)
+
+
+def _generate_image(omni: Omni, use_system_prompt: str | None, image_size: int = 1024) -> Image.Image:
+    return _extract_generated_image(_generate_outputs(omni, use_system_prompt, image_size))
+
+
+@pytest.fixture
+def sharing_tp4_config():
+    """Use production TP4: BF16 backbone plus both KV caches exceeds two H100s."""
+    return Path(get_deploy_config_path("hunyuan-image-3-weight-sharing.yaml")).resolve()
+
+
+@pytest.mark.full_model
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
+def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp4_config):
+    """Real model/connector test; CPU backend tests cannot establish this result."""
+    with OmniRunner(
+        MODEL_NAME,
+        deploy_config=str(sharing_tp4_config),
+        stage_init_timeout=1800,
+        init_timeout=3600,
+    ) as runner:
+        omni = runner.omni
+        sharing = omni.engine._runtime.sharing
+        assert sharing is not None and sharing.state == "READY"
+        assert len(sharing.identities) == 4
+        for _ in range(2):
+            image = _generate_image(omni, "en_think_recaption", image_size=512)
+            assert image.size == (512, 512)
+            assert any(low != high for low, high in image.convert("RGB").getextrema())
+        # The worker reports the larger of allocator reservation and recorded
+        # allocation peak; imported storage is never subtracted on the consumer.
+        ranks = asyncio.run_coroutine_threadsafe(
+            sharing._rpc(sharing.plan.consumer_stage, "status"),
+            omni.engine.orchestrator_loop,
+        ).result(timeout=sharing.plan.timeout + 10)
+        assert all(rank.shared_bytes > rank.private_bytes > 0 for rank in ranks)
+    assert sharing.state == "CLOSED", sharing.error
+    assert sharing.termination_complete
+
+
+@pytest.mark.full_model
+@hardware_test(res={"cuda": "H100"}, num_cards=8)
+def test_shared_backbone_matches_ordinary_loading(tmp_path, record_property, sharing_tp4_config):
+    """Sequential A/B on exclusive GPUs; ordinary loading needs room for two backbones.
+
+    Ordinary AR/DiT use GPUs 0-3/4-7; sharing colocates both on GPUs 0-3.
+    Both stages remain TP4 on the same hardware. NVML measures whole-device resident bytes, while
+    sharing status reports allocator startup peaks. These are distinct metrics;
+    neither a single NVML sample nor resettable peaks prove absence of every
+    transient allocation. Native backend no-copy tests remain complementary.
+    """
+    from vllm.utils.import_utils import import_pynvml
+
+    from tests.e2e.accuracy.helpers import assert_similarity
+
+    base = sharing_tp4_config
+    # Initialize the test client's generator context before either memory baseline.
+    torch.Generator(device=current_omni_platform.device_type or "cuda")
+    devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",")[:8]
+    assert len(devices) == 8, "The TP4 ordinary/shared comparison requires eight visible GPUs"
+    nvml = import_pynvml()
+    nvml.nvmlInit()
+    try:
+        handles = [
+            nvml.nvmlDeviceGetHandleByIndex(int(device))
+            if device.strip().isdigit()
+            else nvml.nvmlDeviceGetHandleByUUID(device.strip())
+            for device in devices
+        ]
+
+        def used_memory():
+            return [nvml.nvmlDeviceGetMemoryInfo(handle).used for handle in handles]
+
+        images = {}
+        ar_tokens = {}
+        measurements = {}
+        for mode in ("ordinary", "shared"):
+            config = base
+            if mode == "ordinary":
+                config = tmp_path / "ordinary.yaml"
+                config.write_text(
+                    yaml.safe_dump(
+                        {
+                            "base_config": str(base),
+                            "weight_sharing": None,
+                            "stages": [{"stage_id": 1, "devices": "4,5,6,7"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            before = used_memory()
+            with OmniRunner(
+                MODEL_NAME, deploy_config=str(config), stage_init_timeout=1800, init_timeout=3600
+            ) as runner:
+                omni = runner.omni
+                sharing = omni.engine._runtime.sharing
+                resident = [used - initial for used, initial in zip(used_memory(), before, strict=True)]
+                # Pair AR rank i on GPU i with DiT rank i on GPU i+4 in the
+                # ordinary run; shared rank i already includes both stages.
+                paired = [resident[i] + resident[i + 4] for i in range(4)] if mode == "ordinary" else resident[:4]
+                measurements[mode] = {
+                    "startup_resident_bytes": resident,
+                    "rank_pair_resident_bytes": paired,
+                }
+                assert all(value > 0 for value in paired), measurements[mode]
+                if mode == "shared":
+                    assert all(abs(value) <= 1024**3 for value in resident[4:]), "Shared run used GPUs 4-7"
+                    assert sharing is not None and sharing.state == "READY"
+                    ranks = asyncio.run_coroutine_threadsafe(
+                        sharing._rpc(sharing.plan.consumer_stage, "status"), omni.engine.orchestrator_loop
+                    ).result(timeout=sharing.plan.timeout + 10)
+                    measurements[mode]["shared_bytes"] = [rank.shared_bytes for rank in ranks]
+                    measurements[mode]["consumer_startup_peak_bytes"] = [rank.private_bytes for rank in ranks]
+                else:
+                    assert sharing is None
+                outputs = _generate_outputs(omni, "en_think_recaption", 512, include_text=True)
+                ar_tokens[mode] = [
+                    list(completion.token_ids)
+                    for output in outputs
+                    if output.stage_id == 0 and output.finished
+                    for completion in output.outputs
+                ]
+                assert ar_tokens[mode] and all(ar_tokens[mode]), "AR output was not returned"
+                images[mode] = _extract_generated_image(outputs)
+                images[mode].save(tmp_path / f"{mode}.png")
+            if mode == "shared":
+                assert sharing.state == "CLOSED", sharing.error
+                assert sharing.termination_complete
+            # CUDA reclamation may lag process exit. Do not use leaked memory
+            # as the next run's baseline and accidentally exaggerate savings.
+            deadline = time.monotonic() + 30
+            while any(used > initial + 1024**3 for used, initial in zip(used_memory(), before, strict=True)):
+                assert time.monotonic() < deadline, f"{mode}: GPU memory was not reclaimed after shutdown"
+                time.sleep(0.5)
+
+        report = json.dumps(measurements, indent=2)
+        (tmp_path / "memory.json").write_text(report, encoding="utf-8")
+        record_property("weight_sharing_memory", report)
+        print(report)
+        assert all(
+            0 < peak < backbone
+            for peak, backbone in zip(
+                measurements["shared"]["consumer_startup_peak_bytes"],
+                measurements["shared"]["shared_bytes"],
+                strict=True,
+            )
+        ), report
+        # Allow allocator/context variance, but require a substantial fraction
+        # of one backbone to disappear on EVERY rank, not just in the aggregate.
+        for ordinary, shared, backbone in zip(
+            measurements["ordinary"]["rank_pair_resident_bytes"],
+            measurements["shared"]["rank_pair_resident_bytes"],
+            measurements["shared"]["shared_bytes"],
+            strict=True,
+        ):
+            assert ordinary - shared >= backbone * 0.5, report
+        assert ar_tokens["shared"] == ar_tokens["ordinary"], "Greedy AR output changed with sharing"
+        assert_similarity(
+            model_name="HunyuanImage3 shared vs ordinary",
+            vllm_image=images["shared"],
+            diffusers_image=images["ordinary"],
+            ssim_threshold=0.99,
+            psnr_threshold=40.0,
+        )
+    finally:
+        nvml.nvmlShutdown()
 
 
 # A floor for "this is recognizably the same generation" against each
