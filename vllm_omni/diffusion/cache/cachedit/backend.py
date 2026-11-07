@@ -120,6 +120,25 @@ def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) ->
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
+def set_separate_cfg(transformer: nn.Module, do_true_cfg: bool) -> None:
+    """Match Cache-DiT's forward-parity accounting to the current request.
+
+    Call once per request, after the runner's refresh and before denoising:
+    sequential CFG runs two forwards per step, whereas no CFG and CFG parallel
+    run one forward per step on each rank. Refreshing clears cached residuals,
+    so this must not run inside the denoising loop. Other cache settings,
+    including the request's step count and computation mask, are preserved.
+    Transformers without Cache-DiT are left alone.
+    """
+    if not BlockAdapter.is_cached(transformer):
+        return
+    cache_dit.refresh_context(
+        transformer,
+        cache_config=DBCacheConfig().reset(enable_separate_cfg=do_true_cfg and _cfg_parallel_world_size() == 1),
+        verbose=False,
+    )
+
+
 def _default_get_pipeline_transformer(
     pipeline: SupportsComponentDiscovery,
 ) -> nn.Module:

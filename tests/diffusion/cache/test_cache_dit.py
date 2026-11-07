@@ -175,6 +175,7 @@ def test_cachedit_public_api_is_explicit():
         "SensenovaCachedAdapter",
         "cache_summary",
         "enable_cache_for_dit",
+        "set_separate_cfg",
     }
     assert not hasattr(cd_backend, "enable_cache_for_wan22")
     assert not hasattr(cd_backend, "enable_cache_for_wan22_s2v")
