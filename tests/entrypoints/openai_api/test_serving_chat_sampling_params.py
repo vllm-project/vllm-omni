@@ -19,6 +19,7 @@ from vllm.sampling_params import SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
 from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -983,3 +984,86 @@ def test_omitted_pooling_stage_keeps_parameter_type(mock_engine_client):
     assert result[1] is not default
     assert result[1].task == "token_classify"
     assert result[1].requires_token_ids is True
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_diffusion_chat_inherits_engine_defaults(mock_engine_client, mocker: MockerFixture, explicit: bool) -> None:
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        guidance_scale=3.0,
+        true_cfg_scale=2.0,
+        seed=42,
+        num_outputs_per_prompt=2,
+        extra_args={"stage_default": "keep"},
+    )
+    captured: list[OmniDiffusionSamplingParams] = []
+
+    async def generate(**kwargs):
+        captured.append(kwargs["sampling_params_list"][0])
+        if False:
+            yield None
+
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_model_name = "test"
+    server._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion")],
+        default_sampling_params_list=[defaults],
+        generate=generate,
+    )
+    server._diffusion_mode = True
+    server._diffusion_extra_body_params = frozenset()
+    server._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("cat", [], [], []))
+    for override in (explicit, False):
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            modalities=["image"],
+            **({"guidance_scale": 0.0, "true_cfg_scale": 0.0} if override else {}),
+        )
+        asyncio.run(server._create_chat_completion(request))
+        params = captured[-1]
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.true_cfg_scale == (0.0 if override else 2.0)
+        assert params.num_inference_steps == 50
+        assert params.seed == 42
+        assert params.num_outputs_per_prompt == 2
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_multistage_diffusion_preserves_each_stage_defaults(
+    mock_engine_client, mocker: MockerFixture, explicit: bool
+) -> None:
+    diffusion_defaults = [
+        OmniDiffusionSamplingParams(guidance_scale=3.0, true_cfg_scale=2.0, seed=42, num_outputs_per_prompt=2),
+        OmniDiffusionSamplingParams(guidance_scale=7.0, true_cfg_scale=4.0, seed=43, num_outputs_per_prompt=3),
+    ]
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[SamplingParams(seed=7), *diffusion_defaults],
+    )
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_engine = engine
+    mocker.patch.object(server, "_resolve_multistage_model_class_name", return_value=None)
+    extra_body = {"guidance_scale": 0.0, "true_cfg_scale": 0.0} if explicit else {}
+    _, _, request_params, _ = server._prepare_diffusion_image_request(prompt="cat", extra_body=extra_body)
+    _, params = server._build_multistage_generation_inputs(
+        engine=engine,
+        prompt="cat",
+        extra_body=extra_body,
+        reference_images=[],
+        gen_params=request_params,
+    )
+    assert params[0].seed == 7
+    for stage_params, default in zip(params[1:], diffusion_defaults):
+        assert stage_params.guidance_scale == (0.0 if explicit else default.guidance_scale)
+        assert stage_params.true_cfg_scale == (0.0 if explicit else default.true_cfg_scale)
+        assert stage_params.seed == default.seed
+        assert stage_params.num_outputs_per_prompt == default.num_outputs_per_prompt
+        assert stage_params is not default

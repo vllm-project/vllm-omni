@@ -801,6 +801,64 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
+def test_multistage_generate_forwards_layers(async_omni_test_client):
+    """Regression: multi-stage /v1/images/generations must forward ``layers``.
+
+    The multi-stage generations path builds ``extra_body`` by hand and used to
+    drop the requested layer count, so layered models kept their default layer
+    count. The single-stage generations path and the multi-stage edits path
+    both forward it.
+    """
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "layers": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == 7
+
+
+def test_multistage_generate_without_layers_keeps_default(async_omni_test_client):
+    """Omitting ``layers`` must leave the stage default layer count untouched."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat"},
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == OmniDiffusionSamplingParams().layers
+
+
+def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion):
+    """The single-stage path also has to carry the requested layer count.
+
+    Sibling of ``test_multistage_generate_forwards_layers``: the two
+    ``/v1/images/generations`` branches build their sampling params
+    differently, so each one needs its own guard.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "layers": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].layers == 7
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
@@ -2836,3 +2894,39 @@ def test_image_sampling_yaml_defaults_reach_generation(
         assert params.extra_args == expected_extra_args
     assert defaults[cfg_field] == cli_defaults.get(cfg_field, default_cfg)
     assert defaults == defaults_before_requests
+
+
+@pytest.mark.parametrize("route", ["generations", "edits"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: str, explicit: bool) -> None:
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        guidance_scale=3.0,
+        seed=42,
+        num_outputs_per_prompt=2,
+        extra_args={"flow_shift": 5.0},
+    )
+    test_client.app.state.engine_client.default_sampling_params_list = [defaults]
+    for override in (explicit, False):
+        payload = {"prompt": "a cat"}
+        if override:
+            payload.update(guidance_scale=0.0, seed=0, n=1)
+        if route == "generations":
+            response = test_client.post("/v1/images/generations", json=payload)
+        else:
+            image = io.BytesIO()
+            Image.new("RGB", (64, 64)).save(image, format="PNG")
+            response = test_client.post(
+                "/v1/images/edits",
+                data=payload,
+                files={"image": ("input.png", image.getvalue(), "image/png")},
+            )
+        assert response.status_code == 200, response.text
+        params = test_client.app.state.engine_client.captured_sampling_params_list[0]
+        assert params.num_inference_steps == 50
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.seed == (0 if override else 42)
+        assert params.num_outputs_per_prompt == (1 if override else 2)
+        assert params.extra_args["flow_shift"] == 5.0
+        params.extra_args["flow_shift"] = 9.0
+    assert defaults.extra_args == {"flow_shift": 5.0}

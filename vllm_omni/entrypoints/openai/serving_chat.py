@@ -145,6 +145,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
     merge_llm_sampling_params,
+    resolve_diffusion_sampling_params,
     to_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import (
@@ -161,6 +162,7 @@ from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, Diffusio
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
     validate_requested_speaker,
 )
 
@@ -1149,8 +1151,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
-            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
-            prompt_additional_information["speaker"] = [normalized]
+            set_prompt_speaker(engine_prompt, normalized)
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():
@@ -2783,6 +2784,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         else (output.finish_reason if output.finish_reason else "stop")
                     ),
                     stop_reason=output.stop_reason,
+                    weight_versions=(
+                        getattr(output, "weight_versions", None) if request.return_weight_versions else None
+                    ),
                 )
                 choices.append(choice_data)
                 continue
@@ -2920,6 +2924,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ),
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                weight_versions=(getattr(output, "weight_versions", None) if request.return_weight_versions else None),
             )
             choices.append(choice_data)
 
@@ -3232,11 +3237,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         width = gen_params.width
         seed = gen_params.seed
         generator_device = gen_params.generator_device
-        num_outputs_per_prompt = gen_params.num_outputs_per_prompt
+        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
         num_inference_steps = extra_body.get("num_inference_steps")
         quality = extra_body.get("quality")
         guidance_scale = extra_body.get("guidance_scale")
-        true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+        true_cfg_scale = extra_body.get("true_cfg_scale", extra_body.get("cfg_scale"))
         negative_prompt = extra_body.get("negative_prompt")
         num_frames = extra_body.get("num_frames")
         guidance_scale_2 = extra_body.get("guidance_scale_2")
@@ -3498,7 +3503,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         seed = extra_body.get("seed")
         generator_device = extra_body.get("generator_device")
         negative_prompt = extra_body.get("negative_prompt")
-        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
         lora_body = extra_body.get("lora")
 
         pil_images: list[Image.Image] = []
@@ -3509,19 +3513,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             except Exception as e:
                 logger.warning("Failed to decode reference image: %s", e)
 
-        gen_params = OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-            seed=seed,
-        )
+        stage_configs = getattr(engine, "stage_configs", None) or []
+        if len(stage_configs) > 1:
+            # Multi-stage requests merge explicit fields into each stage's own defaults.
+            gen_params = OmniDiffusionSamplingParams()
+        else:
+            gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine))
         self._set_if_supported(
             gen_params,
+            height=height,
+            width=width,
+            seed=seed,
+            num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
             generator_device=generator_device,
             quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
-            true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
+            true_cfg_scale=extra_body.get("true_cfg_scale", extra_body.get("cfg_scale")),
             num_frames=extra_body.get("num_frames"),
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),
@@ -3861,7 +3869,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if seed is None:
                 seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
-            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
@@ -3906,10 +3913,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
             if negative_prompt is not None:
                 gen_prompt["negative_prompt"] = negative_prompt
-            gen_params = OmniDiffusionSamplingParams(
+            gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._diffusion_engine))
+            self._set_if_supported(
+                gen_params,
                 height=height,
                 width=width,
-                num_outputs_per_prompt=num_outputs_per_prompt,
+                num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
                 seed=seed,
             )
 
@@ -3987,15 +3996,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 diffusion_params=gen_params,
                 replace_diffusion_params=True,
             )
-            for index, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
-                if get_stage_type(stage_config) != "diffusion" or index >= len(default_sampling_params_list):
-                    continue
-                default_extra_args = getattr(default_sampling_params_list[index], "extra_args", None)
-                if default_extra_args:
-                    sampling_params.extra_args = {
-                        **default_extra_args,
-                        **(getattr(sampling_params, "extra_args", None) or {}),
-                    }
             if not sampling_params_list:
                 sampling_params_list = [gen_params]
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import logging
 from inspect import Signature, signature
 from types import SimpleNamespace
@@ -84,7 +85,12 @@ def _make_server(engine_client=None):
 
 
 @pytest.fixture
-def test_app():
+def test_app(monkeypatch):
+    # Exercise seeded request wiring with a CPU generator in this CPU API test.
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        SimpleNamespace(device_type="cpu"),
+    )
     server = _make_server()
 
     original_fn = server.create_audio_generate
@@ -95,7 +101,7 @@ def test_app():
     async def patched_create_audio_generate(*args, **kwargs):
         return await original_fn(*args, **kwargs)
 
-    patched_create_audio_generate.__signature__ = new_sig
+    setattr(patched_create_audio_generate, "__signature__", new_sig)
     server.create_audio_generate = patched_create_audio_generate
 
     app = FastAPI()
@@ -641,7 +647,11 @@ class TestErrorHandling:
     @pytest.mark.parametrize(
         ("exc", "expected_message", "expected_stage_id"),
         [
-            (OmniEngineDeadError("engine dead", error_stage_id=2), "engine dead", 2),
+            (
+                OmniEngineDeadError("engine dead", error_stage_id=2),
+                OmniEngineDeadError.CLIENT_MESSAGE,
+                2,
+            ),
             (EngineGenerateError("engine generate failed"), "engine generate failed", None),
         ],
     )
@@ -693,7 +703,7 @@ class TestAudioGenerateAPI:
         assert response.headers["content-type"] == "audio/wav"
 
     def test_missing_input_rejected(self, client):
-        payload = {}
+        payload: dict[str, object] = {}
         response = client.post("/v1/audio/generate", json=payload)
         assert response.status_code == 422
 
@@ -702,3 +712,26 @@ class TestAudioGenerateAPI:
         response = client.post("/v1/audio/generate", json=payload)
         # Pydantic v2 ignores extra fields by default
         assert response.status_code == 200
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_audio_generation_inherits_engine_defaults(explicit: bool) -> None:
+    engine = _make_engine_client()
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        guidance_scale=3.0,
+        seed=42,
+        extra_args={"stage_default": "keep"},
+    )
+    engine.default_sampling_params_list = [defaults]
+    server = _make_server(engine)
+    for override in (explicit, False):
+        request = OpenAICreateAudioGenerateRequest(input="rain", **({"guidance_scale": 0.0} if override else {}))
+        asyncio.run(server.create_audio_generate(request))
+        params = engine.generate.call_args.kwargs["sampling_params_list"][0]
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.num_inference_steps == 50
+        assert params.seed == 42
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}
