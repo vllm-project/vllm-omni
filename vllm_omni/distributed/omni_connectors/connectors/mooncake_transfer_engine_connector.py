@@ -36,7 +36,21 @@ _TRANSFER_TIMEOUT_PER_STEP_MS = 5_000
 
 # ZMQ Message constants
 TRANS_DONE = b"trans_done"
+# Legacy errors carry no lifetime proof. Never release a published destination
+# on TRANS_ERROR, including when an older peer sends it.
 TRANS_ERROR = b"trans_error"
+TRANS_NOT_SUBMITTED = b"trans_not_submitted"
+TRANS_UNKNOWN = b"trans_unknown"
+_PROTOCOL_VERSION = 2
+
+# Unknown native operations must retain the engine and registered memory pool.
+_RETAINED_CONNECTORS: set["MooncakeTransferEngineConnector"] = set()
+
+
+class _ReceivePendingError(TimeoutError):
+    """Destination ownership has moved to the connector's pending set."""
+
+
 QUERY_INFO = b"query_info"
 INFO_NOT_FOUND = b"info_not_found"
 
@@ -55,6 +69,7 @@ class QueryResponse:
     request_id: str
     data_size: int
     is_fast_path: bool
+    protocol_version: int = 0
 
 
 @dataclass
@@ -68,6 +83,7 @@ class MooncakeAgentMetadata:
     request_id: str
     dst_addrs: list[int]
     lengths: list[int]
+    protocol_version: int = 0
 
 
 class MooncakeTransferEngineConnector(OmniConnectorBase):
@@ -104,7 +120,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         if TransferEngine is None:
             raise ImportError("Mooncake not available")
 
+        self._state_lock = threading.RLock()
         self._closed = False
+        self._closing = False
+        self._close_scheduled = False
+        self._active_puts = 0
+        self._active_handlers = 0
+        self._receiving_keys: set[str] = set()
+        self._pending_receives: dict[str, tuple[ManagedBuffer, zmq.Socket | None]] = {}
         self._bind_error: Exception | None = None  # fatal ZMQ bind error from listener thread
 
         # --- Early init of all teardown-related fields ---
@@ -116,7 +139,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._listener_thread: threading.Thread | None = None
         self._listener_ready = threading.Event()
         self._local_buffers: dict[str, Any] = {}
-        self._local_buffers_lock = threading.Lock()
+        self._local_buffers_lock = self._state_lock
         self._put_lock = threading.Lock()
         self._req_local = threading.local()
         self._worker_local = threading.local()
@@ -134,6 +157,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         self.config = config
         self.stage_id = config.get("stage_id", -1)
+        self.max_inflight_receives = int(config.get("max_inflight_receives", 64))
+        self.max_inflight_sends = int(config.get("max_inflight_sends", 64))
+        if self.max_inflight_receives < 1 or self.max_inflight_sends < 1:
+            raise ValueError("Mooncake in-flight limits must be positive")
+        self._sender_slots = threading.BoundedSemaphore(self.max_inflight_sends)
         host_config = config.get("host")
         host_value = "auto" if host_config is None else str(host_config)
         # Default sender/receiver bootstrap to a routable local IP so the
@@ -145,6 +173,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             self.host = host_value
         self.zmq_port = config.get("zmq_port", 50051)
         self.protocol = config.get("protocol", "rdma")
+        if os.environ.get("MC_TCP_PROTO") == "1":
+            raise ValueError("Mooncake protocol v2 requires acknowledged TCP completion; unset MC_TCP_PROTO=1")
 
         # --- RDMA Device Configuration ---
         # Specify device names to filter (comma-separated), or empty for all devices.
@@ -329,6 +359,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 logger.error(f"Failed to get local IP via hostname: {e2}, using 127.0.0.1")
                 return "127.0.0.1"
 
+    def _deadline_expired(self) -> bool:
+        deadline = getattr(self._req_local, "deadline", None)
+        return deadline is not None and _time_mod.monotonic() >= deadline
+
+    def _deadline_timeout_ms(self, timeout_ms: int) -> int:
+        """Limit a blocking ZMQ operation to the active receive deadline."""
+        deadline = getattr(self._req_local, "deadline", None)
+        if deadline is None:
+            return timeout_ms
+        remaining_ms = int((deadline - _time_mod.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise TimeoutError("Mooncake receive deadline expired")
+        return min(timeout_ms, max(1, remaining_ms))
+
     def _get_req_socket(self, zmq_addr: str, timeout_ms: int) -> zmq.Socket:
         """Get or create a thread-local cached ZMQ REQ socket.
 
@@ -354,6 +398,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Set timeouts per-call (safe to change between send/recv cycles).
         # SNDTIMEO guards against send() blocking when the peer is unreachable
         # or its receive buffer is full.
+        timeout_ms = self._deadline_timeout_ms(timeout_ms)
         sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
         sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         return sock
@@ -376,8 +421,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         Exposes data for RDMA transfer.
 
         Behavior by data type:
-        - ManagedBuffer (from this pool): Zero-copy, is_fast_path=True
-        - ManagedBuffer (different pool): Fallback to tensor copy path
+        - ManagedBuffer: Copy to an independently owned source allocation
         - torch.Tensor / bytes: Copy to pool, is_fast_path=True
         - Other (dict, etc.): Serialize to bytes, copy to pool, is_fast_path=False
           (receiver will deserialize automatically)
@@ -398,7 +442,21 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # races in the alloc -> copy -> store-metadata flow at the Mooncake
         # C++ engine level.
         with self._put_lock:
-            return self._put_impl(put_key, data)
+            with self._state_lock:
+                if self._closed or self._closing or put_key in self._in_flight_buffers:
+                    return False, 0, None
+                self._active_puts += 1
+            try:
+                # An externally owned ManagedBuffer can be released by its
+                # caller. Copy it so this connector controls native source lifetime.
+                if isinstance(data, ManagedBuffer):
+                    data = data.tensor
+                return self._put_impl(put_key, data)
+            finally:
+                with self._state_lock:
+                    self._active_puts -= 1
+                    if self._closing:
+                        self._schedule_close()
 
     def _put_impl(self, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Internal put implementation, called under _put_lock."""
@@ -422,27 +480,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Pre-process: serialize non-raw types before entering the copy path.
             # This avoids the previous recursive put() pattern and keeps
             # _local_buffers writes atomic (single write, no override needed).
-            if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes)):
+            if not isinstance(data, (torch.Tensor, bytes)):
                 data = OmniSerializer.serialize(data)
                 is_fast_path = False  # Receiver must deserialize
 
-            if isinstance(data, ManagedBuffer):
-                # Zero-Copy Path
-                # Validate that the buffer belongs to this connector's pool.
-                if data.pool_tensor.data_ptr() != self.pool.data_ptr():
-                    # Fallback to copy path: extract tensor and let the
-                    # torch.Tensor branch below handle the copy.
-                    logger.warning("ManagedBuffer from different pool detected. Falling back to copy path.")
-                    data = data.tensor.contiguous()
-                    # Fall through to torch.Tensor branch
-                else:
-                    src_addr = self.base_ptr + data.offset
-                    size = data.size
-                    holder = data  # Keep the buffer alive
-                    should_release_holder = False  # Caller owns it
-
-            # Use 'if' (not 'elif') so the ManagedBuffer fallback above can
-            # convert to Tensor and flow into this branch seamlessly.
             if isinstance(data, (torch.Tensor, bytes)):
                 # Copy Path
                 # 1. Determine size
@@ -514,6 +555,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 return False, 0, None
 
             with self._local_buffers_lock:
+                if put_key in self._in_flight_buffers:
+                    if should_release_holder and isinstance(holder, ManagedBuffer):
+                        holder.release()
+                    return False, 0, None
                 # Release old buffer if put_key already exists (prevents pool leak)
                 old_item = self._local_buffers.pop(put_key, None)
                 if old_item:
@@ -535,6 +580,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Metadata for Consumer
             metadata = {
                 "source_host": self.host,
+                "protocol_version": _PROTOCOL_VERSION,
                 "source_port": self.zmq_port,
                 "data_size": size,
                 "is_fast_path": is_fast_path,  # Hint: True = return ManagedBuffer, False = deserialize
@@ -572,16 +618,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         Returns ``{source_host, source_port, data_size, is_fast_path}``
         or ``None`` when the key is not found / the query fails.
         """
+        if self._deadline_expired():
+            return None
         zmq_addr = f"tcp://{host}:{port}"
-        req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
         try:
+            req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
             req_socket.send(QUERY_INFO + msgspec.msgpack.encode(QueryRequest(request_id=get_key)))
+            req_socket.setsockopt(zmq.RCVTIMEO, self._deadline_timeout_ms(5000))
             resp = req_socket.recv()
             if resp == INFO_NOT_FOUND:
                 return None
             query_resp = msgspec.msgpack.decode(resp, type=QueryResponse)
             return {
                 "source_host": host,
+                "protocol_version": query_resp.protocol_version,
                 "source_port": port,
                 "data_size": query_resp.data_size,
                 "is_fast_path": query_resp.is_fast_path,
@@ -619,7 +669,60 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
         return self._query_metadata_at(get_key, *endpoint)
 
+    def get_with_deadline(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> tuple[Any, int] | None:
+        """Bound network waits; retain abandoned destinations until the write ACK.
+
+        A timeout cannot cancel the remote write. Its destination stays allocated
+        and registered until a terminal response arrives, including during close.
+        """
+        previous_deadline = getattr(self._req_local, "deadline", None)
+        self._req_local.deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
+        try:
+            if self._deadline_expired():
+                return None
+            return self.get(from_stage, to_stage, get_key, metadata)
+        finally:
+            if previous_deadline is None:
+                try:
+                    del self._req_local.deadline
+                except AttributeError:
+                    pass
+            else:
+                self._req_local.deadline = previous_deadline
+
     def get(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[Any, int] | None:
+        key = self._make_key(get_key, from_stage, to_stage)
+        with self._state_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closing or closed")
+            if key in self._pending_receives or key in self._receiving_keys:
+                return None
+            if len(self._receiving_keys) + len(self._pending_receives) >= self.max_inflight_receives:
+                return None
+            self._receiving_keys.add(key)
+        try:
+            return self._get_impl(from_stage, to_stage, get_key, metadata)
+        finally:
+            with self._state_lock:
+                self._receiving_keys.discard(key)
+                if self._closing:
+                    self._schedule_close()
+
+    def _get_impl(
         self,
         from_stage: str,
         to_stage: str,
@@ -649,14 +752,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 Returns ``(DeserializedObject, size)``.
                 Buffer is auto-released internally after deserialization.
         """
-        if self._closed:
-            raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closed")
-
         get_key = self._make_key(get_key, from_stage, to_stage)
         _t0 = _time_mod.perf_counter()
         metadata = self._resolve_metadata(get_key, metadata)
-        if not metadata:
+        if not metadata or self._deadline_expired():
             return None
+        if metadata.get("protocol_version") != _PROTOCOL_VERSION:
+            raise RuntimeError("Mooncake deadline receive requires protocol v2 on both peers")
 
         _t1 = _time_mod.perf_counter()
         query_ms = (_t1 - _t0) * 1000
@@ -681,6 +783,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         except MemoryError:
             return None
 
+        if self._deadline_expired():
+            recv_buffer.release()
+            return None
+
         _t2 = _time_mod.perf_counter()
         alloc_ms = (_t2 - _t1) * 1000
         try:
@@ -690,10 +796,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 source_port=int(src_port),
                 dst_ptr=dst_ptr,
                 data_size=data_size,
+                recv_buffer=recv_buffer,
             )
-        except zmq.Again as e:
+        except _ReceivePendingError:
             self._metrics["timeouts"] += 1
-            logger.error(f"RDMA Get timed out: {e}", exc_info=True)
+            return None
+        except (TimeoutError, zmq.Again) as e:
+            self._metrics["timeouts"] += 1
+            logger.debug("RDMA Get reached its receive deadline: %s", e)
             recv_buffer.release()
             return None
         except Exception as e:
@@ -704,9 +814,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         _t3 = _time_mod.perf_counter()
         rdma_ms = (_t3 - _t2) * 1000
+        if self._deadline_expired():
+            self._metrics["timeouts"] += 1
+            recv_buffer.release()
+            return None
         if resp != TRANS_DONE:
             self._metrics["errors"] += 1
-            logger.error(f"RDMA Get failed: received {resp} instead of TRANS_DONE")
+            logger.error("RDMA Get failed: received %r instead of TRANS_DONE", resp)
             recv_buffer.release()
             return None
 
@@ -715,6 +829,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error(f"Failed to synchronize Mooncake receive buffer: {e}", exc_info=True)
+            recv_buffer.release()
+            return None
+
+        if self._deadline_expired():
+            self._metrics["timeouts"] += 1
             recv_buffer.release()
             return None
 
@@ -784,28 +903,118 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         source_port: int,
         dst_ptr: int,
         data_size: int,
+        recv_buffer: ManagedBuffer,
     ) -> bytes:
-        """Ask the sender to write this key into the local receive buffer."""
+        """Request a remote WRITE; a sent request owns its destination until ACK."""
         agent_meta = MooncakeAgentMetadata(
             remote_hostname=self.host,
             remote_port=self.rpc_port,
             request_id=get_key,
             dst_addrs=[dst_ptr],
             lengths=[data_size],
+            protocol_version=_PROTOCOL_VERSION,
         )
-
-        # Timeout scales with data size: base 30s + 5s per 100MB.
         size_timeout_ms = (data_size // _TRANSFER_TIMEOUT_STEP_BYTES) * _TRANSFER_TIMEOUT_PER_STEP_MS
-        total_timeout_ms = _BASE_TRANSFER_TIMEOUT_MS + size_timeout_ms
-        zmq_addr = f"tcp://{source_host}:{source_port}"
-        req_socket = self._get_req_socket(zmq_addr, timeout_ms=total_timeout_ms)
+        timeout_ms = _BASE_TRANSFER_TIMEOUT_MS + size_timeout_ms
+        # A transfer uses a dedicated socket so an abandoned reply cannot be
+        # consumed by a subsequent request on this thread's metadata socket.
+        req_socket = self.zmq_ctx.socket(zmq.REQ)
+        sent = False
+        deferred = False
+        received = False
         try:
+            req_socket.setsockopt(zmq.LINGER, 0)
+            req_socket.setsockopt(zmq.SNDTIMEO, self._deadline_timeout_ms(timeout_ms))
+            req_socket.connect(f"tcp://{source_host}:{source_port}")
             req_socket.send(msgspec.msgpack.encode(agent_meta))
-            return req_socket.recv()
-        except Exception:
-            # Socket may be stuck after timeout; discard it.
-            self._invalidate_req_socket(zmq_addr)
+            sent = True
+            req_socket.setsockopt(zmq.RCVTIMEO, self._deadline_timeout_ms(timeout_ms))
+            response = req_socket.recv()
+            received = True
+            if response not in (TRANS_DONE, TRANS_NOT_SUBMITTED):
+                raise RuntimeError(f"Mooncake write completion is unknown: {response!r}")
+            return response
+        except Exception as exc:
+            if sent:
+                # No exception, timeout, or local clock proves the remote write
+                # stopped. Transfer exclusive socket/buffer ownership under the
+                # lock; the caller must not release this allocation.
+                deferred = True
+                self._defer_receive(get_key, recv_buffer, req_socket, wait_for_ack=not received)
+                raise _ReceivePendingError(get_key) from exc
             raise
+        finally:
+            if not deferred:
+                req_socket.close(linger=0)
+
+    def _defer_receive(self, get_key: str, buffer: ManagedBuffer, sock: zmq.Socket, *, wait_for_ack: bool) -> None:
+        with self._state_lock:
+            # A received ambiguous reply is final on this REQ socket. The SDK
+            # may still own the memory, but there is no further ACK to wait for.
+            self._pending_receives[get_key] = (buffer, sock if wait_for_ack else None)
+            _RETAINED_CONNECTORS.add(self)
+            if not wait_for_ack:
+                sock.close(linger=0)
+                logger.error("Mooncake completion unknown for %s; retaining destination until process exit", get_key)
+                return
+            waiter = threading.Thread(
+                target=self._finish_receive, args=(get_key,), daemon=True, name="mooncake-completion"
+            )
+            try:
+                waiter.start()
+            except Exception:
+                sock.close(linger=0)
+                self._pending_receives[get_key] = (buffer, None)
+                logger.exception("Cannot start Mooncake completion waiter for %s; retaining destination", get_key)
+
+    def _finish_receive(self, get_key: str) -> None:
+        with self._state_lock:
+            buffer, sock = self._pending_receives[get_key]
+        assert sock is not None
+        completed = False
+        try:
+            sock.setsockopt(zmq.RCVTIMEO, 1000)
+            while True:
+                try:
+                    response = sock.recv()
+                    break
+                except zmq.Again:
+                    continue
+            if response not in (TRANS_DONE, TRANS_NOT_SUBMITTED):
+                raise RuntimeError(f"Mooncake write completion is unknown: {response!r}")
+            if response == TRANS_DONE:
+                self._sync_receive_buffer_if_needed()
+            completed = True
+        except Exception:
+            logger.exception("Mooncake completion for %s is unknown; retaining destination until process exit", get_key)
+        finally:
+            sock.close(linger=0)
+        with self._state_lock:
+            if completed:
+                buffer.release()
+                self._pending_receives.pop(get_key)
+            else:
+                self._pending_receives[get_key] = (buffer, None)
+            self._refresh_retention()
+            if self._closing:
+                self._schedule_close()
+
+    def _refresh_retention(self) -> None:
+        """Called under _state_lock; keep all possibly native-owned memory alive."""
+        if self._pending_receives or self._in_flight_buffers:
+            _RETAINED_CONNECTORS.add(self)
+        elif not self._closing:
+            _RETAINED_CONNECTORS.discard(self)
+
+    def _schedule_close(self) -> None:
+        """Finalize from a separate thread, never join the current sender worker."""
+        if self._closing and not self._close_scheduled:
+            self._close_scheduled = True
+            try:
+                threading.Thread(target=self.close, name="mooncake-close", daemon=True).start()
+            except Exception:
+                self._close_scheduled = False
+                logger.exception("Cannot schedule Mooncake close; retaining registered memory")
 
     def _sync_receive_buffer_if_needed(self) -> float:
         """Synchronize GPU-visible receive memory until Mooncake exposes a finer fence."""
@@ -892,6 +1101,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         if from_stage is not None and to_stage is not None:
             request_id = self._make_key(request_id, from_stage, to_stage)
         with self._local_buffers_lock:
+            if request_id in self._in_flight_buffers:
+                return
             item = self._local_buffers.pop(request_id, None)
             if item:
                 self._in_flight_buffers.discard(request_id)
@@ -919,6 +1130,28 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         }
 
     def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        with self._state_lock:
+            self._close_scheduled = False
+            if self._closed:
+                return
+            self._closing = True
+            if (
+                self._receiving_keys
+                or self._pending_receives
+                or self._in_flight_buffers
+                or self._active_handlers
+                or self._active_puts
+            ):
+                _RETAINED_CONNECTORS.add(self)
+                logger.warning("Mooncake close deferred while operations may still own registered memory")
+                return
+            self._closed = True
+            _RETAINED_CONNECTORS.discard(self)
+        self._close_resources()
+
+    def _close_resources(self) -> None:
         """
         Gracefully shutdown the connector and release all resources.
         This method should be called when the connector is no longer needed.
@@ -926,24 +1159,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         """
         # Idempotent guard — use getattr for safety: if __init__ raised before
         # setting _closed, __del__ → close() would hit AttributeError.
-        if getattr(self, "_closed", True):
-            return
-        self._closed = True
-
         logger.info("Closing MooncakeTransferEngineConnector...")
 
-        # 1. Signal listener thread to stop
-        self._stop_event.set()
-
-        # 2. Wait for listener thread to finish (only if sender mode)
-        if self._listener_thread is not None and self._listener_thread.is_alive():
-            self._listener_thread.join(timeout=2.0)
-            if self._listener_thread.is_alive():
-                logger.warning("Listener thread did not stop gracefully")
-
-        # 3. Shutdown sender executor (may be None if __init__ failed early)
+        # Stop accepting new transfers, then finish existing writes while the
+        # listener can still send their ACKs. Otherwise a receiver that timed
+        # out would retain its destination forever despite a completed write.
+        self.can_put = False
         if self._sender_executor is not None:
             self._sender_executor.shutdown(wait=True, cancel_futures=False)
+        self._stop_event.set()
+        if self._listener_thread is not None and self._listener_thread.is_alive():
+            # Each listener socket wait is bounded. Join before destroying its
+            # context: destroy() is unsafe while another thread owns a socket.
+            self._listener_thread.join()
 
         # 4. Release all pending buffers
         with self._local_buffers_lock:
@@ -957,7 +1185,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # 5. Close thread-local cached REQ sockets (for the calling thread).
         #    Sockets cached in *other* threads are not directly accessible here
         #    because they live in per-thread ``threading.local()`` storage.
-        #    They will be forcefully closed when ``zmq_ctx.term()`` is called
+        #    They will be forcefully closed when ``zmq_ctx.destroy()`` is called
         #    in step 7 below, which is the intended cleanup path.
         cache: dict[str, zmq.Socket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
         if cache:
@@ -965,7 +1193,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 try:
                     sock.close(linger=0)
                 except Exception:
-                    pass  # Best-effort; zmq_ctx.term() below will reclaim
+                    pass  # Best-effort; zmq_ctx.destroy() below will reclaim
             cache.clear()
 
         # 6. Unregister memory from engine (if supported)
@@ -979,7 +1207,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # 7. Close ZMQ contexts (also reclaims sockets cached in other threads)
         try:
             if hasattr(self, "zmq_ctx"):
-                self.zmq_ctx.term()
+                # No get() or completion waiter still owns a socket here.
+                # term() alone would wait forever on other threads' idle caches.
+                self.zmq_ctx.destroy(linger=0)
         except Exception as e:
             logger.warning(f"Failed to terminate ZMQ context: {e}")
 
@@ -1017,6 +1247,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
     def _zmq_listener_loop(self):
         socket = self.zmq_ctx.socket(zmq.ROUTER)
+        # A non-reading peer must not block draining other completion replies.
+        socket.setsockopt(zmq.SNDTIMEO, 1000)
         try:
             socket.bind(f"tcp://{self.host}:{self.zmq_port}")
         except zmq.ZMQError as exc:
@@ -1046,7 +1278,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         response_queue: queue.Queue = queue.Queue()
 
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() or not response_queue.empty():
                 try:
                     # Poll for incoming requests or notifications (with timeout)
                     events = dict(poller.poll(1000))
@@ -1077,14 +1309,30 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     if socket in events:
                         frames = socket.recv_multipart()
                         if len(frames) >= 2:
-                            # Submit to thread pool
-                            self._sender_executor.submit(
-                                self._handle_pull_request,
-                                response_queue,
-                                notify_addr,
-                                frames[0],
-                                frames[-1],
-                            )
+                            reply = None
+                            with self._state_lock:
+                                if self._closing or not self._sender_slots.acquire(blocking=False):
+                                    reply = INFO_NOT_FOUND if frames[-1].startswith(QUERY_INFO) else TRANS_NOT_SUBMITTED
+                                else:
+                                    self._active_handlers += 1
+                                    try:
+                                        assert self._sender_executor is not None
+                                        self._sender_executor.submit(
+                                            self._handle_pull_request,
+                                            response_queue,
+                                            notify_addr,
+                                            frames[0],
+                                            frames[-1],
+                                        )
+                                    except Exception:
+                                        self._active_handlers -= 1
+                                        self._sender_slots.release()
+                                        reply = (
+                                            INFO_NOT_FOUND if frames[-1].startswith(QUERY_INFO) else TRANS_NOT_SUBMITTED
+                                        )
+                                        logger.exception("Cannot submit Mooncake request handler")
+                            if reply is not None:
+                                socket.send_multipart([frames[0], b"", reply])
                 except zmq.ContextTerminated:
                     break
                 except Exception:
@@ -1097,58 +1345,65 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 pass  # Best-effort cleanup during listener shutdown
 
     def _handle_pull_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
-        """
-        Handle pull request or query request in worker thread.
-        Results are put into response_queue and listener is notified via inproc.
-        """
+        """Own a bounded sender slot, including after an ambiguous SDK failure."""
+        uncertain = False
+        key: str | None = None
+        response = TRANS_NOT_SUBMITTED
         try:
-            # Check if this is a query request
             if payload.startswith(QUERY_INFO):
                 self._handle_query_request(response_queue, notify_addr, identity, payload[len(QUERY_INFO) :])
                 return
-
-            # Normal RDMA transfer request
             meta = msgspec.msgpack.decode(payload, type=MooncakeAgentMetadata)
-
-            with self._local_buffers_lock:
-                item = self._local_buffers.get(meta.request_id)
-                if item:
-                    self._in_flight_buffers.add(meta.request_id)
-
-            if not item:
-                response_queue.put((identity, TRANS_ERROR))
-                self._notify_listener(notify_addr)
+            # Legacy consumers release memory on any error. Reject before
+            # invoking the SDK; mixed-version transfers are not supported.
+            if meta.protocol_version != _PROTOCOL_VERSION:
+                response = TRANS_ERROR
                 return
-
-            try:
+            with self._state_lock:
+                item = self._local_buffers.get(meta.request_id)
+                if self._closing or item is None or meta.request_id in self._in_flight_buffers:
+                    return
                 src_addrs, src_lengths, _, _, _, _ = item
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-
-                # RDMA Write
-                ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
-
-                if ret == 0:
-                    self.cleanup(meta.request_id)
-                    response_queue.put((identity, TRANS_DONE))
-                else:
-                    # Keep buffer in _local_buffers so receiver can retry on transient failures.
-                    # Buffer will be cleaned up when: (a) a retry succeeds, (b) close() is called,
-                    # or (c) TTL reclaims it after it is no longer in-flight.
-                    logger.warning(
-                        f"RDMA write failed for {meta.request_id} to {remote_session} "
-                        f"(ret={ret}). Buffer retained for retry."
-                    )
-                    response_queue.put((identity, TRANS_ERROR))
-            finally:
-                with self._local_buffers_lock:
-                    self._in_flight_buffers.discard(meta.request_id)
-
-        except Exception as e:
-            logger.error(f"Push failed: {e}")
-            response_queue.put((identity, TRANS_ERROR))
-
-        # Notify listener thread that response is ready
-        self._notify_listener(notify_addr)
+                if (
+                    len(meta.dst_addrs) != len(src_addrs)
+                    or meta.lengths != src_lengths
+                    or not all(address > 0 for address in meta.dst_addrs)
+                ):
+                    return
+                key = meta.request_id
+                self._in_flight_buffers.add(key)
+                _RETAINED_CONNECTORS.add(self)
+                # A native error/exception does not prove the write stopped.
+                # Pin both ends before entering the synchronous SDK call.
+                uncertain = True
+            remote = f"{meta.remote_hostname}:{meta.remote_port}"
+            response = TRANS_UNKNOWN
+            # Run on the existing sender worker. Receiver socket deadlines do
+            # not cancel this call or establish that a failed write has drained.
+            status = self.engine.batch_transfer_sync_write(remote, src_addrs, meta.dst_addrs, src_lengths)
+            if status != 0:
+                logger.error("Mooncake completion unknown for %s (status=%s); retaining source", key, status)
+                return
+            response = TRANS_DONE
+            with self._state_lock:
+                self._in_flight_buffers.remove(key)
+                uncertain = False
+                self.cleanup(key)
+                self._refresh_retention()
+        except Exception:
+            if response != TRANS_DONE:
+                response = TRANS_UNKNOWN if uncertain else TRANS_NOT_SUBMITTED
+            logger.exception("Mooncake sender failed; destination outcome=%r", response)
+        finally:
+            if not payload.startswith(QUERY_INFO):
+                response_queue.put((identity, response))
+                self._notify_listener(notify_addr)
+            with self._state_lock:
+                self._active_handlers -= 1
+                if not uncertain:
+                    self._sender_slots.release()
+                if self._closing:
+                    self._schedule_close()
 
     def _handle_query_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
         """Handle metadata query request."""
@@ -1167,6 +1422,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     request_id=query.request_id,
                     data_size=src_lengths[0] if src_lengths else 0,
                     is_fast_path=is_fast_path,
+                    protocol_version=_PROTOCOL_VERSION,
                 )
                 response_queue.put((identity, msgspec.msgpack.encode(resp)))
 
