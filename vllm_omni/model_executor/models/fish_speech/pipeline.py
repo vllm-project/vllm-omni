@@ -31,6 +31,7 @@ FISH_SPEECH_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.slow_ar_to_dac_decoder_async_chunk"),
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
                 # <|im_end|> — stop when the model emits end-of-turn.
@@ -46,6 +47,7 @@ FISH_SPEECH_PIPELINE = PipelineConfig(
             model_arch="FishSpeechDACDecoder",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
+            supports_native_mrv2_data_plane=True,
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",

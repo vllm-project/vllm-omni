@@ -65,3 +65,9 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  cuda:
+    # Both stages run on Model Runner V2 on CUDA. Set model_runner: v1 here to
+    # opt out.
+    model_runner: v2

@@ -128,6 +128,46 @@ def test_dac_decoder_uses_tensor_codes_from_runtime_info():
     assert audios[0].shape[0] == 50
 
 
+def test_dac_decoder_decodes_flat_runtime_codes_from_input_ids(monkeypatch):
+    # Model Runner V2 also hands flat codes over in runtime info; they are the input_ids.
+    from vllm_omni.model_executor.models.fish_speech import fish_speech_dac_decoder
+
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = _FakeCodec()
+    decoder._codec_decode_takes_lengths = True
+    decoder._num_codebooks = 2
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._ensure_codec_loaded = lambda: None
+    warnings = []
+    monkeypatch.setattr(fish_speech_dac_decoder.logger, "warning", lambda *args: warnings.append(args))
+    codes = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+
+    out = decoder.forward(
+        input_ids=codes,
+        runtime_additional_information=[{"codes": {"audio": codes}, "meta": {"left_context_size": 1}}],
+    )
+
+    assert out.multimodal_outputs["model_outputs"][0].shape[0] == 50
+    assert warnings == []
+
+
+def test_dac_decoder_loads_the_codec_before_the_first_request():
+    # Model Runner V2 has no warmup dummy run for this stage; on V1 that run loads the codec.
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    loads = []
+    decoder._ensure_codec_loaded = lambda: loads.append(True)
+
+    decoder.capture_auxiliary_graphs()
+
+    assert loads == [True]
+
+
 def test_dac_decoder_supports_codec_decode_without_lengths():
     _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
     decoder = object.__new__(FishSpeechDACDecoder)

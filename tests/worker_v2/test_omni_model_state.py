@@ -1365,3 +1365,52 @@ def test_qwen3_tts_current_step_output_uses_current_spans_and_isolates_requests(
             torch.testing.assert_close(row["codes"]["ref"], refs[i])
     assert [info["codes"]["audio"].shape[0] for info in infos] == [3, 4]
     torch.testing.assert_close(prefill["codes"]["audio"], prefill_snapshot)
+
+
+def test_fish_speech_current_step_frames_use_semantic_ids():
+    """Fish's CB0 is an offset semantic id, so the frame validity comes from the model, not the codebook range."""
+    from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import (
+        FishSpeechSlowARForConditionalGeneration,
+    )
+
+    begin, end, im_end, pad = 100, 107, 200, 7
+    fish = FishSpeechSlowARForConditionalGeneration.__new__(FishSpeechSlowARForConditionalGeneration)
+    torch.nn.Module.__init__(fish)
+    fish._num_codebooks = 3
+    fish._codebook_size = 8
+    fish._semantic_begin_id = begin
+    fish._semantic_end_id = end
+    torch.manual_seed(0)
+    fish.codebook_embeddings = torch.nn.Embedding(3 * 8, _EAGER_DIM)
+    text_embed = torch.nn.Embedding(im_end + 1, _EAGER_DIM)
+    fish.embed_input_ids = lambda ids, **_: text_embed(ids.long())
+    fish.fast_ar = lambda *, semantic_token_id, **_: torch.stack([(semantic_token_id + k) % 8 for k in range(3)], dim=1)
+    # The fused kernel assumes CB0 in [0, codebook vocab); Fish must keep it off.
+    assert not hasattr(fish, "_codebook_vocab_size")
+
+    state = _make_mtp_state()
+    state.model.mtp = fish.mtp
+    state.model.mtp_frame_valid = fish.mtp_frame_valid
+    state.model.embed_input_ids = fish.embed_input_ids
+    _fill_buffers(state, "prefill", "decode", "ended")
+    batch = _EagerBatch([3, 1, 1])
+    # ended: async scheduling ran a request whose input CB0 was im_end once more.
+    input_ids = torch.tensor([pad, pad, pad, begin + 2, im_end])
+    state._mtp_state.recorded = (
+        batch,
+        FrameBatch([(0, 0, "prefill", True), (1, 1, "decode", False), (2, 2, "ended", False)]),
+        input_ids,
+    )
+    hidden = torch.randn(5, _EAGER_DIM)
+    sampled = torch.tensor([[begin + 1], [im_end], [begin + 3]])
+    outputs = _eager_outputs(5)
+
+    state.post_sample(batch, hidden, sampled, outputs)
+
+    assert outputs["meta"]["codec_frame_valid"].tolist() == [0, 0, 1, 0, 0]
+    # The frame kept for the next step is the input V1's talker_mtp builds one step later.
+    v1_input, v1_codes = fish.talker_mtp(
+        sampled[0], fish.embed_input_ids(sampled[0]).reshape(1, -1), hidden[2:3], torch.zeros(1, _EAGER_DIM)
+    )
+    torch.testing.assert_close(state._mtp_state.embeds[0], v1_input[0].to(state._mtp_state.embeds.dtype))
+    assert outputs["codes"]["audio"][2].tolist() == v1_codes[0].tolist()
