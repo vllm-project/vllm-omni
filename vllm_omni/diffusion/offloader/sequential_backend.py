@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
+from vllm.utils.platform_utils import is_pin_memory_available
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
@@ -102,19 +103,16 @@ class SequentialOffloadHook(ModelHook):
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
         moved = False
-        for p in module.parameters():
-            if p.data.device != target_device:
-                data = p.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+        pin = pin_memory and target_device.type == "cpu" and is_pin_memory_available()
+        for tensor in (*module.parameters(), *module.buffers()):
+            # Modules built on host start pageable; pin them on the first offload
+            # so later loads do not stage the whole module through pageable memory.
+            unpinned = pin and not isinstance(tensor.data, DTensor) and not tensor.data.is_pinned()
+            if tensor.data.device != target_device or unpinned:
+                data = tensor.data.to(target_device, non_blocking=non_blocking)
+                if pin and not isinstance(data, DTensor) and not data.is_pinned():
                     data = data.pin_memory()
-                p.data = data
-                moved = True
-        for b in module.buffers():
-            if b.device != target_device:
-                data = b.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
-                    data = data.pin_memory()
-                b.data = data
+                tensor.data = data
                 moved = True
         return moved
 

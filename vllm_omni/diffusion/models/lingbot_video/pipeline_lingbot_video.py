@@ -36,6 +36,13 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader.config import (
+    TEXT_ENCODER_COMPONENT,
+    OffloadStrategy,
+    offload_enabled,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -322,12 +329,28 @@ class LingBotVideoPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        encoder_component_types={"text_encoder": TEXT_ENCODER_COMPONENT},
+        encoder_block_attrs={"text_encoder": ("model.visual.blocks", "model.language_model.layers")},
+    )
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
+        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+            raise ValueError(
+                "LingBot-Video does not support distributed layerwise offload (weight_transfer='allgather', "
+                "resident_layers, or --enable-distributed-layerwise-offload). Use "
+                "diffusion_offload_config mode='layer' with rank-local transfer, or --enable-layerwise-offload."
+            )
+        if getattr(od_config, "quantization_config", None) is not None:
+            raise NotImplementedError(
+                "LingBot-Video does not support quantization: its projections are plain nn.Linear layers."
+            )
         self.od_config = od_config
         self.device = get_local_device()
+        # Build on host under offload so the offload backend decides what goes to the device.
+        load_device = torch.device("cpu") if offload_enabled(od_config) else self.device
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = 8
         self.token_length = TOKEN_LENGTH
@@ -355,7 +378,7 @@ class LingBotVideoPipeline(
             subfolder=transformer_subfolder,
             torch_dtype=transformer_dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        ).to(load_device)
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
             "local_files_only": local_files_only,
@@ -364,7 +387,7 @@ class LingBotVideoPipeline(
             model,
             subfolder=text_encoder_subfolder,
             **text_encoder_kwargs,
-        ).to(self.device)
+        ).to(load_device)
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
             subfolder=processor_subfolder,
@@ -375,7 +398,7 @@ class LingBotVideoPipeline(
             subfolder=vae_subfolder,
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        ).to(load_device)
         self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
             model,
             subfolder=scheduler_subfolder,
@@ -391,12 +414,11 @@ class LingBotVideoPipeline(
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
-        super().to(*args, **kwargs)
         if device is not None:
-            self.device = torch.device(device)
-            self.transformer.to(device=self.device, non_blocking=non_blocking)
-            self.text_encoder.to(device=self.device, non_blocking=non_blocking)
-            self.vae.to(device=self.device, non_blocking=non_blocking)
+            super().to(device=device, non_blocking=non_blocking)
+            # Under offload, to("cpu") parks weights on host; execution stays on the accelerator.
+            if not offload_enabled(self.od_config):
+                self.device = torch.device(device)
         if dtype is not None:
             self.transformer.to(dtype=dtype, non_blocking=non_blocking)
         return self

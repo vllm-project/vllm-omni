@@ -514,3 +514,26 @@ class TestMoveParamsPinMemory:
         )
         hook._move_params(module, accelerator_device, non_blocking=False, pin_memory=True)
         assert not tracker["called"], "pin_memory should not be called for non-CPU target"
+
+    def test_host_built_module_is_pinned_on_first_offload(self, accelerator_device):
+        """A module constructed on host starts pageable and must be pinned by the first offload."""
+        module = _create_simple_module().to("cpu")
+        assert not any(p.is_pinned() for p in module.parameters())
+
+        moved = SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+        assert moved
+        assert all(t.is_pinned() for t in (*module.parameters(), *module.buffers()))
+        assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+    def test_host_module_stays_pageable_without_pin_support(self, monkeypatch: pytest.MonkeyPatch):
+        """Hosts without pinned memory must not try to re-pin a host-built module."""
+        from vllm_omni.diffusion.offloader import sequential_backend
+
+        module = _create_simple_module().to("cpu")
+        tracker, mock_pin = _track_pin_memory_calls()
+        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
+        monkeypatch.setattr(sequential_backend, "is_pin_memory_available", lambda: False)
+
+        assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+        assert not tracker["called"]
