@@ -7,7 +7,7 @@ import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeAudioEncoderConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_test
 from tests.model_executor.models.qwen3_omni.test_vision_encoder_cudagraph_cuda import _parallel_state  # noqa: F401
 from vllm_omni.model_executor.models.qwen3_omni.audio_encoder_cudagraph import (
     Qwen3OmniAudioEncoderCudaGraphs,
@@ -15,9 +15,10 @@ from vllm_omni.model_executor.models.qwen3_omni.audio_encoder_cudagraph import (
     replay_audio_inputs,
 )
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"})]
+pytestmark = [pytest.mark.core_model]
 
 
+@pytest.mark.cpu
 def test_audio_chunk_metadata_preserves_clip_boundaries():
     chunks, indices, boundaries, lengths = audio_chunk_metadata([100, 101, 205], 100, 800)
     assert chunks == [100, 100, 1, 100, 100, 5]
@@ -26,7 +27,8 @@ def test_audio_chunk_metadata_preserves_clip_boundaries():
     assert indices == list(range(27)) + list(range(39, 66))
 
 
-def test_default_audio_capture_is_one_full_width_graph_per_chunk_count():
+@pytest.mark.cpu
+def test_default_audio_capture_has_full_widths_and_single_short_clip_widths():
     graphs = Qwen3OmniAudioEncoderCudaGraphs(type("Tower", (), {"n_window": 50})())
     assert graphs.capture_shapes == [(count, count * 13) for count in range(1, 65)]
     # One exact-width graph per single clip shorter than the 100-frame window.
@@ -34,11 +36,13 @@ def test_default_audio_capture_is_one_full_width_graph_per_chunk_count():
     assert graphs.num_graphs_to_capture() == 64 + 99
 
 
+@pytest.mark.cpu
 def test_explicit_budgets_do_not_capture_short_widths():
     graphs = Qwen3OmniAudioEncoderCudaGraphs(type("Tower", (), {"n_window": 50})(), budgets=(1, 2))
     assert graphs.short_widths == ()
 
 
+@pytest.mark.cpu
 def test_shared_features_and_metadata_refresh(monkeypatch):
     from types import SimpleNamespace
 
@@ -96,6 +100,7 @@ def test_shared_features_and_metadata_refresh(monkeypatch):
     assert len(uploads) == 14
 
 
+@pytest.mark.cpu
 def test_tail_rows_replay_full_width_graph_without_mixing_padding():
     chunks, indices, boundaries, _ = audio_chunk_metadata([100, 101, 205], 100, 800)
     cnn_width = 13
@@ -139,6 +144,7 @@ def _init_tower_weights(tower):
 
 @pytest.mark.parametrize("input_stride", [1, 2])
 @pytest.mark.parametrize("backend", [AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TRITON_ATTN])
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.usefixtures("_parallel_state")
 def test_audio_graph_matches_eager_and_preserves_cached_outputs(monkeypatch, backend, input_stride):
@@ -223,6 +229,7 @@ def test_audio_graph_matches_eager_and_preserves_cached_outputs(monkeypatch, bac
             torch.testing.assert_close(output, saved, rtol=0, atol=0)
 
 
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.usefixtures("_parallel_state")
 def test_short_clip_graph_matches_eager(monkeypatch):
