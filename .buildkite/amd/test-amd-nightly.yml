@@ -1360,6 +1360,60 @@ steps:
             fi
             (exit "$$status")
 
+  - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
+    steps:
+      - label: "Diffusion Exchange, Ring and CFG Parity · 2 GPUs"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_collective_parity
+        artifact_paths:
+          - artifacts/rocm-diffusion-collectives-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 20 45m rocm-diffusion-collectives-2gpu
+            tests/diffusion/distributed/test_comm.py
+            tests/diffusion/distributed/test_cfg_parallel.py
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
+      - label: "Diffusion Exchange and Ring Parity · 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_collective_parity
+        artifact_paths:
+          - artifacts/rocm-diffusion-collectives-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 10 45m rocm-diffusion-collectives-4gpu
+            tests/diffusion/distributed/test_comm.py
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
+
+      # There is no three-GPU pool. Reserve four devices explicitly; each test
+      # spawns exactly three RCCL ranks on local devices 0, 1, 2. The fourth
+      # device is reserved and unused. Do not relabel cards_3 as cards_4.
+      - label: "Diffusion CFG Parity · 3 Ranks on 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_collective_parity
+        artifact_paths:
+          - artifacts/rocm-diffusion-cfg-3rank/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 45m rocm-diffusion-cfg-3rank
+            tests/diffusion/distributed/test_cfg_parallel.py::test_predict_noise_with_multi_branch_cfg_parity
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_3"
+
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     steps:
       - label: "ROCm · Tiny Diffusion Multi-GPU · 2-GPU"
