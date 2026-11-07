@@ -4,7 +4,7 @@ import hashlib
 import os
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from dataclasses import replace
 from functools import partial
 from math import gcd
@@ -108,6 +108,8 @@ _REFERENCE_CONDITIONING_INFLIGHT: dict[
     tuple[SpeakerEmbeddingCache, tuple[str, str, int]], Future[dict[str, torch.Tensor]]
 ] = {}
 _REFERENCE_CONDITIONING_LOCK = Lock()
+# Bound the wait so a wedged owner cannot hang every caller sharing its reference audio.
+_REFERENCE_CONDITIONING_WAIT_S = 30.0
 
 
 def _normalize_request_conditioning(payload: dict) -> dict:
@@ -197,12 +199,13 @@ def _audio_conditioning(proc, audio, model_dir: str, config, mm_kwargs: Mapping[
                 future = Future()
                 _REFERENCE_CONDITIONING_INFLIGHT[inflight_key] = future
     if os.environ.get("COSYVOICE3_REFERENCE_CACHE_DEBUG") == "1":
-        _REFERENCE_CACHE_DEBUG[cached is not None] += 1
+        _REFERENCE_CACHE_DEBUG["hits" if cached is not None else ("misses" if owner else "coalesced")] += 1
         if sum(_REFERENCE_CACHE_DEBUG.values()) % 128 == 0:
             logger.info(
-                "CosyVoice3 reference cache lookups: hits=%d misses=%d model_dir=%s",
-                _REFERENCE_CACHE_DEBUG[True],
-                _REFERENCE_CACHE_DEBUG[False],
+                "CosyVoice3 reference cache lookups: hits=%d misses=%d coalesced=%d model_dir=%s",
+                _REFERENCE_CACHE_DEBUG["hits"],
+                _REFERENCE_CACHE_DEBUG["misses"],
+                _REFERENCE_CACHE_DEBUG["coalesced"],
                 model_dir,
             )
     if cached is None:
@@ -232,12 +235,24 @@ def _audio_conditioning(proc, audio, model_dir: str, config, mm_kwargs: Mapping[
                 # Even an interrupted owner must release every waiting caller.
                 with _REFERENCE_CONDITIONING_LOCK:
                     _REFERENCE_CONDITIONING_INFLIGHT.pop(inflight_key)
-                future.set_exception(error)
+                if isinstance(error, Exception):
+                    future.set_exception(error)
+                else:
+                    waiter_error = RuntimeError("CosyVoice3 reference conditioning was interrupted in another request")
+                    waiter_error.__cause__ = error
+                    future.set_exception(waiter_error)
                 raise
             with _REFERENCE_CONDITIONING_LOCK:
                 _REFERENCE_CONDITIONING_INFLIGHT.pop(inflight_key)
             future.set_result(cached)
         else:
+            if not wait((future,), timeout=_REFERENCE_CONDITIONING_WAIT_S).done:
+                logger.warning(
+                    "CosyVoice3 reference conditioning still running in another request after %.0f s",
+                    _REFERENCE_CONDITIONING_WAIT_S,
+                )
+                raise TimeoutError("CosyVoice3 reference conditioning timed out waiting for another request")
+            # Re-raises the owner's own error, including its own TimeoutError.
             cached = future.result()
     return {key: value.clone() for key, value in cached.items()}
 
@@ -418,8 +433,11 @@ class _SpeechTokenBatcher:
 
 
 _REFERENCE_CONDITIONERS: dict[str, "CosyVoice3MultiModalProcessor"] = {}
-_REFERENCE_CACHE_DEBUG = {True: 0, False: 0}
+_REFERENCE_CACHE_DEBUG = {"hits": 0, "misses": 0, "coalesced": 0}
 _REFERENCE_CONDITIONERS_LOCK = Lock()
+# Own lock for the first S3 load, so same-reference callers still reach the bounded wait in _audio_conditioning.
+# Owners of other references still queue here without a timeout.
+_S3_MODEL_LOCK = Lock()
 
 
 def prefetch_reference_conditioning(model_dir: str, config, audio) -> None:
@@ -591,7 +609,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
     def _ensure_s3_model(cls):
         if cls._s3_model is not None:
             return cls._s3_model
-        with _REFERENCE_CONDITIONERS_LOCK:
+        with _S3_MODEL_LOCK:
             if cls._s3_model is None:
                 cls._s3_model = cls._load_s3_model()
         return cls._s3_model
