@@ -11,7 +11,7 @@ and output delivery. For user-facing configuration and CLI examples, see
 `max_num_seqs` as that mode's scheduler capacity:
 
 | Configuration | Engine mode | Scheduler | Execution |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `step_execution=False`, `max_num_seqs=1` | `REQUEST_BATCH` | `RequestScheduler` | One complete request-level `forward()` |
 | `step_execution=False`, `max_num_seqs>1` | `REQUEST_BATCH` | `RequestScheduler` | One fused `forward()` over compatible requests |
 | `step_execution=True`, `max_num_seqs=1` | `STEP_BATCH` | `StepScheduler` | One request advanced one denoise step per scheduler tick |
@@ -139,7 +139,7 @@ Step execution exposes denoising progress to the scheduler. A supporting
 pipeline implements four stateful operations:
 
 | Operation | Responsibility |
-|---|---|
+| --- | --- |
 | `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
 | `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
 | `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
@@ -149,8 +149,34 @@ Persistent request state lives in `StepRequestState`. Pipeline-specific fields
 that do not belong in the shared contract should be stored in `state.extra`.
 Queueing and lifecycle metadata remain in the scheduler's request state.
 
+### Resumable Prepare
+
+`prepare_encode()` is one-time request setup, and the runner calls it once. A
+unified model whose request begins with autoregressive decode runs that decode
+inside the prepare phase, so the single call lasts as long as the decode does
+while every other scheduled request waits on it. Such a pipeline can implement
+the optional `SupportsResumablePrepare` companion:
+
+| Operation | Responsibility |
+| --- | --- |
+| `prepare_steps_remaining(state)` | Upper bound on remaining prepare steps, or `None` or `0` once prepare is done |
+| `prepare_step(state)` | Advance the prepare phase by one step |
+
+The runner then calls `prepare_encode()`, and afterwards one `prepare_step()`
+per scheduler tick until `prepare_steps_remaining()` returns `None` or `0`, and the
+step that ends the phase puts the request back into the same tick's denoise
+batch. A request inside its prepare phase is not part of that batch, so the
+requests past their own prepare phase keep denoising while it decodes; a
+pipeline that also restricts itself to one active request gets the smaller
+benefit of returning to the scheduler between tokens. The bound may exceed the
+number of steps actually taken, because a decode loop stops on an end token.
+
+A pipeline whose prepare phase produces the whole output leaves
+`state.timesteps` unset; the runner decodes that request with `post_decode()`
+and finishes it as soon as prepare is done, without a denoise step.
+
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
+Qwen-Image, BAGEL, HunyuanImage3, Helios, and SenseNova-U1 / U1.5. Step execution alone does not
 imply continuous-batching support: Qwen-Image accepts batched step states.
 BAGEL accepts batched step states for image generation with its default,
 think-mode, and single-stage deploy configs. Only the diffusion stage uses the
@@ -169,6 +195,18 @@ Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
 for its validated configuration. Helios supports only a single active step
 request and must use `max_num_seqs=1`.
+SenseNova-U1 and U1.5 share a pipeline that implements step execution together
+with `SupportsResumablePrepare`, and U1.5 batches its step waves: a wave carries
+several requests through one `denoise_step` call, one transformer forward per
+request with request-local KV caches and CFG branches. The think and text
+decode phases run on a model-local paged cache that holds one sequence at a
+time, so the pipeline serializes those phases instead of capping
+`max_num_seqs`: at most one decode is live at a time, and a request that
+arrives while another one is decoding keeps its whole prepare phase queued
+while its peers keep stepping through their denoise waves. Requests whose
+derived CFG switch differs (`extra_args.cfg_scale` on vs off) are separated at
+admission through the batch-compatibility key, because the shared batch state
+admits only one CFG switch per wave.
 
 ### Continuous Batching
 
