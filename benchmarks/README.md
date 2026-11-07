@@ -9,6 +9,13 @@ This directory contains benchmark suites for evaluating different model families
 CPU-observed A/B timings for redundant text embedding removal, with real checkpoint
 embeddings, warmup, paired blocks, and embedding call-count validation.
 
+### [π0.5](pi05/README.md) — VLA Policy Latency
+
+Client E2E latency over the OpenPI websocket and model-level `sample_actions` latency for π0.5.
+
+- **Layout**: `pi05/e2e_latency_pi05.py` (OpenPI websocket client), `pi05/bench_pi05.py` (model-level sweep)
+- **Key metrics**: p50/p95 latency, device memory peak
+
 ### [TTS](tts/README.md) — Text-to-Speech
 
 Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM2.
