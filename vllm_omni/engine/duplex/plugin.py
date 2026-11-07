@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
@@ -496,6 +498,18 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    uses_context_ledger: bool = False
+
+    def observe_history_context(
+        self,
+        *,
+        snapshot: DuplexHistorySnapshot,
+        ledger: DuplexContextLedger,
+        state: DuplexModelSessionState,
+        runtime_config: Mapping[str, object],
+    ) -> None:
+        """Observe versioned sources on the session owner loop, never a worker thread."""
 
     async def prepare_auxiliary_request(
         self,

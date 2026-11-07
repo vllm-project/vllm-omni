@@ -178,6 +178,20 @@ class DuplexContextLedger:
                     del self._media_dropped_by_source[source_id]
         return tuple(removed)
 
+    def discard(self, node_id: int) -> tuple[int, ...]:
+        """Retire a derived node and its descendants without editing source history."""
+        removed: list[int] = []
+        for node in tuple(self._nodes.values()):
+            if node.node_id != node_id and not any(parent in removed for parent in node.parents):
+                continue
+            del self._nodes[node.node_id]
+            removed.append(node.node_id)
+            if node.level is DuplexContextLevel.MEDIA_DROPPED:
+                source_id = node.sources[0].source_id
+                if self._media_dropped_by_source.get(source_id) == node.node_id:
+                    del self._media_dropped_by_source[source_id]
+        return tuple(removed)
+
     def valid(self, node_id: int) -> bool:
         """Whether the node survived the latest refresh."""
         return node_id in self._nodes
