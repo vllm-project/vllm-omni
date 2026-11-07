@@ -2091,7 +2091,7 @@ summary memory. These policies extend the existing commit-based duplex session;
 they do not increase the checkpoint's native context length.
 
 ```yaml
-base_config: qwen3_omni_duplex.yaml
+base_config: qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   qwen_context_policy: budget_summary
   qwen_context_max_tokens: 4096
@@ -2099,6 +2099,12 @@ duplex_session:
   qwen_summary_max_tokens: 512
   qwen_summary_input_max_tokens: 3072
   qwen_summary_timeout_s: 30
+  context_auxiliary_budget:
+    max_input_tokens: 8192
+    max_output_tokens: 1024
+    window_s: 60
+    cooldown_s: 5
+    idle_s: 1
 ```
 
 | Setting | Default | Meaning |
@@ -2108,6 +2114,7 @@ duplex_session:
 | `qwen_summary_max_tokens` | `512` | Maximum tokens generated for a summary |
 | `qwen_summary_input_max_tokens` | `8192` | Maximum summary input, additionally capped by the deployment context allowance |
 | `qwen_summary_timeout_s` | `30` | Auxiliary model request deadline in seconds |
+| `context_auxiliary_budget` | `null` | Optional common auxiliary allowance; all five fields must be provided |
 
 These settings are deployment-owned, not client session overrides. Set the
 context allowance no higher than the deployed Thinker's `max_model_len`.
@@ -2128,6 +2135,18 @@ priority. Failed, empty, truncated, timed-out or stale results are ignored,
 as are known bare acknowledgments and explicit no-memory results, and
 the prompt continues with budget selection and any still-valid memory. A failed
 source is not retried repeatedly without new eligible evidence.
+
+The example's auxiliary limits are explicit experimental values. The account
+charges input token IDs and reserved output tokens within a rolling `window_s`,
+with `cooldown_s` between submissions and `idle_s` after user activity. A
+submitted request remains charged if it fails or is cancelled. Work waiting for
+resources consumes no model allowance and can resume when capacity returns.
+Limits remain fixed across live-session resume. The account is separate from
+the foreground prompt-token allowance; clients cannot override it. With no
+common account, summaries keep their existing scheduling and extraction-only
+cards retain their existing compute settings. Configuring both policies
+requires the explicit common account, whose output allowance must fit each
+request's reserved generation.
 
 The most recent complete historical turn takes priority over summary memory.
 A usable summary then takes priority over additional older verbatim turns.

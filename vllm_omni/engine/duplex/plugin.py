@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudgetLimits
     from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
     from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
@@ -470,6 +471,15 @@ class DuplexModelPlugin(ABC):
         """Bind deployment-owned policy before sessions can be admitted."""
         if runtime_config.context_memory is not None:
             raise ValueError("context_memory is unsupported by this duplex plugin")
+        if runtime_config.context_auxiliary_budget is not None:
+            raise ValueError("context_auxiliary_budget is unsupported by this duplex plugin")
+
+    def auxiliary_budget_limits(self) -> DuplexAuxiliaryBudgetLimits | None:
+        """Return the deployment's shared private-work allowance, or opt out."""
+        return None
+
+    def auxiliary_request_submitted(self, *, request: DuplexAuxiliaryRequest, state: DuplexModelSessionState) -> None:
+        """Mark prepared work attempted after resource admission, without yielding."""
 
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""

@@ -19,7 +19,7 @@ from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
-from vllm_omni.config.context_memory import DuplexContextMemoryConfig
+from vllm_omni.config.context_memory import DuplexAuxiliaryBudgetConfig, DuplexContextMemoryConfig
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
@@ -747,6 +747,8 @@ class DuplexSessionRuntimeConfig:
     context_keep_media_turns: int | None = None
     # Experimental text-only extraction; configured only by the deployment.
     context_memory: DuplexContextMemoryConfig | None = None
+    # Shared summary/card allowance; mixed execution requires explicit limits.
+    context_auxiliary_budget: DuplexAuxiliaryBudgetConfig | None = None
     qwen_context_policy: Literal["legacy", "budget", "budget_summary"] = "legacy"
     qwen_context_max_tokens: int | None = None
     qwen_summary_max_tokens: int = 512
@@ -766,6 +768,16 @@ class DuplexSessionRuntimeConfig:
             object.__setattr__(self, "context_memory", memory)
         elif self.context_memory is not None and not isinstance(self.context_memory, DuplexContextMemoryConfig):
             raise ValueError("duplex_session.context_memory must be a mapping or null")
+        if isinstance(self.context_auxiliary_budget, Mapping):
+            try:
+                budget = DuplexAuxiliaryBudgetConfig(**self.context_auxiliary_budget)
+            except TypeError as exc:
+                raise ValueError("invalid duplex_session.context_auxiliary_budget fields") from exc
+            object.__setattr__(self, "context_auxiliary_budget", budget)
+        elif self.context_auxiliary_budget is not None and not isinstance(
+            self.context_auxiliary_budget, DuplexAuxiliaryBudgetConfig
+        ):
+            raise ValueError("duplex_session.context_auxiliary_budget must be a mapping or null")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.qwen_context_policy not in ("legacy", "budget", "budget_summary"):

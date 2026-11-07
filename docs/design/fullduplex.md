@@ -513,9 +513,14 @@ failure refunds once; resource deferral does not spend retries. Manager-local
 private admission is released only for request IDs whose cleanup succeeded;
 failed cleanup retains the permit for teardown retry. Waiting work wakes through
 the existing mailbox and stops with its session. These internal limits are fixed
-for the session lifetime and default to disabled. Shared L2/L3 policy selection,
-Qwen deployment configuration and final prompt consumption remain separate
-integrations; the L1 view policy below does not enable memory extraction.
+for the session lifetime and default to disabled. Qwen can configure this account
+through the deployment-owned `context_auxiliary_budget`. Summary work then uses
+measured token IDs and records its attempted identity only after resource
+admission. A temporary allowance shortage leaves that work eligible for the
+next window. Legacy summary preparation retains its existing contract when no
+common account is configured. Selection between summary/card work and final card
+prompt consumption remain separate integrations; the L1 view policy below does
+not enable memory extraction.
 
 Qwen's memory codec renders captured text as quoted JSON data with local
 evidence and barrier handles. Its strict output schema accepts upsert/retract

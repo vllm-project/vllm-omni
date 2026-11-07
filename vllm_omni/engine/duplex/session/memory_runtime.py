@@ -410,7 +410,8 @@ class SessionMemoryRuntime:
         if any(duplex_is_auxiliary_request(request_id) for _, request_id in self._ctx.session.request_resources):
             return
         context = None
-        compute_budget = None
+        common_limits = self._ctx.plugin.auxiliary_budget_limits()
+        compute_budget = self._ctx.session.context_compute_budget(common_limits) if common_limits is not None else None
         if context_mode:
             if self._interaction_pending or self._interaction_active:
                 return
@@ -584,8 +585,11 @@ class SessionMemoryRuntime:
                     if reservation is None:
                         self._defer_resources(compute_budget.next_ready_at(inputs, outputs, now=now))
                         return None
+                self._ctx.plugin.auxiliary_request_submitted(request=request, state=self._ctx.model_state)
+                if compute_budget is not None:
                     if not self._ctx.manager.mark_auxiliary_submitted(request_id):
                         return None
+                    assert reservation is not None
                     if not compute_budget.settle(reservation, submitted=True, now=self._ctx.manager._clock()):
                         return None
                 submission_started = True
@@ -650,7 +654,11 @@ class SessionMemoryRuntime:
                     raise asyncio.CancelledError
         # Queue completion after cleanup, so the mailbox may schedule the next
         # bounded chunk without racing the previous task's owned resources.
-        if context is not None and request is not None and (request.stage_id, request_id) in session.request_resources:
+        if (
+            (context is not None or compute_budget is not None)
+            and request is not None
+            and (request.stage_id, request_id) in session.request_resources
+        ):
             return
         if request is not None and submission_started and operation == self._generation:
             self._completion_pending = True

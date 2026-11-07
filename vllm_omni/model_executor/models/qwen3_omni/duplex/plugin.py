@@ -351,7 +351,9 @@ class QwenDataPlane(DuplexDataPlane):
 class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
-    private_runtime_config_keys = frozenset({"context_memory", "duplex_session", "memory_compute_budget"})
+    private_runtime_config_keys = frozenset(
+        {"context_memory", "duplex_session", "memory_compute_budget", "context_auxiliary_budget"}
+    )
 
     def __init__(self, encode_audio):
         self.data_plane = QwenDataPlane(encode_audio)
@@ -360,6 +362,7 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
         self._history_calibrator = None
         self._memory_config: DuplexContextMemoryConfig | None = None
         self._memory_compute_limits: DuplexAuxiliaryBudgetLimits | None = None
+        self._shared_compute_limits: DuplexAuxiliaryBudgetLimits | None = None
         self._memory_max_model_len: int | None = None
         self._context_config = DuplexSessionRuntimeConfig()
         self.max_model_len = 0
@@ -372,8 +375,27 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
         self._context_config = runtime_config
         self._memory_config = runtime_config.context_memory
         self.supports_context_auxiliary_requests = self._memory_config is not None
-        self._memory_compute_limits = None
-        if self._memory_config is not None:
+        budget = runtime_config.context_auxiliary_budget
+        if self.supports_auxiliary_requests and self._memory_config is not None and budget is None:
+            raise ValueError("mixed Qwen memory requires context_auxiliary_budget")
+        self._shared_compute_limits = (
+            DuplexAuxiliaryBudgetLimits(
+                max_input_tokens=budget.max_input_tokens,
+                max_output_tokens=budget.max_output_tokens,
+                window_s=budget.window_s,
+                cooldown_s=budget.cooldown_s,
+                idle_s=budget.idle_s,
+            )
+            if budget is not None
+            else None
+        )
+        if budget is not None and (
+            (self.supports_auxiliary_requests and runtime_config.qwen_summary_max_tokens > budget.max_output_tokens)
+            or (self._memory_config is not None and self._memory_config.output_token_limit > budget.max_output_tokens)
+        ):
+            raise ValueError("context_auxiliary_budget cannot fit reserved output")
+        self._memory_compute_limits = self._shared_compute_limits
+        if self._memory_config is not None and self._memory_compute_limits is None:
             config = self._memory_config
             self._memory_compute_limits = DuplexAuxiliaryBudgetLimits(
                 max_input_tokens=config.compute_input_tokens,
@@ -382,6 +404,9 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
                 cooldown_s=config.cooldown_s,
                 idle_s=config.idle_s,
             )
+
+    def auxiliary_budget_limits(self) -> DuplexAuxiliaryBudgetLimits | None:
+        return self._shared_compute_limits
 
     def context_auxiliary_policy(self, *, runtime_config):
         config = self._memory_config
@@ -405,7 +430,12 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             build_memory_request,
             context,
             processor=self.processor,
-            input_token_limit=min(config.input_token_limit, config.compute_input_tokens),
+            input_token_limit=min(
+                config.input_token_limit,
+                self._memory_compute_limits.max_input_tokens
+                if self._memory_compute_limits is not None
+                else config.compute_input_tokens,
+            ),
             output_token_limit=config.output_token_limit,
             max_model_len=self._memory_max_model_len,
         )

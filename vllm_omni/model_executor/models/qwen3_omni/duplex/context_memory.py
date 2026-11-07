@@ -35,11 +35,14 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.context_budget import (
 
 logger = init_logger(__name__)
 
+_SummaryWorkKey = tuple[tuple[DuplexSourceRef, ...], int | None]
+
 
 @dataclass(frozen=True)
 class SummarySource:
     sources: tuple[DuplexSourceRef, ...]
     previous: ContextSummary | None
+    work_key: _SummaryWorkKey | None = None
 
 
 @dataclass(frozen=True)
@@ -56,7 +59,7 @@ class QwenContextMemory:
     omitted: tuple[DuplexSourceRef, ...] = ()
     # One attempted identity, not an ever-growing set of failures. New evidence
     # permits another attempt; unrelated appends and input preemption do not.
-    attempted: tuple[tuple[DuplexSourceRef, ...], int | None] | None = None
+    attempted: _SummaryWorkKey | None = None
 
     def matches(self, sources: tuple[DuplexSourceRef, ...]) -> bool:
         if self.snapshot is None:
@@ -175,10 +178,16 @@ class QwenContextMemoryMixin:
         key = _work_key(turns, previous)
         if not turns or key == memory.attempted:
             return None
-        memory.attempted = key
+        if self._context_config.context_auxiliary_budget is None:
+            memory.attempted = key
         # Capture immutable text and source identities before yielding. The
         # worker receives no session state, ledger or mutable snapshot.
         return await asyncio.to_thread(self._prepare_summary, turns, previous)
+
+    def auxiliary_request_submitted(self, *, request: DuplexAuxiliaryRequest, state: DuplexModelSessionState) -> None:
+        source = request.model_source
+        if self._context_config.context_auxiliary_budget is not None and isinstance(source, SummarySource):
+            _memory(state).attempted = source.work_key
 
     def _prepare_summary(
         self, turns: tuple[_SummaryTurn, ...], previous: ContextSummary | None
@@ -190,8 +199,12 @@ class QwenContextMemoryMixin:
             config.qwen_summary_input_max_tokens,
             min(config.qwen_context_max_tokens or self.max_model_len, self.max_model_len) - output_limit,
         )
+        budget = config.context_auxiliary_budget
+        if budget is not None:
+            input_limit = min(input_limit, budget.max_input_tokens)
         selected: list[_SummaryTurn] = []
         prompt = ""
+        prompt_ids: list[int] = []
         for turn in turns:
             candidate = [*selected, turn]
             transcript = "\n".join(f"{role}: {text}" for item in candidate for role, text in item.text if text)
@@ -234,6 +247,7 @@ class QwenContextMemoryMixin:
                 continue
             selected.append(turn)
             prompt = rendered
+            prompt_ids = tokens
         if not selected:
             return None
         sources = tuple(
@@ -246,13 +260,13 @@ class QwenContextMemoryMixin:
         )
         return DuplexAuxiliaryRequest(
             stage_id=0,
-            prompt={"prompt": prompt},
+            prompt={"prompt": prompt} if budget is None else {"prompt_token_ids": prompt_ids},
             sampling_params=SamplingParams(
                 temperature=0.0, max_tokens=output_limit, output_kind=RequestOutputKind.FINAL_ONLY, detokenize=True
             ),
             history_length=0,
             history_digest=duplex_history_digest(()),
-            model_source=SummarySource(sources, previous),
+            model_source=SummarySource(sources, previous, _work_key(turns, previous)),
             timeout_s=config.qwen_summary_timeout_s,
         )
 
