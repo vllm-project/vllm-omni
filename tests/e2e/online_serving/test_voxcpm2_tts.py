@@ -25,6 +25,11 @@ MAX_CONCURRENT = 4
 # ~0.5 s of 48 kHz mono PCM_16 in WAV (~48k payload + header).
 _MIN_AUDIO_BYTES = 40_000
 
+# ASR for the ``advanced_model`` transcript assertion. A HF repo id selects the
+# transformers Whisper backend, which reuses the image's HF cache; openai-whisper's
+# default would fetch ``small.pt`` from the OpenAI CDN, unreachable in offline CI.
+TRANSCRIPT_MODEL = os.environ.get("VOXCPM2_TRANSCRIPT_MODEL", "openai/whisper-small")
+
 
 def get_prompt(prompt_type="text"):
     """English prompt for zero-shot TTS (Whisper-friendly for advanced_model accuracy)."""
@@ -48,7 +53,7 @@ tts_server_params = [
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client) -> None:
     """
@@ -67,13 +72,14 @@ def test_text_to_audio_001(omni_server, online_client) -> None:
         "response_format": "wav",
         "voice": "default",
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "transcript_model": TRANSCRIPT_MODEL,
     }
     online_client.send_audio_speech_request(request_config, request_num=MAX_CONCURRENT)
 
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, online_client) -> None:
     """
@@ -93,5 +99,6 @@ def test_text_to_audio_002(omni_server, online_client) -> None:
         "response_format": "wav",
         "voice": "default",
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "transcript_model": TRANSCRIPT_MODEL,
     }
     online_client.send_audio_speech_request(request_config)
