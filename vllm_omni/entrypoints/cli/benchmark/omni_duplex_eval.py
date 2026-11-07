@@ -16,7 +16,11 @@ import json
 from pathlib import Path
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, DuplexSample, load_samples
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import (
+    DEFAULT_JUDGE_FRAME_MAX_SIDE,
+    evaluate_sample,
+    summarize_scores,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     DEFAULT_INSTRUCTIONS,
@@ -114,6 +118,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     evaluate.add_argument("--judge-api-key", default="EMPTY")
     evaluate.add_argument("--judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
     evaluate.add_argument("--judge-fps", type=int, default=2)
+    evaluate.add_argument(
+        "--judge-frame-max-side",
+        type=int,
+        default=DEFAULT_JUDGE_FRAME_MAX_SIDE,
+        help="Scale judge frames down so the longer side is at most this many pixels (0 keeps source resolution).",
+    )
     evaluate.add_argument("--window-size", type=float, default=10.0)
     evaluate.add_argument("--allow-invalid-clock", action="store_true")
     evaluate.add_argument("--eval-workers", type=int, default=1)
@@ -188,6 +198,8 @@ def run(args: argparse.Namespace) -> int:
 
     if args.eval_workers < 1:
         raise ValueError("--eval-workers must be at least 1")
+    if args.judge_frame_max_side < 0:
+        raise ValueError("--judge-frame-max-side must be 0 or positive")
     judge = DuplexJudge(args.judge_base_url, args.judge_model, api_key=args.judge_api_key)
 
     def evaluate_one(sample: DuplexSample) -> None:
@@ -202,6 +214,7 @@ def run(args: argparse.Namespace) -> int:
             judge,
             judge_fps=args.judge_fps,
             judge_video_mode=args.judge_video_mode,
+            judge_frame_max_side=args.judge_frame_max_side or None,
             window_size=args.window_size,
             allow_invalid_clock=args.allow_invalid_clock,
         )
