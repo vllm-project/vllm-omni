@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Stable Audio Open Pipeline for vLLM-Omni.
@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -160,7 +161,11 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
 
         # Initialize transformer from HF config to keep architecture aligned with checkpoint.
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, StableAudioDiTModel)
-        self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = StableAudioDiTModel(
+            od_config=od_config,
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
+            **transformer_kwargs,
+        )
 
         # Load scheduler
         self.scheduler = StableAudioSchedulerWrapper(
