@@ -10,7 +10,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
     FASTH3_BASE_MODEL,
     FASTH3_V2_BASE_SCHEDULE,
@@ -227,6 +233,39 @@ def test_v2_serving_contract_reads_a_per_role_fixed_topk_override():
     )
     with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk"):
         spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
+def _scheduled(profile: AttentionConfig) -> OmniDiffusionConfig:
+    """A valid V2 baseline with one schedule profile, ``sparse``."""
+    return OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        diffusion_attention_schedule=AttentionScheduleConfig(profiles={"sparse": profile}, default=[]),
+    )
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)),
+        AttentionConfig(per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)}),
+    ],
+    ids=["default", "per_role_self"],
+)
+def test_v2_serving_contract_rejects_a_scheduled_fixed_topk_on_the_dit_role(profile):
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk override from attention schedule profile 'sparse'"):
+        spec.check_serving_contract(partition="fl2va", od_config=_scheduled(profile))
+
+
+def test_v2_serving_contract_ignores_a_scheduled_topk_on_the_token_refiner():
+    """The pin is on the gated DiT layers (role "self"). The token refiner has no VSA gate, so FASTVIDEO_VSA
+    runs its dense fallback there and a fixed top-k on that role selects nothing."""
+    profile = AttentionConfig(
+        per_role={"minimax_h3.token_refiner": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)}
+    )
+    FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).check_serving_contract(
+        partition="fl2va", od_config=_scheduled(profile)
+    )
 
 
 def test_v2_request_contract_accepts_omitted_steps_and_default_shifts():
