@@ -58,6 +58,14 @@ def _parse_response_json(r: requests.Response) -> dict[str, Any] | list[Any] | N
     return None
 
 
+def _data_url_upload(data_url: str, stem: str) -> tuple[str, BytesIO, str]:
+    """Decode a base64 ``data:`` URL into a multipart ``(filename, file, content_type)`` tuple."""
+    header, encoded = data_url.split(",", 1)
+    content_type = header.split(";")[0].removeprefix("data:")
+    extension = content_type.split("/")[-1]
+    return f"{stem}.{extension}", BytesIO(base64.b64decode(encoded)), content_type
+
+
 def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
     """If ``extra_body`` has list ``height``/``width``, return one config per index (scalar h/w, ``num_outputs_per_prompt=1``)."""
     eb = cfg.get("extra_body")
@@ -1797,6 +1805,9 @@ class OnlineOmniClient:
         """
         Send native /v1/videos requests: multipart ``form_data`` job create, poll until done, download content.
 
+        ``input_references`` is a list of ``data:`` URLs uploaded as repeated ``input_references``
+        parts, in order, for models whose ``extra_params`` refer to uploads by index.
+
         For raw HTTP to video routes without polling, use ``send_videos_create_http_request``, etc.
         """
         if request_num != 1:
@@ -1806,29 +1817,26 @@ class OnlineOmniClient:
         if not isinstance(form_data, dict):
             raise ValueError("Video request_config must contain 'form_data'")
         normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
-        files: dict[str, tuple[str, BytesIO, str]] = {}
+        files: list[tuple[str, tuple[str, BytesIO, str]]] = []
         image_reference = request_config.get("image_reference")
         video_reference = request_config.get("video_reference")
-        if image_reference and video_reference:
-            raise ValueError("Only one of image_reference or video_reference can be provided")
+        input_references = request_config.get("input_references") or []
+        if sum(bool(reference) for reference in (image_reference, video_reference, input_references)) > 1:
+            raise ValueError("Only one of image_reference, video_reference or input_references can be provided")
         if image_reference:
             if image_reference.startswith("data:image"):
-                header, encoded = image_reference.split(",", 1)
-                content_type = header.split(";")[0].removeprefix("data:")
-                extension = content_type.split("/")[-1]
-                file_data = base64.b64decode(encoded)
-                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+                files.append(("input_reference", _data_url_upload(image_reference, "reference")))
             else:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
         if video_reference:
             if video_reference.startswith("data:video"):
-                header, encoded = video_reference.split(",", 1)
-                content_type = header.split(";")[0].removeprefix("data:")
-                extension = content_type.split("/")[-1]
-                file_data = base64.b64decode(encoded)
-                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+                files.append(("input_reference", _data_url_upload(video_reference, "reference")))
             else:
                 normalized_form_data["video_reference"] = json.dumps({"video_url": video_reference})
+        for index, reference in enumerate(input_references):
+            if not reference.startswith("data:"):
+                raise ValueError(f"input_references[{index}] must be a data: URL")
+            files.append(("input_references", _data_url_upload(reference, f"reference_{index}")))
 
         result = DiffusionResponse()
         create_url = self._build_url("/v1/videos")
