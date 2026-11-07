@@ -267,3 +267,24 @@ def test_qwen_image_performance_uses_only_the_verified_image(comparison_runner, 
         "num_warmups": 2,
         "extra_body": {**daily["extra_body"], "return_stage_metrics": True},
     }
+
+
+def test_wan_performance_runs_only_the_selected_video_workload(comparison_runner, tmp_path):
+    result, calls = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": "smoke", "BUILDKITE_SOURCE": "api", "BACKEND_COMPARISON_CASES": "wan22-i2v-perf"}
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == ["buildkite-agent pipeline upload"]
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert job["key"] == "perf-sglang-wan22-i2v"
+    assert "depends_on" not in job
+    (container,) = next(iter(job["plugins"][0].values()))["podSpec"]["containers"]
+    assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+    assert "validate_sglang_videos.py" in job["command"]
+    assert "sglang-video-image-reference.patch" in job["command"]
+    (config,) = json.loads((ROOT / job["env"]["COMPARISON_CONFIG"]).read_text())
+    reference = json.loads((ROOT / "tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json").read_text())[0]
+    daily = {key: value for key, value in reference["benchmark_params"][0].items() if key != "baseline"}
+    assert config["benchmark_params"] == [{**daily, "seed": 0, "num_warmups": 2}]
+    assert config["server_params"]["model"] == reference["server_params"]["model"]

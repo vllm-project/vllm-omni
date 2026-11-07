@@ -61,9 +61,74 @@ def qwen_image_performance_job(benchmark: dict) -> dict:
     return job
 
 
+def wan_performance_job(benchmark: dict) -> dict:
+    # The immutable image also passed the Wan I2V smoke in #18852.
+    job = qwen_image_performance_job(benchmark)
+    config = "tests/dfx/perf/tests/test_wan22_i2v_sglang.json"
+    job.update(
+        key="perf-sglang-wan22-i2v",
+        label=":movie_camera: SGLang · Wan2.2 I2V · 832x480 · 81 frames · 4 steps · C1/10",
+        env={"COMPARISON_CONFIG": config, "COMPARISON_IMAGE_DIGEST": QWEN_IMAGE_DIGEST},
+        artifact_paths=[
+            "tests/dfx/perf/results/wan-smoke/*.json",
+            "tests/dfx/perf/results/result_test_sglang_wan22_i2v_single_device_*.json",
+            "tests/dfx/perf/results/validated_wan22_i2v_media.json",
+        ],
+        command="\n".join(
+            [
+                "set -eu",
+                'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
+                'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"',
+                'export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"',
+                "export BENCHMARK_DIR=tests/dfx/perf/results",
+                'test ! -e "$${BENCHMARK_DIR}/wan-videos"',
+                'mkdir -p "$${BENCHMARK_DIR}/wan-videos"',
+                "sglang_source_root=\"$$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; "
+                "print(Path(sglang.__file__).resolve().parent.parent)')\"",
+                'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" --check '
+                '"$$PWD/docker/patches/sglang-video-image-reference.patch"',
+                'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" '
+                '"$$PWD/docker/patches/sglang-video-image-reference.patch"',
+                "CUDA_VISIBLE_DEVICES=\"\" /opt/sglang/bin/python3 -m pytest --noconftest -o addopts='' "
+                "-q tests/dfx/perf/tests/test_sglang_video_api.py",
+                "export COMPARISON_VIDEO_PATCH=1",
+                "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+                "export BENCHMARK_DIR=tests/dfx/perf/results/wan-smoke",
+                'test ! -e "$${BENCHMARK_DIR}"',
+                'jq \'.[0].server_params.serve_args["output-path"] = '
+                '"tests/dfx/perf/results/wan-smoke/videos" | '
+                ".[0].benchmark_params[0] += {num_prompts:1,num_warmups:0}' "
+                '"$${COMPARISON_CONFIG}" > /tmp/wan-smoke.json',
+                "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
+                "--test-config-file /tmp/wan-smoke.json --run-level full_model",
+                "jq -se 'length == 1 and (.[0] | .completed == 1 and .failed == 0)' "
+                '"$${BENCHMARK_DIR}"/result_test_sglang_wan22_i2v_single_device_*.json',
+                "python3 tests/dfx/perf/scripts/validate_sglang_videos.py "
+                '"$${BENCHMARK_DIR}/videos" --config /tmp/wan-smoke.json '
+                '--output "$${BENCHMARK_DIR}/validated_media.json"',
+                "export BENCHMARK_DIR=tests/dfx/perf/results",
+                "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
+                '--test-config-file "$${COMPARISON_CONFIG}" --run-level full_model',
+                "jq -se 'length == 1 and (.[0] | .completed == 10 and .failed == 0 "
+                "and .total_video_frames == 810 and .total_video_duration_s == 50.625 "
+                "and .request_throughput > 0 and .mean_e2el_ms > 0 "
+                'and .Hardware == "H100" and .experiment_metadata.server_revision == "0.5.22")\' '
+                '"$${BENCHMARK_DIR}"/result_test_sglang_wan22_i2v_single_device_*.json',
+                "python3 tests/dfx/perf/scripts/validate_sglang_videos.py "
+                '"$${BENCHMARK_DIR}/wan-videos" --config "$${COMPARISON_CONFIG}" '
+                '--output "$${BENCHMARK_DIR}/validated_wan22_i2v_media.json"',
+            ]
+        ),
+    )
+    return job
+
+
 def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     qwen_performance = cases == ["qwen-image-21-perf"]
-    if not qwen_performance and (not cases or len(cases) != len(set(cases)) or set(cases) - GPU_COUNTS.keys()):
+    wan_performance = cases == ["wan22-i2v-perf"]
+    if not (qwen_performance or wan_performance) and (
+        not cases or len(cases) != len(set(cases)) or set(cases) - GPU_COUNTS.keys()
+    ):
         raise ValueError(f"Select distinct model keys from: {', '.join(GPU_COUNTS)}")
     # The same agent that uploads the result resolves the YAML anchors. Leave
     # environment interpolation to the final upload, after building the steps.
@@ -76,6 +141,9 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     benchmark = weekly_steps["nightly-sglang-omni-qwen3-omni"]
     if qwen_performance:
         pipeline["steps"] = [qwen_image_performance_job(benchmark)]
+        return pipeline
+    if wan_performance:
+        pipeline["steps"] = [wan_performance_job(benchmark)]
         return pipeline
     pipeline["steps"] = [image]
     if weekly:
