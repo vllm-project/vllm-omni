@@ -100,6 +100,61 @@ def test_set_seq_parallel_pg_uses_explicit_sp_groups(rank, expected_ulysses, exp
     assert allgather_pg.ranks == [rank]
 
 
+class _FakeNCCLOptions:
+    def __init__(self):
+        self.is_high_priority_stream = False
+
+
+def _recording_new_group_factory(created_groups: list[SimpleNamespace]):
+    def _fake_new_group(ranks, *args, pg_options=None, **kwargs):
+        group = SimpleNamespace(ranks=list(ranks), pg_options=pg_options)
+        created_groups.append(group)
+        return group
+
+    return _fake_new_group
+
+
+def _patch_distributed_backend(monkeypatch, backend: str):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(torch.distributed, "is_nccl_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "ProcessGroupNCCL", SimpleNamespace(Options=_FakeNCCLOptions), raising=False)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("use_ulysses_low", [True, False])
+@pytest.mark.parametrize("explicit_sp_groups", [True, False])
+def test_ring_groups_use_high_priority_nccl_stream(use_ulysses_low, explicit_sp_groups, monkeypatch):
+    created_groups: list[SimpleNamespace] = []
+    monkeypatch.setattr(torch.distributed, "new_group", _recording_new_group_factory(created_groups))
+    _patch_distributed_backend(monkeypatch, "nccl")
+
+    ulysses_pg, ring_pg, _ = set_seq_parallel_pg(
+        sp_ulysses_degree=2,
+        sp_ring_degree=2,
+        rank=0,
+        world_size=4,
+        use_ulysses_low=use_ulysses_low,
+        sp_group_ranks=[[0, 1, 2, 3]] if explicit_sp_groups else None,
+    )
+
+    assert ring_pg.pg_options is not None and ring_pg.pg_options.is_high_priority_stream
+    assert ulysses_pg.pg_options is None
+    ring_groups = [g for g in created_groups if g.pg_options is not None]
+    assert len(ring_groups) == 2 and all(len(g.ranks) == 2 for g in ring_groups)
+
+
+@pytest.mark.cpu
+def test_ring_groups_keep_default_options_without_nccl(monkeypatch):
+    created_groups: list[SimpleNamespace] = []
+    monkeypatch.setattr(torch.distributed, "new_group", _recording_new_group_factory(created_groups))
+    _patch_distributed_backend(monkeypatch, "gloo")
+
+    set_seq_parallel_pg(sp_ulysses_degree=1, sp_ring_degree=4, rank=0, world_size=4)
+
+    assert all(g.pg_options is None for g in created_groups)
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_set_seq_parallel_pg_builds_independent_allgather_group(rank, monkeypatch):
