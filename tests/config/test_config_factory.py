@@ -562,6 +562,52 @@ class TestStageResolutionHelpers:
         assert "model" not in overrides
         assert "parallel_config" not in overrides
 
+    @pytest.mark.parametrize(
+        "cli_overrides",
+        [
+            # global key first, then the per-stage key
+            {"gpu_memory_utilization": 0.5, "stage_0_gpu_memory_utilization": 0.9},
+            # per-stage key first, then the global key
+            {"stage_0_gpu_memory_utilization": 0.9, "gpu_memory_utilization": 0.5},
+        ],
+        ids=["global-first", "stage-first"],
+    )
+    def test_build_stage_runtime_overrides_stage_key_beats_global_regardless_of_order(self, cli_overrides):
+        """``stage_<id>_<field>`` must win over the global ``<field>`` no matter
+        which key the caller happened to pass first.
+
+        ``Omni(model, **kwargs)`` forwards the caller's kwargs dict verbatim as
+        ``cli_overrides`` (``OmniEngineBase._resolve_stage_configs`` ->
+        ``resolve_omni_config``), so the insertion order is whatever the user
+        typed. A per-stage override that is silently replaced by the global
+        default depending on argument order is a wrong result.
+        """
+        overrides = build_stage_runtime_overrides(
+            0,
+            cli_overrides,
+            internal_keys=internal_blacklist_keys() | SHARED_FIELDS,
+        )
+
+        assert overrides["gpu_memory_utilization"] == 0.9
+
+    @pytest.mark.parametrize(
+        "cli_overrides",
+        [
+            {"max_num_seqs": 3, "stage_0_max_num_seqs": 7},
+            {"stage_0_max_num_seqs": 7, "max_num_seqs": 3},
+        ],
+        ids=["global-first", "stage-first"],
+    )
+    def test_from_pipeline_config_stage_key_beats_global_regardless_of_order(self, cli_overrides):
+        """End-to-end: the resolved stage config must honour the per-stage key."""
+        pipeline = resolve_pipeline_config("qwen3_tts", None)
+        assert pipeline is not None
+        omni_config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=cli_overrides)
+
+        assert omni_config.stage_by_id(0).scheduler_config.max_num_seqs == 7
+        # The global value still applies to the stage that has no per-stage key.
+        assert omni_config.stage_by_id(1).scheduler_config.max_num_seqs == 3
+
 
 class TestPipelineDiscovery:
     """Tests for the central pipeline registry (``OMNI_PIPELINES``)."""
