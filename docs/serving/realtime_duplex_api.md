@@ -604,8 +604,11 @@ plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
 In `"basic"` and `"context"` mode the window is kept across a barge-in or a
-`response.cancel`: the next reply still sees the earlier units. With `"off"`,
-the next reply starts again from the system turn and the reference audio.
+`response.cancel`: the next reply still sees the units completed before the
+cut, including model text whose audio the client had not played yet. The
+window waits 10 s for the next input, so this holds while the client keeps
+sending audio. With `"off"`, the next reply starts again from the system turn
+and the reference audio.
 
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),

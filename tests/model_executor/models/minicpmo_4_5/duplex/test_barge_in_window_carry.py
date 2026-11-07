@@ -622,3 +622,64 @@ def test_answer_rule_applies_only_to_a_request_that_carries_units() -> None:
 
     assert logits[0, listen_id] == float("-inf")
     assert logits[1, listen_id] == 5.0
+
+
+def test_an_abort_with_nothing_to_keep_drops_the_sessions_earlier_window() -> None:
+    """The worker drops a session's kept units on every finish, so the scheduler does too."""
+    sched = _scheduler()
+    old_id = _stage0_id("s", 0)
+    old = _new_request(old_id)
+    old._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
+    sched.requests[old_id] = old
+    sched._stash_minicpmo45_windows([old_id])
+    assert "s" in sched._minicpmo45_carried_windows
+
+    empty_id = _stage0_id("s", 1)
+    sched.requests[empty_id] = _new_request(empty_id)
+    sched._stash_minicpmo45_windows([empty_id])
+
+    assert "s" not in sched._minicpmo45_carried_windows
+
+
+def test_a_first_plan_that_places_nothing_drops_the_carry_on_both_sides() -> None:
+    sched = _scheduler()
+    session = _new_request(_stage0_id("s", 1))
+    session._minicpmo45_carried_window = {"units": [dict(unit) for unit in CARRIED], "previous": []}
+    # The open unit starts at the closing boundary, so this plan records no unit.
+    session._minicpmo45_window_open_start = 12
+    update = _second_append("basic")
+
+    sched._update_request_as_session(session, update)
+
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert "replace" not in plan
+    assert "carried_units" not in plan
+    assert session._minicpmo45_carried_window is None
+
+    helper = _worker()
+    state = _state(carried_window_units=[_unit(100, 5), _unit(200, 6)])
+    assert helper._window_replacement_parts(state, plan) is None
+    assert state.carried_window_units == []
+
+
+def test_two_sessions_keep_their_own_windows() -> None:
+    sched = _scheduler()
+    for name, units in (("a", CARRIED[:1]), ("b", CARRIED)):
+        request_id = _stage0_id(name, 0)
+        request = _new_request(request_id)
+        request._minicpmo45_window_units = [dict(unit) for unit in units]
+        sched.requests[request_id] = request
+    sched._stash_minicpmo45_windows([_stage0_id("a", 0), _stage0_id("b", 0)])
+
+    new_b = _new_request(_stage0_id("b", 1))
+    sched._attach_minicpmo45_carried_window(new_b)
+    assert [unit["length"] for unit in new_b._minicpmo45_carried_window["units"]] == [5, 6]
+    assert list(sched._minicpmo45_carried_windows) == ["a"]
+
+    helper = _worker()
+    helper.stash_window_units("a", _state(session_id="a", window_units=[_unit(100, 5)]))
+    helper.stash_window_units("b", _state(session_id="b", window_units=[_unit(200, 5), _unit(300, 6)]))
+    restored = _state(session_id="b")
+    helper.restore_window_units(restored)
+    assert [unit.token_ids[0] for unit in restored.carried_window_units] == [200, 300]
+    assert list(helper._carried_window_units) == ["a"]

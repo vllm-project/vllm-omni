@@ -422,13 +422,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @staticmethod
     def _minicpmo45_answer_unless_listen_wins(logits: torch.Tensor, row_idx: int, listen_id: int) -> None:
-        """Answer the user's finished input unless <|listen|> is the most likely token.
+        """Keep <|listen|> only when it is the most likely token.
 
-        Only for a request that carries the conversation across a barge-in. With
-        that context, listening is close to the top at this point more often, and
-        once <|listen|> is sampled every silent unit after it makes listening more
-        likely still, so one draw can leave a question unanswered. Device ops
-        only, so the row decision needs no sync.
+        Used for the rest of a request that carries the conversation across a
+        barge-in, on each silent step after the user has spoken while the model
+        is not replying. With that context, listening is close to the top at
+        this point more often, and once <|listen|> is sampled every silent unit
+        after it makes listening more likely still, so one draw can leave a
+        question unanswered. Device ops only, so the row decision needs no sync.
         """
         row = logits[row_idx]
         listen_slot = row.narrow(0, listen_id, 1)
