@@ -74,6 +74,18 @@ def test_partial_hits_and_randomness_are_model_opt_in():
     assert base[1] != changed_geometry[1]
 
 
+def test_cache_salt_isolates_the_entire_prefix_namespace():
+    sampling = OmniDiffusionSamplingParams()
+    first = get_cache_namespace("qwen-image-21", sampling, cache_salt="tenant-a")
+    assert first == get_cache_namespace("qwen-image-21", sampling, cache_salt="tenant-a")
+    assert first != get_cache_namespace("qwen-image-21", sampling, cache_salt="tenant-b")
+    assert first != get_cache_namespace("qwen-image-21", sampling)
+    with pytest.raises(TypeError, match="cache_salt"):
+        get_cache_namespace("qwen-image-21", sampling, cache_salt=123)
+    with pytest.raises(ValueError, match="non-empty"):
+        get_cache_namespace("qwen-image-21", sampling, cache_salt="")
+
+
 @pytest.mark.parametrize(("adapter_id", "scale"), [(None, 1.0), (2, 0.5), (1, 1.0)])
 def test_lora_is_common_request_wide_identity(adapter_id, scale):
     base = _hashes(_request(adapter_id=1, scale=0.5))

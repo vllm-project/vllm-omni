@@ -243,6 +243,50 @@ def test_paged_kv_profile_requests_match_per_rank_batch(
     engine._prepare_request_for_admission.assert_called_once_with(request)
 
 
+def test_paged_kv_profile_uses_configured_dimensions() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    engine.od_config = SimpleNamespace(
+        diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        model_class_name="QwenImage21Pipeline",
+        max_num_seqs=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_distributed_layerwise_offload=False,
+        additional_config={
+            "diffusion_kv_profile_height": 1216,
+            "diffusion_kv_profile_width": 864,
+        },
+    )
+    request = OmniDiffusionRequest(
+        prompt="profile",
+        request_id="profile-request",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+    )
+    request.diffusion_kv_requests = (
+        DiffusionKVRequest(
+            "profile-request/diffusion-kv/0",
+            sequence_id=0,
+            prefix_len=8,
+            target_len=4104,
+            seq_len=4112,
+        ),
+    )
+    engine._make_dummy_request = Mock(return_value=request)
+    engine._prepare_request_for_admission = Mock(side_effect=lambda req: req)
+
+    result = engine._prepare_diffusion_kv_profile_requests()
+
+    assert result is not None
+    assert engine._diffusion_kv_profile_limits == (1, 4112, 4104)
+    engine._make_dummy_request.assert_called_once_with(
+        height=1216,
+        width=864,
+        guidance_scale=5.0,
+        num_image_inputs=4,
+        num_frames=1,
+    )
+
+
 @pytest.mark.parametrize(
     ("num_sequences", "seq_len", "target_len"),
     [

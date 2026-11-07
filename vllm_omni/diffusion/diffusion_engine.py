@@ -1764,10 +1764,9 @@ class DiffusionEngine:
         rank can execute together. DLO+DP is the exception because each rank
         executes one request from the collective wave.
 
-        Hunyuan is currently the only model integrated with
-        ``paged_scheduler``. The stage's configured default resolution (or
-        1024x1024 when absent), enabled CFG, and the maximum advertised
-        reference-image count exercise its first-step activation peak.
+        The stage's configured default resolution (or 1024x1024 when absent),
+        enabled CFG, and the model-owned maximum advertised reference-image
+        and prompt budgets exercise its first-step activation peak.
         Admission compares each preprocessed request's CFG count and tokenized
         sequence/target shape with the resulting per-request profile envelope.
         Future paged model integrations must extend this recipe for their

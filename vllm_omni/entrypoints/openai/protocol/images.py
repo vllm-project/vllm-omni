@@ -19,6 +19,8 @@ from typing import Any, Literal
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from vllm.entrypoints.generate.base.protocol import validate_cache_salt
+from vllm.exceptions import VLLMValidationError
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
@@ -117,6 +119,19 @@ class ImageGenerationRequest(BaseModel):
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
+    cache_salt: str | None = Field(
+        default=None, description="Non-empty application isolation key for Qwen-Image 2.1 prefix caching."
+    )
+
+    @field_validator("cache_salt")
+    @classmethod
+    def validate_prefix_cache_salt(cls, value):
+        try:
+            validate_cache_salt(value)
+        except VLLMValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
     system_prompt: str | None = Field(
         default=None, description="Custom system prompt. Used when --use_system_prompt is custom"
     )
@@ -222,7 +237,7 @@ class ImageGenerationResponse(BaseModel):
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str | None = Field(None, description="The output format of the image generation")
-    size: str = Field(None, description="The size of the image generated")
+    size: str | None = Field(None, description="The size of the image generated")
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "

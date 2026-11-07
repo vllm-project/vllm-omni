@@ -36,7 +36,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
-from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata, validate_cache_salt
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
@@ -80,6 +80,7 @@ from vllm.entrypoints.speech_to_text.transcription.serving import (
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_derenderer import OnlineDerenderer
@@ -2314,6 +2315,8 @@ async def generate_images(
                 extra_body["size"] = request.size
             if request.negative_prompt is not None:
                 extra_body["negative_prompt"] = request.negative_prompt
+            if request.cache_salt is not None:
+                extra_body["cache_salt"] = request.cache_salt
             if request.num_inference_steps is not None:
                 extra_body["num_inference_steps"] = request.num_inference_steps
             if request.guidance_scale is not None:
@@ -2369,6 +2372,8 @@ async def generate_images(
 
         # Build params - pass through user values directly
         prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
+        if request.cache_salt is not None:
+            prompt["cache_salt"] = request.cache_salt
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
@@ -2513,6 +2518,7 @@ async def edit_images(
     reference_image: str | UploadFile | None = None,
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Form(None),
+    cache_salt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
     guidance_scale: float | None = Form(None),
     guidance_scale_2: float | None = Form(None),
@@ -2537,6 +2543,16 @@ async def edit_images(
 
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
+    # FastAPI normalizes an empty optional Form string to None. Reject the
+    # explicit empty salt before it silently enters the unsalted cache domain.
+    if cache_salt is None and (await raw_request.form()).get("cache_salt") == "":
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail="cache_salt must be non-empty when provided"
+        )
+    try:
+        validate_cache_salt(cache_salt)
+    except VLLMValidationError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model == "auto":
         model = None
@@ -2561,6 +2577,8 @@ async def edit_images(
         # 2. Build prompt & images params
         cot_output = None
         omni_prompt = OmniTextPrompt(prompt=prompt, modalities=["image"])
+        if cache_salt is not None:
+            omni_prompt["cache_salt"] = cache_salt
         if negative_prompt is not None:
             omni_prompt["negative_prompt"] = negative_prompt
         input_images_list = []
@@ -2749,6 +2767,8 @@ async def edit_images(
                     extra_body["height"] = height
             if negative_prompt is not None:
                 extra_body["negative_prompt"] = negative_prompt
+            if cache_salt is not None:
+                extra_body["cache_salt"] = cache_salt
             if num_inference_steps is not None:
                 extra_body["num_inference_steps"] = num_inference_steps
             if guidance_scale is not None:

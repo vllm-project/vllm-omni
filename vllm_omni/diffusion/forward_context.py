@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
+import vllm.envs as vllm_envs
 import vllm.ir
 from vllm.config import VllmConfig
 
@@ -20,6 +21,27 @@ if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
+
+
+@contextmanager
+def vllm_batch_invariant_scope(enabled: bool):
+    """Temporarily enable vLLM's deterministic shape-invariant kernels."""
+
+    if not enabled:
+        yield
+        return
+    had_override = "VLLM_BATCH_INVARIANT" in vars(vllm_envs)
+    previous = vars(vllm_envs).get("VLLM_BATCH_INVARIANT")
+    vllm_envs.VLLM_BATCH_INVARIANT = True
+    try:
+        yield
+    finally:
+        if had_override:
+            vllm_envs.VLLM_BATCH_INVARIANT = previous
+        else:
+            # vLLM resolves environment options lazily through __getattr__.
+            # Leaving a module attribute would permanently bypass that lookup.
+            del vllm_envs.VLLM_BATCH_INVARIANT
 
 
 @dataclass

@@ -417,18 +417,278 @@ memory-bound long-prompt / multi-image workloads, not a free lunch;
 Note: a quantized prefix cache is not CUDA-graph capturable — requests using
 this option stay on the eager decode path (a warning is logged once).
 
-### Why not the scheduler-managed paged KV (`DiffusionKVCacheMode.PAGED_SCHEDULER`)?
+### Scheduler-managed paged KV and cross-request prefix caching (`DiffusionKVCacheMode.PAGED_SCHEDULER`)
 
-Evaluated and deliberately not adopted (see the `qwen21-p0-kv` commit message
-for the full analysis): the paged scheduler targets *cross-request* KV
-management — a statically sized page pool, block sharing/dedup, and eviction —
-whereas this prefix cache lives exactly as long as one generation and is
-sized once per request. Migrating would require routing decode attention
-through the worker paged adapter (writing fresh target K/V into pages every
-step), per-request page tables, and re-validating the block-causal
-piecewise-span masking and Ulysses/CFG constraints, for no memory benefit over
-the per-request dense tensors. The FP8 storage above captures the actual
-memory win at ~1% of the integration cost.
+In addition to the default per-request dense prefix cache (`dense_legacy`),
+`QwenImage21Pipeline` supports Scheduler-managed paged KV (`diffusion_kv_mode="paged_scheduler"`)
+with cross-request prefix caching (`enable_prefix_caching=True`). Because reference
+images precede the edit instruction in the block-causal sequence and modulate from
+`t = 0`, repeated requests that share leading reference images reuse their cached
+KV pages across requests, slice the Step-0 prefill query to the uncached suffix,
+and skip redundant condition-image `vae.encode` (and `encode_prompt` on a full-prefix hit):
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Qwen/Qwen-Image-2.1",
+    diffusion_kv_mode="paged_scheduler",
+    diffusion_kv_max_rows_per_request=2,  # 1 when true_cfg_scale <= 1.0, 2 for standard CFG
+    enable_prefix_caching=True,
+    max_num_batched_tokens=32768,
+)
+```
+
+With CFG, both rows currently use the minimum safe hit length across branches.
+A full common-prefix hit can therefore still encode the longer branch's text;
+prompt encoding is skipped separately only when that branch is fully covered.
+
+The startup memory profile defines the safe paged-KV admission envelope. By
+default it profiles 4 reference images, both CFG branches, an 8192-token VLM
+prompt budget, and a 1024x1024 target (4096 DiT target tokens). Requests may
+use other aspect ratios when their aligned target-token count does not exceed
+4096. To serve a larger target envelope, set
+`additional_config["diffusion_kv_profile_height"]`,
+`additional_config["diffusion_kv_profile_width"]`, and, when needed,
+`additional_config["diffusion_kv_profile_max_sequence_length"]`; increase
+`max_model_len` and the KV memory budget consistently. Requests outside the
+profiled sequence or target-token envelope are rejected before execution
+rather than risking an activation-memory OOM.
+
+For 4-reference-image requests with `true_cfg_scale > 1.0` (~20.5k tokens per CFG branch at 1024×1024), single-rank CFG executes the positive and negative branches sequentially so `max_num_batched_tokens=32768` covers each branch's prefill pass; ensure the KV cache pool (`kv_cache_memory_bytes` or `gpu_memory_utilization`) can hold both branches (~21 GiB in BF16 on 1 GPU, or halved per rank under `cfg_parallel_size=2` / `tensor_parallel_size=2` / `ulysses_degree=2`).
+
+#### Choosing dense or paged execution
+
+`dense_legacy` remains the default. Its DiT KV belongs to one generation,
+and eligible single-GPU configurations retain CUDA-graph decode. Choose
+`paged_scheduler` when repeated condition prefixes justify a retained GPU
+pool and cross-request lookup. A hit saves conditioning and Step-0 work once
+per request; it does not eliminate the remaining denoise steps.
+
+Paged execution disables decode CUDA graphs and rejects FP8 prefix KV
+(`extras.prefix_kv_cache_dtype`). It also requests FP32 GEMM reductions throughout
+the DiT forward; HSDP with Ulysses additionally requires native CUDA
+FlashAttention batch-invariant attention. These per-step costs can outweigh
+the one-time savings, especially for long denoise schedules or cold requests.
+Compare with the default dense path at the intended step count and memory
+budget before selecting paged mode.
+
+Bitwise parity is an observation for a particular GPU, workload, and backend,
+not a guarantee for every request. The VLM prompt encoder runs outside the
+DiT precision scopes, and changing text or suffix lengths can select different
+floating-point kernels. Report bitwise equality where observed and PSNR
+otherwise, including a separate paged-versus-dense comparison. The GPU
+regression compares cache-off with changed-text and changed-later-image hits,
+checks actual Worker tail-page copies, and independently requires RGB and
+alpha (when present) PSNR of at least 40 dB when outputs are not bitwise equal:
+
+```bash
+QWEN_IMAGE21_TEST_MODEL=Qwen/Qwen-Image-2.1 python -m pytest \
+  tests/diffusion/models/qwen_image_21/test_prefix_cache_gpu.py -q -s
+```
+
+The test uses eight CUDA GPUs, HSDP8/Ulysses8, BF16 eager execution, and
+two denoise steps; it is a correctness test, not a serving benchmark.
+
+The 40 dB threshold applies to the selected in-tree regression inputs.
+Numerical agreement is configuration-specific and is reported separately
+for each tested workload.
+
+The cache deliberately isolates image-count/size layouts and CFG branches.
+Replacing a later reference image reuses earlier images only when the layout
+is unchanged. Increasing the reference count or changing a later image's
+aspect ratio currently starts a different namespace. These are conservative
+numerical guards, not a claim that the block-causal graph makes an earlier
+image depend on a later one. CFG rows also retain separate image KV, which
+must be included in capacity estimates.
+
+For request isolation, supply a non-empty string `cache_salt` in the offline prompt,
+the images generation JSON body, the images edit multipart form, or the
+diffusion chat request. Different salts cannot share Qwen prefix hits.
+Applications should assign salts from their own authenticated isolation
+policy; a client-supplied string is not authentication. Omitting the salt
+preserves shared reuse within that engine. Pools are local to one loaded
+model instance; cross-process/model-revision KV sharing is outside this path.
+
+Exact image boundaries use token-granular hashes. Hash construction,
+Scheduler lookup, and request-side hash metadata grow with prefix length;
+include that work in end-to-end latency rather than counting only GPU time.
+
+#### Reproducing the dense/paged comparison
+
+Run each mode in a fresh process on the same GPU allocation. This example
+uses two references, a fixed 14 GiB paged pool, two warmup requests, and the
+median of five measured requests per cold/partial/full-hit case:
+
+```bash
+for mode in dense paged_off paged_on; do
+  CUDA_VISIBLE_DEVICES=0 python benchmarks/diffusion/benchmark_qwen_image_21_prefix_cache.py \
+    --model Qwen/Qwen-Image-2.1 --layout single --mode "$mode" \
+    --steps 50 --cfg 4 --size 1024 --references 2 --kv-cache-gib 14 \
+    --warmup 2 --repeats 5 --capacity-probes 32 --output "prefix-cache-results/$mode"
+done
+```
+
+Use a fresh output directory for each run. Repeat with
+`Qwen/Qwen-Image-2.1-Turbo --steps 8 --cfg 1`, and with eight visible GPUs
+and `--layout hsdp8`. The script limits paged admission to 24,576 tokens so
+the declared maximum sequence fits the single-GPU pool. Untimed preparation
+and capacity requests ask for two steps to materialize the same static prefix;
+Turbo's fixed sigma grid overrides that request and still runs eight steps.
+Each output directory records sample latencies,
+actual cache hits/COW copies, decode-graph replay observations, peak GPU
+memory, output arrays, and retained-prefix capacity after lookup-only probes.
+Cold trials use distinct salts so the shared text preamble cannot hit;
+partial/full trials share the unsalted namespace.
+These are sequential offline request latencies, not concurrent serving
+throughput. Keep each speedup comparison on one host and GPU configuration.
+
+#### Validation on vLLM 0.33
+
+After merging upstream `a2d3b4b2`, the prefix-cache path was revalidated at
+`8c463de7` with vLLM 0.33.0 (frozen wheel commit `4ba787ec9`),
+PyTorch 2.14.0+cu130, CUDA 13.0, cuDNN 9.25.1, Transformers 5.19.0 and
+diffusers 0.40.0. All comparisons below use the same host and allocation.
+
+Affected diffusion/KV/scheduler/runner CPU suites passed **910 tests**;
+image/chat API and profiler endpoints passed **122 tests**, with one existing
+expected failure. The eight-GPU partial-prefix/COW regression passed in
+317.39 seconds on eight RTX PRO 5000 72GB Blackwell cards,
+BF16, HSDP8/Ulysses8, 256² and two steps. All four cases matched cache-off
+bitwise in RGB and alpha, including the changed-text and changed-later-image
+hits with two tail-page copies each. A separate 480×608 control also matched
+bitwise for `mask_sp_padding=False` and `True`, cold and warm: 1,140 logical
+target tokens and four synthetic SP padding tokens.
+
+The representative performance follow-up uses one RTX PRO 5000 72GB card,
+Base at 1024², 50 steps, CFG scale 4, two references and seed 42.
+It uses the benchmark above: fresh processes per mode, two warmups and
+five measured trials per cold/partial/full case, with 14 GiB KV in paged modes.
+References are deterministic synthetic 128×128 RGB inputs processed normally.
+
+| Case | Dense s | Paged off s | Paged on s | Dense / on | Off / on |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cold | 48.983 | 50.248 | 50.488 | 0.970× | 0.995× |
+| partial | 49.006 | 50.313 | 49.554 | 0.989× | 1.015× |
+| full | 49.048 | 50.328 | 48.157 | 1.019× | 1.045× |
+
+All **15/15 measured cache-on/off full-image SHA256 pairs match**, including
+alpha. Each case's first saved on/off output array also matches bitwise.
+The following on/dense comparisons use those first saved matching inputs:
+
+| Case | On/off RGBA | On/dense RGB dB | On/dense RGB max | On/dense alpha max |
+| --- | --- | ---: | ---: | ---: |
+| cold | bitwise | 34.37 | 131 | 8 |
+| partial | bitwise | 36.71 | 159 | 5 |
+| full | bitwise | 34.91 | 161 | 4 |
+
+Actual decode-graph replay was observed in dense mode; paged modes did not
+replay decode graphs. Whole-run NVML sampled peaks were
+**57.76/52.16/52.15 GiB** for dense/off/on.
+These samples include startup, warmup, untimed preparation and retention
+probes, rather than per-request incremental memory. The paged-on pool has
+**1,792 physical blocks / 14 GiB**, retaining **1/32 full common CFG prefixes**
+after lookup-only probes. Capacity depends on image and text lengths.
+
+Full common-prefix hits give **1.045× versus paged-off** and **1.019× versus
+dense** in this Base single-GPU workload. Cold and changed-last-image partial
+requests remain slower than dense. This follow-up does not relabel the earlier
+Base/Turbo single-/multi-GPU matrix as vLLM 0.33 results.
+
+#### Earlier vLLM 0.32 measurements
+
+NVIDIA RTX PRO 5000 Blackwell, BF16, PyTorch 2.13.0+cu130, vLLM 0.32.0.
+Single-GPU cohorts use one 72GB card; HSDP8/Ulysses8 cohorts use eight
+48GB cards on another host. Each dense/off/on comparison stays on one
+host and allocation. These numbers do not measure cross-host or parallel
+scaling. All requests use 1024×1024, two references, seed 42, two warmups
+and the median of five trials per case. Base uses CFG 4; Turbo uses CFG 1.
+Paged modes reserve 14 GiB per rank; all modes use memory utilization 0.9.
+
+References are deterministic synthetic 128×128 RGB images processed by
+the model's normal image preprocessing. Each trial changes reference seeds;
+the corresponding trials match across all three modes.
+
+| Model (steps) | Allocation | Case | Dense s | Paged off s | Paged on s | Dense / on | Off / on |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Base (50) | 1×72GB | cold | 49.069 | 50.321 | 50.367 | 0.974× | 0.999× |
+| Base (50) | 1×72GB | partial | 49.165 | 50.306 | 49.512 | 0.993× | 1.016× |
+| Base (50) | 1×72GB | full | 49.225 | 50.320 | 48.199 | 1.021× | 1.044× |
+| Base (50) | HSDP8/UP8, 8×48GB | cold | 75.332 | 49.977 | 50.139 | 1.502× | 0.997× |
+| Base (50) | HSDP8/UP8, 8×48GB | partial | 75.270 | 50.057 | 49.367 | 1.525× | 1.014× |
+| Base (50) | HSDP8/UP8, 8×48GB | full | 75.189 | 50.066 | 48.202 | 1.560× | 1.039× |
+| Turbo (8) | 1×72GB | cold | 5.991 | 5.309 | 5.374 | 1.115× | 0.988× |
+| Turbo (8) | 1×72GB | partial | 6.172 | 5.391 | 5.020 | 1.229× | 1.074× |
+| Turbo (8) | 1×72GB | full | 6.139 | 5.413 | 4.118 | 1.491× | 1.315× |
+| Turbo (8) | HSDP8/UP8, 8×48GB | cold | 5.344 | 5.468 | 5.493 | 0.973× | 0.995× |
+| Turbo (8) | HSDP8/UP8, 8×48GB | partial | 5.332 | 5.487 | 5.110 | 1.043× | 1.074× |
+| Turbo (8) | HSDP8/UP8, 8×48GB | full | 5.314 | 5.508 | 4.093 | 1.298× | 1.346× |
+
+Ratios above one favor paged cache-on. Partial hits replace the last
+reference with a new image of the same shape. Full means a full common
+CFG prefix; the longer branch may still encode its remaining text.
+Dense/on includes execution-backend and compilation differences;
+off/on measures enabling cross-request reuse within paged execution.
+
+The following comparisons use the first measured matching request in
+each case. PSNR uses native RGB; alpha reports its maximum absolute
+8-bit difference. ∞ means identical RGB values.
+
+| Model | Allocation | Case | On/off RGB dB | On/dense RGB dB | On/off RGB max | On/dense RGB max | Alpha max on/off; on/dense |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Base (50) | 1×72GB | cold | ∞ | 33.59 | 0 | 150 | 0; 6 |
+| Base (50) | 1×72GB | partial | ∞ | 36.73 | 0 | 151 | 0; 4 |
+| Base (50) | 1×72GB | full | ∞ | 34.58 | 0 | 128 | 0; 10 |
+| Base (50) | HSDP8/UP8, 8×48GB | cold | ∞ | 39.39 | 0 | 110 | 0; 2 |
+| Base (50) | HSDP8/UP8, 8×48GB | partial | ∞ | 32.08 | 0 | 180 | 0; 5 |
+| Base (50) | HSDP8/UP8, 8×48GB | full | ∞ | 30.80 | 0 | 198 | 0; 8 |
+| Turbo (8) | 1×72GB | cold | ∞ | 41.30 | 0 | 43 | 0; 4 |
+| Turbo (8) | 1×72GB | partial | ∞ | 37.80 | 0 | 53 | 0; 87 |
+| Turbo (8) | 1×72GB | full | ∞ | 39.43 | 0 | 60 | 0; 28 |
+| Turbo (8) | HSDP8/UP8, 8×48GB | cold | ∞ | 43.80 | 0 | 40 | 0; 4 |
+| Turbo (8) | HSDP8/UP8, 8×48GB | partial | ∞ | 38.87 | 0 | 54 | 0; 26 |
+| Turbo (8) | HSDP8/UP8, 8×48GB | full | ∞ | 39.04 | 0 | 61 | 0; 31 |
+
+All 60/60 measured cache-on/off output SHA256 pairs also match, including alpha.
+
+| Model | Allocation | Pool blocks | Allocated GiB/rank | Retained common prefixes / 32 | Dense graph replay | Sampled peak GiB (dense/off/on), max rank |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| Base (50) | 1×72GB | 1792 | 14.000 | 1/32 | yes | 57.59/51.98/52.14 |
+| Base (50) | HSDP8/UP8, 8×48GB | 14336 | 14.000 | 13/32 | no | 35.95/41.51/41.41 |
+| Turbo (8) | 1×72GB | 1792 | 14.000 | 2/32 | yes | 47.83/52.10/52.10 |
+| Turbo (8) | HSDP8/UP8, 8×48GB | 14336 | 14.000 | 27/32 | no | 31.05/41.41/41.41 |
+
+Graph replay is observed in the actual decode path, not inferred from a
+configuration flag. Paged decode graphs are disabled. Memory is sampled
+through NVML every 0.2 seconds, including engine startup, warmup and
+capacity probes; it is whole-run device usage, not per-request incremental
+memory or an exact PyTorch allocation peak. Retention uses lookup-only probes after 32 distinct
+prefixes; it does not reinsert evicted entries. These capacity values
+apply to the tested two-reference workloads, not every image/text length.
+
+Raw sample commit identities are preserved. Earlier baselines remain
+valid: subsequent changes lower paged admission to fit the fixed pool,
+move native paged metadata construction outside Dynamo, and isolate cold
+trials from the shared text header with unique salts. These changes do
+not alter dense execution. Sample commits: `5ff0cc9e`, `96045624`, `9c9a59f3`.
+
+Later review hardening rejects invalid salts and retries shorter prefix
+hits when COW would exceed the physical pool. The latter retry is not
+reached by this matrix: even two 12,318-token rows plus two COW sources
+need at most 1,542 physical 16-token blocks, below the smallest pool's 1,791 usable
+blocks. The recorded salt values are valid. These measurements retain
+their original source labels; the added edge cases have separate regression
+coverage.
+
+For the 50-step base model, warm reuse alone yields 1.014–1.044× versus
+paged cache-off. The 1.560× full-hit HSDP8 comparison against dense includes
+execution-path differences already visible with cache-off (1.507× on cold
+requests). For Turbo, full hits yield 1.315× and 1.346× versus paged cache-off,
+and 1.491× and 1.298× versus dense, on the single- and eight-GPU allocations
+respectively. Cold or partial requests can still lose to dense. Memory use
+also varies: a retained 14 GiB pool is not always smaller than dense storage.
+Choose from the measured workload and memory trade-off, rather than treating
+cross-request caching as an unconditional speedup.
 
 ## Quality Comparison (head vs diffusers)
 

@@ -25,10 +25,15 @@ from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForCond
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -42,6 +47,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     calculate_dimensions,
     retrieve_latents,
 )
+from vllm_omni.diffusion.models.qwen_image_21 import request_layout as request_layout_utils
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21KVCache,
@@ -149,6 +155,13 @@ def _exclude_text_encoder_subtrees_from_quant(
     return config
 
 
+def get_qwen_image_21_prefix_cache_func(
+    od_config: OmniDiffusionConfig,
+):
+    del od_config
+    return request_layout_utils.prepare_qwen_image_21_prefix_cache
+
+
 def get_qwen_image_21_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -166,6 +179,65 @@ def get_qwen_image_21_pre_process_func(
     # opaque alpha channel unless the input already carries one.
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
     sample_sigmas = (getattr(od_config, "extras", None) or {}).get("sample_sigmas")
+    additional_config = getattr(od_config, "additional_config", None) or {}
+    profile_max_sequence_length = int(
+        additional_config.get(
+            "diffusion_kv_profile_max_sequence_length",
+            request_layout_utils.QWEN_IMAGE_21_MAX_TEXT_LENGTH,
+        )
+    )
+    if not 0 < profile_max_sequence_length <= request_layout_utils.QWEN_IMAGE_21_MAX_TEXT_LENGTH:
+        raise ValueError(
+            "diffusion_kv_profile_max_sequence_length must be in "
+            f"[1, {request_layout_utils.QWEN_IMAGE_21_MAX_TEXT_LENGTH}], got {profile_max_sequence_length}"
+        )
+    prepare_diffusion_kv_layout = (
+        getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        is DiffusionKVCacheMode.PAGED_SCHEDULER
+    )
+    layout_tokenizer = (
+        request_layout_utils.QwenImage21LayoutTokenizer(
+            od_config.model,
+            trust_remote_code=bool(getattr(od_config, "trust_remote_code", False)),
+        )
+        if prepare_diffusion_kv_layout
+        else None
+    )
+
+    def _attach_diffusion_kv_layout(request: OmniDiffusionRequest) -> None:
+        if not prepare_diffusion_kv_layout:
+            return
+        assert layout_tokenizer is not None
+        if (
+            OmniDiffusionRequest.is_dummy_run_request_id(request.request_id)
+            and request.sampling_params.num_inference_steps == 1
+        ):
+            max_rows = int(getattr(od_config, "diffusion_kv_max_rows_per_request", 1) or 1)
+            if max_rows >= 2 and isinstance(request.prompt, dict):
+                request.sampling_params.true_cfg_scale = max(
+                    float(request.sampling_params.true_cfg_scale or 1.0),
+                    4.0,
+                )
+            if isinstance(request.prompt, dict) and request.prompt.get("prompt") == "dummy run":
+                request.sampling_params.max_sequence_length = profile_max_sequence_length
+                profile_prompt = layout_tokenizer.build_profile_prompt(
+                    num_images=len((request.prompt.get("additional_information") or {}).get("input_image_sizes") or ()),
+                    max_sequence_length=profile_max_sequence_length,
+                )
+                request.prompt["prompt"] = profile_prompt
+                if max_rows >= 2:
+                    request.prompt["negative_prompt"] = profile_prompt
+        prepared_layout = request_layout_utils.prepare_qwen_image_21_layout(
+            request,
+            layout_tokenizer=layout_tokenizer,
+            vae_scale_factor=vae_scale_factor,
+            max_prompt_sequence_length=profile_max_sequence_length,
+        )
+        request.prepared_layout = prepared_layout
+        request.diffusion_kv_requests = request_layout_utils.build_qwen_image_21_diffusion_kv_requests(
+            request,
+            prepared_layout,
+        )
 
     def _to_pil(image: Any) -> PIL.Image.Image:
         if isinstance(image, PIL.Image.Image):
@@ -216,9 +288,19 @@ def get_qwen_image_21_pre_process_func(
 
         if isinstance(raw_image, tuple):
             raw_image = list(raw_image)
+        is_kv_profile_request = (
+            prepare_diffusion_kv_layout
+            and OmniDiffusionRequest.is_dummy_run_request_id(request.request_id)
+            and request.sampling_params.num_inference_steps == 1
+        )
+        if is_kv_profile_request and (raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0)):
+            profile_h = int(request.sampling_params.height or OUTPUT_RESOLUTION)
+            profile_w = int(request.sampling_params.width or OUTPUT_RESOLUTION)
+            raw_image = [PIL.Image.new("RGB", (profile_w, profile_h)) for _ in range(MAX_QWEN_IMAGE_21_INPUT_IMAGES)]
         if raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0):
             request.batch_compatibility_key = ("qwen_image_21", ())
             request.prompt = prompt
+            _attach_diffusion_kv_layout(request)
             return request
 
         if not isinstance(raw_image, list):
@@ -263,6 +345,7 @@ def get_qwen_image_21_pre_process_func(
         prompt["additional_information"]["calculated_width"] = calculated_width
         request.batch_compatibility_key = ("qwen_image_21", tuple(input_image_sizes))
         request.prompt = prompt
+        _attach_diffusion_kv_layout(request)
         return request
 
     return pre_process_func
@@ -959,6 +1042,12 @@ class QwenImage21Pipeline(
             )
         return per_request
 
+    def _uses_scheduler_paged_kv(self) -> bool:
+        return (
+            getattr(getattr(self, "od_config", None), "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+
     def _prepare_generation_context(
         self,
         *,
@@ -975,6 +1064,8 @@ class QwenImage21Pipeline(
         per_request_images: list[dict[str, Any]],
         latents=None,
         attention_kwargs=None,
+        prepared_layout: request_layout_utils.QwenImage21PreparedLayout | None = None,
+        paged_kv_cached_prefix_len: int = 0,
     ):
         """Shared preparation logic for forward() and prepare_encode().
 
@@ -1017,20 +1108,51 @@ class QwenImage21Pipeline(
                 "the transformer's joint sequence requires a shared layout."
             )
 
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self.encode_prompt(
-            prompt=prompt,
-            images_per_prompt=images_per_prompt if has_images else None,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
+        skip_cond_prompt_encode = (
+            prepared_layout is not None
+            and batch_size == 1
+            and num_images_per_prompt == 1
+            and paged_kv_cached_prefix_len >= prepared_layout.branches[0].prefix_len
         )
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask, negative_image_pad_mask = self.encode_prompt(
-                prompt=negative_prompt,
+        if skip_cond_prompt_encode:
+            prompt_embeds = None
+            prompt_embeds_mask = None
+            image_pad_mask = torch.tensor(
+                [prepared_layout.branches[0].vlm_image_pad_mask],
+                dtype=torch.bool,
+                device=self.device,
+            )
+        else:
+            prompt_embeds, prompt_embeds_mask, image_pad_mask = self.encode_prompt(
+                prompt=prompt,
                 images_per_prompt=images_per_prompt if has_images else None,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
-                prompt_name="negative_prompt",
             )
+        if do_true_cfg:
+            skip_uncond_prompt_encode = (
+                prepared_layout is not None
+                and prepared_layout.num_branches > 1
+                and batch_size == 1
+                and num_images_per_prompt == 1
+                and paged_kv_cached_prefix_len >= prepared_layout.branches[1].prefix_len
+            )
+            if skip_uncond_prompt_encode:
+                negative_prompt_embeds = None
+                negative_prompt_embeds_mask = None
+                negative_image_pad_mask = torch.tensor(
+                    [prepared_layout.branches[1].vlm_image_pad_mask],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            else:
+                negative_prompt_embeds, negative_prompt_embeds_mask, negative_image_pad_mask = self.encode_prompt(
+                    prompt=negative_prompt,
+                    images_per_prompt=images_per_prompt if has_images else None,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    prompt_name="negative_prompt",
+                )
         else:
             negative_prompt_embeds = None
             negative_prompt_embeds_mask = None
@@ -1038,6 +1160,14 @@ class QwenImage21Pipeline(
 
         # Collate condition images per input slot across requests. Batched VAE
         # encoding requires every request to share the same per-slot sizes.
+        skip_cond_vae = (
+            batch_size == 1
+            and num_images_per_prompt == 1
+            and request_layout_utils.native_kv_covers_cond_images(
+                prepared_layout,
+                paged_kv_cached_prefix_len,
+            )
+        )
         vae_images_batched = None
         input_image_sizes: list[tuple[int, int]] = []
         if has_images:
@@ -1049,19 +1179,21 @@ class QwenImage21Pipeline(
                         "(the transformer's joint sequence requires a shared layout)."
                     )
             input_image_sizes = per_request_images[0]["input_image_sizes"] or []
-            vae_images_batched = [
-                torch.cat([entry["vae_images"][slot] for entry in per_request_images], dim=0)
-                for slot in range(num_slots)
-            ]
+            if not skip_cond_vae:
+                vae_images_batched = [
+                    torch.cat([entry["vae_images"][slot] for entry in per_request_images], dim=0)
+                    for slot in range(num_slots)
+                ]
 
         num_channels_latents = self.transformer.in_channels
+        latent_dtype = prompt_embeds.dtype if prompt_embeds is not None else self.text_encoder.dtype
         latents, image_latents = self.prepare_latents(
             vae_images_batched,
             batch_size * num_images_per_prompt,
             num_channels_latents,
             height,
             width,
-            prompt_embeds.dtype,
+            latent_dtype,
             self.device,
             generator,
             latents,
@@ -1173,6 +1305,18 @@ class QwenImage21Pipeline(
         homogeneous = all(sig == signatures[0] for sig in signatures)
         attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
 
+        prepared_layout = None
+        paged_kv_cached_prefix_len = 0
+        if self._uses_scheduler_paged_kv():
+            if len(req.requests) > 1 or num_images_per_prompt > 1:
+                raise ValueError(
+                    "QwenImage21 paged_scheduler currently supports one single-output request per forward."
+                )
+            if req.requests:
+                prepared_layout = request_layout_utils.get_qwen_image_21_prepared_layout(req.requests[0])
+            if is_forward_context_available():
+                paged_kv_cached_prefix_len = int(get_forward_context().paged_kv_cached_prefix_len)
+
         ctx = self._prepare_generation_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1187,6 +1331,8 @@ class QwenImage21Pipeline(
             per_request_images=per_request_images,
             latents=latents,
             attention_kwargs=attention_kwargs,
+            prepared_layout=prepared_layout,
+            paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         )
 
         latents = self.diffuse(
@@ -1473,6 +1619,11 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        if self._uses_scheduler_paged_kv():
+            raise ValueError(
+                "QwenImage21 paged_scheduler currently supports request-level execution only; "
+                "disable step execution or use dense_legacy."
+            )
 
         if self._needs_decode_seq_len_split(states):
             # Local import: InputBatch is only TYPE_CHECKING at module scope.

@@ -78,7 +78,9 @@ def hash_prefix_cache_value(value: object) -> bytes:
     return bytes.fromhex(MultiModalHasher.hash_kwargs("sha256", identity=encoded))
 
 
-def get_cache_namespace(model_namespace: str, sampling: OmniDiffusionSamplingParams) -> str:
+def get_cache_namespace(
+    model_namespace: str, sampling: OmniDiffusionSamplingParams, *, cache_salt: str | None = None
+) -> str:
     """Isolate model semantics and the adapter actually activated by Worker.
 
     Native LoRA block keys use lora_name, but diffusion also supports a scale
@@ -89,6 +91,13 @@ def get_cache_namespace(model_namespace: str, sampling: OmniDiffusionSamplingPar
 
     if not isinstance(model_namespace, str) or not model_namespace:
         raise ValueError("Model cache namespace must be non-empty")
+    if cache_salt is not None and not isinstance(cache_salt, str):
+        raise TypeError("cache_salt must be a string or None")
+    if cache_salt == "":
+        raise ValueError("cache_salt must be non-empty when provided")
     lora = sampling.lora_request
     adapter = None if lora is None else (lora.lora_int_id, float(sampling.lora_scale))
-    return hash_prefix_cache_value(("diffusion-prefix-identity-v2", model_namespace, adapter)).hex()
+    identity: tuple[object, ...] = ("diffusion-prefix-identity-v2", model_namespace, adapter)
+    if cache_salt is not None:
+        identity = (*identity, ("cache_salt", cache_salt))
+    return hash_prefix_cache_value(identity).hex()

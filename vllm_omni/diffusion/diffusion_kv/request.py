@@ -69,6 +69,8 @@ class DiffusionKVRequest:
         block_hashes: Sequence[BlockHash] = (),
         cache_token_ids: Sequence[int] = (),
         mm_features: Sequence[MultiModalFeatureSpec] = (),
+        atomic_cache_spans: Sequence[tuple[int, int]] = (),
+        cache_dependencies: Sequence[tuple[int, str]] = (),
         cache_namespace: str = "diffusion-primary-v1",
         kv_contexts: Sequence[DiffusionKVContext] = (),
         kv_transfer_params: dict[str, Any] | None = None,
@@ -96,6 +98,36 @@ class DiffusionKVRequest:
             )
         if any(type(token_id) is not int for token_id in token_ids):
             raise TypeError("cache_token_ids must contain only integers")
+        atomic_spans = tuple(atomic_cache_spans)
+        previous_end = 0
+        for span in atomic_spans:
+            if not isinstance(span, tuple) or len(span) != 2 or any(type(boundary) is not int for boundary in span):
+                raise TypeError("atomic_cache_spans must contain only (int, int) tuples")
+            start, end = span
+            if start < previous_end or end <= start or end > prefix_len:
+                raise ValueError(
+                    "atomic_cache_spans must be sorted, non-overlapping, and contained in prefix_len: "
+                    f"span={span}, prefix_len={prefix_len}"
+                )
+            previous_end = end
+        dependencies = tuple(cache_dependencies)
+        previous_offset = -1
+        for dependency in dependencies:
+            if (
+                not isinstance(dependency, tuple)
+                or len(dependency) != 2
+                or type(dependency[0]) is not int
+                or not isinstance(dependency[1], str)
+                or not dependency[1]
+            ):
+                raise TypeError("cache_dependencies must contain only (int, non-empty str) tuples")
+            offset, _ = dependency
+            if offset < previous_offset or offset < 0 or offset >= prefix_len:
+                raise ValueError(
+                    "cache_dependencies must be sorted and contained in prefix_len: "
+                    f"offset={offset}, prefix_len={prefix_len}"
+                )
+            previous_offset = offset
         if not isinstance(cache_namespace, str) or not cache_namespace:
             raise ValueError("cache_namespace must be a non-empty string")
 
@@ -113,6 +145,8 @@ class DiffusionKVRequest:
         self.kv_contexts = contexts
         self.cache_token_ids = token_ids
         self.mm_features = list(mm_features)
+        self.atomic_cache_spans = atomic_spans
+        self.cache_dependencies = dependencies
         self.cache_namespace = cache_namespace
         # Native generate_block_hash_extra_keys consumes this Request surface.
         # Diffusion adapter ID + scale are already isolated in cache_namespace;
@@ -156,6 +190,25 @@ class DiffusionKVRequest:
                 raise ValueError("mm_features must have non-empty content identifiers")
             previous_end = end
 
+    def _validate_cache_dependencies(self) -> None:
+        previous_offset = -1
+        for dependency in self.cache_dependencies:
+            if (
+                not isinstance(dependency, tuple)
+                or len(dependency) != 2
+                or type(dependency[0]) is not int
+                or not isinstance(dependency[1], str)
+                or not dependency[1]
+            ):
+                raise TypeError("cache_dependencies must contain only (int, non-empty str) tuples")
+            offset, _ = dependency
+            if offset < previous_offset or offset < 0 or offset >= self.prefix_len:
+                raise ValueError(
+                    "cache_dependencies must be sorted and contained in prefix_len: "
+                    f"offset={offset}, prefix_len={self.prefix_len}"
+                )
+            previous_offset = offset
+
     def build_block_hashes(
         self,
         hash_block_size: int,
@@ -177,6 +230,7 @@ class DiffusionKVRequest:
                 f"tokens={len(self.cache_token_ids)}, required={num_cache_tokens}"
             )
         self._validate_mm_features()
+        self._validate_cache_dependencies()
 
         # Keep the first hash deterministic without mutating vLLM's process-wide
         # ``NONE_HASH``.  A diffusion manager can be created more than once in
@@ -186,12 +240,24 @@ class DiffusionKVRequest:
         parent_hash: BlockHash | None = BlockHash(hash_function(("diffusion-prefix-root-v1", self.cache_namespace)))
         hashes: list[BlockHash] = []
         mm_index = 0
+        dependency_index = 0
         for start in range(0, num_cache_tokens, hash_block_size):
             end = start + hash_block_size
             # Reuse upstream MM intersection/offset logic directly. Keep our
             # stable-prefix bound: native get_request_block_hasher hashes the
             # entire token axis, including diffusion's mutable target region.
             extra_keys, mm_index = generate_block_hash_extra_keys(self, start, end, mm_index)
+            dependency_keys: list[tuple[str, int, str]] = []
+            while dependency_index < len(self.cache_dependencies):
+                offset, identifier = self.cache_dependencies[dependency_index]
+                activation_offset = (offset + hash_block_size - 1) // hash_block_size * hash_block_size
+                if activation_offset > start:
+                    break
+                if activation_offset == start:
+                    dependency_keys.append(("diffusion-cache-dependency-v1", offset, identifier))
+                dependency_index += 1
+            if dependency_keys:
+                extra_keys = (*(() if extra_keys is None else extra_keys), *dependency_keys)
             parent_hash = hash_block_tokens(
                 hash_function=hash_function,
                 parent_block_hash=parent_hash,
