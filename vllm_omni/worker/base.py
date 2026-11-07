@@ -487,7 +487,12 @@ class OmniGPUWorkerBase(GPUWorker):
         gc.collect()
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        # Keep the same pools as vLLM (CuMemBackend.suspend): the KV-init runtime state
+        # ("runtime") and the CUDA graph pool ("cudagraph") at every level, plus the
+        # weights at level 1. Discarding them breaks the first request after wake_up.
+        offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
+        if level == 1:
+            offload_tags = ("weights", *offload_tags)
         allocator = get_mem_allocator_instance()
         if level == 2:
             self._sleep_saved_tensors = _save_non_parameter_tensors(self._sleep_models(), allocator)
