@@ -203,13 +203,18 @@ def test_real_prepare_hook_admits_reordered_requests(model) -> None:
     assert model._step_discard == [True, False]
 
 
-@pytest.mark.parametrize("spare", [0, 1, 4095, 4096, 5000])
-def test_hold_budget_matches_engine_headroom(spare: int) -> None:
-    """Adapter metadata advertises only the HOLD steps left after clipping."""
-    frames = 250
-    prompt = {"prompt_token_ids": [1] * (y.CONTEXT - frames - 1 - spare)}
+@pytest.mark.parametrize("frames", [200, 250, 9000])
+def test_adapter_does_not_reserve_hold_tokens(frames: int) -> None:
+    from vllm_omni.model_executor.models.yue2.request import phase_params
+
+    prompt = {
+        "prompt_token_ids": [1, 2],
+        "additional_information": {
+            "yue2_song_sampling": phase_params([1, 2], "semantic", 42, frames).extra_args,
+        },
+    }
     adapter = object.__new__(Yue2Adapter)
     request = OpenAICreateSpeechRequest(model="m-a-p/YuE2-3B", input="lyrics", max_new_tokens=frames)
     params = adapter.apply_sampling_overrides([SamplingParams()], request, prompt)[0]
-    assert params.extra_args[y.KEY_MAX_HOLD_STEPS] == min(spare, 4096)
-    assert params.max_tokens == frames + 1 + min(spare, 4096)
+    assert params.extra_args[y.KEY_MAX_HOLD_STEPS] == 0
+    assert params.max_tokens == frames + 2

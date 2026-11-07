@@ -7,15 +7,18 @@
 # model_type stays "yue2" so the registered Yue2Config is used; no
 # trust_remote_code is needed (the registered config/model win over the
 # checkpoint's auto_map).
+model_runner: v1
 pipeline: yue2
 async_chunk: false
 dtype: bfloat16
 
 stages:
   - stage_id: 0
-    # A finishing song keeps its slot during side-stream synthesis,
-    # emitting HOLD tokens until its audio is ready.
+    # AR slots are released while the same worker finishes NAR/VAE synthesis.
     max_num_seqs: 4
+    async_scheduling: false
+    enable_chunked_prefill: false
+    worker_cls: vllm_omni.model_executor.models.yue2.runtime.Yue2Worker
     # Reserve synthesis headroom: NAR K/V, acoustic graph buffers and VAE
     # activations are allocated beyond the engine budget. The earlier 4090
     # memory measurement predates async/compiled synthesis; 0.70 is a starting
@@ -25,11 +28,7 @@ stages:
     # Keep AR capture off by default. Sampler/NAR graphs still need
     # separate synthesis headroom.
     enforce_eager: true
-    # Prefix caching works (the runner builds the song from the live
-    # outputs) but stays off by default: YuE2 prompts are short next to
-    # the song, so a hit saves little, and on a hit the same seed gives a
-    # different song than on a miss (a tail-only prefill is not bitwise
-    # equal to a full one, so sampling drifts after a few frames).
+    # Model-owned acoustic state cannot be restored from an AR prefix cache.
     enable_prefix_caching: false
     max_num_batched_tokens: 24576
     max_model_len: 24576
@@ -42,6 +41,15 @@ stages:
     tokenizer: gpt2
     hf_overrides:
       architectures: ["Yue2ForCausalLM"]
+      # An explicit path wins over the legacy YUE2_VAE environment variable.
+      # null keeps that fallback, then defaults to m-a-p/YuE2-Vae.
+      yue2_vae_path: null
+      yue2_vae_revision: main
+      # Packing is opt-in; VAE keeps the original one-tile execution.
+      yue2_nar_batch_size: 1
+      yue2_vae_batch_size: 1
+      yue2_nar_batch_wait_ms: 0
+      yue2_nar_batch_max_tokens: 0
     default_sampling_params:
       # Defaults for callers that omit model-owned sampling options. The
       # opt-in prepare_runner_inputs hook reads each request's extra_args;
@@ -50,10 +58,9 @@ stages:
         yue2_phase: "semantic"
         yue2_seed: 831001
         yue2_max_audio_frames: 200
-        yue2_max_hold_steps: 4096
+        yue2_max_hold_steps: 0
       detokenize: false
       stop_token_ids: [151848, 151852]  # ABC_END, MUSIC_END
-      # 200 frames + 4096 synthesis holds + the final end token. Callers
-      # changing the frame budget must also reserve this token headroom.
-      max_tokens: 4297
+      # Frames plus terminal handoff; synthesis does not consume AR tokens.
+      max_tokens: 202
       temperature: 1.0
