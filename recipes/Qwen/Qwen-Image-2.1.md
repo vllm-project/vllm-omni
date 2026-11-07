@@ -610,3 +610,19 @@ it. Prefix layout must remain fixed for the lifetime of that branch's KV cache.
 Shared modulation applies to eager prefill and eager decode fallback even when
 a decode graph manager exists. Captured graph execution is unchanged; no new
 graph-mode performance improvement is claimed.
+
+### Experimental NPU residual fusion
+
+For code review and evaluation, `extras={"qwen21_fuse_residual_gate": True}`
+opts into MindIE-SD residual mul/add fusion. The default is off. This requires
+a MindIE-SD `residual_gate_add` interface with `preserve_mul_rounding`; an older
+interface keeps the existing path. The product is rounded back to BF16 before
+adding the residual. The shared tanh preparation remains unchanged.
+
+Eligibility is limited to unquantized NPU BF16 batch-1 eager decode with
+TP1/SP1, no HSDP, LoRA, or offload, and contiguous operands. Prefill and
+unsupported inputs retain the existing residual path.
+
+This is not a performance recommendation: the initial Ascend950PR operator
+comparison regressed, and repeated 1024×1024, 50-step model A/B and profiling
+remain outstanding.

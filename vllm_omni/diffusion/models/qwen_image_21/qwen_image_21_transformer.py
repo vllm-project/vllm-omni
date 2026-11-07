@@ -37,6 +37,11 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.residual_gate_fusion import (
+    ResidualGateOp,
+    resolve_residual_gate_add,
+    try_residual_gate_add,
+)
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -734,6 +739,7 @@ class QwenImage21TransformerBlock(nn.Module):
         cache_write_len: int | None = None,
         prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         _pointwise_validated: bool = False,
+        _residual_gate_add: ResidualGateOp | None = None,
     ) -> torch.Tensor:
         if prepared_modulation is None:
             mod1, mod2 = modulation.chunk(2, dim=-1)
@@ -766,8 +772,12 @@ class QwenImage21TransformerBlock(nn.Module):
         if use_inplace_residual:
             # Mutate only the fresh projection output, preserving input ownership
             # and the BF16 rounding between multiplication and addition.
-            attn_output.mul_(img_gate1).add_(hidden_states)
-            hidden_states = attn_output
+            fused = try_residual_gate_add(_residual_gate_add, hidden_states, attn_output, img_gate1)
+            if fused is None:
+                attn_output.mul_(img_gate1).add_(hidden_states)
+                hidden_states = attn_output
+            else:
+                hidden_states = fused
         else:
             hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
@@ -782,8 +792,12 @@ class QwenImage21TransformerBlock(nn.Module):
             else self.img_mlp(img_modulated2)
         )
         if use_inplace_residual:
-            mlp_output.mul_(img_gate2).add_(hidden_states)
-            hidden_states = mlp_output
+            fused = try_residual_gate_add(_residual_gate_add, hidden_states, mlp_output, img_gate2)
+            if fused is None:
+                mlp_output.mul_(img_gate2).add_(hidden_states)
+                hidden_states = mlp_output
+            else:
+                hidden_states = fused
         else:
             hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
 
@@ -966,6 +980,16 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # quantizes attention Q/K/V *compute* per forward on supported backends.
         extras = getattr(od_config, "extras", None) or {}
         self.prefix_kv_cache_dtype = _normalize_prefix_kv_cache_dtype(extras.get("prefix_kv_cache_dtype"))
+        self._residual_gate_add: ResidualGateOp | None = None
+        if (
+            extras.get("qwen21_fuse_residual_gate", False)
+            and od_config.enforce_eager
+            and self._pointwise_contract_allowed
+            and od_config.parallel_config.tensor_parallel_size == 1
+            and od_config.parallel_config.sequence_parallel_size == 1
+            and not od_config.parallel_config.use_hsdp
+        ):
+            self._residual_gate_add = resolve_residual_gate_add()
 
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
         self.time_text_embed = QwenImage21TimestepProjEmbeddings(
@@ -1416,6 +1440,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 cache_write_len=cache_write_len,
                 prepared_modulation=prepared_modulation,
                 _pointwise_validated=pointwise_validated,
+                _residual_gate_add=self._residual_gate_add if is_decode and not sp_active else None,
             )
 
         if (
