@@ -1229,8 +1229,56 @@ playback fixtures require explicit opt-in and use the session's heard-prefix
 path. A declared interruption also records its permanent cutoff, so a later
 playback ACK cannot restore unheard content. These fixtures do not establish
 real audio, serving or model-quality coverage.
-Those measurements still require integration with the existing evaluation
-runner, actual media and a model-backed query path.
+Model quality and latency still require actual media and model-backed queries.
+
+The serving adapter, `vllm_omni/benchmarks/duplex/memory_card_serving.py`,
+reuses the public `DuplexClient`, its resume/rotation/deduplication behavior,
+`EventCollector` and the existing duplex session metrics. Each query/timing
+trial gets a fresh session; messages and generated turns within a trial share
+that session. Message creation and deletion wait for their corresponding item
+acknowledgements. Idle windows remain fixed rather than waiting for extraction
+success. Failed and unsupported trials remain in the report. Results omit raw
+events, resume credentials and gold. Query send-to-first-output timings are
+separate from per-response and whole-session metrics.
+
+| Replay event | Public serving meaning |
+| --- | --- |
+| `message` | Import committed text and wait for `conversation.item.created` |
+| `delete` | Wait for `conversation.item.deleted` with the same item ID |
+| `idle` | Fixed wall-clock delay, with no extraction-success polling |
+| `resume_live_session` | Force a transport drop; require resume of the same session |
+| `live_response` | Generate actual audio, then ACK observed playback milliseconds and optionally truncate its item |
+| `edit` | Unsupported: no equivalent public in-place source edit |
+| `assistant_playback` | Unsupported: fixture `heard_text` is not real model audio |
+
+`live_response` is a separately identified serving scenario, available through
+the adapter API. It is not a translation of the calibrated CPU playback
+fixture. It requires actual received audio and never sends fixture heard text.
+Of the original 13 CPU query/timing variants, 8 have compatible public protocol
+operations; compatibility alone does not prove context pressure or quality.
+
+Export one execution-only timeline and commands for three separately prepared
+deployment configurations:
+
+```bash
+python -m vllm_omni.benchmarks.duplex.memory_card_serving prepare \
+    --cases tests/benchmarks/duplex/fixtures/memory_card_seeds.jsonl \
+    --url ws://127.0.0.1:8091/v1/realtime --model MODEL \
+    --budget-only budget.yaml --l2 l2.yaml --l2-l3 l2_l3.yaml \
+    --output replay_manifest.json
+```
+
+The generated launch and replay commands use the same timeline for each arm.
+Settings remain deployment-owned; the client does not toggle L2/L3 through
+`extra_body`. The manifest fingerprints the supplied configurations; it does
+not attest which settings an existing server loaded or prove equal compute
+allowances. Verify those separately. Replay reports preserve unsuccessful
+samples and are created without overwriting previous results. Use
+`OPENAI_API_KEY` for authentication; remote endpoints require `wss`, while
+loopback `ws` is supported. Pressure checks and semantic scoring belong to the
+separate evaluator, including `pressure_not_achieved` when the target fact
+remains in the base prompt. Neither protocol tests nor these commands establish
+model-backed results on their own.
 
 ## Qwen budget selection and summary memory
 
