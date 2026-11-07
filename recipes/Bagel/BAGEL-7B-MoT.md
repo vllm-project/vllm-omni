@@ -41,7 +41,8 @@ parameters through the pipeline-declared `extra_args` contract.
 
 This recipe documents the CUDA layouts used by the in-repo BAGEL deploy
 configs. The default two-stage config shares one 80 GB GPU; for more headroom,
-move the diffusion stage to a second GPU in a custom deploy config.
+move the diffusion stage to a second GPU in a custom deploy config. For the
+qualified Ascend 910C path, see [BAGEL-7B-MoT-NPU.md](BAGEL-7B-MoT-NPU.md).
 
 ## GPU
 
