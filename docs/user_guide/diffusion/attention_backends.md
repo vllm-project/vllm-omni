@@ -193,6 +193,8 @@ vllm-omni serve <model> --diffusion-kv-cache-dtype fp8
   `quant_attention`, which performs the vendor-side quantization and attention.
 - `diffusion_kv_cache_skip_steps` / `diffusion_kv_cache_skip_layers` exempt
   individual denoise steps or transformer blocks (format: `"0-9,20,25-30"`).
+  Qwen-Image-2.1 on Ascend requires an explicit step-0 exclusion for its
+  structural prefill; see the [Qwen-Image-2.1 configuration](../quantization/quantized_kvcache.md#qwen-image-21-on-ascend).
 
 Backend support for `fp8`:
 
