@@ -64,6 +64,12 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  cuda:
+    stages:
+      # The DAC stage runs on Model Runner V2 on CUDA; stage 0 stays on V1 for
+      # now. Set model_runner: v1 here to opt out.
+      - stage_id: 1
+        model_runner: v2
   npu:
     # Ascend paged attention only accepts 128-token cache blocks
     # (AscendAttentionBackend.get_supported_kernel_block_sizes() == [128]),
