@@ -115,7 +115,6 @@ class PhononModelState(OmniModelState):
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
-        self.decoder.reset_slots(req_index)
         self.mimi_positions[req_index].zero_()
         self.remaining_tail[req_index].fill_(-1)
         self.active[req_index].fill_(True)
@@ -148,7 +147,6 @@ class PhononModelState(OmniModelState):
     def remove_request(self, req_index_or_id):
         index = self._resolve_req_index(req_index_or_id)
         if index is not None:
-            self.decoder.reset_slots(index)
             self.active[index].fill_(False)
         super().remove_request(req_index_or_id)
 

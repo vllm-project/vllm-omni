@@ -18,7 +18,7 @@ class StreamingConv(nn.Module):
         self.register_buffer("history", torch.zeros(slots, inputs, dilation * (kernel - 1)), persistent=False)
         self.register_buffer("scratch", torch.empty(0), persistent=False)
 
-    def forward(self, inputs, slots):
+    def forward(self, inputs, slots, reset=None):
         return causal_conv_step(
             inputs,
             self.conv.weight,
@@ -26,6 +26,7 @@ class StreamingConv(nn.Module):
             self.history,
             slots,
             dilation=self.conv.dilation[0],
+            reset=reset,
             scratch=self.scratch if self.scratch.shape[-1] == self.history.shape[-1] + inputs.shape[-1] else None,
         )
 
@@ -36,10 +37,13 @@ class StreamingTranspose(nn.Module):
         self.convtr = nn.ConvTranspose1d(inputs, outputs, stride * 2, stride=stride, groups=groups, bias=bias)
         self.register_buffer("history", torch.zeros(slots, outputs, stride), persistent=False)
 
-    def forward(self, inputs, slots):
+    def forward(self, inputs, slots, reset=None):
         output = self.convtr(inputs)
         overlap = self.history.shape[-1]
-        output[..., :overlap] += self.history[slots]
+        history = self.history[slots]
+        if reset is not None:
+            history = torch.where(reset[:, None, None], 0, history)
+        output[..., :overlap] += history
         tail = output[..., -overlap:]
         if self.convtr.bias is not None:
             tail = tail - self.convtr.bias[None, :, None]
@@ -59,10 +63,10 @@ class ResidualBlock(nn.Module):
             ]
         )
 
-    def forward(self, inputs, slots):
+    def forward(self, inputs, slots, reset=None):
         output = inputs
         for layer in self.block:
-            output = layer(output, slots) if isinstance(layer, StreamingConv) else layer(output)
+            output = layer(output, slots, reset) if isinstance(layer, StreamingConv) else layer(output)
         return inputs + output
 
 
@@ -186,9 +190,10 @@ class MimiStreamingDecoder(nn.Module):
                 module.value_pool[slots] = 0
 
     def forward(self, latent, slots, positions):
+        reset = positions == 0
         inputs = self.quantizer_projection(latent)
         if self.upsample is not None:
-            inputs = self.upsample(inputs, slots)
+            inputs = self.upsample(inputs, slots, reset)
         inputs = self.input_projection(inputs.transpose(1, 2))
         position = positions[:, None] + torch.arange(inputs.shape[1], device=positions.device)
         angles = position[:, :, None, None].float() * self.frequencies
@@ -197,7 +202,7 @@ class MimiStreamingDecoder(nn.Module):
             inputs = layer(inputs, slots, positions, rotary)
         inputs = self.output_projection(inputs).transpose(1, 2)
         for layer in self.decoder:
-            inputs = layer(inputs) if isinstance(layer, nn.ELU) else layer(inputs, slots)
+            inputs = layer(inputs) if isinstance(layer, nn.ELU) else layer(inputs, slots, reset)
         return inputs
 
     def load_official_weights(self, weights):

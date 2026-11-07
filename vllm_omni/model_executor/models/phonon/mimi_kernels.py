@@ -46,6 +46,7 @@ def causal_conv_step(
     dilation: int = 1,
     groups: int = 1,
     scratch: torch.Tensor | None = None,
+    reset: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Stride-one causal convolution with alias-safe history update.
 
@@ -54,12 +55,15 @@ def causal_conv_step(
     overwritten when the new history is installed.
     """
     history_length = history_pool.shape[-1]
+    history = history_pool.index_select(0, slots)
+    if reset is not None:
+        history = torch.where(reset[:, None, None], 0, history)
     if scratch is None:
-        combined = torch.cat((history_pool[slots], inputs), dim=-1)
+        combined = torch.cat((history, inputs), dim=-1)
     else:
         combined = scratch[: inputs.shape[0]]
         if history_length:
-            combined[..., :history_length].copy_(history_pool.index_select(0, slots))
+            combined[..., :history_length].copy_(history)
         combined[..., history_length:].copy_(inputs)
     output = F.conv1d(combined, weight, bias, dilation=dilation, groups=groups)
     if history_length:
@@ -82,8 +86,9 @@ def ring_attention_chunk(query, key, value, key_pool, value_pool, slots, positio
     key_positions = torch.cat((old_positions, current_positions), -1)
     delta = current_positions[:, :, None] - key_positions[:, None, :]
     mask = (key_positions[:, None, :] >= 0) & (delta >= 0) & (delta < window)
-    keys = torch.cat((key_pool[slots], key), 1)
-    values = torch.cat((value_pool[slots], value), 1)
+    valid_history = (old_positions >= 0)[:, :, None, None]
+    keys = torch.cat((torch.where(valid_history, key_pool[slots], 0), key), 1)
+    values = torch.cat((torch.where(valid_history, value_pool[slots], 0), value), 1)
     output = F.scaled_dot_product_attention(
         query.transpose(1, 2),
         keys.transpose(1, 2),
