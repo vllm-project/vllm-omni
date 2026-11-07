@@ -595,7 +595,7 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
 
         hidden_representation = self.activation_post(hidden_representation)
         output_waveform = self.conv_post(hidden_representation)
-        return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze().cpu()
+        return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze()
 
 
 class RungeKutta4ODESolver:
