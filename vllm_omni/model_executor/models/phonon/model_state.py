@@ -4,7 +4,14 @@
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -53,10 +60,58 @@ class PhononModelState(OmniModelState):
             count, model.phonon_config["flow_lm"]["d_model"], dtype=self.dtype, device=device
         )
         self.decoder = MimiDecodeRunner(model.mimi.float(), capture=not vllm_config.model_config.enforce_eager)
-        self.flow = FlowSampleRunner(model.flow_lm, capture=not vllm_config.model_config.enforce_eager)
+        self.flow = FlowSampleRunner(
+            model.flow_lm,
+            capture=not vllm_config.model_config.enforce_eager,
+            postprocess=self._flow_postprocess,
+            state_buffers=(self.remaining_tail, self.active, self.next_embeddings),
+        )
         self.audio_output = PhononAudioOutput(None, None, [], 0)
         self._rows = []
         self.condition = model.flow_lm.conditioning()
+
+    def sample_determined_tokens(self, batch, sampler):
+        """Return determined protocol tokens when standard sampling features are inactive."""
+        if type(sampler) is not Sampler:
+            return None
+        rows = batch.idx_mapping_np[: batch.num_reqs]
+        if (
+            sampler.compute_nans
+            or sampler.return_sampling_mask
+            or sampler.trace_replay_state is not None
+            or sampler.get_logprobs_dims(rows) is not None
+            or (
+                sampler.thinking_budget_state.enabled
+                and np.any(sampler.thinking_budget_state.use_thinking_budget[rows])
+            )
+        ):
+            return None
+        for processor in sampler.logits_processors:
+            if type(processor) is LogitBiasState:
+                active = np.any(processor.use_logit_bias[rows])
+            elif type(processor) is PenaltiesState:
+                active = np.any(processor.use_penalty[rows])
+            elif type(processor) is BadWordsState:
+                active = np.any(processor.num_bad_words.np[rows])
+            else:
+                # Custom processors can alter even a single finite logit.
+                return None
+            if active:
+                return None
+        keep = self.model._continue
+        if keep is None or keep.numel() != batch.num_reqs:
+            return None
+        # Owned storage: subsequent forwards can replace the continue mask
+        # while these token IDs are being copied or delivered asynchronously.
+        tokens = torch.where(keep, self.model.continue_token_id, self.model.eos_token_id)
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            batch.seq_lens.new_ones(batch.num_reqs),
+            batch.seq_lens,
+            batch.cu_num_logits,
+            batch.idx_mapping,
+            sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(tokens.reshape(-1, 1), None, None, num_sampled, num_rejected)
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
@@ -146,7 +201,22 @@ class PhononModelState(OmniModelState):
             )
             * self.model.phonon_config.get("temp", 0.8) ** 0.5
         )
-        latent, eos = self.flow.sample(hidden, noise)
+        valid, feedback, denormalized, keep = self.flow.sample(hidden, noise, slots)
+        if len(self._rows) == count:
+            self.model._continue = keep
+        else:
+            self.model._continue[rows] = keep
+        for index, slot in enumerate(input_batch.idx_mapping_np[self._rows]):
+            self.intermediate_buffer.buffers[int(slot)]["next_embedding"] = feedback[index]
+        # Graph output is reused by the next replay; the async output owns its flag.
+        valid = valid.clone()
+        audio, event = self.decoder.decode(denormalized, slots, self.mimi_positions[slots])
+        self.mimi_positions[slots] += self.model.mimi.upsample_ratio
+        self.audio_output = PhononAudioOutput(audio, valid, list(self._rows), count, event)
+
+    def _flow_postprocess(self, hidden, noise, slots):
+        lm = self.model.flow_lm
+        latent, eos = lm.sample(hidden, noise)
         valid = self.active[slots]
         previous = self.remaining_tail[slots]
         tail_frames = self.tail_frames[slots]
@@ -155,16 +225,12 @@ class PhononModelState(OmniModelState):
         )
         ended = tail == 0
         self.remaining_tail[slots] = torch.where(tail >= 0, tail - 1, tail)
-        self.active[slots] = valid & ~ended
-        self.model._continue[rows] = self.active[slots]
+        keep = valid & ~ended
+        self.active[slots] = keep
         feedback = lm.input_linear(latent) + self.condition
         self.next_embeddings[slots] = feedback
-        for index, slot in enumerate(input_batch.idx_mapping_np[self._rows]):
-            self.intermediate_buffer.buffers[int(slot)]["next_embedding"] = feedback[index]
         denormalized = (latent * lm.emb_std + lm.emb_mean).float().unsqueeze(-1)
-        audio, event = self.decoder.decode(denormalized, slots, self.mimi_positions[slots])
-        self.mimi_positions[slots] += self.model.mimi.upsample_ratio
-        self.audio_output = PhononAudioOutput(audio, valid, list(self._rows), count, event)
+        return valid, feedback, denormalized, keep
 
     def postprocess_model_output(self, model_output, input_batch, req_states):
         return model_output, {"phonon_audio_pending": True}

@@ -170,6 +170,8 @@ class PhononTalkerForConditionalGeneration(nn.Module):
         if get_tensor_model_parallel_world_size() != 1:
             raise ValueError("Phonon initial implementation requires tensor_parallel_size=1")
         self.config = vllm_config.model_config.hf_config
+        self.eos_token_id = self.config.eos_token_id
+        self.continue_token_id = self.config.audio_continue_token_id
         self.phonon_config = self.config.to_dict()
         self.flow_lm = PhononFlowLM(self.phonon_config, cache_config=vllm_config.cache_config, paged=True)
         from vllm.utils.torch_utils import set_default_torch_dtype
@@ -196,10 +198,10 @@ class PhononTalkerForConditionalGeneration(nn.Module):
     def compute_logits(self, hidden_states, sampling_metadata=None):
         logits = hidden_states.new_full((hidden_states.shape[0], self.config.vocab_size), float("-inf"))
         if self._continue is None:
-            logits[:, 0] = 0
+            logits[:, self.continue_token_id] = 0
         else:
-            logits[:, 0] = torch.where(self._continue, 0.0, float("-inf"))
-            logits[:, 1] = torch.where(self._continue, float("-inf"), 0.0)
+            logits[:, self.continue_token_id] = torch.where(self._continue, 0.0, float("-inf"))
+            logits[:, self.eos_token_id] = torch.where(self._continue, float("-inf"), 0.0)
         return logits
 
     def create_mrv2_model_state(self, vllm_config, encoder_cache, device):

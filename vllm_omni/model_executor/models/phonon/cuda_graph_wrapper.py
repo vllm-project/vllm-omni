@@ -85,30 +85,43 @@ class MimiDecodeRunner:
 
 
 class FlowSampleRunner:
-    def __init__(self, model, *, capture=True):
+    def __init__(self, model, *, capture=True, postprocess=None, state_buffers=()):
         self.model = model
         self.capture = capture and next(model.parameters()).is_cuda
+        self.postprocess = postprocess
+        self.state_buffers = state_buffers
         self.buckets = {}
 
-    def sample(self, hidden, noise):
-        if not self.capture:
+    def _run(self, hidden, noise, slots):
+        if self.postprocess is None:
             return self.model.sample(hidden, noise)
+        return self.postprocess(hidden, noise, slots)
+
+    def sample(self, hidden, noise, slots=None):
+        if not self.capture:
+            return self._run(hidden, noise, slots)
         batch = hidden.shape[0]
         if batch not in self.buckets:
             static_hidden = torch.zeros_like(hidden)
             static_noise = torch.zeros_like(noise)
+            static_slots = torch.zeros_like(slots) if slots is not None else None
+            saved_state = [buffer.clone() for buffer in self.state_buffers]
             stream = torch.cuda.Stream(device=hidden.device)
             stream.wait_stream(torch.cuda.current_stream(hidden.device))
             with torch.cuda.stream(stream):
                 for _ in range(3):
-                    self.model.sample(static_hidden, static_noise)
+                    self._run(static_hidden, static_noise, static_slots)
             torch.cuda.current_stream(hidden.device).wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = self.model.sample(static_hidden, static_noise)
-            self.buckets[batch] = static_hidden, static_noise, graph, output
-        static_hidden, static_noise, graph, output = self.buckets[batch]
+                output = self._run(static_hidden, static_noise, static_slots)
+            for buffer, saved in zip(self.state_buffers, saved_state, strict=True):
+                buffer.copy_(saved)
+            self.buckets[batch] = static_hidden, static_noise, static_slots, graph, output
+        static_hidden, static_noise, static_slots, graph, output = self.buckets[batch]
         static_hidden.copy_(hidden)
         static_noise.copy_(noise)
+        if static_slots is not None:
+            static_slots.copy_(slots)
         graph.replay()
         return output

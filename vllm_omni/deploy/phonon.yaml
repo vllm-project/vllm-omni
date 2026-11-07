@@ -23,4 +23,3 @@ stages:
       temperature: 0.0
       max_tokens: 1500
       detokenize: false
-      stop_token_ids: [1]
