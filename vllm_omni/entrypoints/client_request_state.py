@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 from vllm_omni.metrics import OrchestratorAggregator
 
@@ -51,3 +52,8 @@ class ClientRequestState:
         # the request state (not a class-level dict) so it is released with
         # the state — see #6462 / #6561.
         self.consumed_metric_message_ids: set[int] = set()
+        # Callback for mid-stream interactions that the engine rejects after
+        # they were queued, awaited with ``(event_id, message)`` (see
+        # ``AsyncOmni.submit_interaction_async``), and the tasks running it.
+        self.interaction_error_handler: Callable[[str, str], Awaitable[None]] | None = None
+        self.interaction_error_tasks: set[asyncio.Future] = set()
