@@ -371,6 +371,18 @@ def test_first_chunk_express_slack_guard_tracks_emitted_audio(monkeypatch):
     scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(24000), "sr": torch.tensor(24000)})
     assert scheduler._continuations_have_slack()
     assert scheduler._stream_audio["started"] == [100.0, 2.0]
+    # After a silence gap (t=110 > 102), new audio re-anchors to `now` without negative slack debt.
+    clock[0] = 110.0
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(12000), "sr": torch.tensor(24000)})
+    assert scheduler._stream_audio["started"] == [110.0, 0.5]
+    assert scheduler._continuations_have_slack()
+    # Stopping a segment clears playback state.
+    scheduler.chunk_transfer_adapter = None
+    ready.resumable = False
+    ready.streaming_queue = None
+    scheduler._handle_stopped_request(ready)
+    assert "started" not in scheduler._stream_audio
+    assert "started" not in scheduler._chunk_started
 
 
 def _express_scheduler():

@@ -80,12 +80,21 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
         warning.assert_called_once()
 
 
-@pytest.mark.parametrize("stateful,tp,pp", [(False, 1, 1), (True, 2, 1), (True, 1, 2)])
-def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(construct_scheduler, stateful, tp, pp):
+@pytest.mark.parametrize("stateful", [False, True])
+def test_native_batch_waiting_allows_stateful_and_chunk_owned_tp1_pp1(construct_scheduler, stateful):
+    scheduler = construct_scheduler(
+        _config(stateful=stateful, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
+    )
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.012
+
+
+@pytest.mark.parametrize("stateful,tp,pp", [(False, 2, 1), (True, 2, 1), (True, 1, 2)])
+def test_native_batch_waiting_still_rejects_unsupported_topology(construct_scheduler, stateful, tp, pp):
     config = _config(
         stateful=stateful, tp=tp, pp=pp, extras={"generation_min_batch_size": 32, "generation_max_wait_ms": 12}
     )
-    with pytest.raises(ValueError, match="stateful native MRV2 TP1/PP1"):
+    with pytest.raises(ValueError, match="native MRV2 TP1/PP1"):
         construct_scheduler(config)
 
 
