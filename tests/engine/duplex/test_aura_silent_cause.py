@@ -80,6 +80,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
         input_stage_id=lambda payload: 0,
         prepare_prompt_config=lambda config, **kwargs: config,
+        memory_prompt_query=lambda **kwargs: None,
         context_view_policy=lambda **kwargs: None,
         extra_prompt_config=lambda runtime_config: {},
         runtime_patch_for_submitted_prompt=lambda prompt: None,
