@@ -70,6 +70,13 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
 layout.
 
+When the AR processor receives `vae_generator_seed`, reference images consume
+one request-local VAE random stream in their input order. Batching and partial
+cache hits preserve that order. Seed forwarding remains specific to each
+entrypoint; an absent VAE seed retains the existing global RNG behavior.
+See [request RNG ownership](../../docs/design/feature/mm_request_rng.md) for
+the cache and execution contract. This does not change the DiT seed.
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with
@@ -139,7 +146,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +159,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +173,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
