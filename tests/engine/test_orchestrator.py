@@ -2515,6 +2515,7 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
     )
     await orchestrator._handle_add_request(
         StageSubmissionMessage(
@@ -2552,6 +2553,7 @@ async def test_explicit_run_rejected_before_admission_releases_reservation() -> 
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         async_chunk=True,
     )
 
@@ -2603,6 +2605,10 @@ async def test_explicit_entry_stage_replica_down_before_preselection_returns_cli
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[stage0_pool, stage1_pool],
+        stage_metadata=[
+            stage_metadata_for_client(0, stage0_pool.stage_client),
+            stage_metadata_for_client(1, stage1_pool.stage_client),
+        ],
     )
     # Input-cache rollback has dedicated coverage; this test isolates the
     # preselection error mapping and reservation cleanup.
@@ -2654,6 +2660,7 @@ async def test_explicit_replica_cfg_companion_inherits_parent_affinity() -> None
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
     )
 
     await orchestrator._handle_add_request(
@@ -4234,6 +4241,7 @@ async def test_raw_stage_error_prefers_request_error_message(mocker):
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
     )
     orchestrator.stage_pools = pools
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
@@ -4271,6 +4279,7 @@ async def test_duplex_session_error_is_not_emitted_twice(mocker):
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
     )
     orchestrator.stage_pools = pools
     orchestrator.request_states["duplex-req"] = OrchestratorRequestState(

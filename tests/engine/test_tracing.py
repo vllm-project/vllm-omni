@@ -189,6 +189,7 @@ async def test_raw_stage_error_trace_matches_frontend_classification(recording, 
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=pools,
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "failed", HEADERS)
