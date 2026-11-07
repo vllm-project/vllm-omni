@@ -163,6 +163,21 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 
 Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` on `vllm serve` to switch to the legacy synchronous path.
 
+### Packed Flow precision
+
+The opt-in packed profiles (`cosyvoice3_full_response.yaml` and
+`cosyvoice3_packed_streaming.yaml`) disable BF16 reduced-precision GEMM
+reductions during each packed Flow solve, including eager solves, graph warmup,
+capture and replay. The previous setting is restored after every solve, so other
+models in the worker keep their own. Batch composition and graph padding can
+otherwise select a different GEMM with larger intermediate rounding errors.
+
+FlashInfer graph plans can choose different attention tiles from eager plans,
+so bitwise graph/eager equivalence is not guaranteed. Validate audio quality
+and performance using the same hardware, software and final deployment settings.
+This precision setting does not change streaming position noise or chunk-causal
+attention semantics.
+
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
