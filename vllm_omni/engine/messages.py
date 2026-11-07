@@ -82,6 +82,15 @@ class InteractionMessage(EngineQueueMessage, kw_only=True):
     interaction: OmniInteractionPrompt
 
 
+class TextInputUpdate(EngineQueueMessage, kw_only=True):
+    """Committed conditioning tokens, not an extension of the AR prompt."""
+
+    type: Literal["append_text"] = "append_text"
+    request_id: str
+    token_ids: list[int]
+    final: bool = False
+
+
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc"] = "collective_rpc"
     rpc_id: str

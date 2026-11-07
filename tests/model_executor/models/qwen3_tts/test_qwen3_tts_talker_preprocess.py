@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.qwen3_tts.input_stream import Qwen3TTSTextInput
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     NORMALIZED_REF_AUDIO_KEY,
     PRECOMPUTED_REF_CODE_KEY,
@@ -21,6 +22,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
     Qwen3TTSTalkerForConditionalGeneration,
 )
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -166,6 +168,226 @@ def _make_minimal_builder(
     builder._resampler_cache = OrderedDict()
     builder._resampler_cache_max = 16
     return builder
+
+
+def _make_custom_voice_builder():
+    builder = _make_minimal_builder()
+    builder._device = lambda: torch.device("cpu")
+    builder._text_embedding = lambda ids: ids.to(torch.float32).unsqueeze(-1).expand(*ids.shape, 4)
+    builder._codec_embed = builder._text_embedding
+    builder._text_tokenizer = lambda *_args, **_kwargs: {"input_ids": torch.tensor([[1, 2, 3, 21, 22, 4, 5, 6, 7, 8]])}
+    builder._talker_config.spk_id = {"vivian": 20}
+    builder._speaker_embed_cache = {}
+    builder._custom_voice_prompt_cache = {}
+    builder._batched_text_embeds = {}
+    builder._projected_text_table = None
+    return builder
+
+
+@pytest.mark.parametrize("input_complete", [False, True])
+@pytest.mark.parametrize("body_ids", [[21], [21, 22, 23]])
+def test_custom_voice_open_text_prefill_only_ends_text_after_eof(input_complete: bool, body_ids: list[int]) -> None:
+    """Keep packet boundaries out of the model's text EOS sequence."""
+    builder = _make_custom_voice_builder()
+    wrapped_ids = torch.tensor([[1, 2, 3, *body_ids, 4, 5, 6, 7, 8]])
+    prompt, trailing, ref_length, ref_codes = builder.build_prompt_embeds(
+        task_type="CustomVoice",
+        info_dict={
+            "text": ["hello"],
+            "speaker": ["vivian"],
+            "input_stream": {"token_ids": body_ids, "final": input_complete},
+            PRECOMPUTED_TEXT_IDS_KEY: wrapped_ids,
+        },
+    )
+
+    expected_tail = body_ids[1:] + ([101] if input_complete else [])
+    assert torch.equal(prompt[-1], torch.full((4,), body_ids[0] + 8.0))
+    assert torch.equal(trailing, torch.tensor(expected_tail).reshape(-1, 1).expand(-1, 4))
+    assert ref_length is None and ref_codes is None
+
+
+@pytest.mark.parametrize("input_complete", [False, True])
+def test_streaming_text_update_uses_body_ids_without_bos(input_complete: bool) -> None:
+    builder = _make_custom_voice_builder()
+    builder._codec_embed = lambda _ids: pytest.fail("Continuation must not embed codec BOS.")
+    rows = builder.build_streaming_text_update([31, 32], input_complete=input_complete)
+    expected_ids = [31, 32] + ([101] if input_complete else [])
+    assert torch.equal(rows, torch.tensor(expected_ids).reshape(-1, 1).expand(-1, 4))
+
+
+@pytest.mark.parametrize("projected_table", [False, True])
+def test_streaming_text_projection_keeps_token_major_shape(projected_table: bool) -> None:
+    builder = _make_custom_voice_builder()
+    builder._text_embedding = torch.nn.Embedding(128, 5)
+    builder._text_projection = torch.nn.Sequential(torch.nn.Linear(5, 7), torch.nn.SiLU(), torch.nn.Linear(7, 4))
+    ids = torch.tensor([31, 32, 101])
+    expected = builder._text_projection(builder._text_embedding(ids))
+    if projected_table:
+        builder._projected_text_table = builder._text_projection(builder._text_embedding.weight)
+    result = builder.build_streaming_text_update([31, 32], input_complete=True)
+    assert result.shape == (3, 4)
+    torch.testing.assert_close(result, expected)
+
+
+def test_native_initial_and_appended_text_share_the_projected_table():
+    builder = _make_custom_voice_builder()
+    builder._projected_text_table = (torch.arange(128, dtype=torch.float32) + 0.25).reshape(-1, 1).expand(-1, 4)
+    prompt, trailing, _, _ = builder.build_prompt_embeds(
+        task_type="CustomVoice",
+        info_dict={"speaker": ["vivian"], "input_stream": {"token_ids": [31, 32], "final": True}},
+    )
+    torch.testing.assert_close(trailing, builder.build_streaming_text_update([32], input_complete=True))
+    torch.testing.assert_close(prompt[-1], builder._projected_text_table[31] + 8.0)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_active_text_queue_consumes_body_then_eos_once_and_keeps_the_same_prompt(batched):
+    model = _make_minimal_talker()
+    model.eager_frames_active = True
+    model._prompt_builder = _make_custom_voice_builder()
+    model.embed_input_ids = lambda ids: torch.zeros((*ids.shape, 4), dtype=torch.bfloat16)
+    buffer = OmniIntermediateBuffer(1)
+    runtime: dict[str, Any] = {"req_id": "request", "speaker": ["vivian"]}
+    buffer.buffers[0] = runtime
+    model.apply_text_input_update(
+        runtime, {"input_stream_update": {"token_ids": [31, 32], "final": False}}, replace=True
+    )
+    expected_prompt, _, _, _ = model._prompt_builder.build_prompt_embeds(
+        task_type="CustomVoice", info_dict=dict(runtime)
+    )
+    _, _, updates = model.preprocess(
+        torch.zeros(expected_prompt.shape[0], dtype=torch.long), None, **runtime, _omni_is_prefill=True
+    )
+    buffer.update(0, updates)
+    original_prompt = runtime["embed"]["prefill"]
+    assert original_prompt.shape == expected_prompt.shape
+    assert torch.equal(original_prompt[-1], torch.full((4,), 39.0))
+    assert runtime["meta"]["qwen3_tts_text_projected"] == 2
+    model.apply_text_input_update(runtime, {"input_stream_update": {"token_ids": [33], "final": False}})
+
+    def decode(expected):
+        if batched:
+            _, _, _, text_step, current_updates = model.preprocess_decode_batch(
+                input_ids=torch.tensor([1]), req_infos=[runtime]
+            )
+            current_updates = current_updates[0]
+        else:
+            _, _, current_updates = model.preprocess(torch.tensor([1]), None, **runtime, _omni_is_prefill=False)
+            text_step = current_updates.pop("mtp_inputs")[1]
+        buffer.update(0, current_updates)
+        assert text_step.tolist() == [[expected] * 4]
+        assert runtime["embed"]["prefill"] is original_prompt
+
+    decode(32)
+    decode(33)
+    assert not model.eager_decode_settled(runtime)
+    model.apply_text_input_update(runtime, {"input_stream_update": {"token_ids": [], "final": True}})
+    decode(101)
+    decode(0)
+    assert model.eager_decode_settled(runtime)
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_reinstalled_text_snapshot_preserves_projection_and_consumption(final):
+    from vllm_omni.worker_v2.model_states.mtp_model_state import _snapshot_runtime
+
+    model = _make_minimal_talker()
+    model.eager_frames_active = True
+    model._prompt_builder = _make_custom_voice_builder()
+    model.embed_input_ids = lambda ids: torch.zeros((*ids.shape, 4), dtype=torch.bfloat16)
+    stream = Qwen3TTSTextInput([31, 32, 33], 8, 128, final=final)
+    buffer = OmniIntermediateBuffer(1)
+    buffer.buffers[0] = {"req_id": "request", "speaker": ["vivian"]}
+    model.apply_text_input_update(
+        buffer.buffers[0], {"input_stream_update": stream.take_update(reset=True)}, replace=True
+    )
+    prompt, _, _, _ = model._prompt_builder.build_prompt_embeds(
+        task_type="CustomVoice", info_dict=dict(buffer.buffers[0])
+    )
+    _, _, updates = model.preprocess(
+        torch.zeros(len(prompt), dtype=torch.long), None, **buffer.buffers[0], _omni_is_prefill=True
+    )
+    buffer.update(0, updates)
+
+    def decode(expected):
+        _, _, updates = model.preprocess(torch.tensor([1]), None, **buffer.buffers[0], _omni_is_prefill=False)
+        assert updates.pop("mtp_inputs")[1].tolist() == [[expected] * 4]
+        buffer.update(0, updates)
+
+    decode(32)
+    restored = _snapshot_runtime(buffer.buffers[0])
+    buffer.buffers[0] = restored
+    meta = restored["meta"]
+    trailing = restored["hidden_states"]["trailing_text"]
+    model.apply_text_input_update(restored, {"input_stream_update": stream.take_update(reset=True)}, replace=True)
+    assert restored["meta"] is meta
+    assert restored["hidden_states"]["trailing_text"] is trailing
+    assert meta["qwen3_tts_text_projected"] == 3
+    assert meta["talker_text_offset"] == 1
+    assert meta["qwen3_tts_text_eos_projected"] is final
+    decode(33)
+    if not final:
+        stream.append([34], final=True)
+        model.apply_text_input_update(restored, {"input_stream_update": stream.take_update(reset=False)})
+        decode(34)
+    decode(101)
+    model.apply_text_input_update(restored, {"input_stream_update": stream.take_update(reset=True)}, replace=True)
+    decode(0)
+
+
+def test_text_appended_during_chunked_prefill_is_consumed_only_after_prefill():
+    model = _make_minimal_talker()
+    model.eager_frames_active = True
+    model._prompt_builder = _make_custom_voice_builder()
+    model.embed_input_ids = lambda ids: torch.zeros((*ids.shape, 4), dtype=torch.bfloat16)
+    buffer = OmniIntermediateBuffer(1)
+    runtime: dict[str, Any] = {"req_id": "request", "speaker": ["vivian"]}
+    buffer.buffers[0] = runtime
+    model.apply_text_input_update(
+        runtime, {"input_stream_update": {"token_ids": [31, 32], "final": False}}, replace=True
+    )
+    _, first_chunk, updates = model.preprocess(
+        torch.zeros(2, dtype=torch.long), None, **runtime, _omni_is_prefill=True, _omni_num_computed_tokens=0
+    )
+    buffer.update(0, updates)
+    prompt = runtime["embed"]["prefill"]
+    model.apply_text_input_update(runtime, {"input_stream_update": {"token_ids": [33], "final": True}})
+    _, last_chunk, updates = model.preprocess(
+        torch.zeros(len(prompt) - 2, dtype=torch.long), None, **runtime, _omni_is_prefill=True
+    )
+    buffer.update(0, updates)
+    torch.testing.assert_close(first_chunk, prompt[:2].to(dtype=model._embedding_dtype))
+    torch.testing.assert_close(last_chunk, prompt[2:].to(dtype=model._embedding_dtype))
+    assert runtime["meta"]["qwen3_tts_text_projected"] == 2
+    assert not runtime["meta"]["qwen3_tts_text_eos_projected"]
+    for expected in (32, 33, 101):
+        _, _, updates = model.preprocess(torch.tensor([1]), None, **runtime, _omni_is_prefill=False)
+        assert updates.pop("mtp_inputs")[1].tolist() == [[expected] * 4]
+        buffer.update(0, updates)
+    assert runtime["embed"]["prefill"] is prompt
+    assert runtime["meta"]["qwen3_tts_text_eos_projected"]
+
+
+@pytest.mark.parametrize("channel", ["additional", "native"])
+def test_text_updates_do_not_mutate_the_initial_request_payload(channel):
+    model = _make_minimal_talker()
+    initial = {"token_ids": [31], "final": False}
+    request = SimpleNamespace(
+        req_id="request",
+        mm_features=[],
+        additional_information={"input_stream": initial} if channel == "additional" else None,
+        model_intermediate_buffer={"input_stream": initial} if channel == "native" else None,
+    )
+    buffer = OmniIntermediateBuffer(1)
+    buffer.add_request(0, request)
+    runtime = buffer.buffers[0]
+    snapshot = {"token_ids": [31], "final": False}
+    model.apply_text_input_update(runtime, {"input_stream_update": snapshot}, replace=True)
+    model.apply_text_input_update(runtime, {"input_stream_update": {"token_ids": [32], "final": True}})
+    assert initial == {"token_ids": [31], "final": False}
+    assert snapshot == {"token_ids": [31], "final": False}
+    assert runtime["input_stream"] == {"token_ids": [31, 32], "final": True}
+    assert "input_stream_update" not in runtime
 
 
 def test_single_token_prefill_uses_prefill_path():

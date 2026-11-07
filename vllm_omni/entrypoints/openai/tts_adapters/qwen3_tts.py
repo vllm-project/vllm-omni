@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     DEFAULT_TTS_LANGUAGES,
     ARTTSAdapter,
+    IncrementalTTSInput,
     PreparedRequest,
     TextCommitmentCapabilities,
     TTSGenerationError,
@@ -149,11 +150,45 @@ class Qwen3TTSCodecLimitError(TTSGenerationError):
         super().__init__(message, retryable=True)
 
 
+class _Qwen3TTSIncrementalInput:
+    """Ordinary tokenization of released text for one interleaved request."""
+
+    def __init__(self, adapter: "Qwen3TTSAdapter", request: "OpenAICreateSpeechRequest") -> None:
+        self.adapter = adapter
+        self.request = request
+
+    async def _encode(self, text: str) -> list[int]:
+        def encode() -> list[int]:
+            tokenizer = self.adapter.ctx.server._tts_tokenizer
+            return tokenizer.encode(text, add_special_tokens=False)
+
+        return await make_async(encode, executor=getattr(self.adapter.ctx.server, "_tts_executor", None))()
+
+    async def build(self, text: str, *, final: bool) -> PreparedRequest:
+        tokens = await self._encode(text)
+        if self.request.non_streaming_mode is True:
+            raise ValueError("Incremental text input requires interleaved prompt construction")
+        params = self.adapter._build_tts_params(self.request)
+        params["non_streaming_mode"] = [False]
+        params["input_stream"] = {"token_ids": tokens, "final": final}
+        prompt_len = await self.adapter._estimate_prompt_len_async(params)
+        prompt = tokens_input(prompt_token_ids=[1] * prompt_len)
+        prompt["additional_information"] = params
+        return PreparedRequest(prompt=prompt, tts_params=params, model_type="CustomVoice")
+
+    async def append(self, request_id: str, text: str, *, final: bool) -> None:
+        tokens = await self._encode(text)
+        if tokens or final:
+            assert self.adapter.ctx.engine_client is not None
+            await self.adapter.ctx.engine_client.append_text(request_id, tokens, final=final)
+
+
 @register_tts_adapter
 class Qwen3TTSAdapter(ARTTSAdapter):
     """Adapter for Qwen3-TTS (AR ``engine_client`` backend)."""
 
     validates_generation = True
+    supports_incremental_input = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
     text_commitment = TextCommitmentCapabilities(
@@ -571,6 +606,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
+        await make_async(self._load_text_tokenizer, executor=getattr(self.ctx.server, "_tts_executor", None))()
+        return _Qwen3TTSIncrementalInput(self, request)
+
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
@@ -703,6 +742,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # ceiling. It remains an upper bound; for Base a length finish is
             # still surfaced as an incomplete generation rather than valid audio.
             effective_cap = int(request.max_new_tokens)
+        elif additional_information is not None and "input_stream" in additional_information:
+            effective_cap = int(configured_cap) if configured_cap is not None else None
         elif budget is not None and budget.enabled:
             counted_text_tokens = server._count_usage_text_tokens(request.input)
             if counted_text_tokens > 0:
@@ -768,7 +809,11 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # under the server-derived text budget, including when that budget is
         # clamped to the configured stage limit; an explicit caller budget
         # keeps returning the audio as before.
-        if task_type != "Base" and not _first_value(tts_params.get(QWEN3_TTS_AUTO_BUDGET_KEY)):
+        if (
+            task_type != "Base"
+            and "input_stream" not in tts_params
+            and not _first_value(tts_params.get(QWEN3_TTS_AUTO_BUDGET_KEY))
+        ):
             return
 
         raw_limit = _first_value(tts_params.get(QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY))

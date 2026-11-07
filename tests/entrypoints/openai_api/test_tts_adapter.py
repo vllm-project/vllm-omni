@@ -832,6 +832,57 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.model_type == "CustomVoice"
 
 
+def test_qwen3_tts_incremental_input_reuses_tokenizer_and_keeps_the_whole_request_budget(mocker):
+    tokenizer = mocker.Mock()
+    tokenizer.encode.side_effect = [[31, 32], [33], []]
+    server = SimpleNamespace(
+        _tts_executor=None,
+        _tts_tokenizer=tokenizer,
+        _tts_stage=None,
+        uploaded_speakers={},
+        _voice_created_at=mocker.Mock(return_value=0),
+    )
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(codec_eos_token_id=2150))),
+        append_text=mocker.AsyncMock(),
+    )
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine_client))
+    adapter.capabilities = TTSCapabilities(
+        supported_speakers=frozenset({"vivian"}),
+        default_speaker="vivian",
+    )
+    mocker.patch.object(adapter, "_estimate_prompt_len_async", new=mocker.AsyncMock(return_value=3))
+    request = OpenAICreateSpeechRequest(input="Hello", voice="vivian", language="English")
+
+    async def prepare():
+        model_input = await adapter.create_incremental_input(request)
+        prepared = await model_input.build("Hello", final=False)
+        await model_input.append("request", " world", final=False)
+        await model_input.append("request", "", final=True)
+        return prepared
+
+    prepared = asyncio.run(prepare())
+
+    assert server._tts_tokenizer is tokenizer
+    assert tokenizer.encode.call_args_list == [
+        mocker.call("Hello", add_special_tokens=False),
+        mocker.call(" world", add_special_tokens=False),
+        mocker.call("", add_special_tokens=False),
+    ]
+    assert prepared.prompt["prompt_token_ids"] == [1, 1, 1]
+    assert prepared.tts_params["input_stream"] == {"token_ids": [31, 32], "final": False}
+    assert prepared.tts_params["non_streaming_mode"] == [False]
+    assert engine_client.append_text.await_args_list == [
+        mocker.call("request", [33], final=False),
+        mocker.call("request", [], final=True),
+    ]
+    params = adapter.apply_sampling_overrides([SamplingParams(max_tokens=1024)], request, prepared.prompt)
+    assert params[0].max_tokens == 1024
+    assert QWEN3_TTS_AUTO_BUDGET_KEY not in prepared.tts_params
+    with pytest.raises(Qwen3TTSCodecLimitError, match="incomplete"):
+        adapter.validate_generation(prepared.tts_params, stage0_finish_reason="length", output_tokens=1024)
+
+
 def test_covo_audio_build_constructs_tokenized_prompt():
     class FakeTokenizer:
         def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
