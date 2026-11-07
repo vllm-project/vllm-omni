@@ -9,6 +9,13 @@
 
 `POST /v1/run` runs one stage per call. Instead of submitting a stage's result to the next stage, the server returns it, and the caller sends it back to run that stage. This lets callers route each call themselves, e.g., to independently scaled headless stages.
 
+Each call may include a stage-local `replica_id`. When present, the request is
+sent only to that live, attached replica; an unknown or unavailable replica is
+rejected without falling back to automatic routing. Omitting `replica_id`
+preserves the existing load-balanced behavior. Replica IDs are independent
+between stages, so the same numeric ID can name different workers in different
+stage pools.
+
 ## Deployment
 
 We will use Qwen3-TTS as an example for independent stage execution, illustrating how to pass the payload from one stage to the next. First, start the frontend, which also brings up the orchestrator in its own thread. For now, this can be accomplished by passing a stage-id of `none`. Note that you must configure the Omni master server settings for remote replicas.
@@ -104,17 +111,21 @@ def main() -> None:
     stage1_request = httpx.post(
         url,
         json={
-            "stage_input": build_stage0_input(args.model, args.text, args.speaker)
+            "stage_input": build_stage0_input(args.model, args.text, args.speaker),
+            # Optional: explicitly run Talker replica 1.
+            "replica_id": 1,
         },
         timeout=600,
     )
     stage1_request.raise_for_status()
 
     # Stage 1 (code2wav) returns the final output.
+    stage1_body = stage1_request.json()
+    # Optional: independently select Code2Wav replica 0.
+    stage1_body["replica_id"] = 0
     final = httpx.post(
         url,
-        content=stage1_request.content,
-        headers={"Content-Type": "application/json"},
+        json=stage1_body,
         timeout=600,
     )
     final.raise_for_status()
