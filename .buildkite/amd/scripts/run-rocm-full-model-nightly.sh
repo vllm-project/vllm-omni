@@ -7,10 +7,10 @@ set -euo pipefail
 
 test_target=${1:?test file required}
 expected_tests=${2:?expected test count required}
-model_kind=${3:?omni or tts required}
+model_kind=${3:?omni, tts or diffusion required}
 artifact_name=${4:?artifact directory name required}
 [[ "$expected_tests" =~ ^[1-9][0-9]*$ ]]
-[[ "$model_kind" == omni || "$model_kind" == tts ]]
+[[ "$model_kind" == omni || "$model_kind" == tts || "$model_kind" == diffusion ]]
 [[ "$artifact_name" =~ ^[a-z0-9-]+$ ]]
 artifact_dir="${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/${artifact_name}"
 mkdir -p "$artifact_dir"
