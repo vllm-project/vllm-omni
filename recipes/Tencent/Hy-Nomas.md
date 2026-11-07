@@ -91,8 +91,10 @@ The converted checkpoint was qualified on one and two H200s at vLLM-Omni commit
 `81620d2d69dc661d694fdc66ae737be0c7d8993d`. See [Verification](#verification)
 for the tested workloads.
 
-Weights, text encoding, and PixelUMM decoding remain replicated with sequence
-parallelism. The degree must divide the DiT's 16 attention heads and the spatial
+Weights and text encoding remain replicated with sequence parallelism. PixelUMM
+decodes on each rank by default; its optional window mode distributes decode
+windows across the Ulysses group while retaining a decoder on each rank. The
+degree must divide the DiT's 16 attention heads and the spatial
 token count per latent frame. Real-model validation covers degrees one and two.
 Memory and latency depend on the workload; see [Verification](#verification)
 for the measured configurations and revisions.
@@ -247,6 +249,23 @@ PixelUMM emits stable frames and retains an overlapping tail between chunks.
 Short chunks may emit no frames. Completion flushes the tail; cancellation or
 disconnect releases the session and discards the withheld tail.
 
+To enable experimental PixelUMM window decoding, add
+`--custom-pipeline-args '{"decoder_parallel_mode":"window"}'` to a multi-rank
+Ulysses deployment. The default is `"none"`. Window mode requires more than one
+Ulysses rank and uses the same group as the DiT. Rank 0 merges and emits the
+decoded frames; decoder weights remain replicated. The DiT head and spatial-token
+divisibility constraints still apply. Real-model correctness and performance
+for this native window mode must be validated for each deployment configuration.
+
+For example, an SP4 streaming deployment selects four devices:
+
+```bash
+vllm serve ./Hy-Nomas-Diffusers --omni --port 8098 \
+  --deploy-config vllm_omni/deploy/hy_nomas_ar.yaml \
+  --ulysses-degree 4 --stage-overrides '{"0":{"devices":"0,1,2,3"}}' \
+  --custom-pipeline-args '{"decoder_parallel_mode":"window"}'
+```
+
 Change `ar_height`, `ar_width`, `ar_chunk_latent_frames`, `ar_max_latent_frames`,
 `ar_max_segments`, and `ar_session_capacity` through `custom_pipeline_args`.
 Requests must fit the configured limits; increasing capacity requires more memory.
@@ -334,7 +353,7 @@ MP4 incrementally instead of retaining all decoded frames in host memory.
 | --- | --- |
 | [Sequence parallelism](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) | Strict Ulysses with the existing worker group. Ring, AllGather-KV, and UAA are unsupported. |
 | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) | Module offload, including with SP; layerwise and distributed layerwise offload are unsupported. |
-| [Other parallelism](../../docs/user_guide/diffusion/parallelism/overview.md) | TP, PP, DP, CFG, HSDP, text encoder sharding, and VAE parallelism are unsupported. |
+| [Other parallelism](../../docs/user_guide/diffusion/parallelism/overview.md) | Experimental PixelUMM window decoding uses the Ulysses group. TP, PP, DP, CFG, HSDP, text encoder sharding, and VAE patch parallelism are unsupported. |
 | [Other acceleration](../../docs/user_guide/diffusion_features.md) | Quantization, LoRA, and Cache-DiT are unsupported. Use eager execution; full-transformer compilation is rejected and generic regional compilation leaves the cached reference forward unchanged. FlexAttention retains its own kernel compilation. |
 
 ## Verification
@@ -352,7 +371,7 @@ the recorded adapter revisions; native GPU requalification is pending. Relative 
 | A2 | Native rolling PixelUMM decoder, preserving the `16a4c228` source contract | Native GPU precision and performance requalification pending |
 | A3 | Session-bound rolling decode, positions, empty stable metadata, normal final flush | Full cancellation/transport qualification |
 | A4 | Full/recent transactional retention; offline AR and normal realtime/typed output; 18/36 precision and 120+ second delivery | Remaining A4 service matrix, 72 precision, complete high-water accounting and broad W6/full-vs-recent quality |
-| B1–B9 | Basic SP/module offload remains supported; no new B-series optimization claimed | Media/kernel/attention/staging optimization, chunk residency/prefetch, decode parallelism, encoder sharding, regional compile/graphs and sparsity |
+| B1–B9 | Basic SP/module offload; experimental window decoding, with a 385-frame SP2 screening at `c3689f0db` | Window decoding needs sustained, offload and SP4/SP8/SP16 qualification; media/kernel/attention/staging optimization, chunk residency/prefetch, encoder sharding, regional compile/graphs and sparsity |
 | C1–C8 | Full/recent through AR state interfaces | CPU archival, other history sampling, KV/weight quantization, undo and pause/resume |
 | D1–D3 | Camera trajectory conditioning | Nomas-PE, official LoRA and browser camera UI |
 

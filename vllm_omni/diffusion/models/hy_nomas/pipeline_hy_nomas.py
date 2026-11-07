@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
@@ -13,6 +13,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -165,9 +166,18 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    allowed = {"text_encoder", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    allowed = {
+        "text_encoder",
+        "decoder_parallel_mode",
+        *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__),
+    }
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
+    decoder_mode = custom.get("decoder_parallel_mode", "none")
+    if decoder_mode not in ("none", "window"):
+        raise ValueError("Hy-Nomas decoder_parallel_mode must be none or window.")
+    if decoder_mode == "window" and parallel.ulysses_degree <= 1:
+        raise ValueError("Hy-Nomas window decoder parallelism requires more than one Ulysses rank.")
     HyNomasARConfig.from_args(custom)
     if config.step_execution and not config.streaming_output:
         raise ValueError("Hy-Nomas step execution requires streaming_output=true.")
@@ -217,6 +227,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
+        self.decoder_parallel_mode = (od_config.custom_pipeline_args or {}).get("decoder_parallel_mode", "none")
         self.initialize_ar(od_config.custom_pipeline_args or {})
         self.sp_size = od_config.parallel_config.ulysses_degree
         self.target_dtype = torch.bfloat16
@@ -286,6 +297,16 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .requires_grad_(False)
         )
         self.vae = build_decoder(decoder_config, self.device)
+        # Error propagation must not allocate device memory after an OOM.
+        self._sp_error_status = (
+            torch.empty(1, dtype=torch.int32, device=next(self.vae.parameters()).device) if self.sp_size > 1 else None
+        )
+        if self.decoder_parallel_mode == "window":
+            group = get_sp_group().ulysses_group
+            if dist.get_global_rank(group, 0) != 0:
+                raise ValueError("Hy-Nomas decoder output rank must match the executor's global rank 0.")
+            self.vae.configure_distributed_decode(group, output_rank=0)
+            logger.info("Hy-Nomas PixelUMM window decoding enabled with SP%d and output rank 0.", self.sp_size)
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
@@ -433,6 +454,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             spatial * (noise_frames * self.in_channels + decoder_frames * self.transformer.config.out_channels) * 2
         )
         model_bytes += config.height * config.width * 3 * 4 * (4 * decoder_frames)
+        if self.decoder_parallel_mode == "window":
+            # Reserve space for gathered tensors and tiles awaiting merging.
+            ys, xs, tile_h, tile_w = self.vae._tile_grid(config.height // self.s_ratio, config.width // self.s_ratio)
+            tile_bytes = 3 * (4 * window) * (tile_h * self.s_ratio) * (tile_w * self.s_ratio) * 2
+            model_bytes += (self.sp_size + len(ys) * len(xs)) * tile_bytes
         model_bytes += (
             text_tokens * 3584 * 2 + (config.max_total_latent_frames if recent else config.max_latent_frames) * 512
         )
@@ -838,11 +864,29 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
 
     def _check_sp_error(self, error: Exception | None, operation: str) -> None:
         if self.sp_size > 1:
-            failed = torch.tensor([error is not None], dtype=torch.int32, device=self.device)
+            failed = self._sp_error_status
+            if failed is None:
+                raise RuntimeError("Hy-Nomas SP error status is not initialized")
+            failed.fill_(int(error is not None))
             if get_sp_group().all_reduce(failed).item() and error is None:
                 error = RuntimeError(f"Hy-Nomas {operation} failed on another SP rank.")
         if error is not None:
             raise error
+
+    @contextmanager
+    def _decoder_guard(self, operation: str) -> Iterator[None]:
+        if self.decoder_parallel_mode == "none":
+            yield
+            return
+        error = None
+        try:
+            yield
+        except Exception as exc:
+            error = exc
+        self._check_sp_error(error, operation)
+
+    def _decoder_is_output_rank(self) -> bool:
+        return self.decoder_parallel_mode == "none" or get_sp_group().ulysses_rank == 0
 
     @torch.no_grad()
     def denoise_step(
@@ -878,28 +922,36 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         error = None
         video = None
         try:
-            with self._component_context(self.vae):
-                session.decoder.final_segment = finish
-                pixels = session.decoder.push(self._prepare_vae_decode_latents(latents), pixel_frames=pixel_frames)
+            with ExitStack() as stack:
+                with self._decoder_guard("PixelUMM preparation"):
+                    stack.enter_context(self._component_context(self.vae))
+                    if (
+                        self.decoder_parallel_mode == "window"
+                        and session.decoder.committed_pixel_frames != session.emitted_frames
+                    ):
+                        raise RuntimeError("Hy-Nomas decoder and session frame positions disagree.")
+                    session.decoder.final_segment = finish
+                    decode_latents = self._prepare_vae_decode_latents(latents)
+                with self._decoder_guard("PixelUMM push"):
+                    pixels = session.decoder.push(decode_latents, pixel_frames=pixel_frames)
                 if finish:
-                    tail = session.decoder.finish()
-                    if tail.numel():
-                        pixels = torch.cat((pixels, tail), 2) if pixels.numel() else tail
+                    with self._decoder_guard("PixelUMM finish"):
+                        tail = session.decoder.finish()
+                        if tail.numel():
+                            pixels = torch.cat((pixels, tail), 2) if pixels.numel() else tail
             if pixels.numel():
                 pixels = (pixels * 0.5 + 0.5).clamp(0, 1)
                 video = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).cpu().numpy()
             else:
                 video = np.empty((0, session.height, session.width, 3), dtype=np.uint8)
+            if self.decoder_parallel_mode == "window":
+                committed = session.decoder.committed_pixel_frames - session.emitted_frames
+                expected = committed if self._decoder_is_output_rank() else 0
+                if committed < 0 or len(video) != expected:
+                    raise RuntimeError("Hy-Nomas decoder output does not match its committed frame positions.")
         except Exception as exc:
             error = exc
-        # PixelUMM runs independently on each SP rank. All peers must reject
-        # a failed decode before any of them enters the next DiT collective.
-        if self.sp_size > 1:
-            failed = torch.tensor([error is not None], dtype=torch.int32, device=self.device)
-            if get_sp_group().all_reduce(failed).item() and error is None:
-                error = RuntimeError("Hy-Nomas PixelUMM decoding failed on another SP rank.")
-        if error is not None:
-            raise error
+        self._check_sp_error(error, "PixelUMM decoding")
         assert video is not None
         return video
 
@@ -935,7 +987,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             pixel_frames=chunk.pixel_frames,
             finish=state.request_denoise_completed and state.extra["hy_nomas_finish"],
         )
-        session.emitted_frames += len(video)
+        if self.decoder_parallel_mode == "window":
+            session.emitted_frames = session.decoder.committed_pixel_frames
+        else:
+            session.emitted_frames += len(video)
         tick = state.extra["hy_nomas_tick"]
         identity = (
             ARDiffusionChunkMetadata.from_tick(tick)
@@ -1005,24 +1060,46 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 output.output["metadata"]["stream"]["frame_start"] = frame_start
                 return output
             inputs = state.extra["hy_nomas_request"]
-            with self._component_context(self.vae):
-                video = self.vae.decode(self._prepare_vae_decode_latents(torch.cat(chunks, dim=2))).sample
-            video = (video[:, :, : inputs.num_frames] * 0.5 + 0.5).clamp(0, 1)
-            expected = (1, 3, inputs.num_frames, inputs.height, inputs.width)
-            if tuple(video.shape) != expected:
-                raise RuntimeError(f"Hy-Nomas returned video shape {tuple(video.shape)}; expected {expected}.")
-            return DiffusionOutput(
-                media=DiffusionMediaOutput(
-                    video=VideoMediaOutput(
-                        tensor=video,
-                        spec=VideoTensorSpec(
-                            layout=VideoTensorLayout.BCTHW,
-                            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
-                            value_range=VideoValueRange.ZERO_TO_ONE,
-                        ),
-                    )
-                )
-            )
+            error = None
+            result = None
+            try:
+                with self._decoder_guard("offline PixelUMM residency"):
+                    with ExitStack() as stack:
+                        with self._decoder_guard("offline PixelUMM preparation"):
+                            stack.enter_context(self._component_context(self.vae))
+                            decode_latents = self._prepare_vae_decode_latents(torch.cat(chunks, dim=2))
+                        with self._decoder_guard("offline PixelUMM decode"):
+                            video = self.vae.decode(decode_latents).sample
+                with self._decoder_guard("offline PixelUMM output"):
+                    if self._decoder_is_output_rank():
+                        video = (video[:, :, : inputs.num_frames] * 0.5 + 0.5).clamp(0, 1)
+                        expected = (1, 3, inputs.num_frames, inputs.height, inputs.width)
+                        if tuple(video.shape) != expected:
+                            raise RuntimeError(
+                                f"Hy-Nomas returned video shape {tuple(video.shape)}; expected {expected}."
+                            )
+                        result = DiffusionOutput(
+                            media=DiffusionMediaOutput(
+                                video=VideoMediaOutput(
+                                    tensor=video,
+                                    spec=VideoTensorSpec(
+                                        layout=VideoTensorLayout.BCTHW,
+                                        encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                                        value_range=VideoValueRange.ZERO_TO_ONE,
+                                    ),
+                                )
+                            )
+                        )
+                    else:
+                        result = DiffusionOutput()
+            except Exception as exc:
+                error = exc
+            if self.decoder_parallel_mode == "window":
+                self._check_sp_error(error, "offline PixelUMM decoding")
+            elif error is not None:
+                raise error
+            assert result is not None
+            return result
         finally:
             if self._ar_state is None:
                 self._offline_session = None
