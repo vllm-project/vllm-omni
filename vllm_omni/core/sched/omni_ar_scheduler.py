@@ -6,7 +6,7 @@ from __future__ import annotations
 import inspect
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import replace
 from typing import Any, TypedDict
 
@@ -14,8 +14,9 @@ import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
@@ -129,7 +130,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
+    waiting: RequestQueue
+    kv_holding_waiting: RequestQueue
     max_num_active_reqs: int
+    max_num_scheduled_tokens: int
+    prev_step_scheduled_req_ids: set[str]
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -215,7 +220,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
-        self._init_prefill_admission_policy()
+        extra = self._get_scheduler_extra_config()
+        self._init_prefill_admission_policy(extra)
+        self._init_generation_coalescing(extra)
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
@@ -369,7 +376,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         is_final, _ = self._omni_final_stage_flags(request)
         return is_final
 
-    def _init_prefill_admission_policy(self) -> None:
+    def _init_prefill_admission_policy(self, extra: Mapping[str, Any]) -> None:
         """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
 
         While at least ``ar_prefill_admission_min_running`` requests run, a new
@@ -378,15 +385,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         share one prefill / mixed step instead of each turning a decode step
         into one. Off unless ``ar_prefill_admission_min_batch`` > 1.
         """
-        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
-        extra = (
-            connector_config.get("extra", connector_config)
-            if isinstance(connector_config, dict)
-            else getattr(connector_config, "extra", None)
-        ) or {}
-        # A stage without a configured connector edge sets the same keys in additional_config.
-        additional = getattr(self.vllm_config, "additional_config", None)
-        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -401,6 +399,70 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._prefill_admission_max_wait_s * 1000,
                 self._prefill_admission_min_running,
             )
+
+    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
+        """Initialize AR execution batching after admission policy setup."""
+        super()._init_generation_coalescing(extra)
+        if self._generation_min_batch_size > 1 and self._generation_max_wait_s:
+            if any(
+                extra.get(key)
+                for key in (
+                    "ar_prefill_admission_min_batch",
+                    "ar_prefill_admission_max_wait_ms",
+                    "ar_prefill_admission_min_running",
+                )
+            ):
+                raise ValueError("generation coalescing and ar_prefill_admission_* cannot be enabled together")
+            parallel = self.vllm_config.parallel_config
+            if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                raise ValueError("AR generation batch waiting requires TP1/PP1")
+            if extra.get("generation_coalescing_policy", "fixed") != "fixed":
+                raise ValueError("AR generation batch waiting supports only the fixed coalescing policy")
+            if self._get_coalescing_ready_request_ids() is None:
+                logger.warning("AR generation batch waiting ignored: requires input readiness support")
+                self._generation_max_wait_s = 0.0
+
+    def _get_ar_coalescing_ready_request_ids(self) -> set[str]:
+        """Count candidates, leaving allocation and execution limits upstream."""
+        ready = self._get_coalescing_ready_request_ids()
+        if ready is None:
+            return set()
+        ready.update(
+            request.request_id
+            for request in self.running
+            if request.status == RequestStatus.RUNNING
+            and request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
+        )
+        for queue in (self.waiting, self.kv_holding_waiting):
+            ready.update(
+                request.request_id
+                for request in queue
+                if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            )
+        return {
+            req_id
+            for req_id in ready
+            if (request := self.requests.get(req_id)) is not None
+            and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
+        }
+
+    def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
+        """Bound batch waiting without restarting the deadline as inputs arrive."""
+        max_wait = getattr(self, "_generation_max_wait_s", 0.0)
+        target = getattr(self, "_generation_min_batch_size", 1)
+        if not max_wait or target <= 1 or self._pause_state != PauseState.UNPAUSED:
+            self._generation_batch_deadline = None
+            return False
+        if not ready_ids or self._generation_batch_ready(ready_ids):
+            self._generation_batch_deadline = None
+            return False
+        now = time.monotonic()
+        if self._generation_batch_deadline is None:
+            self._generation_batch_deadline = now + max_wait
+        if now >= self._generation_batch_deadline:
+            self._generation_batch_deadline = None
+            return False
+        return True
 
     def _should_defer_waiting_admission(self) -> bool:
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
@@ -844,12 +906,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        defer_generation = False
+        if getattr(self, "_generation_max_wait_s", 0.0) and self._generation_min_batch_size > 1:
+            defer_generation = self._should_defer_ar_generation(self._get_ar_coalescing_ready_request_ids())
         # Talker K-frame guard: a step whose decode spans would be uneven
         # (mixed prefill+decode rows, or a first-step decode joining a
         # steady-state K-step request) must not carry the K-step drafts --
         # the multi-frame loop requires uniform decode spans and the runner
         # refuses the rest.
-        self._drop_talker_drafts_if_prefill_pending()
+        if not defer_generation:
+            self._drop_talker_drafts_if_prefill_pending()
 
         original_wait_queues = None
         if self._should_defer_waiting_admission():
@@ -864,9 +930,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+        original_token_budget = None
+        previous_batch_ids = None
+        if defer_generation:
+            # Both runners still process control/completion work on empty
+            # steps. Defer before allocation, never discard a scheduled batch.
+            original_token_budget = self.max_num_scheduled_tokens
+            self.max_num_scheduled_tokens = 0
+            if not self.use_v2_model_runner:
+                previous_batch_ids = self.prev_step_scheduled_req_ids.copy()
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            if original_token_budget is not None:
+                self.max_num_scheduled_tokens = original_token_budget
+            if previous_batch_ids is not None:
+                # Upstream clears these on empty steps, causing the next V1
+                # execution to copy full histories for otherwise retained rows.
+                self.prev_step_scheduled_req_ids = previous_batch_ids
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
@@ -874,6 +955,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
+
+        if previous_batch_ids is not None:
+            previous_batch_ids.difference_update(scheduler_output.finished_req_ids)
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
@@ -890,6 +974,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
+            preserve_v1_batch=previous_batch_ids is not None,
         )
 
     def update_from_output(
