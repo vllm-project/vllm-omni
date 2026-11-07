@@ -5,6 +5,9 @@
 # so auto-detection falls through. This key routes the deploy-config probe in
 # StageConfigFactory.create_from_model to the correct registry entry.
 pipeline: ming_tts
+# On CUDA both stages run on Model Runner V2 (native data plane). Set
+# `model_runner: v1` in a copy of this file to opt out until upstream removes V1.
+model_runner: v2
 async_chunk: true
 trust_remote_code: false
 dtype: bfloat16
@@ -54,3 +57,16 @@ stages:
       top_k: -1
       max_tokens: 1
       detokenize: false
+
+platforms:
+  # MRV2 is qualified on CUDA only; keep the legacy V1 runner elsewhere.
+  # The pipeline's supports_native_mrv2_data_plane only takes effect with
+  # model_runner: v2, so moving a platform to v2 here also enables that plane.
+  rocm:
+    model_runner: v1
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  musa:
+    model_runner: v1
