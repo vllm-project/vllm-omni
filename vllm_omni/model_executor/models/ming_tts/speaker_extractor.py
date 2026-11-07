@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/spkemb_extractor.py
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.common.ming.speaker_extractor import Speake
 
 from .audio_prep import coerce_prompt_waveform, coerce_speaker_embeddings
 from .constants import (
+    KEY_SPEAKER_AUDIO_KEYS,
     KEY_SPEAKER_EMBEDDING,
     KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
@@ -118,6 +119,28 @@ def _resolve_speaker_embeddings(
             raise ValueError(f"Ming-TTS speaker '{voice_name}' was requested without reference audio on cache miss")
         return None
 
+    # Inline references use decoded audio identity, independent of request text
+    # or locator. Keep uploaded voices on their versioned, deletable cache path.
+    audio_keys = info_dict.get(KEY_SPEAKER_AUDIO_KEYS)
+    if (
+        cache_key is None
+        and len(waveform_inputs) == 1
+        and isinstance(audio_keys, (list, tuple))
+        and len(audio_keys) == 1
+    ):
+        audio_key = audio_keys[0]
+        if isinstance(audio_key, str) and audio_key.strip():
+            # Keep the configured model string: path/ID aliases do not prove identical CAM++ weights.
+            cache_key = cache.make_cache_key(
+                audio_key, model_type=f"ming_tts.reference:{wrapper.vllm_config.model_config.model}"
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                cached_embeddings = coerce_speaker_embeddings(cached.get("speaker_embedding"))
+                if cached_embeddings is not None and len(cached_embeddings) == 1:
+                    logger.debug("Speaker cache HIT for Ming-TTS reference '%s'", audio_key)
+                    return cached_embeddings
+
     extractor = _load_speaker_extractor(wrapper)
     embeddings = [
         extractor.extract_from_waveform(waveform, sample_rate).detach().reshape(-1).to(torch.float32).cpu()
@@ -127,7 +150,7 @@ def _resolve_speaker_embeddings(
     if cache_key is not None and resolved is not None:
         cached_embedding = resolved[0] if len(resolved) == 1 else torch.stack(resolved, dim=0)
         cache.put(cache_key, {"speaker_embedding": cached_embedding})
-        logger.debug("Speaker cache STORE for Ming-TTS speaker '%s'", voice_name)
+        logger.debug("Speaker cache STORE for Ming-TTS key %s", cache_key)
     return resolved
 
 
