@@ -37,7 +37,7 @@ def test_streaming_graphs_preserve_ring_state_and_owned_pcm():
             request_ids=["0", "1"],
             caches=caches,
             terminal=[terminal, terminal],
-            legacy_decoder=decoder,
+            eager_decoder=decoder,
             chunk_size=300,
             left_context_size=25,
         )
@@ -95,7 +95,7 @@ def test_icl_graph_matches_eager_across_reordered_chunks():
             if ordinal == 0
             else codes[list(order), :, cursor : cursor + length]
         )
-        kwargs = {"terminal": [False, False], "legacy_decoder": decoder, "chunk_size": 300, "left_context_size": 25}
+        kwargs = {"terminal": [False, False], "eager_decoder": decoder, "chunk_size": 300, "left_context_size": 25}
         graph_wavs = graphed.decode(
             chunk,
             [chunk.shape[-1]] * 2,

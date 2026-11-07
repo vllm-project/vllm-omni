@@ -914,31 +914,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self.post_init()
 
-        # CUDA Graph support
-        self._cudagraph_enabled = False
-        self._cudagraph_wrapper = None
+        # The Code2Wav stage enables request-local eager caches on platforms
+        # without the fused streaming decoder.
+        self._async_chunk = False
 
     def model_local_kv_specs(self):
-        """Declare this decoder's attention KV.
-
-        Only the async-chunk path holds KV. In stateless mode the decoder runs
-        ``_forward_exact``, which calls ``pre_transformer`` without
-        ``use_cache`` and allocates no cache at all, so declaring a per-request
-        cache there invents memory that does not exist. The previous revision
-        did exactly that and reported over a gigabyte for stateless
-        deployments; the one before it hung the declaration off the CUDA-graph
-        wrapper and so reported zero under ``enforce_eager``, where the eager
-        async-chunk path does allocate. Both mistakes come from tying this to
-        the wrong condition.
-
-        Two entries when async-chunk is on: the retained per-request cache, and
-        the working copy ``_decode_icl_first_chunk`` deep-copies from it, which
-        is live at the same time.
-
-        The wrapper, when present, adds the graph-resident copies. It is a
-        plain object rather than a submodule, so the module-tree walk cannot
-        reach it; this is the hop it needs.
-        """
+        """Declare eager request KV; streaming rings are owned by Code2Wav."""
         from vllm_omni.model_executor.models.model_local_kv import (
             ModelLocalKVScope,
             RowDriver,
@@ -956,10 +937,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return []
 
         specs = []
-        wrapper = getattr(self, "_cudagraph_wrapper", None)
-        # async_chunk is the wrapper's record of the mode; without a wrapper the
-        # decoder has not been told, and only the stateless path is reachable.
-        if wrapper is not None and getattr(wrapper, "async_chunk", False):
+        if self._async_chunk:
             common = dict(
                 config=config,
                 dtype=dtype,
@@ -983,8 +961,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                     **common,
                 )
             )
-        if wrapper is not None:
-            specs.extend(wrapper.model_local_kv_specs())
         return specs
 
     def precompute_snake_caches(self):
@@ -1023,60 +999,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         for block in self.decoder:
             wav = block(wav)
         return wav
-
-    def enable_cudagraph(
-        self,
-        capture_modes: tuple[str, ...] = ("icl", "xvec"),
-        capture_batch_sizes: list[int] | None = None,
-        stateless_capture_sizes: list[int] | None = None,
-        device: torch.device | None = None,
-        codec_chunk_frames: int = 0,
-        codec_left_context_frames: int = 0,
-        initial_codec_chunk_frames: int = 1,
-        codec_chunk_ramp: list[int] | None = None,
-        async_chunk: bool = True,
-        decode_chunk_size: int = 300,
-        decode_left_context: int = 25,
-    ):
-        # from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
-        from ..segmented_graph_wrapper import CUDAGraphDecoderWrapper
-
-        if device is None:
-            device = next(self.parameters()).device
-        if device.type != "cuda":
-            logger.warning("Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)", device)
-            return
-
-        self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
-            decoder=self,
-            capture_modes=capture_modes,
-            capture_batch_sizes=capture_batch_sizes,
-            stateless_capture_sizes=stateless_capture_sizes,
-            num_quantizers=self.config.num_quantizers,
-            enabled=True,
-            async_chunk=async_chunk,
-            initial_chunk_frames=initial_codec_chunk_frames,
-            codec_chunk_frames=codec_chunk_frames or 25,
-            codec_chunk_ramp=codec_chunk_ramp,
-            decode_chunk_size=decode_chunk_size,
-            decode_left_context=decode_left_context,
-        )
-        self._incremental_chunk_frames = codec_chunk_frames or 25
-        self._incremental_chunk_ramp = list(codec_chunk_ramp or ())
-        self._cudagraph_wrapper.warmup(
-            device,
-            dtype=torch.long,
-        )
-        self._cudagraph_enabled = True
-        logger.info(
-            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
-            self._cudagraph_wrapper.capture_batch_sizes,
-            (
-                self._cudagraph_wrapper.icl_capture_sizes
-                if async_chunk
-                else self._cudagraph_wrapper.stateless_capture_sizes
-            ),
-        )
 
     def _forward_exact(self, codes):
         hidden = self.quantizer.decode(codes)
@@ -1155,10 +1077,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def _decode_xvec_first_chunk_state_only(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         """State for later chunks when the first chunk's audio was delivered upstream."""
         return self._init_xvec_first_chunk_state(codes, caches)
-
-    # Capture hint only: the raw connector option does not guarantee that
-    # a request received upstream audio. Only its skip_first_audio marker does.
-    capture_first_audio_state_only = False
 
     def _decode_stream_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         if not caches.get("skip_first_audio", False):
@@ -1329,16 +1247,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         chunk_size=300,
         left_context_size=25,
     ):
-        # Use CUDA graph if enabled
-        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(
-                codes,
-                caches=caches,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-            )
-
-        # Original implementation (eager mode)
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:
@@ -1653,20 +1561,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         left_context_size=25,
         max_batch_size=0,
     ):
-        if (
-            self._cudagraph_enabled
-            and self._cudagraph_wrapper is not None
-            and hasattr(self._cudagraph_wrapper, "batched_chunked_decode_with_cudagraph")
-        ):
-            return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
-                codes,
-                lengths,
-                caches=caches,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-                max_batch_size=max_batch_size,
-            )
-
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
             initial_codec_chunk_frames = int(getattr(self, "_initial_codec_chunk_frames", 1))

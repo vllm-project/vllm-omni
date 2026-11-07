@@ -353,10 +353,18 @@ Qwen3-TTS-specific execution path on CUDA with BF16 weights:
   and Gumbel argmax when the runner supplies FP32 uniforms. It preserves top-k
   ties and uses the supplied randomness. Explicit generator paths retain the
   existing sampler. Qwen3-Omni does not read either TTS option.
-- `decode_cudnn_benchmark` selects convolution algorithms during Code2Wav
-  warmup and graph capture. The process's cuDNN flags are restored afterwards,
-  including on capture failure. Captured graphs retain the selected algorithms.
-
+- CUDA async-chunk Code2Wav uses the same fused streaming decoder kernels as
+  the single-stage Talker. ICL reference codes prime its state once; generated
+  codes then append to the convolution history and sliding attention KV rings.
+  The segmented CUDA graph backend and its `decode_streaming` selection switch
+  have been removed. Non-CUDA and non-async decoding retain the eager decoder.
+  Reference priming pre-captures the observed hot lengths, 55 and 72 frames, for each
+  configured graph batch bucket, with larger frame and batch shapes captured
+  first in a shared graph pool. Other reference lengths still trigger lazy capture.
+- `decode_cudnn_benchmark` selects convolution algorithms during streaming
+  Code2Wav startup warmup and graph capture. The process's cuDNN flags are
+  restored afterwards, including on capture failure. Captured graphs retain
+  the selected algorithms.
 - `decode_time_major_conv` keeps codec convolution activations in time-major
   layout to reduce transposes and copies between layers.
 - `talker_first_audio` completes residual prediction immediately after the
