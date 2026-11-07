@@ -34,7 +34,7 @@ FASTH3_V2_NATIVE_VAE_REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
 
 def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, AttentionSpec]]:
     """The self-attention spec of each schedule profile that selects FASTVIDEO_VSA, with its name."""
-    schedule = od_config.diffusion_attention_schedule
+    schedule = getattr(od_config, "diffusion_attention_schedule", None)
     if schedule is None:
         return []
     specs = []
@@ -43,6 +43,36 @@ def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, Atte
         if spec is not None and spec.backend.upper() == "FASTVIDEO_VSA":
             specs.append((name, spec))
     return specs
+
+
+def _resolve_vsa_provider(spec: AttentionSpec, dtype: torch.dtype, tile_size: int) -> None:
+    """Resolve the sparse provider and precision ``spec`` runs with on this worker's device and tile."""
+    provider = resolve_block_sparse_provider(
+        spec.fastvideo_vsa_provider,
+        spec.fastvideo_vsa_precision,
+        get_local_device(),
+        dtype,
+        128,
+        block_size=tile_size,
+    )
+    if provider == "fastvideo" and tile_size == 64:
+        # At tile64 the resolver returns fastvideo unchecked when it is explicit or when auto runs off CUDA;
+        # the profile's step imports this kernel.
+        require_fastvideo_sparse()
+
+
+def check_scheduled_vsa_providers(od_config: OmniDiffusionConfig, *, name: str, tile_size: int) -> None:
+    """Resolve each scheduled VSA profile on this worker's device and tile.
+
+    H3 skips warm-up, so a profile the device can't run would otherwise fail on the first step that selects it,
+    after the server has started.
+    """
+    for profile, spec in _scheduled_vsa_specs(od_config):
+        try:
+            # The runtime resolves with the query dtype, which H3 fixes to BF16 whatever --dtype is.
+            _resolve_vsa_provider(spec, torch.bfloat16, tile_size)
+        except (ImportError, ValueError) as exc:
+            raise ValueError(f"{name} cannot run attention schedule profile {profile!r}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -139,35 +169,16 @@ class FastH3CheckpointSpec:
         if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
         self._check_base_vsa_provider(attention, od_config)
-        # Warm-up runs only the base, so each scheduled VSA profile is resolved here on this checkpoint's tile.
         for name, spec in _scheduled_vsa_specs(od_config):
             if spec.fastvideo_vsa_topk is not None:
                 raise ValueError(
                     f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk "
                     f"override from attention schedule profile {name!r}"
                 )
-            try:
-                # The runtime resolves with the query dtype, which H3 fixes to BF16 whatever --dtype is.
-                self._resolve_vsa_provider(spec, torch.bfloat16)
-            except (ImportError, ValueError) as exc:
-                raise ValueError(f"{self.name} cannot run attention schedule profile {name!r}: {exc}") from exc
+        check_scheduled_vsa_providers(od_config, name=self.name, tile_size=self.vsa_tile_size)
 
     def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
-        """Warm-up checks V2's base provider."""
-
-    def _resolve_vsa_provider(self, spec: AttentionSpec, dtype: torch.dtype) -> None:
-        """Resolve the sparse provider and precision ``spec`` runs with on this worker's device and tile."""
-        provider = resolve_block_sparse_provider(
-            spec.fastvideo_vsa_provider,
-            spec.fastvideo_vsa_precision,
-            get_local_device(),
-            dtype,
-            128,
-            block_size=self.vsa_tile_size,
-        )
-        if provider == "fastvideo" and self.vsa_tile_size == 64:
-            # The resolver returns an explicit tile64 provider unchecked; the profile's step imports this kernel.
-            require_fastvideo_sparse()
+        """V2 does not check its base provider at startup; an unavailable one fails the first request."""
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, *, step_execution: bool = False) -> None:
         if step_execution:
@@ -212,7 +223,7 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
     base_revision: str = ""
 
     def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
-        self._resolve_vsa_provider(attention, od_config.dtype)
+        _resolve_vsa_provider(attention, od_config.dtype, self.vsa_tile_size)
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, object]) -> FastH3OmniCheckpointSpec:

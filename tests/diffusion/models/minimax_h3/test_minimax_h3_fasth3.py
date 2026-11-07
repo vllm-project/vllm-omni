@@ -10,6 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
     FASTH3_BASE_MODEL,
     FASTH3_BASE_SCHEDULE,
@@ -494,6 +495,28 @@ def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path)
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
     )
     fusion.check_serving_contract(od_config=sparse_dit, **contract)
+
+
+def test_a_vsa_variant_checks_scheduled_vsa_providers_at_startup(tmp_path, monkeypatch):
+    # H3 skips warm-up, so a scheduled profile the device can't run has to
+    # fail at startup rather than on the first step that selects it.
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint.get_local_device", lambda: torch.device("cpu")
+    )
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    sage = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")
+    od_config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        diffusion_attention_schedule=AttentionScheduleConfig(
+            profiles={"sage": AttentionConfig(default=sage)}, default=[]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="FastH3 adapter cannot run attention schedule profile 'sage'"):
+        _load(sparse.parent).check_serving_contract(
+            partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0
+        )
 
 
 def test_a_gate_that_never_reached_the_model_is_refused(tmp_path):
