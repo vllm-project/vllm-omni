@@ -164,3 +164,14 @@ def test_sampler_subclass_uses_standard_path(sampling):
 
     sampler.__class__ = OtherSampler
     assert state.sample_determined_tokens(batch, sampler) is None
+
+
+@pytest.mark.parametrize("eos", [None, 7])
+def test_pipeline_enforces_configured_stop_without_tokenizer(eos):
+    from vllm_omni.config.stage_config import merge_sampling_constraints
+    from vllm_omni.model_executor.models.phonon.pipeline import resolve_phonon_pipeline
+
+    config = PhononConfig(eos_token_id=eos)
+    stage = resolve_phonon_pipeline(config).stages[0]
+    merged = merge_sampling_constraints({"detokenize": False}, stage.sampling_constraints)
+    assert config.eos_token_id in merged["stop_token_ids"]
