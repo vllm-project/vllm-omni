@@ -35,10 +35,19 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import (
+    LAST_OUTPUT_TOKEN_KEY,
+    OUTPUT_TOKEN_COUNT_KEY,
+    REQUEST_ID_KEY,
+    REQUEST_SAMPLING_PARAMS_KEY,
+    OmniPayload,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
-from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
+from vllm_omni.model_executor.models.interfaces import (
+    requires_request_sample_eligibility,
+    requires_request_sampling_params,
+)
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -2079,6 +2088,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # mimo-audio check
                 req_state = self.requests.get(req_id)
                 req_infos = cast(dict[str, Any], self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id))
+                needs_sampling_params = requires_request_sampling_params(self.model)
+                if needs_sampling_params:
+                    # Preprocess-only snapshots must not become persistent
+                    # request data or be mirrored into transport metadata.
+                    req_infos = dict(req_infos)
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
@@ -2086,7 +2100,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 span_len = int(e) - int(s)
 
                 # call the custom process function
-                req_infos["request_id"] = req_id
+                req_infos[REQUEST_ID_KEY] = req_id
                 req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
                 req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
@@ -2106,6 +2120,26 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
+                if needs_sampling_params:
+                    # The model needs committed progress, not an O(T) copy of
+                    # lifecycle IDs. Nine-codebook replay stays request-owned.
+                    output_token_ids = getattr(req_state, "output_token_ids", ())
+                    req_infos[OUTPUT_TOKEN_COUNT_KEY] = len(output_token_ids)
+                    req_infos[LAST_OUTPUT_TOKEN_KEY] = output_token_ids[-1] if output_token_ids else None
+                    req_infos[REQUEST_SAMPLING_PARAMS_KEY] = {
+                        key: getattr(sampling_params, key, None)
+                        for key in (
+                            "temperature",
+                            "top_k",
+                            "top_p",
+                            "min_p",
+                            "seed",
+                            "max_tokens",
+                            "ignore_eos",
+                            "repetition_penalty",
+                            "extra_args",
+                        )
+                    }
                 if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue

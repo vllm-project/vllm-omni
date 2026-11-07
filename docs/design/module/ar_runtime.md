@@ -100,6 +100,29 @@ adapter, not injected through unrelated scheduler state.
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
 
+## Model-owned sampling metadata
+
+The V1 GPU runner supplies preprocessing snapshots to models selected by
+`models.interfaces.requires_request_sampling_params`. MRv2 does not implement
+this hook; ZONOS2 rejects MRv2 during construction.
+
+The existing `request_id` is the sole request identity across preprocess,
+forward and postprocess. `data_entry_keys.py` owns `REQUEST_ID_KEY`,
+`REQUEST_SAMPLING_PARAMS_KEY`, `OUTPUT_TOKEN_COUNT_KEY` and
+`LAST_OUTPUT_TOKEN_KEY`. The sampling fields are transient preprocessing
+metadata, not `OmniPayload`/`MetaStruct` wire fields: the runner injects them
+into a shallow copy and persists only model-returned updates. Other models
+retain the existing metadata path. The separate eligibility channel controls
+which scheduled rows may sample, including partial prefill; it is unchanged.
+
+Sampling snapshots contain resolved vLLM values. Omitting offline request
+parameters selects deployment defaults; supplying `SamplingParams` overrides
+the complete parameter set, including values equal to vLLM's class defaults.
+Multi-codebook history needed for reconstruction remains request-owned
+multimodal state; lifecycle continue/stop tokens cannot replace that history.
+Partial prefill must not advance sampling state. Finished and cancelled
+requests release model-owned state through the existing lifecycle callback.
+
 ## Token-only output payloads
 
 An AR stage whose downstream decoder consumes sampled tokens rather than
