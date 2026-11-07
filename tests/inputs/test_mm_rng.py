@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 from itertools import count
+from uuid import uuid4
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache.lru import LruKeyReplicatedReceiverCache, LruKeyReplicatedSenderCache
+from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import InputProcessingContext, ProcessorInputs
 from vllm.multimodal.processing.context import TimingContext
@@ -149,6 +151,11 @@ def test_seeded_reference_prefixes_and_lru_hits(cached_request, real_processor, 
 
     prefix = cached_request([None, None], ["A", "A"], seed, raw).mm_features
     assert [f.identifier for f in prefix] == [f.identifier for f in first[:2]]
+    mixed = cached_request([None, None, a], ["A", "A", "A"], seed, raw).mm_features
+    assert [f.identifier for f in mixed[:2]] == [f.identifier for f in first[:2]]
+    assert len({f.identifier for f in mixed}) == 3
+    assert all(f.data["vae_generator_seed"].data.item() == seed for f in mixed)
+    assert image_counts[-1] == 1  # Validation sees only the newly processed occurrence.
     other_seed = cached_request([a], ["A"], 42 if seed == 0 else 0, raw).mm_features
     assert other_seed[0].identifier != first[0].identifier
 
@@ -212,3 +219,79 @@ def test_invalid_seed_is_rejected_before_processor_cache_mutation(seed, real_pro
         replace(inputs, hf_processor_mm_kwargs={"vae_generator_seed": 0}), TimingContext(enabled=False)
     )
     assert valid["mm_kwargs"]["image"][0] is not None
+
+
+@pytest.fixture(params=["lru", "shm"])
+def processor_cache(request, real_processor, mocker, monkeypatch):
+    processor, _ = real_processor
+    model_config = processor.info.ctx.model_config
+    if request.param == "lru":
+        yield LruKeyReplicatedSenderCache(model_config)
+        return
+    monkeypatch.setattr("vllm.envs.VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", f"hunyuan-input-{uuid4().hex}")
+    model_config.multimodal_config.mm_shm_cache_max_object_size_mb = 1
+    config = mocker.Mock(spec=VllmConfig, model_config=model_config)
+    config.parallel_config = mocker.Mock(world_size=1)
+    cache = ShmObjectStoreSenderCache(config)
+    try:
+        yield cache
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("vae_generator_seed", None),
+        ("vae_generator_seed", [0]),
+        ("vae_generator_seed", torch.tensor([0.0])),
+        ("vae_generator_seed", torch.tensor(0)),
+        ("vae_generator_seed", torch.tensor([1])),
+        ("vae_generator_seed", torch.tensor([0, 0])),
+        ("vae_generator_seed", torch.empty((1,), dtype=torch.long, device="meta")),
+        ("vae_token_grid_hw", None),
+        ("vae_token_grid_hw", [[2, 3]]),
+        ("vae_token_grid_hw", torch.tensor([[2.0, 3.0]])),
+        ("vae_token_grid_hw", torch.tensor([2, 3])),
+        ("vae_token_grid_hw", torch.tensor([[0, 3]])),
+        ("vae_token_grid_hw", torch.tensor([[-1, 3]])),
+        ("vae_token_grid_hw", torch.tensor([[2, 3], [2, 3]])),
+        ("vae_token_grid_hw", torch.empty((1, 2), dtype=torch.long, device="meta")),
+    ],
+)
+def test_invalid_rng_metadata_is_rejected_before_cache_write(field, value, processor_cache, real_processor, mocker):
+    processor, _ = real_processor
+    original = processor._call_hf_processor
+
+    def malformed_output(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if value is None:
+            result.pop(field)
+        else:
+            result[field] = value
+        return result
+
+    processor._call_hf_processor = malformed_output
+    inputs = ProcessorInputs(
+        [99],
+        processor.info.get_data_parser().parse_mm_data({"image": Image.new("RGB", (4, 4), "red")}),
+        {"image": ["image-uuid"]},
+        hf_processor_mm_kwargs={"vae_generator_seed": 0},
+        cache=processor_cache,
+    )
+    cache_write = mocker.spy(processor_cache, "get_and_update_item")
+    with pytest.raises(VLLMValidationError, match=field):
+        processor.apply(inputs, TimingContext(enabled=False))
+    cache_write.assert_not_called()
+
+    # The same cache key must still accept valid pixels after rejection. Its
+    # subsequent UUID-only hit contains None (LRU) or an address (SHM), not RNG fields.
+    processor._call_hf_processor = original
+    valid = processor.apply(inputs, TimingContext(enabled=False))
+    assert valid["mm_kwargs"]["image"][0] is not None
+    cached = processor.apply(
+        replace(inputs, mm_data_items=processor.info.get_data_parser().parse_mm_data({"image": [None]})),
+        TimingContext(enabled=False),
+    )
+    item = cached["mm_kwargs"]["image"][0]
+    assert item is None or "address" in item

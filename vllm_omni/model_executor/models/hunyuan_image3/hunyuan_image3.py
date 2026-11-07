@@ -1087,6 +1087,29 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
             batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
         return batch_feature
 
+    def _apply_hf_processor_main(self, mm_items: MultiModalDataItems, hf_kwargs: Mapping[str, object]) -> BatchFeature:
+        result = super()._apply_hf_processor_main(mm_items, hf_kwargs)
+        seed = hf_kwargs.get("vae_generator_seed")
+        num_images = mm_items.get_count("image", strict=False)
+        if seed is None or num_images == 0:
+            return result
+        # Validate before field splitting and LRU/SHM writes. At this point
+        # metadata includes passthrough values and the uncached image count is known.
+        for name, shape in (("vae_generator_seed", (num_images,)), ("vae_token_grid_hw", (num_images, 2))):
+            value = result.get(name)
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.device.type != "cpu"
+                or value.dtype != torch.long
+                or value.shape != shape
+            ):
+                raise VLLMValidationError(f"Hunyuan {name} must be a CPU int64 tensor with shape {shape}")
+        if not bool((result["vae_generator_seed"] == seed).all()):
+            raise VLLMValidationError("Hunyuan vae_generator_seed must match the request seed")
+        if not bool((result["vae_token_grid_hw"] > 0).all()):
+            raise VLLMValidationError("Hunyuan vae_token_grid_hw must contain positive dimensions")
+        return result
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,

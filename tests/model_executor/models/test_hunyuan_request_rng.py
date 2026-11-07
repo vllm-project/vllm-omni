@@ -31,6 +31,7 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.core.sched.output import OmniNewRequestData
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS
 from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
 from vllm_omni.model_executor.models.hunyuan_image3 import autoencoder_kl_3d
 from vllm_omni.model_executor.models.hunyuan_image3 import hunyuan_image3 as hunyuan
@@ -597,4 +598,70 @@ def test_real_vae_posterior_matches_draw_plan_and_replay(runner, make_request, m
         with provider.sample(handle, index, specs[index]) as generator:
             actual = posteriors[index].sample(generator)
         assert torch.equal(actual, expected[index])
+    assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())
+
+
+@pytest.mark.parametrize(
+    "runner", [runner_case("cuda", dtype) for dtype in (torch.float32, torch.bfloat16)], indirect=True
+)
+def test_full_vae_config_production_buckets_match_draw_plan(runner, make_request):
+    # Exact VAE config, with random weights and no unused decoder:
+    # https://huggingface.co/tencent/HunyuanImage-3.0-Instruct/blob/
+    # 2ec2c78bee7d4b94157341fba86c4c2c7b1858b2/config.json
+    vae_config = {
+        "_class_name": "AutoencoderKLConv3D",
+        "block_out_channels": [128, 256, 512, 1024, 1024],
+        "in_channels": 3,
+        "out_channels": 3,
+        "latent_channels": 32,
+        "layers_per_block": 2,
+        "ffactor_spatial": 16,
+        "ffactor_temporal": 4,
+        "sample_size": 384,
+        "sample_tsize": 96,
+        "downsample_match_channel": True,
+        "upsample_match_channel": True,
+        "scaling_factor": 0.562679178327931,
+    }
+    model = runner.model
+    dtype = model.vae.dtype
+    model.vae = (
+        autoencoder_kl_3d.AutoencoderKLConv3D.from_config(vae_config, only_encoder=True)
+        .to(device=runner.device, dtype=dtype)
+        .eval()
+    )
+    # Native tiling bounds activation memory; widths and image buckets are unchanged.
+    model.vae.enable_spatial_tiling()
+    model.config = PretrainedConfig(vae_downsample_factor=(16, 16), patch_size=1, vae=vae_config)
+    resolutions = hunyuan.HunyuanImage3Processor.ResolutionGroup(
+        base_size=1024,
+        extra_resolutions=[hunyuan.HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+    )
+    refs = []
+    for height, width in ((1024, 1024), (768, 1024), (1024, 768)):
+        assert resolutions.get_target_size(width, height) == (width, height)
+        refs.append(torch.zeros((3, height, width)))
+    req = make_request("full-vae", refs)
+    for feature, pixels in zip(req.mm_features, refs, strict=True):
+        grid = feature.data["vae_token_grid_hw"]
+        feature.data["vae_token_grid_hw"] = replace(
+            grid, data=torch.tensor([pixels.shape[-2] // 16, pixels.shape[-1] // 16])
+        )
+    specs = model.get_mm_rng_specs(req.mm_features, 42)
+    provider = runner._mm_rng_provider
+    handle = provider.register(req.request_id, 42, specs)
+    reference_generator = torch.Generator(device=runner.device).manual_seed(42)
+    with torch.inference_mode():
+        for index, pixels in enumerate(refs):
+            posterior = model.vae.encode(pixels.unsqueeze(0).to(device=runner.device, dtype=dtype)).latent_dist
+            assert specs[index] == RandomDrawSpec(
+                tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device
+            )
+            expected = posterior.sample(reference_generator)
+            assert torch.isfinite(expected).all()
+            if index == len(refs) - 1:
+                # The first scheduled image needs replay of two real-size draws.
+                with provider.sample(handle, index, specs[index]) as generator:
+                    assert torch.equal(posterior.sample(generator), expected)
+            del posterior, expected
     assert torch.equal(provider.streams[handle].checkpoints[3], reference_generator.get_state())
