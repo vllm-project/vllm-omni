@@ -375,7 +375,8 @@ def test_model_level_persistent_staging_gated_on_decode_graph(
     backend.enable(pipeline)
 
     hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
-    assert (hook._stager is not None) is expect_stager
+    expected_stager = expect_stager and accelerator_device.type == "cuda"
+    assert (hook._stager is not None) is expected_stager
 
     backend.disable()
 
