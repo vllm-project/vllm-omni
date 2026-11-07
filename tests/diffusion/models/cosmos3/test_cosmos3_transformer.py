@@ -807,6 +807,258 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
+def test_forward_rejects_nonuniform_text_lengths_on_cache_miss(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+
+    with pytest.raises(ValueError, match="identical real text lengths"):
+        model(
+            hidden_states=torch.zeros(2, 2, 1, 2, 2),
+            timestep=torch.ones(2),
+            text_ids=torch.tensor([[1, 2], [1, 0]], dtype=torch.long),
+            text_mask=torch.tensor([[1, 1], [1, 0]], dtype=torch.long),
+            video_shape=(1, 2, 2),
+            fps=24.0,
+        )
+
+
+def test_forward_cache_hit_avoids_text_length_scalar_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    kwargs = {
+        "hidden_states": torch.zeros(1, 2, 1, 2, 2),
+        "timestep": torch.tensor([1.0]),
+        "text_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "text_mask": torch.ones(1, 2, dtype=torch.long),
+        "video_shape": (1, 2, 2),
+        "fps": 24.0,
+    }
+
+    model(**kwargs)
+    assert model.cached_kv is not None
+
+    def fail_item(_self):
+        raise AssertionError("cache-hit forward must not read text lengths through Python")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+    output = model(**kwargs)
+
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+@pytest.fixture
+def text_cache_model(monkeypatch: pytest.MonkeyPatch):
+    """Use real one-layer UND/GEN stacks with CPU-capable attention."""
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_omni.diffusion.attention import layer
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **kwargs: (SDPABackend, None))
+    monkeypatch.setattr(SDPAImpl, "forward", SDPAImpl._forward_impl)
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=1), dtype=torch.float32)
+    )
+    with torch.no_grad():
+        generator = torch.Generator().manual_seed(5669)
+        for parameter in model.parameters():
+            parameter.uniform_(-0.1, 0.1, generator=generator)
+    for module in model.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+    inputs = {
+        "hidden_states": torch.zeros(2, 2, 1, 2, 2),
+        "timestep": torch.ones(2),
+        "text_ids": torch.tensor([[1, 2, 0], [1, 2, 0]], dtype=torch.long),
+        "text_mask": torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.long),
+        "video_shape": (1, 2, 2),
+        "fps": 24.0,
+    }
+    return model, inputs
+
+
+@pytest.fixture(params=["forward", "seacache_extractor"])
+def text_cache_entry(request):
+    from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
+
+    def run(model, inputs):
+        if request.param == "forward":
+            return model(**inputs)
+        context = extract_cosmos3_context(model, **inputs)
+        return context.postprocess(context.run_transformer_blocks()[0])
+
+    return run
+
+
+@torch.inference_mode()
+def test_text_cache_frequency_reconstruction_rejects_nonuniform_mask(
+    text_cache_model, text_cache_entry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import Cosmos3StateAdapter
+    from vllm_omni.experimental.world_models.session_state import SessionStateManager
+
+    model, inputs = text_cache_model
+    text_cache_entry(model, inputs)
+    cached_kv = model.cached_kv
+    assert cached_kv is not None and len(cached_kv) == 1
+    adapter = Cosmos3StateAdapter("freq-only", SessionStateManager())
+    adapter.set_branch_kv(False, cached_kv)
+    model.reset_cache()
+    adapter.load_into_transformer(model, False)
+    assert model.cached_kv is not None
+    assert model.cached_freqs_gen is None
+    inputs["text_mask"] = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.long)
+    rope_calls = []
+    compute_rope = model._compute_rope_freqs
+
+    def record_rope(*args, **kwargs):
+        rope_calls.append(args[0].clone())
+        return compute_rope(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_compute_rope_freqs", record_rope)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Cosmos3 requires identical real text lengths within a batch \(got min=1, max=2\)\.$",
+    ):
+        text_cache_entry(model, inputs)
+
+    assert not rope_calls
+    assert model.cached_freqs_gen is None
+    for restored, original in zip(model.cached_kv, cached_kv):
+        assert restored[0] is original[0]
+        assert restored[1] is original[1]
+
+
+@torch.inference_mode()
+def test_text_cache_miss_rejects_nonuniform_mask(text_cache_model, text_cache_entry) -> None:
+    model, inputs = text_cache_model
+    inputs["text_mask"] = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.long)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Cosmos3 requires identical real text lengths within a batch \(got min=1, max=2\)\.$",
+    ):
+        text_cache_entry(model, inputs)
+
+    assert model.cached_kv is None
+    assert model.cached_freqs_gen is None
+
+
+@pytest.mark.parametrize("cache_state", ["miss", "freq_only"])
+@torch.inference_mode()
+def test_text_cache_uniform_reconstruction(
+    text_cache_model, text_cache_entry, cache_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import Cosmos3StateAdapter
+    from vllm_omni.experimental.world_models.session_state import SessionStateManager
+
+    model, inputs = text_cache_model
+    expected = text_cache_entry(model, inputs)
+    cached_kv = model.cached_kv
+    cached_freqs = model.cached_freqs_gen
+    assert cached_kv is not None and len(cached_kv) == 1
+    assert cached_freqs is not None
+    adapter = Cosmos3StateAdapter("uniform", SessionStateManager())
+    adapter.set_branch_kv(False, cached_kv)
+    model.reset_cache()
+    assert model.cached_kv is None and model.cached_freqs_gen is None
+    if cache_state == "freq_only":
+        adapter.load_into_transformer(model, False)
+    restored_kv = model.cached_kv
+    compute_rope = model._compute_rope_freqs
+    rope_results = []
+    language_results = []
+    scalar_reads: list[int | float | bool] = []
+    validation_reads = []
+    tensor_item = torch.Tensor.item
+
+    def record_rope(*args, **kwargs):
+        validation_reads.append(list(scalar_reads))
+        result = compute_rope(*args, **kwargs)
+        rope_results.append(result)
+        return result
+
+    def record_item(tensor, *args, **kwargs):
+        value = tensor_item(tensor, *args, **kwargs)
+        scalar_reads.append(value)
+        return value
+
+    monkeypatch.setattr(model, "_compute_rope_freqs", record_rope)
+    handle = model.language_model.register_forward_hook(lambda module, args, output: language_results.append(output))
+    try:
+        with monkeypatch.context() as scalar_patch:
+            scalar_patch.setattr(torch.Tensor, "item", record_item)
+            output = text_cache_entry(model, inputs)
+    finally:
+        handle.remove()
+
+    assert validation_reads == [[2, 2]]
+    assert len(rope_results) == 1
+    assert len(language_results) == (1 if cache_state == "miss" else 0)
+    assert model.cached_freqs_gen is rope_results[0][1]
+    assert model.cached_kv is not None and len(model.cached_kv) == 1
+    if cache_state == "freq_only":
+        assert model.cached_kv is restored_kv
+    else:
+        assert language_results[0][0][0].shape[1] == inputs["text_ids"].shape[1] == 3
+    for current, previous in zip(model.cached_kv, cached_kv):
+        for actual, original in zip(current, previous):
+            assert actual.shape == (2, 2, 2, 4)
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    for actual, original in zip(model.cached_freqs_gen, cached_freqs):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("nonuniform_mask", [False, True])
+@torch.inference_mode()
+def test_text_cache_full_hit_avoids_scalar_reads(
+    text_cache_model, text_cache_entry, nonuniform_mask, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import Cosmos3StateAdapter
+    from vllm_omni.experimental.world_models.session_state import SessionStateManager
+
+    model, inputs = text_cache_model
+    expected = text_cache_entry(model, inputs)
+    adapter = Cosmos3StateAdapter("full-hit", SessionStateManager())
+    adapter.capture_from_transformer(model, False)
+    model.reset_cache()
+    adapter.load_into_transformer(model, False)
+    cached_kv = model.cached_kv
+    cached_freqs = model.cached_freqs_gen
+    assert cached_kv is not None and cached_freqs is not None
+    if nonuniform_mask:
+        inputs["text_mask"] = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.long)
+
+    def fail_cache_rebuild(*args, **kwargs):
+        raise AssertionError("full text-cache hit must not rebuild K/V or RoPE")
+
+    def fail_item(*args, **kwargs):
+        raise AssertionError("full text-cache hit must not read Python scalars")
+
+    monkeypatch.setattr(model, "_compute_rope_freqs", fail_cache_rebuild)
+    monkeypatch.setattr(model.language_model, "forward", fail_cache_rebuild)
+    with monkeypatch.context() as scalar_patch:
+        scalar_patch.setattr(torch.Tensor, "item", fail_item)
+        output = text_cache_entry(model, inputs)
+
+    assert model.cached_kv is cached_kv
+    assert model.cached_freqs_gen is cached_freqs
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
