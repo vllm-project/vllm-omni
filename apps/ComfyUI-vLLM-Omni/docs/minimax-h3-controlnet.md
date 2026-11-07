@@ -128,6 +128,7 @@ Structural modes can also use `source_video` plus one mask. A connected source
 requires a mask. Inpaint requires a mask and can optionally also accept a
 prepared control video. Use one mask input at a time. Keep `frame` and
 `references` disconnected when Control is connected.
+Timeline guides cannot be combined with ControlNet requests.
 
 ## Prepared Depth, HED and MLSD examples
 
@@ -212,6 +213,11 @@ ComfyUI output. An existing response-recording/debugging tool is sufficient;
 record its steps and associate both files with the job ID. Check decodability
 and listen to both tracks. Backend silence and audio lost during client
 conversion require separate diagnosis.
+
+Current H3 requests count denoiser evaluations: `num_inference_steps=40`
+runs 40 forwards using 41 sigma boundaries. The historical measurements below
+used the previous step-count convention; preserve their recorded request values
+when comparing old results.
 
 ### Recorded runtime results (2026-09-13 to 2026-09-14)
 
