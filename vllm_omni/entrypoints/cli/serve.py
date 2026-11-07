@@ -38,6 +38,7 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
+from vllm_omni.entrypoints.pd_utils import reject_pd_until_runtime_ready
 from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -1254,6 +1255,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
 
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+    # The API workers' OmniEngineBase runs this guard only after
+    # launch_stage_engines has loaded every stage, so check here first.
+    reject_pd_until_runtime_ready(stage_configs)
 
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
@@ -1507,6 +1511,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+    # A headless stage never builds an OmniEngineBase; refuse a PD pipeline
+    # before this stage's engine is prepared.
+    reject_pd_until_runtime_ready(stage_configs)
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)

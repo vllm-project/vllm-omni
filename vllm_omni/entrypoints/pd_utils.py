@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PD (Prefill-Decode) disaggregation helpers.
 
 Mixin for OmniBase — keeps omni.py focused on orchestration.
@@ -7,15 +7,58 @@ Mixin for OmniBase — keeps omni.py focused on orchestration.
 
 import logging
 import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm import SamplingParams
 
-_DEFAULT_MOONCAKE_BOOTSTRAP_PORT = 25201
+# vLLM's VLLM_MOONCAKE_BOOTSTRAP_PORT default, also the stage runtime's default
+# for kv_connector_extra_config.bootstrap_port.
+_DEFAULT_MOONCAKE_BOOTSTRAP_PORT = 8998
 
 logger = logging.getLogger(__name__)
+
+
+def mooncake_prefill_bootstrap_addr(kv_cfg: Mapping[str, Any], replica_id: int = 0) -> str | None:
+    """Bootstrap URL of a MooncakeConnector prefill replica, or ``None``.
+
+    Mirrors ``StageRuntime._prepare_replica_vllm_config``: replica ``r`` of a
+    Mooncake ``kv_producer`` listens on
+    ``kv_connector_extra_config.bootstrap_port`` (default 8998) + ``r``.
+    """
+    if kv_cfg.get("kv_connector") != "MooncakeConnector":
+        return None
+    extra = kv_cfg.get("kv_connector_extra_config") or {}
+    port = int(extra.get("bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)) + replica_id
+    host = kv_cfg.get("kv_ip") or "127.0.0.1"
+    return f"http://{host}:{port}"
+
+
+def reject_pd_until_runtime_ready(stage_configs: Sequence[Any]) -> None:
+    """Refuse to launch a detected PD pair: its prefill->decode handoff is not implemented.
+
+    The orchestrator needs ``remote_request_id`` from the prefill output, which
+    the pinned MooncakeConnector never returns, so every request would fail at
+    the handoff after both engines loaded; no other connector has been run on
+    this path. Each launch path calls this right after its stage configs are
+    resolved, before it launches any stage: ``OmniEngineBase.__init__``
+    (``Omni``/``AsyncOmni`` and ``vllm serve`` with one API server), the
+    ``--api-server-count`` > 1 parent in ``_build_multi_api_stage_runtime`` and
+    ``run_headless``.
+    """
+    # TODO: remove once the PD runtime handoff lands (Mooncake transfer_id
+    # contract, decode request rebuilt from the processed prefill request),
+    # tracked in https://github.com/vllm-project/vllm-omni/pull/2947.
+    pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(list(stage_configs))
+    if pair is None:
+        return
+    raise NotImplementedError(
+        f"Stages declared with pd_role form a PD pair (prefill stage {pair[0]}, decode stage {pair[1]}), "
+        "but PD disaggregation cannot run yet: the prefill->decode KV handoff is not implemented, so "
+        "requests would fail at the handoff. Remove pd_role from these stages to launch the pipeline."
+    )
 
 
 class PDDisaggregationMixin:
@@ -61,17 +104,28 @@ class PDDisaggregationMixin:
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
         for i, stage in enumerate(stage_configs):
-            if getattr(stage, "is_prefill_only", False):
+            pd_role = getattr(stage, "pd_role", None)
+            pd_role_value = getattr(pd_role, "value", pd_role)
+            is_prefill = pd_role_value == "prefill"
+            is_decode = pd_role_value == "decode"
+
+            # Keep the legacy boolean markers as a fallback for hand-built
+            # stage configs that do not carry ``pd_role``.
+            if pd_role_value is None:
+                is_prefill = bool(getattr(stage, "is_prefill_only", False))
+                is_decode = bool(getattr(stage, "is_decode_only", False))
+
+            if is_prefill:
                 prefill_by_id[i] = i
                 sid = getattr(stage, "stage_id", i)
                 if sid != i:
                     prefill_by_id[sid] = i
-            if getattr(stage, "is_decode_only", False):
+            if is_decode:
                 decode_indices.append(i)
 
         pd_pairs: list[tuple[int, int]] = []
         for j in decode_indices:
-            source_ids = getattr(stage_configs[j], "engine_input_source", [])
+            source_ids = PDDisaggregationMixin._get_stage_input_sources(stage_configs[j])
             for src in source_ids:
                 if src in prefill_by_id:
                     pd_pairs.append((prefill_by_id[src], j))
@@ -115,6 +169,34 @@ class PDDisaggregationMixin:
                 logger.debug("Unable to convert %s to dict", type(obj))
                 return default
 
+    @staticmethod
+    def _get_stage_input_sources(stage: Any) -> list[int]:
+        """Upstream stage ids: legacy ``engine_input_source`` or typed ``input_sources``."""
+        source_ids = getattr(stage, "engine_input_source", None)
+        if source_ids is None:
+            source_ids = getattr(stage, "input_sources", None)
+        return list(source_ids or [])
+
+    @staticmethod
+    def _get_stage_kv_transfer_config(stage: Any) -> Any:
+        """KV transfer config from legacy ``engine_args`` or typed ``connector_config``."""
+        engine_args = getattr(stage, "engine_args", None)
+        if engine_args is not None:
+            cfg = getattr(engine_args, "kv_transfer_config", None)
+            if cfg is None and hasattr(engine_args, "get"):
+                cfg = engine_args.get("kv_transfer_config", None)
+            if cfg is not None:
+                return cfg
+        return getattr(getattr(stage, "connector_config", None), "kv_transfer_config", None)
+
+    @staticmethod
+    def _get_stage_tensor_parallel_size(stage: Any) -> int:
+        engine_args = getattr(stage, "engine_args", None)
+        tp = getattr(engine_args, "tensor_parallel_size", None) if engine_args is not None else None
+        if tp is None:
+            tp = getattr(getattr(stage, "parallel_config", None), "tensor_parallel_size", None)
+        return int(tp or 1)
+
     def _kv_cfg_to_dict(self, kv_cfg: Any) -> dict[str, Any]:
         return self._to_dict(kv_cfg, default={}) or {}
 
@@ -130,10 +212,7 @@ class PDDisaggregationMixin:
         d_stage = self.stage_configs[d_id]
 
         def _get_kv_cfg(stage: Any) -> dict[str, Any]:
-            ea = stage.engine_args
-            cfg = getattr(ea, "kv_transfer_config", None)
-            if cfg is None:
-                cfg = ea.get("kv_transfer_config", None) if hasattr(ea, "get") else None
+            cfg = self._get_stage_kv_transfer_config(stage)
             if cfg is None:
                 raise ValueError(f"Stage-{stage.stage_id} is marked for PD but has no 'kv_transfer_config'")
             cfg_dict = self._kv_cfg_to_dict(cfg)
@@ -151,7 +230,7 @@ class PDDisaggregationMixin:
         if d_role not in ("kv_consumer", "kv_both"):
             raise ValueError(f"Decode stage-{d_id} kv_role must be 'kv_consumer' or 'kv_both', got '{d_role}'")
 
-        d_sources = list(getattr(d_stage, "engine_input_source", []) or [])
+        d_sources = self._get_stage_input_sources(d_stage)
         if p_id not in d_sources and p_stage.stage_id not in d_sources:
             raise ValueError(f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source")
 
@@ -168,8 +247,8 @@ class PDDisaggregationMixin:
             if p_val is not None and d_val is not None and p_val != d_val:
                 raise ValueError(f"PD {key} mismatch: prefill='{p_val}', decode='{d_val}'")
 
-        p_tp = getattr(getattr(p_stage, "engine_args", None), "tensor_parallel_size", 1)
-        d_tp = getattr(getattr(d_stage, "engine_args", None), "tensor_parallel_size", 1)
+        p_tp = self._get_stage_tensor_parallel_size(p_stage)
+        d_tp = self._get_stage_tensor_parallel_size(d_stage)
         if p_tp != d_tp:
             raise ValueError(f"PD stages must have matching tensor_parallel_size: prefill={p_tp}, decode={d_tp}")
 
@@ -182,29 +261,23 @@ class PDDisaggregationMixin:
         p_id, _ = pair
         p_stage = self.stage_configs[p_id]
 
-        ea = p_stage.engine_args
-        kv_cfg = getattr(ea, "kv_transfer_config", None)
-        if kv_cfg is None and hasattr(ea, "get"):
-            kv_cfg = ea.get("kv_transfer_config")
+        kv_cfg = self._get_stage_kv_transfer_config(p_stage)
         if kv_cfg is None:
             return None
 
         kv_cfg_dict = self._kv_cfg_to_dict(kv_cfg)
         if not kv_cfg_dict:
             return None
-
-        kv_connector = str(kv_cfg_dict.get("kv_connector", "") or "")
-        extra_cfg = kv_cfg_dict.get("kv_connector_extra_config", {}) or {}
-        if not isinstance(extra_cfg, dict):
-            extra_cfg = self._kv_cfg_to_dict(extra_cfg)
+        extra_cfg = kv_cfg_dict.get("kv_connector_extra_config")
+        if extra_cfg is not None and not isinstance(extra_cfg, dict):
+            kv_cfg_dict = {**kv_cfg_dict, "kv_connector_extra_config": self._kv_cfg_to_dict(extra_cfg)}
 
         info: dict[str, Any] = {}
-
-        if "mooncake" in kv_connector.lower():
-            bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)
-            kv_ip = kv_cfg_dict.get("kv_ip") or "127.0.0.1"
-            info["prefill_bootstrap_addr"] = f"{kv_ip}:{bootstrap_port}"
-
+        # Replica 0's address; the orchestrator reads the per-replica value
+        # from the prefill client's KV transfer config.
+        bootstrap_addr = mooncake_prefill_bootstrap_addr(kv_cfg_dict)
+        if bootstrap_addr is not None:
+            info["prefill_bootstrap_addr"] = bootstrap_addr
         return info
 
     def _prepare_prefill_sampling_params(self, req_id: str, sp: "SamplingParams") -> "SamplingParams":

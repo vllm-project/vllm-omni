@@ -585,6 +585,66 @@ def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
         serve_module._build_multi_api_stage_runtime(args, 2)
 
 
+def _pd_pair_stage_configs() -> tuple[Any, Any]:
+    """Resolved stage configs whose pd_role marks a prefill/decode pair."""
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import PDRole, StagePipelineConfig
+
+    return (
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="thinker", pd_role=PDRole.PREFILL)
+        ),
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=1, model_stage="thinker", pd_role=PDRole.DECODE, input_sources=(0,)
+            )
+        ),
+    )
+
+
+def test_run_multi_api_server_omni_refuses_a_pd_pair_before_launching_engines(mocker: MockerFixture) -> None:
+    """With --api-server-count >= 2 the parent launches the stage engines before
+    any API worker builds an OmniEngineBase, so the PD guard must run here."""
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(
+            model="dummy-model",
+            model_tag=None,
+            api_server_count=2,
+            shutdown_timeout=1,
+            stage_init_timeout=1,
+            tokenizer=None,
+            disable_log_stats=False,
+        ),
+        frozenset({"model", "api_server_count"}),
+    )
+    socket = mocker.Mock()
+    mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
+    mocker.patch(
+        "vllm_omni.config.config_factory.with_trust_remote_code_override",
+        side_effect=lambda kwargs, _trust: kwargs,
+    )
+    mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=OmniConfigResolution(config_path="dummy-config", stage_configs=_pd_pair_stage_configs()),
+    )
+    stage_runtime_cls = mocker.patch("vllm_omni.engine.stage_runtime.StageRuntime")
+    mocker.patch("signal.signal")
+    mocker.patch("vllm.entrypoints.openai.api_server.setup_server", return_value=("127.0.0.1:8000", socket))
+    mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
+    start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager")
+
+    with pytest.raises(NotImplementedError, match=r"prefill stage 0, decode stage 1.*KV handoff"):
+        serve_module.run_multi_api_server_omni(args)
+
+    stage_runtime_cls.assert_not_called()
+    stage_runtime_cls.return_value.launch_stage_engines.assert_not_called()
+    start_manager.assert_not_called()
+    socket.close.assert_called_once_with()
+
+
 def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(mocker: MockerFixture) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
@@ -994,6 +1054,27 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
     args = _make_headless_args(stage_id=0)
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(args)
+
+
+@pytest.mark.parametrize("stage_id", [0, 1])
+def test_run_headless_refuses_a_pd_pair_before_launching_the_stage(mocker: MockerFixture, stage_id: int) -> None:
+    """A headless prefill or decode stage never builds an OmniEngineBase, so the
+    PD guard must stop it before the stage's engine is prepared or launched."""
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(*_pd_pair_stage_configs()),
+    )
+    prepare_env = mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    launch_llm = mocker.patch("vllm_omni.engine.stage_engine_startup.launch_headless_llm_replicas")
+    launch_diffusion = mocker.patch("vllm_omni.engine.stage_engine_startup.launch_headless_diffusion_replicas")
+    mocker.patch("signal.signal")
+
+    with pytest.raises(NotImplementedError, match=r"prefill stage 0, decode stage 1.*KV handoff"):
+        run_headless(_make_headless_args(stage_id=stage_id))
+
+    prepare_env.assert_not_called()
+    launch_llm.assert_not_called()
+    launch_diffusion.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
