@@ -89,6 +89,39 @@ def test_deferred_input_audio_base64_is_materialized_from_data_uri():
 
 
 @pytest.mark.asyncio
+async def test_unformattable_audio_is_not_dropped_when_another_modality_is_deferred(serving_chat, monkeypatch):
+    monkeypatch.setattr(serving_chat, "_deferred_multimodal_modalities", lambda: {"audio", "image"})
+
+    async def materialize(_connector, _modality, parts):
+        return parts
+
+    monkeypatch.setattr(serving_chat, "_materialize_deferred_multimodal_parts", materialize)
+    audio = {"type": "input_audio", "input_audio": {"data": "AAAA"}}
+    messages = [{"role": "user", "content": [audio, {"type": "image_url", "image_url": {"url": "image"}}]}]
+
+    stripped, deferred = await serving_chat._prepare_multistage_multimodal_inputs(
+        messages, SimpleNamespace(media_io_kwargs=None)
+    )
+
+    assert stripped[0]["content"] == [audio]
+    assert deferred["image"] == ["image"]
+    assert "audio" not in deferred
+
+
+@pytest.mark.asyncio
+async def test_missing_audio_fetcher_fails_for_message_reference(serving_chat, monkeypatch):
+    class ConnectorWithoutAudioFetcher:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_chat.MediaConnector", ConnectorWithoutAudioFetcher)
+    with pytest.raises(ValueError, match="requires asynchronous audio fetching"):
+        await serving_chat._attach_minicpmo45_ref_audio(
+            SimpleNamespace(media_io_kwargs=None), "file:///tmp/ref.wav", {"additional_information": {}}
+        )
+
+
+@pytest.mark.asyncio
 async def test_materializes_ref_audio_into_deferred_contract(serving_chat):
     request = SimpleNamespace(media_io_kwargs=None)
     prompt = {"additional_information": {}}

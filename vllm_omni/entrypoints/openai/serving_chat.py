@@ -317,7 +317,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
         fetch_audio = getattr(media_connector, "fetch_audio_async", None)
         if fetch_audio is None:
-            return
+            raise ValueError("MiniCPM-o reference audio requires asynchronous audio fetching")
         deferred["audio"] = [await fetch_audio(ref_audio_uri)]
         additional_information["deferred_multi_modal_data"] = deferred
 
@@ -1110,7 +1110,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         audio = audio.get("url")
                 else:
                     audio = audio.get("url") or audio.get("data")
-            return "audio", audio
+            # Leave malformed parts in the conversation for normal renderer
+            # validation instead of silently dropping them when other parts
+            # of this message can be deferred.
+            return ("audio", audio) if audio is not None else (None, None)
         return None, None
 
     @staticmethod
