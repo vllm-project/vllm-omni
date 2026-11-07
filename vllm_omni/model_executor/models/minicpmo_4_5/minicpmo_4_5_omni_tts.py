@@ -2560,11 +2560,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
+        # Eager sampling already drops non-emitted frames. Still publish a
+        # row mask so full-payload accumulation stays aligned when this request
+        # also runs CUDA graph steps, which retain masked padding rows.
         meta_outputs = {
             "finished": terminal_flags,
-            # flush_kstep_pending keeps only emitted codec rows. Pair those
-            # rows with validity even when this request also uses fused steps.
-            "codec_frame_valid": [delta.new_ones((delta.shape[0],), dtype=torch.bool) for delta in codec_deltas],
+            "codec_frame_valid": [
+                torch.ones(delta.shape[0], dtype=torch.bool, device=delta.device) for delta in codec_deltas
+            ],
         }
         if emit_duplex_metadata:
             meta_outputs.update(
@@ -2634,9 +2637,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     self._merge_frame_finished([frame[index] for frame in per_frame]) for index in range(num_reqs)
                 ]
             elif key == "codec_frame_valid":
-                meta_outputs[key] = [
-                    torch.cat([frame[index] for frame in per_frame], dim=0) for index in range(num_reqs)
-                ]
+                meta_outputs[key] = [torch.cat([frame[index] for frame in per_frame]) for index in range(num_reqs)]
             else:
                 # Duplex metadata is per request and constant across the step's
                 # frames; the last frame is as good as any and matches what a
