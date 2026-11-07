@@ -93,8 +93,8 @@ Fixed case used for the stage split and the torch.profiler kernel table:
 
 | Stage | Time | Share |
 | --- | --- | --- |
-| Text prefix (`_t2i_prefix_forward`, understanding tower) | 0.06 s | 0.7% |
-| Denoising loop (`_run_denoising_loop`, generation tower, 50 steps) | 7.56 s | 98.5% |
+| Text prefix (`_t2i_prefix` / `_t2i_caches`, understanding tower) | 0.06 s | 0.7% |
+| Denoising (`_denoise_one` x50 and `_denoising_output`, generation tower) | 7.56 s | 98.5% |
 | Pipeline `forward` | 7.68 s | 100% |
 
 There is no VAE. The loop ends in unpatchify / denorm / PIL, which is inside the denoise
@@ -118,7 +118,7 @@ branch counts at 8-step 1024x1024: 2-way (`img_cfg_scale=1`, `cond`+`img_cond`)
 1.09 s; 3-way (`cfg_scale=4`, `img_cfg_scale=2`, `cond`+`img_cond`+`uncond`)
 1.74 s (3 branches on 2 ranks dispatch as `[[0, 2], [1]]`). Cache-DiT and
 layerwise CPU offload do not take effect on A3B; see
-[diffusion features](../../docs/user_guide/diffusion_features.md) note 8.
+[diffusion features](../../docs/user_guide/diffusion_features.md) note 9.
 
 Other configurations on the same machine (second run, warm kernels):
 
@@ -128,7 +128,7 @@ Other configurations on the same machine (second run, warm kernels):
 | text2img 1024x1024, 50 steps, think off, TP=2 | 5.64 s | 36.7 GiB per GPU |
 | img2img 2048x2048 output, 25 steps, think off | 20.93 s | 74.6 GiB |
 
-Think-on spends 1.37 s in `_generate_think` (215 tokens). At the same seed TP=2 differs
+Think-on spends 1.37 s in the think decode (`_think_step`, 215 tokens). At the same seed TP=2 differs
 from TP=1 only numerically (MAE 2.97/255, identical composition) from the changed
 reduction order.
 
