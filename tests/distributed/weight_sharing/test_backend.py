@@ -21,8 +21,8 @@ class Runtime:
         self.api = importlib.import_module(f"{package.__name__}.contracts")
         self.backend = importlib.import_module(f"{package.__name__}.backend")
         self.codec = FakeCodec(self.api)
-        self.provider = self.backend.TorchCudaIpcBackend(codec=self.codec)
-        self.consumer = self.backend.TorchCudaIpcBackend(codec=self.codec)
+        self.provider = self.backend.TorchIpcBackend(codec=self.codec)
+        self.consumer = self.backend.TorchIpcBackend(codec=self.codec)
         self.context = make_context(self.api)
 
     def publish(self, *, two_storages=False):

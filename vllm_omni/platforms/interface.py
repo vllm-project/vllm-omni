@@ -18,6 +18,7 @@ logger = init_logger(__name__)
 
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 
 
@@ -88,6 +89,11 @@ class OmniPlatform(Platform):
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
+
+    @classmethod
+    def apply_diffusion_model_patches(cls, model: nn.Module, od_config: "OmniDiffusionConfig") -> None:
+        """Apply platform-specific rewrites after common model initialization."""
         return None
 
     @classmethod
