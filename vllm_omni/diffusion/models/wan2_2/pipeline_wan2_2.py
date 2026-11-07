@@ -40,7 +40,12 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.schedulers import (
+    FlowUniPCMultistepScheduler,
+    build_pipeline_scheduler,
+    filter_injected_scheduler_kwargs,
+    is_injected_scheduler,
+)
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
     resolve_wan_preencode_batch_frames,
@@ -102,6 +107,45 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     raise ValueError(
         f"Unsupported Wan sample_solver: {sample_solver}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}"
     )
+
+
+def apply_wan_runtime_scheduler(pipeline: Any, sample_solver: str, flow_shift: float) -> None:
+    """Apply per-request stock scheduler changes unless an injected class owns them."""
+    if is_injected_scheduler(pipeline.od_config):
+        logger.warning(
+            "Ignoring per-request sample_solver=%s/flow_shift=%s because injected scheduler %r is active.",
+            sample_solver,
+            flow_shift,
+            pipeline.od_config.scheduler,
+        )
+        return
+    pipeline.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+    pipeline._sample_solver = sample_solver
+    pipeline._flow_shift = flow_shift
+
+
+def set_wan_scheduler_timesteps(
+    pipeline: Any,
+    num_steps: int,
+    device: torch.device,
+    sample_solver: str,
+    flow_shift: float,
+) -> None:
+    """Set Wan timesteps, passing the optional shift only when supported."""
+    if sample_solver == "unipc":
+        if is_injected_scheduler(pipeline.od_config):
+            kwargs, unsupported = filter_injected_scheduler_kwargs(pipeline.scheduler, {"shift": flow_shift})
+            if unsupported:
+                logger.warning(
+                    "Injected Wan scheduler %s does not accept optional set_timesteps kwargs %s; omitting them.",
+                    type(pipeline.scheduler).__name__,
+                    unsupported,
+                )
+            pipeline.scheduler.set_timesteps(num_steps, device=device, **kwargs)
+        else:
+            pipeline.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+    else:
+        pipeline.scheduler.set_timesteps(num_steps, device=device)
 
 
 def refresh_cache_for_denoise_schedule(pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None) -> None:
@@ -644,7 +688,11 @@ class Wan22Pipeline(
             if od_config.flow_shift is not None
             else 5.0
         )
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: build_wan_scheduler(self._sample_solver, self._flow_shift),
+            local_files_only=os.path.exists(od_config.model),
+        )
 
         self.vae_scale_factor_temporal, self.vae_scale_factor_spatial = load_wan_vae_scale_factors(
             model, local_files_only
@@ -1364,14 +1412,9 @@ class Wan22Pipeline(
             sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
             flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
             if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-                self._sample_solver = sample_solver
-                self._flow_shift = flow_shift
+                apply_wan_runtime_scheduler(self, sample_solver, flow_shift)
 
-            if sample_solver == "unipc":
-                self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
-            else:
-                self.scheduler.set_timesteps(num_steps, device=device)
+            set_wan_scheduler_timesteps(self, num_steps, device, sample_solver, flow_shift)
             timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None

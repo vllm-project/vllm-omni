@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
@@ -40,6 +41,7 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
+    apply_wan_runtime_scheduler,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
@@ -50,6 +52,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
     retrieve_latents,
+    set_wan_scheduler_timesteps,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
@@ -329,7 +332,11 @@ class Wan22I2VPipeline(
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: build_wan_scheduler(self._sample_solver, self._flow_shift),
+            local_files_only=os.path.exists(od_config.model),
+        )
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
@@ -629,15 +636,10 @@ class Wan22I2VPipeline(
         sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
         flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+            apply_wan_runtime_scheduler(self, sample_solver, flow_shift)
 
         # Timesteps
-        if sample_solver == "unipc":
-            self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
-        else:
-            self.scheduler.set_timesteps(num_steps, device=device)
+        set_wan_scheduler_timesteps(self, num_steps, device, sample_solver, flow_shift)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 

@@ -41,6 +41,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.krea2.krea2_transformer import Krea2Transformer2DModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -173,8 +174,12 @@ class Krea2Pipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
         # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
         prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            ),
+            local_files_only=local_files_only,
         )
 
         self.text_encoder = from_pretrained_with_prefetch(
