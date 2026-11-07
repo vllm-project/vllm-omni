@@ -103,10 +103,12 @@ class FakeView:
 
 
 class FakeNewReq:
-    def __init__(self, req_id, num_computed_tokens=0, block_ids=None):
+    def __init__(self, req_id, num_computed_tokens=0, block_ids=None, session_id=None, resumable=False):
         self.req_id = req_id
         self.num_computed_tokens = num_computed_tokens
         self.block_ids = block_ids
+        self.session_id = session_id
+        self.resumable = resumable
 
 
 class FakeSchedOut:
@@ -2163,5 +2165,357 @@ def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
         result = mgr.materialize(sid, ["b"])
         expected = expected_rows(view.slots_for("b", 0, 9))
         assert torch.equal(result.hidden_states["b"], expected)
+    finally:
+        mgr.shutdown()
+
+
+# ------------------------------------------------------- session-level
+# Session-keyed namespace, session-scoped retention, coarse
+# invalidation, live-session resume. Single-request steps; hidden values
+# are slot ids (plus value_offset), so a slot reused by another request
+# with a different offset is distinguishable from the session's rows.
+
+
+def run_session_step(
+    mgr, view, req_id, blocks, start_pos, sched, *, hit=0, session=None, offset=0, finished=(), resumable=False
+):
+    """One single-request step through the adapter (session-aware)."""
+    view.order = [req_id]
+    view.req_blocks[req_id] = blocks
+    view.computed[req_id] = start_pos
+    slots = view.slots_for(req_id, start_pos, start_pos + sched)
+    view.step_slot_mapping = slots
+    hidden = (slots.to(DTYPE) + offset).unsqueeze(1).expand(sched, HIDDEN).clone()
+    sched_out = FakeSchedOut(
+        new_reqs=[
+            FakeNewReq(
+                req_id, num_computed_tokens=hit, block_ids=[list(blocks)], session_id=session, resumable=resumable
+            )
+        ],
+        finished=list(finished),
+        num_scheduled={req_id: sched},
+    )
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(sched_out)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+    n = int(slots.numel())
+    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=n, num_tokens_padded=n, write_layout=layout)
+
+
+def test_session_store_serves_hit_after_slot_reuse():
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Another request reuses the same blocks with different values.
+        s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8, offset=1000, finished=["a"])
+        mgr.materialize(s2, ["b"])
+        # Same session, new turn, prefix hit on the reused blocks.
+        s3 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", finished=["b"])
+        # Sanity: the slot pool really holds the reuser's rows now.
+        assert float(mgr._pool.rows(HIDDEN_KEY, torch.tensor([0]))[0, 0]) == 1000.0
+        outs = mgr.materialize(s3, ["a2"])
+        merged = outs.hidden_states["a2"]
+        # Prefix comes from the session store (original values), not the
+        # slot pool (1000+ values); tail is this turn's own rows.
+        assert torch.equal(merged[:8], expected_rows(view.slots_for("a", 0, 8)))
+        assert torch.equal(merged[8:], expected_rows(view.slots_for("a2", 8, 12)))
+    finally:
+        mgr.shutdown()
+
+
+def run_decode_step(mgr, view, req_id, blocks, start_pos, sched, *, offset=0):
+    """One continuation step for an already-started request: no STARTED
+    event (the runner's decode path), consumed via discard_step."""
+    view.order = [req_id]
+    view.req_blocks[req_id] = blocks
+    view.computed[req_id] = start_pos
+    slots = view.slots_for(req_id, start_pos, start_pos + sched)
+    view.step_slot_mapping = slots
+    hidden = (slots.to(DTYPE) + offset).unsqueeze(1).expand(sched, HIDDEN).clone()
+    sched_out = FakeSchedOut(new_reqs=[], finished=[], num_scheduled={req_id: sched})
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(sched_out)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+    n = int(slots.numel())
+    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=n, num_tokens_padded=n, write_layout=layout)
+
+
+def test_session_decode_discard_appends_and_next_turn_hits():
+    mgr, view = make_manager()
+    try:
+        # Turn 1 prefill: 8 rows, materialized (existing path).
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Turn 1 decode: 4 rows at positions [8, 12), no STARTED event,
+        # consumed via discard_step (the runner's decode path). Before the
+        # decode-capture fix this left the stream stuck at 8 and the next
+        # turn missed; now the stream extends to 12 in order.
+        s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
+        mgr.discard_step(s2)
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            expected_rows(view.slots_for("a", 0, 12)),
+        )
+        # Another request reuses the same blocks with different values;
+        # turn 1's request finishes (unbind only, rows survive).
+        s3 = run_session_step(mgr, view, "b", [0, 1, 2], 0, 12, offset=1000, finished=["a"])
+        mgr.materialize(s3, ["b"])
+        assert mgr._session_store.session_of("a") is None
+        assert "a" not in mgr._req_row_pos and "a" not in mgr._req_session_offset
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        # Same session, new turn, prefix hit on the reused blocks.
+        s4 = run_session_step(mgr, view, "a2", [0, 1, 2, 3], 12, 4, hit=12, session="S", finished=["b"])
+        assert float(mgr._pool.rows(HIDDEN_KEY, torch.tensor([0]))[0, 0]) == 1000.0
+        outs = mgr.materialize(s4, ["a2"])
+        merged = outs.hidden_states["a2"]
+        # Prefix comes from the session store (original values), not the
+        # slot pool (1000+ values); tail is this turn's own rows; and the
+        # turn's rows appended at the continuation (12 -> 16).
+        assert torch.equal(merged[:12], expected_rows(view.slots_for("a", 0, 12)))
+        assert torch.equal(merged[12:], expected_rows(view.slots_for("a2", 12, 16)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 16
+    finally:
+        mgr.shutdown()
+
+
+def test_session_warm_pool_start_seeds_store_and_next_turn_hits():
+    mgr, view = make_manager()
+    try:
+        # An unrelated request writes the prompt prefix into the pool.
+        s0 = run_session_step(mgr, view, "x", [0, 1], 0, 8)
+        mgr.materialize(s0, ["x"])
+        # New session, warm pool: the first turn starts with a pool hit
+        # (hit=8) and an empty store. Before the seeding fix this
+        # stalled forever (expected=8 vs actual=0 on every append);
+        # now materialize seeds [0, 8) from the pool, then appends the
+        # suffix, so the stream covers the full prefix.
+        s1 = run_session_step(mgr, view, "a", [0, 1, 2], 8, 4, hit=8, session="S")
+        outs = mgr.materialize(s1, ["a"])
+        assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("x", 0, 8)))
+        assert torch.equal(outs.hidden_states["a"][8:], expected_rows(view.slots_for("a", 8, 12)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            expected_rows(view.slots_for("a", 0, 12)),
+        )
+        # Next turn hits from the session store (not the pool).
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2, 3], 12, 4, hit=12, session="S", finished=["a"])
+        outs = mgr.materialize(s2, ["a2"])
+        assert torch.equal(outs.hidden_states["a2"][:12], expected_rows(view.slots_for("a", 0, 12)))
+        assert torch.equal(outs.hidden_states["a2"][12:], expected_rows(view.slots_for("a2", 12, 16)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 16
+    finally:
+        mgr.shutdown()
+
+
+def test_session_discard_without_binding_is_noop():
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8)
+        mgr.discard_step(s1)
+        assert mgr._session_store.session_ids() == []
+        # Staging slot freed: a later save consumes cleanly.
+        s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8)
+        mgr.materialize(s2, ["b"])
+    finally:
+        mgr.shutdown()
+
+
+def test_session_coarse_invalidation_is_negative():
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr.invalidate_session("S") >= 1
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8, offset=1000, finished=["a"])
+        mgr.materialize(s2, ["b"])
+        # Post-invalidation turn: no stale pre-mutation row may be served.
+        s3 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", finished=["b"])
+        outs = mgr.materialize(s3, ["a2"])
+        # Prefix still comes from the pool (b's current rows), never from
+        # the session's invalidated rows: no stale pre-mutation row served.
+        assert torch.equal(outs.hidden_states["a2"][:8], expected_rows(view.slots_for("b", 0, 8)) + 1000)
+        # But the stream no longer stalls: with the pool covering the
+        # prefix, materialize seeds [0, 8) from the pool (b's rows) and
+        # appends the suffix, so the stream covers the full prefix and
+        # holds no pre-invalidation row.
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            torch.cat(
+                [
+                    expected_rows(view.slots_for("b", 0, 8)) + 1000,
+                    expected_rows(view.slots_for("a2", 8, 12)),
+                ]
+            ),
+        )
+    finally:
+        mgr.shutdown()
+
+
+def test_session_append_requires_exact_continuation():
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        # Partial hit: 4 < stored 8, so this turn's rows must NOT append.
+        s2 = run_session_step(mgr, view, "a2", [0, 1], 4, 4, hit=4, session="S", finished=["a"])
+        outs = mgr.materialize(s2, ["a2"])
+        assert torch.equal(outs.hidden_states["a2"], expected_rows(view.slots_for("a", 0, 8)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr._session_store.fetch("S", HIDDEN_KEY, 12) is None
+    finally:
+        mgr.shutdown()
+
+
+def test_session_overlap_appends_only_tail():
+    mgr, view = make_manager()
+    try:
+        # Turn 1: 8 rows stored.
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Turn 2 with a block-truncated pool hit (hit=4 < stored 8) and
+        # 8 new rows spanning [4, 12): before the overlap fix the whole
+        # batch was rejected and the stream froze at 8; now only the
+        # tail [8, 12) appends, so the stream covers the full prefix.
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 4, 8, hit=4, session="S", finished=["a"])
+        outs = mgr.materialize(s2, ["a2"])
+        assert torch.equal(outs.hidden_states["a2"][:4], expected_rows(view.slots_for("a", 0, 4)))
+        assert torch.equal(outs.hidden_states["a2"][4:], expected_rows(view.slots_for("a2", 4, 12)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            torch.cat(
+                [
+                    expected_rows(view.slots_for("a", 0, 8)),
+                    expected_rows(view.slots_for("a2", 8, 12)),
+                ]
+            ),
+        )
+    finally:
+        mgr.shutdown()
+
+
+def test_session_binding_dropped_on_finish_but_rows_survive():
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        adapter = mgr._test_adapter
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(finished=["a"])))
+        assert mgr._session_store.session_of("a") is None
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # New turn rebinds at STARTED and is served from the session store.
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S")
+        outs = mgr.materialize(s2, ["a2"])
+        assert torch.equal(outs.hidden_states["a2"][:8], expected_rows(view.slots_for("a", 0, 8)))
+    finally:
+        mgr.shutdown()
+
+
+def test_session_bind_and_drop_api():
+    mgr, view = make_manager()
+    try:
+        mgr.bind_session("a", "S")
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr.drop_session("S") >= 1
+        assert mgr._session_store.session_of("a") is None
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+    finally:
+        mgr.shutdown()
+
+
+def run_session_step_cuda(mgr, view, req_id, blocks, start_pos, sched, *, hit=0, session=None, finished=()):
+    """Single-request step with CUDA hidden states (D2H staging path)."""
+    view.order = [req_id]
+    view.req_blocks[req_id] = blocks
+    view.computed[req_id] = start_pos
+    slots = view.slots_for(req_id, start_pos, start_pos + sched)
+    view.step_slot_mapping = slots
+    hidden = slots.to(device="cuda", dtype=DTYPE).unsqueeze(1).expand(sched, HIDDEN).clone()
+    sched_out = FakeSchedOut(
+        new_reqs=[FakeNewReq(req_id, num_computed_tokens=hit, block_ids=[list(blocks)], session_id=session)],
+        finished=list(finished),
+        num_scheduled={req_id: sched},
+    )
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(sched_out)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+    n = int(slots.numel())
+    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=n, num_tokens_padded=n, write_layout=layout)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA session save/materialize")
+def test_session_store_serves_cuda_hidden_through_d2h():
+    """CUDA hidden states stage device→host into the session store, and
+    a later turn's hit is served from it."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step_cuda(mgr, view, "a", [0, 1], 0, 8, session="S")
+        outs1 = mgr.materialize(s1, ["a"])
+        assert outs1.hidden_states["a"].device.type == "cpu"
+        assert torch.equal(outs1.hidden_states["a"], expected_rows(view.slots_for("a", 0, 8)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s2 = run_session_step_cuda(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", finished=["a"])
+        outs2 = mgr.materialize(s2, ["a2"])
+        merged = outs2.hidden_states["a2"]
+        assert merged.device.type == "cpu"
+        assert torch.equal(merged[:8], expected_rows(view.slots_for("a", 0, 8)))
+        assert torch.equal(merged[8:], expected_rows(view.slots_for("a2", 8, 12)))
+    finally:
+        mgr.shutdown()
+
+
+def finish_session_request(mgr, req_id):
+    """Drive a FINISHED event for req_id through the adapter + manager."""
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(FakeSchedOut(finished=[req_id]))
+    mgr.new_step_starts(step)
+
+
+def test_session_drop_on_resumable_request_finish():
+    """A resumable session request's finish ends the session: rows drop."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", resumable=True)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        finish_session_request(mgr, "a")
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        assert "S" not in mgr._session_store.session_ids()
+        assert mgr._session_store.session_of("a") is None
+    finally:
+        mgr.shutdown()
+
+
+def test_session_survives_ephemeral_request_finish():
+    """An ephemeral session request's finish only unbinds; rows survive."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        finish_session_request(mgr, "a")
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr._session_store.session_of("a") is None
     finally:
         mgr.shutdown()

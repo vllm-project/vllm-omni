@@ -516,6 +516,62 @@ Threads, locks, and what each may block on:
 | controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
 | `WriteTask.lock` | `state`, `reassigned`, `append_chunk` | waiting on `host_ready` / `done` (those are events) |
 
+### Session-level prefix caching
+
+The slot pool is keyed by KV block id, so any request's traffic can hand
+a block to a new tenant: a live duplex session's prefix rows can be
+evicted by unrelated load. This adds a session-level counterpart,
+`SessionPrefixStore`, holding per-session, token-ordered copies of
+immediate-key rows (hidden + non-deferred mm), independent of block-pool
+eviction. A session's rows survive until the session itself mutates its
+history or ends.
+
+- Namespace: `bind_session` / STARTED events carrying `session_id`
+  (the adapter reads it tolerantly from scheduler payloads; absent means
+  slot-pool-only). Wiring, all inside this repo: the duplex orchestrator
+  stamps `session_id` on the stage request at submit time, the
+  `OmniNewRequestData` conversions carry it to the worker-side adapter
+  (explicitly, not relying on the upstream payload shape), and the
+  adapter binds the STARTED event. A duplex session's stage request is
+  long-lived (resumed across turns), so its FINISHED/ABORTED is the
+  worker-visible session-end signal: a resumable binding's termination
+  drops the session's rows. An ephemeral request's termination only
+  unbinds; the session continues and its rows stay servable.
+- Retention: each consumed step appends its new rows at their session
+  position: exact continuation appends in full, a batch starting
+  behind the stored length (a block-truncated pool hit) first passes a
+  content check on its overlapping prefix (within tolerance), then
+  appends only its not-yet-stored tail, and a batch starting ahead
+  (a gap) is refused. The position is the turn-start offset (the
+  request's STARTED hit_end)
+  plus rows the request saved earlier in the turn, both snapshotted into
+  the step context at publish — so decode steps, which carry no pool
+  hit, append at their true sequence position too. Discarded steps
+  (including coalesced decode flushes) append through `discard_step`;
+  materialized steps through `materialize`. The slot pool is
+  untouched, so existing cross-request sharing is unchanged.
+- Coarse invalidation: `invalidate_session` drops a session's segments
+  wholesale on any history mutation (edit, truncation, interruption),
+  or when an appending batch's overlapping rows mismatch the stored
+  rows (a forked session detected at append time).
+  Segments are per-session copies, so dropping one session can never
+  corrupt another's hits. A later turn whose hit length is nonzero
+  after an invalidation rebuilds the stream from its pool-hit prefix
+  when the pool covers it (materialize seeds [0, hit_end) first); it
+  only stalls when the pool does not cover the prefix.
+- Live-session resume: a later turn's hit is served from the session
+  store when it covers the hit prefix (snapshot under the lock,
+  concatenated unlocked, so a concurrent invalidate cannot corrupt an
+  in-flight read). Otherwise the slot-pool path serves it.
+- Limits: `PrefixCacheConfig.session_store_max_bytes` (default 2 GiB)
+  caps host bytes; over-budget appends are refused and fall back to the
+  slot pool. Deferred mm is not stored (not on CPU at materialize time).
+
+Explicitly out of scope: fine-grained invalidation (builds on
+the snapshot/ledger work), and any change to vLLM block eviction —
+the manager cannot pin blocks, which is why the session store holds
+copies rather than namespacing the pool.
+
 ### Related Files
 
 - `vllm_omni/core/prefix_cache/`
