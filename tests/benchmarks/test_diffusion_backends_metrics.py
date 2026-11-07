@@ -131,6 +131,7 @@ async def test_request_timeout_reaches_video_polling(delayed_generation_server, 
         extra_body={"model": "queued"},
         request_timeout=0.0,
         video_job_timeout=10.0,
+        video_poll_interval=0.01,
     )
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=0.01)) as session:
         output = await async_request_v1_videos(request, session)

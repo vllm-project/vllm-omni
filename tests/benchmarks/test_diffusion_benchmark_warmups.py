@@ -146,16 +146,19 @@ async def test_request_timeout_rejects_invalid_budgets(diffusion_benchmark, valu
 async def test_timeout_reaches_warmups_measurement_and_result_json(
     monkeypatch, mocker, diffusion_benchmark, warmup_args, input_requests, tmp_path, capsys
 ):
+    warmup_args.task = "t2v"
+    warmup_args.endpoint = "/v1/videos"
     warmup_args.request_timeout = 0.0
+    warmup_args.video_poll_interval = 0.25
     warmup_args.output_file = str(tmp_path / "results.json")
-    seen_timeouts = []
+    seen_budgets = []
 
     async def successful_request(request, session, progress):
-        seen_timeouts.append(request.request_timeout)
+        seen_budgets.append((request.request_timeout, request.video_poll_interval))
         return RequestFuncOutput(success=True, latency=0.1)
 
     monkeypatch.setitem(
-        diffusion_benchmark.backends_function_mapping["2i"],
+        diffusion_benchmark.backends_function_mapping["2v"],
         warmup_args.endpoint,
         (successful_request, warmup_args.endpoint),
     )
@@ -165,6 +168,8 @@ async def test_timeout_reaches_warmups_measurement_and_result_json(
 
     await diffusion_benchmark.benchmark(warmup_args)
 
-    assert seen_timeouts == [0.0] * (warmup_args.warmup_requests + len(input_requests))
-    assert diffusion_benchmark.json.loads((tmp_path / "results.json").read_text())["request_timeout"] == 0.0
+    assert seen_budgets == [(0.0, 0.25)] * (warmup_args.warmup_requests + len(input_requests))
+    results = diffusion_benchmark.json.loads((tmp_path / "results.json").read_text())
+    assert results["request_timeout"] == 0.0
+    assert results["video_poll_interval"] == 0.25
     assert "HTTP request timeout (s):" in capsys.readouterr().out

@@ -24,6 +24,9 @@ FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Routing tag: the stage returns its full payload on its output instead of sending it to the
+# next stage. Set on run requests whose next stage takes a full payload.
+RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
 # an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
@@ -495,3 +498,18 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
+
+
+def returns_stage_payload(tags: Mapping[str, object] | AdditionalInformationPayload | None) -> bool:
+    """Return whether a request's routing tags ask its stage to return its full payload.
+
+    NOTE: Currently we support reading the serialized or deserialized format for compatibility
+    with both model runner v1 & v2.
+    """
+    if tags is None:
+        return False
+    if isinstance(tags, Mapping):
+        return bool(tags.get(RETURN_STAGE_PAYLOAD_KEY))
+    # Serialized tags: read the one scalar without decoding the payload's tensors.
+    entry = tags.entries.get(RETURN_STAGE_PAYLOAD_KEY)
+    return entry is not None and bool(entry.scalar_data)

@@ -29,7 +29,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -54,6 +59,7 @@ from vllm_omni.utils.mm_outputs import (
     partition_payload_list,
     snapshot_mm_payload,
 )
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
@@ -217,6 +223,9 @@ class _SamplingFeedbackOutput(AsyncModelRunnerOutput):
         output.invalid_logits_req_ids = {output.req_ids[row] for row in self.feedback.invalid_rows()}
         return output
 
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.output.get_kv_connector_output()
+
 
 class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
@@ -304,6 +313,15 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self._num_nans_cpu = None
         with record_function_or_nullcontext("omni_async_output:get_output/finalize_async_sampled_tokens"):
             return super().get_output()
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # The background builder assigns this after __init__. Salvage before
+        # that assignment, or after object.__new__ skips __init__, has nothing
+        # to return.
+        output = getattr(self, "_model_runner_output", None)
+        if output is None:
+            return None
+        return output.kv_connector_output
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -481,6 +499,10 @@ class GPUARModelRunner(
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
 
+    def initialize_kv_cache(self, *args, **kwargs) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        validate_duplex_kv_cache(self)
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
@@ -489,44 +511,7 @@ class GPUARModelRunner(
 
     def _maybe_apply_duplex_window_reanchor(self, scheduler_output: SchedulerOutput | None = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
-        reanchor_hook = getattr(getattr(self, "model", None), "apply_duplex_kv_reanchor", None)
-        if callable(reanchor_hook):
-            try:
-                reanchor_hook(self, scheduler_output=scheduler_output)
-            except TypeError:
-                reanchor_hook(self)
-            return
-
-        helper = getattr(self, "_duplex_window_helper", None)
-        if helper is not None and hasattr(helper, "maybe_apply_reanchor"):
-            try:
-                helper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
-            except TypeError:
-                helper.maybe_apply_reanchor(self)
-            return
-
-        # Fallback for dynamic runner inspection without hardcoding model classes
-        if not hasattr(self, "input_batch") or self.input_batch is None:
-            return
-        num_reqs = getattr(self.input_batch, "num_reqs", 0)
-        req_ids = self.input_batch.req_ids[:num_reqs]
-        has_reanchor = False
-        for req_id in req_ids:
-            info = self.model_intermediate_buffer.get(req_id)
-            if isinstance(info, dict) and isinstance(info.get("duplex"), dict):
-                if "stage0_reanchor" in info["duplex"]:
-                    has_reanchor = True
-                    break
-        if not has_reanchor:
-            return
-
-        model_module = getattr(getattr(self, "model", None), "__module__", "")
-        if "minicpmo_4_5" in model_module:
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-                MiniCPMO45DuplexWorkerHelper,
-            )
-
-            MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
+        apply_duplex_window_reanchor(self, scheduler_output)
 
     def _maybe_apply_stage0_reanchor(self) -> None:
         """Backward-compatible alias for _maybe_apply_duplex_window_reanchor."""

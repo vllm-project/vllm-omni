@@ -118,9 +118,6 @@ def warm_up_moe_prefill_kernels(worker: Any) -> list[int]:
     if not moe_prefill_warmup_enabled():
         logger.info("Skipping MoE prefill warmup (%s=%s).", _ENV_FLAG, os.environ.get(_ENV_FLAG))
         return []
-    if getattr(worker, "use_v2_model_runner", False):
-        logger.info("Skipping MoE prefill warmup: not wired for the v2 model runner.")
-        return []
 
     model_runner = worker.model_runner
     has_fused_moe = model_has_fused_moe(model_runner.get_model())

@@ -33,6 +33,8 @@ The bundled Qwen3-Omni setup explicitly sets `moe_backend: triton` for the Think
 both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashInfer CUTLASS unquantized MoE path on
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
+On CUDA the same file selects model runner v2 and leaves the Thinker prefix cache off.
+NPU, XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to keep the CUDA V1 path.
 
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to
@@ -309,7 +311,10 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 This Web UI demo allows users to interact with the model through a web browser.
 
