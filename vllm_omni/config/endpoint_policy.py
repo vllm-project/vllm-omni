@@ -48,6 +48,29 @@ class EndpointRestriction:
     reason: str
 
 
+def speech_only_endpoint_restrictions(model_name: str) -> tuple[EndpointRestriction, ...]:
+    """Reject public generation routes that bypass speech prompt preparation.
+
+    Opt in only for pipelines that require the speech adapter's conditioning.
+    Keep the engine's internal ``generate`` task available for speech synthesis.
+    """
+    return tuple(
+        EndpointRestriction(
+            capability,
+            f"{model_name} does not support the {api_name} API. Use /v1/audio/speech instead.",
+        )
+        for capability, api_name in (
+            (OmniServingCapability.COMPLETIONS, "Completions"),
+            (OmniServingCapability.CHAT_COMPLETIONS, "Chat Completions"),
+            (OmniServingCapability.CHAT_COMPLETIONS_BATCH, "Batch Chat Completions"),
+            (OmniServingCapability.RESPONSES, "Responses"),
+            (OmniServingCapability.MESSAGES, "Messages"),
+            (OmniServingCapability.INVOCATIONS, "Invocations"),
+            (OmniServingCapability.GENERATE_TOKENS, "Generate Tokens"),
+        )
+    )
+
+
 def build_rejection_handler(reason: str):
     """Build a rejection handler for a given endpoint for the provided reason."""
 
