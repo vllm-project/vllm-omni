@@ -60,6 +60,7 @@ def test_video_pipeline_rejects_non_video_final_outputs(stage_configs):
         "LTX2DistilledTwoStagePipeline",
         "WanDMDPipeline",
         "LingBotWorldCausalDMDPipeline",
+        "SelfForcingPipeline",
         "LongCatVideoAvatarPipeline",
         "SanaVideoPipeline",
         "SanaImageToVideoPipeline",
