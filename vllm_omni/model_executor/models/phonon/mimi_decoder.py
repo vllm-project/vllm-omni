@@ -8,7 +8,42 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .mimi_kernels import causal_conv_step, ring_attention_chunk
+from .mimi_attention import ring_attention_chunk
+
+
+def causal_conv_step(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    history_pool: torch.Tensor,
+    slots: torch.Tensor,
+    *,
+    dilation: int = 1,
+    groups: int = 1,
+    scratch: torch.Tensor | None = None,
+    reset: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Stride-one causal convolution with alias-safe history update.
+
+    Inputs are [batch, channels, time]. History is [slots, channels,
+    dilation * (kernel_size - 1)]. No tensor retained by convolution is
+    overwritten when the new history is installed.
+    """
+    history_length = history_pool.shape[-1]
+    history = history_pool.index_select(0, slots)
+    if reset is not None:
+        history = torch.where(reset[:, None, None], 0, history)
+    if scratch is None:
+        combined = torch.cat((history, inputs), dim=-1)
+    else:
+        combined = scratch[: inputs.shape[0]]
+        if history_length:
+            combined[..., :history_length].copy_(history)
+        combined[..., history_length:].copy_(inputs)
+    output = F.conv1d(combined, weight, bias, dilation=dilation, groups=groups)
+    if history_length:
+        history_pool[slots] = combined[..., -history_length:]
+    return output
 
 
 class StreamingConv(nn.Module):

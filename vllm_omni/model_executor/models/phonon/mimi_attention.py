@@ -1,10 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803 - Triton constexpr parameters use kernel-style capitals.
-"""Write-then-attend over a ring with chunk headroom."""
+"""Reference and Triton implementations of Mimi's streaming ring attention."""
 
 import torch
+import torch.nn.functional as F
 from vllm.triton_utils import tl, triton
+
+
+def ring_attention_chunk(query, key, value, key_pool, value_pool, slots, positions, window=None):
+    """Attend a complete chunk against the physical ring and current keys."""
+    capacity = key_pool.shape[1]
+    window = capacity if window is None else window
+    if not 0 < window <= capacity:
+        raise ValueError("Attention window must fit inside the ring")
+    if query.is_cuda:
+        return ring_attention_cuda(query, key, value, key_pool, value_pool, slots, positions, window)
+    frames = query.shape[1]
+    offsets = torch.arange(frames, device=positions.device)
+    physical = torch.arange(capacity, device=positions.device)
+    old_positions = positions[:, None] - 1 - (positions[:, None] - 1 - physical).remainder(capacity)
+    current_positions = positions[:, None] + offsets
+    delta = current_positions[:, :, None] - torch.cat((old_positions, current_positions), -1)[:, None, :]
+    key_positions = torch.cat((old_positions, current_positions), -1)
+    mask = (key_positions[:, None, :] >= 0) & (delta >= 0) & (delta < window)
+    valid_history = (old_positions >= 0)[:, :, None, None]
+    keys = torch.cat((torch.where(valid_history, key_pool[slots], 0), key), 1)
+    values = torch.cat((torch.where(valid_history, value_pool[slots], 0), value), 1)
+    output = F.scaled_dot_product_attention(
+        query.transpose(1, 2),
+        keys.transpose(1, 2),
+        values.transpose(1, 2),
+        attn_mask=mask[:, None],
+    ).transpose(1, 2)
+    retained = min(frames, capacity)
+    indices = current_positions[:, -retained:].remainder(capacity)
+    key_pool[slots[:, None], indices] = key[:, -retained:]
+    value_pool[slots[:, None], indices] = value[:, -retained:]
+    return output
 
 
 @triton.jit

@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_ca
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("frames", [1, 16, 51, 52, 270])
 def test_direct_ring_attention_matches_cpu_reference(frames):
-    from vllm_omni.model_executor.models.phonon.mimi_kernels import ring_attention_chunk
+    from vllm_omni.model_executor.models.phonon.mimi_attention import ring_attention_chunk
 
     torch.manual_seed(89)
     slots = torch.tensor([2, 0])
