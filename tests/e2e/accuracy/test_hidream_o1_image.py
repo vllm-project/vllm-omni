@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import (
+    assert_similarity,
+    measure_image_similarity,
+    model_output_dir,
+    write_accuracy_result,
+)
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
@@ -56,10 +61,23 @@ def test_hidream_o1_image_tp2_matches_baseline(
     assert BASELINE_PATH.exists()
     baseline = Image.open(BASELINE_PATH).convert("RGB")
     resized = image.resize(baseline.size, Image.Resampling.LANCZOS)
+    ssim, psnr = measure_image_similarity(
+        model_name=MODEL_ID,
+        vllm_image=resized,
+        diffusers_image=baseline,
+    )
+    write_accuracy_result(
+        model_id=MODEL_ID,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+    )
     assert_similarity(
         model_name=MODEL_ID,
         vllm_image=resized,
         diffusers_image=baseline,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
