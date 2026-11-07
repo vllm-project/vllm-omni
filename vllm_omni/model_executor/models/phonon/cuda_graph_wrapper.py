@@ -11,6 +11,16 @@ class MimiDecodeRunner:
         device = next(decoder.parameters()).device
         self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.capture = capture and self.stream is not None
+        self._forward = (
+            torch.compile(
+                decoder.forward,
+                fullgraph=True,
+                dynamic=False,
+                options={"triton.cudagraphs": False},
+            )
+            if self.capture
+            else decoder.forward
+        )
         self.buckets = {}
         if self.stream is not None:
             self.stream.wait_stream(torch.cuda.current_stream(device))
@@ -35,10 +45,10 @@ class MimiDecodeRunner:
             # Capture mutates streaming histories. Preserve every slot around warmup.
             state = {name: value.clone() for name, value in self.decoder.named_buffers()}
             for _ in range(3):
-                self.decoder(latent, slots, positions)
+                self._forward(latent, slots, positions)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=self.stream):
-                output = self.decoder(latent, slots, positions)
+                output = self._forward(latent, slots, positions)
             for name, value in self.decoder.named_buffers():
                 value.copy_(state[name])
         else:
@@ -49,7 +59,7 @@ class MimiDecodeRunner:
 
     def decode(self, latent, slots, positions):
         if self.stream is None:
-            return self.decoder(latent, slots, positions), None
+            return self._forward(latent, slots, positions), None
         main = torch.cuda.current_stream(latent.device)
         ready = torch.cuda.Event()
         ready.record(main)
@@ -62,7 +72,7 @@ class MimiDecodeRunner:
             copied = torch.cuda.Event()
             copied.record(self.stream)
             if graph is None:
-                output = self.decoder(static_latent, static_slots, static_positions)
+                output = self._forward(static_latent, static_slots, static_positions)
             else:
                 graph.replay()
             # Own output storage before the next replay overwrites the graph output.

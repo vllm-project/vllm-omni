@@ -19,9 +19,7 @@ def test_official_checkpoint_streaming_smoke():
     from safetensors.torch import load_file
     from transformers.utils.hub import cached_file
 
-    root = (
-        Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/phonon"
-    )
+    root = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/phonon"
     spec = importlib.util.spec_from_file_location(
         "_phonon_checkpoint_test",
         root / "__init__.py",
@@ -40,16 +38,10 @@ def test_official_checkpoint_streaming_smoke():
     lm.load_official_weights(weights)
     decoder = MimiStreamingDecoder(config["mimi"], 1).eval()
     decoder.load_official_weights(weights)
-    voice = load_file(cached_file(checkpoint, "default-voice.safetensors"))[
-        "speaker_wavs"
-    ]
-    tokenizer = sentencepiece.SentencePieceProcessor(
-        model_file=cached_file(checkpoint, "tokenizer.model")
-    )
+    voice = load_file(cached_file(checkpoint, "default-voice.safetensors"))["speaker_wavs"]
+    tokenizer = sentencepiece.SentencePieceProcessor(model_file=cached_file(checkpoint, "tokenizer.model"))
     slots = torch.tensor([0])
-    caches = [
-        [torch.empty(0, 8, 64), torch.empty(0, 8, 64)] for _ in lm.transformer.layers
-    ]
+    caches = [[torch.empty(0, 8, 64), torch.empty(0, 8, 64)] for _ in lm.transformer.layers]
     torch.manual_seed(53)
     with torch.inference_mode():
         prompt = build_prompt(lm, tokenizer.encode("Hello world."), voice)
@@ -61,9 +53,7 @@ def test_official_checkpoint_streaming_smoke():
             latent, eos = lm.sample(hidden[-1:], torch.randn(1, 32) * 0.8**0.5)
             denormalized = (latent * lm.emb_std + lm.emb_mean).unsqueeze(-1)
             latents.append(denormalized)
-            pcm = decoder(
-                denormalized, slots, torch.tensor([step * decoder.upsample_ratio])
-            )
+            pcm = decoder(denormalized, slots, torch.tensor([step * decoder.upsample_ratio]))
             assert pcm.shape == (1, 1, 1920)
             assert torch.isfinite(pcm).all() and torch.isfinite(eos).all()
             audio.append(pcm.flatten())
@@ -74,13 +64,21 @@ def test_official_checkpoint_streaming_smoke():
             if countdown is not None:
                 countdown -= 1
             feedback = lm.input_linear(latent) + lm.conditioning()
-            hidden = lm.transformer(
-                feedback, torch.tensor([prompt.shape[0] + step]), caches
-            )
+            hidden = lm.transformer(feedback, torch.tensor([prompt.shape[0] + step]), caches)
         assert countdown == 0, "Smoke request did not finish its EOS tail"
         waveform = torch.cat(audio)
         assert waveform.square().mean() > 0
         decoder.reset_slots(slots)
         complete = decoder(torch.cat(latents, -1), slots, torch.tensor([0])).flatten()
         torch.testing.assert_close(complete, waveform, atol=2e-5, rtol=2e-4)
+        decoder.reset_slots(slots)
+        expected = decoder(latents[0], slots, torch.tensor([0]))
+        expected_state = {name: value.clone() for name, value in decoder.named_buffers() if "scratch" not in name}
+        decoder.reset_slots(slots)
+        compiled = torch.compile(decoder.forward, backend="eager", fullgraph=True, dynamic=False)
+        actual = compiled(latents[0], slots, torch.tensor([0]))
+        torch.testing.assert_close(actual, expected)
+        for name, value in decoder.named_buffers():
+            if "scratch" not in name:
+                torch.testing.assert_close(value, expected_state[name])
     sys.modules.pop(spec.name)

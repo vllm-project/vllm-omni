@@ -61,7 +61,59 @@ def test_convolution_chunking_and_history_aliasing():
         _kernels.causal_conv_step(chunk, weight, bias, history, slots, dilation=2)
         for chunk in inputs.split([1, 3, 2, 11], dim=-1)
     ]
+    scratch_history = torch.zeros_like(history)
+    scratch_outputs = []
+    for chunk in inputs.split([1, 3, 2, 11], dim=-1):
+        scratch = torch.empty(2, 3, 4 + chunk.shape[-1])
+        scratch_outputs.append(
+            _kernels.causal_conv_step(
+                chunk,
+                weight,
+                bias,
+                scratch_history,
+                slots,
+                dilation=2,
+                scratch=scratch,
+            )
+        )
+    torch.testing.assert_close(torch.cat(scratch_outputs, -1), torch.cat(outputs, -1))
+    torch.testing.assert_close(scratch_history, history)
     expected = F.conv1d(F.pad(inputs, (4, 0)), weight, bias, dilation=2)
     torch.testing.assert_close(torch.cat(outputs, -1), expected)
     torch.testing.assert_close(history[slots], inputs[..., -4:])
     assert history[1].count_nonzero() == 0
+
+
+def test_chunk_attention_matches_incremental_ring_and_wrap():
+    generator = torch.Generator().manual_seed(71)
+    slots = torch.tensor([2, 0])
+    key_pool = torch.zeros(3, 5, 2, 4)
+    value_pool = torch.zeros_like(key_pool)
+    reference_keys = key_pool.clone()
+    reference_values = value_pool.clone()
+    position = 0
+    for frames in (1, 3, 8, 2):
+        query, key, value = [torch.randn(2, frames, 2, 4, generator=generator) for _ in range(3)]
+        expected = torch.stack(
+            [
+                _kernels.ring_attention_step(
+                    query[:, frame],
+                    key[:, frame],
+                    value[:, frame],
+                    reference_keys,
+                    reference_values,
+                    slots,
+                    torch.full((2,), position + frame),
+                )
+                for frame in range(frames)
+            ],
+            1,
+        )
+        actual = _kernels.ring_attention_chunk(
+            query, key, value, key_pool, value_pool, slots, torch.full((2,), position)
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(key_pool, reference_keys)
+        torch.testing.assert_close(value_pool, reference_values)
+        position += frames
+    assert key_pool[1].count_nonzero() == 0
