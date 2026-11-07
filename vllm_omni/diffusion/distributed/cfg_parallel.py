@@ -142,7 +142,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         if not self.supports_cfg_batching:
             return False
         od_config = getattr(self, "od_config", None)
-        if od_config is None or not getattr(od_config, "enable_cfg_batching", True):
+        if od_config is None or not getattr(od_config, "enable_cfg_batching", False):
             return False
         # Non-last pipeline-parallel stages return IntermediateTensors, which
         # cannot be split back into branches.
@@ -250,10 +250,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
             many forwards it has seen, which goes wrong once non-CFG forwards
             run in between (e.g. under step execution).
 
-            With one CFG rank, pipelines that set ``supports_cfg_batching``
-            run both branches as one ``predict_noise`` call on the
-            concatenated batch (see ``merge_cfg_branch_kwargs``), unless
-            ``enable_cfg_batching`` is off or a cache backend is configured.
+            With one CFG rank and ``enable_cfg_batching`` on (default off),
+            pipelines that set ``supports_cfg_batching`` run both branches as
+            one ``predict_noise`` call on the concatenated batch (see
+            ``merge_cfg_branch_kwargs``), unless a cache backend is configured.
         """
         self._set_transformer_do_true_cfg(do_true_cfg)
 

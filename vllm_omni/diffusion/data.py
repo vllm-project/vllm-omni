@@ -853,7 +853,8 @@ class OmniDiffusionConfig:
     # Run the positive and negative CFG branches as one batched denoiser call
     # when CFG is not split across ranks. Only pipelines that declare
     # ``supports_cfg_batching`` use it; it halves the denoiser calls per step.
-    enable_cfg_batching: bool = True
+    # Off by default: opt in with ``--enable-cfg-batching``.
+    enable_cfg_batching: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE

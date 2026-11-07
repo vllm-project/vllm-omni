@@ -793,7 +793,7 @@ class OrchestratorArgs:
     # --enforce-eager also disables it.
     enable_cuda_graph_decode: bool | None = None
     # Run both CFG branches as one batched denoiser call on pipelines that
-    # support it. None defers to the OmniDiffusionConfig default (enabled).
+    # support it. None defers to the OmniDiffusionConfig default (disabled).
     enable_cfg_batching: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
