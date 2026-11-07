@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for component routing for quantization."""
 
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -87,6 +88,11 @@ TALKER_MAPPER = WeightsMapper(
         "talker.": "",
     }
 )
+
+H3_ENCODER_PREFIX_MAP = {
+    "model.language_model.": "text_encoder.text_model.",
+    "model.visual.": "text_encoder.vision.",
+}
 
 
 # ===================================================================
@@ -193,8 +199,6 @@ class TestApplyVllmMapper:
 
     def test_extra_config_regex_key_still_works(self):
         """Regex extra_config keys use re.search so no stage prefix needed."""
-        import re
-
         extra = {
             r".*thinker\.model\.layers\.0\.mlp\.gate.*": {"bits": 16},
         }
@@ -203,6 +207,87 @@ class TestApplyVllmMapper:
         runtime_name = "thinker.language_model.model.layers.0.mlp.gate"
         matched = any(re.search(k, runtime_name) for k in cfg.extra_config)
         assert matched
+
+    def test_extra_config_bare_dot_regex_key_still_works(self):
+        """Regex extra_config keys with bare dots are remapped too."""
+        extra = {
+            r".*thinker.model.layers.\d+.mlp.gate.*": {"bits": 16},
+        }
+        cfg = _make_inc_config("thinker.model.layers", extra_config=extra)
+        cfg.apply_vllm_mapper(THINKER_MAPPER)
+        runtime_name = "thinker.language_model.model.layers.0.mlp.gate"
+        assert list(cfg.extra_config) == [r".*language_model.model.layers.\d+.mlp.gate.*"]
+        assert any(re.search(k, runtime_name) for k in cfg.extra_config)
+
+
+class TestApplyPrefixMap:
+    def test_remaps_blocks_and_plain_extra_config(self):
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={"model.language_model.layers.0.mlp.down_proj": {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert cfg.block_name_to_quantize == ["text_encoder.text_model.layers"]
+        assert cfg.extra_config == {"text_encoder.text_model.layers.0.mlp.down_proj": {"bits": 16}}
+
+    def test_extra_config_override_resolves_at_runtime_prefix(self):
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={"model.language_model.layers.0.mlp.down_proj": {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert not cfg.config_parser.resolve(object(), "text_encoder.text_model.layers.0.mlp.down_proj").quantized
+        assert cfg.config_parser.resolve(object(), "text_encoder.text_model.layers.1.mlp.down_proj").quantized
+
+    def test_remaps_regex_extra_config_keys(self):
+        key = r".*model\.language_model\.layers\.0\.mlp\.down_proj.*"
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={key: {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert list(cfg.extra_config) == [r".*text_encoder\.text_model\.layers\.0\.mlp\.down_proj.*"]
+
+    def test_remaps_bare_dot_regex_extra_config_keys(self):
+        key = r".*model.language_model.layers.0.mlp.down_proj.*"
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={key: {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert list(cfg.extra_config) == [r".*text_encoder.text_model.layers.0.mlp.down_proj.*"]
+        assert not cfg.config_parser.resolve(object(), "text_encoder.text_model.layers.0.mlp.down_proj").quantized
+        assert cfg.config_parser.resolve(object(), "text_encoder.text_model.layers.1.mlp.down_proj").quantized
+
+    def test_remaps_bare_dot_regex_with_quantifier(self):
+        key = r".*model.language_model.layers.\d+.mlp.down_proj.*"
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={key: {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert list(cfg.extra_config) == [r".*text_encoder.text_model.layers.\d+.mlp.down_proj.*"]
+
+    def test_leaves_unmatched_entries_unchanged(self):
+        cfg = _make_inc_config(
+            "lm_head",
+            extra_config={"lm_head": {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert cfg.block_name_to_quantize == ["lm_head"]
+        assert cfg.extra_config == {"lm_head": {"bits": 16}}
 
 
 # ===================================================================
@@ -233,6 +318,36 @@ class TestOmniINCConfigUpgrade:
         assert isinstance(upgraded, OmniINCConfig)
         assert upgraded.weight_bits == 4
         assert upgraded.group_size == 128
+
+    def test_upgraded_config_resolves_remapped_blocks(self):
+        """Layer resolution sees blocks remapped after the upgrade (#5652).
+
+        The upgraded instance must not keep a config_parser bound to the
+        vanilla INCConfig, otherwise the stage-prefix remap done by
+        apply_vllm_mapper is not seen when thinker layers are resolved.
+        """
+        from vllm.model_executor.layers.quantization.inc import INCConfig
+
+        vanilla = INCConfig(
+            weight_bits=4,
+            group_size=128,
+            sym=True,
+            block_name_to_quantize="thinker.model.layers",
+        )
+        upgraded = OmniINCConfig.maybe_upgrade(vanilla)
+        upgraded.apply_vllm_mapper(THINKER_MAPPER)
+
+        layer = torch.nn.Linear(8, 8)
+        # Remapped thinker block -> quantized with the checkpoint settings.
+        assert upgraded.get_layer_config(layer, "thinker.language_model.model.layers.0.mlp.down_proj") == (
+            4,
+            128,
+            True,
+        )
+        # Outside the quantized blocks -> left unquantized.
+        assert upgraded.get_layer_config(layer, "thinker.visual.blocks.0.attn.proj") == (16, -1, True)
+        # The original config is not remapped by the upgrade.
+        assert vanilla.block_name_to_quantize == ["thinker.model.layers"]
 
 
 # ===================================================================
@@ -454,9 +569,9 @@ class TestComponentResolve:
 
     def test_min_capability(self):
         a = _MockQuantConfig("a")
-        a.get_min_capability = lambda: 80
+        a.get_min_capability = lambda: 80  # type: ignore[method-assign]
         b = _MockQuantConfig("b")
-        b.get_min_capability = lambda: 70
+        b.get_min_capability = lambda: 70  # type: ignore[method-assign]
         cqc = ComponentQuantizationConfig(component_configs={"x": a, "y": b})
         assert cqc.get_min_capability() == 70
 

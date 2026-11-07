@@ -144,3 +144,11 @@ cleanup without duplicate stage shutdown.
   processes.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
+
+## Platform preparation before stage construction
+
+`StageEngineCoreProc` calls `current_omni_platform.prepare_stage_engine()`
+before the upstream engine constructor creates its scheduler and cache
+managers. The default hook is a no-op. The NPU implementation installs its
+Mamba allocator signature compatibility here, so Ascend imports and patches
+remain in the NPU platform and are not applied to other platforms.

@@ -48,6 +48,21 @@ def test_long_video_limits_cover_all_duration_inputs(mode, limit, input_kind):
 
 
 @pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
+def test_num_frames_cap_matches_aligned_max_duration(task):
+    image = Image.new("RGB", (64, 64)) if task == "fl2va" else None
+    sampling = OmniDiffusionSamplingParams(
+        width=64, height=64, fps=24, num_frames=362, extra_args={"aspect_ratio": "1:1"}
+    )
+    assert resolve_minimax_h3_shape(task, sampling, image)[2] == 362
+    sampling.extra_args = {"aspect_ratio": "1:1", "duration": 15}
+    assert resolve_minimax_h3_shape(task, sampling, image)[2] == 362
+    sampling.extra_args = {"aspect_ratio": "1:1"}
+    sampling.num_frames = 363
+    with pytest.raises(OmniClientError, match="362 frames"):
+        resolve_minimax_h3_shape(task, sampling, image)
+
+
+@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
 def test_full_mode_rejects_300_seconds_and_accepts_comparison(task):
     sampling = OmniDiffusionSamplingParams(
         width=64,

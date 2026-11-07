@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
@@ -45,7 +45,7 @@ def _recording_backend(events):
 
 
 def test_startup_cache_follows_omit_lossless_high_omit_state_machine(monkeypatch):
-    events = []
+    events: list[tuple] = []
     FakeBackend = _recording_backend(events)
     monkeypatch.setattr(runtime_module, "CacheDiTBackend", FakeBackend)
     pipeline = object()
@@ -83,7 +83,7 @@ def test_startup_cache_follows_omit_lossless_high_omit_state_machine(monkeypatch
 
 
 def test_high_installs_without_startup_cache_and_lossless_uninstalls(monkeypatch):
-    events = []
+    events: list[tuple] = []
     monkeypatch.setattr(runtime_module, "CacheDiTBackend", _recording_backend(events))
     pipeline = object()
     runtime = RequestScopedCacheDiTRuntime(pipeline)
@@ -99,3 +99,21 @@ def test_high_installs_without_startup_cache_and_lossless_uninstalls(monkeypatch
     ]
     assert events[2][-1] == 40
     assert not runtime.is_enabled
+
+
+def test_denoise_pass_refresh_preserves_profile_and_uses_actual_steps(monkeypatch):
+    events: list[tuple] = []
+    monkeypatch.setattr(runtime_module, "CacheDiTBackend", _recording_backend(events))
+    pipeline = object()
+    runtime = RequestScopedCacheDiTRuntime(pipeline)
+    runtime.refresh(10)
+    assert events == []
+    runtime.prepare(_spec("high", 50))
+    events.clear()
+    runtime.refresh(20)
+    runtime.refresh(50)
+    assert events == [("refresh", pipeline, 20), ("refresh", pipeline, 50)]
+    runtime.disable()
+    events.clear()
+    runtime.refresh(20)
+    assert events == []

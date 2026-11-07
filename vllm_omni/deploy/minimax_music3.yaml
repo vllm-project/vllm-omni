@@ -127,3 +127,17 @@ stages:
       temperature: 0.0
       max_tokens: 4096
       seed: 0
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # 32 GiB card: talker alone, eager. Stock sizes this stage for a 140 GB card.
+        max_num_seqs: 4
+        gpu_memory_utilization: 0.9
+        enforce_eager: true
+      - stage_id: 1
+        # Acoustic decoder on the second card.
+        max_num_seqs: 2
+        gpu_memory_utilization: 0.9
+        devices: "1"

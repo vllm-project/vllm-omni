@@ -1,3 +1,29 @@
 # MiniCPM-o 4.5 using the turn-based engine and ordinary HTTP serving.
 base_config: minicpmo_4_5.yaml
 session_mode: turn
+
+stages:
+  - stage_id: 0
+    # CUDA V1 and MRv2 restore cached Thinker outputs for the Talker.
+    # Other platforms keep their existing overrides below and in the base.
+    enable_prefix_caching: true
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Keep the turn engine's upstream kernel and compilation defaults.
+        kernel_config: {}
+        compilation_config: {}
+  rocm:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  xpu:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  musa:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false

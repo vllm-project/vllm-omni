@@ -13,6 +13,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -95,13 +96,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         for request_id in list(self._requests):
             if self.request_belongs_to_session(request_id, session_id):
                 self.close_request(request_id)
-
-    def has_request(self, request_id: str) -> bool:
-        return request_id in self._requests
-
-    def has_pending_audio(self, request_id: str) -> bool:
-        state = self._requests.get(request_id)
-        return bool(state and state.pending_audio_without_text)
 
     def audio_offset(self, request_id: str | None) -> int | None:
         if request_id is None:
@@ -575,12 +569,6 @@ def coerce_int(value: object) -> int | None:
         return None
 
 
-def payload_turn_id(payload: object) -> int | None:
-    if not isinstance(payload, Mapping):
-        return None
-    return coerce_int(payload.get("duplex_turn_id"))
-
-
 def output_turn_id_from_metadata(mm_output: dict[str, object]) -> int | None:
     return _first_metadata_int(mm_output, "duplex_turn_id", "turn_id")
 
@@ -638,8 +626,12 @@ def _native_decision(
         return None
     if mm_output.get("duplex_native_decision") == "listen" or mm_output.get("model_listen") is True:
         return "listen"
-    listen_id = _special_token_ids(mm_output).get("listen_token_id")
+    special_token_ids = _special_token_ids(mm_output)
+    listen_id = special_token_ids.get("listen_token_id")
     if listen_id is None:
+        return None
+    unit_ids = max(token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), key=len)
+    if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
         return None
     stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
     if coerce_int(stop_reason) == listen_id:

@@ -27,18 +27,13 @@ from benchmarks.accuracy.common import pil_to_base64
 from tests.e2e.accuracy.helpers import (
     apply_ftfy_mock,
     assert_similarity,
+    assert_video_similarity_metrics,
     env_to_apply_ftfy_mock_in_subproc,
+    measure_image_similarity,
+    measure_video_similarity_metrics,
     model_output_dir,
     resolve_device_threshold,
-)
-from tests.e2e.accuracy.helpers import (
-    parse_psnr_score as _parse_psnr_score,
-)
-from tests.e2e.accuracy.helpers import (
-    parse_ssim_score as _parse_ssim_score,
-)
-from tests.e2e.accuracy.helpers import (
-    run_ffmpeg_similarity as _run_ffmpeg_similarity,
+    write_accuracy_result,
 )
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
@@ -53,12 +48,13 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def _flash_attempt_backends() -> list[str]:
     """Backends in ``CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS`` that can actually launch.
 
-    Those names are Hopper FA2/FA3. ``set_attention_backend`` only checks import,
-    so a newer GPU still "selects" them and then dies with "no kernel image".
-    Do not probe by launching: a missing cubin can leave the CUDA context dead.
-    Capability >= 10 is outside that wheel, including future SKUs in that family.
+    Those names are NVIDIA Hopper FA2/FA3. ``set_attention_backend`` only checks
+    import, so ROCm or a newer CUDA GPU can still "select" one and then die when
+    it launches. Do not probe by launching: an incompatible kernel can leave the
+    accelerator context dead. Capability >= 10 is outside that CUDA wheel,
+    including future SKUs in that family.
     """
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         return []
     major, _ = torch.cuda.get_device_capability()
     if major >= 10:
@@ -87,9 +83,10 @@ SEED = 42
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
 
-# A single-shot latency measurement on this benchmark is dominated by CI variance
-# (see issue #5108). Warm up once, then report the median of several timed runs.
-NUM_TIMED_RUNS = 2
+# Warm up once, then take the median of an odd number of timed requests.
+# Two samples make np.median their mean, so one spike still moves the gate
+# (issues #5108, #9449).
+NUM_TIMED_RUNS = 3
 
 VIDEO_PROMPT = "The bear in the image dances happily"
 VIDEO_WIDTH = 832
@@ -307,7 +304,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
 def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, model_id + "-diffusers-backend")
@@ -325,6 +322,19 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
         f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, diffusers latency={diffusers_latency:.2f}ms, lower is better"
     )
 
+    ssim, psnr = measure_image_similarity(
+        model_name=model_id,
+        vllm_image=vllm_output,
+        diffusers_image=diffusers_output,
+        width=WIDTH,
+        height=HEIGHT,
+    )
+    write_accuracy_result(
+        model_id=model_id,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+    )
     assert_similarity(
         model_name=model_id,
         vllm_image=vllm_output,
@@ -333,11 +343,12 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
         height=HEIGHT,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
-    # Latency is checked against a warmed median of NUM_TIMED_RUNS runs (see the
-    # _run_* helpers), so the assertion reflects steady-state rather than a single
-    # cold shot -- which is what previously made this check flaky (issue #5108).
-    # Correctness is additionally gated by the SSIM/PSNR assertions above.
+    # Latency is the median of NUM_TIMED_RUNS warmed requests. The count is odd,
+    # so one spiked sample is dropped (issues #5108, #9449). Correctness is
+    # additionally gated by the SSIM/PSNR assertions above.
     assert vllm_latency <= latency_threshold, (
         f"VLLM latency ({vllm_latency:.2f}ms) is greater than "
         f"{latency_threshold_factor * 100}% more than Diffusers latency "
@@ -380,26 +391,35 @@ def test_diffusers_backend_i2v_matches_diffusers(
     )
     latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
 
-    ssim_output = _run_ffmpeg_similarity("ssim", vllm_path, diffusers_path)
-    psnr_output = _run_ffmpeg_similarity("psnr", vllm_path, diffusers_path)
-    ssim_score = _parse_ssim_score(ssim_output)
-    psnr_score = _parse_psnr_score(psnr_output)
     print(f"{model_id} latency metrics:")
     print(
         f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, "
         f"diffusers latency={diffusers_latency:.2f}ms, slack={latency_threshold_factor:.0%} ({gpu_key}), lower is better"
     )
-    print(f"{model_id} similarity metrics:")
-    print(f"  SSIM: value={ssim_score:.6f}, threshold>={VIDEO_SSIM_THRESHOLD:.6f}, range=[-1, 1], higher is better")
-    print(
-        f"  PSNR: value={psnr_score:.6f} dB, threshold>={VIDEO_PSNR_THRESHOLD:.6f} dB, range=[0, +inf), higher is better"
+    ssim_score, psnr_score = measure_video_similarity_metrics(
+        label=model_id,
+        online_path=vllm_path,
+        offline_path=diffusers_path,
     )
-
-    assert ssim_score >= VIDEO_SSIM_THRESHOLD, (
-        f"SSIM below threshold for {model_id}: got {ssim_score:.6f}, expected >= {VIDEO_SSIM_THRESHOLD:.6f}."
+    write_accuracy_result(
+        model_id=model_id,
+        dataset="video_similarity",
+        metrics={"ssim": ssim_score, "psnr": psnr_score},
+        baseline={"ssim": VIDEO_SSIM_THRESHOLD, "psnr": VIDEO_PSNR_THRESHOLD},
+        extra={
+            "online_video": str(vllm_path),
+            "offline_video": str(diffusers_path),
+            "latency_ms": vllm_latency,
+        },
     )
-    assert psnr_score >= VIDEO_PSNR_THRESHOLD, (
-        f"PSNR below threshold for {model_id}: got {psnr_score:.6f}, expected >= {VIDEO_PSNR_THRESHOLD:.6f}."
+    assert_video_similarity_metrics(
+        label=model_id,
+        online_path=vllm_path,
+        offline_path=diffusers_path,
+        ssim_threshold=VIDEO_SSIM_THRESHOLD,
+        psnr_threshold=VIDEO_PSNR_THRESHOLD,
+        ssim_score=ssim_score,
+        psnr_score=psnr_score,
     )
     assert vllm_latency <= latency_threshold, (
         f"VLLM latency ({vllm_latency:.2f}ms) is greater than {latency_threshold_factor * 100}% more than Diffusers latency ({diffusers_latency:.2f}ms)."

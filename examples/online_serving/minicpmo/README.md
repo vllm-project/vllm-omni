@@ -163,7 +163,11 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
 
 Video input uses the same session. PyAV demuxes JPEG frames at `--video-fps`
 (default 1.0) and vLLM `load_audio` extracts a 16 kHz mono WAV unless
-`--input-wav` overrides the soundtrack. Frames keep their capture size
+`--input-wav` overrides the soundtrack. If the file has no audio track and no
+external WAV is provided, the demo sends frame-only input units at the configured
+video rate. These use the model's VISION path without synthetic silence; each
+unit can produce a listen/speak decision before the final input commit.
+Frames keep their capture size
 (`--frame-max-side 0`); the server `process_image` normalizes at 448.
 
 `--stack-frames N` raises the visual refresh rate the way official duplex does:
@@ -189,14 +193,44 @@ patches `get_sliced_grid` cuts for its size at `scale_resolution=448`, and the
 composite adds one block. The wire still rejects a caller-supplied
 `max_slice_nums`, so slicing is Stage 0's decision, not the client's.
 
+For a video's own soundtrack, the demo trims decoder padding or adds silence
+to match the video's whole-second units, as in the official
+`adjust_audio_length=True` flow. An explicit `--input-wav` keeps its own
+timeline. This avoids submitting AAC padding as another audio-only unit after
+the final video frame.
+
+Use `--instructions '...'` to set the session system prompt. When evaluating a
+video containing UI overlays, identify the intended object in this prompt;
+otherwise a question about a "shape" can also refer to an audio meter or
+progress bar. The default remains `Streaming Omni Conversation.`.
+
 That detail costs context. One 960x540 frame is 66 vision tokens per unit and a
 stacked pair is 264, on top of the unit's audio, so the Stage 0 prompt grows by
 277 tokens per second stacked against 79 with a single frame. Against the
 40960-token context this model ships with, a listen-heavy call reaches the limit
 after about 2.5 minutes stacked and about 8.5 minutes unstacked (measured on a
-264 s 960x540 clip). Duplex sessions cannot yet evict old units, so keep
-multi-minute calls on the default `--stack-frames 1`; a stacked session that
-outgrows the context ends with a context-length error.
+264 s 960x540 clip). For long sessions, enable the existing retention policy
+with `--sliding-window-mode basic`; `--basic-window-high-tokens` (8000) and
+`--basic-window-low-tokens` (6000) control its watermarks. The CLI default is
+`off` to preserve existing runs. Sliding bounds retained history; it does not
+guarantee answer accuracy.
+
+For comparison, `--sliding-window-mode context` rebuilds retained units with
+previous generated text. `--context-max-units` (24) bounds the retained units;
+`--context-previous-max-tokens` (500) bounds that text. Rebuilding dense video
+history can lag behind real time; a smaller window reduces retained history
+but does not necessarily improve answers. Compare both content and response
+timing before choosing this mode.
+
+Use `--tail-silence-s 8` when a clip ends immediately after a question. This
+streams additional silent input while holding the last frame, giving native
+duplex model time to finish its answer before commit/close. It defaults to 0.
+The result records the input start clock, window settings, and tail frame count
+for comparison against a timestamped reference. `input_timeline.json` records
+each audio append's media position and actual send clock, without audio payloads.
+Real-time PCM pacing accounts for send overhead rather than accumulating it
+after each chunk. `ok` checks transport and
+lifecycle only; semantic correctness must be assessed separately.
 
 ## Open the experimental browser client
 
@@ -260,6 +294,11 @@ vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
 
 Generate, evaluate, and summarize:
 
+`omni-duplex-eval generate` requires `--ref-audio` to pin the assistant voice
+across benchmark samples. Pass the model-bundled `assets/HT_ref_audio.wav` when
+you want to score that default voice; regular duplex clients may omit the
+reference and let the server load it.
+
 ```bash
 vllm bench omni-duplex-eval --omni generate \
     --url ws://127.0.0.1:8099/v1/realtime?duplex=1 \
@@ -320,7 +359,8 @@ them unless `--allow-invalid-clock` is explicit.
 ### Shared realtime UI implementation
 
 The `python -m examples.online_serving.minicpmo.realtime_web` command remains
-available with the same MiniCPM defaults and required `--ref-audio`. Its assets
+available with the same MiniCPM defaults. `--ref-audio` is optional: when it is
+omitted, the server uses the model-bundled `assets/HT_ref_audio.wav`. Its assets
 now live in [the shared realtime UI](../realtime_web/README.md), with a dedicated
 `minicpm-native` profile preserving native duplex input, playback ACKs and camera
 frames. Qwen3 uses a separate profile in the same shell, supporting manual STT

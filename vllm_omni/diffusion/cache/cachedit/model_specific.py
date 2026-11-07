@@ -29,8 +29,10 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
+    _make_pipeline_transformer_getter,
     _maybe_build_block_adapter,
     enable_cache_for_dit,
+    resolve_has_separate_cfg,
 )
 from vllm_omni.diffusion.cache.cachedit.config import CacheDiTConfig
 
@@ -50,20 +52,24 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
     Returns:
         A tuple of (num_high_noise_steps, num_low_noise_steps).
     """
-    if pipeline.boundary_ratio is not None:
-        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
-    else:
-        boundary_timestep = None
+    # Mirror the fallback forward() applies when the server pins no boundary_ratio;
+    # without it every step would land on transformer and transformer_2's context
+    # would be sized for zero steps.
+    boundary_ratio = pipeline.boundary_ratio if pipeline.boundary_ratio is not None else 0.875
+    boundary_timestep = boundary_ratio * pipeline.scheduler.config.num_train_timesteps
 
-    # Set timesteps to calculate the split
+    # Set timesteps to calculate the split. forward() re-arms the scheduler for
+    # every request, so probing it here is safe, but it must use the same flow
+    # shift: the UniPC scheduler is built unshifted and forward() applies the
+    # shift in set_timesteps, so an unshifted probe misplaces the boundary.
     device = next(pipeline.transformer.parameters()).device
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    if getattr(pipeline, "_sample_solver", None) == "unipc":
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device, shift=pipeline._flow_shift)
+    else:
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
 
     timesteps = pipeline.scheduler.timesteps
-    num_high_noise_steps = 0  # high-noise steps for transformer
-    for t in timesteps:
-        if boundary_timestep is None or t >= boundary_timestep:
-            num_high_noise_steps += 1
+    num_high_noise_steps = int((timesteps >= boundary_timestep).sum())  # high-noise steps for transformer
     # low-noise steps for transformer_2
     num_low_noise_steps = num_inference_steps - num_high_noise_steps
     return num_high_noise_steps, num_low_noise_steps
@@ -86,27 +92,53 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     db_cache_config = projected_config.to_db_cache_config()
     calibrator_config = projected_config.to_calibrator_config()
 
-    if getattr(pipeline, "transformer_2", None) is None:
-        logger.info("transformer_2 not found, enabling cache-dit for single transformer mode")
+    transformer = getattr(pipeline, "transformer", None)
+    transformer_2 = getattr(pipeline, "transformer_2", None)
+
+    if transformer is None and transformer_2 is None:
+        raise ValueError(f"{type(pipeline).__name__} has no loaded transformer to enable cache-dit on")
+
+    if transformer is None or transformer_2 is None:
+        # Only one expert is resident.  Either the checkpoint is single-expert
+        # (Wan2.1-style), or it is a Wan2.2 MoE checkpoint run with
+        # boundary_ratio pinned to 1.0 / 0.0, which makes Wan22Pipeline load
+        # only the low-noise / high-noise expert respectively.  Both cases must
+        # key off whichever attribute actually holds a module: assuming the
+        # survivor is always ``transformer`` crashes the low-noise-only run.
+        active_name = "transformer" if transformer is not None else "transformer_2"
+        active_transformer = transformer if transformer is not None else transformer_2
+        logger.info("Enabling cache-dit for single transformer mode on %s", active_name)
         cache_dit.enable_cache(
             BlockAdapter(
-                transformer=pipeline.transformer,
+                transformer=active_transformer,
                 # For VACE, cache only the main denoising blocks. The
                 # conditioning branch (vace_blocks) has a different forward
                 # contract and produces per-step hints from the current latent
                 # plus vace_context; keeping it outside CacheDiT preserves the
                 # control signal while still accelerating the repeated backbone.
-                blocks=[pipeline.transformer.blocks],
+                blocks=[active_transformer.blocks],
                 forward_pattern=[ForwardPattern.Pattern_2],
                 params_modifiers=[
                     ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
                 ],
-                has_separate_cfg=True,
+                has_separate_cfg=resolve_has_separate_cfg(True),
             ),
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return _build_cache_context_refresh(cache_config)
+        # The refresh callback must read the same attribute we cached; the
+        # default getter hardcodes ``pipeline.transformer``, which is None here
+        # when only the low-noise expert was loaded.
+        refresh_single = _build_cache_context_refresh(cache_config, _make_pipeline_transformer_getter(active_name))
+
+        def refresh_single_for_schedule(
+            pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+        ) -> None:
+            # A single expert denoises every timestep forward() resolved.
+            refresh_single(pipeline, len(timesteps), verbose)
+
+        pipeline._cache_dit_refresh_for_schedule = refresh_single_for_schedule
+        return refresh_single
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -142,7 +174,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
                     calibrator_config=calibrator_config,
                 ),
             ],
-            has_separate_cfg=True,
+            has_separate_cfg=resolve_has_separate_cfg(True),
         ),
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
@@ -162,6 +194,30 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
         refresh_trans_one(pipeline, num_high_noise_steps, verbose)
         refresh_trans_two(pipeline, num_low_noise_steps, verbose)
 
+    def refresh_cache_context_for_schedule(
+        pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+    ) -> None:
+        """Size both experts' contexts to the timesteps forward() is about to denoise.
+
+        The runner refreshes before forward() resolves this request's solver, flow
+        shift and boundary, so its split can follow the previous request's
+        schedule. forward() calls this once they are resolved; the counts follow
+        diffuse(), which runs transformer for t >= boundary_timestep and
+        transformer_2 below it.
+        """
+        if boundary_timestep is None:
+            num_high_noise_steps = len(timesteps)
+        else:
+            num_high_noise_steps = int((timesteps >= boundary_timestep).sum())
+        num_low_noise_steps = len(timesteps) - num_high_noise_steps
+        # An expert that gets no step in this request never runs, so its context
+        # can keep the reset the runner already gave it.
+        if num_high_noise_steps > 0:
+            refresh_trans_one(pipeline, num_high_noise_steps, verbose)
+        if num_low_noise_steps > 0:
+            refresh_trans_two(pipeline, num_low_noise_steps, verbose)
+
+    pipeline._cache_dit_refresh_for_schedule = refresh_cache_context_for_schedule
     return refresh_cache_context
 
 
@@ -197,7 +253,7 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> RefreshCache
             params_modifiers=[
                 ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
             ],
-            has_separate_cfg=True,
+            has_separate_cfg=resolve_has_separate_cfg(True),
         ),
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
@@ -908,6 +964,35 @@ def enable_cache_for_mammothmoda2(pipeline: Any, cache_config: Any) -> CacheDiTE
     return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
 
 
+def enable_cache_for_kandinsky6(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Cache-DiT over K6 visual blocks only.
+
+    Text and audio block lists are not one residual chain with the visual
+    stack. If the block adapter rejects the fused ``(video, audio)`` return,
+    fall back to the same step-level velocity cache MagCache uses.
+    """
+    transformer = pipeline.transformer
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.visual_transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_0],
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
+    try:
+        return enable_cache_for_dit(pipeline, cache_config, block_adapter)
+    except Exception as exc:
+        logger.warning("Cache-DiT block adapter failed for Kandinsky 6 (%s); using step cache", exc)
+        from vllm_omni.diffusion.models.kandinsky6.cache_accel import attach_mag_cache
+
+        attach_mag_cache(transformer, threshold=0.24, max_skip_steps=3, retention_ratio=0.1)
+
+        def _refresh(*_args, **_kwargs):
+            return None
+
+        return _refresh
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -925,6 +1010,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "Kandinsky6TI2VAPipeline": enable_cache_for_kandinsky6,
             "Magi2Pipeline": enable_cache_for_magi2,
             "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }
