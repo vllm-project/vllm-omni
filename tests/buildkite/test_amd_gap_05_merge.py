@@ -50,18 +50,31 @@ def test_gap_05_selects_bounded_advanced_rocm_cases() -> None:
 
 @pytest.mark.parametrize("group, expected_count", GROUPS)
 @pytest.mark.parametrize(
-    "pytest_status, timeout_status, count_delta, skipped, expected_status",
+    "pytest_status, timeout_status, count_delta, skipped, failures, errors, expected_status",
     [
-        (0, None, 0, 0, 0),
-        (0, None, -1, 0, 5),
-        (0, None, 1, 0, 5),
-        (0, None, 0, 1, 5),
-        (1, None, 0, 0, 1),
-        (5, None, 0, 0, 5),
-        (0, 124, 0, 0, 124),
-        (0, 137, 0, 0, 137),
+        (0, None, 0, 0, 0, 0, 0),
+        (0, None, -1, 0, 0, 0, 5),
+        (0, None, 1, 0, 0, 0, 5),
+        (0, None, 0, 1, 0, 0, 5),
+        (0, None, 0, 0, 1, 0, 5),
+        (0, None, 0, 0, 0, 1, 5),
+        (1, None, 0, 0, 0, 0, 1),
+        (5, None, 0, 0, 0, 0, 5),
+        (0, 124, 0, 0, 0, 0, 124),
+        (0, 137, 0, 0, 0, 0, 137),
     ],
-    ids=["pass", "missing-case", "extra-case", "skip", "assertion", "empty", "deadline", "killed"],
+    ids=[
+        "pass",
+        "missing-case",
+        "extra-case",
+        "skip",
+        "junit-failure",
+        "junit-error",
+        "assertion",
+        "empty",
+        "deadline",
+        "killed",
+    ],
 )
 def test_gap_05_execution_guard(
     tmp_path: Path,
@@ -71,6 +84,8 @@ def test_gap_05_execution_guard(
     timeout_status: int | None,
     count_delta: int,
     skipped: int,
+    failures: int,
+    errors: int,
     expected_status: int,
 ) -> None:
     _assert_nightly_junit_guard(
@@ -84,6 +99,8 @@ def test_gap_05_execution_guard(
         pytest_status=pytest_status,
         tests=expected_count + count_delta,
         skipped=skipped,
+        failures=failures,
+        errors=errors,
         timeout_status=timeout_status,
         expected_status=expected_status,
     )
