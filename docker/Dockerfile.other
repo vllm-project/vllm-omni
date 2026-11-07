@@ -51,10 +51,15 @@ RUN "${VLLM_OMNI_VENV}/bin/python" -c "from vllm._version import __commit_id__; 
 RUN cd "$(/opt/sglang/bin/python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" && \
     git apply "${APP_DIR}/docker/patches/sglang-omni-ignore-eos.patch"
 
+# The base image may install native SGLang editably, outside site-packages.
+RUN cd "$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; print(Path(sglang.__file__).resolve().parent.parent)')" && \
+    git apply "${APP_DIR}/docker/patches/sglang-diffusion-config-only-guider.patch"
+
 RUN CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -c \
       "from sglang_omni.models.minicpm_o.components.token2wav.speech_tokenizer_weights import load_tokenizer_weights" && \
     CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -m pytest \
-      --noconftest -o addopts='' -q tests/dfx/perf/tests/test_sglang_sampling.py
+      --noconftest -o addopts='' -q tests/dfx/perf/tests/test_sglang_sampling.py \
+      tests/dfx/perf/tests/test_sglang_diffusion_loader.py
 
 # pytest and the common benchmark client use vLLM; only the server uses SGLang.
 ENV PATH=${VLLM_OMNI_VENV}/bin:${PATH}
