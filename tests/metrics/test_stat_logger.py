@@ -18,8 +18,6 @@ from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
-from vllm_omni.engine.orchestrator import Orchestrator
-from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
@@ -733,6 +731,9 @@ def test_register_replica_preserves_existing_metrics(stats_config, initial_map):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial_replicas", [0, 1])
 async def test_orchestrator_records_stats_from_late_replica(stats_config, initial_replicas):
+    from vllm_omni.engine.orchestrator import Orchestrator
+    from vllm_omni.engine.stage_pool import StagePool
+
     pool = Mock(spec=StagePool, num_replicas=initial_replicas, stage_vllm_config=stats_config)
     pool.available_replica_ids.return_value = list(range(initial_replicas))
     pool.process_llm_raw_outputs = AsyncMock(return_value=[])

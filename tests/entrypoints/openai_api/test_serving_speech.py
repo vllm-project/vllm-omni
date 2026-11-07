@@ -167,7 +167,7 @@ class TestAudioMixin:
         audio_obj = CreateAudio(audio_tensor=stereo_tensor)
 
         mock_speed = mocker.patch.object(
-            audio_mixin, "_apply_speed_adjustment", side_effect=lambda tensor, speed, sr: (tensor, sr)
+            audio_mixin, "apply_speed_adjustment", side_effect=lambda tensor, speed: tensor
         )
         mocker.patch("soundfile.write")
 
@@ -181,7 +181,7 @@ class TestAudioMixin:
     def test_speed_adjustment(self, audio_mixin):
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        adjusted_audio, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=2.0, sample_rate=24000)
+        adjusted_audio = audio_mixin.apply_speed_adjustment(audio_tensor, speed=2.0)
 
         assert adjusted_audio.shape == (12000,)
 
@@ -234,7 +234,7 @@ class TestAudioMixin:
 
         mock_time_stretch = mocker.patch("torchaudio.transforms.TimeStretch")
         # speed=1.0 should return immediately without calling torchaudio
-        result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
+        result = audio_mixin.apply_speed_adjustment(audio_tensor, speed=1.0)
 
         mock_time_stretch.assert_not_called()
         assert np.array_equal(result, audio_tensor)
@@ -243,7 +243,7 @@ class TestAudioMixin:
         """Test that speed adjustment handles stereo (channels-last) input."""
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
 
-        result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
+        result = audio_mixin.apply_speed_adjustment(stereo_tensor, speed=2.0)
 
         assert result.shape == (12000, 2)
 
@@ -431,7 +431,15 @@ def client(test_app):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
-async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: MockerFixture, enable_scale_out):
+async def test_server_worker_applies_speech_only_endpoint_restrictions(
+    mocker: MockerFixture, enable_scale_out, request: pytest.FixtureRequest
+):
+    # SageMaker route registration imports a dependency that changes root.level.
+    # Restore it through setLevel so later tests also clear cached log filters.
+    root_logger = logging.getLogger()
+    previous_level = root_logger.level
+    request.addfinalizer(lambda: root_logger.setLevel(previous_level))
+
     class FakeCompletionHandler:
         def __init__(self):
             self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
@@ -5184,7 +5192,8 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     assert response.body.decode("utf-8") == (
-        '{"error":{"message":"engine dead","type":"InternalServerError","param":null,'
+        '{"error":{"message":"The server had an error while processing your request.",'
+        '"type":"InternalServerError","param":null,'
         '"code":500,"request_id":"speech-req-1","error_stage_id":1}}'
     )
     terminate_mock.assert_called_once()

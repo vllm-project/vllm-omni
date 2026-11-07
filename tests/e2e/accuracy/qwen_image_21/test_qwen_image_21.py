@@ -11,8 +11,7 @@ Run from the repository root in the installed serving environment::
         -m 'full_model and diffusion and H100 and cards_1' --run-level full_model
 
 Model setup follows main (cached main in offline mode), unless QWEN_IMAGE_21_MODEL
-names a complete local snapshot. Both runtimes use the same resolved directory;
-model_assets.json records its path and snapshot revision when available.
+names a complete local snapshot. Both runtimes use the same resolved directory.
 
 For NPU A3 nightly, use '-m "full_model and diffusion and npu and A3 and cards_1"'.
 The NPU native uses TORCH_SDPA with dense-mask prefill; the upstream reference
@@ -36,27 +35,25 @@ import math
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from importlib.metadata import version
 from io import BytesIO
 from pathlib import Path
 
-import huggingface_hub
 import numpy as np
 import pytest
 import requests
-import torch
 from PIL import Image
 
 from tests.e2e.accuracy.helpers import (
     SimilarityThresholds,
     assert_similarity_metrics,
-    compute_image_ssim_psnr,
+    baseline_from_similarity_thresholds,
+    measure_image_similarity,
     model_output_dir,
     resolve_device_profile,
     resolve_similarity_thresholds,
-    write_json_artifact,
+    write_accuracy_result,
 )
 from tests.e2e.accuracy.qwen_image_21.contract import (
     CASES,
@@ -102,36 +99,9 @@ def _reference(request_path: Path, output: Path, *, preflight: bool, repeats: in
     env["PYTHONNOUSERSITE"] = "1"
     name = "preflight" if preflight else "reference"
     with (output / f"{name}.log").open("w", encoding="utf-8") as log:
-        try:
-            result = subprocess.run(command, cwd=HERE, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=3600)
-        except subprocess.TimeoutExpired:
-            write_json_artifact(
-                output / f"{name}_exit.json", {"command": command, "exit_status": "timeout", "timeout_s": 3600}
-            )
-            raise
-    write_json_artifact(output / f"{name}_exit.json", {"command": command, "exit_status": result.returncode})
+        result = subprocess.run(command, cwd=HERE, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=3600)
     assert result.returncode == 0, f"Reference {name} failed: {output / (name + '.log')}"
     return json.loads((output / "reference_preflight.json").read_text(encoding="utf-8"))
-
-
-def _source_provenance() -> dict[str, str]:
-    try:
-        return {
-            "git_head": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
-            ).strip(),
-            "git_status": subprocess.check_output(
-                ["git", "status", "--short"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
-            ),
-        }
-    except (OSError, subprocess.CalledProcessError):
-        buildkite_commit = os.environ.get("BUILDKITE_COMMIT")
-        if not buildkite_commit:
-            raise RuntimeError("Cannot identify the tested source: no Git checkout or BUILDKITE_COMMIT") from None
-        return {
-            "git_head": buildkite_commit,
-            "git_status": "unavailable: repository metadata is not mounted",
-        }
 
 
 def _native(request: dict, output: Path) -> None:
@@ -149,17 +119,6 @@ def _native(request: dict, output: Path) -> None:
     }
     payload = {key: value for key, value in payload.items() if value is not None}
     serve_args = SERVER_ARGS + ["--diffusion-attention-backend", request["attention_backend"]]
-    write_json_artifact(
-        output / "native_launch.json",
-        {
-            "model": request["model"],
-            "serve_args": serve_args,
-            "request": payload,
-            "python": sys.executable,
-            **_source_provenance(),
-            "versions": {name: version(name) for name in ("vllm", "diffusers", "torch", "transformers", "Pillow")},
-        },
-    )
     with OmniServer(model=request["model"], serve_args=serve_args, startup_timeout=1200) as server:
         payload["model"] = server.model
         if request["inputs"]:
@@ -178,7 +137,6 @@ def _native(request: dict, output: Path) -> None:
                 json=payload,
                 timeout=1200,
             )
-        (output / "http_response.json").write_text(response.text, encoding="utf-8")
         response.raise_for_status()
         body = response.json()
         assert isinstance(body, dict) and isinstance(body.get("data"), list), body
@@ -192,7 +150,12 @@ def _native(request: dict, output: Path) -> None:
 
 
 def _scores(prediction: Image.Image, reference: Image.Image) -> dict[str, float]:
-    ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=reference, compare_mode="RGBA")
+    ssim, psnr = measure_image_similarity(
+        model_name="Qwen-Image 2.1",
+        vllm_image=prediction,
+        diffusers_image=reference,
+        compare_mode="RGBA",
+    )
     alpha = (
         np.abs(np.asarray(prediction, dtype=np.float32)[..., 3] - np.asarray(reference, dtype=np.float32)[..., 3]) / 255
     )
@@ -211,7 +174,6 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     calibration = os.environ.get("QWEN_IMAGE_21_CALIBRATE") == "1"
     policy = json.loads((HERE / "thresholds.json").read_text(encoding="utf-8"))
     bounds = policy[case_name]
-    write_json_artifact(output / "threshold_policy.json", policy)
     device_type = "rocm" if current_omni_platform.is_rocm() else current_omni_platform.device_type
     device = device_preflight(device_type)
     device_name = device["device"]
@@ -263,41 +225,27 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
                     "processed_size": [processed_w, processed_h],
                 }
             )
-    request_path = output / "request.json"
-    write_json_artifact(request_path, request)
-    native_assets = validate_model(model)
-    write_json_artifact(
-        output / "model_assets.json",
-        {
-            "expected_public_model": MODEL_ID,
-            "resolved_revision": model.name if model.parent.name == "snapshots" else None,
-            **native_assets,
-        },
-    )
-    # Run the actual reference interpreter's import and asset checks before either model loads.
-    preflight = _reference(request_path, output, preflight=True)
-    assert preflight["assets"] == native_assets
-    shared_packages = ["torch", "transformers", "accelerate", "Pillow", "huggingface-hub"]
-    if device_type == "npu":
-        shared_packages.append("torch-npu")
-    for package in shared_packages:
-        assert preflight["versions"][package] == version(package), f"Mismatched shared dependency: {package}"
-    assert all(preflight[key] == value for key, value in device.items())
-    write_json_artifact(
-        output / "comparison_preflight.json",
-        {
-            **device,
-            "cuda": torch.version.cuda,
-            "torchmetrics": version("torchmetrics"),
-            "numpy": version("numpy"),
-            "huggingface_hub_path": str(Path(huggingface_hub.__file__).resolve()),
-            "python": sys.executable,
-        },
-    )
-    _native(request, output)
-    reference_repeats = 2 if calibration else 1
-    _reference(request_path, output, preflight=False, repeats=reference_repeats)
-    artifact_names = ["native.png", "reference_0.png"]
+    # Ephemeral IPC for run_reference.py; not retained as a case artifact.
+    request_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False)
+    try:
+        json.dump(request, request_file)
+        request_file.close()
+        request_path = Path(request_file.name)
+        native_assets = validate_model(model)
+        # Run the actual reference interpreter's import and asset checks before either model loads.
+        preflight = _reference(request_path, output, preflight=True)
+        assert preflight["assets"] == native_assets
+        shared_packages = ["torch", "transformers", "accelerate", "Pillow", "huggingface-hub"]
+        if device_type == "npu":
+            shared_packages.append("torch-npu")
+        for package in shared_packages:
+            assert preflight["versions"][package] == version(package), f"Mismatched shared dependency: {package}"
+        assert all(preflight[key] == value for key, value in device.items())
+        _native(request, output)
+        reference_repeats = 2 if calibration else 1
+        _reference(request_path, output, preflight=False, repeats=reference_repeats)
+    finally:
+        Path(request_file.name).unlink(missing_ok=True)
     with (
         Image.open(output / "native.png") as candidate,
         Image.open(output / "reference_0.png") as reference,
@@ -312,15 +260,22 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
                 repeated.load()
                 assert repeated.mode == "RGBA" and repeated.size == reference.size
                 comparisons["reference_repeatability"] = _scores(repeated, reference)
-            artifact_names.append("reference_1.png")
     selected = None
+    table = None
     if not calibration:
         # Uncalibrated profiles may remain null while a different device is gated.
         table = {key: SimilarityThresholds(**row) for key, row in bounds.items()}
         selected = resolve_similarity_thresholds(table, device_name=device_name)
-    write_json_artifact(
-        output / "metrics.json",
-        {
+    write_accuracy_result(
+        model_id=MODEL_ID,
+        dataset="image_similarity",
+        metrics={
+            "ssim": candidate_scores["ssim"],
+            "psnr": candidate_scores["psnr"],
+            "alpha_mae": candidate_scores.get("alpha_mae"),
+        },
+        baseline=baseline_from_similarity_thresholds(table) if table is not None else None,
+        extra={
             "case": case_name,
             "device": device_name,
             "device_type": device_type,
@@ -331,18 +286,14 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
             "expected_xfail_reason": expected_xfail,
             "calibration_only": calibration,
             "reference_generations": reference_repeats,
-            "representation": "RGBA uint8 / 255, no compositing or resizing",
-            **{
-                comparison: {metric: str(value) if math.isinf(value) else value for metric, value in scores.items()}
-                for comparison, scores in comparisons.items()
-            },
-            "artifacts": {name: sha256(output / name) for name in artifact_names},
+            "comparisons": comparisons,
+            "artifacts": str(output),
         },
     )
     if calibration:
-        pytest.xfail(f"Calibration collected; thresholds were not enforced. Metrics: {output / 'metrics.json'}")
+        pytest.xfail(f"Calibration collected; thresholds were not enforced. Artifacts: {output}")
     if expected_xfail:
-        pytest.xfail(f"{expected_xfail} Metrics: {output / 'metrics.json'}")
+        pytest.xfail(f"{expected_xfail} Artifacts: {output}")
     assert selected is not None
     assert_similarity_metrics(
         model_name=f"Qwen-Image 2.1 {case_name}; artifacts: {output}",
