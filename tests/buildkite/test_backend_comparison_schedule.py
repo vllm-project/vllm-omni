@@ -288,3 +288,40 @@ def test_wan_performance_runs_only_the_selected_video_workload(comparison_runner
     daily = {key: value for key, value in reference["benchmark_params"][0].items() if key != "baseline"}
     assert config["benchmark_params"] == [{**daily, "seed": 0, "num_warmups": 2}]
     assert config["server_params"]["model"] == reference["server_params"]["model"]
+
+
+def test_cosmos_performance_only_runs_its_two_gpu_workload(comparison_runner, tmp_path):
+    result, _ = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": "smoke", "BUILDKITE_SOURCE": "api", "BACKEND_COMPARISON_CASES": "cosmos3-t2i-perf"}
+    )
+    assert result.returncode == 0, result.stderr
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert job["key"] == "perf-sglang-cosmos3-t2i"
+    assert "depends_on" not in job
+    (container,) = next(iter(job["plugins"][0].values()))["podSpec"]["containers"]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 2
+    assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
+    assert job["command"].index(".completed == 1") < job["command"].index(".completed == 3")
+
+
+def test_video_diagnostics_reuse_image_and_apply_loader_fix_before_gpu(comparison_runner, tmp_path):
+    result, _ = comparison_runner(
+        {
+            "BACKEND_COMPARISON_ONLY": "smoke",
+            "BUILDKITE_SOURCE": "api",
+            "BACKEND_COMPARISON_CASES": "hunyuanvideo15,minimax-h3",
+        }
+    )
+    assert result.returncode == 0, result.stderr
+    jobs = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert [j["key"] for j in jobs] == ["smoke-sglang-hunyuanvideo15", "smoke-sglang-minimax-h3"]
+    for job, cards in zip(jobs, [1, 2]):
+        assert "depends_on" not in job
+        container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
+        assert container["resources"]["limits"]["nvidia.com/gpu"] == cards
+        assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
+        assert job["command"].startswith("set -eu")
+        assert job["concurrency"] == 2
+    assert jobs[0]["command"].index("test_sglang_diffusion_loader.py") < jobs[0]["command"].index(
+        "run_sglang_diffusion_smoke.py"
+    )

@@ -123,10 +123,57 @@ def wan_performance_job(benchmark: dict) -> dict:
     return job
 
 
+def cosmos_performance_job(benchmark: dict) -> dict:
+    job = qwen_image_performance_job(benchmark)
+    container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
+    container["resources"]["limits"]["nvidia.com/gpu"] = 2
+    job.update(
+        key="perf-sglang-cosmos3-t2i",
+        label=":frame_with_picture: SGLang · Cosmos3 T2I · TP2 H100 · 1024x1024 · 4 steps · C1/3",
+        env={
+            "COMPARISON_CONFIG": "tests/dfx/perf/tests/test_cosmos3_t2i_sglang.json",
+            "COMPARISON_IMAGE_DIGEST": QWEN_IMAGE_DIGEST,
+        },
+        artifact_paths=[
+            "tests/dfx/perf/results/cosmos-smoke/*.json",
+            "tests/dfx/perf/results/result_test_sglang_cosmos3_t2i_tp2_*.json",
+        ],
+        concurrency=2,
+        concurrency_group="vllm-omni/pr1994/sglang-smoke",
+        command="\n".join(
+            [
+                "set -eu",
+                'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
+                'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"',
+                'export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"',
+                "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+                "export BENCHMARK_DIR=tests/dfx/perf/results/cosmos-smoke",
+                "jq '.[0].benchmark_params[0] += {num_prompts:1,num_warmups:0}' "
+                '"$${COMPARISON_CONFIG}" > /tmp/cosmos-smoke.json',
+                "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
+                "--test-config-file /tmp/cosmos-smoke.json --run-level full_model",
+                "jq -se 'length == 1 and (.[0] | .completed == 1 and .failed == 0 and .total_images == 1 "
+                "and .average_pixels_per_image == 1048576)' "
+                '"$${BENCHMARK_DIR}"/result_test_sglang_cosmos3_t2i_tp2_*.json',
+                "export BENCHMARK_DIR=tests/dfx/perf/results",
+                "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
+                '--test-config-file "$${COMPARISON_CONFIG}" --run-level full_model',
+                "jq -se 'length == 1 and (.[0] | .completed == 3 and .failed == 0 and .total_images == 3 "
+                "and .average_pixels_per_image == 1048576 and .request_throughput > 0 and .mean_e2el_ms > 0 "
+                'and .Hardware == "H100" and .experiment_metadata.num_gpus == 2 '
+                'and .experiment_metadata.server_revision == "0.5.22")\' '
+                '"$${BENCHMARK_DIR}"/result_test_sglang_cosmos3_t2i_tp2_*.json',
+            ]
+        ),
+    )
+    return job
+
+
 def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     qwen_performance = cases == ["qwen-image-21-perf"]
     wan_performance = cases == ["wan22-i2v-perf"]
-    if not (qwen_performance or wan_performance) and (
+    cosmos_performance = cases == ["cosmos3-t2i-perf"]
+    if not (qwen_performance or wan_performance or cosmos_performance) and (
         not cases or len(cases) != len(set(cases)) or set(cases) - GPU_COUNTS.keys()
     ):
         raise ValueError(f"Select distinct model keys from: {', '.join(GPU_COUNTS)}")
@@ -145,7 +192,11 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     if wan_performance:
         pipeline["steps"] = [wan_performance_job(benchmark)]
         return pipeline
-    pipeline["steps"] = [image]
+    if cosmos_performance:
+        pipeline["steps"] = [cosmos_performance_job(benchmark)]
+        return pipeline
+    pinned_diagnostics = not weekly and set(cases) <= {"hunyuanvideo15", "minimax-h3"}
+    pipeline["steps"] = [] if pinned_diagnostics else [image]
     if weekly:
         pipeline["steps"].extend(
             [benchmark, weekly_steps["nightly-sglang-omni-qwen3-tts"], qwen_image_performance_job(benchmark)]
@@ -163,10 +214,16 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
         plugin = job["plugins"][0]["github.com/buildkite-plugins/kubernetes-buildkite-plugin"]
         container = plugin["podSpec"]["containers"][0]
         container["resources"]["limits"]["nvidia.com/gpu"] = GPU_COUNTS[case]
+        if pinned_diagnostics:
+            job.pop("depends_on", None)
+            job["env"]["COMPARISON_IMAGE_DIGEST"] = QWEN_IMAGE_DIGEST
+            container["image"] = container["image"].rsplit(":", 1)[0] + "@" + QWEN_IMAGE_DIGEST
         commands = [
             'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
             'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"',
         ]
+        if pinned_diagnostics:
+            commands.insert(0, "set -eu")
         if case in {"minicpm-o", "minicpm-o-perf"}:
             commands.insert(0, "set -eu")
             # Use the same client/voice-conditioning path as the measured case.
@@ -203,6 +260,19 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
                 )
                 job["artifact_paths"].append("tests/dfx/perf/results/result_test_sglang_minicpmo_4_5_*.json")
         else:
+            if case == "hunyuanvideo15" and pinned_diagnostics:
+                commands.extend(
+                    [
+                        "sglang_source_root=\"$$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; "
+                        "print(Path(sglang.__file__).resolve().parent.parent)')\"",
+                        'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" --check '
+                        '"$$PWD/docker/patches/sglang-diffusion-config-only-guider.patch"',
+                        'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" '
+                        '"$$PWD/docker/patches/sglang-diffusion-config-only-guider.patch"',
+                        'CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -m pytest '
+                        "--noconftest -o addopts='' -q tests/dfx/perf/tests/test_sglang_diffusion_loader.py",
+                    ]
+                )
             commands.append(
                 '/opt/sglang/bin/python3 tests/dfx/perf/scripts/run_sglang_diffusion_smoke.py "$${SMOKE_CASE}"'
             )

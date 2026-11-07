@@ -174,6 +174,7 @@ def main() -> None:
         "num_gpus": case.num_gpus,
         "build_id": os.getenv("BUILDKITE_BUILD_ID"),
         "job_id": os.getenv("BUILDKITE_JOB_ID"),
+        "image_digest": os.getenv("COMPARISON_IMAGE_DIGEST"),
         "runner_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
     }
     try:
