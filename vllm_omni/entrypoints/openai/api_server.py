@@ -3439,6 +3439,12 @@ async def download_video(video_id: str) -> Response:
     return response
 
 
+def _raise_for_profiler_rpc_errors(results: list[object] | None) -> None:
+    for result in results or []:
+        if isinstance(result, dict) and result.get("supported") is False:
+            raise RuntimeError(str(result.get("error") or "Profiling is unsupported by a selected stage"))
+
+
 @profiler_router.post("/start_profile")
 async def start_profile(raw_request: Request, request: ProfileRequest | None = None):
     """Start profiling for the engine.
@@ -3467,7 +3473,16 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
                 profile_kwargs["max_iterations"] = request.max_iterations
             if request.profiler_kwargs is not None:
                 profile_kwargs["profiler_kwargs"] = request.profiler_kwargs
-        await engine_client.start_profile(stages=stages, **profile_kwargs)
+        results = await engine_client.start_profile(stages=stages, **profile_kwargs)
+        try:
+            _raise_for_profiler_rpc_errors(results)
+        except RuntimeError:
+            try:
+                cleanup_results = await engine_client.stop_profile(stages=stages)
+                _raise_for_profiler_rpc_errors(cleanup_results)
+            except Exception:
+                logger.exception("Failed to clean up partially started profiler")
+            raise
         logger.info("Profiler started.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
@@ -3493,7 +3508,8 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         stages = request.stages if request else None
         logger.info("Stopping profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        await engine_client.stop_profile(stages=stages)
+        results = await engine_client.stop_profile(stages=stages)
+        _raise_for_profiler_rpc_errors(results)
         logger.info("Profiler stopped.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
