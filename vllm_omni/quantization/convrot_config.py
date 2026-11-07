@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""ConvRot online quantization for diffusion transformers: rotated W8A8 and W4A4.
+"""ConvRot online quantization for diffusion transformers.
 
 ConvRot (arXiv:2512.03673) splits the input dimension of each linear into
 groups of ``rotation_group_size`` channels and rotates every group of both the
@@ -19,6 +19,12 @@ weight packed two values per byte, and runs the product on INT8 tensor cores,
 which compute the INT4 values exactly on GPUs without INT4 MMA (e.g. Hopper).
 Its ``int8_layers`` keep sensitive layers on rotated INT8, the paper's mixed
 W4A4 + INT8 setting.
+
+``convrot_mxfp4`` keeps the same rotation and stores both operands in the
+block-32 MXFP4 format: E2M1 values with one E8M0 scale per 32 input channels.
+``convrot_mxfp8`` uses the same block layout with E4M3 values. vLLM selects the
+MXFP linear kernel for the current device and shape. ``convrot_mxfp4`` can
+additionally route sensitive layers to MXFP8 through ``mxfp8_layers``.
 """
 
 from __future__ import annotations
@@ -30,9 +36,18 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear import (
+    MxFp4LinearKernel,
+    Mxfp8LinearKernel,
+    init_mxfp4_linear_kernel,
+    init_mxfp8_linear_kernel,
+)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
@@ -231,6 +246,116 @@ class DiffusionConvRotInt4Config(DiffusionConvRotConfig):
         return "convrot_int4"  # type: ignore[return-value]
 
 
+class DiffusionConvRotMxfp4Config(DiffusionConvRotConfig):
+    """ConvRot rotated W4A4 MXFP4, optionally mixed with W8A8 MXFP8 layers."""
+
+    weight_bits = 4
+
+    def __init__(
+        self,
+        rotation_group_size: int = DEFAULT_ROTATION_GROUP_SIZE,
+        ignored_layers: list[str] | None = None,
+        int8_layers: list[str] | None = None,
+        mxfp8_layers: list[str] | None = None,
+    ) -> None:
+        if int8_layers:
+            raise ValueError(
+                "convrot_mxfp4 does not support int8_layers; use mxfp8_layers for MXFP8 "
+                "fallback or ignored_layers for BF16"
+            )
+        super().__init__(
+            rotation_group_size=rotation_group_size,
+            ignored_layers=ignored_layers,
+            int8_layers=None,
+        )
+        self.mxfp8_layers = mxfp8_layers or []
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return "convrot_mxfp4"  # type: ignore[return-value]
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 75
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        super().apply_vllm_mapper(hf_to_vllm_mapper)
+        self.mxfp8_layers = hf_to_vllm_mapper.apply_list(self.mxfp8_layers)
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> DiffusionConvRotMxfp4Config:
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None) or cls.get_from_keys_or(
+            config, ["modules_to_not_convert"], None
+        )
+        return cls(
+            rotation_group_size=cls.get_from_keys_or(config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE),
+            ignored_layers=ignored_layers,
+            mxfp8_layers=cls.get_from_keys_or(config, ["mxfp8_layers"], None),
+        )
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
+        if not isinstance(layer, LinearBase):
+            return None
+        if self._matches(prefix, self.ignored_layers):
+            return UnquantizedLinearMethod()
+        if self._matches(prefix, self.mxfp8_layers):
+            return ConvRotMxfp8OnlineLinearMethod(self)
+        return ConvRotMxfp4OnlineLinearMethod(self)
+
+
+class DiffusionConvRotMxfp8Config(DiffusionConvRotConfig):
+    """ConvRot rotated W8A8 with native block-32 MXFP8 tensor-core GEMM."""
+
+    weight_bits = 8
+
+    def __init__(
+        self,
+        rotation_group_size: int = DEFAULT_ROTATION_GROUP_SIZE,
+        ignored_layers: list[str] | None = None,
+        int8_layers: list[str] | None = None,
+    ) -> None:
+        if int8_layers:
+            raise ValueError("convrot_mxfp8 does not support int8_layers; use ignored_layers for BF16 fallback")
+        super().__init__(
+            rotation_group_size=rotation_group_size,
+            ignored_layers=ignored_layers,
+            int8_layers=None,
+        )
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return "convrot_mxfp8"  # type: ignore[return-value]
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 75
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> DiffusionConvRotMxfp8Config:
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None) or cls.get_from_keys_or(
+            config, ["modules_to_not_convert"], None
+        )
+        return cls(
+            rotation_group_size=cls.get_from_keys_or(config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE),
+            ignored_layers=ignored_layers,
+        )
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
+        if not isinstance(layer, LinearBase):
+            return None
+        if self._matches(prefix, self.ignored_layers):
+            return UnquantizedLinearMethod()
+        return ConvRotMxfp8OnlineLinearMethod(self)
+
+
 class ConvRotInt8OnlineLinearMethod(Int8OnlineLinearMethod):
     """Rotated W8A8: per-output-channel INT8 weights and dynamic per-token INT8 activations."""
 
@@ -263,7 +388,7 @@ class ConvRotInt4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         qweight, scale = quantize_int4(_rotated_weight(layer, self.rotation_group_size))
         replace_parameter(layer, "weight", torch.nn.Parameter(pack_int4(qweight), requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(scale.t().contiguous(), requires_grad=False))
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if layer.convrot_hadamard is not None:
@@ -274,3 +399,84 @@ class ConvRotInt4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         # INT4 values are exact in INT8, so INT8 tensor cores compute the W4A4 product.
         out = ops.cutlass_scaled_mm(qx, weight.t(), x_scale, layer.weight_scale, x.dtype, bias)
         return out.reshape(*x.shape[:-1], -1)
+
+
+class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
+    """Rotated block-32 MXFP4 using vLLM's device-selected linear kernel.
+
+    ConvRot rotates the weights and activations. Weight conversion and the
+    dtype/layout required by the activation are delegated to vLLM's MXFP4
+    kernel factory and the selected kernel.
+    """
+
+    def __init__(self, quant_config: DiffusionConvRotMxfp4Config):
+        super().__init__(quant_config._int8)
+        self.rotation_group_size = quant_config.rotation_group_size
+        self.kernel: MxFp4LinearKernel | None = None
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if layer.orig_dtype != torch.bfloat16:
+            raise ValueError("convrot_mxfp4 requires bfloat16 activations")
+
+        weight = _rotated_weight(layer, self.rotation_group_size).to(torch.bfloat16).contiguous()
+        if weight.shape[-1] % 32:
+            raise ValueError(f"convrot_mxfp4 needs an input size divisible by 32, got {weight.shape[-1]}")
+
+        kernel = init_mxfp4_linear_kernel(activation_quant_key=kMxfp4Dynamic)
+        self.kernel = kernel
+        qweight, weight_scale = mxfp4_quantize(weight)
+        layer.params_dtype = layer.orig_dtype
+        replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
+        replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
+        kernel.process_weights_after_loading(layer)
+        self._finish_weight_processing(layer)
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        kernel = self.kernel
+        if kernel is None:
+            raise RuntimeError("convrot_mxfp4 linear kernel is not initialized; process weights first")
+        if layer.convrot_hadamard is not None:
+            x = rotate(x, layer.convrot_hadamard)
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = kernel.apply_weights(layer, rows, bias)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
+class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
+    """Rotated block-32 MXFP8 using vLLM's device-selected linear kernel."""
+
+    def __init__(self, quant_config: DiffusionConvRotConfig):
+        super().__init__(quant_config._int8)
+        self.rotation_group_size = quant_config.rotation_group_size
+        self.kernel: Mxfp8LinearKernel | None = None
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if layer.orig_dtype != torch.bfloat16:
+            raise ValueError("convrot_mxfp8 requires bfloat16 activations")
+
+        weight = _rotated_weight(layer, self.rotation_group_size).to(torch.bfloat16).contiguous()
+        if weight.shape[-1] % 32:
+            raise ValueError(f"convrot_mxfp8 needs an input size divisible by 32, got {weight.shape[-1]}")
+
+        kernel = init_mxfp8_linear_kernel(weight_shape=tuple(weight.shape))
+        self.kernel = kernel
+        qweight, weight_scale = mxfp8_e4m3_quantize(weight)
+        layer.params_dtype = layer.orig_dtype
+        replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
+        replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
+        kernel.process_weights_after_loading(layer)
+        self._finish_weight_processing(layer)
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        kernel = self.kernel
+        if kernel is None:
+            raise RuntimeError("convrot_mxfp8 linear kernel is not initialized; process weights first")
+        if layer.convrot_hadamard is not None:
+            x = rotate(x, layer.convrot_hadamard)
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = kernel.apply_weights(layer, rows, bias)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
