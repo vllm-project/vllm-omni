@@ -9,6 +9,46 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
+  - group: ":full_moon: Wan2.2 Backend Similarity MI300 Nightly"
+    steps:
+      - label: "Wan2.2 Diffusers Backend Similarity"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: diffusion_wan22_accuracy
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-backend-similarity/**/*
+        commands:
+          - |
+            # ROCm similarity gates stay active; latency is recorded for future
+            # per-GPU calibration, without borrowing H100/B200 allowances.
+            if bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh \
+              tests/e2e/accuracy/test_diffusers_backend_similarity.py::test_diffusers_backend_i2v_matches_diffusers \
+              1 diffusion rocm-wan22-backend-similarity; then
+              status=0
+            else
+              status=$$?
+            fi
+            source_dir=tests/e2e/accuracy/artifacts/Wan2_2-I2V-A14B-Diffusers-diffusers-backend
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-wan22-backend-similarity/accuracy"
+            if [[ -d "$$source_dir" ]]; then
+              mkdir -p "$$artifact_dir"
+              cp -a "$$source_dir/." "$$artifact_dir/"
+            fi
+            if [[ "$$status" -eq 0 ]]; then
+              for artifact in vllm_omni.mp4 diffusers.mp4 metrics.json ssim.txt psnr.txt; do
+                if [[ ! -s "$$artifact_dir/$$artifact" ]]; then
+                  echo "Missing Wan2.2 comparison artifact: $$artifact" >&2
+                  status=5
+                fi
+              done
+            fi
+            (exit "$$status")
+
   # Full weights and existing response validators. ROCm uses the legacy V1
   # path (the deploy default); these jobs do not qualify the CUDA MRV2 path.
   - group: ":full_moon: MiniCPM-o Full-Model Modalities MI300 Nightly"

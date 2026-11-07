@@ -636,6 +636,10 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_wan22_expansion.py
 
   diffusion_wan22_accuracy:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
     - *wan22
     - tests/e2e/accuracy/wan22_i2v/
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
