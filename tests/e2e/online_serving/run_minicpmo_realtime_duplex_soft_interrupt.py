@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Validate MiniCPM-o Realtime duplex soft-interrupt delta streaming.
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
@@ -15,15 +18,14 @@ import hashlib
 import io
 import json
 import sys
-import uuid
 import wave
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
-AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
+AUDIO_DELTA_EVENTS = {"response.output_audio.delta"}
 TRANSCRIPT_DELTA_EVENTS = {
-    "response.audio_transcript.delta",
+    "response.output_audio_transcript.delta",
     "response.output_text.delta",
 }
 
@@ -409,10 +411,9 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         str(args.chunk_ms),
         "--timeout-s",
         str(args.timeout_s),
-        "--session-id",
-        f"duplex-soft-interrupt-{uuid.uuid4().hex}",
     ]
-    command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
+    if args.ref_audio is not None:
+        command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
     temperature = getattr(args, "temperature", None)
     if temperature is None and args.validation_mode == "response-required":
         temperature = 0.0
@@ -473,7 +474,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--input-wav", required=True)
-    parser.add_argument("--ref-audio", required=True)
+    parser.add_argument(
+        "--ref-audio",
+        help="Optional reference WAV; the MiniCPM-o server uses the bundled prompt when omitted.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--summary-output")
     parser.add_argument("--chunk-ms", type=int, default=200)

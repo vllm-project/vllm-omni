@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Released-checkpoint MAGI-2 Preview serving smoke on four H100 GPUs.
+"""Released-checkpoint MAGI-2 Preview serving smoke on four CUDA GPUs or Ascend NPUs.
 
 This is a one-step 272p load/dispatch test, not a quality or performance test.
 It exercises the recommended resident SP4 topology through ``/v1/videos``.
 
 From ``tests/``::
 
-    pytest -s -v e2e/online_serving/test_magi2.py -m "advanced_model and diffusion" --run-level=advanced_model
+    pytest -s -v e2e/online_serving/test_magi2.py -m "slow and diffusion" --run-level=full_model
 """
 
 import json
@@ -25,10 +25,10 @@ MODEL = "sand-ai/MAGI-2-preview"
 PROMPT = "A red fox walks through fresh snow while wind moves the pine branches."
 
 FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=4)
+NPU_FOUR_CARD_MARKS = hardware_marks(res={"npu": "A5"}, num_cards=4)
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -50,7 +50,30 @@ FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=4)
             ),
             id="resident_sp4_272p_one_step",
             marks=FOUR_CARD_MARKS,
-        )
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--model-class-name",
+                    "Magi2Pipeline",
+                    "--num-gpus",
+                    "4",
+                    "--tensor-parallel-size",
+                    "1",
+                    "--ulysses-degree",
+                    "4",
+                    "--enforce-eager",
+                    "--stage-overrides",
+                    '{"0":{"pin_cpu_memory":false}}',
+                ],
+                init_timeout=3600,
+                stage_init_timeout=3600,
+                startup_timeout=3600,
+            ),
+            id="npu_resident_sp4_272p_one_step",
+            marks=NPU_FOUR_CARD_MARKS,
+        ),
     ],
     indirect=True,
 )

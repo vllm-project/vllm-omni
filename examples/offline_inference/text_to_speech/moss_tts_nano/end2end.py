@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline inference example for MOSS-TTS-Nano via vLLM-Omni.
 
 Single-stage pipeline: the 0.1B AR LM and MOSS-Audio-Tokenizer-Nano codec
@@ -136,21 +136,20 @@ def main(args) -> None:
     )
     params_list = sampling_params
 
-    for stage_outputs in omni.generate(inputs, params_list):
-        for i, req_output in enumerate(stage_outputs):
-            for j, out in enumerate(req_output.outputs):
-                mm = out.multimodal_output
-                if mm is None:
-                    print(f"  [req {i}] No audio output.")
-                    continue
-                audio = mm.get("audio")
-                sr_tensor = mm.get("sr")
-                if audio is None:
-                    print(f"  [req {i}] No waveform in multimodal_output.")
-                    continue
-                sr = int(sr_tensor.item()) if sr_tensor is not None else 48000
-                out_path = str(output_dir / f"output_{i}_{j}.wav")
-                save_audio(audio.cpu(), out_path, sr)
+    for i, req_output in enumerate(omni.generate(inputs, params_list)):
+        for j, out in enumerate(req_output.outputs):
+            mm = out.multimodal_output
+            if mm is None:
+                print(f"  [req {i}] No audio output.")
+                continue
+            audio = mm.get("audio")
+            sr_tensor = mm.get("sr")
+            if audio is None:
+                print(f"  [req {i}] No waveform in multimodal_output.")
+                continue
+            sr = int(sr_tensor.item()) if sr_tensor is not None else 48000
+            out_path = str(output_dir / f"output_{i}_{j}.wav")
+            save_audio(audio.cpu(), out_path, sr)
 
     print("Done.")
 

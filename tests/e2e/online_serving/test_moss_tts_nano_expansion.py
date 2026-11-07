@@ -84,7 +84,7 @@ tts_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -106,7 +106,7 @@ def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> No
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -138,7 +138,7 @@ def test_text_to_audio_002(omni_server, online_client, ref_audio_data_url) -> No
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_003(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -160,7 +160,7 @@ def test_text_to_audio_003(omni_server, online_client, ref_audio_data_url) -> No
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_004_ref_text_ignored(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -181,3 +181,23 @@ def test_text_to_audio_004_ref_text_ignored(omni_server, online_client, ref_audi
     }
 
     online_client.send_audio_speech_request(request_config)
+
+
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_text_to_audio_005_concurrent_requests_are_serialized(omni_server, online_client, ref_audio_data_url) -> None:
+    """Concurrent clients produce identical audio when generation is serialized."""
+    request_config = {
+        "model": omni_server.model,
+        "input": "Concurrent clients should receive clean and deterministic speech.",
+        "stream": False,
+        "response_format": "wav",
+        "ref_audio": ref_audio_data_url,
+        "seed": 42,
+    }
+
+    responses = online_client.send_audio_speech_request(request_config, request_num=2)
+
+    assert len(responses) == 2
+    assert responses[0].audio_bytes
+    assert responses[0].audio_bytes == responses[1].audio_bytes

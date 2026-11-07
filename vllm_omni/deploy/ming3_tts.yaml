@@ -1,0 +1,30 @@
+# Default single-stage Ming3-TTS for 64 streams: Stage 0 decodes
+# its latents with the AudioVAE decoder and returns PCM itself (no AudioVAE
+# stage, no connector). Each step decodes every stream's newest latent in one
+# pass; a request that halts runs one more step, in which its last latent is
+# flushed, and stops there.
+pipeline: ming3_tts
+model_runner: v2
+async_chunk: true
+trust_remote_code: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    enforce_eager: false
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    # Batch new arrivals under load; this wait contributes to first-audio latency.
+    additional_config:
+      ar_prefill_admission_min_batch: 8
+      ar_prefill_admission_max_wait_ms: 150
+      ar_prefill_admission_min_running: 32
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+      cudagraph_num_of_warmups: 1

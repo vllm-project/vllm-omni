@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -16,7 +16,13 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
-from tests.e2e.accuracy.helpers import assert_video_metadata, assert_video_similarity_metrics, probe_video
+from tests.e2e.accuracy.helpers import (
+    assert_video_metadata,
+    assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
+    probe_video,
+    write_accuracy_result,
+)
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
@@ -44,7 +50,7 @@ SSIM_THRESHOLDS = {
 }
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.skipif(
         not GOLDEN_BASE_URL,
@@ -169,6 +175,7 @@ def _validate_metadata(payload: Any, manifest: dict[str, Any], variant: str, tas
 
 def _download_case(variant: str, task: str, output_dir: Path, filenames: set[str]) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    assert GOLDEN_BASE_URL is not None
     base_url = f"{GOLDEN_BASE_URL.rstrip('/')}/{variant}/{task}"
     response = requests.get(f"{base_url}/manifest.json", timeout=60)
     response.raise_for_status()
@@ -201,6 +208,7 @@ def test_sana_video_transformer_matches_frozen_golden(
     variant: str,
     _hardware,
     accuracy_artifact_root: Path,
+    sana_model_parallel,
 ) -> None:
     del _hardware
     from vllm.config import LoadConfig
@@ -314,15 +322,38 @@ def test_sana_video_pipeline_matches_frozen_golden(
 
     metadata = probe_video(actual_path)
     assert_video_metadata(metadata, width=width, height=height, fps=16, frame_count=81)
-    assert_video_similarity_metrics(
-        label=f"sana_video_{variant}_{task}",
+    # The native prompt cross-attention uses vLLM-Omni Attention rather
+    # than Diffusers SDPA. Frozen stage checks prove exact inputs and
+    # scheduler state, while the BF16 backend reduction difference grows
+    # across CFG denoising. Calibrate only the affected 480p T2V case;
+    # its frozen result is 0.919861 SSIM / 28.7442 dB PSNR.
+    label = f"sana_video_{variant}_{task}"
+    ssim_threshold = SSIM_THRESHOLDS[(variant, task)]
+    psnr_threshold = 28.0
+    ssim, psnr = measure_video_similarity_metrics(
+        label=label,
         online_path=actual_path,
         offline_path=golden_path,
-        # The native prompt cross-attention uses vLLM-Omni Attention rather
-        # than Diffusers SDPA. Frozen stage checks prove exact inputs and
-        # scheduler state, while the BF16 backend reduction difference grows
-        # across CFG denoising. Calibrate only the affected 480p T2V case;
-        # its frozen result is 0.919861 SSIM / 28.7442 dB PSNR.
-        ssim_threshold=SSIM_THRESHOLDS[(variant, task)],
-        psnr_threshold=28.0,
+    )
+    write_accuracy_result(
+        model_id=label,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": ssim_threshold, "psnr": psnr_threshold},
+        extra={
+            "label": label,
+            "variant": variant,
+            "task": task,
+            "online_video": str(actual_path),
+            "offline_video": str(golden_path),
+        },
+    )
+    assert_video_similarity_metrics(
+        label=label,
+        online_path=actual_path,
+        offline_path=golden_path,
+        ssim_threshold=ssim_threshold,
+        psnr_threshold=psnr_threshold,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 from unittest.mock import AsyncMock
 
@@ -5,14 +8,14 @@ import pytest
 from openai.types.chat import ChatCompletionUserMessageParam
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio
 from starlette.requests import Request
-from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
 )
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
+from vllm.renderers.chat_utils import ChatCompletionMessageParam
 
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 

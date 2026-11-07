@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 from transformers import Qwen2Config
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.mammoth_moda2 import mammoth_moda2
 from vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2 import (
@@ -164,6 +165,7 @@ def embedding_model():
     nn.Module.__init__(model)
     model.extra_gen_vocab = True
     model.gen_vocab_start_index = 4
+    model.base_vocab_size = 4
     model.config = Qwen2Config(hidden_size=3, num_attention_heads=1, num_key_value_heads=1)
     model.embed_tokens = nn.Embedding.from_pretrained(torch.arange(12.0).reshape(4, 3))
     model.gen_embed_tokens = nn.Embedding.from_pretrained(torch.arange(9.0).reshape(3, 3) + 100)
@@ -243,6 +245,13 @@ def test_token_routing_builder_produces_complete_disjoint_partition(mask_values)
     assert sorted(generation_positions.tolist() + base_positions.tolist()) == list(range(len(mask_values)))
 
 
+@pytest.mark.parametrize("mask_values", [[], [False, False], [True, True], [False, True, False, True]])
+def test_token_routing_builder_defers_to_mask_during_capture(monkeypatch, mask_values):
+    monkeypatch.setattr(mammoth_moda2, "_is_graph_capturing", lambda device: True)
+
+    assert _build_token_routing(torch.tensor(mask_values, dtype=torch.bool)) is None
+
+
 class _PassthroughNorm(nn.Module):
     def forward(self, hidden_states, residual=None):
         if residual is None:
@@ -260,13 +269,16 @@ class _PassthroughAttention(nn.Module):
     [(MammothModa2Qwen2ForCausalLM, Mammoth2DecoderLayer), (MammothModa2Qwen3ForCausalLM, Mammoth3DecoderLayer)],
 )
 @pytest.mark.parametrize("input_mode", ["ids", "ids_and_embeds", "embeds_only"])
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("first_rank", [True, False])
 def test_forward_reuses_routing_and_preserves_inputs_embeds_contract(
-    embedding_model, monkeypatch, model_class, layer_class, input_mode
+    embedding_model, monkeypatch, model_class, layer_class, input_mode, capturing, first_rank
 ):
     model = model_class.__new__(model_class)
     nn.Module.__init__(model)
     model.extra_gen_vocab = embedding_model.extra_gen_vocab
     model.gen_vocab_start_index = embedding_model.gen_vocab_start_index
+    model.base_vocab_size = embedding_model.base_vocab_size
     model.config = embedding_model.config
     model.embed_tokens = embedding_model.embed_tokens
     model.gen_embed_tokens = embedding_model.gen_embed_tokens
@@ -289,12 +301,18 @@ def test_forward_reuses_routing_and_preserves_inputs_embeds_contract(
     model.layers = nn.ModuleList(layers)
     model.start_layer, model.end_layer = 0, len(layers)
     model.norm = _PassthroughNorm()
-    monkeypatch.setattr(mammoth_moda2, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
+    monkeypatch.setattr(
+        mammoth_moda2, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank, is_last_rank=True)
+    )
+    monkeypatch.setattr(mammoth_moda2, "_is_graph_capturing", lambda device: capturing)
     routing_calls = []
 
     def record_routing(mask):
         routing_calls.append(mask)
-        return _build_token_routing(mask)
+        routing = _build_token_routing(mask)
+        if capturing:
+            assert routing is None
+        return routing
 
     monkeypatch.setattr(mammoth_moda2, "_build_token_routing", record_routing)
     input_ids = torch.tensor([0, 4, 6, 2])
@@ -312,10 +330,28 @@ def test_forward_reuses_routing_and_preserves_inputs_embeds_contract(
         else supplied_embeds
     )
 
+    intermediate_tensors = None
+    if not first_rank:
+        tensors = {"hidden_states": initial, "residual": None}
+        if input_mode != "embeds_only":
+            tensors["gen_token_mask"] = input_ids >= 4
+        intermediate_tensors = IntermediateTensors(tensors)
+
+    if capturing and input_mode == "embeds_only":
+        with pytest.raises(RuntimeError, match="requires gen_token_mask"):
+            model(
+                input_ids=None,
+                positions=torch.arange(4),
+                inputs_embeds=supplied_embeds,
+                intermediate_tensors=intermediate_tensors,
+            )
+        return
+
     output = model(
-        input_ids=input_ids if input_mode != "embeds_only" else None,
+        input_ids=input_ids if first_rank and input_mode != "embeds_only" else None,
         positions=torch.arange(4),
         inputs_embeds=supplied_embeds if input_mode != "ids" else None,
+        intermediate_tensors=intermediate_tensors,
     )
 
     expected = initial

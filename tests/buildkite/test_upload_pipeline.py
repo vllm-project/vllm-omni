@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+import ast
+import copy
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -10,18 +15,26 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
+from ci_conditions import NIGHTLY_LABEL_IF, RELEASE_LINE_BUILDKITE_PATTERN  # noqa: E402
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
+    CUDA_HF_TOKEN_EXPORT,
+    _changed_files_for_source_filter,
     _expand_mirror_hardwares,
     _get_mirror_hw_selector,
     _load_bootstrap_steps,
+    _load_mirror_hardwares,
+    _load_source_file_dependencies,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
+    _resolve_source_file_dependencies,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
+NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
@@ -73,11 +86,16 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     by_key = {step["key"]: step for step in doc["steps"]}
     assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
     assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-ready-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
     assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
     assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-merge-pipeline"]["if"]
+    assert "build.pull_request.id == null" in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-nightly-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-weekly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
     assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
@@ -98,6 +116,27 @@ def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
     by_key = {step["key"]: step for step in doc["steps"]}
     assert "upload-ready-pipeline" not in by_key
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
+
+
+def test_nightly_label_if_is_only_nightly_test() -> None:
+    assert 'labels includes "nightly-test"' in NIGHTLY_LABEL_IF
+    forbidden = (
+        'includes "omni-test"',
+        'includes "tts-test"',
+        'includes "diffusion-x2iat-test"',
+        'includes "diffusion-x2v-test"',
+    )
+    for needle in forbidden:
+        assert needle not in NIGHTLY_LABEL_IF
+    for path in (
+        Path(".buildkite/cuda/test-nightly.yml"),
+        Path(".buildkite/npu/test-npu-nightly.yml"),
+        Path(".buildkite/common/scripts/ci_conditions.py"),
+        Path(".buildkite/common/scripts/upload_pipeline.py"),
+    ):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            assert needle not in text, f"{path} still references {needle}"
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
@@ -133,6 +172,7 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
     assert step["retry"] == {
+        "manual": {"permit_on_passed": True},
         "automatic": [
             {"exit_status": -1, "limit": 1},
             {"exit_status": 128, "limit": 1},
@@ -143,6 +183,43 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
     assert container["image"].endswith("$BUILDKITE_COMMIT")
     assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+    env_names = {item["name"] for item in container["env"]}
+    assert "VLLM_CI_HF_TOKEN" in env_names
+    assert "HF_TOKEN" not in env_names
+    assert step["commands"] == [
+        CUDA_HF_TOKEN_EXPORT,
+        "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+        "pytest -sv tests/example",
+    ]
+
+
+def test_every_hardware_preset_uses_shared_retry() -> None:
+    presets = _load_mirror_hardwares()
+    assert presets
+    for preset in presets.values():
+        assert preset["retry"]["manual"] == {"permit_on_passed": True}
+        assert preset["retry"]["automatic"] == [
+            {"exit_status": -1, "limit": 1},
+            {"exit_status": 128, "limit": 1},
+            {"signal_reason": "agent_stop", "limit": 1},
+            {"signal_reason": "agent_refused", "limit": 1},
+        ]
+
+
+def test_cpu_step_does_not_gain_hardware_retry() -> None:
+    rendered = _render_test_pipeline(
+        {
+            "steps": [
+                {
+                    "label": "CPU report",
+                    "commands": ["echo ok"],
+                    "agents": {"queue": "medium_cpu_queue_premerge"},
+                },
+            ],
+        },
+        changed_files=None,
+    )
+    assert "retry" not in rendered["steps"][0]
 
 
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
@@ -154,6 +231,7 @@ def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
         },
     )
     assert step["retry"] == {"automatic": [{"exit_status": 255, "limit": 2}]}
+    assert "manual" not in step["retry"]
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
@@ -182,6 +260,37 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     assert step["plugins"][0]["kubernetes"]["podSpecPatch"]["imagePullSecrets"] == [
         {"name": "swr-secret"},
     ]
+    assert step["commands"] == ["pytest -sv tests/example"]
+
+
+def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
+    for name in (
+        "l4_1",
+        "l4_2",
+        "l4_3",
+        "l4_4",
+        "h100_1",
+        "h100_2",
+        "h100_3",
+        "h100_4",
+        "b200_1",
+        "b200_2",
+        "b200_3",
+        "b200_4",
+    ):
+        step = _expand_mirror_hardwares(
+            {"label": name, "mirror_hardwares": name, "commands": ["pytest -sv tests/example"]},
+        )
+        assert step is not None
+        container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+        env_names = {item["name"] for item in container["env"]}
+        assert "VLLM_CI_HF_TOKEN" in env_names
+        assert "HF_TOKEN" not in env_names
+        assert step["commands"][0] == CUDA_HF_TOKEN_EXPORT
+        assert step["commands"][1:] == [
+            "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+            "pytest -sv tests/example",
+        ]
 
 
 def _gpu_limit(step: dict) -> int:
@@ -308,8 +417,54 @@ def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytes
 
 
 def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
-    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "cpu_queue_premerge"}}
+    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "medium_cpu_queue_premerge"}}
     assert _expand_mirror_hardwares(step) is step
+
+
+def _leaf_steps(steps: list) -> list[dict]:
+    leaves: list[dict] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        nested = step.get("steps")
+        if nested is not None:
+            leaves.extend(_leaf_steps(nested))
+        else:
+            leaves.append(step)
+    return leaves
+
+
+def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nightly inferred jobs share card counts across H100/L4 and B200 mirrors."""
+    src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    pytest_leaves = [step for step in _leaf_steps(src["steps"]) if "pytest" in str(step.get("commands"))]
+    inferred_leaves = [step for step in pytest_leaves if "mirror_hardwares" not in step]
+    pinned_leaves = [step for step in pytest_leaves if "mirror_hardwares" in step]
+    assert inferred_leaves
+
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    default_by_label = {
+        step["label"]: step for step in _leaf_steps(_render_test_pipeline(src, changed_files=None)["steps"])
+    }
+
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    b200_src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    b200_by_label = {
+        step["label"]: step for step in _leaf_steps(_render_test_pipeline(b200_src, changed_files=None)["steps"])
+    }
+
+    pytest_labels = {step["label"] for step in inferred_leaves}
+    pinned_labels = {step["label"] for step in pinned_leaves}
+    assert pinned_labels <= set(default_by_label)
+    assert pinned_labels.isdisjoint(b200_by_label)
+    assert pytest_labels <= set(default_by_label)
+    assert pytest_labels <= set(b200_by_label)
+    for label in pytest_labels:
+        default_step = default_by_label[label]
+        b200_step = b200_by_label[label]
+        assert default_step["agents"]["queue"] in {"mithril-h100-pool", "l4-k8s"}
+        assert b200_step["agents"]["queue"] == "b200-k8s"
+        assert _gpu_limit(default_step) == _gpu_limit(b200_step)
 
 
 @pytest.mark.parametrize(("raw", "expected"), [("", ""), ("  ", ""), ("b200", "b200"), ("B200", "b200")])
@@ -334,8 +489,17 @@ def test_mirror_hw_typo_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:
-    rendered = _render_test_pipeline(doc, changed_files=changed_files)
+def _surviving_labels(
+    doc: dict,
+    changed_files: list[str],
+    *,
+    pipeline_path: Path | None = None,
+) -> set[str]:
+    rendered = _render_test_pipeline(
+        doc,
+        changed_files=changed_files,
+        pipeline_path=pipeline_path,
+    )
     labels: set[str] = set()
 
     def walk(steps: list | None) -> None:
@@ -348,6 +512,86 @@ def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:
 
     walk(rendered.get("steps"))
     return labels
+
+
+def _iter_steps(doc: dict):
+    def walk(steps: list | None):
+        for step in steps or []:
+            if not isinstance(step, dict):
+                continue
+            yield step
+            yield from walk(step.get("steps"))
+
+    yield from walk(doc.get("steps"))
+
+
+@pytest.mark.parametrize(
+    "pipeline_path,legacy_keys",
+    [
+        (
+            NIGHTLY_YAML,
+            {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
+        ),
+        (
+            Path(".buildkite/npu/test-npu-nightly.yml"),
+            {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "changed_file,select_legacy",
+    [
+        ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
+        ("vllm_omni/clients/duplex.py", False),
+        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
+        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
+        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
+        ("tests/dfx/perf/scripts/run_benchmark.py", True),
+    ],
+)
+def test_qwen3_perf_pipeline_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_path: Path,
+    legacy_keys: set[str],
+    changed_file: str,
+    select_legacy: bool,
+) -> None:
+    """Keep realtime-only inputs from selecting legacy CUDA/NPU perf jobs."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    _load_source_file_dependencies.cache_clear()
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=[changed_file], pipeline_path=pipeline_path)
+    surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
+
+    # Compare the dependency-filtered Qwen perf jobs.
+    expected_keys = set(legacy_keys) if select_legacy else set()
+    assert surviving_keys & legacy_keys == expected_keys
+
+
+def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
+    doc = yaml.safe_load(AMD_MERGE_YAML.read_text(encoding="utf-8"))
+    jobs = {
+        step["label"]: "\n".join(step.get("commands", []))
+        for step in _iter_steps(doc)
+        if step.get("label", "").startswith("Diffusion · Wan22")
+    }
+
+    assert set(jobs) == {
+        "Diffusion · Wan22 Offline Test",
+        "Diffusion · Wan22 Online Test",
+    }
+    offline = jobs["Diffusion · Wan22 Offline Test"]
+    online = jobs["Diffusion · Wan22 Online Test"]
+    assert "timeout 40m" in offline
+    assert "timeout 40m" in online
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" in offline
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" not in offline
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" in online
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" not in online
 
 
 # Synthetic coverage-style job: shared inputs that change what the split measures.
@@ -394,3 +638,488 @@ def test_coverage_shared_inputs_ignored_for_unrelated_change() -> None:
     )
     assert "Coverage Pilot" not in labels
     assert "Unrelated Model Test" not in labels
+
+
+def _pipeline_dep_keys(path: Path) -> set[str]:
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    keys: set[str] = set()
+
+    def walk(steps: list | None) -> None:
+        for step in steps or []:
+            if not isinstance(step, dict):
+                continue
+            deps = step.get("source_file_dependencies")
+            if isinstance(deps, str) and "/" not in deps:
+                keys.add(deps)
+            elif isinstance(deps, list) and deps and all("/" not in item for item in deps):
+                keys.update(deps)
+            walk(step.get("steps"))
+
+    walk((doc or {}).get("steps"))
+    return keys
+
+
+def test_pipeline_source_file_dependency_keys_are_registered() -> None:
+    _load_source_file_dependencies.cache_clear()
+    registry = _load_source_file_dependencies()
+    used = (
+        _pipeline_dep_keys(Path(".buildkite/cuda/test-ready.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/cuda/test-merge.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/cuda/test-nightly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/cuda/test-weekly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-nightly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-weekly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/npu/test-npu-nightly.yml"))
+    )
+    missing = used - set(registry)
+    assert not missing, f"unregistered source_file_dependencies keys: {sorted(missing)}"
+
+
+def test_source_file_dependencies_key_expands_from_registry() -> None:
+    doc = {
+        "steps": [
+            {
+                "label": "Diffusion · Qwen Image Test",
+                "source_file_dependencies": "diffusion_qwen_image_function",
+                "commands": ["pytest"],
+            },
+        ],
+    }
+    assert "Diffusion · Qwen Image Test" in _surviving_labels(
+        doc,
+        ["vllm_omni/diffusion/models/qwen_image/transformer.py"],
+    )
+    assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
+
+
+def test_npu_platform_change_does_not_select_shared_minimax_h3_jobs() -> None:
+    doc = {
+        "steps": [
+            {"label": key, "source_file_dependencies": key, "commands": ["pytest"]}
+            for key in ("diffusion_minimax_h3_function", "diffusion_minimax_h3_accuracy", "diffusion_minimax_h3_perf")
+        ]
+    }
+    assert not _surviving_labels(doc, ["vllm_omni/platforms/npu/platform.py"])
+
+
+@pytest.mark.parametrize("pipeline", ["test-ready.yml", "test-merge.yml", "test-nightly.yml"])
+def test_sensenova_accuracy_is_not_in_daily_pipelines(pipeline: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda") / pipeline
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=None, pipeline_path=path)
+    assert not any("SenseNova-U1" in step.get("label", "") for step in _iter_steps(rendered))
+
+
+@pytest.mark.parametrize("mode", ["text2img", "img2img"])
+def test_sensenova_accuracy_uses_weekly_mark(mode: str) -> None:
+    path = Path(f"tests/e2e/offline_inference/test_sensenova_u1_{mode}_expansion.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    case = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == f"test_sensenova_u1_{mode}_pixel_accuracy"
+    )
+    marks = {ast.unparse(mark) for mark in case.decorator_list}
+    assert "pytest.mark.slow" in marks
+    assert not marks & {"pytest.mark.core_model", "pytest.mark.advanced_model", "pytest.mark.full_model"}
+
+
+@pytest.mark.parametrize(
+    ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
+    [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],
+)
+def test_sensenova_weekly_runs_each_accuracy_case_once_and_preserves_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    smoke_exit: int,
+    text2img_exit: int,
+    img2img_exit: int,
+    expected_exit: int,
+) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=None, pipeline_path=path, e2e_only=True)
+    group = next(step for step in rendered["steps"] if "E2E" in step.get("group", ""))
+    assert group["if"] == 'build.env("NON_CRITICAL") == "1"'
+    steps = [step for step in _iter_steps(rendered) if "SenseNova-U1" in step.get("label", "")]
+    assert len(steps) == 1
+    step = steps[0]
+    assert step["artifact_paths"] == ["sensenova-accuracy/**/*"]
+    calls_path = tmp_path / "pytest-calls.jsonl"
+    # Run the actual weekly shell command with a lightweight pytest executable:
+    # this checks failure propagation without importing vLLM or requiring a GPU.
+    (tmp_path / "pytest").write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['PYTEST_CALLS'], 'a') as output:\n"
+        "    output.write(json.dumps({'args': sys.argv[1:], 'artifacts': os.environ.get('SENSENOVA_U1_ARTIFACT_DIR')}) + '\\n')\n"
+        "args = ' '.join(sys.argv[1:])\n"
+        "case = 'TEXT2IMG' if 'text2img_pixel_accuracy' in args else 'IMG2IMG' if 'img2img_pixel_accuracy' in args else 'SMOKE'\n"
+        "sys.exit(int(os.environ['EXIT_' + case]))\n"
+    )
+    (tmp_path / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("PYTEST_CALLS", str(calls_path))
+    monkeypatch.setenv("BUILDKITE_COMMIT", "test-head")
+    for case, status in (("SMOKE", smoke_exit), ("TEXT2IMG", text2img_exit), ("IMG2IMG", img2img_exit)):
+        monkeypatch.setenv(f"EXIT_{case}", str(status))
+    # Hardware expansion prepends GPU runtime checks. Exercise the workload
+    # script itself here; Buildkite unescapes $$ before the agent executes it.
+    source_step = next(source for source in _iter_steps(doc) if source.get("label") == step["label"])
+    command = "\n".join(source_step["commands"]).replace("$$", "$")
+    result = subprocess.run(["bash", "-e", "-c", command], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == expected_exit, result.stderr
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    assert len(calls) == 3
+    assert all(call["artifacts"] == "sensenova-accuracy" for call in calls)
+    smoke_args = calls[0]["args"]
+    assert smoke_args[smoke_args.index("-k") + 1] == "not pixel_accuracy"
+    for call, mode in zip(calls[1:], ("text2img", "img2img")):
+        args = call["args"]
+        assert args[1] == (
+            f"tests/e2e/offline_inference/test_sensenova_u1_{mode}_expansion.py"
+            f"::test_sensenova_u1_{mode}_pixel_accuracy"
+        )
+        assert args[args.index("-m") + 1] == "slow and diffusion and cuda and H100 and cards_1"
+        assert args[args.index("--run-level") + 1] == "full_model"
+
+
+def test_registry_lists_pytest_targets() -> None:
+    _load_source_file_dependencies.cache_clear()
+    resolved = _resolve_source_file_dependencies(
+        {
+            "label": "Diffusion · Wan22 Test",
+            "source_file_dependencies": "diffusion_wan22_function",
+            "commands": [
+                "pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py "
+                "tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model'",
+            ],
+        },
+    )
+    assert resolved is not None
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" in resolved
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" in resolved
+    assert "vllm_omni/diffusion/models/wan2_2/" in resolved
+
+
+def test_coverage_key_lists_offline_online_scripts() -> None:
+    resolved = _resolve_source_file_dependencies(
+        {
+            "label": "TTS · Qwen3-TTS Base Test",
+            "source_file_dependencies": "tts_qwen3_tts_cov",
+            "commands": [
+                ".buildkite/common/scripts/run_cov_split.sh \\\n"
+                "  --offline tests/e2e/offline_inference/test_qwen3_tts_base.py \\\n"
+                "  --online tests/e2e/online_serving/test_qwen3_tts_base.py",
+            ],
+        },
+    )
+    assert resolved is not None
+    assert "tests/e2e/offline_inference/test_qwen3_tts_base.py" in resolved
+    assert "tests/e2e/online_serving/test_qwen3_tts_base.py" in resolved
+    assert ".buildkite/common/scripts/run_cov_split.sh" in resolved
+    assert "pyproject.toml" in resolved
+
+
+def test_source_file_dependencies_list_of_keys_concatenates() -> None:
+    resolved = _resolve_source_file_dependencies(
+        {
+            "label": "composed",
+            "source_file_dependencies": ["omni_qwen3_omni_function", "tts_qwen3_tts_function"],
+        },
+    )
+    assert resolved is not None
+    assert "vllm_omni/model_executor/models/qwen3_omni/" in resolved
+    assert "vllm_omni/model_executor/models/qwen3_tts/" in resolved
+    assert resolved.count("vllm_omni/model_executor/models/common/snake_activation.py") == 1
+
+
+def test_unknown_source_file_dependencies_key() -> None:
+    with pytest.raises(ValueError, match="unknown source_file_dependencies"):
+        _render_test_pipeline(
+            {"steps": [{"label": "bad", "source_file_dependencies": "not_a_real_key"}]},
+            changed_files=None,
+        )
+
+
+def test_source_file_dependencies_rejects_mixed_keys_and_paths() -> None:
+    with pytest.raises(ValueError, match="mixes registry keys and path prefixes"):
+        _resolve_source_file_dependencies(
+            {
+                "label": "bad",
+                "source_file_dependencies": ["omni_qwen3_omni_function", "tests/e2e/online_serving/test_qwen3_omni.py"],
+            },
+        )
+
+
+# Synthetic pipeline: selection depends only on listed deps, not on live job names.
+_SOURCE_FILTER_DOC = {
+    "steps": [
+        {
+            "group": "E2E Tests",
+            "if": 'build.env("NON_CRITICAL") == "1"',
+            "steps": [
+                {
+                    "label": "Dedicated E2E",
+                    "commands": ["pytest -sv tests/e2e/online_serving/test_magi2.py"],
+                },
+            ],
+        },
+        {
+            "label": "Omni Sweep",
+            "source_file_dependencies": ["tests/e2e/online_serving/test_qwen3_omni.py"],
+            "commands": ["pytest -sv tests/e2e/ -m omni"],
+        },
+        {
+            "label": "Z-Image Function",
+            "source_file_dependencies": [
+                "tests/e2e/online_serving/test_zimage_expansion.py",
+                "vllm_omni/diffusion/models/z_image/",
+            ],
+            "mirror_hardwares": "l4_4",
+            "commands": ["pytest -sv tests/e2e/online_serving/test_zimage_expansion.py"],
+        },
+        {
+            "label": "Tiny Model",
+            "source_file_dependencies": ["tests/e2e/online_serving/test_tiny.py"],
+            "commands": ["pytest -sv tests/e2e/ -m tiny"],
+        },
+        {
+            "label": "Wan Function",
+            "source_file_dependencies": [
+                "tests/e2e/offline_inference/test_wan22_t2v.py",
+                "tests/e2e/online_serving/test_wan22_t2v.py",
+                "vllm_omni/diffusion/models/wan2_2/",
+            ],
+            "commands": ["pytest -sv tests/e2e/offline_inference/test_wan22_t2v.py"],
+        },
+        {
+            "label": "Wan Perf",
+            "source_file_dependencies": ["vllm_omni/diffusion/models/wan2_2/"],
+            "commands": ["pytest -sv tests/dfx/perf/scripts/run_benchmark.py"],
+        },
+        {
+            "label": "Doc Test",
+            "source_file_dependencies": [
+                "tests/examples/offline_inference/test_text_to_image.py",
+                "tests/examples/online_serving/test_text_to_image.py",
+                "vllm_omni/diffusion/models/qwen_image/",
+                "vllm_omni/diffusion/models/z_image/",
+            ],
+            "commands": ["pytest -sv tests/examples/*/test_text_to_image.py"],
+        },
+    ],
+}
+
+
+def test_source_filter_ignores_unrelated_e2e_file() -> None:
+    """A sweep command is not a dependency; only listed paths select a keyed job."""
+    labels = _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_magi2.py"])
+    assert labels == {"Dedicated E2E"}
+
+
+def test_source_filter_selects_job_by_listed_script_not_sibling() -> None:
+    labels = _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_zimage_expansion.py"])
+    assert labels == {"Dedicated E2E", "Z-Image Function"}
+
+
+def test_source_filter_selects_every_job_sharing_a_path() -> None:
+    labels = _surviving_labels(_SOURCE_FILTER_DOC, ["vllm_omni/diffusion/models/wan2_2/transformer.py"])
+    assert labels == {"Dedicated E2E", "Wan Function", "Wan Perf"}
+
+
+def test_source_filter_selects_composed_doc_job_by_example_or_model() -> None:
+    for changed in (
+        "tests/examples/online_serving/test_text_to_image.py",
+        "vllm_omni/diffusion/models/z_image/transformer.py",
+        "vllm_omni/diffusion/models/qwen_image/foo.py",
+    ):
+        labels = _surviving_labels(_SOURCE_FILTER_DOC, [changed])
+        assert "Doc Test" in labels, changed
+        assert "Tiny Model" not in labels
+        assert "Omni Sweep" not in labels
+    assert "Doc Test" not in _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_magi2.py"])
+
+
+def test_source_filter_strips_deps_and_expands_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    rendered = _render_test_pipeline(
+        _SOURCE_FILTER_DOC,
+        changed_files=["tests/e2e/online_serving/test_zimage_expansion.py"],
+    )
+    dumped = yaml.safe_dump(rendered)
+    assert "source_file_dependencies" not in dumped
+    assert "mirror_hardwares" not in dumped
+    z_image = next(step for step in _iter_steps(rendered) if step.get("label") == "Z-Image Function")
+    assert z_image["agents"]["queue"] == "l4-k8s"
+
+
+def test_source_filter_respects_force_all_and_uses_diff_on_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Ctx:
+        changed_files = ["vllm_omni/unrelated.py"]
+
+    # Post-merge main L3 must still filter by the commit diff.
+    monkeypatch.setenv("BUILDKITE_BRANCH", "main")
+    assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=False) == [
+        "vllm_omni/unrelated.py",
+    ]
+
+    monkeypatch.setenv("BUILDKITE_BRANCH", "feat/source-filter")
+    assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=False) == [
+        "vllm_omni/unrelated.py",
+    ]
+    assert _changed_files_for_source_filter(_Ctx(), force_all=True, e2e_only=False) is None
+    assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=True) is None
+
+
+def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback only when no listed prefix matched; a matching prefix still wins."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "feat/nightly-yaml")
+    pipeline_yaml = Path(".buildkite/npu/test-npu-nightly.yml")
+    shared_paths = _load_source_file_dependencies()["source_filter_fallback"]
+
+    # Synthetic steps only — do not pin live Buildkite job labels.
+    doc = {
+        "steps": [
+            {"key": "ungated", "commands": ["true"]},
+            {
+                "key": "gated_a",
+                "source_file_dependencies": ["pkg/model_a/"],
+                "commands": ["true"],
+            },
+            {
+                "key": "gated_b",
+                "source_file_dependencies": ["pkg/model_b/"],
+                "commands": ["true"],
+            },
+        ],
+    }
+
+    def surviving_keys(changed_files: list[str]) -> set[str]:
+        rendered = _render_test_pipeline(
+            doc,
+            changed_files=changed_files,
+            pipeline_path=pipeline_yaml,
+        )
+        return {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
+
+    # Only pipeline YAML / fallback paths → no listed prefix match → keep every step.
+    for changed in [pipeline_yaml.as_posix(), *shared_paths]:
+        assert surviving_keys([changed]) == {"ungated", "gated_a", "gated_b"}, changed
+
+    # A different pipeline YAML is not a fallback for this upload.
+    assert surviving_keys([".buildkite/cuda/test-nightly.yml"]) == {"ungated"}
+
+    # A matching source prefix wins over fallback files in the same diff.
+    assert surviving_keys(["pkg/model_a/transformer.py", *shared_paths[:1]]) == {
+        "ungated",
+        "gated_a",
+    }
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "expected_keys"),
+    [
+        (["tests/helpers/runtime.py"], {"ungated", "helper_user", "model_b", "unrelated"}),
+        (["tests/helpers/runtime.py", "README.md"], {"ungated", "helper_user", "model_b", "unrelated"}),
+        (["tests/helpers/runtime.py", "pkg/model_b/pipeline.py"], {"ungated", "helper_user", "model_b"}),
+        (
+            ["tests/helpers/runtime.py", "README.md", "pkg/model_b/pipeline.py"],
+            {"ungated", "helper_user", "model_b"},
+        ),
+        (["pkg/model_b/pipeline.py"], {"ungated", "model_b"}),
+    ],
+)
+def test_shared_helper_dependencies_preserve_broad_and_mixed_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_files: list[str],
+    expected_keys: set[str],
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = {
+        "steps": [
+            {"key": "ungated", "commands": ["true"]},
+            {"key": "helper_user", "source_file_dependencies": ["tests/helpers/"], "commands": ["true"]},
+            {"key": "model_b", "source_file_dependencies": ["pkg/model_b/"], "commands": ["true"]},
+            {"key": "unrelated", "source_file_dependencies": ["pkg/unrelated/"], "commands": ["true"]},
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files, pipeline_path=NIGHTLY_YAML)
+    assert {step["key"] for step in _iter_steps(rendered)} == expected_keys
+
+
+@pytest.mark.parametrize("pipeline_path", [NIGHTLY_YAML, Path(".buildkite/npu/test-npu-nightly.yml")])
+def test_qwen_image_21_accuracy_shared_helper_routing(monkeypatch: pytest.MonkeyPatch, pipeline_path: Path) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    qwen_label = next(
+        step["label"]
+        for step in _iter_steps(doc)
+        if step.get("source_file_dependencies") == "diffusion_qwen_image_21_accuracy"
+    )
+
+    def selected_labels(changed_files: list[str] | None) -> set[str]:
+        rendered = _render_test_pipeline(copy.deepcopy(doc), changed_files, pipeline_path=pipeline_path)
+        return {step["label"] for step in _iter_steps(rendered) if "label" in step}
+
+    helper = "tests/helpers/runtime.py"
+    wan = "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"
+    assert selected_labels([helper]) == selected_labels(None)
+    assert selected_labels([helper, "README.md"]) == selected_labels(None)
+    wan_labels = selected_labels([wan])
+    assert qwen_label not in wan_labels
+    mixed_labels = selected_labels([helper, wan])
+    assert qwen_label in mixed_labels
+    assert wan_labels <= mixed_labels
+    assert selected_labels([helper, "README.md", wan]) == mixed_labels
+
+
+@pytest.mark.parametrize(
+    "changed_path,selected",
+    [
+        ("vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py", True),
+        ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", True),
+        ("vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py", True),
+        ("vllm_omni/model_extras/qwen_image_21.py", True),
+        ("tests/e2e/accuracy/qwen_image_21/thresholds.json", True),
+        ("vllm_omni/diffusion/attention/backends/sdpa.py", False),
+        ("vllm_omni/diffusion/worker/diffusion_worker.py", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "pipeline_path,queue,selector",
+    [
+        (NIGHTLY_YAML, "mithril-h100-pool", "full_model and diffusion and H100 and cards_1"),
+        (
+            Path(".buildkite/npu/test-npu-nightly.yml"),
+            "ascend-a3",
+            "full_model and diffusion and npu and A3 and cards_1",
+        ),
+    ],
+)
+def test_qwen_image_21_accuracy_model_dependencies(
+    monkeypatch: pytest.MonkeyPatch, changed_path: str, selected: bool, pipeline_path: Path, queue: str, selector: str
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    # Include a known model match so the no-match fallback cannot mask routing.
+    changed_files = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
+    rendered = _render_test_pipeline(doc, changed_files, pipeline_path=pipeline_path)
+    steps = [step for step in _iter_steps(rendered) if "Qwen-Image 2.1 Accuracy Test" in step.get("label", "")]
+    assert len(steps) == int(selected)
+    if not selected:
+        return
+    step = steps[0]
+    assert step["agents"]["queue"] == queue
+    assert not step.get("skip")
+    assert step["env"]["QWEN_IMAGE_21_CALIBRATE"] == "0"
+    assert any("test_qwen_image_21.py" in command for command in step["commands"])
+    assert any(selector in command for command in step["commands"])
+    assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]

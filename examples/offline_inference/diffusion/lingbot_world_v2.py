@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generate a LingBot-World v2 video from an image and camera trajectory.
 
 The official checkpoint is licensed separately under CC BY-NC-SA and is
@@ -32,7 +32,6 @@ import numpy as np
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
 _MAX_SEQUENCE_LENGTH = 512
 _MAX_PIXEL_AREA = 480 * 832
-_MAX_RAW_FRAMES = 117
 _MAX_SOURCE_CAMERA_FRAMES = 4096
 _TEMPORAL_COMPRESSION = 4
 _LATENT_FRAMES_PER_BLOCK = 3
@@ -99,6 +98,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for tensor parallelism inside the DiT.",
     )
+    parser.add_argument("--ulysses-degree", type=int, default=1, help="Pure Ulysses sequence parallel degree.")
     parser.add_argument("--flow-shift", type=float, default=5.0, help="Positive FlowUniPC scheduler shift.")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second in the exported MP4.")
     parser.add_argument("--output", default="lingbot_world_v2.mp4", help="Output MP4 path.")
@@ -158,6 +158,8 @@ def build_omni_kwargs(
 
     if args.tensor_parallel_size <= 0:
         raise ValueError("--tensor-parallel-size must be a positive integer.")
+    if args.ulysses_degree <= 0:
+        raise ValueError("--ulysses-degree must be a positive integer.")
     flow_shift = _positive_finite(args.flow_shift, "--flow-shift")
     model_path = Path(args.model).expanduser()
     model = str(model_path.resolve()) if model_path.exists() else args.model
@@ -165,6 +167,7 @@ def build_omni_kwargs(
         "model": model,
         "flow_shift": flow_shift,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "ulysses_degree": args.ulysses_degree,
         "enforce_eager": args.enforce_eager,
         "model_config": {"lingbot_action_root": str(paths.action_root)},
     }
@@ -187,8 +190,6 @@ def build_request(
         raise ValueError("--height * --width must not exceed 480 * 832 pixels.")
     if args.num_frames <= 0:
         raise ValueError("--num-frames must be a positive integer.")
-    if args.num_frames > _MAX_RAW_FRAMES:
-        raise ValueError("--num-frames must not exceed 117 raw frames.")
     if args.num_frames > paths.camera_frames:
         raise ValueError("Camera arrays must contain at least --num-frames frames.")
     if (args.num_frames - 1) % _TEMPORAL_COMPRESSION:

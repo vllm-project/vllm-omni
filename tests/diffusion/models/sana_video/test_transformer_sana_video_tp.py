@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """TP unit tests for SANA-Video: distributed RMSNorm, sharded attention and
 sharded GLUMB temporal conv.
@@ -7,8 +7,6 @@ sharded GLUMB temporal conv.
 CPU-only. The TP world size and the collective are mocked so a single process
 simulates the shard/reduce logic a real multi-rank run depends on.
 """
-
-import os
 
 import pytest
 import torch
@@ -36,8 +34,9 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29501")
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
+    assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
     initialize_model_parallel()
     yield
@@ -51,7 +50,7 @@ def force_default_gemm(monkeypatch):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
 
 

@@ -16,8 +16,11 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 | --- | --- | --- | --- | --- | --- |
+| AuK / AuK-Flash | assembled local bundle | ✓ (`ref_audio`) | HTTP audio after full generation | — | — |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
@@ -92,9 +95,44 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
+Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/speech_api.md).
+
+---
+
+## AuK / AuK-Flash
+
+AuK serves speech generation and reference-voice synthesis at 24 kHz. Assemble a local bundle before serving:
+
+```bash
+python tools/prepare_auk_checkpoint.py \
+    --auk-dir ckpts/AuK --qwen-dir ckpts/Qwen2.5-Omni-3B --out ckpts/auk-omni
+MODEL=ckpts/auk-omni bash examples/online_serving/text_to_speech/auk/run_server.sh
+```
+
+AuK accepts the complete instruction after you fill in the [local recipe template](../../../../recipes/Tencent/AuK-H100.md#supported-model-contract) or the [official AuK cookbook](https://github.com/Tencent-Hunyuan/AuK/blob/main/docs/COOKBOOK.md). Pass it in `instructions` and leave `input` empty. For instruct TTS, fill in `Generate speech based on the following description: "{voice description}". The content to speak is: "{text}".`; for zero-shot TTS, editing, enhancement and separation, use the corresponding complete instruction from the cookbook. Set `duration_seconds` for text-only generation; with `ref_audio`, omitting it keeps the source length.
+
+For compatibility with clients that can only send `input`, AuK treats an input-only request as the complete instruction and logs a recommendation to move it to `instructions` with `input=""`.
+
+`extra_params` accepts `num_inference_steps`, `guidance_scale`, `sway`, `t_grid`, and `vae_sample`; `seed` is a top-level field.
+
+```bash
+python examples/online_serving/text_to_speech/auk/speech_client.py \
+    --model ckpts/auk-omni \
+    --instructions 'Generate speech based on the following description: "A calm young woman speaking warmly and slowly.". The content to speak is: "Welcome back, how was your day?".' \
+    --duration-seconds 3 --seed 7
+```
+
+Complete-instruction editing also does not need a separate text argument:
+
+```bash
+python examples/online_serving/text_to_speech/auk/speech_client.py \
+    --model ckpts/auk-omni --instructions "Keep pure speech voice, remove noise and reverberation." \
+    --ref-audio noisy.wav --seed 7 --output clean.wav
+```
+
+The client accepts local reference files, URLs, and data URLs. `--stream` writes signed 16-bit 24 kHz PCM after the complete waveform is ready. See `speech_client.py --help` for editing and sampling options.
 
 ---
 
@@ -118,7 +156,62 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 ./cosyvoice3/run_server.sh
 ```
 
-Streaming is on by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path.
+Streaming is on by default. On CUDA Hopper GPUs with at least 140 GiB of device memory (H200), serving automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when `nvidia-cuda-mps-control` is available on `PATH`: AR32 / codec32, standard sampling, packed Flow, cached ISTFT, HiFT decode graphs, and local CUDA MPS. No `--hf-overrides` is needed. Other devices and environments without the MPS control tool use `cosyvoice3.yaml` with RAS sampling and AR8 / codec8.
+
+The optimized profile is not a universal hardware configuration. Its packed kernels are Hopper-only; the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
+
+The H200 default targets streaming throughput at C32/C64. It changes sampling from RAS to standard (temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.21); output lengths and quality can differ. HiFT captures a recurring exact shape on its third use, which adds latency to that request, and its graph pool needs memory headroom beyond the engine reservations. This profile is not a claim of optimal first-audio latency at low concurrency. Pass `--deploy-config cosyvoice3.yaml` to retain the previous configuration, or `--deploy-config <path>` to select another profile.
+
+Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path; use `--deploy-config cosyvoice3.yaml` alongside it when selecting that path on H200.
+
+Cross-request Stage-1 flow batching is enabled in the H200 profile. For the generic configuration, enable it in the server environment when concurrent requests should share a flow-estimator call:
+
+```bash
+export COSYVOICE3_BATCH_FLOW=1
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
+```
+
+Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+
+### Ascend Stage-1 graph regions
+
+On Ascend NPU, Stage 1 can capture the complete Flow Euler solve and the
+deterministic HiFT decode as separate exact-shape NPUGraph regions. In a copy
+of the deploy YAML, set Stage 1 to the following and opt in through the server
+environment:
+
+```bash
+export COSYVOICE3_STAGE1_NPU_GRAPH=1
+```
+
+```yaml
+enforce_eager: false
+compilation_config:
+  mode: 0
+  cudagraph_mode: NONE
+```
+
+The outer stage remains dynamic; graph capture happens inside Code2Wav.
+The opt-in NPU path uses `torch_npu.npu_fused_infer_attention_score` for the
+DiT's dense noncausal FP16/BF16 attention and the existing real-valued DFT
+implementation for HiFT. FIA applies whenever the adapter is enabled,
+including eager warmup, unsupported graph signatures, and new shapes beyond
+the graph-cache limit. Other attention backend selections do not replace FIA
+on these adapter-owned paths.
+Keep Stage 1 eager when comparing another attention backend.
+Fresh noise, reference preprocessing, CPU F0, oscillator state, and request
+cache updates stay outside capture. Final and non-final HiFT calls use
+separate signatures; output buffers remain owned by each request.
+
+The adapter is disabled by default. Leave `COSYVOICE3_STAGE1_NPU_GRAPH` unset,
+set it to `0`, or use Stage-1 `enforce_eager: true` to retain the generic path.
+`COSYVOICE3_STAGE1_NPU_GRAPH_MAX` defaults to 8 graphs per
+region; new shapes beyond that limit run eagerly. A new shape first runs an
+eager warmup and capture, so warm up at the intended concurrency before
+reporting steady-state latency. Capture errors require restarting the stage;
+they are not silently recovered in the same process. `ASCEND_LAUNCH_BLOCKING=1`
+is incompatible with this graph mode. The generic deploy YAML and non-NPU
+execution paths retain their defaults.
 
 ### CLI client
 
@@ -148,8 +241,57 @@ The client supports `--api-base`, `--model`, `--text`, `--ref-audio`, `--ref-tex
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
-- Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+- Deploy config auto-loads the device-specific CosyVoice3 default described above. Pass `--deploy-config <path>` to override.
 - For offline inference and the end-to-end script, see the [offline CosyVoice3 section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#cosyvoice3).
+
+---
+
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz: a Qwen3.5 MoE backbone samples one
+semantic token per frame and a codebook tower predicts the other 9 codebooks.
+It shares the DAC codec stage with Fish Speech S2 Pro. Speaker tags
+(`<|speaker:0|>` to `<|speaker:15|>`) and inline event tags such as `[sighs]`
+go in `input`. See the [Drama 3 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/fishaudio/Drama-3.md) for measured
+performance and known limitations.
+
+### Launch
+
+```bash
+vllm serve fishaudio/drama-3 --omni --port 8091
+```
+
+The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+On Ascend, the same command uses the `npu` profile: Model Runner V2 with tensor parallel 2 and expert parallel across two 910B cards, and the DAC stage sharing the second card. See the recipe.
+
+### Voice cloning
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "fishaudio/drama-3",
+        "input": "[sighs] Fine. If we miss it, it is on you.",
+        "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+        "ref_text": "We asked over twenty different people, and they all said it was his.",
+        "response_format": "wav"
+    }' --output cloned.wav
+```
+
+### CLI client
+
+The Fish Speech client works unchanged with `--model fishaudio/drama-3`:
+
+```bash
+cd examples/online_serving/text_to_speech/fish_speech
+python speech_client.py --model fishaudio/drama-3 --text "<|speaker:0|> Hi. <|speaker:1|> Hello."
+python speech_client.py --model fishaudio/drama-3 --text "Hello world" --stream --output output.pcm
+```
+
+### Notes
+
+- Output: 44.1 kHz mono. Streaming PCM players must use `-r 44100`.
+- `ref_audio` needs `ref_text` (the transcript of the reference audio).
 
 ---
 
@@ -200,6 +342,61 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## Gepard-1.0
+
+Single-stage native AR TTS at 22.05 kHz mono. Zero-shot only: omit `voice` or pass `"default"`. Voice cloning from reference audio is not available yet.
+
+### Prerequisites
+
+Same NeMo NanoCodec install as the [offline Gepard section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#gepard-10). On a host whose CUDA toolkit cannot build kernels — no `nvcc`/`ninja`, or a consumer Blackwell (`sm_120`) card — also `export VLLM_USE_FLASHINFER_SAMPLER=0` before launch. That env is not a deploy-YAML field.
+
+### Launch
+
+```bash
+vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
+    --stage-init-timeout 900 \
+    --deploy-config vllm_omni/deploy/gepard.yaml
+# or:
+./gepard/run_server.sh
+```
+
+`--stage-init-timeout 900` matches the online e2e fixture and the offline example. Serve defaults to 300s, which is often too short for a cold download of the talker plus NanoCodec.
+
+The packaged `vllm_omni/deploy/gepard.yaml` must be passed with `--deploy-config`. The checkpoint self-identifies as `qwen3_5_text`, so omitting the YAML launches a diffusion fallback instead of the Gepard pipeline. The YAML sets `async_chunk: false`, `max_num_seqs: 4`, and currently pins `seed: 42`, so serving is deterministic by default until that YAML seed is removed. Pass an explicit per-request `seed` in tests and clients rather than depending on either default.
+
+### Sending requests
+
+```bash
+python examples/online_serving/text_to_speech/gepard/speech_client.py \
+    --text "Hello, this is Gepard speaking."
+
+python examples/online_serving/text_to_speech/gepard/speech_client.py \
+    --text "Hello, this is Gepard speaking." --seed 7 --stream --output output.pcm
+```
+
+Gepard accepts `input` (required), `voice` (`"default"`), `response_format`, `stream` / `stream_format`, `max_new_tokens`, and `seed`. Unsupported fields include `speed`, `language`, `instructions`, `task_type`, `ref_audio`, `ref_text`, `extra_params`, and `word_timestamps`.
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Gepard speaking.",
+        "voice": "default",
+        "seed": 7
+    }' --output output.wav
+```
+
+### Notes
+
+- Output: 22.05 kHz mono. `max_new_tokens` is a **frame** budget (1 token = 1 frame = 1024 samples ≈ 46.4 ms at 21.5 fps; adapter bounds 1..4096).
+- Supported request fields: `input` (required), `voice` (`default` only), `response_format` (`wav` default; `wav/pcm/flac/mp3` non-streaming; `opus` 400 because 22.05 kHz is not an Opus sample rate; streaming `pcm/wav` only), `stream` / `stream_format`, `max_new_tokens`, `seed`.
+- Unsupported: `speed`, `extra_params` (including `temperature`/`top_p`/`top_k`), `ref_audio`, `ref_text`, `speaker_embedding`, `task_type`, `instructions`, `language`, and `word_timestamps`.
+- Concurrent requests at `max_num_seqs: 4` are supported. Native-AR recompute preemption is a known limitation of this architecture (a request that is preempted mid-generation can resume incorrectly); keep concurrency at or below `max_num_seqs` and treat preemption as out of scope until the platform fix lands.
+- Optional comparison against the upstream Gepard reference server needs Blackwell/Hopper + CUDA 13 + Postgres and is not part of CI.
+- For the request-field table, see the [Speech API Gepard section](https://github.com/vllm-project/vllm-omni/blob/main/docs/serving/speech_api.md#gepard-10).
 
 ---
 
@@ -292,7 +489,7 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 
@@ -300,7 +497,7 @@ Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **
 huggingface-cli download k2-fsa/OmniVoice
 ```
 
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`. When `ref_text` is omitted, OmniVoice loads `openai/whisper-large-v3-turbo` on the worker device to transcribe the reference audio. Set `additional_config.omnivoice_asr.load_asr_on_startup` to `true` to load Whisper during worker startup, or set `additional_config.omnivoice_asr.asr_device` to use another GPU or the CPU.
 
 ### Launch
 
@@ -316,13 +513,35 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 cd examples/online_serving/text_to_speech/omnivoice
 python speech_client.py --text "Hello, how are you?"
 python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+python speech_client.py --text "hello" --ref-audio /path/to/ref_audio.wav
 ```
 
-The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`,
+`--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`,
+`--seed`, and `--output`.
 
 ### Notes
 
-- Voice cloning and voice design require offline inference; see the [offline OmniVoice section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#omnivoice).
+- The explicit `--ref-text` path is faster because it does not load Whisper.
+- By default, the first request with reference audio and no reference text loads
+  `openai/whisper-large-v3-turbo` on the worker device, which adds latency and
+  device memory use. Set `additional_config.omnivoice_asr.load_asr_on_startup` to
+  `true` to move that load to worker startup. Generated audio is mono at 24 kHz.
+
+### Reference audio and output processing
+
+When a request includes `ref_audio`, OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `ref_text` is omitted, it trims a clip longer than 20 seconds at a detected silence.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `ref_text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice processes voice cloning output by removing middle gaps of at least 500 milliseconds and trimming edge silence while keeping 100 milliseconds at each edge. It uses the original reference RMS when the RMS is below `0.1`, and it leaves the level unchanged when the RMS is at least `0.1`. It fades the first and last 100 milliseconds, then adds 100 milliseconds of silence at both edges. Text only output returns the decoder tensor without this processing.
 
 ---
 
@@ -347,6 +566,21 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ./qwen3_tts/run_server.sh VoiceDesign
 ./qwen3_tts/run_server.sh Base
 ```
+
+For a local deployment with multiple API frontend processes sharing one set
+of TTS stage engines, add `--api-server-count`:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni --api-server-count 2 --port 8091
+```
+
+This mode supports local EngineCore stages with one local process group per
+replica, including stages configured with multiple `num_replicas`. Headless,
+remote, intra-replica data-parallel, and Ray stage deployments are not
+supported. Built-in voices, inline `ref_audio`, voices restored from
+`custom_voice_dir` at startup, and runtime voice upload and deletion are
+supported: all API frontends share the uploaded-voice directory.
 
 ### Executor backend
 
@@ -412,6 +646,10 @@ For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
 checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
+
+Uploaded voices live in `SPEAKER_SAMPLES_DIR`; with `--api-server-count > 1`
+every API process shares that directory, so a voice uploaded or deleted through
+one process is used or rejected consistently by all of them.
 
 ### Precomputed custom voices
 

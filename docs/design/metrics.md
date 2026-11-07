@@ -60,7 +60,7 @@ Upstream per-engine metrics retain the `vllm:` prefix but are now registered by 
 
 There are five independent paths for metric collection.
 
-**Path 1: Pipeline-level metrics (`vllm_omni:*`)**
+#### Path 1: Pipeline-level metrics (`vllm_omni:*`)
 
 `OmniPrometheusMetrics` registers the Gauge / Counter / Histogram collectors at import time. It is instantiated once per entrypoint, labeled with the model name. The entrypoint calls its methods as requests progress:
 
@@ -69,7 +69,7 @@ There are five independent paths for metric collection.
 - `request_failed()` — recorded by the cleanup path when a request exits without natural completion. Internally maps to `finished_reason="abort"` on the existing completion Counter.
 - `inc_requests_failed(reason)` — increments the dedicated failure-attribution Counter once per request. Reasons are normalized to the bounded set `client_abort`, `client_disconnect`, `stage_error`, and `unknown`.
 
-**Path 2: Image and diffusion metrics**
+#### Path 2: Image and diffusion metrics
 
 Image and diffusion metrics use two cooperating collectors. `OmniPrometheusMetrics` owns pipeline/stage workload families, while `OmniModalityMetrics` owns per-replica diffusion breakdowns. Finished stage messages are consumed once in `OmniBase._process_single_result`, which prevents replayed terminal messages from incrementing Counters or Histograms twice.
 
@@ -81,15 +81,15 @@ Image and diffusion metrics use two cooperating collectors. `OmniPrometheusMetri
 
 Zero and missing values have different meanings. Valid zero-duration queue observations are recorded, while unavailable optional measurements are omitted instead of being exported as synthetic zeroes. `peak_memory_mb`, `diffusion_forward_s`, `diffusion_kv_load_s`, `vae_decode_s`, and `kv_wait_s` therefore appear only when their data source is active.
 
-**Path 3: Audio modality metrics (`vllm_omni:audio_*`)**
+#### Path 3: Audio modality metrics (`vllm_omni:audio_*`)
 
 `OmniModalityMetrics` registers seven audio families with `{model_name, stage, replica}` (plus an extra `threshold_ms` / `reason` label on the two extra-cardinality Counters). Three observation sites:
 
 - `observe_modality_at_finalize(...)` — called from `omni_base._process_single_result` inside the existing `e2e_done` finalize guard. For `output_type == "audio"` it emits `audio_frames_total`, `audio_duration_s`, `audio_rtf` (or `audio_skipped_requests_total{reason="no_audio_data"}` when no audio was produced). Sample rate is resolved from `engine_outputs.multimodal_output` via `definitions.resolve_audio_sample_rate(...)` (fallback chain mirrors `serving_chat.py`'s audio response path).
-- `observe_audio_first_packet(...)` — called from the OpenAI SSE audio branch in `serving_chat.py` on the first audio packet for a request. The once-per-request guard is held by `ClientRequestState.first_audio_ts`. The `request_arrival_ts` anchor is stored in `ClientRequestState` by `async_omni.generate()`, computed at request entry.
-- `observe_audio_streaming_finalize(...)` — called from `serving_chat.py` after the streaming chunk loop exhausts. It runs the per-chunk player simulation from `vllm_omni/benchmarks/audio_continuity.py` to compute the worst-case underrun and emits `audio_underrun_s` plus (when the request stayed below the threshold) `audio_continuity_ok_total{threshold_ms}`. Per-chunk PCM byte counts and arrival timestamps are recorded by the same audio branch that updates `first_audio_ts`.
+- `observe_audio_first_packet(...)` — called from the OpenAI SSE audio branch in `serving_chat.py` and the streaming TTS output paths in `serving_speech.py` on the first non-empty audio payload for a request. Streaming Speech observes the first PCM payload rather than a header-only WAV chunk. HTTP carries the middleware request timestamp through response generation; WebSocket uses the start of each sentence synthesis request. Non-streaming Speech does not emit TTFP and uses `e2e_request_latency_s` for overall latency instead.
+- `observe_audio_streaming_finalize(...)` — called from `serving_chat.py` and `serving_speech.py` after a streaming chunk loop exhausts normally. It runs the per-chunk player simulation from `vllm_omni/benchmarks/audio_continuity.py` to compute the worst-case underrun and emits `audio_underrun_s` plus (when the request stayed below the threshold) `audio_continuity_ok_total{threshold_ms}`. Per-chunk PCM byte counts and arrival timestamps are recorded by the same output paths that update TTFP. Speech records raw PCM payloads before raw/SSE/WebSocket encoding, excludes WAV headers and empty chunks, and does not emit continuity samples for failed, cancelled, or non-streaming requests.
 
-**Path 4: Cross-stage transfer metrics (`vllm_omni:transfer_*`)**
+#### Path 4: Cross-stage transfer metrics (`vllm_omni:transfer_*`)
 
 `OmniTransferMetrics` registers four Histogram families with `{model_name, from_stage, from_replica, to_stage, to_replica}` labels. Each observation corresponds to one physical transfer hop (one chunk between adjacent stages), not the per-request accumulated total — so the histograms track per-transfer distribution.
 
@@ -100,9 +100,21 @@ The hook lives in `OrchestratorAggregator.record_transfer_tx` and `record_transf
 
 Defensive fail-safe: if `transfer_emitter` or `replica_resolver` is missing, or the resolver returns `None` for either side, the emit is skipped silently (the underlying `TransferEdgeStats` accumulation is unaffected).
 
-**Path 5: Per-engine metrics (`vllm:*`, stage/replica wrap)**
+#### Path 5: Per-engine metrics (`vllm:*`, stage/replica wrap)
 
 The Orchestrator instantiates `OmniPrometheusStatLogger` (a thin subclass of upstream `vllm.v1.metrics.loggers.PrometheusStatLogger`) and feeds it scheduler stats and iteration stats after processing each batch of engine outputs. This populates the standard ~37 vLLM metric families (TTFT, ITL, TPOT, KV cache usage, etc.) using the same upstream code path — but with the `engine` label reshaped into `stage` + `replica` so multi-replica deployments produce distinct series per replica. See the next section for the wrap mechanics.
+
+At stage readiness, the orchestrator requests the worker's saved allocator
+snapshot through a control-plane remote procedure call (RPC) and publishes it
+before the frontend becomes ready. Qwen3-TTS Code2Wav supplies the snapshot.
+The snapshot does not travel through model-runner, request, or API output.
+
+Remote replica attachment triggers another snapshot request. A replacement in
+the same slot publishes its own values, and the orchestrator ignores late
+replies from a removed worker. Detachment and eviction remove memory series
+from the ordinary process-local registry. See
+[post-warmup memory](#generation-stage-post-warmup-memory-2) for measurement
+scope and the separate Prometheus multiprocess storage limitation.
 
 ### Shared State Between Threads
 
@@ -139,19 +151,27 @@ stage_replica_map = {
 
 A reverse map `(stage_id, replica_id) -> flat_idx` is maintained on the Orchestrator so the per-replica `record(engine_idx=...)` call site can look up the right flat index.
 
-> Dynamic add/remove of replicas at runtime is intentionally out of scope — the upstream `PrometheusStatLogger` materializes per-engine_idx child metrics at init time, and supporting hot-add would require non-trivial intervention into upstream's per-family child dictionaries.
+New replicas receive metric slots when they attach or first report statistics.
+Existing flat indexes and cumulative counters remain across detachment and
+rejoining. Attachment refreshes post-warmup memory samples from the new worker,
+including replacements that reuse a slot. Detachment removes those samples
+from the ordinary process-local registry; the
+[multiprocess storage limitation](#multiprocess-storage-retains-removed-labels)
+still applies.
 
-## Gating: `--log-stats`
+## Gating: `--log-stats` and `--collect-stage-metrics`
 
-All metrics — both the omni-specific `vllm_omni:*` families and the upstream `vllm:*` wrap families — are gated by the user's `--log-stats` CLI flag (default off). The flag is plumbed from `OmniBase.__init__(log_stats=...)` through `AsyncOmniEngine` to the stage-spawn helpers and to the three Prometheus metric classes (`OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics`), and is forwarded to `Orchestrator._init_metrics_state(...)`.
+Prometheus emission and upstream engine statistics are gated by `log_stats`. The Python interface defaults to `log_stats=False`, while API serving enables statistics by default unless `--disable-log-stats` is supplied. These defaults are unchanged by the addition of `--collect-stage-metrics`. The setting is plumbed from `OmniBase.__init__(log_stats=...)` through `OmniEngineBase` to the stage-spawn helpers and to the three Prometheus metric classes (`OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics`), and is forwarded to `Orchestrator._init_metrics_state(...)`.
 
-Behavior with `--log-stats=off` (default):
+Per-request stage diagnostics are controlled separately by `--collect-stage-metrics`, which defaults to on for backward compatibility. Disabling it skips per-output timestamp/audio bookkeeping, diagnostic calculations, and full response-level stage-metric merging. Lightweight `StageRequestStats` objects still carry token counts and finish reasons into response-level stage metadata, preserving usage accounting and generation validation. Because statistics logging consumes the full metrics for omni-specific observations, `log_stats=True` with `collect_stage_metrics=False` is rejected as an invalid configuration. For API serving, use `--no-collect-stage-metrics --disable-log-stats` to disable stage diagnostics.
+
+Behavior with `log_stats=False` (the Python-interface default, or API serving with `--disable-log-stats`):
 
 - The three `Omni*Metrics` classes register their module-level Gauge / Counter / Histogram families at import time (prometheus_client requires up-front registration), but each `observe / inc / set` method early-returns. The per-label child series for `vllm_omni:*` stay materialized but never have data written to them.
 - `OmniPrometheusStatLogger` is not constructed in `_init_metrics_state`, so the ~65 upstream `vllm:*` wrap families are not registered in the default registry at all.
 - The engine core's `Scheduler.make_stats()` also short-circuits inside upstream (`if not self.log_stats: return None`), so no `SchedulerStats` is produced per step — the per-iteration cost is bounded by the existing upstream gate.
 
-Behavior with `--log-stats=on`: all metric paths fire normally; the orchestrator's per-replica recording is bounded only by `OmniSchedulerMixin.make_stats()`'s per-scheduler 1 Hz throttle (see next section).
+Behavior with `log_stats=True`: the post-warmup memory snapshot is published at readiness and on remote replica attachment. Request-time metric paths fire normally, as described below.
 
 The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omni-30B single replica (30 sequential audio requests) showed a mean latency delta of +0.6% (Welch's t = 0.318, n=30, not statistically significant at α=0.05); the `/metrics` line count drops from 1358 to 124 lines when the flag is off.
 
@@ -159,7 +179,7 @@ The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omn
 
 Upstream vLLM's `Scheduler.make_stats()` runs on every AR generation step, returning a SchedulerStats object for the orchestrator. Under vLLM's architecture, this is fine. But since vLLM-Omni requires that the object be serialized and transferred over ZMQ, receiving a SchedulerStats object on every step can introduce unacceptable overhead to the system.
 
-`OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step overhead.
+`OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step serialization overhead.
 
 The orchestrator side does not add its own throttle on top. Scheduler gauges are
 recorded when `raw_outputs.scheduler_stats is not None` (i.e. this replica's
@@ -174,7 +194,7 @@ second.
 ### Pipeline (4)
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
+| -------- | ------ | -------- | ------------- |
 | `vllm_omni:num_requests_running` | Gauge | `model_name` | Requests currently executing across all stages |
 | `vllm_omni:num_requests_waiting` | Gauge | `model_name` | Requests queued but not yet scheduled |
 | `vllm_omni:requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason ({stop, length, abort, ...}); aborts cover client-disconnect / cancellation paths in addition to upstream `FinishReason.ABORT` |
@@ -183,7 +203,7 @@ second.
 ### Image and diffusion service-level metrics
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
+| -------- | ------ | -------- | ------------- |
 | `vllm_omni:stage_gen_time_s` | Histogram | `model_name`, `stage`, `stage_type` | Stage submit to finished output; includes in-stage queueing |
 | `vllm_omni:request_queue_wait_s` | Histogram | `model_name` | Orchestration-layer queue wait; a present zero is recorded |
 | `vllm_omni:stage_waiting_requests` | Gauge | `model_name`, `stage` | Sum of the latest waiting snapshots across live replicas in the stage |
@@ -200,7 +220,7 @@ second.
 Labels: `{model_name, stage, replica}`.
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `vllm_omni:diffusion_exec_s` | Histogram | Core diffusion-step execution time per request |
 | `vllm_omni:diffusion_exec_per_step_s` | Histogram | Core diffusion execution divided by inference-step count |
 | `vllm_omni:diffusion_preprocess_s` | Histogram | Diffusion input preprocessing time |
@@ -218,7 +238,7 @@ The optional breakdown and memory families are sparse by design: when an engine 
 Labels: `{model_name, stage, replica}` plus the listed extra label.
 
 | Metric | Type | Extra label | Description |
-|--------|------|-------------|-------------|
+| -------- | ------ | ------------- | ------------- |
 | `vllm_omni:audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
 | `vllm_omni:audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm_omni:audio_rtf` | Histogram | — | Real-time factor `stage_gen_time_s / audio_duration_s` (SLO `< 1`); uses `RTF_BUCKETS` |
@@ -227,16 +247,98 @@ Labels: `{model_name, stage, replica}` plus the listed extra label.
 | `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
 | `vllm_omni:audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
+### Speech streaming (2)
+
+Labels: `{model_name}` plus the listed extra label.
+
+| Metric | Type | Extra label | Description |
+| -------- | ------ | ------------- | ------------- |
+| `vllm_omni:speech_stream_aborted_total` | Counter | `reason` | Interrupted audio generators, including before first PCM; reasons: `cancelled`, `closed`, `engine_dead`, `error` |
+| `vllm_omni:speech_stream_completed_total` | Counter | — | Normally completed audio generators; does not confirm client receipt |
+
+Scope: started Speech audio generators (raw/SSE/WebSocket), counted once per
+generation; WebSocket counts each sentence. Chat, non-streaming Speech, and
+failures before generator execution are excluded. Interrupted streams do not
+emit continuity or underrun samples.
+
+Interruption ratio: `aborted / (aborted + completed)`, using increments over the
+same time window and summing all reasons per model.
+
 ### Cross-stage transfer (4)
 
 Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `vllm_omni:transfer_size_bytes` | Histogram | Per-transfer payload size in bytes |
 | `vllm_omni:transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
 | `vllm_omni:transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
 | `vllm_omni:transfer_in_flight_s` | Histogram | Network in-flight time (TX done → RX recv start) |
+
+### Generation-stage post-warmup memory (2)
+
+Qwen3-TTS exposes a saved memory snapshot for each generation-stage replica.
+The snapshot describes memory held by the rank-0 worker's PyTorch allocator
+immediately after decoder graph warmup. The values are static and do not track
+request-time memory use.
+
+Both gauges use the labels `{model_name, stage, replica}` and report bytes:
+
+| Metric | Description |
+| --- | --- |
+| `vllm_omni:stage_post_warmup_memory_allocated_bytes` | Worker PyTorch allocator bytes allocated after decoder graph warmup |
+| `vllm_omni:stage_post_warmup_memory_reserved_bytes` | Worker PyTorch allocator bytes reserved after decoder graph warmup |
+
+#### Measurement happens during model loading
+
+The decoder records the snapshot after successful graph warmup during model
+loading. Publication happens later, at stage readiness or remote replica
+attachment, when statistics are enabled and rank 0 supplies a snapshot.
+The saved values are reused without per-request or per-step sampling.
+
+The values are absolute allocator totals for the rank-0 worker on its device.
+They include other PyTorch allocations held by that worker at capture time.
+They do not isolate the decoder's allocation increase or include non-PyTorch
+device allocations. Values are not summed across tensor- or pipeline-parallel
+ranks.
+
+Capture precedes engine key-value (KV) cache allocation and later graph
+captures. The snapshot therefore does not represent the final stage memory
+footprint.
+
+CUDA and ROCm decoder graphs can supply a snapshot. Eager decoders, unsuccessful
+graph warmup, models without the snapshot hook, and NPU workers emit no samples.
+The default ROCm deployment runs Code2Wav in eager mode and therefore emits no
+snapshot samples. An eager serving check does not validate graph-based memory
+collection.
+
+#### Replica attachment refreshes the saved values
+
+The orchestrator fetches the attached worker's snapshot, including when a new
+worker reuses an existing replica slot. It rejects late replies from detached
+workers and replies that arrive after shutdown.
+
+Detachment, eviction, and engine shutdown remove the memory series from the
+ordinary process-local Prometheus registry. Multiprocess storage has the
+separate removal limitation described below.
+
+#### Multiple API frontends publish one observation per replica
+
+Each API frontend publishes the same shared worker's snapshot. The gauges use
+`multiprocess_mode="mostrecent"` to export the latest observation once per
+`{model_name, stage, replica}`. The collector neither adds a `pid` label nor
+sums duplicate observations. A shared worker's saved snapshot remains available
+after an API process exits.
+
+#### Multiprocess storage retains removed labels
+
+Prometheus multiprocess storage retains samples for removed label sets.
+`mostrecent` controls aggregation; it does not enable label removal. Multi-API
+serving currently excludes remote replica membership changes.
+
+Let vLLM create a fresh multiprocess directory for each server run. If setting
+`PROMETHEUS_MULTIPROC_DIR` manually, use an empty directory at startup to avoid
+mixing files from older runs or gauge modes.
 
 ### LLM stage-level (wrapped `vllm:*`)
 
@@ -245,16 +347,51 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
 ## Naming Convention
 
 - All time-bearing metrics use the `_s` suffix (values in seconds). Two bucket families are used:
-  - `SECONDS_BUCKETS` (0.05 s – 300 s) for e2e / generation / TTFP style values.
-  - `SECONDS_FAST_BUCKETS` (0.001 s – 60 s) for fine-grained cross-stage transfer and audio-underrun values that need millisecond-level resolution.
+    - `SECONDS_BUCKETS` (0.05 s – 300 s) for e2e / generation / TTFP style values.
+    - `SECONDS_FAST_BUCKETS` (0.001 s – 60 s) for fine-grained cross-stage transfer and audio-underrun values that need millisecond-level resolution.
 - Counters use the `_total` suffix (auto-appended by `prometheus_client`).
 - Sizes use the `_bytes` suffix.
 - All omni-specific families are prefixed `vllm_omni:`. The upstream `unregister_vllm_metrics()` function is monkey-patched to a scoped version that still strips upstream `vllm:*` collectors (so multi-engine init within one process does not crash on duplicate registration) but preserves anything prefixed `vllm_omni:` / `vllm_omni`.
 
 ## Logging vs. Prometheus
 
-`OrchestratorAggregator` (in `vllm_omni/metrics/stats.py`) is the logging-oriented metrics path. It collects detailed per-request, per-stage, and per-transfer statistics and prints formatted tables to the `INFO` log. This is designed for development and debugging — individual request traces, transfer bandwidth, inter-stage timing.
+`OrchestratorAggregator` (in `vllm_omni/metrics/stats.py`) is the logging-oriented metrics path. It collects detailed per-request, per-stage, and per-transfer statistics and prints formatted tables to the log (per-request tables at `DEBUG`, the `[OmniTiming]` summary at `INFO`). This is designed for development and debugging — individual request traces, transfer bandwidth, inter-stage timing.
 
 `OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics` form the Prometheus-oriented path. They record aggregate counters, gauges, and histograms suitable for time-series monitoring and alerting. Both paths share the same source data (`StageRequestStats`, `TransferEdgeStats`) — `OrchestratorAggregator.record_transfer_tx/rx` in particular calls both the existing accumulator code and the Prometheus emit hook in the same method body. The two consumption models can run simultaneously without coupling.
 
 The separation follows upstream vLLM's pattern of `LoggingStatLogger` vs. `PrometheusStatLogger` — same underlying data, different consumption models.
+
+### LLM-stage phase split in `StageRequestStats`
+
+With `--log-stats`, a stage served by a vLLM engine core (AR and generation stages) adds the engine-core phase split of the finished request to its `StageRequestStats` row:
+
+| Field | Interval |
+| ----- | -------- |
+| `vllm_queued_ms` | `QUEUED` event to first `SCHEDULED` event |
+| `vllm_prefill_ms` | First `SCHEDULED` event to first engine-core output (the first token for an AR stage) |
+| `vllm_decode_ms` | First engine-core output to last engine-core output |
+| `vllm_num_preemptions` | Number of `PREEMPTED` events |
+
+The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. No Prometheus family is added.
+
+The first engine-core output ends prefill even when it carries no token. A generation stage that emits one output when it stops therefore reports its whole run as `vllm_prefill_ms`, with a measured `vllm_decode_ms` of `0`.
+
+`vllm_queued_ms` runs from the stage's engine core accepting the request to its first scheduling. For stage 0 this is scheduler wait. A downstream stage can also wait there for its input:
+
+- With `async_chunk`, a downstream stage that receives chunks is submitted together with stage 0, and the request stays in `WAITING_FOR_CHUNK` until the first upstream chunk arrives. Later waits for the next chunk fall inside `vllm_decode_ms`.
+- A stage with `requires_full_payload_input` stays in `WAITING_FOR_INPUT` until the connector delivers the payload.
+
+For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+
+These intervals can overlap with other timings of the same request: the upstream stage's run, the transfer times in `TransferEdgeStats` and `vllm_omni:transfer_tx_s` / `vllm_omni:transfer_rx_s`, and stage-to-stage handoff events. Do not add them together into an end-to-end breakdown of a request unless the intervals are known not to overlap and use the same clock.
+
+Two more cases where an interval covers more than its name suggests:
+
+- A KV-transfer sender (a stage with `kv_transfer_criteria`) keeps the request running until the KV extraction is acknowledged, and the token-less `kv_ready` output it emits still advances the last-token timestamp. `vllm_decode_ms` therefore includes the wait for that acknowledgement.
+- `vllm_num_preemptions` counts `PREEMPTED` events. In the default (non-windowed) path, when the chunk transfer adapter moves running requests over `max_num_seqs` back to the waiting queue, it sets `PREEMPTED` without recording an event, so that wait is not counted as a preemption and stays inside prefill or decode.
+
+The per-request `[StageRequestStats]` table is logged at `DEBUG` (for example `VLLM_LOGGING_LEVEL=DEBUG`); at `INFO` only the `[OmniTiming]` line is printed.
+
+Missing and zero are different. A field is `None` when its interval was not observed: a diffusion stage, `--log-stats` off, or an engine-core event that never arrived. A measured `0` stays `0`. In the `[StageRequestStats]` table a missing value prints as `None`, and, as for every other field, a row whose values are all zero or missing is hidden.
+
+For a streaming-input request, only the output that finishes the request carries the split. On an AR stage, vLLM's output processor finishes the request only after the input stream has ended; at each earlier segment stop it applies the next streaming update instead, which restarts the request stats, so the split covers the last input segment. The last segment's `QUEUED` event can arrive with the previous segment's final output, before that restart, so its `vllm_queued_ms` may be missing. A generation stage finishes on the first output that is not a segment stop and does not restart its stats between segments, so its split spans the whole request: `vllm_prefill_ms` is the first segment's, `vllm_decode_ms` runs from the first segment's first output to the last output, gaps between segments included, and `vllm_queued_ms` is missing when a later segment was queued after the first scheduling. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks. The duplex per-response table leaves them out (`DUPLEX_STAGE_TABLE_EXCLUDE`): they describe one engine-core request, not a response turn.
