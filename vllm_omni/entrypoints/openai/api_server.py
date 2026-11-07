@@ -516,7 +516,11 @@ async def omni_run_server_worker(
         # If we are running a stage by itself with no master, we shutdown all endpoints that may
         # require the full pipeline, and also all inference should be done through /v1/run calls
         stage_id = getattr(args, "stage_id", None)
-        if stage_id is not None and getattr(args, "omni_master_address", None) is None:
+        has_master = (
+            getattr(args, "omni_master_address", None) is not None
+            and getattr(args, "omni_master_port", None) is not None
+        )
+        if stage_id is not None and not has_master:
             shutdown_full_pipeline_routes(
                 app,
                 f"This server runs only stage {stage_id}; send each stage's request to "
