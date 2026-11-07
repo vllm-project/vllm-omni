@@ -328,6 +328,7 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.

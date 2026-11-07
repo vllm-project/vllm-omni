@@ -237,6 +237,81 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
+def _stable_config_repr(value: Any, depth: int = 0) -> str:
+    """Process-independent text for a config value (default object reprs embed memory addresses)."""
+    import dataclasses
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return repr(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if depth > 4:
+        return type(value).__qualname__
+    if isinstance(value, dict):
+        items = sorted((str(k), _stable_config_repr(v, depth + 1)) for k, v in value.items())
+        return "{" + ",".join(f"{k}:{v}" for k, v in items) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stable_config_repr(v, depth + 1) for v in value) + "]"
+    if isinstance(value, (set, frozenset)):
+        return "{" + ",".join(sorted(_stable_config_repr(v, depth + 1) for v in value)) + "}"
+    get_name = getattr(value, "get_name", None)
+    if callable(get_name):
+        # A quantization config: its method and the layers it skips, not runtime state the model load adds to it.
+        try:
+            name = get_name()
+        except Exception:
+            name = None
+        skipped = next(
+            (getattr(value, a) for a in ("ignored_layers", "ignore", "modules_to_not_convert") if hasattr(value, a)),
+            None,
+        )
+        method, skip = _stable_config_repr(name, depth + 1), _stable_config_repr(skipped, depth + 1)
+        return f"{type(value).__qualname__}({method},{skip})"
+    if dataclasses.is_dataclass(value):
+        attrs = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+    else:
+        attrs = {k: v for k, v in vars(value).items() if not k.startswith("_")} if hasattr(value, "__dict__") else {}
+    body = ",".join(f"{k}={_stable_config_repr(v, depth + 1)}" for k, v in sorted(attrs.items()))
+    return f"{type(value).__qualname__}({body})"
+
+
+def _flashinfer_autotune_cache_path(od_config: OmniDiffusionConfig, rank: int) -> str:
+    """Per-rank FlashInfer autotune cache file for this diffusion stage.
+
+    The key covers what changes the GEMM shapes and kernels a rank runs: the model, its quantization, the dtype and
+    the parallel layout. FlashInfer itself records the GPU and library versions in the file and does not reuse a
+    file written under a different environment.
+    """
+    import hashlib
+
+    import vllm.envs as envs
+
+    key_src = "|".join(
+        _stable_config_repr(part)
+        for part in (
+            od_config.model,
+            od_config.quantization_config,
+            od_config.dtype,
+            od_config.num_gpus,
+            od_config.parallel_config,
+        )
+    )
+    key = hashlib.sha256(key_src.encode()).hexdigest()[:16]
+    return os.path.join(envs.VLLM_CACHE_ROOT, "flashinfer_autotune", "diffusion", key, f"rank{rank}.json")
+
+
+def _flashinfer_tune_signature(sampling_params: Any) -> tuple[Any, ...]:
+    """What sets a request's GEMM row counts: output geometry, outputs per prompt and whether CFG batches."""
+    cfg = any((getattr(sampling_params, name, None) or 0) > 1 for name in ("guidance_scale", "true_cfg_scale"))
+    return (
+        *(
+            getattr(sampling_params, name, None)
+            for name in ("height", "width", "num_frames", "resolution", "num_outputs_per_prompt")
+        ),
+        cfg,
+    )
+
+
 def _get_mem_allocator_instance() -> Any:
     from vllm.device_allocator import get_mem_allocator_instance
 
@@ -476,9 +551,85 @@ class DiffusionWorker:
     def _get_profiler(self) -> WorkerProfiler | None:
         return getattr(self, "profiler", None)
 
+    def _flashinfer_autotune_context(
+        self,
+        sampling_params: list[Any] | None = None,
+        *,
+        request_ids: list[str] | None = None,
+        new_request_ids: list[str] | None = None,
+    ) -> AbstractContextManager[Any]:
+        """FlashInfer autotune for forwards that run a request shape this worker has not tuned yet.
+
+        vLLM tunes FlashInfer kernels only in its LLM worker warm-up, so without this the diffusion
+        stage runs FlashInfer GEMMs (on SM100+: MXFP8 linears and per-tensor-activation FP8 linears;
+        online per-token FP8 uses CUTLASS) on the library's heuristic tactic. Tune mode profiles
+        only cache misses, but it also adds milliseconds of host time to every FlashInfer call even
+        on cache hits, so it is entered only for the first request of each
+        new shape signature (with step execution: every step of that request, since prefill and
+        decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
+        The per-rank cache file is loaded once and rewritten when new tactics were profiled.
+        Graph-captured paths are safe: their eager warm-up runs before capture, so capture only
+        sees cache hits.
+        """
+        od_config = getattr(self, "od_config", None)
+        if not getattr(od_config, "diffusion_flashinfer_autotune", False):
+            return nullcontext()
+        if not current_omni_platform.is_cuda():
+            return nullcontext()
+        from vllm.utils.flashinfer import has_flashinfer
+
+        if not has_flashinfer():
+            logger.warning_once("diffusion_flashinfer_autotune is set but FlashInfer is not installed; ignoring it.")
+            return nullcontext()
+        cache_path = self.__dict__.get("_flashinfer_autotune_cache_file") or _flashinfer_autotune_cache_path(
+            od_config, self.rank
+        )
+        self._load_flashinfer_autotune_cache(cache_path)
+        seen: set[tuple[Any, ...]] = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
+        tuning_ids: set[str] = self.__dict__.setdefault("_flashinfer_tuning_request_ids", set())
+        signatures = [_flashinfer_tune_signature(sp) for sp in sampling_params or []]
+        new_signature = any(sig not in seen for sig in signatures)
+        seen.update(signatures)
+        if new_signature and new_request_ids:
+            tuning_ids.update(new_request_ids)
+        tune = new_signature or bool(request_ids and tuning_ids.intersection(request_ids))
+        if not tune:
+            return nullcontext()
+        return self._flashinfer_autotune_session(cache_path)
+
+    def _finish_flashinfer_tuning(self, request_ids: list[str]) -> None:
+        tuning_ids = self.__dict__.get("_flashinfer_tuning_request_ids")
+        if tuning_ids:
+            tuning_ids.difference_update(request_ids)
+
+    def _load_flashinfer_autotune_cache(self, cache_path: str) -> None:
+        if getattr(self, "_flashinfer_autotune_loaded", None) == cache_path:
+            return
+        from flashinfer.autotuner import AutoTuner
+
+        if os.path.exists(cache_path):
+            AutoTuner.get().load_configs(cache_path)
+        self._flashinfer_autotune_loaded = cache_path
+        logger.info("Worker %d: FlashInfer autotune enabled, cache %s", self.rank, cache_path)
+
+    @contextmanager
+    def _flashinfer_autotune_session(self, cache_path: str) -> Iterator[None]:
+        from flashinfer.autotuner import AutoTuner, autotune
+
+        tuner = AutoTuner.get()
+        with autotune(tune_mode=True):
+            yield
+        # Only shapes that missed the cache were profiled; persist them for the next start.
+        if getattr(tuner, "_dirty", False):
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tuner.save_configs(cache_path)
+
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if getattr(self.od_config, "diffusion_flashinfer_autotune", False):
+            # Key the autotune cache before loading: the load attaches runtime state to the quantization config.
+            self._flashinfer_autotune_cache_file = _flashinfer_autotune_cache_path(self.od_config, self.rank)
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
         cutlass_fp8_context = (
@@ -856,7 +1007,7 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
-        with ctx:
+        with ctx, self._flashinfer_autotune_context([request.sampling_params]):
             kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
             if diffusion_kv_metadata is not None:
                 kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
@@ -889,7 +1040,8 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
-        with ctx:
+        batch_params = [new_req.req.sampling_params for new_req in scheduler_output.scheduled_new_reqs]
+        with ctx, self._flashinfer_autotune_context(batch_params):
             output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
@@ -902,18 +1054,28 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         try:
-            with ctx:
+            new_reqs = scheduler_output.scheduled_new_reqs
+            tune_ctx = self._flashinfer_autotune_context(
+                [new_req.req.sampling_params for new_req in new_reqs],
+                request_ids=list(scheduler_output.scheduled_request_ids),
+                new_request_ids=[new_req.req.request_id for new_req in new_reqs],
+            )
+            with ctx, tune_ctx:
                 output = self.model_runner.execute_stepwise(scheduler_output)
         except Exception:
             # The engine terminates every scheduled request when execution raises.
             for request_id in scheduler_output.scheduled_request_ids:
                 self._step_lora_state.pop(request_id, None)
+            self._finish_flashinfer_tuning(list(scheduler_output.scheduled_request_ids))
             raise
         # The runner owns model state; retire the worker's metadata before idle.
+        finished_ids = []
         for request_id in scheduler_output.scheduled_request_ids:
             request_output = output.get_request_output(request_id)
             if request_output is not None and request_output.finished:
                 self._step_lora_state.pop(request_id, None)
+                finished_ids.append(request_id)
+        self._finish_flashinfer_tuning(finished_ids)
         if profiler:
             profiler.step()
         return output
@@ -924,6 +1086,7 @@ class DiffusionWorker:
         self.model_runner.release_step_requests(request_ids)
         for request_id in request_ids:
             self._step_lora_state.pop(request_id, None)
+        self._finish_flashinfer_tuning(request_ids)
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.

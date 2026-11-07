@@ -1133,6 +1133,11 @@ class OmniDiffusionConfig:
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
+    # FlashInfer autotune for diffusion GEMMs (CUDA, FlashInfer installed): the first request of each new shape
+    # runs in FlashInfer's tune mode and later ones reuse the tactics, cached per rank across restarts. Without it
+    # the stage keeps FlashInfer's heuristic tactics, because vLLM autotunes FlashInfer only in its LLM worker
+    # warm-up. The first request of a new shape is slower.
+    diffusion_flashinfer_autotune: bool = False
 
     # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
     # None/"auto" keeps native dtype; other values are validated by the selected backend.
