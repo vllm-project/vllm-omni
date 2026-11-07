@@ -1291,10 +1291,6 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _hsdp_shard_conditions = [_is_transformer_block]
 
-    # Standard unquantized vLLM linears need no value-dependent post-load
-    # processing on accelerators. Edge inherits the same loading contract.
-    _hsdp_pre_sharded_meta_post_load = True
-
     # Modules whose parameters must NOT be FSDP-sharded at the root level.
     # time_embedder is cast to fp32 by post_load_weights for precision; if it
     # were swept into the root flat-parameter under MixedPrecisionPolicy(param_dtype=bf16),

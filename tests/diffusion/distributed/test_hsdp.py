@@ -9,7 +9,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DeviceMesh, DTensor
 from vllm.utils.network_utils import get_file_store_init_method
 
@@ -341,37 +340,6 @@ class TestHSDPShardConditions:
                 matched.append(name)
         assert "blocks.0" in matched
         assert "blocks.1" in matched
-
-
-def test_pre_sharded_to_empty_materializes_fsdp_internal_storage(cpu_process_group):
-    with torch.device("meta"):
-        model = nn.Module()
-        model.transformer = nn.Sequential(nn.Linear(2, 2, bias=False))
-    model.transformer.register_buffer("scratch", torch.tensor([3.0]), persistent=False)
-    shard_model(
-        model.transformer,
-        mesh=DeviceMesh("cpu", [0]),
-        hsdp_shard_conditions=[lambda name, _module: name == "0"],
-    )
-
-    load_plan = SimpleNamespace(
-        roots=[SimpleNamespace(name="transformer", module=model.transformer)],
-        groups=[SimpleNamespace(module=model.transformer[0])],
-        binding_names=frozenset({"transformer.0.weight"}),
-    )
-    sharded_weight = model.transformer[0].weight
-
-    DiffusersPipelineLoader._materialize_pre_sharded_hsdp_state(model, load_plan, torch.device("cpu"))
-
-    fsdp_param = fully_shard.state(model.transformer[0])._fsdp_param_group.fsdp_params[0]
-    assert model.transformer[0].weight is sharded_weight
-    assert model.transformer[0].weight.to_local().device.type == "cpu"
-    assert fsdp_param._sharded_param_data.device.type == "cpu"
-    assert (
-        fsdp_param._sharded_param_data.untyped_storage().data_ptr()
-        == model.transformer[0].weight.to_local().untyped_storage().data_ptr()
-    )
-    assert torch.equal(model.transformer.scratch, torch.tensor([3.0]))
 
 
 def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path, monkeypatch):
