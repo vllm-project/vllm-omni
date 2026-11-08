@@ -42,7 +42,7 @@ def test_scaled_softmax_reuses_kernel_across_video_shapes() -> None:
         caches = getattr(_scaled_softmax_kernel, "device_caches", None)
         entry = caches.get(triton.runtime.driver.active.get_current_device()) if caches is not None else None
         if not isinstance(entry, tuple) or not entry or not isinstance(entry[0], dict):
-            pytest.skip(f"Triton {triton.__version__} JIT cache layout differs; cannot count compiled variants")
+            pytest.fail(f"Triton {triton.__version__} JIT cache layout differs; cannot count compiled variants")
         return len(entry[0])
 
     def check(rows: int, tokens: int) -> None:

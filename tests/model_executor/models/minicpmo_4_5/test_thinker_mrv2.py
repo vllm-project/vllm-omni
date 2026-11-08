@@ -26,8 +26,11 @@ def test_native_input_item_identity_is_per_row_and_cleared_by_next_unit():
     )
     for index, expected in enumerate(["first", "second"]):
         payload = to_payload_element(first["meta"], idx=index, start=index, end=index + 1)
-        _, client = partition_flat_payload({f"meta.{key}": value for key, value in payload.items()})
-        wire = _ensure_tensor_values(client)
+        inter_stage, client = partition_flat_payload({f"meta.{key}": value for key, value in payload.items()})
+        # A client payload would make the output processor drop the Thinker's
+        # pooling_output, including the latent llm2tts needs.
+        assert client == {}
+        wire = _ensure_tensor_values(inter_stage)
         encoded = wire["meta.duplex_input_item_id_utf8"]
         assert encoded.device.type == "cpu"
         assert bytes(encoded.tolist()).decode("utf-8") == expected

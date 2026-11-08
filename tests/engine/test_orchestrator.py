@@ -4184,13 +4184,14 @@ async def test_input_identity_survives_speaking_unit_decode_but_not_next_segment
     key = "meta.duplex_input_item_id_utf8"
     identity = torch.tensor(list(b"committed-input"), dtype=torch.uint8)
 
-    async def deliver(metadata, *, finished=False):
+    async def deliver(metadata, *, finished=False, pooling=None):
         raw = EngineCoreOutputs(
             outputs=[
                 OmniEngineCoreOutput(
                     request_id=state.request_id,
                     new_token_ids=[1],
                     multimodal_output=metadata,
+                    pooling_output=pooling,
                     is_segment_finished=finished,
                 )
             ]
@@ -4204,9 +4205,18 @@ async def test_input_identity_survives_speaking_unit_decode_but_not_next_segment
     assert (await deliver({}, finished=True))[key] is identity
     assert key not in await deliver({}, finished=True)  # A later unit cannot reuse it.
 
+    # A batched step republishes this decoding row's buffer payload, which
+    # may be empty or describe a later append; the unit keeps its identity.
     await deliver({key: identity})
     cleared = torch.empty(0, dtype=torch.uint8)
+    later = torch.tensor(list(b"later-input"), dtype=torch.uint8)
+    assert (await deliver({key: cleared}))[key] is identity
+    assert (await deliver({key: later}, finished=True))[key] is identity
+    # The next unit starts a new segment and may clear the identity.
     assert (await deliver({key: cleared}, finished=True))[key] is cleared
+
+    # MRv2 Thinkers keep the identity off the client channel.
+    assert (await deliver(None, pooling={key: later, "latent": torch.ones(16, 8)}, finished=True))[key] is later
 
 
 @pytest.mark.asyncio

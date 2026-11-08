@@ -1063,11 +1063,16 @@ class OrchestratorBase:
                 # finishes on a later decode step that may carry no metadata.
                 # Retain only this small identity within the current segment;
                 # never retain activations or inherit it across a boundary.
+                # Batched steps republish every row's current buffer payload,
+                # so the first identity of a segment wins over later ones.
+                # MRv2 Thinkers carry it only in pooling_output.
                 input_key = "meta.duplex_input_item_id_utf8"
-                input_item_id = raw_mm.get(input_key) if isinstance(raw_mm, dict) else None
                 previous_segment = req_state.streaming.segment(stage_id)
-                if input_item_id is None and not previous_segment.finished:
-                    input_item_id = previous_segment.output_metadata.get(input_key)
+                input_item_id = None if previous_segment.finished else previous_segment.output_metadata.get(input_key)
+                if input_item_id is None:
+                    for channel in (raw_mm, getattr(eco, "pooling_output", None)):
+                        if isinstance(channel, dict) and (input_item_id := channel.get(input_key)) is not None:
+                            break
                 if input_item_id is not None:
                     output_metadata[input_key] = input_item_id
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
