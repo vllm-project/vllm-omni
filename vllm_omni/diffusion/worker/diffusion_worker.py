@@ -97,6 +97,7 @@ if TYPE_CHECKING:
 
     from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
+    from vllm_omni.lora.inventory import LoRAAdapterInfo
 
 logger = init_logger(__name__)
 
@@ -987,6 +988,12 @@ class DiffusionWorker:
         if self.lora_manager is None:
             return []
         return self.lora_manager.list_adapters()
+
+    def list_lora_adapters(self) -> list[LoRAAdapterInfo]:
+        """Return runtime adapter identities for the inventory RPC."""
+        if self.lora_manager is None:
+            return []
+        return self.lora_manager.list_adapter_metadata()
 
     def pin_lora(self, adapter_id: int) -> bool:
         if self.lora_manager is None:

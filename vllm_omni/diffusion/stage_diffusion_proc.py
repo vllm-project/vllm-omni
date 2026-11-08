@@ -48,6 +48,7 @@ from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_de
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.inventory import LORA_ADAPTERS_RPC, merge_lora_adapter_records
 from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -327,6 +328,17 @@ class StageDiffusionProc:
             for part in results:
                 merged.update(part or [])
             return sorted(merged)
+
+        if method == LORA_ADAPTERS_RPC:
+            results = await run_executor(
+                self._engine.collective_rpc,
+                LORA_ADAPTERS_RPC,
+                timeout,
+                (),
+                {},
+                None,
+            )
+            return merge_lora_adapter_records(results)
 
         if method == "pin_lora":
             lora_id = args[0] if args else kwargs.get("adapter_id")

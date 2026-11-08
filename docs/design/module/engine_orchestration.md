@@ -144,6 +144,12 @@ and is applied while draining outputs, including cancelled requests. Ordinary
 request failures retain retryable classification; duplex session termination
 keeps its existing semantics.
 
+The runtime LoRA inventory RPC is a read-only control query. Stage pools attach
+logical stage and physical replica identity to its results, while worker ranks
+are merged within their owning replica. A failed inventory query produces a
+query-scoped error; it must not terminate the orchestrator or mutate request
+routing and adapter state.
+
 ## Promotion gate
 
 - Reconcile current names and boundaries after #5441 merges, closes, or is

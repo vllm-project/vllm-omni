@@ -59,6 +59,7 @@ the default wrapper for every generation task.
 | Video depth estimation | `POST /v1/videos/depth` | Multipart form | Per-frame depth as a rendered MP4; optional raw float16 depth (NPZ) | [Video Depth](video_depth_api.md) |
 | Video generation (recommended) | `POST /v1/videos` | Multipart form | Asynchronous job JSON | [Videos](videos_api.md) |
 | Video generation (blocking) | `POST /v1/videos/sync` | Multipart form | Video bytes | [Videos](videos_api.md#synchronous-response) |
+| Runtime LoRA inventory | `GET /v1/omni/loras` | None | Stage/replica adapter JSON | [LoRA guide](../user_guide/diffusion/lora.md#runtime-inventory) |
 
 `POST /v1/videos/sync` is intended for tests and simple scripts. Use the
 asynchronous job API for production requests so clients can poll, download,

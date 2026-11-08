@@ -41,6 +41,7 @@ from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, disable_watermarking
+from vllm_omni.lora.inventory import LORA_ADAPTERS_RPC, merge_lora_adapter_records
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -64,6 +65,7 @@ class _SubmitRevokedError(Exception):
 
 
 CACHE_RESET_TIMEOUT_S = 60.0
+LORA_INVENTORY_TIMEOUT_S = 5.0
 
 
 def ar_level2_wake_enabled() -> bool:
@@ -1622,6 +1624,76 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             elif isinstance(result, int):
                 merged.add(result)
         return sorted(merged)
+
+    async def get_lora_inventory(self) -> list[dict[str, object]]:
+        """Return runtime LoRA adapters grouped by stage and replica.
+
+        The existing :meth:`list_loras` method intentionally keeps its flat
+        ID-only return type for Python callers. This method preserves the
+        physical ownership metadata required by the public inventory route.
+
+        Raises:
+            RuntimeError: If a live stage cannot answer the inventory query or
+                returns a malformed result.
+        """
+        stage_configs = list(getattr(self.engine, "stage_configs", []) or [])
+        stage_metadata = list(getattr(self.engine, "stage_metadata", []) or [])
+        inventory: dict[int, dict[str, object]] = {}
+        for index, config in enumerate(stage_configs):
+            if isinstance(config, Mapping):
+                stage_id = int(config.get("stage_id", index))
+                model_stage = config.get("model_stage")
+            else:
+                stage_id = int(getattr(config, "stage_id", index))
+                model_stage = getattr(config, "model_stage", None)
+            if model_stage is None and index < len(stage_metadata):
+                model_stage = getattr(stage_metadata[index], "model_stage", None)
+            inventory[stage_id] = {
+                "stage_id": stage_id,
+                "model_stage": model_stage,
+                "replicas": [],
+            }
+
+        results = await self.collective_rpc(
+            method=LORA_ADAPTERS_RPC,
+            timeout=LORA_INVENTORY_TIMEOUT_S,
+        )
+        for result in results:
+            if not isinstance(result, Mapping):
+                raise RuntimeError("LoRA inventory returned an invalid stage result")
+            stage_id = result.get("stage_id")
+            replica_id = result.get("replica_id")
+            stage_result = result.get("result")
+            if (
+                "result" not in result
+                or isinstance(stage_id, bool)
+                or not isinstance(stage_id, int)
+                or isinstance(replica_id, bool)
+                or not isinstance(replica_id, int)
+            ):
+                raise RuntimeError("LoRA inventory returned an invalid stage result envelope")
+            stage_inventory = inventory.get(stage_id)
+            if stage_inventory is None:
+                raise RuntimeError("LoRA inventory returned an unknown stage")
+            if isinstance(stage_result, Mapping) and stage_result.get("todo"):
+                adapters: list[dict[str, object]] = []
+            elif isinstance(stage_result, Mapping) and stage_result.get("supported") is False:
+                raise RuntimeError(f"LoRA inventory RPC failed for stage {stage_id} replica {replica_id}")
+            else:
+                try:
+                    adapters = merge_lora_adapter_records(stage_result)
+                except (RuntimeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"LoRA inventory RPC returned an invalid result for stage {stage_id} replica {replica_id}"
+                    ) from exc
+            cast(list[dict[str, object]], stage_inventory["replicas"]).append(
+                {"replica_id": replica_id, "adapters": adapters}
+            )
+
+        for stage_inventory in inventory.values():
+            replicas = cast(list[dict[str, object]], stage_inventory["replicas"])
+            replicas.sort(key=lambda replica: cast(int, replica["replica_id"]))
+        return [inventory[stage_id] for stage_id in sorted(inventory)]
 
     async def pin_lora(self, adapter_id: int) -> bool:
         """Pin a LoRA adapter across stages."""

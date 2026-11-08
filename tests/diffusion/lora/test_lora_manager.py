@@ -1205,6 +1205,40 @@ def _dummy_lora_request(adapter_id: int) -> LoRARequest:
     )
 
 
+def test_lora_manager_lists_adapter_metadata_and_removes_it(monkeypatch):
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=2,
+    )
+
+    def _fake_load(request: LoRARequest):
+        return type("LM", (), {"id": request.lora_int_id})(), type("PH", (), {})()
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
+
+    request = _dummy_lora_request(7)
+    assert manager.add_adapter(request)
+    assert manager.list_adapter_metadata() == [{"id": 7, "name": "adapter_7"}]
+    assert manager.remove_adapter(7)
+    assert manager.list_adapter_metadata() == []
+
+
+def test_lora_manager_hides_non_request_selectable_adapters():
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._registered_adapters = {7: SimpleNamespace()}
+    manager._adapter_names = {7: "merged"}
+    manager._fixed_adapter = False
+    manager.lora_application = "merged"
+    assert manager.list_adapter_metadata() == []
+
+    manager.lora_application = "runtime"
+    manager._fixed_adapter = True
+    assert manager.list_adapter_metadata() == []
+
+
 def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
