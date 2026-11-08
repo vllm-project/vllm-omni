@@ -7,9 +7,11 @@ from collections.abc import Collection, Mapping
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 from vllm_omni.inputs.data import (
     DIFFUSION_QUALITY_LEVELS,
     OmniDiffusionSamplingParams,
+    absorb_attention_schedule_extra_args,
 )
 
 logger = init_logger(__name__)
@@ -103,9 +105,17 @@ def apply_normalized_diffusion_request_extra_args(
     sampling_params: OmniDiffusionSamplingParams,
     normalized_extra_args: Mapping[str, object],
 ) -> None:
-    """Overlay request extras without discarding stage defaults."""
+    """Overlay request extras without discarding stage defaults.
+
+    A request ``attention_schedule`` moves onto the typed field and replaces a stage default there;
+    an invalid one raises a 400 client error before dispatch.
+    """
     if normalized_extra_args:
         sampling_params.extra_args = {
             **(sampling_params.extra_args or {}),
             **normalized_extra_args,
         }
+    try:
+        absorb_attention_schedule_extra_args(sampling_params, override=True)
+    except (TypeError, ValueError) as exc:
+        raise InvalidAttentionScheduleError(str(exc)) from exc

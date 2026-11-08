@@ -18,6 +18,7 @@ from vllm.v1.engine.utils import EngineZmqAddresses
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
 from vllm_omni.config.stage_config import (
+    DeployConfig,
     DuplexSessionRuntimeConfig,
     PipelineConfig,
     StageExecutionType,
@@ -412,7 +413,7 @@ class TestSingleStageModeDetection:
             )
             mocker.patch(
                 "vllm_omni.engine.omni_engine_base.load_deploy_config",
-                return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
+                return_value=DeployConfig(),
             )
 
         def resolve_stage_configs(engine, *args, **kwargs):
@@ -512,7 +513,7 @@ class TestSingleStageModeDetection:
         )
         load_deploy_config = mocker.patch(
             "vllm_omni.engine.omni_engine_base.load_deploy_config",
-            return_value=SimpleNamespace(duplex_session=duplex_session),
+            return_value=DeployConfig(duplex_session=duplex_session),
         )
 
         engine = self._make_engine_no_thread(
@@ -543,7 +544,7 @@ class TestSingleStageModeDetection:
         )
         load_deploy_config = mocker.patch(
             "vllm_omni.engine.omni_engine_base.load_deploy_config",
-            return_value=SimpleNamespace(duplex_session=duplex_session),
+            return_value=DeployConfig(duplex_session=duplex_session),
         )
 
         engine = self._make_engine_no_thread(
@@ -620,7 +621,7 @@ class TestEndpointRestrictionsTrustRemoteCode:
     def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
         mocker.patch(
             "vllm_omni.engine.omni_engine_base.load_deploy_config",
-            return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
+            return_value=DeployConfig(),
         )
         mocker.patch.object(
             AsyncOmniEngine,

@@ -558,8 +558,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # Reuse the request scheduler's complete compatibility key. DLO
             # AllGather requires every DP rank to execute the same collective
             # schedule, including shape, CFG, denoise steps, output count,
-            # and LoRA settings.
-            compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
+            # and LoRA settings. Building the keys below cannot raise:
+            # add_request() already resolved each schedule against this service
+            # config and rejected an invalid one as that request's client error.
+            attention_schedule_config = self.od_config.diffusion_attention_schedule
+            compatibility_keys = [
+                build_request_batch_sampling_params_key(nr.req, attention_schedule_config) for nr in new_reqs
+            ]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
                     "DLO DP multi-concurrency requires compatible shape, CFG, "
