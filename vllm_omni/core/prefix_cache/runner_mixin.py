@@ -29,6 +29,7 @@ from vllm_omni.core.prefix_cache.interface import (
     ModelCachePolicy,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
+    StageCacheOutputs,
 )
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager, _is_step_token_tensor
 from vllm_omni.data_entry_keys import flatten_payload
@@ -52,6 +53,13 @@ class PrefixCacheRunnerMixin:
     their instance fields as before.
     """
 
+    if TYPE_CHECKING:
+        _pending_full_payload_send: dict[str, tuple[Any, ...]]
+
+        def _should_accumulate_full_payload_output(self) -> bool: ...
+
+        def resume_full_payload_output(self, req_id: str, delivered_upto: int) -> None: ...
+
     # Host-class fields (annotation only; the runner initializes them).
     input_batch: Any
     kv_cache_config: Any
@@ -72,6 +80,7 @@ class PrefixCacheRunnerMixin:
     ) = None
     _prefix_cache_decode_reserved = 0
     _prefix_cache_pure_decode = False
+    _scheduled_token_ranges: dict[str, tuple[int, int]] | None = None
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
         """Freeze the model's cache policy at load_model."""
@@ -142,6 +151,12 @@ class PrefixCacheRunnerMixin:
         """Per-step lifecycle entry; must run before ``_update_states``
         removes finished requests (finished/abort escalation happens inside
         ``new_step_starts``). Builds the manager on the first real step."""
+        if getattr(self, "_pending_full_payload_send", None) and self._should_accumulate_full_payload_output():
+            for req_id in getattr(scheduler_output, "replaced_req_ids", ()):
+                self._pending_full_payload_send.pop(req_id, None)
+            cached = scheduler_output.scheduled_cached_reqs
+            for req_id in cached.resumed_req_ids:
+                self.resume_full_payload_output(req_id, scheduler_output.delivered_upto[req_id])
         if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
@@ -172,6 +187,7 @@ class PrefixCacheRunnerMixin:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        token_ranges: dict[str, tuple[int, int]] | None = None,
     ) -> int | None:
         """Write this step's outputs into the cache.
 
@@ -182,6 +198,7 @@ class PrefixCacheRunnerMixin:
         """
         from vllm.distributed.parallel_state import get_pp_group
 
+        self._scheduled_token_ranges = token_ranges
         if self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
             return None
         if self._prefix_cache_adapter is None or self._prefix_cache_group_view is None:
@@ -190,7 +207,11 @@ class PrefixCacheRunnerMixin:
             raise RuntimeError("prefix-cache step snapshot was not initialized")
         layout = self._prefix_cache_adapter.build_write_layout(
             self._prefix_cache_group_view,
-            num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
+            num_scheduled_tokens=(
+                {rid: end - start for rid, (start, end) in token_ranges.items()}
+                if token_ranges is not None
+                else dict(self._prefix_cache_step.scheduled_tokens)
+            ),
         )
         mm = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
         n = num_tokens_unpadded
@@ -298,9 +319,7 @@ class PrefixCacheRunnerMixin:
             self._prefix_cache_decode_reserved = 0
             self._prefix_cache_pure_decode = False
 
-    def _prefix_cache_materialize(
-        self, step_id: int | None, req_ids: list[str]
-    ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
+    def _prefix_cache_materialize(self, step_id: int | None, req_ids: list[str]) -> StageCacheOutputs | None:
         """Per-request merged outputs for a saved step.
 
         ``req_ids`` must be the save-time snapshot, never the live
@@ -309,6 +328,5 @@ class PrefixCacheRunnerMixin:
         ``mm_outputs`` is all-or-nothing; empty only when the step had no mm.
         """
         if step_id is None or self.omni_prefix_cache is None:
-            return None, None
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
-        return outs.hidden_states, (outs.mm_outputs or None)
+            return None
+        return self.omni_prefix_cache.materialize(step_id, list(req_ids))

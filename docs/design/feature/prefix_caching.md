@@ -267,7 +267,10 @@ Which stages may set `enable_prefix_caching: true`:
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
-Hit spans come from adapter-classified `STARTED` events for new requests:
+The adapter snapshots lifecycle events before the runner updates requests, then
+snapshots the write layout after batch ordering. The layout keeps request-local
+token positions separate from packed batch row offsets and physical cache slots.
+The manager consumes these snapshots without reading scheduler or batch state:
 
 - A new request with a (partial) prefix hit is the normal path: the hit
   blocks are read from the pool, the rest is this step's rows, and the
@@ -285,28 +288,40 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   ref before it overwrites the pool, so a delayed fetch serves the original
   tenant. A version mismatch with no preserved copy raises for live and
   finished alike (the pool rows are a newer tenant's). Production defaults
-  stay opt-in until preempt/resume hit spans are reconstructed.
-- `async_chunk` continuation: when the next upstream chunk arrives, the same
-  request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
-  to what it already computed itself. The adapter classifies an observed ID as
-  `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
-  earlier steps and re-emitting them would duplicate output. On Model
-  Runner V2 the adapter also tracks a delivery watermark (below); an
-  in-order continuation starts exactly at it and produces no delivery.
-- Preemption + reschedule: for stages with `recompute_preemption="allow"`
-  (the default), vLLM resets `num_computed_tokens` to 0 on
-  preemption and re-runs prefix matching on resume, so the resumed request
-  can come back with a fresh hit. With the V1 model runner it arrives
-  through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
-  replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
-  as an already-observed ID. Neither path marks an omni hit span: the
-  resumed request gets only the rows it recomputes, and its still-open
-  deferred write keeps appending (a slot written twice keeps the later
-  chunk). Cache integrity holds either way — the hit blocks already have
-  rows, from this request or the one it hit. On V1, stages that need full
-  prompt hidden states should be sized so preemption does not occur while
-  prefix caching is on. On Model Runner V2 the delivery watermark keeps the
-  resumed output gapless and duplicate-free (below).
+  are selected by the stage configuration.
+- `async_chunk` continuation arrives as an `EXTENDED` event. It retains the
+  request's delivery progress and does not replay earlier output.
+- On preemption, vLLM resets `num_computed_tokens` and looks up the prefix
+  again when resuming. The runner receives the new hit boundary `h` and
+  the scheduler's accepted-output boundary `d`. The manager recovers `[d, h)`
+  when the hit grows. When the hit shrinks below `d`, recomputed rows still
+  enter the cache, while outgoing payloads exclude the replayed prefix.
+- Explicit prompt replacement resets delivery progress for the same request ID.
+  Ordinary streaming extensions retain it. V1 and V2 share this accepted boundary.
+
+The scheduler owns `delivered_upto`. It advances only for accepted frames after
+stale-output and failure checks, using immutable scheduled positions and excluding
+rejected draft tokens. Preemption retains the boundary; prompt replacement and
+new logical requests start at zero. This describes local scheduler acceptance,
+not connector or client receipt.
+
+The scheduler sends its accepted boundary for every scheduled request.
+On V1, `materialize` restores raw step outputs for postprocess. The output builder then
+clips token fields using the frozen execution range and accepted boundary,
+for both chunk and full-payload delivery, with or without a cache. Buffered decode
+uses the same positions before its cache writes flush. The flush only coalesces
+rows from a stable batch and preserves their captured slots. Cache write completion remains owned by
+the controller and slot state. Output builders never advance delivery progress.
+
+Full-payload accumulation appends already-clipped token rows and replaces fields
+listed in the processor's `_FULL_PAYLOAD_REPLACE_KEYS`. Before resume, the worker
+joins pending builders and removes unaccepted rows from token fields declared by
+`_FULL_PAYLOAD_TOKEN_KEYS` (flat keys or namespace roots); `hidden` is token-aligned
+by default. Other fields retain their existing accumulation semantics. Fixed
+embeddings are replaced and never sliced by token count. Ordered builders
+propagate failures to later outputs. Terminal notifications join pending builders
+before flush or discard. Sparse list-only audio bypasses token clipping because
+its emission does not follow scheduler token ranges.
 
 Stages whose decode state cannot be reconstructed from token IDs declare
 `recompute_preemption="fail"` in their AR pipeline topology. Capacity
@@ -333,15 +348,22 @@ from that ledger and the `InputBatch` bound for the step being saved
 `check_mrv2_prefix_cache_layout` refuses DCP and a block-size mismatch at
 kv-cache init.
 
-The same adapter tracks a delivery watermark: the number of leading rows
-already emitted for each request. A re-entry whose first position differs
-from it yields a `PrefixCacheDelivery`:
+The adapter reads `delivered_upto` from the scheduler snapshot. It does not
+advance a second watermark from scheduled token counts: async output can be
+rejected after execution. A re-entry whose first position differs from the
+accepted boundary yields a `PrefixCacheDelivery`:
 
 - start above the watermark (a resume that hit more than it had delivered):
   the manager registers a replay span `[watermark, start)` over the new
   blocks, so the gap is served from the cache ahead of this step's rows;
 - start below it (a resume that recomputes delivered rows): `trim` leading
-  rows of this step's slice are dropped from the merged output.
+  rows of this step's slice are dropped from the merged output. Subsequent
+  recompute steps keep trimming until they reach the accepted boundary.
+
+An ordinary running step ahead of the accepted boundary does not trigger a
+cache replay: its predecessor may still be in flight. V2 applies cached-key
+recovery and trimming through its output finalizer, without a second V1
+builder slicing pass.
 
 With the multiprocessing executor (including Ray V2), only TP rank 0
 retains step ids for output rewrites when no KV/EC output aggregation is
@@ -407,17 +429,10 @@ order. Terminal events precede arrivals, so same-step ID reuse finishes the old 
 before `STARTED` classifies the new one. The manager keeps write/resource
 bookkeeping only, with no second `live_reqs` lifecycle classifier.
 `ABORTED` accepts explicit optional `discarded_req_ids` or `aborted_req_ids`.
-The current `OmniSchedulerOutput` and upstream scheduler contract produce
-neither field: the `discarded_req_ids` producer is proposed in
-[PR #7681](https://github.com/vllm-project/vllm-omni/pull/7681), which has not
-landed. Until that dependency lands, production terminals remain `FINISHED`.
-The adapter's synthetic-input tests cover optional-field interpretation and
-ABORTED-over-FINISHED precedence, not production cancellation delivery.
-When #7681 lands, pin the producer/adapter contract with a real
-`OmniSchedulerOutput` test so a field rename cannot silently drop ABORTED.
-`REPLACED` belongs to item 5.
-Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
-resume delivery watermarks are follow-up contracts, not inferred here.
+The Omni scheduler records cancelled requests in `discarded_req_ids` when their
+terminal notification reaches the runner. The adapter translates these into
+`ABORTED`; ordinary completion remains `FINISHED`. Explicit prompt replacement
+produces `REPLACED` and resets the old request's cache and delivery state.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 

@@ -38,11 +38,9 @@ logger = logging.getLogger(__name__)
 
 # Pooling output layer indices (semantic names for clarity)
 # Actual layer indices are integers; these functions provide semantic access
-# Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
-# set use REPLACE semantics (subsequent emissions discard prior chunks)
-# instead of CONCAT.  qwen3-omni currently has none — model_outputs is
-# not emitted by the thinker/talker forward.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
+# Fixed embeddings replace earlier emissions; token fields can be trimmed on resume.
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.tts_bos", "embed.tts_eos", "embed.tts_pad"})
+_FULL_PAYLOAD_TOKEN_KEYS: frozenset[str] = frozenset({"hidden", "hidden_states", "codes.audio"})
 
 _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196

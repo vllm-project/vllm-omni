@@ -493,7 +493,11 @@ class OmniPrefixCacheManager:
             #    would leave future hits ABSENT. The next save waits
             #    join_host_ready. (Not leftover_mm — those are this-step reads.)
             for event in events:
-                if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
+                if event.kind not in (
+                    PrefixCacheEventKind.FINISHED,
+                    PrefixCacheEventKind.ABORTED,
+                    PrefixCacheEventKind.REPLACED,
+                ):
                     continue
                 req_id = event.req_id
                 tids, dtask = self._request_tasks.finish(req_id)
@@ -510,14 +514,18 @@ class OmniPrefixCacheManager:
             #    materialize (async builder) must not reread that live table.
             self._clear_hit_infos()
             for event in events:
-                if event.kind not in (PrefixCacheEventKind.STARTED,):
+                if event.kind not in (
+                    PrefixCacheEventKind.STARTED,
+                    PrefixCacheEventKind.REPLACED,
+                    PrefixCacheEventKind.RESUMED,
+                ):
                     continue
                 req_id = event.req_id
                 # The adapter alone classifies starts versus continuation or
                 # resume. Do not re-infer that lifecycle from write-task state.
                 num_computed = int(event.hit_end)
-                if num_computed > 0:
-                    self._register_hit_span(req_id, num_computed, event.block_ids, read_start=0)
+                if num_computed > event.delivered_upto:
+                    self._register_hit_span(req_id, num_computed, event.block_ids, read_start=event.delivered_upto)
             # Re-entries whose first position differs from what was already
             # delivered: replay the gap from the cache, or drop the overlap.
             for delivery in step.deliveries:

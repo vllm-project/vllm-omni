@@ -215,6 +215,28 @@ def split_mapping_outputs(
     return batch_payloads
 
 
+def slice_token_payload(
+    payload: dict[str, object],
+    *,
+    token_range: tuple[int, int],
+    delivered_upto: int,
+    token_keys: frozenset[str],
+) -> dict[str, object]:
+    """Slice delivery after postprocess, using frozen positions rather than tensor length."""
+    start, end = token_range
+    if end <= delivered_upto:
+        return {}
+    result = dict(payload)
+    for key in token_keys:
+        value = result.get(key)
+        if not isinstance(value, torch.Tensor) or value.ndim == 0:
+            continue
+        offset = max(0, delivered_upto - start)
+        if offset:
+            result[key] = value[offset:]
+    return result
+
+
 def to_payload_element(
     element: object,
     idx: int,

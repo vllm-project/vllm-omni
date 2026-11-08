@@ -390,15 +390,6 @@ class _OmniConnectorRuntimeMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Force-flush any pending full-payload accumulator entry before
-        # cleanup proceeds.  Without this, finished requests with no
-        # downstream consumer (e.g. text-only on multi-modal arch) leave
-        # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.  The
-        # flush is idempotent when the entry has already been flushed by the
-        # scheduler-driven path, but this cleanup path runs for every request,
-        # so skip it entirely when the request never accumulated a payload.
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})

@@ -48,6 +48,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
@@ -58,6 +59,7 @@ from vllm_omni.utils.device_copy import HostCopyBatch, index_to_device
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
     partition_payload_list,
+    slice_token_payload,
     snapshot_mm_payload,
 )
 from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
@@ -401,6 +403,7 @@ class GPUARModelRunner(
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
     _prefix_cache_coalesce_decode = True
+    _full_payload_output_future: Future[None] | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -812,6 +815,7 @@ class GPUARModelRunner(
         # 1. Unfreeze GC so model weights and GPU tensors are collected
         #    immediately when references are dropped (upstream Worker.shutdown
         #    also does this before any teardown).
+        self._full_payload_output_future = None
         gc.unfreeze()
 
         # 2. Destroy talker MTP CUDA graph wrapper to release captured graphs.
@@ -1027,7 +1031,7 @@ class GPUARModelRunner(
         needs_scheduled_hidden_payload: bool,
         req_ids: list[str],
         step_id: int | None,
-    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
+    ) -> tuple[torch.Tensor | None, StageCacheOutputs | None]:
         """Prefix-cache payload sources for the pooler payload build.
 
         req_ids must be the step's snapshot, not ``input_batch.req_ids``: under
@@ -1045,9 +1049,8 @@ class GPUARModelRunner(
             # there is no step context to consume; serve the fresh slice.
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
-            return hidden_states_cpu, None, None
-        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
-        return hidden_states_cpu, combined_hidden, combined_mm
+            return hidden_states_cpu, None
+        return hidden_states_cpu, self._prefix_cache_materialize(step_id, list(req_ids))
 
     def _build_omni_pooler_payload(
         self,
@@ -1213,6 +1216,14 @@ class GPUARModelRunner(
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
 
+        if (
+            scheduler_output.finished_req_ids
+            or getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", ())
+            or getattr(scheduler_output, "replaced_req_ids", ())
+        ) and self._full_payload_output_future is not None:
+            self._full_payload_output_future.result()
+            self._full_payload_output_future = None
+
         # Exactly once per real scheduler_output, before _update_states
         # (dummy/warmup runs never reach execute_model).
         self._prefix_cache_step_begin(scheduler_output)
@@ -1237,7 +1248,9 @@ class GPUARModelRunner(
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids, discarded_req_ids=getattr(scheduler_output, "discarded_req_ids", set())
+                    )
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -1533,6 +1546,13 @@ class GPUARModelRunner(
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+                deferred_state_corrections_fn = None
+            token_ranges = {
+                rid: (self.requests[rid].num_computed_tokens, self.requests[rid].num_computed_tokens + count)
+                for rid, count in scheduler_output.num_scheduled_tokens.items()
+            }
             # Prefix-cache write: freeze + submit; policy gating (full
             # hidden, skip/deferred keys) happens inside the manager.
             prefix_cache_step_id = self._prefix_cache_save_step(
@@ -1540,6 +1560,7 @@ class GPUARModelRunner(
                 multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
+                token_ranges=token_ranges,
             )
             if (
                 prefix_cache_step_id is not None
@@ -1898,7 +1919,7 @@ class GPUARModelRunner(
         scheduler_output: SchedulerOutput,
     ) -> SchedulerOutput:
         updates: dict[str, Any] = {}
-        for attr in ("num_scheduled_tokens", "scheduled_spec_decode_tokens"):
+        for attr in ("num_scheduled_tokens", "scheduled_spec_decode_tokens", "delivered_upto"):
             val = getattr(scheduler_output, attr, None)
             if isinstance(val, dict):
                 updates[attr] = val.copy()
@@ -2112,9 +2133,11 @@ class GPUARModelRunner(
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
+        scheduled_token_ranges: dict[str, tuple[int, int]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
+        cache_outputs = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
@@ -2186,16 +2209,15 @@ class GPUARModelRunner(
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
             if cache_step:
-                (
-                    hidden_states_cpu,
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._prepare_prefix_cache_pooler_payload_sources(
+                hidden_states_cpu, cache_outputs = self._prepare_prefix_cache_pooler_payload_sources(
                     staged_hidden_states_cpu=staged_hidden_states_cpu,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
                 )
+                if cache_outputs is not None:
+                    combined_hidden_states = cache_outputs.hidden_states
+                    combined_multimodal_outputs = cache_outputs.mm_outputs or None
             if combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 if defer_full_payload_d2h:
@@ -2245,7 +2267,17 @@ class GPUARModelRunner(
                         scheduled_seq_len=scheduled_seq_len,
                         restored_mm=restored_mm,
                     )
-                    pooler_output.append(flatten_payload(payload))
+                    payload = flatten_payload(payload)
+                    if scheduled_token_ranges is not None and rid in scheduled_token_ranges and not audio_sparse_output:
+                        token_keys = frozenset(key for key in payload if self._is_full_payload_token_key(key))
+                        token_keys -= self._resolve_full_payload_replace_keys()
+                        payload = slice_token_payload(
+                            payload,
+                            token_range=scheduled_token_ranges[rid],
+                            delivered_upto=getattr(scheduler_output, "delivered_upto", {}).get(rid, 0),
+                            token_keys=token_keys,
+                        )
+                    pooler_output.append(payload)
 
         pooler_inter: Sequence[dict[str, object] | None] | None
         pooler_client: Sequence[dict[str, object] | None] | None
@@ -2265,10 +2297,10 @@ class GPUARModelRunner(
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                for i, rid in enumerate(req_ids_output_copy):
-                    req_state = self.requests.get(rid)
-                    if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+                for rid, request_payload in zip(req_ids_output_copy, pooler_inter):
+                    request = self.requests.get(rid)
+                    if request is not None and request_payload:
+                        self.accumulate_full_payload_output(rid, request_payload, request)
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(
@@ -2332,6 +2364,7 @@ class GPUARModelRunner(
             prefix_cache_step_id,
         ) = self.execute_model_state
         self.execute_model_state = None
+        scheduled_token_ranges = self._scheduled_token_ranges
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2566,7 +2599,13 @@ class GPUARModelRunner(
         # would then consume the wrong step's prefix.
         restored_mm_snapshot = self._take_restored_mm(req_ids_output_snapshot)
 
+        accumulate_full_payload = use_async_omni_output and self._should_accumulate_full_payload_output()
+        previous_full_payload_output = self._full_payload_output_future if accumulate_full_payload else None
+
         def output_builder() -> OmniModelRunnerOutput:
+            if previous_full_payload_output is not None:
+                # The single worker already preserves order; propagate earlier failures.
+                previous_full_payload_output.result()
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
@@ -2597,6 +2636,7 @@ class GPUARModelRunner(
                     postprocess_already_applied=omni_postprocess_already_applied,
                     prefix_cache_step_id=prefix_cache_step_id,
                     restored_mm=restored_mm_snapshot,
+                    scheduled_token_ranges=scheduled_token_ranges,
                 )
             output.omni_connector_output = omni_connector_output
             if sampling_feedback is not None:
@@ -2631,6 +2671,8 @@ class GPUARModelRunner(
                     cuda_device=self.device,
                     **async_output_kwargs,
                 )
+                if accumulate_full_payload:
+                    self._full_payload_output_future = async_output._background_future
             else:
                 async_output = async_output_cls(
                     model_runner_output=output,

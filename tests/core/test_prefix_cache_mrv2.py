@@ -21,7 +21,7 @@ HIDDEN = 8
 DTYPE = torch.float32
 
 
-def sched_output(*, new=(), cached=(), resumed=(), finished=(), preempted=(), scheduled=None):
+def sched_output(*, new=(), cached=(), resumed=(), finished=(), preempted=(), scheduled=None, delivered=None):
     """new: (req_id, num_computed, blocks); cached: (req_id, num_computed, new_blocks | None)."""
     return SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(req_id=r, num_computed_tokens=c, block_ids=[list(b)]) for r, c, b in new],
@@ -35,6 +35,7 @@ def sched_output(*, new=(), cached=(), resumed=(), finished=(), preempted=(), sc
         finished_req_ids=set(finished),
         preempted_req_ids=set(preempted),
         num_scheduled_tokens=dict(scheduled or {}),
+        delivered_upto=dict(delivered or {}),
     )
 
 
@@ -123,19 +124,27 @@ def test_untracked_adapter_keeps_no_ledger():
 def test_delivery_watermark_trims_overlap_and_replays_gap():
     adapter = PrefixCacheSchedulerAdapter(track_requests=True)
     assert adapter.translate_step(sched_output(new=[("a", 0, [0, 1])], scheduled={"a": 8})).deliveries == ()
-    assert adapter.translate_step(sched_output(cached=[("a", 8, [2])], scheduled={"a": 1})).deliveries == ()
+    assert (
+        adapter.translate_step(sched_output(cached=[("a", 8, [2])], scheduled={"a": 1}, delivered={"a": 8})).deliveries
+        == ()
+    )
 
     adapter.translate_step(sched_output(preempted=["a"]))
-    step = adapter.translate_step(sched_output(new=[("a", 4, [0, 1, 2])], scheduled={"a": 6}))
+    step = adapter.translate_step(sched_output(new=[("a", 4, [0, 1, 2])], scheduled={"a": 6}, delivered={"a": 9}))
     assert step.deliveries == (PrefixCacheDelivery("a", trim=5),)
     assert step.extended_req_ids == ("a",)
 
     adapter.translate_step(sched_output(preempted=["a"]))
-    step = adapter.translate_step(sched_output(new=[("a", 12, [0, 1, 2, 3])], scheduled={"a": 2}))
+    step = adapter.translate_step(sched_output(new=[("a", 12, [0, 1, 2, 3])], scheduled={"a": 2}, delivered={"a": 10}))
     assert step.deliveries == (PrefixCacheDelivery("a", read_start=10, read_end=12, block_ids=((0, 1, 2, 3),)),)
 
     # In-order steps produce nothing; a finished id starts over.
-    assert adapter.translate_step(sched_output(cached=[("a", 14, None)], scheduled={"a": 1})).deliveries == ()
+    assert (
+        adapter.translate_step(
+            sched_output(cached=[("a", 14, None)], scheduled={"a": 1}, delivered={"a": 14})
+        ).deliveries
+        == ()
+    )
     adapter.translate_step(sched_output(finished=["a"]))
     assert adapter.translate_step(sched_output(new=[("a", 4, [0, 1])], scheduled={"a": 4})).deliveries == ()
 
@@ -192,10 +201,10 @@ def test_new_request_hit_is_rewritten(harness):
 
 def test_resume_below_watermark_trims_delivered_rows(harness):
     harness.mgr.discard_step(harness.step([("a", 0, 8)], new=[("a", 0, [0, 1])])[1])
-    harness.mgr.discard_step(harness.step([("a", 8, 1)], cached=[("a", 8, [2])])[1])
+    harness.mgr.discard_step(harness.step([("a", 8, 1)], cached=[("a", 8, [2])], delivered={"a": 8})[1])
     harness.mgr.discard_step(harness.step(preempted=["a"])[1])
 
-    step, s4 = harness.step([("a", 8, 2)], new=[("a", 8, [0, 1, 2])])
+    step, s4 = harness.step([("a", 8, 2)], new=[("a", 8, [0, 1, 2])], delivered={"a": 9})
     assert step.deliveries == (PrefixCacheDelivery("a", trim=1),)
     assert harness.mgr.step_rewrite_req_ids(s4) == {"a"}
     out = harness.mgr.materialize(s4, ["a"], include_uncached=False)
@@ -209,8 +218,35 @@ def test_resume_above_watermark_replays_gap(harness):
     harness.mgr.discard_step(harness.step([("b", 0, 8)], new=[("b", 0, [0, 1])])[1])
     harness.mgr.discard_step(harness.step(finished=["b"])[1])
 
-    step, s5 = harness.step([("a", 8, 2)], new=[("a", 8, [0, 1, 2])])
+    step, s5 = harness.step([("a", 8, 2)], new=[("a", 8, [0, 1, 2])], delivered={"a": 4})
     assert step.deliveries == (PrefixCacheDelivery("a", read_start=4, read_end=8, block_ids=((0, 1, 2),)),)
     assert harness.mgr.step_rewrite_req_ids(s5) == {"a"}
     out = harness.mgr.materialize(s5, ["a"], include_uncached=False)
     assert torch.equal(out.hidden_states["a"], rows_for(range(4, 10)))
+
+
+@pytest.mark.parametrize("via_new", [False, True], ids=["cached-resume", "new-reentry"])
+def test_resume_recovers_scheduled_but_unaccepted_rows(harness, via_new):
+    harness.mgr.discard_step(harness.step([("a", 0, 8)], new=[("a", 0, [0, 1])])[1])
+    harness.mgr.discard_step(harness.step([("a", 8, 1)], cached=[("a", 8, [2])], delivered={"a": 8})[1])
+    # The last scheduled row was dropped. A different request fills the larger hit.
+    harness.mgr.discard_step(harness.step(preempted=["a"])[1])
+    harness.mgr.discard_step(harness.step([("b", 0, 12)], new=[("b", 0, [0, 1, 2])])[1])
+    harness.mgr.discard_step(harness.step(finished=["b"])[1])
+    resumed_request = [("a", 12, [0, 1, 2, 3])]
+    _, sid = harness.step(
+        [("a", 12, 1)],
+        delivered={"a": 8},
+        new=resumed_request if via_new else (),
+        cached=() if via_new else resumed_request,
+        resumed=() if via_new else ["a"],
+    )
+    out = harness.mgr.materialize(sid, ["a"], include_uncached=False)
+    assert torch.equal(out.hidden_states["a"], rows_for([8, 9, 10, 11, 12]))
+
+
+def test_inflight_step_does_not_replay_unaccepted_predecessor(harness):
+    harness.mgr.discard_step(harness.step([("a", 0, 8)], new=[("a", 0, [0, 1])])[1])
+    _, sid = harness.step([("a", 8, 1)], cached=[("a", 8, [2])], delivered={"a": 0})
+    assert harness.mgr.step_rewrite_req_ids(sid) == frozenset()
+    assert torch.equal(harness.mgr.materialize(sid, ["a"]).hidden_states["a"], rows_for([8]))

@@ -48,3 +48,24 @@ normal completion, cancellation, failure, and shutdown.
 
 Test setup, transfer, synchronization, timeout, cancellation, failure, and
 cleanup across every affected backend.
+
+## Full-payload request lifecycle
+
+The worker owns pending full-payload outputs under the internal request ID.
+The scheduler supplies terminal status; the connector does not infer success
+from a request disappearing from the active batch.
+
+- **Completion:** stop and length-limit completion flush the accumulated
+  payload once, then release its data and position tracking.
+- **Cancellation or failure:** aborted, errored and ignored requests discard
+  pending payloads without invoking the downstream processor. Already
+  submitted connector writes are outside the pending accumulator's ownership.
+- **Preemption and resume:** keep accepted AR outputs. The scheduler owns
+  `delivered_upto`; the runner clips declared token fields before accumulation.
+  After pending builders complete, resume truncates an unaccepted accumulated
+  suffix to that boundary. The accumulator then appends the recovered or newly
+  computed rows. Fixed embeddings use the processor's replacement policy and
+  are never sliced by token count. One-shot generation payloads retain their
+  existing append/replace policy.
+
+Lifecycle regressions live in `tests/worker/test_full_payload_lifecycle.py`.

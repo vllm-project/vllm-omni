@@ -91,6 +91,10 @@ class FakeView:
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
 
+    def token_range(self, req_id, num_scheduled):
+        start = self.computed.get(req_id, 0)
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []
         for r in req_ids:
