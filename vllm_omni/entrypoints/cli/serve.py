@@ -504,12 +504,6 @@ class OmniServeCommand(CLISubcommand):
             help="The timeout for initializing the stages.",
         )
         omni_config_group.add_argument(
-            "--shm-threshold-bytes",
-            type=int,
-            default=65536,
-            help="The threshold for the shared memory size.",
-        )
-        omni_config_group.add_argument(
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
@@ -665,6 +659,12 @@ class OmniServeCommand(CLISubcommand):
                 "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
                 "into the base model at server startup; 'peft' uses the adapter manager."
             ),
+        )
+        omni_config_group.add_argument(
+            "--lora-application",
+            choices=["runtime", "merged"],
+            default=None,
+            help="Apply diffusion LoRA per request, or merge one global policy into dense weights.",
         )
         omni_config_group.add_argument(
             "--lora-scale",

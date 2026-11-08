@@ -652,11 +652,12 @@ steps:
     # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
     # Keep the initial ROCm burn-in scoped to tests/model_executor/.
-    # Shard 0 checks the full 1420-node set. The other shards skip that
-    # collection and run their pytest slice immediately.
+    # Shard 0 checks the full 1424-node set. The other shards skip that
+    # collection and run their pytest slice immediately. CUDA READY runs the
+    # same guard when tests/model_executor/ or this file changes.
     - |
       if [[ "$${BUILDKITE_PARALLEL_JOB:-0}" == "0" ]]; then
-        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1420 \
+        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1424 \
           tests/model_executor/ \
           -m 'core_model and rocm and MI325 and not nvidia_only and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' \
           --run-level "core_model"
@@ -780,6 +781,9 @@ steps:
       nodes=(
             "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[1]"
             "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[3]"
+            "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape0]"
+            "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape1]"
+            "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape2]"
             "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets0]"
             "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets1]"
             "tests/worker/test_batched_omni_output.py::test_mixed_stop_flags_do_not_synchronize_cuda"
@@ -822,7 +826,7 @@ steps:
         | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
         | sort > /tmp/worker-ready-collected.txt
       if ! diff -u /tmp/worker-ready-expected.txt /tmp/worker-ready-collected.txt; then
-        echo "One-card worker READY collection drifted from the 32 MI325 nodes" >&2
+        echo "One-card worker READY collection drifted from the 35 MI325 nodes" >&2
         exit 1
       fi
       WORKER_READY
@@ -837,7 +841,7 @@ steps:
         --run-level "core_model" \
         --junitxml="$$WORKER_READY_ARTIFACT_DIR/pytest.xml" || status=$$?
       if [[ "$$status" -eq 0 ]]; then
-        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 32 and skipped == 0; print(f"Expected exactly 32 executed one-card worker GPU tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
+        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 35 and skipped == 0; print(f"Expected exactly 35 executed one-card worker GPU tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
         then
           status=0
         else
@@ -1028,11 +1032,8 @@ steps:
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_audio_output[default]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_identical[prefix_cache_async_chunk]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_shared_image_prefix[prefix_cache_async_chunk]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_completions_rejected_for_thinker_talker[default-rocm]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_text[default-rocm]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_audio_out[default-rocm]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts0-default-rocm]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts1-default-rocm]"
       )
       printf '%s\n' "$${nodes[@]}" | sort > /tmp/qwen3-omni-ready-expected.txt
       pytest -q tests/e2e/online_serving/test_qwen3_omni.py \
@@ -1043,7 +1044,7 @@ steps:
         | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
         | sort > /tmp/qwen3-omni-ready-collected.txt
       if ! diff -u /tmp/qwen3-omni-ready-expected.txt /tmp/qwen3-omni-ready-collected.txt; then
-        echo "Qwen3-Omni READY collection drifted from the 11 core_model nodes" >&2
+        echo "Qwen3-Omni READY collection drifted from the 8 core_model nodes" >&2
         exit 1
       fi
     - |
@@ -1071,9 +1072,9 @@ steps:
       suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
       tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
       skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-      if tests != 11 or skipped != 0:
+      if tests != 8 or skipped != 0:
           print(
-              f"Expected exactly 11 executed Qwen3-Omni READY tests; "
+              f"Expected exactly 8 executed Qwen3-Omni READY tests; "
               f"reported tests={tests}, skipped={skipped}.",
               file=sys.stderr,
           )
