@@ -192,9 +192,7 @@ async def test_get_lora_inventory_rejects_malformed_replica_envelope():
 
 @pytest.mark.cpu
 def test_lora_inventory_record_normalization_deduplicates_conflicting_ranks():
-    assert merge_lora_adapter_records(
-        [[{"id": 3, "name": "first"}], [{"id": 3, "name": "second"}, 5]]
-    ) == [
+    assert merge_lora_adapter_records([[{"id": 3, "name": "first"}], [{"id": 3, "name": "second"}, 5]]) == [
         {"id": 3, "name": None},
         {"id": 5, "name": None},
     ]

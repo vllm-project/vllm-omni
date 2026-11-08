@@ -97,6 +97,7 @@ if TYPE_CHECKING:
 
     from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
+
     from vllm_omni.lora.inventory import LoRAAdapterInfo
 
 logger = init_logger(__name__)
