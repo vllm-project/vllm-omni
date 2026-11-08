@@ -248,7 +248,7 @@ def _tensor_to_shm(
                 message = str(exc)
                 if "MallocHost" not in message and "out of memory" not in message.lower():
                     raise
-                logger.warning(
+                logger.warning_once(
                     "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
                     tuple(t.shape),
                     t.dtype,
