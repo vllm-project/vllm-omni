@@ -203,7 +203,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 return
             self.stage_pools[stage_id].evict_replica(replica_id)
         else:
-            affected = placement.drop_reservations(stage_id, replica_id)
+            affected = placement.reattach(stage_id, replica_id)
         if affected:
             await self.session_manager.fail_sessions(sorted(affected), reason=reason)
 
@@ -224,10 +224,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         )
 
     async def _on_replica_added(self, stage_id: int, replica_id: int, client: Any) -> None:
-        """Fail reservations when a restarted process takes over a slot."""
+        """Re-enable a re-attached slot and fail the sessions it used to hold.
+
+        An attach that follows a detach means the process behind the slot is new.
+        At startup there was no detach, and the slot holds no reservation, so this
+        is a no-op.
+        """
         await super()._on_replica_added(stage_id, replica_id, client)
-        if not self.stage_pools[stage_id].consume_reattach(replica_id):
-            return
         await self._fail_reserved_sessions(
             stage_id,
             replica_id,

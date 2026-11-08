@@ -21,8 +21,8 @@ def _assert_isolated_import_succeeds(script: str) -> None:
     # unrelated, inconsistent device-selection environment prevent the child
     # interpreter from reaching the boundary assertion.
     env = os.environ.copy()
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,

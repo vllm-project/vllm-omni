@@ -12,7 +12,6 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
-import inspect
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
@@ -129,17 +128,9 @@ class MembershipController:
         if client is not None and replica_id is not None and self._replica_removed_callback is not None:
             # The duplex runtime fails the sessions reserved on the replica, which
             # is async; a metrics-only handler returns None and is called inline.
-            # A failing handler must not cost the remaining requests their cleanup.
-            try:
-                outcome = self._replica_removed_callback(stage_id, replica_id)
-                if inspect.isawaitable(outcome):
-                    await outcome
-            except Exception:
-                logger.exception(
-                    "[MembershipController] replica-removed handler failed stage=%d replica=%d",
-                    stage_id,
-                    replica_id,
-                )
+            outcome = self._replica_removed_callback(stage_id, replica_id)
+            if asyncio.iscoroutine(outcome):
+                await outcome
         if affected and effective_cleanup_callback is not None:
             await effective_cleanup_callback(affected)
         if affected and effective_output_queue is not None:

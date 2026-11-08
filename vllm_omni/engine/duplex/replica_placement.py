@@ -183,15 +183,15 @@ class DuplexReplicaPlacement:
             self._reserved[replica] -= 1
             self._owners[replica].remove(session_id)
 
-    def drop_reservations(self, stage_id: int, replica_id: int) -> set[str]:
-        """Release every session reserved on a replica, keeping it usable.
+    def reattach(self, stage_id: int, replica_id: int) -> set[str]:
+        """Re-enable a replicated slot and release the sessions it held.
 
-        Used when the process behind a slot is replaced: the reservations it held
-        point at state that no longer exists, but the slot itself is healthy and
-        must stay eligible for new sessions -- unlike ``mark_unavailable``, this
-        does not exclude it from ``reserve``.
+        A slot that comes back belongs to a new process: the reservations it held
+        reference state that is gone, and the slot must be eligible again. This
+        undoes ``mark_unavailable`` for the slot.
         """
         replica = (stage_id, replica_id)
+        self._unavailable.discard(replica)
         affected = set(self._owners.get(replica, ()))
         for session_id in affected:
             self.release(session_id)
