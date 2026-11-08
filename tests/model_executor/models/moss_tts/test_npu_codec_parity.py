@@ -51,6 +51,25 @@ def _npu_available() -> bool:
 npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
 npu_device = pytest.param("npu", marks=npu_only)
 
+try:
+    from tests.helpers.mark import hardware_marks
+except ModuleNotFoundError:  # direct-load verification runs without the repo root
+    hardware_marks = None
+
+
+def _with_npu_a3_marks(func):
+    """Attach the A3 hardware marks used by NPU CI selection.
+
+    The marks checker forbids bare ``pytest.mark.npu`` on tests; accelerator
+    marks must go through ``hardware_marks`` so the platform, SKU and card
+    count are attached. ``@npu_only`` above keeps non-NPU hosts skipping.
+    """
+    if hardware_marks is None:
+        return func
+    for mark in hardware_marks(res={"npu": "A3"}, num_cards=1):
+        func = mark(func)
+    return func
+
 
 # =============================================================================
 # 1a. Platform-independent: ring-cache position arithmetic (runs on CPU in CI)
@@ -434,6 +453,48 @@ def test_attention_streaming_mode_with_rotated_mask():
             torch.testing.assert_close(result_npu.cpu(), result_cpu, atol=1e-2, rtol=1e-2)
 
     assert not torch.any(torch.isnan(result_npu))
+
+
+@npu_only
+@_with_npu_a3_marks
+def test_attention_forward_npu_graph_capture():
+    """NPUGraph capture of the codec attention must succeed and replay exactly.
+
+    op-plugin's legacy ``npu_fusion_attention`` forward leaves an event tail on
+    a secondary stream when ``sync=False``, even with ``keep_prob=1.0``, which
+    aborts capture with error 107025 ("capture model contains a stream that was
+    not joined to the original stream"). The codec call site therefore passes
+    ``sync=True``. This test captures the module forward the way the codec graph
+    runner does and fails on stacks where the default ``sync=False`` leaks the
+    unjoined stream.
+    """
+    torch.manual_seed(7)
+    dev = torch.device("npu")
+    dtype = torch.bfloat16
+    embed_dim, num_heads = 128, 2
+
+    attn = MossAudioTokenizerMultiheadAttention(
+        embed_dim, num_heads, causal=True, context=9, device=dev, dtype=dtype
+    ).eval()
+
+    B, T = 3, 5
+    x = torch.randn(B, T, embed_dim, device=dev, dtype=dtype)
+
+    with torch.inference_mode():
+        expected = attn(x, x, x).clone()
+        # Warm every per-(device, T) cache before capture: a captured graph
+        # bakes in pointers, so allocations must not happen mid-capture.
+        attn(x, x, x)
+        torch.npu.synchronize()
+
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            captured = attn(x, x, x)
+        torch.npu.synchronize()
+
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(captured, expected, atol=0, rtol=0)
 
 
 # =============================================================================

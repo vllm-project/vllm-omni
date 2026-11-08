@@ -23,7 +23,7 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     matches a job-key prefix; unrelated files must not reduce fallback coverage.
     List used shared helpers in job dependencies so mixed diffs retain their consumers.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
-    for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
+    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -599,7 +599,8 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
-    # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
+    # A step-level retry fully replaces the preset retry. It is not merged, so a
+    # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
     return merged
@@ -621,6 +622,8 @@ def _get_step_label(step: dict[str, Any]) -> str:
 def _process_test_steps(
     steps: list[Any],
     changed_files: list[str] | None,
+    *,
+    expand_mirror_hardwares: bool = True,
 ) -> list[Any]:
     """Drop steps by ``source_file_dependencies`` when *changed_files* is set; always strip that field."""
     processed: list[Any] = []
@@ -636,7 +639,11 @@ def _process_test_steps(
 
         nested = step.get("steps")
         if nested is not None:
-            kept_nested = _process_test_steps(nested, changed_files)
+            kept_nested = _process_test_steps(
+                nested,
+                changed_files,
+                expand_mirror_hardwares=expand_mirror_hardwares,
+            )
             if not kept_nested:
                 _log(f"omit empty group {_get_step_label(step)!r}")
                 continue
@@ -646,6 +653,9 @@ def _process_test_steps(
             continue
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
+        if not expand_mirror_hardwares:
+            processed.append(leaf)
+            continue
         expanded = _expand_mirror_hardwares(leaf)
         if expanded is None:
             continue
@@ -699,21 +709,11 @@ def _render_test_pipeline(
         return doc
     if e2e_only:
         steps = _select_e2e_group_steps(steps)
-    # Shared dependencies must not suppress fallback coverage unless a
-    # non-fallback change matches a job. Unrelated files do not narrow coverage.
-    if changed_files is not None and pipeline_path is not None:
-        bypass = _source_filter_fallback_reason(changed_files, pipeline_path)
-        if bypass is not None:
-            pipeline_rel = _repo_relative_posix(pipeline_path)
-            fallback_prefixes = _source_filter_fallback_prefixes()
-            non_fallback_files = [
-                path
-                for path in changed_files
-                if path != pipeline_rel and not _match_source_file([path], fallback_prefixes)
-            ]
-            if not _any_source_dependency_match(steps, non_fallback_files):
-                _log(f"keep all jobs (no non-fallback source_file_dependencies match; bypassed by {bypass})")
-                changed_files = None
+    changed_files = _apply_source_filter_fallback(
+        steps,
+        changed_files,
+        pipeline_path=pipeline_path,
+    )
     steps = _process_test_steps(steps, changed_files)
     return {**doc, "steps": steps}
 
@@ -741,7 +741,12 @@ def _source_filter_fallback_prefixes() -> list[str]:
     return prefixes
 
 
-def _source_filter_fallback_reason(changed_files: list[str] | None, pipeline_path: Path) -> str | None:
+def _source_filter_fallback_reason(
+    changed_files: list[str] | None,
+    pipeline_path: Path,
+    *,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> str | None:
     """Return the changed path that should disable source filtering, if any."""
     if not changed_files:
         return None
@@ -749,11 +754,69 @@ def _source_filter_fallback_reason(changed_files: list[str] | None, pipeline_pat
     pipeline_rel = _repo_relative_posix(pipeline_path)
     if pipeline_rel in changed:
         return pipeline_rel
-    prefixes = _source_filter_fallback_prefixes()
+    prefixes = [*_source_filter_fallback_prefixes(), *extra_fallback_prefixes]
     for path in changed_files:
         if _match_source_file([path], prefixes):
             return path
     return None
+
+
+def _apply_source_filter_fallback(
+    steps: list[Any],
+    changed_files: list[str] | None,
+    *,
+    pipeline_path: Path | None,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> list[str] | None:
+    """Keep all jobs for routing-only diffs unless another changed path selects a job."""
+    if changed_files is None or pipeline_path is None:
+        return changed_files
+
+    bypass = _source_filter_fallback_reason(
+        changed_files,
+        pipeline_path,
+        extra_fallback_prefixes=extra_fallback_prefixes,
+    )
+    if bypass is None:
+        return changed_files
+
+    pipeline_rel = _repo_relative_posix(pipeline_path)
+    fallback_prefixes = [*_source_filter_fallback_prefixes(), *extra_fallback_prefixes]
+    non_fallback_files = [
+        path for path in changed_files if path != pipeline_rel and not _match_source_file([path], fallback_prefixes)
+    ]
+    if _any_source_dependency_match(steps, non_fallback_files):
+        return changed_files
+
+    _log(f"keep all jobs (no non-fallback source_file_dependencies match; bypassed by {bypass})")
+    return None
+
+
+def filter_pipeline_by_source_dependencies(
+    doc: dict[str, Any],
+    changed_files: list[str] | None,
+    *,
+    pipeline_path: Path | None = None,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Filter and strip source dependency metadata without expanding hardware presets."""
+    steps = doc.get("steps")
+    if not isinstance(steps, list):
+        return doc
+    changed_files = _apply_source_filter_fallback(
+        steps,
+        changed_files,
+        pipeline_path=pipeline_path,
+        extra_fallback_prefixes=extra_fallback_prefixes,
+    )
+    return {
+        **doc,
+        "steps": _process_test_steps(
+            steps,
+            changed_files,
+            expand_mirror_hardwares=False,
+        ),
+    }
 
 
 def _changed_files_for_source_filter(

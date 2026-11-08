@@ -4,7 +4,7 @@
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,11 @@ from vllm.platforms import Platform
 from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
+
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 
 
 class OmniPlatformEnum(Enum):
@@ -76,7 +81,19 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_shared_memory_connector_cls(cls) -> "type[SharedMemoryConnector]":
+        """Select OS storage adaptation while retaining the SHM lifecycle."""
+        from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+
+        return SharedMemoryConnector
+
+    @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
+
+    @classmethod
+    def apply_diffusion_model_patches(cls, model: nn.Module, od_config: "OmniDiffusionConfig") -> None:
+        """Apply platform-specific rewrites after common model initialization."""
         return None
 
     @classmethod
@@ -372,6 +389,17 @@ class OmniPlatform(Platform):
 
         return CUDAGraphWrapper
 
+    @classmethod
+    def get_graphed_forward_cls(cls) -> type:
+        """Return the capture-and-replay class for keyword-only module forwards.
+
+        Defaults to the CUDA ``GraphedForward``, which stays eager off CUDA; XPU
+        overrides with ``XPUGraphedForward``.
+        """
+        from vllm_omni.diffusion.cuda_graph import GraphedForward
+
+        return GraphedForward
+
     def capture_graph(
         self, capture: Callable[[], None], generators: Sequence[torch.Generator] = ()
     ) -> torch.cuda.CUDAGraph | None:
@@ -398,6 +426,14 @@ class OmniPlatform(Platform):
             eager()
             return
         graph.replay()
+
+    def is_graph_capturing(self) -> bool:
+        """Whether a device graph is recording on the current stream.
+
+        Host synchronization (``synchronize()``, ``.item()``) is illegal while
+        capturing, so callers that would otherwise sync check this first.
+        """
+        return self.is_cuda_alike() and torch.cuda.is_current_stream_capturing()
 
     @classmethod
     def set_forward_context(

@@ -143,7 +143,7 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
     import torch
 
     if torch.accelerator.device_count() < degree:
-        pytest.skip(f"SeedVR2 USP={degree} requires {degree} CUDA devices")
+        pytest.skip(f"SeedVR2 USP={degree} requires {degree} accelerator devices")
 
     from tests.helpers.runtime import OmniServer
     from vllm_omni.diffusion.models.seedvr2.long_video import MAX_FRAMES

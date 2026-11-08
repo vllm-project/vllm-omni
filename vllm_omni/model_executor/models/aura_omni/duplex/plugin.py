@@ -405,6 +405,21 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         text = getattr(completion, "text", None) if completion is not None else None
         cumulative = getattr(completion, "cumulative_text", None) if completion is not None else None
         text_blob = " ".join(part for part in (text, cumulative) if isinstance(part, str))
+        # A finished Stage1 chunk can carry stop id 151669 and still be spoken.
+        # include_stop_str_in_output leaves <|silent|> on that text.
+        # is_effectively_silent is only the exact marker, so a sentence with
+        # the marker still appended is spoken. Classifying it as listen aborts
+        # the utterance sentence TTS already handed to Talker.
+        spoken = next(
+            (
+                part
+                for part in (cumulative, text)
+                if isinstance(part, str) and part.strip() and not is_effectively_silent(part)
+            ),
+            None,
+        )
+        if spoken is not None:
+            return None
         # Empty finished Stage1 is silent: stop_token 151669 is often omitted from
         # token_ids/text unless include_stop_str_in_output is set.
         is_silent = (

@@ -32,9 +32,13 @@ def _disable_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize(("is_rocm", "expected"), [(True, False), (False, True)])
-def test_depth_layer_compile_options(monkeypatch, is_rocm: bool, expected: bool) -> None:
+@pytest.mark.parametrize(
+    ("is_rocm", "is_xpu", "expected"),
+    [(True, False, False), (False, True, False), (False, False, True)],
+)
+def test_depth_layer_compile_options(monkeypatch, is_rocm: bool, is_xpu: bool, expected: bool) -> None:
     monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: is_xpu)
 
     assert _depth_layer_compile_options() == {
         "epilogue_fusion": False,
