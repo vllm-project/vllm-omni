@@ -84,6 +84,9 @@ def test_feedback_eos_output_ownership_and_slot_reuse(monkeypatch, async_schedul
     monkeypatch.setattr(OmniModelState, "__init__", base_init)
     monkeypatch.setattr(OmniModelState, "add_request", lambda *args: None)
     monkeypatch.setattr(OmniModelState, "remove_request", lambda *args: None)
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.phonon.prompt.load_default_voice", lambda *args: torch.zeros(1, 8)
+    )
     cfg = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=True))
     state = PhononModelState(cfg, model, None, torch.device("cpu"))
     flow_flags = []
