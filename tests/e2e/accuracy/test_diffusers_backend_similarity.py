@@ -30,10 +30,19 @@ from tests.e2e.accuracy.helpers import (
     assert_video_similarity_metrics,
     env_to_apply_ftfy_mock_in_subproc,
     measure_image_similarity,
-    measure_video_similarity_metrics,
     model_output_dir,
     resolve_device_threshold,
     write_accuracy_result,
+    write_json_artifact,
+)
+from tests.e2e.accuracy.helpers import (
+    parse_psnr_score as _parse_psnr_score,
+)
+from tests.e2e.accuracy.helpers import (
+    parse_ssim_score as _parse_ssim_score,
+)
+from tests.e2e.accuracy.helpers import (
+    run_ffmpeg_similarity as _run_ffmpeg_similarity,
 )
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
@@ -357,7 +366,7 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "model_id",
     [
@@ -385,21 +394,46 @@ def test_diffusers_backend_i2v_matches_diffusers(
     )
     diffusers_latency = diffusers_latency * 1000
     # H100 keeps the historical 30% slack. B200 measured ~35.8% (6008 vs 4425 ms).
-    gpu_key, latency_threshold_factor = resolve_device_threshold(
-        {"H100": 0.3, "B200": 0.36},
-        label="latency threshold factor",
+    # No measured ROCm allowance exists yet. Keep similarity assertions active
+    # and retain timings for calibration; do not claim AMD latency protection.
+    latency_threshold_factor: float | None = None
+    gpu_key = "ROCm-unqualified"
+    if torch.version.hip is None:
+        gpu_key, latency_threshold_factor = resolve_device_threshold(
+            {"H100": 0.3, "B200": 0.36},
+            label="latency threshold factor",
+        )
+    latency_threshold = (
+        diffusers_latency * (1 + latency_threshold_factor) if latency_threshold_factor is not None else None
     )
-    latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
 
+    ssim_output = _run_ffmpeg_similarity("ssim", vllm_path, diffusers_path)
+    psnr_output = _run_ffmpeg_similarity("psnr", vllm_path, diffusers_path)
+    (output_dir / "ssim.txt").write_text(ssim_output, encoding="utf-8")
+    (output_dir / "psnr.txt").write_text(psnr_output, encoding="utf-8")
+    ssim_score = _parse_ssim_score(ssim_output)
+    psnr_score = _parse_psnr_score(psnr_output)
     print(f"{model_id} latency metrics:")
-    print(
-        f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, "
-        f"diffusers latency={diffusers_latency:.2f}ms, slack={latency_threshold_factor:.0%} ({gpu_key}), lower is better"
-    )
-    ssim_score, psnr_score = measure_video_similarity_metrics(
-        label=model_id,
-        online_path=vllm_path,
-        offline_path=diffusers_path,
+    print(f"  Latency={vllm_latency:.2f}ms, diffusers latency={diffusers_latency:.2f}ms, profile={gpu_key}")
+    if latency_threshold is None:
+        print("  ROCm latency gate: unqualified; timings are diagnostic until an AMD allowance is measured.")
+    else:
+        print(f"  Latency threshold<={latency_threshold:.2f}ms, lower is better")
+    write_json_artifact(
+        output_dir / "metrics.json",
+        {
+            "model": model_id,
+            "device_profile": gpu_key,
+            "ssim": ssim_score,
+            "ssim_threshold": VIDEO_SSIM_THRESHOLD,
+            "psnr_db": "inf" if psnr_score == float("inf") else psnr_score,
+            "psnr_threshold_db": VIDEO_PSNR_THRESHOLD,
+            "vllm_latency_ms": vllm_latency,
+            "diffusers_latency_ms": diffusers_latency,
+            "latency_threshold_factor": latency_threshold_factor,
+            "latency_threshold_ms": latency_threshold,
+            "latency_gate": "unqualified" if latency_threshold is None else "enforced",
+        },
     )
     write_accuracy_result(
         model_id=model_id,
@@ -410,6 +444,10 @@ def test_diffusers_backend_i2v_matches_diffusers(
             "online_video": str(vllm_path),
             "offline_video": str(diffusers_path),
             "latency_ms": vllm_latency,
+            "diffusers_latency_ms": diffusers_latency,
+            "latency_threshold_factor": latency_threshold_factor,
+            "latency_threshold_ms": latency_threshold,
+            "latency_gate": "unqualified" if latency_threshold is None else "enforced",
         },
     )
     assert_video_similarity_metrics(
@@ -421,9 +459,10 @@ def test_diffusers_backend_i2v_matches_diffusers(
         ssim_score=ssim_score,
         psnr_score=psnr_score,
     )
-    assert vllm_latency <= latency_threshold, (
-        f"VLLM latency ({vllm_latency:.2f}ms) is greater than {latency_threshold_factor * 100}% more than Diffusers latency ({diffusers_latency:.2f}ms)."
-    )
+    if latency_threshold is not None:
+        assert vllm_latency <= latency_threshold, (
+            f"VLLM latency ({vllm_latency:.2f}ms) exceeds the measured {gpu_key} allowance ({latency_threshold:.2f}ms)."
+        )
 
 
 def _diffusers_dummy_run(pipe: DiffusionPipeline) -> None:

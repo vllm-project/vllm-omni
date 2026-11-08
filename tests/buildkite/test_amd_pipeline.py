@@ -757,7 +757,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1420,
+        1424,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -2476,6 +2476,8 @@ def _assert_nightly_junit_guard(
     skipped: int,
     timeout_status: int | None,
     expected_status: int,
+    failures: int = 0,
+    errors: int = 0,
     extra_env: dict[str, str] | None = None,
 ) -> None:
     step = _find_step(step_label, pipeline_path)
@@ -2510,6 +2512,9 @@ def _assert_nightly_junit_guard(
         'mkdir -p "$(dirname "$xml_path")"\n'
         'printf \'<testsuite tests="%s" skipped="%s" failures="0" errors="0"/>\\n\' \\\n'
         '  "$FAKE_JUNIT_TESTS" "$FAKE_JUNIT_SKIPPED" > "$xml_path"\n'
+        'sed "s/failures=\\"0\\"/failures=\\"$FAKE_JUNIT_FAILURES\\"/; '
+        's/errors=\\"0\\"/errors=\\"$FAKE_JUNIT_ERRORS\\"/" "$xml_path" > "$xml_path.tmp"\n'
+        'mv "$xml_path.tmp" "$xml_path"\n'
         'echo "fake pytest status=$FAKE_PYTEST_STATUS"\n'
         'exit "$FAKE_PYTEST_STATUS"\n',
     )
@@ -2528,6 +2533,8 @@ def _assert_nightly_junit_guard(
             "FAKE_PYTEST_STATUS": str(pytest_status),
             "FAKE_JUNIT_TESTS": str(tests),
             "FAKE_JUNIT_SKIPPED": str(skipped),
+            "FAKE_JUNIT_FAILURES": str(failures),
+            "FAKE_JUNIT_ERRORS": str(errors),
             "FAKE_TIMEOUT_STATUS": "" if timeout_status is None else str(timeout_status),
             "TEST_COMMANDS": run_command.replace("$$", "$"),
         }
@@ -3947,7 +3954,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    35 ids. R2-01 still collects 1420 model-executor nodes and does not run them.
+    35 ids. R2-01 still collects 1424 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -3993,7 +4000,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1420" in r2_01_command
+    assert "assert-pytest-collection.sh 1424" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -4205,7 +4212,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1420 model-executor nodes.
+    still collects 1424 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4257,7 +4264,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1420" in r2_01_command
+    assert "assert-pytest-collection.sh 1424" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
