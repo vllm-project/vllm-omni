@@ -34,6 +34,9 @@ from .cuda_graph_wrapper import (
     _format_memory_delta,
     _materialize_att_rows,
     _memory_snapshot,
+    _pack_att_cache,
+    _packed_att_buffer,
+    _unpack_att_cache,
     _zero_padded_cnn_cache,
     empty_hift_outputs,
 )
@@ -203,6 +206,8 @@ def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     tensor[..., valid_frames:] = 0.0
 
 
+
+
 def plan_token2wav_encode_slices(
     num_frames: int,
     *,
@@ -274,7 +279,9 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
 
 # Cache frame axes a row-offset merge keeps per row: the encoder runs once per conformer cache
 # length (``decode_ragged_batch``), and a slot-pool solve attends each estimator cache in its slot.
-_ROW_OFFSET_FRAME_AXES = {"conformer_att_cache": 3, "estimator_att_cache": 4}
+# ``conformer_att_cache`` is ``(depth, N, H, frames, D)``; ``estimator_att_cache`` keeps the
+# ``(n_t, depth, 2, N, H, frames, D)`` K/V-split layout, so its frames are the second-to-last axis.
+_ROW_OFFSET_FRAME_AXES = {"conformer_att_cache": 3, "estimator_att_cache": 5}
 
 
 def row_offset_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
@@ -1163,15 +1170,20 @@ class BatchedToken2Wav(nn.Module):
                 valid_lengths,
             )
         else:
+            # Upstream walks the layers itself and needs ``[K | V]`` packed per
+            # layer, while the buffers kept across steps are split by K/V; pack
+            # on the way in and unpack the result back into ``att_out``.
+            packed_out = _packed_att_buffer(att_out)
             result = estimator.blocks_forward_chunk(
                 estimator_input,
                 time_embedding,
                 attn_mask,
                 old_cnn,
-                old_att,
+                _pack_att_cache(old_att),
                 cnn_out,
-                att_out,
+                packed_out,
             )
+            _unpack_att_cache(packed_out, att_out)
         return result, cnn_out, att_out
 
     def _ragged_body(
@@ -1253,15 +1265,15 @@ class BatchedToken2Wav(nn.Module):
     ) -> torch.Tensor:
         """``attn.forward_chunk`` that keeps the new keys and values in ``kv``.
 
-        ``kv`` (b, heads, >= t + cache frames, 2 * head_dim) is the block's new
-        cache, ``[current | cache]`` like upstream's. Upstream concatenates the
-        whole cache behind the current keys and values, then both into the new
-        cache, which the caller copied into ``kv``: four passes over Stage 2's
-        largest tensor. Here only the current chunk is written and attention reads ``kv`` in
-        place. A cache that already sits behind the current chunk in ``kv``
-        (Whole-Euler) is not moved; any other is copied there once. CUDA and
-        NPU share this inference path. Other devices keep upstream's attention
-        and copy its cache into ``kv``.
+        ``kv`` is the split ``(2, b, heads, >= t + cache frames, head_dim)``
+        cache (K, then V), ``[current | cache]`` like upstream's. Upstream
+        concatenates the whole cache behind the current keys and values, then
+        both into the new cache, which the caller copied into ``kv``: four
+        passes over Stage 2's largest tensor. Here only the current chunk is
+        written and attention reads ``kv`` in place. A cache that already sits
+        behind the current chunk in ``kv`` (Whole-Euler) is not moved; any other
+        is copied there once. CUDA and NPU share this inference path. Other
+        devices keep upstream's attention and copy its cache into ``kv``.
         """
         if x.device.type == "npu" and x.dtype == kv.dtype == torch.float32 and not attn.training:
             from vllm_omni.platforms.npu.models.minicpmo_fused import attention, supports_packed_qkv
@@ -1279,8 +1291,12 @@ class BatchedToken2Wav(nn.Module):
                 and (att_cache is None or att_cache.shape[-2] < _NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES)
             )
         ):
+            # Upstream ``forward_chunk`` still expects the packed ``[K | V]``
+            # cache width, while ``att_cache`` is split (2, ...) here: repack
+            # for this fallback, which never runs on the NPU fused path.
+            packed_cache = None if att_cache is None else torch.cat((att_cache[0], att_cache[1]), dim=-1)
             # A reduced-precision cache attends in the activation dtype.
-            x_att, new_att = attn.forward_chunk(x, att_cache, attn_mask)
+            x_att, new_att = attn.forward_chunk(x, packed_cache, attn_mask)
             span = int(new_att.shape[2])
             split = int(new_att.shape[-1]) // 2
             kv[0][:, :, :span].copy_(new_att[..., :split])
@@ -1294,7 +1310,10 @@ class BatchedToken2Wav(nn.Module):
         cached = 0 if att_cache is None else int(att_cache.shape[-2])
         behind_keys, behind_values = keys[:, :, frames:], values[:, :, frames:]
         if cached and (
-            att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride()
+            att_cache[0].data_ptr() != behind_keys.data_ptr()
+            or att_cache[0].stride() != behind_keys.stride()
+            or att_cache[1].data_ptr() != behind_values.data_ptr()
+            or att_cache[1].stride() != behind_values.stride()
         ):
             behind_keys[:, :, :cached].copy_(att_cache[0])
             behind_values[:, :, :cached].copy_(att_cache[1])
@@ -1647,7 +1666,7 @@ class BatchedToken2Wav(nn.Module):
                                     int(step_att.shape[0]),
                                     2,
                                     2,
-                                    int(step_att.shape[4]),
+                                    int(step_att.shape[3]),
                                     valid_length + (offset if row_offsets is None else row_offsets[row]),
                                     int(step_att.shape[5]),
                                 ),

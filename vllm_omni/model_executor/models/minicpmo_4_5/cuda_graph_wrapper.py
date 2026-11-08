@@ -1467,8 +1467,23 @@ class WholeEulerCFMGraphWrapper:
                 if slotted:
                     kwargs["slots"] = (statics.slot_rows, statics.slot_positions)
                 estimate = self.ragged_body(self.estimator, *args, statics.lengths, **kwargs)
-            else:
+            elif slotted:
                 estimate = self.estimator.blocks_forward_chunk(*args)
+            else:
+                # Upstream walks the layers itself and needs the ``[K | V]``
+                # packed cache, while the kept buffers are split by K/V half;
+                # pack in and unpack the result back (captured with the graph).
+                packed_out = _packed_att_buffer(out_att_cache[step])
+                estimate = self.estimator.blocks_forward_chunk(
+                    estimator_input,
+                    statics.time_embeddings[step],
+                    statics.attn_mask,
+                    statics.cnn_cache[step],
+                    _pack_att_cache(statics.att_cache[step]),
+                    out_cnn_cache[step],
+                    packed_out,
+                )
+                _unpack_att_cache(packed_out, out_att_cache[step])
 
             cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
