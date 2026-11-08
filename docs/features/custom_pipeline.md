@@ -48,6 +48,19 @@ The `diffusion_load_format` parameter controls the initial diffusion model load.
 
 **Location:** `vllm_omni/diffusion/worker/diffusion_worker.py`
 
+### Startup contract
+
+When `custom_pipeline_args` contains `pipeline_class`, vLLM-Omni validates the
+custom pipeline before creating a diffusion worker. The value may be a
+qualified class name or an already imported class. The class must be callable
+with `od_config=...`, and an explicitly supplied `worker_extension_cls` must
+provide `re_init_pipeline(custom_pipeline_args)`.
+
+The validator does not construct the pipeline or load weights. It reports the
+pipeline class, module, and missing contract fields without rendering the full
+custom argument dictionary. Arguments such as `components_path` remain native
+pipeline arguments when `pipeline_class` is absent.
+
 ## Usage Example
 
 ### Step 1: Create a Custom Pipeline

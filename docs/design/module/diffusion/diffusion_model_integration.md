@@ -33,6 +33,16 @@ last_reviewed: 2026-07-16
 Diffusion model integration owns pipeline contracts, registration, checkpoint
 loading, adapters, shared layers, and model-specific processing.
 
+## Custom pipeline startup contract
+
+When `custom_pipeline_args` contains `pipeline_class`, startup resolves and
+validates the selected class before creating a diffusion worker. The loader
+constructs it with `od_config=...`; therefore the class must accept that
+keyword, and an explicitly supplied worker extension must provide
+`re_init_pipeline(custom_pipeline_args)`. The check is static and does not
+construct the pipeline or load weights. Native custom arguments without a
+`pipeline_class` entry remain unchanged.
+
 ## Candidate invariants
 
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract
