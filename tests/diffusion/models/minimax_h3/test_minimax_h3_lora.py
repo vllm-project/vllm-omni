@@ -218,7 +218,7 @@ def test_h3_turbo_ref2v_artifact_requires_a_ref_capable_server(tmp_path):
     path = tmp_path / "minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors"
     _write_tiny_turbo(path)
 
-    with pytest.raises(ValueError, match="requires a Ref2VA-capable server"):
+    with pytest.raises(ValueError, match="is a Ref2VA Turbo artifact"):
         load_minimax_h3_turbo_lora(
             partition="fl2va",
             lora_request=_request(path),
