@@ -998,7 +998,7 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
-    assert step["timeout_in_minutes"] == 40
+    assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
 
@@ -1014,6 +1014,7 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
     run_argv = split(run_command)
     assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
     assert collect_argv[2] == str(expected_count)
+    assert "timeout --signal=TERM --kill-after=2m 40m" in run_command
 
     for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
         assert TINY_DIFFUSION_PATH in argv
@@ -1028,6 +1029,19 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
     assert "pytest.xml" in all_commands
     assert "pytest.log" in all_commands
     assert "pytest-summary.txt" in all_commands
+
+
+def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
+    """The distributed Flux2Klein cold start must not retain the 600s default."""
+    settings_source = Path("tests/model_tests/diffusion/model_settings.py").read_text(encoding="utf-8")
+    flux2_settings = settings_source.split('"Flux2KleinPipeline":', 1)[1].split('"LTX2Pipeline":', 1)[0]
+    config_source = Path("tests/model_tests/diffusion/config_types.py").read_text(encoding="utf-8")
+    offline_source = Path("tests/model_tests/diffusion/test_common_offline.py").read_text(encoding="utf-8")
+
+    assert "offline_init_timeout_s: int | None = None" in config_source
+    assert "offline_init_timeout_s=900" in flux2_settings
+    assert "if settings.offline_init_timeout_s is not None:" in offline_source
+    assert 'model_kwargs["init_timeout"] = settings.offline_init_timeout_s' in offline_source
 
 
 def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:

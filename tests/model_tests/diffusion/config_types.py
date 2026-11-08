@@ -109,6 +109,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Native single-file models: builders/resolvers return the containing directory.
     checkpoint_filename: str | None = None
 
+    # Optional engine startup deadline for offline tests whose cold initialization
+    # is known to exceed the default on supported hardware.
+    offline_init_timeout_s: int | None = None
+
 
 ### Mappings & utils for building offline Omni() instances given a list of enabled accelerations
 ACC_OMNI_KWARGS: dict[DiffusionAccs, dict[str, Any]] = {
