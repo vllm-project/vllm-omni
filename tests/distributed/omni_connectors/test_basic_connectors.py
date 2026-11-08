@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
@@ -38,7 +38,7 @@ def test_serialize_into_matches_serialize():
     data = {"key": "value", "nested": [1, 2, {"x": True}]}
     expected = OmniSerializer.serialize(data)
 
-    buffer = bytearray()
+    buffer = bytearray(b"stale" * 8)
     size = OmniSerializer.serialize_into(data, buffer)
 
     assert size == len(expected)
@@ -302,3 +302,4 @@ def test_tensor_serialize_into_edge_shapes():
         assert decoded.dtype == tensor.dtype
         assert decoded.shape == tensor.shape
         assert torch.equal(decoded, tensor)
+
