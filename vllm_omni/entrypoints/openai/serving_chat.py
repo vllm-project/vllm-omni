@@ -1182,7 +1182,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatLikeRequest | ResponsesRequest,
         supported_speakers: set[str] | None = None,
     ) -> str | None:
-        """Honor root speakers; ignore unsupported nested chat-audio voices."""
+        """Honor root speakers; use nested voices only when known to be supported."""
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         if speaker is not None:
             return speaker if isinstance(speaker, str) else None
@@ -1194,7 +1194,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             speaker = getattr(audio_params, "voice", None)
         if not isinstance(speaker, str):
             return None
-        if supported_speakers and speaker.strip().lower() not in supported_speakers:
+        if not supported_speakers or speaker.strip().lower() not in supported_speakers:
             return None
         return speaker
 

@@ -71,10 +71,17 @@ def test_get_supported_speakers_caches_normalized_keys(mocker: MockerFixture, se
     assert serving_chat._get_supported_speakers() == {"vivian", "ethan"}
 
 
-def test_resolve_chat_speaker_falls_back_to_nested_audio_voice(serving_chat):
+def test_resolve_chat_speaker_uses_known_nested_audio_voice(serving_chat):
     request = SimpleNamespace(audio={"voice": "Vivian"})
 
-    assert serving_chat._resolve_chat_speaker(request) == "Vivian"
+    assert serving_chat._resolve_chat_speaker(request, {"vivian"}) == "Vivian"
+
+
+@pytest.mark.parametrize("supported", [None, set()])
+def test_resolve_chat_speaker_ignores_nested_voice_without_speaker_table(serving_chat, supported):
+    request = SimpleNamespace(audio={"voice": "Vivian"})
+
+    assert serving_chat._resolve_chat_speaker(request, supported) is None
 
 
 @pytest.fixture
@@ -140,10 +147,44 @@ async def test_chat_known_nested_voice_selects_speaker(preprocess_chat):
 
 
 @pytest.mark.asyncio
-async def test_chat_unknown_nested_voice_without_speaker_list_is_forwarded(preprocess_chat):
-    prompt = await preprocess_chat(_chat_request("alloy"), supported=set())
+@pytest.mark.parametrize("voice", ["alloy", "vivian"])
+async def test_chat_nested_voice_without_speaker_list_uses_default(preprocess_chat, voice):
+    prompt = await preprocess_chat(_chat_request(voice), supported=set())
 
-    assert prompt["additional_information"]["speaker"] == ["alloy"]
+    assert "speaker" not in prompt.get("additional_information", {})
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_speaker_list_preserves_explicit_prompt_metadata(preprocess_chat):
+    request = _chat_request("alloy", additional_information={"speaker": ["Ryan"], "language": ["English"]})
+
+    prompt = await preprocess_chat(request, supported=set())
+
+    assert prompt["additional_information"] == {"speaker": ["Ryan"], "language": ["English"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["voice", "speaker"])
+async def test_chat_explicit_root_speaker_without_speaker_list_is_forwarded(preprocess_chat, field):
+    prompt = await preprocess_chat(_chat_request("alloy", **{field: "Ryan"}), supported=set())
+
+    assert prompt["additional_information"]["speaker"] == ["ryan"]
+
+
+@pytest.mark.asyncio
+async def test_joyai_chat_without_speaker_list_uses_valid_tts_default(mocker: MockerFixture, preprocess_chat):
+    from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
+        _build_tts_metadata,
+        _validate_talker_speaker,
+    )
+
+    prompt = await preprocess_chat(_chat_request("alloy"), supported=set())
+    metadata = _build_tts_metadata(prompt, "Hello")
+    target_model = mocker.MagicMock()
+    target_model.hf_config.talker_config.spk_id = {"vivian": 3065, "ryan": 3061}
+
+    _validate_talker_speaker(metadata, target_model)
+    assert metadata["speaker"] == ["Vivian"]
 
 
 @pytest.mark.asyncio
@@ -183,6 +224,24 @@ async def test_fallback_unknown_session_voice_is_still_rejected(preprocess_chat)
 
     with pytest.raises(ValueError, match="Invalid speaker 'alloy'"):
         await preprocess_chat(request)
+
+
+@pytest.mark.asyncio
+async def test_fallback_session_voice_without_speaker_list_is_forwarded(preprocess_chat):
+    fallback_request = DuplexFallbackRequest(
+        session_id="sid",
+        request_id="fallback-sid-0-1",
+        response_id="resp",
+        epoch=0,
+        history=(),
+        response_config={"model": "qwen", "modalities": ["audio"], "voice": "Ryan"},
+        input_payload=None,
+        policy_messages=(),
+    )
+
+    prompt = await preprocess_chat(build_chat_request(fallback_request, model="qwen"), supported=set())
+
+    assert prompt["additional_information"]["speaker"] == ["ryan"]
 
 
 @pytest.mark.asyncio

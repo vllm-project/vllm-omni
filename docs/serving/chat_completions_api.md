@@ -38,8 +38,8 @@ For models that declare supported speakers, `audio.voice` selects a matching
 speaker name without regard to case. If the name is not supported (for example,
 an OpenAI voice name on a model with different speakers), it does not override
 the model's default speaker. Other explicitly supplied speaker metadata is
-preserved. When the model declares no speaker list, the name is passed through
-without this validation.
+preserved. When the model declares no discoverable speaker list, nested
+`audio.voice` is ignored and the model's default remains in effect.
 
 The top-level vLLM `voice` and `speaker` fields take precedence over
 `audio.voice` and are validated against a declared speaker list. An unsupported
