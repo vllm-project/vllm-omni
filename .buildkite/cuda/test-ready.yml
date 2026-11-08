@@ -34,6 +34,15 @@ steps:
           - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
         mirror_hardwares: l4_1
 
+      # AMD READY R2-01 is non-blocking, so fail the change that moves its
+      # pinned collection here. Some parametrizations need a visible GPU.
+      - label: "Simple · ROCm R2-01 Collection Count"
+        timeout_in_minutes: 10
+        source_file_dependencies: amd_ready_r2_01_collection
+        commands:
+          - "python3 .buildkite/amd/scripts/run_collection_guard.py .buildkite/amd/test-amd-ready.yml 'ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t'"
+        mirror_hardwares: l4_1
+
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
     steps:
