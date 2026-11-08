@@ -67,6 +67,7 @@ class _FakeBackend:
     def __init__(self, token2wav, **kwargs):
         self.token2wav = token2wav
         self.kwargs = kwargs
+        self._whole_euler_graph_wrapper = None
 
 
 @pytest.fixture(autouse=True)

@@ -60,6 +60,11 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
         chunk_ms=200,
         no_realtime_pacing=False,
         tail_silence_s=8,
+        # Native duplex lets the model keep listening instead of answering the
+        # last scene. Asking for one response on the final commit makes that
+        # answer a session contract instead of a ~25% nightly coin flip; the
+        # scene-coverage assertion below still judges what the model said.
+        final_create_response=True,
         require_audio=True,
     )
     result = asyncio.run(demo.run_demo(args))
@@ -68,6 +73,7 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
     report["fixture_archive_sha256"] = manifest["archive_sha256"]
     report["reference_audio_sha256"] = manifest["reference_audio_sha256"]
     report["scope"] = "12 scene descriptions plus response completion; not all-question accuracy or token parity"
+    report["post_commit"] = result["post_commit"]
     (output / "recognition.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     assert result["ok"], result
     assert result["video_frames_sent"] == 180, result
