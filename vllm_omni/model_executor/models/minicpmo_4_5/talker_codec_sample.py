@@ -130,6 +130,8 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         temperature = tl.load(temp_ptr + row)
         scores = scores / tl.where(temperature == 0, 1.0, temperature)
         tl.store(out_ptr + row * vocab + offsets, scores, valid)
+
+    @triton.jit
     def _topk_topp_mask_kernel(
         logits_ptr,
         vals_ptr,
