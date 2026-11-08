@@ -506,18 +506,31 @@ def test_model_cpu_offload_remains_dense_only(offload_kwargs, tmp_path):
         ),
     ],
 )
-def test_layerwise_offload_is_refused_because_it_bypasses_the_fusion(offload_config, tmp_path):
-    fusion = _fusion(tmp_path)
+@pytest.mark.parametrize("requires_vsa", [False, True], ids=["dense", "vsa"])
+def test_layerwise_offload_is_refused_because_it_bypasses_the_fusion(offload_config, requires_vsa, tmp_path):
+    if requires_vsa:
+        sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+        _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+        fusion = _load(sparse.parent)
+    else:
+        fusion = _fusion(tmp_path)
 
     # Layerwise host-weight paths can install the transformer without
     # load_weights(), so the fusion and its completeness check would be skipped.
-    with pytest.raises(ValueError, match="cannot be combined with"):
+    with pytest.raises(ValueError, match="cannot be combined with") as exc_info:
         fusion.check_serving_contract(
             partition="fl2va",
             od_config=offload_config,
             video_shift=12.0,
             audio_shift=3.0,
         )
+
+    message = str(exc_info.value)
+    if requires_vsa:
+        assert message.endswith("Serve VSA without offload.")
+        assert "model-level CPU offload" not in message
+    else:
+        assert message.endswith("Use model-level CPU offload or serve it without offload.")
 
 
 def test_adopting_the_contract_refuses_a_vsa_variant_and_ref2va(tmp_path):

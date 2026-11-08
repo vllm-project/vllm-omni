@@ -87,7 +87,10 @@ remains unsupported.
 
 For a single GPU, the Dense / Data-Free variant may be combined with
 model-level CPU offload. New configurations should use the component-selective
-API. Replace the multi-GPU parallel settings in the serve command above with:
+API. In the serve command above, set `CUDA_VISIBLE_DEVICES=0` and remove
+`--usp 8`, `--ring 1`, `--vae-patch-parallel-size 8`,
+`--vae-parallel-mode tile`, and `--vae-use-tiling`. Keep
+`--tensor-parallel-size 1` and replace `--num-gpus 8` with:
 
 ```bash
 --num-gpus 1 \

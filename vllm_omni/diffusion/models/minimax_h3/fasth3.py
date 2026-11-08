@@ -537,11 +537,11 @@ class FastH3WeightFusion:
             raise FastH3AdapterError(
                 f"FastH3 delta for {name} has shape {tuple(delta.shape)}, parameter is {tuple(weight.shape)}"
             )
-        # Leave the result on the compute device. These weights are bound for
-        # the accelerator anyway, so returning them to host memory would pay a
-        # device-to-host copy of the whole checkpoint only for the loader to
-        # send it straight back: measured at 152s against 15s for 60 GiB of
-        # patched projections, against 17s for the unavoidable upload alone.
+        # Leave the result on the compute device. Without offload, returning
+        # accelerator-bound weights to host memory would add a needless
+        # round trip. With model-level CPU offload, the loader instead copies
+        # the fused result into the CPU-resident parameter; that startup-only
+        # staging is necessary.
         # Fold the base weight into the freshly built delta in place. Promoting
         # the weight to float32 on its own would allocate two more buffers the
         # size of the parameter, and H3's largest patched projection is 0.5 GiB.
@@ -613,11 +613,16 @@ class FastH3WeightFusion:
         if offload_strategy in (OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE):
             # Layerwise host-weight paths can install the transformer without
             # going through load_weights(), which is where the fusion and its
-            # completeness check live. Model-level CPU offload is installed
-            # only after ordinary loading and is therefore compatible.
+            # completeness check live. Dense model-level CPU offload is
+            # installed only after ordinary loading and is therefore compatible.
+            remedy = (
+                "Serve VSA without offload."
+                if self.requires_vsa
+                else "Use model-level CPU offload or serve it without offload."
+            )
             raise ValueError(
                 f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
-                f"{offload_strategy.value}. Use model-level CPU offload or serve it without offload."
+                f"{offload_strategy.value}. {remedy}"
             )
         if self.requires_vsa and offload_strategy is OffloadStrategy.MODEL_LEVEL:
             raise ValueError(
