@@ -32,7 +32,7 @@ PSNR_THRESHOLD = 19.0
 
 def _assert_matches_baseline(
     parallel_config: DiffusionParallelConfig,
-    output_name: str,
+    label: str,
     accuracy_artifact_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -58,7 +58,7 @@ def _assert_matches_baseline(
         image = images[0].convert("RGB")
 
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
-    image.save(output_dir / output_name)
+    image.save(output_dir / f"vllm_omni_{label}.png")
     assert BASELINE_PATH.exists()
     baseline = Image.open(BASELINE_PATH).convert("RGB")
     resized = image.resize(baseline.size, Image.Resampling.LANCZOS)
@@ -72,6 +72,7 @@ def _assert_matches_baseline(
         dataset="image_similarity",
         metrics={"ssim": ssim, "psnr": psnr},
         baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+        extra={"label": label},
     )
     assert_similarity(
         model_name=MODEL_ID,
@@ -91,7 +92,7 @@ def test_hidream_o1_image_tp2_matches_baseline(
 ) -> None:
     _assert_matches_baseline(
         DiffusionParallelConfig(tensor_parallel_size=2),
-        "vllm_omni_tp2.png",
+        "tp2",
         accuracy_artifact_root,
         monkeypatch,
     )
@@ -104,7 +105,7 @@ def test_hidream_o1_image_cfg_parallel2_matches_baseline(
 ) -> None:
     _assert_matches_baseline(
         DiffusionParallelConfig(cfg_parallel_size=2),
-        "vllm_omni_cfg_parallel2.png",
+        "cfg_parallel2",
         accuracy_artifact_root,
         monkeypatch,
     )
