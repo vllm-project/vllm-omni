@@ -228,6 +228,45 @@ def test_npu_device_selects_ascend_model_state(monkeypatch):
     assert ms.create_fish_omni_model_state(None, None, None, SimpleNamespace(type="npu")) is sentinel
 
 
+def test_hybrid_omni_stage_keeps_drama3_model_state(monkeypatch):
+    """Issue #9556: a hybrid Omni stage must not replace Drama 3's factory.
+
+    ``OmniMambaHybridModelState`` does not build Ascend attention metadata, so
+    the NPU Model Runner V2 exits before the server is ready.
+    """
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
+    from vllm_omni.worker_v2.model_states import init_omni_model_state
+
+    class HybridConfig(OmniModelConfig):
+        is_hybrid = True
+
+    class _State(ModelState):
+        def prepare_inputs_embeds(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_dummy_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_attn(self, *args, **kwargs):
+            raise NotImplementedError
+
+    sentinel = object.__new__(_State)
+    monkeypatch.setattr(ms, "create_fish_omni_model_state", lambda *args: sentinel)
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=object.__new__(HybridConfig)),
+        object.__new__(FishOmniForConditionalGeneration),
+        None,
+        torch.device("cpu"),
+    )
+    assert state is sentinel
+
+
 def test_cuda_device_keeps_the_upstream_model_state(monkeypatch):
     monkeypatch.setattr(ms.FishOmniModelState, "__init__", lambda self, *args, **kwargs: None)
     state = ms.create_fish_omni_model_state(None, None, None, SimpleNamespace(type="cuda"))

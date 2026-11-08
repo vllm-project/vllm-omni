@@ -26,6 +26,17 @@ import numpy as np
 import pytest
 import websockets
 import yaml
+from openai.types.realtime import (
+    ConversationItemCreateEvent,
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
+    RealtimeFunctionTool,
+    RealtimeSessionCreateRequest,
+    ResponseCreateEvent,
+    SessionUpdateEvent,
+)
+from openai.types.realtime.realtime_client_event import RealtimeClientEvent
+from openai.types.realtime.realtime_conversation_item_user_message import Content
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
@@ -33,6 +44,12 @@ from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
     generate_synthetic_audio,
+)
+from tests.helpers.realtime import (
+    WEATHER_TOOL_ANSWER,
+    WEATHER_TOOL_OUTPUT,
+    WEATHER_TOOL_PROMPT,
+    WEATHER_TOOL_SPEC,
 )
 from tests.helpers.runtime import OmniServer, OmniServerParams, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -63,7 +80,6 @@ ISSUE_6474_SYNTH_PHRASE_TEXT = (
     "Can you tell me the current temperature and weather conditions in New York City? "
     "What about Los Angeles? Please compare them in detail using at least eight complete sentences."
 )
-
 # Simulate realtime upload pacing (``openai_realtime_client.py --send-delay-ms``).
 SEND_DELAY_MS = 200
 CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livekit" / "client_vad_replay.jsonl"
@@ -97,11 +113,23 @@ realtime_async_chunk_server_params = [
             model=MODEL,
             stage_config_path=default_stage_config,
             use_stage_cli=True,
-            server_args=["--async-chunk"],
+            server_args=[
+                "--async-chunk",
+                "--tool-call-parser",
+                "hermes",
+                "--enable-auto-tool-choice",
+            ],
         ),
         id="async_chunk",
     ),
 ]
+
+# Stage-log lines the cold-start replay test checks.
+REALTIME_CONNECTION_LOG_MARKER = "[realtime] connection opened"
+# vLLM's JIT monitor logs a kernel compiled after startup warmup with this
+# text, once per kernel and process (``warning_once``).
+RUNTIME_JIT_LOG_MARKER = "JIT compilation during inference"
+MOE_PREFILL_WARMUP_LOG_MARKER = "MoE prefill warmup ran"
 
 realtime_server_vad_server_params = [
     pytest.param(
@@ -240,6 +268,110 @@ async def _run_realtime_audio_roundtrip(
         "delta_events": delta_events,
         "audio_done": audio_done,
     }
+
+
+async def _send_client_event(ws: Any, event: RealtimeClientEvent) -> None:
+    """Serialize a client event the same way the OpenAI SDK does."""
+    await ws.send(event.to_json(exclude_defaults=True, exclude_unset=True))
+
+
+async def _run_realtime_audio_tool_call(
+    host: str,
+    port: int,
+    model: str,
+    *,
+    timeout_s: float = 600,
+) -> dict:
+    """Ask for an audio response that must call a tool, then feed the result back."""
+
+    def summarize(events: list[dict]) -> dict:
+        transcript = "".join(
+            event.get("delta", "")
+            for event in events
+            if event.get("type") in ("response.output_audio_transcript.delta", "response.output_text.delta")
+        )
+        tool_calls = [
+            event["item"]
+            for event in events
+            if event.get("type") == "response.output_item.done" and event.get("item", {}).get("type") == "function_call"
+        ]
+        first_control = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("type") == "response.output_item.added"
+                and event.get("item", {}).get("type") == "function_call"
+            ),
+            len(events),
+        )
+        return {
+            "transcript": transcript,
+            "tool_calls": tool_calls,
+            "audio_deltas": sum(1 for event in events if event.get("type") == "response.output_audio.delta"),
+            "audio_after_tool_call": sum(
+                1 for event in events[first_control:] if event.get("type") == "response.output_audio.delta"
+            ),
+        }
+
+    async def recv_response(ws) -> list[dict]:
+        events: list[dict] = []
+        while True:
+            message = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
+            if isinstance(message, bytes):
+                continue
+            event = json.loads(message)
+            events.append(event)
+            if event.get("type") == "error":
+                raise AssertionError(f"WebSocket error: {event}")
+            if event.get("type") == "response.done":
+                return events
+
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
+        await _send_client_event(
+            ws,
+            SessionUpdateEvent(
+                type="session.update",
+                session=RealtimeSessionCreateRequest(
+                    type="realtime",
+                    model=model,
+                    output_modalities=["audio"],
+                    tools=[RealtimeFunctionTool(**WEATHER_TOOL_SPEC)],
+                    tool_choice="auto",
+                ),
+            ),
+        )
+        await _send_client_event(
+            ws,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item=RealtimeConversationItemUserMessage(
+                    type="message",
+                    role="user",
+                    content=[Content(type="input_text", text=WEATHER_TOOL_PROMPT)],
+                ),
+            ),
+        )
+        await _send_client_event(ws, ResponseCreateEvent(type="response.create"))
+        tool_turn = summarize(await recv_response(ws))
+
+        answer_turn = None
+        if tool_turn["tool_calls"]:
+            call = tool_turn["tool_calls"][0]
+            await _send_client_event(
+                ws,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item=RealtimeConversationItemFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=call["call_id"],
+                        output=WEATHER_TOOL_OUTPUT,
+                    ),
+                ),
+            )
+            await _send_client_event(ws, ResponseCreateEvent(type="response.create"))
+            answer_turn = summarize(await recv_response(ws))
+
+    return {"tool_turn": tool_turn, "answer_turn": answer_turn}
 
 
 async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
@@ -402,6 +534,7 @@ async def _run_client_vad_replay(
     *,
     wait_s: float = 10.0,
     answer_timeout_s: float = 60.0,
+    stall_s: list[float] | None = None,
 ) -> list[str]:
     """Replay a captured LiveKit client-VAD session at its original speed.
 
@@ -414,6 +547,10 @@ async def _run_client_vad_replay(
     answers are collected, so the checks below compare model output rather than
     the recording's teardown. The cancels that precede a ``response.create`` are
     part of the interaction and still go out on time.
+
+    When ``stall_s`` is given, it receives one entry per response: seconds from
+    ``response.created`` to its first transcript delta (or to ``response.done``
+    if no delta arrived).
     """
     with replay_path.open() as replay_file:
         records = [json.loads(line) for line in replay_file]
@@ -424,6 +561,8 @@ async def _run_client_vad_replay(
     completed_answers: dict[str, str] = {}
     pending_responses: dict[str, asyncio.Future] = {}
     errors: list[dict] = []
+    created_at: dict[str, float] = {}
+    first_output_at: dict[str, float] = {}
 
     last_create = max(
         (index for index, record in enumerate(records) if record["data"].get("type") == "response.create"),
@@ -465,6 +604,7 @@ async def _run_client_vad_replay(
                     response_order.append(response_id)
                     answers_by_response_id[response_id] = ""
                     pending_responses[response_id] = asyncio.get_running_loop().create_future()
+                    created_at[response_id] = asyncio.get_running_loop().time()
                 elif event_type in {
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
@@ -474,11 +614,14 @@ async def _run_client_vad_replay(
                     response_id = event.get("response_id")
                     if response_id in answers_by_response_id:
                         answers_by_response_id[response_id] += event.get("delta", "")
+                        if event.get("delta"):
+                            first_output_at.setdefault(response_id, asyncio.get_running_loop().time())
                 elif event_type == "response.done":
                     response = event["response"]
                     response_id = response["id"]
                     text = answers_by_response_id.get(response_id, "")
                     completed_answers[response_id] = text or _output_text(response)
+                    first_output_at.setdefault(response_id, asyncio.get_running_loop().time())
                     future = pending_responses.get(response_id)
                     if future is not None and not future.done():
                         future.set_result(None)
@@ -513,6 +656,12 @@ async def _run_client_vad_replay(
             await asyncio.gather(receiver, return_exceptions=True)
 
     assert not [error for error in errors if error.get("error", {}).get("type") == "server_error"]
+    if stall_s is not None:
+        stall_s.extend(
+            first_output_at[response_id] - created_at[response_id]
+            for response_id in response_order
+            if response_id in first_output_at
+        )
     return [completed_answers[response_id] for response_id in response_order if response_id in completed_answers]
 
 
@@ -718,6 +867,30 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_audio_response_parses_tool_call(self, omni_server) -> None:
+        """Audio turns must surface function calls, hide their markup, and speak the tool result."""
+        result = asyncio.run(_run_realtime_audio_tool_call(omni_server.host, omni_server.port, omni_server.model))
+
+        tool_turn = result["tool_turn"]
+        assert len(tool_turn["tool_calls"]) == 1, tool_turn["transcript"]
+        call = tool_turn["tool_calls"][0]
+        assert call["name"] == "get_weather"
+        assert "paris" in (call["arguments"] or "").lower()
+        for marker in ("<tool_call>", "</tool_call>"):
+            assert marker not in tool_turn["transcript"]
+        assert tool_turn["audio_after_tool_call"] == 0, tool_turn
+
+        answer_turn = result["answer_turn"]
+        assert answer_turn is not None
+        assert answer_turn["audio_deltas"] > 0, "the tool result turn produced no audio"
+        assert WEATHER_TOOL_ANSWER in answer_turn["transcript"]
+        for marker in ("<tool_call>", "</tool_call>"):
+            assert marker not in answer_turn["transcript"]
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_server_vad_server_params, indirect=True)
     def test_server_vad_multi_turn_without_client_commit(
         self,
@@ -837,6 +1010,68 @@ _DUPLEX_REPEATS_FULL = 20
 _DUPLEX_LONG_INSTRUCTIONS = "Answer the user's question in English using at least eight complete sentences."
 _DUPLEX_SHORT_INSTRUCTIONS = "Answer the user's question in one short English sentence."
 _SEMANTIC_VAD_ASSETS = Path(__file__).resolve().parents[2] / "assets" / "semantic_vad"
+
+
+class TestQwen3OmniRealtimeColdStart:
+    """Replay on a server that is started for this test alone."""
+
+    @pytest.fixture(scope="function")
+    def cold_omni_server(self, request, run_level):
+        # Function scope and its own class on purpose: pytest reuses a
+        # class-scoped server for value-equal params even under a different
+        # test id, and the class boundary tears down the server above before
+        # this one starts on the same GPUs.
+        from tests.helpers.fixtures.runtime import omni_fixture_lock
+        from tests.helpers.runtime import iter_omni_server
+
+        yield from iter_omni_server(request, run_level, omni_fixture_lock)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100"}, num_cards=2)
+    @pytest.mark.parametrize("cold_omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_livekit_client_vad_replay_without_runtime_jit(self, cold_omni_server) -> None:
+        """A fresh server answers all three replay turns without compiling kernels mid-request.
+
+        Without the MoE prefill warmup, the thinker and talker JIT-compile
+        ``fused_moe_kernel`` configs on every turn of this replay (#9069 follow-up).
+        The JIT monitor logs only the first compile per kernel, so a green run
+        means this replay hit no un-warmed kernel; the warmup log check below is
+        what shows the warmup itself ran.
+        """
+        stalls: list[float] = []
+        answers = asyncio.run(
+            _run_client_vad_replay(
+                cold_omni_server.host,
+                cold_omni_server.port,
+                cold_omni_server.model,
+                CLIENT_VAD_REPLAY_PATH,
+                stall_s=stalls,
+            )
+        )
+        print(f"client_vad_replay first-output stall per turn (s): {[round(s, 3) for s in stalls]}")
+
+        assert len(answers) == 3, answers
+        assert "qwen" in answers[0].lower(), answers
+        assert "paris" in answers[1].lower(), answers
+        assert "paris" in answers[2].lower(), answers
+
+        logs = cold_omni_server.read_stage_logs()
+        connections = sum(log.count(REALTIME_CONNECTION_LOG_MARKER) for log in logs.values())
+        assert connections == 1, (
+            f"expected a fresh server whose only realtime session is this replay, saw {connections}"
+        )
+
+        runtime_jit = [
+            f"stage {stage_id}: {line.strip()}"
+            for stage_id, log in sorted(logs.items())
+            for line in log.splitlines()
+            if RUNTIME_JIT_LOG_MARKER in line
+        ]
+        assert not runtime_jit, "kernels JIT-compiled mid-request:\n" + "\n".join(runtime_jit)
+
+        warmed = sorted(stage_id for stage_id, log in logs.items() if MOE_PREFILL_WARMUP_LOG_MARKER in log)
+        assert warmed == [0, 1], f"MoE prefill warmup should run in the thinker (0) and talker (1), ran in {warmed}"
 
 
 class _DuplexTestRuntime(NamedTuple):

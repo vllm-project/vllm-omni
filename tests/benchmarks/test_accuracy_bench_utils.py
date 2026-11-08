@@ -130,7 +130,7 @@ def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved["daily_omni_accuracy"] == 0.8
     assert saved["dataset"] == "daily_omni"
     assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
-    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
+    assert saved["baseline"] == {"H100": {"min_daily_omni_accuracy": 0.77}}
     assert saved["Hardware"] == "H100"
     assert saved["branch"] == "main"
 
@@ -164,7 +164,7 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
     assert saved["daily_omni_accuracy"] == 0.8
     assert saved["dataset"] == "daily_omni"
     assert saved["model_id"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.69}
+    assert saved["baseline"] == {"default": {"min_daily_omni_accuracy": 0.69}}
     assert saved["Hardware"] == ""
     assert saved["branch"] == ""
     assert "Hardware" in caplog.text

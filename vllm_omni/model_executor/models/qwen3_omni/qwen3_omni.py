@@ -62,6 +62,8 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_placeholder_token_ids
+from vllm_omni.model_executor.models.qwen3_omni.talker_sampler import mrv2_talker_sampler
 from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
@@ -111,10 +113,13 @@ logger = init_logger(__name__)
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
+    "encoder_cudagraph_group_eligible",
     "get_encoder_cudagraph_config",
     "get_input_modality",
     "get_max_frames_per_video",
     "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_path_max_budget",
+    "get_encoder_cudagraph_path_budgets",
     "get_encoder_cudagraph_item_specs",
     "select_encoder_cudagraph_items",
     "prepare_encoder_cudagraph_capture_inputs",
@@ -241,6 +246,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Speculative sampling can change the token width between steps.
             # Keep the existing capture-stream handoff for the entire request.
             self.publishes_sampled_embeddings = self.is_staged_run and vllm_config.speculative_config is None
+            # MRv2: every Thinker output row is on the token axis before
+            # sampling, so prefix-cache hits can be merged from cached rows.
+            self.supports_mrv2_prefix_cache_outputs = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -306,6 +314,17 @@ class Qwen3OmniMoeForConditionalGeneration(
             # next text step (see ``talker_mtp``).
             self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
+            # Codebook 0 uses V1's per-request CUDA generator (see
+            # Qwen3OmniTalkerSampler). Residual codebooks draw inside talker_mtp,
+            # which is also what V1 captures: replay advances Philox, so each
+            # step gets a fresh stream. An external uniform buffer is a different
+            # stream and, together with MRv2's murmur3 codebook-0 sampler, raises
+            # Seed-TTS word error by about 0.4 percentage points.
+            self.mtp_sample_uniforms = False
+            self.mrv2_custom_sampler = mrv2_talker_sampler
+            self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
+            self.mtp_sample_vocab_size = self._codec_codebook_size
+            self.talker_mtp_accepts_per_row_generators = True
             self._apply_subtalker_sampling_params(getattr(vllm_config.model_config, "subtalker_sampling_params", None))
 
             # Decode each stream's first frame here (see talker_first_audio_enabled).
@@ -1048,6 +1067,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        sample_uniforms: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        generators: Any = None,
         **kwargs: Any,
     ):
         # TODO(Peiqi): not support intermediate_tensors now
@@ -1060,8 +1082,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
+        # One decode row per request. A longer span still samples inside the
+        # predictor; the static uniform buffer is shaped for a single step.
+        sampling_noise = sample_uniforms if input_ids.shape[-1] == 1 else None
         code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-            input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
+            input_ids,
+            inputs_embeds,
+            last_talker_hidden=last_talker_hidden,
+            sample_uniforms=sampling_noise,
+            generator=None if sampling_noise is not None else generator,
+            generators=None if sampling_noise is not None else generators,
         )
         # summed_embeddings is [B, seq_len, H] (3D) while text_step is [B, H] (2D).
         # Flatten to 2D first to avoid wrong broadcasting: [B,1,H]+[B,H] → [B,B,H]
@@ -1121,10 +1151,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequence_embeds = to_device_nonblocking(embed["prefill"], talker_device).to(
             torch.bfloat16
         )  # Tensor [P,H]
-        thinker_hidden_states = to_device_nonblocking(hs["output"], talker_device).to(torch.bfloat16)  # Tensor [K,H]
         # Token ids stay on CPU too: prefill parsing reads them on the host.
         thinker_sequences_cpu = None if ids.get("all") is None else _cpu_long(ids["all"])
         thinker_chatml_ids_cpu = None if ids.get("prompt") is None else _cpu_long(ids["prompt"])
+        if meta.get("prefill_holds_accept_hidden") and thinker_chatml_ids_cpu is not None:
+            # Async chunk 0 sent one merged prefill tensor whose placeholder
+            # rows already hold the accept-layer hidden state.
+            thinker_hidden_states = thinker_sequence_embeds[: thinker_chatml_ids_cpu.shape[-1]]
+        else:
+            hidden_output = hs.get("output")
+            thinker_hidden_states = None
+            if hidden_output is not None:
+                thinker_hidden_states = to_device_nonblocking(hidden_output, talker_device).to(torch.bfloat16)  # [K,H]
         thinker_sequences = (
             None if thinker_sequences_cpu is None else to_device_nonblocking(thinker_sequences_cpu, talker_device)
         )
@@ -1270,10 +1308,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         result_ids = thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
         im_start_indexes = torch.nonzero(parse_ids[0] == self.config.im_start_token_id).flatten().tolist()
         im_start_indexes.append(target_len)
+        # Same placeholder set as the merged chunk-0 prefill (talker_rows.py).
+        audio_token_id, image_token_id, video_token_id = talker_placeholder_token_ids(self.thinker_config)
         multimodal_mask = (
-            (result_ids == self.thinker_config.audio_token_id) |
-            (result_ids == self.thinker_config.image_token_id) |
-            (result_ids == self.thinker_config.video_token_id)
+            (result_ids == audio_token_id) |
+            (result_ids == image_token_id) |
+            (result_ids == video_token_id)
         )  # [t] # fmt: skip
         role_tokens = parse_ids[0].tolist()
 
@@ -1351,7 +1391,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )
-        start_index = meta.get("num_processed_tokens", 0)
+        if meta.get("resumable", False):
+            start_index = meta.get("num_processed_tokens", 0)
+        else:
+            # Decode rows start at the first text token the prefill did not
+            # consume, one per generated frame, and rows that arrived during a
+            # chunked prefill are cached first. The row for this position is
+            # therefore the number of frames before it, not the text index.
+            start_index = payload["_omni_num_computed_tokens"] - payload["_omni_prompt_len"]
+            if start_index < 0:
+                raise ValueError(f"Talker decode requires a non-negative generation offset, got {start_index}")
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = to_device_nonblocking(cached_thinker_decode_embeds, device)
@@ -1417,10 +1466,10 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         last_talker_hidden = None
         text_step = None
+        if self.vllm_config.model_config.async_chunk:
+            text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
         try:
-            if self.vllm_config.model_config.async_chunk:
-                text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
-            else:
+            if not self.vllm_config.model_config.async_chunk:
                 q_tail = hs.get("trailing_text", None)
                 if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                     use_vec = q_tail[0:1, :]
