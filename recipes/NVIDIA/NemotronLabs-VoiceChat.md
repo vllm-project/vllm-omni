@@ -202,6 +202,8 @@ completion).
 
 Compatible audio frames in the same thinker step are batched automatically. Waveform windows are grouped by length, and encoder chunks by width and stream-start drop count. Each request retains its own caches. Session admission limits are unchanged.
 
+Batching is enabled through the shared runner hook without a platform gate; NPU/XPU runners that inherit this hook also use it when running this model. Validation covers CPU regressions and real-weight CUDA runs on an A800. NPU/XPU execution has not been validated.
+
 #### Duplex performance profile
 
 `nemotron_labs_voicechat_duplex.yaml` defaults to the fast profile: the
