@@ -1432,6 +1432,16 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "test_hunyuan_image_ep_startup.py" not in hunyuan_command
 
 
+def test_hunyuan_offline_accuracy_has_cold_start_headroom() -> None:
+    accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
+    offline_accuracy = accuracy.split("def _run_vllm_omni_hunyuan_image3_offline", maxsplit=1)[1].split(
+        "def _assert_against_baseline", maxsplit=1
+    )[0]
+
+    assert '"--stage-init-timeout",\n            "900"' in offline_accuracy
+    assert '"--init-timeout",\n            "1800"' in offline_accuracy
+
+
 def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     from vllm_omni.config.stage_config import resolve_deploy_yaml
 
