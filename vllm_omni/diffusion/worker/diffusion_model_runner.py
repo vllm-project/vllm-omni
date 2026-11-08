@@ -42,7 +42,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank, get_world_group
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
@@ -96,28 +96,23 @@ logger = init_logger(__name__)
 
 
 def _dit_any_rank_failed(local_failed: bool) -> bool:
-    """All-reduce a per-request failure flag across the DiT process group.
+    """All-reduce a per-request failure flag across every DiT rank.
 
-    Every DiT rank must reach this point in lockstep; the caller wraps
-    ``pipeline.prepare_encode`` so both the success and the exception paths
-    call the helper. In single-rank execution this collapses to the local
-    flag with no collectives issued.
+    Every rank of the diffusion WORLD executes the same step-mode scheduler
+    output, so every rank must reach this point in lockstep; the caller wraps
+    ``pipeline.prepare_encode`` and the interaction-session setup so both the
+    success and the exception paths call the helper. A rank that fails before
+    a collective inside the pipeline leaves its peers blocked there, so such
+    pipelines must agree on those failures themselves. In single-rank
+    execution this collapses to the local flag with no collectives issued.
     """
-    if not torch.distributed.is_initialized():
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
         return local_failed
-    try:
-        from vllm_omni.diffusion.distributed import parallel_state
-
-        get_dit_group = getattr(parallel_state, "get_dit_group", None)
-        group = get_dit_group() if get_dit_group is not None else None
-    except (AssertionError, ImportError):
-        group = None
-    if group is None:
-        return local_failed
-    signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32)
-    if current_omni_platform.is_available():
-        signal = signal.to(device=current_omni_platform.device_type)
-    torch.distributed.all_reduce(signal, op=torch.distributed.ReduceOp.MAX, group=group)
+    group = get_world_group()
+    # Control-plane vote on the Gloo group: a device tensor would wait for all
+    # queued device work when the result is read back.
+    signal = torch.tensor([int(local_failed)], dtype=torch.int32)
+    torch.distributed.all_reduce(signal, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group)
     return bool(signal.item())
 
 
