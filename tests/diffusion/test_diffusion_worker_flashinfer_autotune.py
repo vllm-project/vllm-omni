@@ -232,3 +232,46 @@ def test_cache_path_ignores_state_added_by_model_load(tmp_path, monkeypatch):
     other = _OnlineQuantConfig()
     other.ignored_layers = []
     assert dw._flashinfer_autotune_cache_path(_od_config(True, quantization_config=other), 0) != before
+
+
+@pytest.mark.parametrize(
+    ("setting", "capability_ok", "expected"),
+    [
+        (None, True, True),  # auto on SM100 / SM120
+        (None, False, False),  # auto on SM90 and older: FlashInfer's heuristic already matches
+        (False, True, False),  # explicit off wins on Blackwell
+        (True, False, True),  # explicit on wins on older GPUs
+    ],
+)
+def test_auto_default_turns_on_for_sm100_and_newer(mocker, fake_flashinfer, setting, capability_ok, expected):
+    _cuda(mocker)
+    capability = mocker.patch.object(dw, "_device_capability_at_least", return_value=capability_ok)
+    worker = _make_worker(_od_config(setting), lambda req, **kw: fake_flashinfer.is_tuning_mode)
+
+    assert worker.execute_model(_request(), worker.od_config) is expected
+    if setting is None:
+        capability.assert_called_with(100)
+    else:
+        capability.assert_not_called()
+
+
+def test_auto_default_without_flashinfer_is_silent(mocker, monkeypatch):
+    _cuda(mocker)
+    mocker.patch.object(dw, "_device_capability_at_least", return_value=True)
+    monkeypatch.setattr("vllm.utils.flashinfer.has_flashinfer", lambda: False)
+    warn = mocker.patch.object(dw.logger, "warning_once")
+
+    assert dw._flashinfer_autotune_wanted(_od_config(None)) is False
+    warn.assert_not_called()
+    assert dw._flashinfer_autotune_wanted(_od_config(True)) is False
+    warn.assert_called_once()
+
+
+def test_decision_is_made_once_per_worker(mocker, fake_flashinfer):
+    _cuda(mocker)
+    capability = mocker.patch.object(dw, "_device_capability_at_least", return_value=True)
+    worker = _make_worker(_od_config(None), lambda req, **kw: "out")
+    for shape in ({}, {"height": 720, "width": 1280}, {}):
+        worker.execute_model(_request(**shape), worker.od_config)
+
+    assert capability.call_count == 1

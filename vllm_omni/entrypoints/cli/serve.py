@@ -822,11 +822,12 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--diffusion-flashinfer-autotune",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Diffusion-only: autotune FlashInfer GEMMs on CUDA (on SM100+: MXFP8 and per-tensor FP8 linears) "
-                "so they use tuned tactics instead of heuristics. The first request of each new shape pays the tuning; "
+                "Diffusion-only: autotune FlashInfer GEMMs (on SM100+: MXFP8 and per-tensor FP8 linears) so they use "
+                "tuned tactics instead of heuristics. Default: on for CUDA SM100+ with FlashInfer, off elsewhere; "
+                "--no-diffusion-flashinfer-autotune disables it. The first request of each new shape pays the tuning; "
                 "tactics are cached per rank under VLLM_CACHE_ROOT and reused after a restart."
             ),
         )

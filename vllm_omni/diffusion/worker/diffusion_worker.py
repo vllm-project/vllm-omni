@@ -300,6 +300,39 @@ def _flashinfer_autotune_cache_path(od_config: OmniDiffusionConfig, rank: int) -
     return os.path.join(envs.VLLM_CACHE_ROOT, "flashinfer_autotune", "diffusion", key, f"rank{rank}.json")
 
 
+def _device_capability_at_least(capability: int) -> bool:
+    from vllm.platforms import current_platform
+
+    return bool(current_platform.has_device_capability(capability))
+
+
+def _flashinfer_autotune_wanted(od_config: Any) -> bool:
+    """Resolve ``diffusion_flashinfer_autotune``: True / False are explicit; None (default) means auto.
+
+    Auto turns it on for CUDA SM100+ with FlashInfer installed. That is where vLLM routes diffusion
+    GEMMs through FlashInfer (MXFP8 linears, per-tensor-activation FP8 linears) and where tuned
+    tactics measurably beat the heuristic (B200 MXFP8 Wan2.2: 1.19x); on SM90 the heuristic already
+    matches. Online per-token FP8 runs on CUTLASS, so auto mode tunes nothing there.
+    """
+    setting = getattr(od_config, "diffusion_flashinfer_autotune", None)
+    if setting is False or not current_omni_platform.is_cuda():
+        return False
+    from vllm.utils.flashinfer import has_flashinfer
+
+    if not has_flashinfer():
+        if setting:
+            logger.warning_once("diffusion_flashinfer_autotune is set but FlashInfer is not installed; ignoring it.")
+        return False
+    if setting is None:
+        if not _device_capability_at_least(100):
+            return False
+        logger.info_once(
+            "FlashInfer autotune auto-enabled for this diffusion stage (CUDA SM100+); the first request of each "
+            "new shape is slower while it tunes. Disable with --no-diffusion-flashinfer-autotune."
+        )
+    return True
+
+
 def _flashinfer_tune_signature(sampling_params: Any) -> tuple[Any, ...]:
     """What sets a request's GEMM row counts: output geometry, outputs per prompt and whether CFG batches."""
     cfg = any((getattr(sampling_params, name, None) or 0) > 1 for name in ("guidance_scale", "true_cfg_scale"))
@@ -560,6 +593,9 @@ class DiffusionWorker:
     ) -> AbstractContextManager[Any]:
         """FlashInfer autotune for forwards that run a request shape this worker has not tuned yet.
 
+        On by default on CUDA SM100+ with FlashInfer (``diffusion_flashinfer_autotune=None``), explicit
+        True / False override that (see ``_flashinfer_autotune_wanted``).
+
         vLLM tunes FlashInfer kernels only in its LLM worker warm-up, so without this the diffusion
         stage runs FlashInfer GEMMs (on SM100+: MXFP8 linears and per-tensor-activation FP8 linears;
         online per-token FP8 uses CUTLASS) on the library's heuristic tactic. Tune mode profiles
@@ -572,14 +608,10 @@ class DiffusionWorker:
         sees cache hits.
         """
         od_config = getattr(self, "od_config", None)
-        if not getattr(od_config, "diffusion_flashinfer_autotune", False):
-            return nullcontext()
-        if not current_omni_platform.is_cuda():
-            return nullcontext()
-        from vllm.utils.flashinfer import has_flashinfer
-
-        if not has_flashinfer():
-            logger.warning_once("diffusion_flashinfer_autotune is set but FlashInfer is not installed; ignoring it.")
+        enabled = self.__dict__.get("_flashinfer_autotune_on")
+        if enabled is None:
+            enabled = self._flashinfer_autotune_on = _flashinfer_autotune_wanted(od_config)
+        if not enabled:
             return nullcontext()
         cache_path = self.__dict__.get("_flashinfer_autotune_cache_file") or _flashinfer_autotune_cache_path(
             od_config, self.rank
@@ -627,7 +659,8 @@ class DiffusionWorker:
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        if getattr(self.od_config, "diffusion_flashinfer_autotune", False):
+        self._flashinfer_autotune_on = _flashinfer_autotune_wanted(self.od_config)
+        if self._flashinfer_autotune_on:
             # Key the autotune cache before loading: the load attaches runtime state to the quantization config.
             self._flashinfer_autotune_cache_file = _flashinfer_autotune_cache_path(self.od_config, self.rank)
         load_format = kwargs.get("load_format", load_format)

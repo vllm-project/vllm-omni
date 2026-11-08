@@ -94,12 +94,16 @@ On SM100+ vLLM runs some quantized linears through FlashInfer: MXFP8 linears
 (`FlashInferCutedslMxfp8LinearKernel`, e.g. AutoRound MXFP8 checkpoints) and FP8
 linears with per-tensor activation scales (`FlashInferFP8ScaledMMLinearKernel`).
 FlashInfer picks their GEMM tactic by heuristic unless it is autotuned, and vLLM
-autotunes FlashInfer only in its LLM worker warm-up, so diffusion stages opt in
-explicitly. Online `--quantization fp8` is not affected: it uses dynamic
-per-token activation scales on CUTLASS.
+autotunes FlashInfer only in its LLM worker warm-up. Diffusion stages therefore
+autotune FlashInfer themselves, by default on CUDA SM100+ with FlashInfer
+installed (on SM90 FlashInfer's heuristic already matches the tuned tactic).
+Online `--quantization fp8` is not affected: it uses dynamic per-token
+activation scales on CUTLASS, so nothing is tuned.
 
 ```bash
-vllm serve <mxfp8-checkpoint> --omni --diffusion-flashinfer-autotune
+vllm serve <mxfp8-checkpoint> --omni                                  # SM100+: on by default
+vllm serve <mxfp8-checkpoint> --omni --no-diffusion-flashinfer-autotune  # off
+vllm serve <mxfp8-checkpoint> --omni --diffusion-flashinfer-autotune     # force on (e.g. SM90)
 ```
 
 On one B200, Wan2.2-T2V-A14B MXFP8 (832x480, 81 frames, 40 steps) went from
