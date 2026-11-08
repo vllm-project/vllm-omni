@@ -16,12 +16,14 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
@@ -410,6 +412,43 @@ def _replica(input_addr: str) -> ReplicaInfo:
     )
 
 
+@pytest.mark.parametrize(
+    ("stage1_vllm_config", "returns_payload"),
+    [
+        (None, False),  # Currently this is the case for diffusion
+        (SimpleNamespace(model_config=SimpleNamespace(stage_id=1, requires_full_payload_input=True)), True),
+    ],
+)
+def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_stage(
+    mocker: MockerFixture, stage1_vllm_config: SimpleNamespace | None, returns_payload: bool
+):
+    """Ensure a run request's entry stage returns its payload only when the next stage takes a full payload."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params, params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [
+        StagePool(0, [_FakeStageClient()]),
+        StagePool(1, [_FakeStageClient()], stage_vllm_config=stage1_vllm_config),
+    ]
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1, 1, 1]},
+        sampling_params_list=[params, params],
+        final_stage_id=1,
+        yield_stage_id=0,
+        requested_replica_id=0,
+    )
+
+    assert returns_stage_payload(msg.prompt.additional_information) is returns_payload
+    assert msg.requested_replica_id == 0
+
+
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
@@ -444,6 +483,62 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].startswith("stage0:rep0:")
     assert seen_uuids[1].startswith("stage0:rep1:")
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
+
+
+def test_explicit_replica_scopes_mm_uuids_without_frontend_reservation(mocker: MockerFixture):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    pool = engine.stage_pools[0]
+    select_replica = mocker.patch.object(
+        pool,
+        "select_replica_id",
+        side_effect=AssertionError("explicit routing must not run frontend replica selection"),
+    )
+
+    msg = engine._build_add_request_message(
+        request_id="req-explicit",
+        prompt={"prompt": "describe", "multi_modal_data": {"image": "image-a"}},
+        sampling_params_list=[params],
+        final_stage_id=0,
+        requested_replica_id=1,
+    )
+
+    assert msg.requested_replica_id == 1
+    assert len(seen_uuids) == 1
+    assert seen_uuids[0].startswith("stage0:rep1:")
+    select_replica.assert_not_called()
+    assert pool._requested_replica_ids == {}
+    assert pool.get_bound_replica_id("req-explicit") is None
+
+
+@pytest.mark.parametrize("requested_replica_id", [99, 1])
+def test_invalid_explicit_replica_rejected_before_multimodal_preprocess(
+    mocker: MockerFixture,
+    requested_replica_id: int,
+):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    pool = engine.stage_pools[0]
+    if requested_replica_id == 1:
+        pool.mark_replica_unavailable(1)
+    prompt = {"prompt": "describe", "multi_modal_data": {"image": "image-a"}}
+
+    with pytest.raises(
+        OmniClientError,
+        match=rf"replica_id {requested_replica_id} does not exist or is not available",
+    ):
+        engine._build_add_request_message(
+            request_id="req-invalid-explicit",
+            prompt=prompt,
+            sampling_params_list=[params],
+            final_stage_id=0,
+            requested_replica_id=requested_replica_id,
+        )
+
+    engine.input_processor.process_inputs.assert_not_called()
+    assert seen_uuids == []
+    assert "multi_modal_uuids" not in prompt
+    assert pool._requested_replica_ids == {}
 
 
 def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
