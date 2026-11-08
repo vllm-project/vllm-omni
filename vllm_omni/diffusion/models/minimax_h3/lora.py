@@ -292,7 +292,10 @@ def load_minimax_h3_turbo_lora(
         if partition == "ref2va" and spec.task_family == "fl2v":
             raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
         if spec.task_family == "ref2v" and partition not in {"ref2va", "combined"}:
-            raise ValueError(f"{spec.filename} requires a Ref2VA-capable server")
+            raise ValueError(
+                f"{spec.filename} is a Ref2VA Turbo artifact; start the server with "
+                f"--task-type ref2va, or use a combined server"
+            )
         dit_component = "transformers_ref" if partition == "combined" and spec.task_family == "ref2v" else "transformer"
         if unsupported_offload_mode is not None:
             raise ValueError(f"MiniMax-H3 Turbo dynamic LoRA does not support {unsupported_offload_mode}")
