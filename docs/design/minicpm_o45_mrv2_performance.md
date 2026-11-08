@@ -85,6 +85,42 @@ in groups over the shared workspace. For example, changing 4 to 32 rows grows
 the default five-step attention workspace from 1.25 GiB to 10 GiB; persistent
 request caches and the other stages need additional memory.
 
+### Turn-mode C64 profile
+
+`minicpmo_4_5_turn_mrv2_c64.yaml` is an opt-in single-GPU profile for
+64 concurrent turn requests. It extends the H200 MRv2 turn profile with:
+
+- stage capacity 64 and Whole-Euler admission 64;
+- an explicit 16-row `micro_batch_size`;
+- HiFT capture batches up to 64;
+- encoder runtime capture after the startup arena (threshold 8);
+- 16 GiB of Talker KV for 64 full-context requests.
+
+At this concurrency Code2Wav is the binding stage. Sixteen workspace rows
+replay a 64-row batch in four groups; both smaller and derived full-width
+workspaces were slower.
+
+Measured on one NVIDIA L20X (vLLM 0.33.0, PyTorch 2.14.0+cu126, MPS on).
+The workload is Seed-TTS English, HTTP streaming, text+audio TTS template,
+seed 0, temperature 0. C64 used 640 requests after 64 warmups; C1 used 128
+requests after 8 warmups. All requests succeeded. Mean RTF is per request;
+throughput is audio seconds generated per wall-clock second.
+
+| Deployment | C64 mean RTF | C64 P99 RTF | Audio throughput | Peak device memory |
+| --- | ---: | ---: | ---: | ---: |
+| H200 profile, capacity 64, 4-row workspace | 0.960 | 1.552 | 66.8 | 97.1 GiB |
+| This profile with 64-row workspace | 1.032 | 1.641 | 62.3 | 138.9 GiB |
+| This profile (16 rows) | 0.847 | 1.327 | 75.7 | 97.4 GiB |
+
+The first row ran at `2b610b3e9c` with 4 GiB Talker KV. Peak memory is
+`nvidia-smi` device usage sampled every 500 ms, covering all three stages.
+At C1 this profile measured a mean RTF of 0.111. Each row is one run.
+Removing the runtime encoder capture and the extended HiFT buckets
+from an otherwise similar setup changed C64 RTF by about 2% and less than 1%,
+respectively. WER and speaker similarity were not measured. The 64-row
+workspace nearly fills the 140 GiB device, so do not raise
+`micro_batch_size` for this profile without memory validation.
+
 The base profile allows 36 Whole-Euler graphs for the default six batch sizes,
 three cache offsets and steady/final query widths. Encoder graphs retain four
 rows and 12 entries; they have independent workspace and replay grouping.
