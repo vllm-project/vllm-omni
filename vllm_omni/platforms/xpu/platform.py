@@ -1,25 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import os
+from collections.abc import Callable, Sequence
 
 import torch
 from vllm.config import VllmConfig
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.xpu import XPUPlatform
+from vllm.utils.torch_utils import supports_xpu_graph
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.xpu.patch import apply_patches
 
 logger = init_logger(__name__)
-
-
-# Use the native query; vLLM's XPU custom op reports free=0 in spawned workers.
-torch.accelerator.get_memory_info = lambda device=None: torch.xpu.mem_get_info(device)
-
-# The XPU sampler kernel is broken for omni on the current vLLM; use the native path.
-os.environ.setdefault("VLLM_XPU_USE_SAMPLER_KERNEL", "0")
 
 
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
@@ -30,6 +25,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.XPU
+
+    def __init__(self):
+        super().__init__()
+        apply_patches()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -100,6 +99,31 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     def synchronize(cls) -> None:
         torch.xpu.synchronize()
 
+    def capture_graph(
+        self, capture: Callable[[], None], generators: Sequence[torch.Generator] = ()
+    ) -> torch.xpu.XPUGraph | None:
+        # torch.xpu.graph has no capture_error_mode. Each graph also gets a
+        # private pool: on torch 2.14+xpu, capturing into a shared pool after
+        # another graph in it was freed hits an XPUCachingAllocator assert.
+        if not supports_xpu_graph():
+            return None
+        graph = torch.xpu.XPUGraph()
+        for generator in generators:
+            graph.register_generator_state(generator)
+        with torch.xpu.graph(graph):
+            capture()
+        return graph
+
+    @classmethod
+    def is_graph_capturing(cls) -> bool:
+        return supports_xpu_graph() and torch.xpu.is_current_stream_capturing()
+
+    @classmethod
+    def get_graphed_forward_cls(cls) -> type:
+        from vllm_omni.diffusion.xpu_graph import XPUGraphedForward
+
+        return XPUGraphedForward
+
     @classmethod
     def record_device_event(cls) -> torch.Event | None:
         """Record an XPU event on the current stream to mark tensor readiness.
@@ -133,6 +157,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.xpu.memory_reserved(device))
+
+    @classmethod
     def get_profiler_cls(cls) -> str:
         """Return XPU-specific profiler that handles XPU events."""
         return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"
@@ -150,4 +178,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        return IrOpPriorityConfig.with_default(default)
+        # Mirrors upstream XPUPlatform defaults: `gelu_and_mul_sparse` has no XPU
+        # provider, so it must not fall back to `default` (which contains
+        # `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(default, gelu_and_mul_sparse=["native"])

@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import asdict, is_dataclass
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
@@ -217,10 +221,10 @@ def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
 
 
 def shm_read_bytes(meta: dict[str, Any]) -> bytes:
-    """Read bytes from SharedMemory by meta {name,size} and cleanup."""
+    """Read and unlink shared memory; an omitted size reads the full segment."""
     shm = _shm.SharedMemory(name=meta["name"])  # type: ignore[index]
     mv = memoryview(shm.buf)
-    data = bytes(mv[: meta["size"]])
+    data = bytes(mv[: meta.get("size", shm.size)])
     del mv
     try:
         shm.close()
@@ -274,6 +278,8 @@ def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)
+        if is_dataclass(x) and not isinstance(x, type):
+            return asdict(x)
         return _omega_to_dict(x)
     except Exception:
         try:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The OmniVoice generator packs q/k/v and gate/up into fused projections.
 
 The HF checkpoint stores those five tensors separately, so packing them is a
@@ -13,6 +13,8 @@ that would leave one partly written raises instead.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -49,6 +51,13 @@ def _config() -> OmniVoiceConfig:
     )
 
 
+def _generator() -> OmniVoiceGenerator:
+    return OmniVoiceGenerator(
+        _config(),
+        SimpleNamespace(max_num_seqs=1),
+    )
+
+
 def _checkpoint_shards() -> dict[str, torch.Tensor]:
     """The five per-layer tensors an OmniVoice checkpoint actually stores."""
     torch.manual_seed(0)
@@ -64,7 +73,7 @@ def _checkpoint_shards() -> dict[str, torch.Tensor]:
 
 
 def test_every_fused_parameter_is_written() -> None:
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     shards = _checkpoint_shards()
 
     loaded = generator._load_fused_projections(shards)
@@ -77,7 +86,7 @@ def test_every_fused_parameter_is_written() -> None:
 
 def test_packed_weight_matches_the_shards_it_came_from() -> None:
     """Packing order is q,k,v and gate,up -- the split in forward() assumes it."""
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     shards = _checkpoint_shards()
     generator._load_fused_projections(shards)
 
@@ -101,7 +110,7 @@ def test_packed_weight_matches_the_shards_it_came_from() -> None:
 
 def test_no_fused_parameter_keeps_its_random_init() -> None:
     """The corruption this guards against: a fused param never written at all."""
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     before = {
         name: param.detach().clone()
         for name, param in generator.named_parameters()
@@ -121,7 +130,7 @@ def test_no_fused_parameter_keeps_its_random_init() -> None:
     ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj", "mlp.gate_proj", "mlp.up_proj"],
 )
 def test_a_missing_shard_raises_instead_of_loading_partially(dropped: str) -> None:
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     shards = _checkpoint_shards()
     del shards[f"llm.layers.0.{dropped}.weight"]
 
@@ -130,7 +139,7 @@ def test_a_missing_shard_raises_instead_of_loading_partially(dropped: str) -> No
 
 
 def test_a_wrong_shaped_shard_raises() -> None:
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     shards = _checkpoint_shards()
     shards["llm.layers.0.self_attn.q_proj.weight"] = torch.randn(NUM_HEADS * HEAD_DIM + 1, HIDDEN)
 
@@ -140,7 +149,7 @@ def test_a_wrong_shaped_shard_raises() -> None:
 
 def test_a_checkpoint_missing_a_whole_layer_raises() -> None:
     """Half-loaded is the dangerous state: it neither errors nor works."""
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     shards = {k: v for k, v in _checkpoint_shards().items() if not k.startswith("llm.layers.1.")}
 
     with pytest.raises(ValueError, match="fused projections"):
@@ -149,7 +158,7 @@ def test_a_checkpoint_missing_a_whole_layer_raises() -> None:
 
 def test_a_checkpoint_with_no_fused_shards_is_left_alone() -> None:
     """An unrelated state_dict must not trip the completeness check."""
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     assert generator._load_fused_projections({"audio_heads.weight": torch.randn(4, 4)}) == set()
 
 
@@ -162,7 +171,7 @@ def test_load_weights_wires_the_packing_in(tmp_path, monkeypatch: pytest.MonkeyP
     """
     import safetensors.torch
 
-    generator = OmniVoiceGenerator(_config())
+    generator = _generator()
     shards = _checkpoint_shards()
     before = generator.layers[0].self_attn.qkv_proj.weight.detach().clone()
 

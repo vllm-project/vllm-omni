@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import inspect
 import json
 import logging
@@ -34,6 +34,10 @@ from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -800,7 +804,11 @@ class Flux2Pipeline(
         width,
         prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
+        num_inference_steps=None,
     ):
+        if num_inference_steps is not None and num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
+
         if (
             height is not None
             and height % (self.vae_scale_factor * 2) != 0
@@ -832,6 +840,10 @@ class Flux2Pipeline(
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
+        elif isinstance(prompt, str) and not prompt.strip():
+            raise ValueError("`prompt` cannot be empty or whitespace-only.")
+        elif isinstance(prompt, list) and any(isinstance(p, str) and not p.strip() for p in prompt):
+            raise ValueError("`prompt` cannot contain empty or whitespace-only strings.")
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
@@ -914,7 +926,9 @@ class Flux2Pipeline(
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        if req.sampling_params.num_inference_steps is not None:
+            num_inference_steps = req.sampling_params.num_inference_steps
+
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
@@ -953,6 +967,7 @@ class Flux2Pipeline(
             width=width,
             prompt_embeds=prompt_embeds,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            num_inference_steps=num_inference_steps,
         )
 
         self._guidance_scale = guidance_scale
@@ -1160,7 +1175,7 @@ class Flux2Pipeline(
         text_encoder_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "text_encoder")
         transformer_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "transformer")
         if (
-            self.od_config.enable_cpu_offload
+            resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
             and text_encoder_quant_config is not None
             and transformer_quant_config is None
         ):

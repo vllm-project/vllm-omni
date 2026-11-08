@@ -15,8 +15,7 @@ from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
     Magi2MoEConfig,
     Magi2PreviewConfig,
 )
-from vllm_omni.diffusion.models.magi2.layers import MultiModalityRMSNorm
-from vllm_omni.diffusion.models.magi2.mh_moe import Magi2MultiHeadMoE
+from vllm_omni.diffusion.models.magi2.layers import Magi2MultiHeadMoE, MultiModalityRMSNorm
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import (
     Magi2PreviewTransformer,
     Modality,
@@ -88,6 +87,21 @@ def test_hsdp_policy_shards_individual_preview_layers():
     assert condition("block.layers.1", model.block.layers[1])
     assert not condition("block", model.block)
     assert not condition("pre_adapter", model.pre_adapter)
+
+
+def test_layerwise_offload_contract() -> None:
+    from vllm_omni.diffusion.offloader import get_blocks_from_dit
+
+    model = Magi2PreviewTransformer(_tiny_config(num_layers=2))
+
+    assert model._layerwise_offload_blocks_attrs == ["block"]
+    assert "block" in dict(model.named_children())
+    assert list(model.block) == list(model.block.layers)
+    assert model.layers is model.block.layers
+
+    attr_names, blocks = get_blocks_from_dit(model)
+    assert attr_names == ["block"]
+    assert blocks == list(model.block.layers)
 
 
 def test_data_proxy_keeps_output_layout_request_scoped() -> None:

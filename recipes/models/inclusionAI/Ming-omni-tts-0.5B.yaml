@@ -1,0 +1,149 @@
+meta:
+  title: "Ming-omni-tts-0.5B"
+  slug: "ming-omni-tts-0.5b"
+  provider: "inclusionAI"
+  description: "inclusionAI's dense 0.5B-LM text-to-speech model served via vLLM-Omni with style, dialect, voice-cloning and multi-speaker controls, through the OpenAI /v1/audio/speech API (44.1 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - openbmb/VoxCPM2
+    - OpenMOSS-Team/MOSS-TTS
+
+model:
+  model_id: "inclusionAI/Ming-omni-tts-0.5B"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "0.5B"
+  active_parameters: "0.5B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--enforce-eager"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "Ming-omni-tts via /v1/audio/speech with style/dialect/cloning controls (44.1 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "inclusionAI/Ming-omni-tts-0.5B",
+            "input": "我觉得社会企业同个人都有责任",
+            "voice": "default",
+            "ref_audio": "file:///path/to/prompt.wav",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "BF16 weights — 0.5B LM backbone (~1.6B total incl. audio encoder + vocoder); fits a small single GPU"
+
+compatible_strategies: []
+
+hardware_overrides:
+  amd:
+    extra_args: []
+    extra_env:
+      VLLM_ROCM_USE_AITER: "0"
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Ming-omni-tts-0.5B](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B) is
+  inclusionAI's dense text-to-speech model served through **vLLM-Omni** with the
+  OpenAI-compatible `/v1/audio/speech` API. It exposes style, dialect, voice
+  cloning, and multi-speaker controls and outputs **44.1 kHz mono** audio. The
+  `0.5B` refers to the LM backbone; the full checkpoint is ~1.6B parameters
+  including the audio encoder and vocoder.
+
+  ## Prerequisites
+
+  - **Hardware**: a single GPU. The reference end-to-end run was on **AMD
+    `gfx942` (ROCm 7.x)** using the `vllm/vllm-omni-rocm:v0.22.0` image; the
+    NVIDIA CUDA path uses the same `vllm serve` command shown below.
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+  - Ming's `model_type` falls through deploy-config auto-detection, so the
+    launch command passes `--deploy-config vllm_omni/deploy/ming_tts.yaml`
+    explicitly (the file ships in the vLLM-Omni repo/package).
+  - The tested environment uses `--enforce-eager`.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  ### NVIDIA (CUDA)
+
+  ```bash
+  vllm serve inclusionAI/Ming-omni-tts-0.5B \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --omni --enforce-eager --port 8000
+  ```
+
+  ### AMD (ROCm) — reference-tested via the official image
+
+  ```bash
+  docker run --rm \
+    --group-add=video --ipc=host --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    --device /dev/kfd --device /dev/dri \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -v "$PWD":/app/vllm-omni -w /app/vllm-omni \
+    -e VLLM_ROCM_USE_AITER=0 \
+    -p 8000:8000 \
+    vllm/vllm-omni-rocm:v0.22.0 \
+    --model inclusionAI/Ming-omni-tts-0.5B \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --omni --port 8000 --enforce-eager
+  ```
+
+  ## Client usage
+
+  Dialect control with a reference clip (e.g. Cantonese / 广粤话). `--ref-audio`
+  matches upstream `use_spk_emb=True`; do **not** add `--ref-text` for the
+  dialect case:
+
+  ```bash
+  python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "我觉得社会企业同个人都有责任" \
+    --instruction-json '{"方言":"广粤话"}' \
+    --ref-audio /path/to/yue_prompt.wav \
+    --max-new-tokens 200 \
+    --output dialect.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **44.1 kHz mono**.
+  - The reference validation in the source recipe was on AMD `gfx942` (ROCm);
+    the CUDA command above is the equivalent path.
+
+  ## References
+
+  - [Model card](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
+  - [Ming-omni-tts upstream repo](https://github.com/inclusionAI/Ming-omni-tts)
+  - [vLLM-Omni Ming-TTS online example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/ming_tts)
+  - [vLLM-Omni Ming-TTS offline example](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/ming_tts)

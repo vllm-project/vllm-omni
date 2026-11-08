@@ -204,11 +204,11 @@ def load_diffusion_benchmark_configs(
 ) -> list[dict[str, Any]]:
     """Load one diffusion benchmark JSON, or merge all ``*.json`` under *config_dir*."""
     if config_path is not None:
-        configs = load_configs(config_path)
+        loaded = load_configs(config_path)
         source = str(Path(config_path).resolve())
-        for cfg in configs:
+        for cfg in loaded:
             cfg.setdefault(_DIFFUSION_SOURCE_CONFIG_KEY, source)
-        return configs
+        return loaded
     if config_dir is None:
         raise ValueError("load_diffusion_benchmark_configs requires config_path or config_dir")
     configs: list[dict[str, Any]] = []
@@ -231,7 +231,15 @@ if CONFIG_FILE_PATH is None:
         f"use -m to filter, e.g. -m diffusion)"
     )
 else:
-    BENCHMARK_CONFIGS = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+    _loaded = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+    BENCHMARK_CONFIGS = [cfg for cfg in _loaded if is_diffusion_perf_config(cfg)]
+    skipped = len(_loaded) - len(BENCHMARK_CONFIGS)
+    if skipped:
+        print(
+            f"--test-config-file: loaded {len(BENCHMARK_CONFIGS)} diffusion case(s); "
+            f"skipped {skipped} omni-bench generation case(s) "
+            f"(/v1/images/edits, /v1/images/generations, /v1/videos → run_benchmark.py)"
+        )
 
 _AGGREGATED_RESULT_FILES_BY_SOURCE: dict[str, Path] = {}
 
@@ -852,6 +860,7 @@ def run_benchmark(
         "stage_durations_p50": metrics.get("stage_durations_p50"),
         "stage_durations_p99": metrics.get("stage_durations_p99"),
         "commit_sha": _get_branchpoint_commit_sha(),
+        "branch": os.environ.get("BUILDKITE_BRANCH", ""),
         "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
         "source_file": source_file,
