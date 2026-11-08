@@ -14,6 +14,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+    from vllm_omni.diffusion.attention.schedule import AttentionSchedule
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
     from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
 
@@ -95,6 +96,10 @@ class StepBatchSamplingParamsKey:
     # ``build_lora_batch_key``; None when no LoRA is active.
     lora_key: tuple[tuple[int, float], ...] | None = None
 
+    # Same resolved request schedule and source as the request-batch key.
+    attention_schedule: AttentionSchedule = ()
+    attention_schedule_explicit: bool = False
+
 
 @dataclass(frozen=True, eq=True)
 class RequestBatchSamplingParamsKey:
@@ -158,6 +163,13 @@ class RequestBatchSamplingParamsKey:
 
     # LoRA identity. See StepBatchSamplingParamsKey.lora_key.
     lora_key: tuple[tuple[int, float], ...] | None = None
+
+    # Request schedule resolved against the service default; () runs the baseline. Different ranges
+    # must not share a batch.
+    attention_schedule: AttentionSchedule = ()
+    # Whether the request sent its schedule. An explicit schedule is checked against the step count and
+    # an inherited default is not, so the two never share a batch even when their ranges are equal.
+    attention_schedule_explicit: bool = False
 
 
 @dataclass
