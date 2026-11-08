@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Batch-bucket alignment for the MiniCPM-o 4.5 NPU code2wav graph path.
 
 The NPU capture key is the full tensor shape
