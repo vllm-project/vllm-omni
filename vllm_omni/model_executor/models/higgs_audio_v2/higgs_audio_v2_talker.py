@@ -1415,8 +1415,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Per-request reset: under MRV2 the req_id keys make new requests
         # self-evident (a key not yet in the dict is new). Under V1 the
         # output_token_ids length heuristic detects slot reuse.
-        if not hasattr(self, "_slot_output_len"):
-            self._slot_output_len: dict[Any, int] = {}
+        # ``_slot_output_len`` is always initialised above, next to
+        # ``_audio_state`` — this reset block runs after every early return.
         output_ids = getattr(sampling_metadata, "output_token_ids", None)
         for batch_i in audio_row_indices:
             bi = int(batch_i)

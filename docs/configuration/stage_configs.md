@@ -576,9 +576,10 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 Higgs-Audio V3 runs `model_runner: v2` by default. The MRV2 feature switches
 (`audio_mrv2_*`, `audio_async_*`) are tri-state fields of `HiggsAudioV3Config`
 that self-enable from the runner selection, so a deploy yaml needs only the
-`model_runner` key — the explicit `hf_overrides` block the old opt-in profile
-carried is now a tuning override, not a requirement. `audio_async_payload` and
-`audio_async_prompt_mode` are structural under v2 and cannot be disabled.
+`model_runner` key — the old opt-in profile's explicit switch overrides are
+gone, and its remaining `hf_overrides` carry only codec-graph tuning keys.
+`audio_async_payload` and `audio_async_prompt_mode` are structural under v2
+and cannot be disabled.
 
 Select one of these deployment profiles:
 
