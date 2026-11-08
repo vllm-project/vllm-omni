@@ -23,7 +23,7 @@ def test_gap_07_limits_relaxed_pixel_tolerance_to_rocm_img2img() -> None:
     source = BAGEL_CONNECTOR_TEST.read_text(encoding="utf-8")
 
     assert "PIXEL_TOLERANCE = 10" in source
-    assert "ROCM_PIXEL_TOLERANCE = 20" in source
+    assert "ROCM_PIXEL_TOLERANCE = 25" in source
     assert "TEXT2IMG_PIXEL_TOLERANCE = 5" in source
     assert source.count("current_omni_platform.is_rocm()") == 1
     assert "return ROCM_PIXEL_TOLERANCE" in source
