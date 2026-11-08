@@ -282,3 +282,23 @@ def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
     assert connector._metrics == {"errors": 1, "timeouts": 0}
     recv_buffer.release.assert_called_once()
     connector._closed = True
+
+
+def test_tensor_serialize_into_edge_shapes():
+    """0-dim, empty, and non-contiguous tensors keep their wire bytes and shape."""
+    import torch
+
+    cases = [
+        torch.tensor(1.5, dtype=torch.bfloat16),
+        torch.empty((0, 3), dtype=torch.bfloat16),
+        torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).t(),
+    ]
+    for tensor in cases:
+        expected = OmniSerializer.serialize(tensor)
+        buffer = bytearray()
+        size = OmniSerializer.serialize_into(tensor, buffer)
+        assert bytes(buffer) == expected
+        decoded = OmniSerializer.deserialize(buffer[:size])
+        assert decoded.dtype == tensor.dtype
+        assert decoded.shape == tensor.shape
+        assert torch.equal(decoded, tensor)
