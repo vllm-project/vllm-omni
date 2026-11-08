@@ -25,7 +25,7 @@ def pack_visible_rows(ctx, first_position: dict[int, int], device: torch.device)
     recent = max(sink_end, max(0, end - ctx.window_tokens) // unit * unit, (ctx.sink_tokens + skipped) // unit * unit)
     ranges = ((0, min(sink_end, end)), (recent, end))
     signature = (tuple(first_position.items()), ranges, ctx.adapter.compacted_tokens)
-    previous = getattr(cache, "superpage_plan", None)
+    previous = cache.superpage_plan
     if previous is not None and previous[0] == signature:
         _, pages, length, ctx.private_slots, ctx.superpage_fragment_tokens = previous
         return pages, length

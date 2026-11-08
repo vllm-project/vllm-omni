@@ -121,6 +121,7 @@ class ARDiffusionPagedForwardContext:
     max_seq_len: int = 0
     _prepared: bool = False
     private_slots: torch.Tensor | None = None
+    superpage_fragment_tokens: int = 0
 
     @property
     def block_size(self) -> int:
@@ -405,7 +406,7 @@ class ARDiffusionPagedForwardContext:
         # pinned, non-blocking path as the slot mappings above so the CPU does
         # not wait for the stream to drain three times before the first layer.
         signature = (tuple(padded), self.kv_len, self.query_len)
-        previous = getattr(self.kv_cache, "superpage_metadata", None) if self.kv_cache.superpage_size else None
+        previous = self.kv_cache.superpage_metadata
         if previous is not None and previous[0] == signature:
             return (*previous[1:], self.query_len, max_seq_len)
         block_table = _to_device_async(torch.tensor([padded], dtype=torch.int32), device)

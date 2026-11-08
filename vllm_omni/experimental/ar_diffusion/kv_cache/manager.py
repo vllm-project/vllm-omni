@@ -277,6 +277,9 @@ class ARDiffusionKVCache:
         self.superpage_size = config.superpage_tokens
         self.visibility_block_size = visibility_block_size or block_size
         self.superpage_private_pages = 0
+        # Last page plan and block-table metadata, reused while the window is unchanged.
+        self.superpage_plan: tuple | None = None
+        self.superpage_metadata: tuple | None = None
         if self.superpage_size:
             if segmented is not None or config.reuse_history_staging or contiguous_kv_gather_enabled():
                 raise ValueError(
