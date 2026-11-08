@@ -42,7 +42,11 @@ def test_cached_request_data_accepts_platform_base_default_fields() -> None:
     )
     from typing import Any
 
-    namespace: dict[str, Any] = {"dataclass": dataclass, "CachedRequestData": PlatformCachedRequestData}
+    namespace: dict[str, Any] = {
+        "dataclass": dataclass,
+        "field": field,
+        "CachedRequestData": PlatformCachedRequestData,
+    }
     exec(compile(ast.Module(body=[cached_class], type_ignores=[]), str(output_path), "exec"), namespace)
     cached = namespace["OmniCachedRequestData"](
         req_ids=["req"],

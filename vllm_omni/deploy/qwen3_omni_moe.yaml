@@ -4,7 +4,7 @@
 # Runner selection:
 #   Model Runner V2 is the default on CUDA and NPU. Set `model_runner: v1`
 #   in an overlay to opt out. XPU, ROCm and MUSA keep V1. The Thinker prefix
-#   cache is on for CUDA and NPU on both runners (stage 0). Other platforms
+#   cache is on for CUDA on both runners (stage 0). NPU, the other platforms
 #   and qwen3_omni_moe_mrv2.yaml keep it off.
 #   Duplex keeps V1 in qwen3_omni_duplex.yaml.
 #
@@ -116,7 +116,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
-        enable_prefix_caching: true
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.6
         tensor_parallel_size: 2
         max_num_batched_tokens: 8192

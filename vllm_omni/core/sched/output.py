@@ -85,7 +85,7 @@ class OmniNewRequestData(NewRequestData):
         )
 
 
-@dataclass(kw_only=True)
+@dataclass
 class OmniCachedRequestData(CachedRequestData):
     """Cached request data for omni models with embeddings support.
 

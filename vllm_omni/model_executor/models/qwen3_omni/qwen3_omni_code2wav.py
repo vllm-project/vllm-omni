@@ -282,6 +282,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         codec_left_context_frames: int = 0,
         extra_capture_sizes: Iterable[int] = (),
         streaming_batch_sizes: Iterable[int] = (),
+        npu_graph_shapes: Iterable[tuple[int, int]] = (),
     ):
         """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav).
 
@@ -291,7 +292,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         captures multi-row graphs for every bucket up to one streaming window
         (chunk + left context); a streaming batch is then decoded as a few
         length groups (``plan_decode_groups``) instead of one eager call
-        padded to its longest row.
+        padded to its longest row. On NPU only ``npu_graph_shapes`` are
+        captured, exactly and before serving; other shapes run eagerly.
         """
         from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
             CUDAGraphDecoderWrapper,
@@ -306,9 +308,16 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             )
 
             prepare_code2wav_graph_runtime()
-            self._cudagraph_wrapper = NPUGraphDecoderWrapper(self, self.config.num_quantizers)
+            shapes = list(npu_graph_shapes)
+            npu_wrapper = NPUGraphDecoderWrapper(self, self.config.num_quantizers)
+            npu_wrapper.warmup(device, shapes)
+            self._cudagraph_wrapper = npu_wrapper
             self._cudagraph_enabled = True
-            logger.info("Code2Wav exact-shape NPUGraph enabled (capture on first use, up to 32 shapes).")
+            logger.info(
+                "Code2Wav NPUGraph captured %d exact shapes before serving: %s; other shapes run eagerly.",
+                len(shapes),
+                shapes,
+            )
             return
         if device.type != "cuda":
             logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)

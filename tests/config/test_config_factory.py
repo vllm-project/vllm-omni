@@ -1720,7 +1720,7 @@ stages:
             expect_v2,
             expect_v2,
         ]
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is expect_v2
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
 
         duplex = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
@@ -2102,8 +2102,7 @@ stages:
         ("yaml_name", "platform", "enabled"),
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
-            ("qwen3_omni_moe.yaml", "npu", True),
-            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("rocm", "xpu", "musa")),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
