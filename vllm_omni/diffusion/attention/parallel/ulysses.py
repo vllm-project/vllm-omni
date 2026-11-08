@@ -269,6 +269,63 @@ class UlyssesParallelAttention:
     def name(self) -> str:
         return "ulysses"
 
+    @property
+    def use_sync(self) -> bool:
+        """True when every all-to-all is followed by a host barrier."""
+        return self._use_sync
+
+    @property
+    def ulysses_world_size(self) -> int:
+        return self._sp_group.ulysses_world_size
+
+    def plan_head_overlap(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        requested_groups: int,
+    ) -> int:
+        """Return the head-group count to pipeline, or 0 for the plain path.
+
+        Splitting the QKV all-to-all along the head axis only reproduces the
+        single-collective result when each group's head count is a multiple of
+        the Ulysses world size -- the head scatter needs that divisibility.
+        Everything the plain path folds into the collective (joint tensors, the
+        VSA gate, per-call host barriers, the fused permute kernel) would have
+        to be split alongside, so those shapes are rejected here and fall
+        through to the composed path.
+        """
+        if requested_groups <= 1:
+            return 0
+        if self._use_sync:
+            # A host barrier per group serializes the pipeline it exists to build.
+            return 0
+        world_size = max(self._sp_group.ulysses_world_size, 1)
+        if _a2a_permute_enabled(self._ulysses_a2a_permute, self._scatter_idx, self._gather_idx, world_size):
+            return 0
+        if get_ulysses_mode(default="strict") == "advanced_uaa":
+            # UAA recovers the per-rank sequence lengths with a host-syncing
+            # all_gather unless the lengths are already known equal. Per group
+            # that would put a device-to-host stall on every slice, which is
+            # strictly worse than the serial all-to-all this replaces.
+            if not (is_forward_context_available() and get_forward_context().sp_rank_local_seq_lens_equal):
+                return 0
+        if key.shape[2] != query.shape[2] or value.shape[2] != query.shape[2]:
+            # GQA would need the KV heads re-grouped per slice.
+            return 0
+        if attn_metadata is not None:
+            if attn_metadata.joint_query is not None:
+                return 0
+            if "gate_compress" in attn_metadata.extra:
+                return 0
+        heads = int(query.shape[2])
+        if requested_groups > heads or heads % requested_groups:
+            return 0
+        if (heads // requested_groups) % world_size:
+            return 0
+        return requested_groups
+
     def pre_attention(
         self,
         query: torch.Tensor,
