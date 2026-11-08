@@ -1568,7 +1568,10 @@ async def test_reattached_slot_fails_the_sessions_reserved_on_it() -> None:
 
         await orchestrator._on_replica_added(0, reserved, restarted)
 
-        assert (0, reserved) in set(placement.snapshot()["unavailable"])
+        # The replacement process is healthy, so the slot stays eligible for new
+        # sessions; only the reservations that referenced the old state are gone.
+        assert (0, reserved) not in set(placement.snapshot()["unavailable"])
+        assert SESSION_ID not in placement.snapshot()["sessions"]
     finally:
         await orchestrator.session_manager.shutdown()
 

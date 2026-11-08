@@ -12,6 +12,7 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
@@ -131,7 +132,7 @@ class MembershipController:
             # A failing handler must not cost the remaining requests their cleanup.
             try:
                 outcome = self._replica_removed_callback(stage_id, replica_id)
-                if asyncio.iscoroutine(outcome):
+                if inspect.isawaitable(outcome):
                     await outcome
             except Exception:
                 logger.exception(

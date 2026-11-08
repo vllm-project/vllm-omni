@@ -181,17 +181,29 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             )
         await super()._handle_dead_replica(stage_id, replica_id, error, failed_request_id=failed_request_id)
 
-    async def _fail_reserved_sessions(self, stage_id: int, replica_id: int, *, reason: str) -> None:
-        """Mark a replica unavailable and fail the sessions reserved on it."""
+    async def _fail_reserved_sessions(
+        self, stage_id: int, replica_id: int, *, reason: str, replica_is_gone: bool
+    ) -> None:
+        """Fail the sessions reserved on a replica.
+
+        ``replica_is_gone`` separates the two cases. A replica that left the pool
+        is marked unavailable and evicted, exactly as ``_handle_dead_replica``
+        does. A slot taken over by a restarted process is *not* marked
+        unavailable: the process is healthy and must stay eligible for new
+        sessions, but the reservations on it reference state that is gone.
+        """
         placement = self.replica_placement
         if placement is None:
             return
-        try:
-            affected = placement.mark_unavailable(stage_id, replica_id)
-        except ValueError:
-            # A replica outside the declared topology holds no reservation.
-            return
-        self.stage_pools[stage_id].evict_replica(replica_id)
+        if replica_is_gone:
+            try:
+                affected = placement.mark_unavailable(stage_id, replica_id)
+            except ValueError:
+                # A replica outside the declared topology holds no reservation.
+                return
+            self.stage_pools[stage_id].evict_replica(replica_id)
+        else:
+            affected = placement.drop_reservations(stage_id, replica_id)
         if affected:
             await self.session_manager.fail_sessions(sorted(affected), reason=reason)
 
@@ -208,6 +220,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_id,
             replica_id,
             reason=f"Stage-{stage_id} replica-{replica_id} left the pool",
+            replica_is_gone=True,
         )
 
     async def _on_replica_added(self, stage_id: int, replica_id: int, client: Any) -> None:
@@ -219,6 +232,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_id,
             replica_id,
             reason=f"Stage-{stage_id} replica-{replica_id} was restarted; session state is gone",
+            replica_is_gone=False,
         )
 
     def _on_stage_submitted(

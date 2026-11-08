@@ -183,6 +183,20 @@ class DuplexReplicaPlacement:
             self._reserved[replica] -= 1
             self._owners[replica].remove(session_id)
 
+    def drop_reservations(self, stage_id: int, replica_id: int) -> set[str]:
+        """Release every session reserved on a replica, keeping it usable.
+
+        Used when the process behind a slot is replaced: the reservations it held
+        point at state that no longer exists, but the slot itself is healthy and
+        must stay eligible for new sessions -- unlike ``mark_unavailable``, this
+        does not exclude it from ``reserve``.
+        """
+        replica = (stage_id, replica_id)
+        affected = set(self._owners.get(replica, ()))
+        for session_id in affected:
+            self.release(session_id)
+        return affected
+
     def route(self, session_id: str, stage_id: int) -> int:
         reservation = self._sessions.get(session_id)
         if reservation is None:
