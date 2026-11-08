@@ -364,3 +364,41 @@ def test_fused_tail_matches_eager_at_the_parameter_edges(top_k, top_p):
     kept_eager = torch.isfinite(eager)
     assert torch.equal(kept_fused, kept_eager)
     assert torch.equal(fused[kept_fused], eager[kept_eager])
+
+
+def _tied_logits(name: str) -> torch.Tensor:
+    """One B=1 row whose finite logits contain exact ties."""
+    vocab = tcs.VOCAB_SIZE
+    logits = torch.full((1, vocab), -20.0, device=_device())
+    if name == "all_tied":
+        logits[0, :25] = 0.0
+    elif name == "partial_tie":
+        logits[0, :10] = 1.0
+        logits[0, 10:25] = torch.linspace(0.5, 0.1, 15, device=_device())
+    else:  # pragma: no cover - guards the caller below
+        raise AssertionError(name)
+    return logits
+
+
+@pytest.mark.parametrize("top_p", [0.5, 0.85, 1.0])
+@pytest.mark.parametrize("name", ["all_tied", "partial_tie"])
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_keeps_a_valid_distribution_on_tied_logits(name, top_p):
+    """Tied finite logits must keep the eager support, not collapse to all ``-inf``.
+
+    ``smaller`` used to sum strictly-smaller candidates only, so 25 equal logits
+    with ``top_p=0.85`` left every candidate at ``smaller == 0`` and the kernel
+    returned a row without support, whose softmax is NaN.
+    """
+    logits = _tied_logits(name)
+    fused = tcs._topk_topp_fused(logits.clone(), 25, top_p)
+    assert fused is not None
+    kept = torch.isfinite(fused)
+    assert bool(kept.any()), f"{name}/{top_p}: fused mask has no support"
+    probs = torch.softmax(fused, dim=-1)
+    assert not bool(torch.isnan(probs).any()), f"{name}/{top_p}: softmax is NaN"
+    assert torch.allclose(probs.sum(-1), torch.ones(1, device=probs.device), atol=1e-5)
+    eager = _eager_top_k_top_p(logits, 25, top_p)
+    kept_eager = torch.isfinite(eager)
+    assert torch.equal(kept, kept_eager), f"{name}/{top_p}: support differs from eager"
+    assert torch.equal(fused[kept], eager[kept_eager]), f"{name}/{top_p}: logits differ"

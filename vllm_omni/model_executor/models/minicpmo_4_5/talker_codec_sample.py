@@ -148,9 +148,12 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         evaluated on the top-k-filtered distribution. The largest candidate
         is never removed (total mass 1 > 1 - top_p for top_p < 1), so the
         eager guard ``remove[..., -1:] = False`` holds by construction.
-        Ties among finite values cannot arise from continuous model logits;
-        ``-inf`` top-k padding candidates carry zero prob and sort before every
-        finite value, so both paths always remove them.
+        Ties are ordered by candidate index, matching the ascending cumsum the
+        eager path takes over ``torch.sort``: inside a tie group the cumsum is
+        the strict prefix plus ``k`` copies of the (equal) ``q``, so a member's
+        fate depends only on its position within the group. ``-inf`` top-k
+        padding candidates carry zero prob and sort before every finite value,
+        so both paths always remove them.
 
         ``out`` arrives pre-filled with ``-inf`` from the caller and the kernel
         only scatters the kept candidates: filling and scattering from the same
@@ -171,7 +174,14 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         vi = tl.reshape(v, (KP, 1))
         vj = tl.reshape(v, (1, KP))
         qj = tl.reshape(q, (1, KP))
-        smaller = tl.sum(tl.where(vj < vi, qj, 0.0), axis=1)
+        # Equal candidates accumulate too, in index order. A strictly-less
+        # prefix leaves a tie group at ``smaller == 0``, and 25 equal candidates
+        # with ``top_p=0.85`` would then lose every member and return an all
+        # ``-inf`` row, while the eager cumsum keeps a prefix of the group.
+        ii = tl.reshape(offs, (KP, 1))
+        jj = tl.reshape(offs, (1, KP))
+        before = (vj < vi) | ((vj == vi) & (jj < ii))
+        smaller = tl.sum(tl.where(before, qj, 0.0), axis=1)
         keep = cand & ((smaller + q) > (1.0 - top_p))
         gids = tl.load(idx_ptr + offs, mask=cand, other=0)
         tl.store(out_ptr + gids, v, mask=keep)
