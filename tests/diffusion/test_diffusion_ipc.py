@@ -496,8 +496,9 @@ def test_d2h_pinned_failure_falls_back_to_pageable(monkeypatch):
     handle = _tensor_to_shm(x, stream, created=[])
 
     assert attempts == [True]
+    # _tensor_from_shm consumes the segment (opens, reads and unlinks it), so
+    # no separate unlink is needed here.
     restored = _tensor_from_shm(handle)
-    _unpack_if_shm_handle(handle)
     assert torch.equal(restored, x.float())
 
 
@@ -518,6 +519,7 @@ def test_d2h_uses_pinned_buffer_when_available(monkeypatch):
     handle = _tensor_to_shm(x, stream, created=[])
 
     assert attempts == [True]
+    # _tensor_from_shm consumes the segment (opens, reads and unlinks it), so
+    # no separate unlink is needed here.
     restored = _tensor_from_shm(handle)
-    _unpack_if_shm_handle(handle)
     assert torch.equal(restored, x.float())
