@@ -23,6 +23,7 @@ MAX_VIDEO_INPUT_BYTES: Final = 50 * 1024 * 1024
 MAX_AUDIO_INPUT_BYTES: Final = 15 * 1024 * 1024
 MEDIA_DOWNLOAD_TIMEOUT_S: Final = 60.0
 _READ_CHUNK_SIZE: Final = 64 * 1024
+_MAX_REDIRECTS: Final = 20
 
 
 class MediaInputTooLargeError(InvalidInputReferenceError):
@@ -83,15 +84,17 @@ async def download_media_bytes(
 
     ``Content-Length`` is checked before the body is read. Responses without a
     trustworthy length are counted incrementally, so chunked and streaming
-    responses cannot exceed ``max_bytes``. The request advertises identity
-    encoding and rejects non-identity responses before HTTPX can decompress
-    them, so compressed payloads cannot bypass the limit.
+    responses cannot exceed ``max_bytes``. Redirects are followed one at a
+    time so an intermediate response body is never read or decompressed. The
+    request advertises identity encoding and rejects non-identity final
+    responses before HTTPX can decompress them, so compressed payloads cannot
+    bypass the limit.
 
     Args:
         url: HTTP(S) media URL.
         max_bytes: Maximum number of decoded response bytes permitted.
         source: User-facing input name for error messages.
-        follow_redirects: Whether HTTPX should follow redirects.
+        follow_redirects: Whether to follow redirects one at a time.
         timeout_s: Total time permitted for connection and body download.
 
     Returns:
@@ -109,32 +112,55 @@ async def download_media_bytes(
 
     try:
         async with asyncio.timeout(timeout_s):
-            async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=follow_redirects) as client:
-                async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as response:
-                    response.raise_for_status()
-                    content_encoding = response.headers.get("content-encoding", "").strip().lower()
-                    if content_encoding and content_encoding != "identity":
-                        raise InvalidInputReferenceError(f"Invalid {source}: compressed responses are not supported.")
+            async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
+                current_url = url
+                redirect_count = 0
+                while True:
+                    async with client.stream(
+                        "GET",
+                        current_url,
+                        headers={"Accept-Encoding": "identity"},
+                    ) as response:
+                        if response.has_redirect_location:
+                            if not follow_redirects:
+                                response.raise_for_status()
+                            if redirect_count >= _MAX_REDIRECTS:
+                                raise httpx.TooManyRedirects(
+                                    f"Exceeded {_MAX_REDIRECTS} redirects.",
+                                    request=response.request,
+                                )
+                            current_url = response.url.join(response.headers["location"])
+                            redirect_count += 1
+                            continue
 
-                    content_length = response.headers.get("content-length")
-                    if content_length is not None:
-                        try:
-                            declared_length = int(content_length)
-                        except ValueError:
-                            declared_length = None
-                        if declared_length is not None and declared_length > max_bytes:
-                            raise MediaInputTooLargeError(
-                                f"Invalid {source}: response exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
+                        response.raise_for_status()
+                        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+                        if content_encoding and content_encoding != "identity":
+                            raise InvalidInputReferenceError(
+                                f"Invalid {source}: compressed responses are not supported."
                             )
 
-                    payload = bytearray()
-                    async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
-                        if len(payload) + len(chunk) > max_bytes:
-                            raise MediaInputTooLargeError(
-                                f"Invalid {source}: response exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
-                            )
-                        payload.extend(chunk)
-                    return bytes(payload)
+                        content_length = response.headers.get("content-length")
+                        if content_length is not None:
+                            try:
+                                declared_length = int(content_length)
+                            except ValueError:
+                                declared_length = None
+                            if declared_length is not None and declared_length > max_bytes:
+                                raise MediaInputTooLargeError(
+                                    f"Invalid {source}: response exceeds the "
+                                    f"{max_bytes // (1024 * 1024)} MiB size limit."
+                                )
+
+                        payload = bytearray()
+                        async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
+                            if len(payload) + len(chunk) > max_bytes:
+                                raise MediaInputTooLargeError(
+                                    f"Invalid {source}: response exceeds the "
+                                    f"{max_bytes // (1024 * 1024)} MiB size limit."
+                                )
+                            payload.extend(chunk)
+                        return bytes(payload)
     except TimeoutError as exc:
         raise MediaInputTimeoutError(f"Invalid {source}: download exceeded the {timeout_s:g}s time limit.") from exc
 

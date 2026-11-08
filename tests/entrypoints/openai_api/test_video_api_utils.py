@@ -72,7 +72,33 @@ async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
     assert image.size == (2, 1)
     assert image.mode == "RGB"
     assert requested_paths == ["/redirect.png", "/image.png"]
-    assert client_kwargs == [{"timeout": 60, "follow_redirects": True}]
+    assert client_kwargs == [{"timeout": 60, "follow_redirects": False}]
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_does_not_read_redirect_response_body(monkeypatch):
+    redirect_stream = _ChunkedStream([b"not-a-gzip-body"])
+
+    def _handler(request):
+        if request.url.path == "/redirect.png":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "/image.png",
+                    "content-encoding": "gzip",
+                    "content-length": str(video_api_utils.MAX_IMAGE_INPUT_BYTES + 1),
+                },
+                stream=redirect_stream,
+            )
+        return httpx.Response(200, content=_png_bytes(), headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, [])
+
+    image = await video_api_utils.decode_image_url("https://example.com/redirect.png")
+
+    assert image.size == (2, 1)
+    assert not redirect_stream.started
 
 
 @pytest.mark.asyncio
