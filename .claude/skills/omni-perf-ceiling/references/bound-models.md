@@ -78,8 +78,9 @@ single-batch latency is the binding term.
 
 ## Per-stage physical bounds
 
-Measure device peaks on the target GPU (`scripts/measure_peaks.py`); do not
-use data-sheet numbers.
+Measure device peaks on the target device (`scripts/measure_peaks.py`); do not
+use data-sheet numbers, and do not reuse peaks measured on another
+accelerator. See [npu-ceiling.md](npu-ceiling.md) for the Ascend variant.
 
 Autoregressive decode at batch `B` is bandwidth bound while
 `B * flops_per_token / bytes_per_step` stays below the device's
@@ -101,8 +102,13 @@ g_compute >= flops_per_audio_second / peak_flops(dtype)
 
 Count FLOPs with the torch profiler (`with_flops`) on that stage only, or
 analytically from layer shapes, sampling steps and CFG duplication. Use the
-peak for the dtype that actually runs (TF32 versus IEEE FP32 differs by an
-order of magnitude on many GPUs).
+peak for the dtype that actually runs; reduced-precision float32 (TF32 on
+CUDA, HF32 on Ascend) is a different peak from IEEE FP32.
+
+That spread is device-specific: bf16 is about 15x IEEE fp32 on an L20X and
+about 3.4x on a 910B1. A stage a CUDA ledger flags as precision bound can
+already sit near its roofline on Ascend, so recompute the term instead of
+carrying the conclusion across.
 
 ## Reading the ledger
 

@@ -1,6 +1,6 @@
 ---
 name: omni-perf-ceiling
-description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF or first-audio latency at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured, configuration-envelope, and physical-bound numbers with a per-stage headroom ledger. Use `omni-perf-opt` afterwards to implement optimizations.
+description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF or first-audio latency at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured, configuration-envelope, and physical-bound numbers with a per-stage headroom ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
 ---
 
 # Omni Performance Ceiling
@@ -29,7 +29,10 @@ In addition, fix:
   (sum of generation time over sum of audio). They differ under load.
 - Output mode: streaming chunks or a single final audio. Streaming adds
   first-chunk work; compare engines only within one mode.
-- GPU budget: one shared device, or one device per stage.
+- Device budget: one shared device, or one device per stage.
+- Accelerator: CUDA GPU or Ascend NPU. On Ascend read
+  [references/npu-ceiling.md](references/npu-ceiling.md) first; the MPS lever
+  and per-process SM attribution are not available there.
 - Whether numerics-changing levers (TF32, FP16 CFM, quantization) are inside
   the envelope. Default: report them in a separate column.
 
@@ -65,8 +68,9 @@ Do not use one model for both. Derivations:
 
 3. **Measure the cells.** Warm up with at least `C` requests, then run
    `10 x C` (minimum 128) prompts per cell with `--print-stage`,
-   `--save-result --save-detailed`, and GPU utilisation sampling
-   (`nvidia-smi --query-gpu=utilization.gpu -lms 500`). Keep profilers off.
+   `--save-result --save-detailed`, and device utilisation sampling
+   (`nvidia-smi --query-gpu=utilization.gpu -lms 500`, or `npu-smi info watch`
+   on Ascend). Keep profilers off.
 
 4. **Build the ledger.** Run
    `python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py`
@@ -76,11 +80,12 @@ Do not use one model for both. Derivations:
    did not hold concurrency (ramp, failures, or too few prompts); fix that
    before reading anything else.
 
-5. **Attribute GPU time per stage.** Pick one:
+5. **Attribute device time per stage.** Pick one:
    - one device per stage (`*_3gpu.yaml`): per-device utilisation is the
      stage's `g_i` directly;
-   - one shared device with MPS disabled (`platforms.cuda.cuda_mps: false`)
-     and `nvidia-smi pmon -s u`: per-process SM share;
+   - CUDA only: one shared device with MPS disabled
+     (`platforms.cuda.cuda_mps: false`) and `nvidia-smi pmon -s u`, giving
+     per-process SM share. Ascend has no per-process AI Core counter;
    - stage isolation microbenchmarks at the target batch.
    Experiment recipes:
    [references/ceiling-experiments.md](references/ceiling-experiments.md).
@@ -91,7 +96,7 @@ Do not use one model for both. Derivations:
    run-to-run variance (`omni-perf-opt` quality gate) for the envelope to
    count.
 
-7. **Compute bounds.** Run `scripts/measure_peaks.py` on the target GPU for
+7. **Compute bounds.** Run `scripts/measure_peaks.py` on the target device for
    memory bandwidth and dense matmul throughput. Bound autoregressive decode
    by bytes read per step, compute stages by FLOPs per audio second (torch
    profiler `with_flops` on that stage, or analytic counts). State which
@@ -114,6 +119,9 @@ Do not use one model for both. Derivations:
   RTF from low-concurrency runs, or the reverse.
 - A cell whose throughput is still rising with concurrency is not saturated;
   its aggregate RTF floor is the next cell's, not this one's.
+- A ceiling belongs to one accelerator. Bounds scale with that device's
+  measured peaks and the envelope with the levers it actually has, so never
+  carry a CUDA ceiling, or a CUDA lever's delta, to Ascend or back.
 - The best configuration can differ per cell (a latency-optimized stage at
   concurrency 1 can saturate first at high concurrency). Report the envelope
   configuration next to each cell instead of one "best" profile.
@@ -158,8 +166,11 @@ Do not use one model for both. Derivations:
   capacity models, Little's law, roofline bounds for decode and compute
   stages
 - [references/ceiling-experiments.md](references/ceiling-experiments.md):
-  admission overlays, per-stage GPU attribution, envelope sweeps, peak
+  admission overlays, per-stage device attribution, envelope sweeps, peak
   measurement
+- [references/npu-ceiling.md](references/npu-ceiling.md): what the method keeps
+  on Ascend NPU, what MPS and pmon are replaced by, reservation and
+  `npu-smi` sampling, and how the bound terms shift
 - `omni-perf-opt`: measurement protocol, quality gate, optimization levers
 - `.claude/skills/vllm-omni/references/models/`: per-model stage maps and
   deploy YAMLs

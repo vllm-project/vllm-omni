@@ -4,17 +4,23 @@
 
 """Build a performance-ceiling ledger from `vllm bench serve --omni` cells.
 
-Each ``--cell`` is ``NAME=RESULT_JSON[:BENCH_LOG[:GPU_CSV]]``:
+Each ``--cell`` is ``NAME=RESULT_JSON[:BENCH_LOG[:UTIL]]``:
 
 - RESULT_JSON: ``--save-result`` output of one concurrency cell.
 - BENCH_LOG: stdout of the same run with ``--print-stage`` (stage timing).
-- GPU_CSV: ``nvidia-smi --query-gpu=timestamp,utilization.gpu,... --format=csv``
-  sampled on the serving device during the run.
+- UTIL: device utilisation sampled on the serving device during the run, either
+  ``nvidia-smi --query-gpu=timestamp,utilization.gpu,... --format=csv`` or
+  ``npu-smi info watch -s abmn``. The format is detected from the header.
 
-``--pmon NAME=PMON_TXT:SERVER_LOG`` attributes the cell's GPU busy share to
-stages from ``nvidia-smi pmon -s u`` samples (MPS off), mapping PIDs to stages
-through ``StageEngineCoreProc_stage<N>`` lines in the server log. Samples are
-trimmed to the span between the first and last non-idle sample.
+Per-stage attribution, in order of preference:
+
+- ``--stage-util NAME=STAGE:UTIL``: one device per stage, one sample file per
+  device. Works on both CUDA and Ascend.
+- ``--pmon NAME=PMON_TXT:SERVER_LOG``: CUDA only. Attributes the cell's busy
+  share from ``nvidia-smi pmon -s u`` samples (MPS off), mapping PIDs to stages
+  through ``StageEngineCoreProc_stage<N>`` lines in the server log. Samples are
+  trimmed to the span between the first and last non-idle sample. Ascend has no
+  per-process AI Core counter, so use ``--stage-util`` there.
 
 Optional physical bounds need ``--peaks`` (``measure_peaks.py`` output):
 
@@ -36,6 +42,8 @@ import regex as re
 STAGE_HEADER = re.compile(r"=+\s*Stage (\d+) \(([^)]*)\)\s*=+")
 STAGE_GEN_MEAN = re.compile(r"Mean stage_gen_time \(ms\):\s+([\d.]+)")
 STAGE_PID = re.compile(r"StageEngineCoreProc_stage(\d+)_replica\d+ pid=(\d+)")
+NPU_COLUMN = re.compile(r"[A-Za-z][A-Za-z0-9 _]*\([^)]*\)")
+SMI_TIME_PREFIX = re.compile(r"\d{4}/\d{2}/\d{2} ")
 
 
 def stage_pids(server_log: Path) -> dict[int, str]:
@@ -100,26 +108,62 @@ def _parse_smi_time(raw: str) -> dt.datetime | None:
     return None
 
 
-def gpu_busy_share(csv_path: Path, window: tuple[dt.datetime, dt.datetime] | None) -> tuple[float, int]:
-    """Mean utilization.gpu share inside the measured window, and sample count."""
-    values = []
-    with csv_path.open() as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        if not header:
-            return 0.0, 0
-        util_col = next(i for i, name in enumerate(header) if "utilization.gpu" in name)
-        for row in reader:
-            if len(row) <= util_col:
-                continue
-            ts = _parse_smi_time(row[0])
-            if window and ts and not (window[0] <= ts <= window[1]):
-                continue
-            try:
-                values.append(float(row[util_col].strip().rstrip("%").strip()) / 100.0)
-            except ValueError:
-                continue
-    return (sum(values) / len(values) if values else 0.0), len(values)
+def _nvidia_smi_samples(lines: list[str], column: str) -> list[tuple[dt.datetime | None, float]]:
+    reader = csv.reader(lines)
+    header = next(reader, None)
+    if not header:
+        return []
+    util_col = next(i for i, name in enumerate(header) if column in name)
+    samples = []
+    for row in reader:
+        if len(row) <= util_col:
+            continue
+        try:
+            value = float(row[util_col].strip().rstrip("%").strip()) / 100.0
+        except ValueError:
+            continue
+        samples.append((_parse_smi_time(row[0]), value))
+    return samples
+
+
+def _npu_smi_samples(lines: list[str], column: str) -> list[tuple[dt.datetime | None, float]]:
+    """Parse ``npu-smi info watch`` output, with or without a prepended timestamp.
+
+    ``npu-smi`` emits fixed-width columns and no timestamp, so a sampler that
+    prefixes ``<date>, `` per line (see references/npu-ceiling.md) is what makes
+    window trimming possible; without it every sample is kept.
+    """
+    header_index = next(i for i, line in enumerate(lines) if "AI Core(%)" in line)
+    header = lines[header_index]
+    has_time = bool(SMI_TIME_PREFIX.match(header))
+    # Columns are fixed width and some names contain a space ("AI Core(%)"), so
+    # names are read as "<label>(<unit>)" runs rather than split on whitespace.
+    names = NPU_COLUMN.findall(header)
+    util_col = names.index(column)
+    samples = []
+    for line in lines[header_index + 1 :]:
+        stamp, _, payload = line.partition(", ") if has_time else ("", "", line)
+        fields = payload.split()
+        if len(fields) <= util_col or not fields[util_col].replace(".", "", 1).isdigit():
+            continue
+        samples.append((_parse_smi_time(stamp) if has_time else None, float(fields[util_col]) / 100.0))
+    return samples
+
+
+def device_busy_share(
+    util_path: Path, window: tuple[dt.datetime, dt.datetime] | None, npu_column: str
+) -> tuple[float, int, bool]:
+    """Mean busy share in the measured window, sample count, and whether trimmed."""
+    lines = util_path.read_text(errors="replace").splitlines()
+    if any("AI Core(%)" in line for line in lines):
+        samples = _npu_smi_samples(lines, npu_column)
+    else:
+        samples = _nvidia_smi_samples(lines, "utilization.gpu")
+    # Untimestamped samples cannot be trimmed; the sampler must already be
+    # scoped to the measured window.
+    trimmed = bool(window) and bool(samples) and all(ts is not None for ts, _ in samples)
+    values = [v for ts, v in samples if not (window and ts) or window[0] <= ts <= window[1]]
+    return (sum(values) / len(values) if values else 0.0), len(values), trimmed
 
 
 def measured_window(result: dict) -> tuple[dt.datetime, dt.datetime] | None:
@@ -133,12 +177,17 @@ def measured_window(result: dict) -> tuple[dt.datetime, dt.datetime] | None:
     return start + slack, end - slack
 
 
+def measured_window_of(cell: dict) -> tuple[dt.datetime, dt.datetime] | None:
+    window = cell.get("window")
+    return None if window is None else (dt.datetime.fromisoformat(window[0]), dt.datetime.fromisoformat(window[1]))
+
+
 def percentile(result: dict, name: str, p: float) -> float | None:
     value = result.get(f"p{p:g}_{name}")
     return None if value is None else float(value)
 
 
-def analyse_cell(name: str, spec: str) -> dict:
+def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
     parts = spec.split(":")
     result = json.loads(Path(parts[0]).read_text())
     concurrency = int(result["max_concurrency"])
@@ -146,8 +195,10 @@ def analyse_cell(name: str, spec: str) -> dict:
     mean_audio_s = float(result["mean_audio_duration_s"])
     mean_e2el_s = float(result["mean_e2el_ms"]) / 1000.0
 
+    window = measured_window(result)
     cell = {
         "name": name,
+        "window": None if window is None else [window[0].isoformat(), window[1].isoformat()],
         "concurrency": concurrency,
         "completed": result["completed"],
         "failed": result["failed"],
@@ -170,9 +221,10 @@ def analyse_cell(name: str, spec: str) -> dict:
         cell["stage_gen_ms"] = stage_ms
         cell["stage_share_of_audio"] = {k: v / (mean_audio_s * 1000.0) for k, v in stage_ms.items()}
     if len(parts) > 2 and parts[2]:
-        busy, samples = gpu_busy_share(Path(parts[2]), measured_window(result))
+        busy, samples, trimmed = device_busy_share(Path(parts[2]), window, npu_column)
         cell["gpu_busy_share"] = busy
         cell["gpu_samples"] = samples
+        cell["util_trimmed"] = trimmed
         if throughput and busy:
             # GPU-seconds per audio-second across all stages on this device.
             cell["g_total"] = busy / throughput
@@ -236,6 +288,15 @@ def render(cells: list[dict]) -> str:
                 g = c["pmon_stage_g"][stage]
                 lines.append(f"  stage {stage}: SM share {share:.2f}, g {g:.4f} GPU-s per audio-s")
             lines.append(f"  idle {max(0.0, 1.0 - sum(shares.values())):.2f}")
+        if shares := c.get("stage_device_share"):
+            lines.append(f"Per-stage busy share and g_i from one device per stage ({c['name']}):")
+            for stage, share in shares.items():
+                g = c["stage_device_g"][stage]
+                lines.append(f"  stage {stage}: busy {share:.2f}, g {g:.4f} device-s per audio-s")
+            binding = max(shares, key=shares.get)
+            lines.append(
+                f"  binding stage {binding}; X bound by it: {1.0 / c['stage_device_g'][binding]:.2f} audio-s/s"
+            )
         if bounds := c.get("g_bound"):
             lines.append(f"Physical g bound at batch {c['concurrency']} ({c['name']}):")
             for stage, g in bounds.items():
@@ -248,6 +309,12 @@ def render(cells: list[dict]) -> str:
         if abs(c.get("little_residual") or 0.0) > 0.10
     ]
     warnings += [f"{c['name']}: {c['failed']} failed requests" for c in cells if c["failed"]]
+    warnings += [
+        f"{c['name']}: utilisation samples carry no timestamp; busy share covers the whole sample "
+        "file, not the measured window"
+        for c in cells
+        if c.get("gpu_samples") and not c.get("util_trimmed")
+    ]
     for c in cells:
         pmon_sum = sum((c.get("pmon_stage_share") or {}).values())
         busy = c.get("gpu_busy_share")
@@ -264,8 +331,16 @@ def render(cells: list[dict]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--cell", action="append", required=True, help="NAME=RESULT_JSON[:BENCH_LOG[:GPU_CSV]]")
-    parser.add_argument("--pmon", action="append", default=[], help="NAME=PMON_TXT:SERVER_LOG")
+    parser.add_argument("--cell", action="append", required=True, help="NAME=RESULT_JSON[:BENCH_LOG[:UTIL]]")
+    parser.add_argument("--pmon", action="append", default=[], help="NAME=PMON_TXT:SERVER_LOG (CUDA only)")
+    parser.add_argument(
+        "--stage-util", action="append", default=[], help="NAME=STAGE:UTIL, one device per stage (CUDA or Ascend)"
+    )
+    parser.add_argument(
+        "--npu-util-column",
+        default="AI Core(%)",
+        help="column read from npu-smi info watch output; 'NPU Util(%%)' is the closer analogue of utilization.gpu",
+    )
     parser.add_argument("--peaks", help="measure_peaks.py JSON")
     parser.add_argument("--decode-bound", action="append", default=[], help="NAME=WEIGHT_GIB,TOKENS_PER_AUDIO_S")
     parser.add_argument("--compute-bound", action="append", default=[], help="NAME=TFLOP_PER_AUDIO_S,DTYPE")
@@ -276,8 +351,17 @@ def main() -> int:
     cells = []
     for raw in args.cell:
         name, _, spec = raw.partition("=")
-        cells.append(analyse_cell(name, spec))
+        cells.append(analyse_cell(name, spec, args.npu_util_column))
     by_name = {c["name"]: c for c in cells}
+    for raw in args.stage_util:
+        name, _, spec = raw.partition("=")
+        stage, _, util_path = spec.partition(":")
+        if not util_path:
+            parser.error(f"--stage-util {raw!r} must be NAME=STAGE:UTIL")
+        cell = by_name[name]
+        busy, _, _ = device_busy_share(Path(util_path), measured_window_of(cell), args.npu_util_column)
+        cell.setdefault("stage_device_share", {})[stage] = busy
+        cell.setdefault("stage_device_g", {})[stage] = busy / cell["audio_throughput"]
     for raw in args.pmon:
         name, _, spec = raw.partition("=")
         pmon_path, server_log = spec.split(":")

@@ -70,7 +70,8 @@ self-check.
 - [`omni-perf-ceiling`](omni-perf-ceiling/SKILL.md): estimates the best
   reachable omni serving performance (for example AUDIO_RTF at a target
   concurrency) from measured cells, a configuration envelope, and per-stage
-  physical bounds, and reports where the remaining headroom sits
+  physical bounds, and reports where the remaining headroom sits, on CUDA GPUs
+  or Ascend NPUs
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, simplification opportunities,
   accuracy and performance claims, and merge readiness

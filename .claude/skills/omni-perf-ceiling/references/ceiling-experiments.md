@@ -50,12 +50,16 @@ vllm bench serve --omni --host 127.0.0.1 --port $PORT --model $MODEL \
   > $OUT/c${C}_bench.log 2>&1
 ```
 
-Sample the serving GPU for the whole measured window:
+Sample the serving device for the whole measured window:
 
 ```bash
 nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used \
   --format=csv -lms 500 > $OUT/c${C}_gpu.csv &
 ```
+
+On Ascend use `npu-smi info watch` with a timestamp prefix instead; the command
+and its caveats are in [npu-ceiling.md](npu-ceiling.md). `ceiling_report.py`
+detects either format from the header.
 
 Build the ledger:
 
@@ -93,10 +97,12 @@ audio) belong to the workload freeze; copy them from the model profile.
 Choose the cheapest method that the hardware allows.
 
 1. **One device per stage** (`*_3gpu.yaml` or equivalent overlay). Sample
-   every device; each device's busy share is its stage's `u_i`. Inter-device
-   transfer differs from the shared-device deployment, so use this for
-   `g_i`, not for the shared-device RTF.
-2. **Shared device, MPS off.** Add `platforms: {cuda: {cuda_mps: false}}` to
+   every device and pass one file per stage as
+   `--stage-util c64=<stage>:$OUT/c64_dev<n>.csv`; each device's busy share is
+   that stage's `u_i`. Inter-device transfer differs from the shared-device
+   deployment, so use this for `g_i`, not for the shared-device RTF. This is
+   the only method that yields absolute `g_i` on Ascend.
+2. **Shared device, MPS off (CUDA only).** Add `platforms: {cuda: {cuda_mps: false}}` to
    the overlay so each stage process owns its context, then sample
    `nvidia-smi pmon -i $GPU -s u -d 1`, then pass
    `--pmon c64=$OUT/c64_pmon.txt:$OUT/server.log` to `ceiling_report.py`.
@@ -126,7 +132,7 @@ One configuration lever per column, same commit and workload:
 | Runner | `model_runner: v2` per stage, or the model's MRv2 profile |
 | Graph coverage | graph batch limits, graph budgets, capture sizes |
 | Micro-batching | per-stage micro-batch or chunk scheduling knobs |
-| Co-location | `cuda_mps`, `gpu_memory_utilization`, placement |
+| Co-location | `cuda_mps` (CUDA only), `gpu_memory_utilization`, placement |
 | Replicas | replica profiles for the binding stage |
 
 Keep the best value per cell. Numerics-changing levers go in a separate
@@ -138,8 +144,10 @@ column with their quality delta.
 python .claude/skills/omni-perf-ceiling/scripts/measure_peaks.py --json $OUT/peaks.json
 ```
 
-Run it on an otherwise idle device. It reports copy bandwidth and dense
-matmul throughput for BF16, FP16, TF32 and IEEE FP32.
+Run it on an otherwise idle device. It reports copy bandwidth and dense matmul
+throughput for BF16, FP16, IEEE FP32, and the device's reduced-precision FP32
+mode: TF32 on CUDA, HF32 on Ascend. `--device` forces a backend when both are
+importable.
 
 ## Pitfalls
 
