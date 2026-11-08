@@ -271,6 +271,14 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
             model,
             "--enforce-eager",
             "--enable-expert-parallel",
+            # Cold MI300 expert-parallel weight loading has crossed the 600s
+            # script defaults. Keep the per-stage bound finite and leave enough
+            # overall headroom for orchestrator startup without changing the
+            # nightly job deadline.
+            "--stage-init-timeout",
+            "900",
+            "--init-timeout",
+            "1800",
         ],
         check=True,
     )
