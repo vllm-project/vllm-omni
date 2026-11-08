@@ -46,7 +46,7 @@ For the exact historical instrumentation patch, retrieve `per-request-timing.pat
 
 **Status: measurement matrix complete; S0 acceptance is pending the BF16 correctness decision.**
 
-This report records the S0 result for the fixed source revision and instrumentation patch below. It documents a negative optimization result: the tested inline/single-stage direction did not show a reproducible benefit, so no extra scheduler or buffer-reuse complexity is proposed here.
+This report records measurements for the fixed source revision and instrumentation patch below. They are historical observations, not measurements of this PR head. The timing decomposition does not directly isolate model execution from engine overhead, so it cannot establish that non-executor overhead is below a threshold or rule out an optimization direction.
 
 ## Reproduction identity
 
@@ -87,12 +87,12 @@ Warm p50 in ms; the value is the median of three independent runs.
 | queue wait | 0.394 | 0.369 |
 | stage submission | 0.600 | 0.594 |
 | scheduler wait | 0.233 | 0.239 |
-| executor run | 331.900 | 365.198 |
+| stage generation residual (derived) | 331.900 | 365.198 |
 | output routing | 0.074 | 0.073 |
 | response handling | 0.380 | 0.368 |
 | stage 0 generation total | 332.143 | 365.435 |
 
-Non-executor engine work is about 1.5–1.7 ms. No stable queue/scheduler/routing segment above 10 ms was observed. `mp` was faster than `uni` in this workload; this does not support landing an inline/direct path or additional allocation-reuse complexity for S0.
+The residual is computed as `stage_gen_time_ms - scheduler_wait_ms`; it is not a direct model-only or executor timer. The separately measured model-only loop is not paired with the same engine request. These measurements therefore do not support a quantitative claim about total non-model overhead or a conclusion that a particular optimization is unnecessary. `mp` was faster than `uni` in this historical workload, but that comparison alone does not establish the cause.
 
 ## Cross-GPU comparison
 

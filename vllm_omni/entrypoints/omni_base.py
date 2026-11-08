@@ -662,9 +662,9 @@ class OmniBase(PDDisaggregationMixin):
                 pipeline_timings = {}
                 _m.pipeline_timings = pipeline_timings
             pipeline_timings["scheduler_wait_ms"] = scheduler_wait_ms
-            pipeline_timings["executor_run_ms"] = max(float(_m.stage_gen_time_ms) - scheduler_wait_ms, 0.0)
+            pipeline_timings["stage_gen_residual_ms"] = max(float(_m.stage_gen_time_ms) - scheduler_wait_ms, 0.0)
             stage_durations["scheduler_wait_ms"] = scheduler_wait_ms
-            stage_durations["executor_run_ms"] = pipeline_timings["executor_run_ms"]
+            stage_durations["stage_gen_residual_ms"] = pipeline_timings["stage_gen_residual_ms"]
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
