@@ -2296,20 +2296,28 @@ def test_invalidate_addr_returns_pinned_requests_too() -> None:
     assert pool.get_bound_replica_id("pinned-turn") == 1
 
 
-def test_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
-    """Between the hub marking a replica DOWN and the watcher detaching it, a pin
-    must not be dispatched: ``is_replica_available`` is only the local view."""
+def _pinned_pool_with_hub_status(status: ReplicaStatus) -> StagePool:
     addr = "tcp://192.0.2.10:5001"
     pool = StagePool(0, [FakeStageClient(), _addressed_client(addr)])
     pool.add_client(addr, pool.clients[1], replica_id=1)
     pool.attach_hub(
         SimpleNamespace(
-            get_replicas_for_stage=lambda stage_id: SimpleNamespace(
-                replicas=[SimpleNamespace(input_addr=addr, status="DOWN")]
-            )
+            get_replicas_for_stage=lambda stage_id: SimpleNamespace(replicas=[_routing_replica(addr, status)])
         )
     )
+    return pool
 
+
+def test_pinned_binding_accepts_a_replica_the_hub_reports_up() -> None:
+    """The hub check must not reject a healthy replica: it is on every submission."""
+    pool = _pinned_pool_with_hub_status(ReplicaStatus.UP)
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+
+
+def test_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
+    """Between the hub marking a replica DOWN and the watcher detaching it, a pin
+    must not be dispatched: ``is_replica_available`` is only the local view."""
+    pool = _pinned_pool_with_hub_status(ReplicaStatus.DOWN)
     with pytest.raises(StageUnavailableError, match="is not UP in the hub"):
         pool.bind_request_to_replica("pinned", 1)
 
