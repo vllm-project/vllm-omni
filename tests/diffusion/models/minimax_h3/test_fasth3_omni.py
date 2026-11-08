@@ -168,6 +168,20 @@ def test_omni_serving_rejects_unavailable_tile128_provider(monkeypatch, device, 
         FastH3OmniCheckpointSpec().check_serving_contract(partition="ref2va", od_config=config)
 
 
+def test_omni_serving_resolves_its_base_with_bf16_whatever_the_dtype(mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import fasth3_checkpoint
+
+    resolve = mocker.patch.object(fasth3_checkpoint, "resolve_block_sparse_provider", return_value="flashinfer")
+    config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        dtype=torch.float16,
+    )
+    FastH3OmniCheckpointSpec().check_serving_contract(partition="ref2va", od_config=config)
+    # H3's attention operands are BF16 whatever --dtype is, and tile128 requires BF16.
+    assert resolve.call_args.args[3] == torch.bfloat16
+    assert resolve.call_args.kwargs["block_size"] == 128
+
+
 def test_omni_serving_checks_flashinfer_on_the_worker_device(monkeypatch, mocker):
     from vllm_omni.diffusion.attention.ops import block_sparse, flashinfer_block_sparse
 

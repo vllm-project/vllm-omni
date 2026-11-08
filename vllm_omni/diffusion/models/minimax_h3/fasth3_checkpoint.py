@@ -30,6 +30,10 @@ FASTH3_V2_BASE_SCHEDULE = DMD2SigmaSchedule.from_positions((0.999, 0.874, 0.749,
 # The public V2 export omits provenance.json. This is the Omni adapter's native
 # VAE compatibility pin, not a claim about the release's training provenance.
 FASTH3_V2_NATIVE_VAE_REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
+# H3 builds its attention operands in BF16 whatever --dtype is: the DiT builds its hidden stream in BF16, and every
+# op on the way to attention keeps that dtype. The runtime resolves the sparse provider with the query dtype, so the
+# startup checks use BF16 too.
+_H3_ATTENTION_DTYPE = torch.bfloat16
 
 
 def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, AttentionSpec]]:
@@ -57,8 +61,21 @@ def _resolve_vsa_provider(spec: AttentionSpec, dtype: torch.dtype, tile_size: in
     )
     if provider == "fastvideo" and tile_size == 64:
         # At tile64 the resolver returns fastvideo unchecked when it is explicit or when auto runs off CUDA;
-        # the profile's step imports this kernel.
+        # the attention step imports this kernel.
         require_fastvideo_sparse()
+
+
+def check_base_vsa_provider(spec: AttentionSpec | None, *, name: str, tile_size: int) -> None:
+    """Resolve the DiT's base VSA provider on this worker's device and tile.
+
+    H3 skips warm-up, so a provider the device can't run would otherwise fail the first request.
+    """
+    if spec is None or str(spec.backend).upper() != "FASTVIDEO_VSA":
+        return
+    try:
+        _resolve_vsa_provider(spec, _H3_ATTENTION_DTYPE, tile_size)
+    except (ImportError, ValueError) as exc:
+        raise ValueError(f"{name} cannot run its base attention: {exc}") from exc
 
 
 def check_scheduled_vsa_providers(od_config: OmniDiffusionConfig, *, name: str, tile_size: int) -> None:
@@ -69,8 +86,7 @@ def check_scheduled_vsa_providers(od_config: OmniDiffusionConfig, *, name: str, 
     """
     for profile, spec in _scheduled_vsa_specs(od_config):
         try:
-            # The runtime resolves with the query dtype, which H3 fixes to BF16 whatever --dtype is.
-            _resolve_vsa_provider(spec, torch.bfloat16, tile_size)
+            _resolve_vsa_provider(spec, _H3_ATTENTION_DTYPE, tile_size)
         except (ImportError, ValueError) as exc:
             raise ValueError(f"{name} cannot run attention schedule profile {profile!r}: {exc}") from exc
 
@@ -168,7 +184,7 @@ class FastH3CheckpointSpec:
         parallel = od_config.parallel_config
         if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
-        self._check_base_vsa_provider(attention, od_config)
+        check_base_vsa_provider(attention, name=self.name, tile_size=self.vsa_tile_size)
         for name, spec in _scheduled_vsa_specs(od_config):
             if spec.fastvideo_vsa_topk is not None:
                 raise ValueError(
@@ -176,9 +192,6 @@ class FastH3CheckpointSpec:
                     f"override from attention schedule profile {name!r}"
                 )
         check_scheduled_vsa_providers(od_config, name=self.name, tile_size=self.vsa_tile_size)
-
-    def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
-        """V2 does not check its base provider at startup; an unavailable one fails the first request."""
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, *, step_execution: bool = False) -> None:
         if step_execution:
@@ -221,9 +234,6 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
     vsa_ref_keep_rate: ClassVar[float] = 0.1
     vsa_sparsity: float = 0.9
     base_revision: str = ""
-
-    def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
-        _resolve_vsa_provider(attention, od_config.dtype, self.vsa_tile_size)
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, object]) -> FastH3OmniCheckpointSpec:

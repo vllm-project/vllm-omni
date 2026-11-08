@@ -157,8 +157,8 @@ errors on the job record rather than the creation response.
   gate or a VSA base, and gated FastH3 layers accept only VSA.
   FastH3 checkpoints pin VSA sparsity, so their profiles cannot set
   `fastvideo_vsa_topk`. FastH3 checkpoints and fused FastH3 VSA deltas check
-  each VSA profile's provider and precision on the device at startup, because
-  H3 skips warm-up.
+  the provider and precision of the base and each VSA profile on the device at
+  startup, because H3 skips warm-up.
 - TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
   layer is explicitly ignored.
 - Regional `torch.compile` stays enabled: H3 selects the profile and runs
