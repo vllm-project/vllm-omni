@@ -69,6 +69,9 @@ class PhononModelState(OmniModelState):
         self.audio_output = PhononAudioOutput(None, None, [], 0)
         self._rows = []
         self.condition = model.flow_lm.conditioning()
+        from .prompt import load_default_voice
+
+        self.voice = load_default_voice(vllm_config.model_config, model.flow_lm)
 
     def sample_determined_tokens(self, batch, sampler):
         """Return determined protocol tokens when standard sampling features are inactive."""
@@ -135,12 +138,11 @@ class PhononModelState(OmniModelState):
         if "phonon_text_ids" in buffer:
             from .prompt import build_prompt
 
-            voice = buffer["phonon_voice"]
             buffer["phonon_prompt_embeds"] = build_prompt(
                 self.model.flow_lm,
                 buffer["phonon_text_ids"],
-                voice,
-                project_voice=bool(buffer.get("phonon_project_voice", True)),
+                self.voice,
+                project_voice=False,
                 conditioning=self.condition,
             )
 

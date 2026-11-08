@@ -16,8 +16,13 @@ vllm serve gradium/phonon-31m-en --omni \
 ```
 
 Use `/v1/audio/speech` with `voice="default"` and English text. The adapter
-prepares the official SentencePiece text IDs and precomputed speaker latents.
-The model checks the speaker file's `sig@epoch` against `embeddings_ext`.
+initializes the official SentencePiece tokenizer once and encodes request text.
+Currently, only the checkpoint's default voice embedding from
+`default-voice.safetensors` is supported. The worker loads and projects it once
+during model-state initialization, then reuses the GPU tensor across requests.
+The adapter reads its shape to determine prompt length. Requests carry text IDs
+and tail-frame settings. The model checks the speaker file's `sig@epoch`
+against `embeddings_ext`.
 Whitespace, capitalization and sentence-final punctuation are normalized.
 Full official English number/date/currency normalization is not ported.
 
@@ -25,7 +30,7 @@ Full official English number/date/currency normalization is not ported.
 
 AR uses vLLM paged attention and runner CUDA graphs. The stateless LSD flow
 head has a separate main-stream graph. Its normalized latent supplies the
-next AR embedding through `model_intermediate_buffer`.
+next AR embedding through the model state's persistent feedback buffer.
 
 Mimi consumes a denormalized latent through its quantizer output projection,
 depthwise upsampling, two Transformer layers and SEANet decoder. Mimi owns
@@ -51,8 +56,9 @@ emitted immediately, including the final frame.
 - The initial implementation supports one concurrent request (`max_num_seqs=1`)
   and tensor parallelism size 1.
 - Requests cannot be recompute-preempted; preemption fails the request.
-- Only the default pretrained speaker is supported. Online voice cloning and
-  additional checkpoint variants are not supported.
+- Only the checkpoint's default voice embedding (`voice="default"`) is supported.
+  Custom speaker embeddings, online voice cloning and additional checkpoint
+  variants are not supported.
 
 ## Default-voice benchmark
 

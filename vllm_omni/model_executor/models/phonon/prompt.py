@@ -9,6 +9,19 @@ from transformers.utils.hub import cached_file
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
 
+def voice_layout(file):
+    # Official formats are emb [T, D] / [1, T, D] and
+    # speaker_wavs [C, T] / [1, C, T], which requires projection.
+    name = "emb" if "emb" in file.keys() else "speaker_wavs"
+    if name not in file.keys():
+        raise ValueError("Phonon voice requires emb [T, D] or speaker_wavs [C, T], optionally batched")
+    shape = file.get_slice(name).get_shape()
+    if len(shape) not in (2, 3) or (len(shape) == 3 and shape[0] != 1):
+        raise ValueError(f"Invalid Phonon {name} shape {shape}: expected a 2D tensor or batch size 1")
+    project = name == "speaker_wavs"
+    return name, shape[-1] if project else shape[-2], project
+
+
 def load_voice(model_path, config, revision=None):
     filename = cached_file(model_path, "default-voice.safetensors", revision=revision)
     with safe_open(filename, framework="pt", device="cpu") as file:
@@ -17,9 +30,19 @@ def load_voice(model_path, config, revision=None):
         identifier = f"{metadata.get('sig')}@{metadata.get('epoch')}"
         if allowed and identifier not in allowed:
             raise ValueError(f"Voice metadata does not match embeddings_ext: {metadata}")
-        keys = list(file.keys())
-        name = "speaker_wavs" if "speaker_wavs" in keys else "emb"
-        return file.get_tensor(name), name == "speaker_wavs"
+        name, _, project = voice_layout(file)
+        return file.get_tensor(name), project
+
+
+@torch.inference_mode()
+def load_default_voice(model_config, lm):
+    voice, project = load_voice(
+        model_config.model, model_config.hf_config.to_dict(), getattr(model_config, "revision", None)
+    )
+    voice = to_device_nonblocking(voice.to(dtype=lm.bos_emb.dtype), lm.bos_emb.device)
+    if voice.ndim == 3:
+        voice = voice.squeeze(0)
+    return lm.speaker_projection(voice.transpose(0, 1)) if project else voice
 
 
 def prepare_text(text):
