@@ -2309,31 +2309,61 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen3-TTS Perf" not in text
 
 
-def test_minicpmo_accuracy_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("MiniCPM-o 4.5 Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    commands = "\n".join(step["commands"])
-    assert "full_model and omni and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert step["env"]["SEED_TTS_WER_EVAL"] == "1"
-    assert step["env"]["SEED_TTS_SIM_EVAL"] == "1"
-    assert "SEED_TTS_EVAL_DEVICE" not in commands
-    assert "SEED_TTS_UTMOS_EVAL" not in commands
-    assert "Expected exactly $${#nodes[@]} MiniCPM-o 4.5 accuracy nodes" in commands
-    for node in (
-        "test_minicpmo_4_5_daily_omni_accuracy_bench",
-        "test_minicpmo_4_5_seed_tts_wer_bench",
-    ):
-        assert node in commands
+def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
+    group = _find_group(":full_moon: MiniCPM-o 4.5 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
+    jobs: tuple[tuple[str, str, str, str, str, dict[str, str]], ...] = (
+        (
+            "MiniCPM-o 4.5 Daily-Omni Accuracy",
+            "test_minicpmo_4_5_daily_omni_accuracy_bench",
+            "artifacts/rocm-minicpmo-daily-omni-accuracy/**/*",
+            "ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR",
+            "Expected exactly one MiniCPM-o 4.5 Daily-Omni accuracy node",
+            {},
+        ),
+        (
+            "MiniCPM-o 4.5 Seed-TTS Accuracy",
+            "test_minicpmo_4_5_seed_tts_wer_bench",
+            "artifacts/rocm-minicpmo-seed-tts-accuracy/**/*",
+            "ROCM_MINICPMO_SEED_ACCURACY_ARTIFACT_DIR",
+            "Expected exactly one MiniCPM-o 4.5 Seed-TTS accuracy node",
+            {
+                "SEED_TTS_WER_EVAL": "1",
+                "SEED_TTS_SIM_EVAL": "1",
+                "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
+            },
+        ),
+    )
+
+    assert [step["label"] for step in group["steps"]] == [job[0] for job in jobs]
+    all_nodes = {job[1] for job in jobs}
+    for step, (label, node, artifact, artifact_env, collection_guard, env) in zip(group["steps"], jobs, strict=True):
+        commands = "\n".join(step["commands"])
+        assert step["label"] == label
+        assert step["grade"] == "NonBlocking"
+        assert step["agent_pool"] == "mi300_1"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 180
+        assert step["source_file_dependencies"] == "omni_minicpmo_4_5_accuracy"
+        assert step["artifact_paths"] == [artifact]
+        assert step.get("env", {}) == env
+        assert "full_model and omni and rocm and MI325 and cards_1" in commands
+        assert "--run-level full_model" in commands
+        assert commands.count("--collect-only") == 1
+        assert "exit 5" in commands
+        assert "pytest.xml" in commands
+        assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+        assert artifact_env in commands
+        assert collection_guard in commands
+        assert commands.count(node) == 2
+        for other_node in all_nodes - {node}:
+            assert other_node not in commands
+        assert "SEED_TTS_EVAL_DEVICE" not in commands
+        assert "SEED_TTS_UTMOS_EVAL" not in commands
+
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
-        assert "MiniCPM-o 4.5 Accuracy" not in text
+        for label, *_ in jobs:
+            assert label not in text
 
 
 def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
