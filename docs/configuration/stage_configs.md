@@ -160,8 +160,11 @@ hold their slots, and closing sessions release them after cleanup completes.
 When no group has capacity, opening a session fails with the retryable
 `resource_exhausted` error containing `replica_capacity_exhausted`.
 
-`least_sessions` supports local single-host deployments only; coordinator or
-distributed routing is rejected at startup. A per-replica cap above `1` also
+`least_sessions` supports a local single-host deployment, and a distributed one
+(coordinator, hub or load-balancer routing) when `replica_groups` declares the
+stage replica topology; a distributed deployment without `replica_groups` is
+rejected at startup, because the replica count includes slots left by replicas
+that already detached. A per-replica cap above `1` also
 requires the model plugin to support concurrent sessions on one replica; use
 `1` for plugins without that capability, including VoiceChat. A failed replica
 closes all sessions assigned to it, including idle sessions. Those sessions

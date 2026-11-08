@@ -575,7 +575,10 @@ independent real-model verification.
 ## Session-aware replica placement
 
 The opt-in `duplex_session.replica_policy: least_sessions` policy places each
-session on a local replica group mapping every stage to a replica. The
+session on a replica group mapping every stage to a replica. In a local
+deployment the group is local; in a distributed one its stages may live on
+different hosts, and the deployment declares the groups explicitly through
+`duplex_session.replica_groups`. The
 orchestrator owns a separate session reservation ledger; StagePool's request
 bindings continue to describe submitted requests only. Admission reserves a
 group synchronously after taking the global admission slot. The group must
@@ -624,7 +627,9 @@ have the same owner, and `K` must not exceed the group count. The global session
 budget is divided by floor/remainder across frontends and bounded by each
 frontend's owned replica capacity; budgets do not move between frontends.
 The reservation lifetime, strict stage pins and worker caps apply within each
-owner's groups. With `K=1`, routing and admission behavior are unchanged.
+owner's groups. With `K=1`, routing and admission behavior are unchanged. A distributed
+deployment is the `K=1` case: every group belongs to the single frontend, and a
+group's stages may be spread across hosts.
 
 The multi-frontend WebSocket guard allows only `least_sessions` and plugins
 without session resume. Credentials, attachment state and replay journals
