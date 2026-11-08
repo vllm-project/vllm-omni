@@ -9,11 +9,15 @@ import importlib.metadata
 import sys
 
 
+def _is_omni_invocation(argv: list[str]) -> bool:
+    """Return whether the CLI should dispatch to the Omni subcommands."""
+    return "--omni" in argv or argv[1:2] == ["doctor"]
+
+
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    # Check if --omni flag is present. `doctor` is a read-only Omni subcommand
-    # and is reachable without the serve-time flag.
-    if "--omni" not in sys.argv and sys.argv[1:2] != ["doctor"]:
+    # `doctor` is read-only and is reachable without the serve-time --omni flag.
+    if not _is_omni_invocation(sys.argv):
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()
