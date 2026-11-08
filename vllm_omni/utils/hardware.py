@@ -61,6 +61,11 @@ def _apple_memory_gb() -> float | None:
         return None
 
 
+def _mps_available() -> bool:
+    mps = getattr(torch.backends, "mps", None)
+    return mps is not None and bool(mps.is_available())
+
+
 def _cpu_memory_gb() -> float | None:
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
@@ -94,7 +99,7 @@ def detect_hardware() -> HardwareInfo:
         )
 
     is_apple = sys.platform == "darwin" and platform.machine() == "arm64"
-    if is_apple:
+    if is_apple and _mps_available():
         return HardwareInfo(
             backend="mps",
             device=platform.processor() or "Apple Silicon",

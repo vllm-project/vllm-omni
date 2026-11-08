@@ -49,6 +49,7 @@ def test_detect_hardware_apple_silicon(monkeypatch):
     monkeypatch.setattr(hardware.sys, "platform", "darwin")
     monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(hardware.platform, "processor", lambda: "arm")
+    monkeypatch.setattr(hardware, "_mps_available", lambda: True)
     monkeypatch.setattr(hardware, "_apple_memory_gb", lambda: 16.0)
 
     info = hardware.detect_hardware()
@@ -56,6 +57,22 @@ def test_detect_hardware_apple_silicon(monkeypatch):
     assert info.backend == "mps"
     assert info.memory_gb == 16.0
     assert info.detail == "unified memory"
+
+
+def test_detect_hardware_apple_without_mps_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(hardware.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(hardware, "_nvidia_smi", lambda: None)
+    monkeypatch.setattr(hardware.sys, "platform", "darwin")
+    monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(hardware.platform, "processor", lambda: "arm")
+    monkeypatch.setattr(hardware, "_mps_available", lambda: False)
+    monkeypatch.setattr(hardware, "_cpu_memory_gb", lambda: 16.0)
+
+    info = hardware.detect_hardware()
+
+    assert info.backend == "cpu"
+    assert info.memory_gb == 16.0
+    assert info.detail == "no accelerator detected"
 
 
 def test_detect_hardware_cpu_fallback(monkeypatch):
