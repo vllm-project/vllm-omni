@@ -3924,6 +3924,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if not sampling_params_list:
                 sampling_params_list = [resolve_diffusion_sampling_params(default_sampling_params_list)]
             for gen_params in sampling_params_list:
+                if not isinstance(gen_params, OmniDiffusionSamplingParams):
+                    continue
                 self._set_if_supported(
                     gen_params,
                     height=height,

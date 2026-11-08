@@ -1056,6 +1056,52 @@ def test_diffusion_chat_inherits_engine_defaults(
         assert default.extra_args == {"stage_default": index, "pipeline_option": "keep"}
 
 
+def test_diffusion_chat_overrides_leave_non_diffusion_params_unchanged(
+    mock_engine_client, mocker: MockerFixture
+) -> None:
+    llm_defaults = SamplingParams(seed=7)
+    diffusion_defaults = OmniDiffusionSamplingParams(extra_args={"stage_default": "keep"})
+    captured: list[SamplingParams | OmniDiffusionSamplingParams] = []
+
+    async def generate(**kwargs):
+        captured.extend(kwargs["sampling_params_list"])
+        if False:
+            yield None
+
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_model_name = "test"
+    server._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
+        default_sampling_params_list=[llm_defaults, diffusion_defaults],
+        generate=generate,
+    )
+    server._extract_diffusion_prompt_and_media = mocker.Mock(
+        return_value=("cat", [], ["reference.mp4"], ["reference.wav"])
+    )
+    asyncio.run(
+        server._create_diffusion_chat_completion(
+            ChatCompletionRequest(model="test", messages=[]),
+            normalized_extra_args={"pipeline_option": "override"},
+            diffusion_request_args={"guidance_scale": 0.0, "seed": 0, "num_inference_steps": 4},
+        )
+    )
+    assert len(captured) == 2
+    assert captured[0].seed == 7
+    assert captured[0].extra_args is None
+    assert not hasattr(captured[0], "num_inference_steps")
+    assert captured[1].seed == 0
+    assert captured[1].guidance_scale == 0.0
+    assert captured[1].num_inference_steps == 4
+    assert captured[1].extra_args == {
+        "stage_default": "keep",
+        "pipeline_option": "override",
+        "video_path": "reference.mp4",
+        "audio_path": "reference.wav",
+    }
+    assert llm_defaults.extra_args is None
+    assert diffusion_defaults.extra_args == {"stage_default": "keep"}
+
+
 @pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
 def test_multistage_diffusion_preserves_each_stage_defaults(
     mock_engine_client, mocker: MockerFixture, explicit: bool
