@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from vllm.entrypoints.cli.types import CLISubcommand
 
@@ -33,6 +34,30 @@ def render_doctor(info: HardwareInfo) -> str:
     return "\n".join(lines)
 
 
+def doctor_payload(info: HardwareInfo) -> dict[str, object]:
+    """Machine-readable form of the doctor report."""
+    minimum = min(minimum_gb for _, minimum_gb, _ in DOCUMENTED_RECIPES)
+    meets_minimum = info.memory_gb is not None and info.memory_gb >= minimum
+    return {
+        "hardware": {
+            "backend": info.backend,
+            "device": info.device,
+            "memory_gb": info.memory_gb,
+            "os_name": info.os_name,
+            "detail": info.detail,
+        },
+        "recipes": [
+            {"name": name, "minimum_gb": minimum_gb, "source": source}
+            for name, minimum_gb, source in DOCUMENTED_RECIPES
+        ],
+        "tier": "meets_documented_minimum" if meets_minimum else "not_yet_measured",
+    }
+
+
+def render_doctor_json(info: HardwareInfo) -> str:
+    return json.dumps(doctor_payload(info), indent=2, sort_keys=True)
+
+
 class DoctorCommand(CLISubcommand):
     """The `doctor` subcommand for the vLLM CLI."""
 
@@ -40,14 +65,20 @@ class DoctorCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
-        del args
-        print(render_doctor(detect_hardware()))
+        info = detect_hardware()
+        print(render_doctor_json(info) if args.json else render_doctor(info))
 
     def subparser_init(self, subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
-        return subparsers.add_parser(
+        parser = subparsers.add_parser(
             self.name,
             help="Print the current machine's acceleration tier and documented recipe minimums.",
         )
+        parser.add_argument(
+            "--json",
+            action="store_true",
+            help="Emit the report as JSON.",
+        )
+        return parser
 
 
 def cmd_init() -> list[CLISubcommand]:

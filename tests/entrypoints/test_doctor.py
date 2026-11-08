@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
+
 import pytest
 
-from vllm_omni.entrypoints.cli.doctor import render_doctor
+from vllm_omni.entrypoints.cli.doctor import render_doctor, render_doctor_json
 from vllm_omni.entrypoints.cli.main import _is_omni_invocation
 from vllm_omni.utils.hardware import HardwareInfo
 
@@ -46,3 +48,20 @@ def test_render_doctor_meets_documented_minimum():
 
     assert "meets the documented minimum" in output
     assert "end-to-end run is still required" in output
+
+
+def test_render_doctor_json_is_machine_readable():
+    info = HardwareInfo(
+        backend="cuda",
+        device="NVIDIA RTX 4060 Laptop GPU",
+        memory_gb=8.0,
+        os_name="Linux-WSL2",
+        detail="CUDA capability 8.9",
+    )
+
+    payload = json.loads(render_doctor_json(info))
+
+    assert payload["hardware"]["backend"] == "cuda"
+    assert payload["hardware"]["memory_gb"] == 8.0
+    assert payload["tier"] == "not_yet_measured"
+    assert payload["recipes"]
