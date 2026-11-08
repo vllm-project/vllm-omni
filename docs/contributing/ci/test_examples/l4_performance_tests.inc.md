@@ -4,8 +4,7 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 
 | Model type | Runner | Example JSON files |
 | ---------- | ------ | ------------------ |
-| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
-| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json` (CUDA only), `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
+| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` in `mark`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
 | Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, … |
 | Diffusion (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) | `run_benchmark.py` | `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_lingbot_video_vllm_omni.json`, … |
@@ -21,7 +20,7 @@ Diffusion-script cases are detected by `is_diffusion_perf_config()`: presence of
 
 #### Running perf cases
 
-Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects. For example, the nightly object in `test_qwen3_omni_async_chunk.json` declares both H100 and A3, while its `slow` weekly object is CUDA-only; there is no NPU weekly counterpart. Use `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
+Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly and platform-specific case objects. For example, the object in `test_qwen3_omni_async_chunk.json` declares H100, B200, A3, and MI325. Use `-m "H100 and full_model"` or `-m "npu"` to select the intended platform.
 
 ```JSON
 {
@@ -58,35 +57,6 @@ Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk sca
 ```
 
 #### Parameter Explanation
-
-##### Qwen3-Omni multi-replica audio baseline recalibration
-
-`test_qwen3_omni_multi_replicas.json` explicitly selects `speaker: "ethan"`
-for all four audio-output workloads. Earlier runs omitted the speaker and
-used Chelsie before the default-voice correction in #8568. Their audio TTFP
-and RTF baselines are not comparable with the fixed Ethan workloads.
-
-The affected H100 `mean_audio_ttfp_ms` and `mean_audio_rtf` baselines are
-temporarily absent pending recalibration; measurements continue to be saved,
-but these metrics have no baseline regression comparison during this period.
-The Thinker TPOT baseline remains in place. Text-only and A3 configurations
-retain their existing baselines.
-
-CI maintainers should restore the audio baselines after the sender snapshot
-optimization associated with #8794 is merged. Run the fixed Ethan workloads
-multiple times on H100, including the concurrency sweep `[8, 16, 24, 32]`
-and the three multimodal-input workloads. Record the tested commit, deployment
-configuration, speaker, request counts, input/output lengths, and the
-variation in latency and audio duration. Review the high-concurrency TTFP
-tail separately before choosing thresholds: changing the voice does not
-resolve sender backlog. Keep restored baseline arrays aligned with the sweep.
-
-```bash
-export BENCHMARK_DIR=tests/dfx/perf/results
-pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json \
-  -m "H100 and slow"
-```
 
 ##### Overview
 
@@ -172,6 +142,13 @@ Examples:
 - Omni/TTS and OpenAI generation endpoints (`/v1/images/*`, `/v1/videos`): `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
 - Remaining diffusion (`run_diffusion_benchmark.py`): one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file
 
+DFX cases with `duplex_eval_accuracy_config` keep intermediate judge inputs in a
+per-test temporary directory under `duplex_eval_response_root`. Pytest teardown
+removes that directory after evaluation, including failed tests and interrupts;
+performance and accuracy summary JSON files remain available. This also applies
+when running the DFX case locally. Direct `vllm bench serve --omni` runs retain
+their normal output behavior.
+
 #### Local commands
 
 ```bash
@@ -187,10 +164,7 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   -m "H100 and B200 and cards_2"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
-  -m "H100 and full_model and not slow"
-pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
-  -m "H100 and full_model and slow"
+  -m "H100 and full_model"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
   -m "npu"

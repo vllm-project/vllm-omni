@@ -59,16 +59,19 @@ def _minimax_h3_keyframe_encode_context(
 
     # Deterministic cuDNN algorithms can still use reduced-precision TF32.
     # On Hopper, TF32 can shift the keyframe latent enough to push I2VA below
-    # the reference accuracy thresholds. Use FP32 convolutions for this
-    # sensitive encode only; preserve the existing math mode elsewhere.
+    # the reference accuracy thresholds. Use FP32 deterministic convolutions
+    # for this sensitive CUDA encode only. MIOpen has no deterministic
+    # algorithm for the MI325 timeline-guide convolution, so applying the
+    # cuDNN policy on ROCm raises ``miopenStatusUnknownError``.
+    deterministic = current_omni_platform.is_cuda()
     allow_tf32 = True
-    if current_omni_platform.is_cuda():
+    if deterministic:
         capability = current_omni_platform.get_device_capability(device.index or 0)
         allow_tf32 = capability is None or capability.major != 9
     with torch.backends.cudnn.flags(
         enabled=True,
         benchmark=False,
-        deterministic=True,
+        deterministic=deterministic,
         allow_tf32=allow_tf32,
     ):
         yield
@@ -260,9 +263,12 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
         backends.cuda.enable_flash_sdp(False)
         backends.cuda.enable_mem_efficient_sdp(False)
         backends.cuda.enable_math_sdp(True)
+        self._jit_executor = torch.jit.optimized_execution(False)
+        self._jit_executor.__enter__()
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        self._jit_executor.__exit__(exc_type, exc, traceback)
         backends = torch.backends
         (
             backends.cuda.matmul.allow_tf32,
@@ -339,6 +345,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        lightvae_decoder_path: str | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -346,6 +353,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        if lightvae_decoder_path is not None and decoder_source is not None:
+            raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -364,6 +373,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "quant_conv"))
+            if lightvae_decoder_path is not None:
+                from .lightvae import install_h3_lite_decoder, read_h3_lite_decoder_checkpoint
+
+                checkpoint = read_h3_lite_decoder_checkpoint(lightvae_decoder_path)
+                install_h3_lite_decoder(self.remote.model, checkpoint, native_config=self.config_dict)
+                logger.info(
+                    "Loaded H3 Lite video decoder: path=%s layers=%d device=%s",
+                    lightvae_decoder_path,
+                    len(checkpoint.kept_layers),
+                    device,
+                )
+                del checkpoint
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
         # weights may be materialized in FP16 because reference decode casts
@@ -978,6 +999,43 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
+    @torch.inference_mode()
+    def encode_control_latents(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Deterministic Fun conditioning: normalized posterior mode, not a sample.
+
+        The native temporal encoder returns the same moments as VideoX-Fun's
+        VAE._encode: per-clip spatial tiling, final-frame padding, token_drop.
+        Its first 24 channels are the diagonal Gaussian mean.
+        Match VideoX-Fun control/inpaint encoding: normalize on-device in FP32,
+        then encode under FP16 autocast rather than the keyframe sampling path.
+        """
+        parameter = next(self.parameters())
+        pixels = pixels.to(device=parameter.device, dtype=torch.float32)
+        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+        previous_parallel = self.model.parallel_tiling
+        if int(getattr(self, "parallel_size", 1)) <= 1:
+            self.model.parallel_tiling = False
+        try:
+            with (
+                self._encoder_tiling_context(int(pixels.shape[-2]), int(pixels.shape[-1])),
+                current_omni_platform.create_autocast_context(
+                    device_type=parameter.device.type,
+                    dtype=torch.float16,
+                    enabled=parameter.device.type != "cpu",
+                ),
+            ):
+                moments = self.model.encode_temporal((pixels - mean) / std)
+        finally:
+            self.model.parallel_tiling = previous_parallel
+        channels = int(self.config_dict["latent_channels"])
+        if moments.shape[1] != 2 * channels:
+            raise ValueError("H3 control encoder must return mean and log-variance channels")
+        latent = moments[:, :channels].float()
+        mean = latent.new_tensor(self.config_dict["latents_mean"]).view(1, channels, 1, 1, 1)
+        std = latent.new_tensor(self.config_dict["latents_std"]).view(1, channels, 1, 1, 1)
+        return (latent - mean) / std
+
     def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
         """Pick the tiling mode a decode of ``latent`` can safely use.
 
@@ -1033,6 +1091,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     # Chunks are reverted through the checkpoint's processor, which
     # denormalizes and clamps into the unit interval.
     chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
+
+    @property
+    def owns_chunk_output(self) -> bool:
+        """Whether this rank publishes frames to the streaming MP4 consumer."""
+        if not self.is_distributed_enabled():
+            return True
+        group = self._native_parallel_state().get("sp_process_group")
+        if group is None:
+            raise RuntimeError("MiniMax-H3 VAE chunk decode has no spatial-parallel group")
+        return dist.get_rank(group) == 0
 
     @torch.inference_mode()
     def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
@@ -1228,7 +1296,10 @@ class MiniMaxH3AudioVAE(nn.Module):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1)
-        waveform = self.remote.decode(latent * std + mean)
+        # The remote decoder's TorchScript activations round differently on
+        # their first (unfused) call; keep every request on the same path.
+        with torch.jit.optimized_execution(False):
+            waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
         return waveform.permute(1, 0, 2).contiguous().float()

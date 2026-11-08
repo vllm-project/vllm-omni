@@ -5,7 +5,7 @@
 - Vendor: m-a-p
 - Model: `m-a-p/SheetSage2` with the `m-a-p/MERT-v2-FullSong` parent
 - Task: recording → ABC score, MIDI and timed music annotations
-- Mode: standalone official Transformers inference; optional YuE2 request export
+- Mode: standalone official Transformers inference, as a CLI or a small HTTP server; optional YuE2 request export
 - Hardware: one NVIDIA H200 (141 GB)
 - Maintainer: [@princepride](https://github.com/princepride)
 
@@ -177,6 +177,42 @@ Use `--yue2-model` to match a custom served model name. The tool does not
 submit the request or set a generation token budget; the server's own
 duration and context limits apply.
 
+### Serve transcription over HTTP
+
+For applications that transcribe uploads on demand, `tools/sheetsage2_serve.py`
+loads the model once and exposes an OpenAI-style transcription endpoint. It
+takes the same loading options as the CLI and runs in the same
+`.venv-sheetsage2` environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv-sheetsage2/bin/python tools/sheetsage2_serve.py \
+  --trust-remote-code --device cuda:0 --served-model-name m-a-p/SheetSage2 \
+  --host 0.0.0.0 --port 8092
+```
+
+Upload a recording; `text` is the ABC score. `melody_only` and `max_seconds`
+are extra form fields matching `--melody-only` and `--max-seconds`:
+
+```bash
+curl --fail-with-body http://localhost:8092/v1/audio/transcriptions \
+  -F file=@reference.wav -F model=m-a-p/SheetSage2 -F melody_only=true
+```
+
+Pass the score to YuE2 as `extra_params.abc`, with `cot=melody` for a
+melody-only score and `cot=full` otherwise. Requests run one at a time on the
+model's device; uploads and upstream annotations are deleted after each
+response. `response_format=text` returns the bare score. Errors use the
+OpenAI error shape:
+
+- 400 for an invalid or missing form field, or a recording FFmpeg cannot decode.
+- 413 for a request body above `--max-upload-mb` (default 200). The limit
+  applies while the body arrives, before it is spooled to disk, including
+  chunked uploads.
+- 500 for a failed score export.
+
+Upstream error details go to the server log, not the response. `GET /health`
+and `GET /v1/models` support readiness checks.
+
 ## Verification
 
 After a successful transcription, set `output` below to its output directory
@@ -209,12 +245,13 @@ Run the CPU CLI contract tests in the repository's normal test
 environment (with pytest and pytest-mock installed):
 
 ```bash
-python -m pytest tests/tools/test_sheetsage2_transcribe.py -m 'core_model and cpu' -q
+python -m pytest tests/tools/test_sheetsage2_transcribe.py tests/tools/test_sheetsage2_serve.py \
+  -m 'core_model and cpu' -q
 ```
 
 These tests cover request construction, loading options, validation and
-failure handling with a mocked backend. They do not measure transcription
-accuracy or generated cover similarity.
+failure handling with a mocked backend, for both the CLI and the server.
+They do not measure transcription accuracy or generated cover similarity.
 
 Local H200 checks with the pinned backend:
 
@@ -226,14 +263,17 @@ Local H200 checks with the pinned backend:
 | Local snapshots, fresh Transformers module cache | Successful offline full-score export |
 | Both generated JSON requests, #7886 adapter at `5cc8acc942e76fa6f12f8b2f2558c2663abc2aa5` | Validation and prompt construction passed (919 / 2,821 prompt tokens) |
 | Full score + new Mandarin lyrics, offline YuE2, `cot=full`, seed 831001, 9,000-frame budget | 241.319 s, 48 kHz stereo WAV; 6,034 generated tokens; `truncated=False` |
+| HTTP server, same 45 s prefix, melody-only | Score identical to the CLI export; 2.8 s per warm request; about 3 GiB on the device |
+| Server score + new Mandarin lyrics, YuE2 over HTTP, `cot=melody`, 1,500-frame budget | 44.16 s MP3, ended before the budget; 14 s end to end |
 
 The offline cover used a 108 BPM Chinese traditional pop style and one H200
 with `--gpu-memory-utilization 0.25`. The saved waveform contained finite
 samples, peak amplitude 0.9501, RMS 0.1232 and no full-scale samples. This is
 one functional run, not an accuracy or performance benchmark. It does not
-establish perceptual equivalence to the recording. HTTP synthesis and
-recordings longer than 300 seconds were not exercised. The local recording,
-lyrics, generated scores and cover audio are not included in the repository.
+establish perceptual equivalence to the recording. The HTTP cover is one
+short functional run with YuE2 served from vLLM-Omni `bec812a5f`; recordings
+longer than 300 seconds were not exercised. The local recording, lyrics,
+generated scores and cover audio are not included in the repository.
 
 ## Notes
 
@@ -253,7 +293,7 @@ lyrics, generated scores and cover audio are not included in the repository.
 
 | Feature | Status |
 | --- | --- |
-| Audio-to-score preprocessing | Official backend; local file input |
-| YuE2 score-conditioned generation | Offline ABC handoff qualified on H200; HTTP request export validated, HTTP synthesis configuration-only |
+| Audio-to-score preprocessing | Official backend; local file input or HTTP upload (`tools/sheetsage2_serve.py`) |
+| YuE2 score-conditioned generation | Offline ABC handoff qualified on H200; HTTP request export validated; one short HTTP cover from a served score |
 | Native Omni inference, continuous batching, TP/PP/SP | Not implemented for SheetSage2 |
 | Streaming transcription or cover audio | Not supported by this tool |
