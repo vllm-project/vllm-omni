@@ -2312,6 +2312,8 @@ def test_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
 
     with pytest.raises(StageUnavailableError, match="is not UP in the hub"):
         pool.bind_request_to_replica("pinned", 1)
+
+
 class _RoutingHub:
     def __init__(self, replicas: list[ReplicaInfo]) -> None:
         self.replicas = replicas

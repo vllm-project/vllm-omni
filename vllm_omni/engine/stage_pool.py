@@ -557,9 +557,7 @@ class StagePool:
         replica_id = self._addr_to_replica_id.get(input_addr)
         if replica_id is not None:
             affected.extend(
-                rid
-                for rid, bound in self._request_bindings.items()
-                if bound == replica_id and rid not in affected
+                rid for rid, bound in self._request_bindings.items() if bound == replica_id and rid not in affected
             )
         return affected
 
