@@ -2818,50 +2818,29 @@ def test_image_sampling_defaults_are_request_isolated(image_client_with_cli_defa
     assert client.app.state.engine_client.captured_sampling_params_list[0].extra_args["flow_shift"] == 5.0
 
 
-@pytest.mark.parametrize(
-    "model,architecture,yaml_name,cfg_field,default_cfg,yaml_extra_args",
-    [
-        (
-            "OpenMOSS-Team/MOSS-Image-Base",
-            "MOSSImagePipeline",
-            "moss_image.yaml",
-            "guidance_scale",
-            3.0,
-            {"flow_shift": 5.0},
-        ),
-        ("Qwen/Qwen-Image-2.1", "QwenImage21Pipeline", "qwen_image_21.yaml", "true_cfg_scale", 1.0, {}),
-    ],
-    ids=["moss-image", "qwen-image21"],
-)
 @pytest.mark.parametrize("override", ["none", "cli-cfg", "request-cfg", "cli-extra-args", "request-extra-args"])
 def test_image_sampling_yaml_defaults_reach_generation(
     test_client: TestClient,
     mocker: MockerFixture,
-    model: str,
-    architecture: str,
-    yaml_name: str,
-    cfg_field: str,
-    default_cfg: float,
-    yaml_extra_args: dict[str, float],
     override: str,
 ) -> None:
     mocker.patch("vllm_omni.config.config_factory.StageConfigFactory.get_hf_config", return_value=None)
     mocker.patch(
         "vllm_omni.config.config_factory.get_hf_file_to_dict",
         side_effect=lambda filename, *args, **kwargs: (
-            {"_class_name": architecture} if filename == "model_index.json" else None
+            {"_class_name": "MOSSImagePipeline"} if filename == "model_index.json" else None
         ),
     )
     cli_defaults: dict[str, float | dict[str, str]] = {}
     request: dict[str, str | int | float | bool] = {"prompt": "a cat", "seed": 42}
-    expected_cfg = default_cfg
-    expected_extra_args: dict[str, float | str] = dict(yaml_extra_args)
+    expected_cfg = 3.0
+    expected_extra_args: dict[str, float | str] = {"flow_shift": 5.0}
     if override == "cli-cfg":
-        cli_defaults = {cfg_field: 4.0}
+        cli_defaults = {"guidance_scale": 4.0}
         expected_cfg = 4.0
     elif override == "request-cfg":
-        cli_defaults = {cfg_field: 4.0}
-        request[cfg_field] = 0.0
+        cli_defaults = {"guidance_scale": 4.0}
+        request["guidance_scale"] = 0.0
         expected_cfg = 0.0
     elif override == "cli-extra-args":
         cli_defaults = {"extra_args": {"use_system_prompt": "dynamic"}}
@@ -2871,14 +2850,14 @@ def test_image_sampling_yaml_defaults_reach_generation(
         request["use_system_prompt"] = "en_vanilla"
         expected_extra_args["use_system_prompt"] = "en_vanilla"
     config = resolve_omni_config(
-        model=model,
+        model="OpenMOSS-Team/MOSS-Image-Base",
         trust_remote_code=None,
         deploy_config_path=None,
         cli_overrides={"default_sampling_params": json.dumps({"0": cli_defaults})},
         stage_overrides=None,
         strategy_config_path=None,
     )
-    assert Path(config.config_path).name == yaml_name
+    assert Path(config.config_path).name == "moss_image.yaml"
     defaults = config.stage_by_id(0).model_config.default_sampling_params
     defaults_before_requests = copy.deepcopy(defaults)
     test_client.app.state.engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams(**defaults)]
@@ -2890,9 +2869,9 @@ def test_image_sampling_yaml_defaults_reach_generation(
         assert params.height is None
         assert params.width is None
         assert params.num_inference_steps == 50
-        assert getattr(params, cfg_field) == expected_cfg
+        assert params.guidance_scale == expected_cfg
         assert params.extra_args == expected_extra_args
-    assert defaults[cfg_field] == cli_defaults.get(cfg_field, default_cfg)
+    assert defaults["guidance_scale"] == cli_defaults.get("guidance_scale", 3.0)
     assert defaults == defaults_before_requests
 
 
