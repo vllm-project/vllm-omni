@@ -165,8 +165,7 @@ def test_a_response_may_not_declare_an_output_format_outside_the_output_set() ->
     assert validate_realtime_response_audio_formats({"output_audio_format": "wav"}) is None
     assert validate_realtime_response_audio_formats({"audio": {"output": {"format": "pcm"}}}) is None
     assert (
-        validate_realtime_response_audio_formats({"response_format": "mp3"})
-        == "Unsupported output_audio_format: mp3"
+        validate_realtime_response_audio_formats({"response_format": "mp3"}) == "Unsupported output_audio_format: mp3"
     )
 
 
