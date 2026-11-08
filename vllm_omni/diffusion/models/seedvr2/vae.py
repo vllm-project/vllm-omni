@@ -95,6 +95,8 @@ class TemporalContext:
 
 
 def _frame_norm_silu(norm: nn.GroupNorm, x: torch.Tensor, context: TemporalContext | None = None) -> torch.Tensor:
+    # Sharded inputs always come with context.spatial (split() runs only when it is set),
+    # so the fused path below only sees unsharded tensors.
     if context is not None and context.spatial is not None:
         return F.silu(context.spatial.normalize(norm, x))
     if x.is_cuda:
