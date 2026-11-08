@@ -154,6 +154,11 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
 
     _supports_tile64_provider = True
 
+    def graph_phase(self, attn_metadata: AttentionMetadata | None) -> int:
+        """VSA-H3 is uncapturable: its routing builds tensors per forward."""
+        del attn_metadata
+        return -1
+
     def _forward_h3(
         self,
         query: torch.Tensor,
