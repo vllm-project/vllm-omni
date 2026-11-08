@@ -262,15 +262,20 @@ platforms:
         # Duplex KV window (window_kv.py) requires prefix caching disabled.
         enable_prefix_caching: false
         compilation_config:
-          # A full decode-step graph keeps in-graph sampling and multi-frame
-          # expansion. The static-shape builder gates its runtime buckets on
-          # the decode graph mode, so PIECEWISE also runs here (K included,
-          # verified on 910B1). This is stage 0 and it ships PIECEWISE; the
-          # K-step's measured RTF win is FULL-only on stage 1, which ships
-          # FULL_DECODE_ONLY below. Stage-0 data point for scale (910B1):
-          # PIECEWISE without K is +75% RTF at 32/1 versus FULL_DECODE_ONLY
-          # with K=8.
-          cudagraph_mode: PIECEWISE
+          # Stage 0 carries no K-step, so nearly every step after prefill is a
+          # uniform decode batch; one whole-step graph replays it without the
+          # per-segment launch/sync cost of piecewise splitting. The static-shape
+          # builder gates its runtime buckets on the decode graph mode, so
+          # FULL_DECODE_ONLY covers those steps. Measured on 910B1 with the
+          # three-stage co-located profile, seed-tts en, mean audio RTF at
+          # 32@1 / 64@4 / 128@8: FULL_DECODE_ONLY 0.2749 / 0.5332 / 0.8346
+          # versus PIECEWISE 0.3008 / 0.5428 / 0.8267, i.e. -8.6% at 32@1,
+          # -1.8% at 64@4 and +0.9% at 128@8, inside this tier's ~2% run-to-run
+          # scatter. FULL_AND_PIECEWISE was measured as well (0.2800 / 0.5354 /
+          # 0.8337): no tier beats this mode and startup grows 20-70 s for the
+          # second graph set, so stage 0 keeps the decode-only graph. Stage 1
+          # below already ships FULL_DECODE_ONLY with the K-step.
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.
