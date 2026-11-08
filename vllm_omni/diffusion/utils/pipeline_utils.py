@@ -91,11 +91,15 @@ def _constructor_missing_fields(pipeline_cls: type) -> tuple[str, ...]:
     for name, parameter in parameters.items():
         if name == "od_config":
             continue
-        if parameter.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        ) and parameter.default is inspect.Parameter.empty:
+        if (
+            parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            and parameter.default is inspect.Parameter.empty
+        ):
             missing.append(f"constructor.{name}")
     return tuple(missing)
 

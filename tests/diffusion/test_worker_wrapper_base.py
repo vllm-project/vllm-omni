@@ -219,9 +219,7 @@ class TestWorkerWrapperBaseInitialization:
                 gpu_id=0,
                 od_config=mock_od_config,
                 base_worker_class=DiffusionWorker,
-                custom_pipeline_args={
-                    "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
-                },
+                custom_pipeline_args={"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"},
             )
 
         assert len(instances) == 1
@@ -933,9 +931,7 @@ class TestCustomPipelineWorkerExtension:
             WorkerWrapperBase(
                 gpu_id=0,
                 od_config=mock_od_config,
-                custom_pipeline_args={
-                    "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
-                },
+                custom_pipeline_args={"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"},
             )
 
         worker.shutdown.assert_called_once_with()
