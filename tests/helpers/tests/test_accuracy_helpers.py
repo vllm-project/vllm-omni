@@ -5,6 +5,7 @@ import json
 import math
 from datetime import datetime
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -15,18 +16,56 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    ("device_name", "profile"),
-    [("NVIDIA H100 80GB HBM3", "H100"), ("NVIDIA B200", "default"), ("Ascend A3", "default")],
+    ("device_name", "device_architecture", "profile"),
+    [
+        ("NVIDIA H100 80GB HBM3", None, "H100"),
+        ("NVIDIA B200", None, "default"),
+        ("Ascend A3", None, "default"),
+        ("AMD Instinct MI300X", "gfx942", "gfx942"),
+    ],
 )
-def test_similarity_thresholds_device_and_default(device_name, profile):
+def test_similarity_thresholds_device_and_default(device_name, device_architecture, profile):
     table = {
         "H100": helpers.SimilarityThresholds(ssim=0.98, psnr=35.0),
+        "gfx942": helpers.SimilarityThresholds(ssim=0.95, psnr=27.0),
         "default": helpers.SimilarityThresholds(ssim=0.99, psnr=40.0),
     }
-    resolved_profile = helpers.resolve_device_profile(device_name, profiles=table)
+    resolved_profile = helpers.resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=table,
+    )
     assert resolved_profile == profile
     assert helpers.resolve_similarity_thresholds(table, resolved_profile) == table[profile]
-    assert helpers.resolve_similarity_thresholds(table, device_name=device_name) == table[profile]
+    assert (
+        helpers.resolve_similarity_thresholds(
+            table,
+            device_name=device_name,
+            device_architecture=device_architecture,
+        )
+        == table[profile]
+    )
+
+
+def test_similarity_thresholds_use_runtime_rocm_architecture(monkeypatch):
+    import vllm_omni.platforms as platforms
+
+    runtime_platform = SimpleNamespace(
+        get_device_name=lambda: "AMD Instinct MI300X",
+        get_torch_device=lambda: "cuda",
+    )
+    device_module = SimpleNamespace(
+        get_device_properties=lambda _device_id: SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-")
+    )
+    monkeypatch.setattr(platforms, "current_omni_platform", runtime_platform)
+    monkeypatch.setattr(helpers.torch, "get_device_module", lambda _device: device_module)
+
+    rocm = helpers.SimilarityThresholds(ssim=0.95, psnr=27.0)
+    default = helpers.SimilarityThresholds(ssim=0.98, psnr=34.6)
+    table = {"gfx942": rocm, "default": default}
+
+    assert helpers.resolve_device_profile(profiles=table) == "gfx942"
+    assert helpers.resolve_similarity_thresholds(table) == rocm
 
 
 def test_similarity_thresholds_require_default():
