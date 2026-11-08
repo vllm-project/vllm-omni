@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import os
 from collections.abc import Callable, Sequence
 
 import torch
@@ -16,13 +15,6 @@ from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.platforms.xpu.patch import apply_patches
 
 logger = init_logger(__name__)
-
-
-# Use the native query; vLLM's XPU custom op reports free=0 in spawned workers.
-torch.accelerator.get_memory_info = lambda device=None: torch.xpu.mem_get_info(device)
-
-# The XPU sampler kernel is broken for omni on the current vLLM; use the native path.
-os.environ.setdefault("VLLM_XPU_USE_SAMPLER_KERNEL", "0")
 
 
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
