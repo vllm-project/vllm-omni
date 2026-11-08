@@ -472,13 +472,14 @@ def _drive_d2h(monkeypatch: pytest.MonkeyPatch, *, pin_error: str | None = None)
             pass
 
     attempts: list[bool] = []
+    real_empty = torch.empty
 
     def fake_empty(shape, dtype=None, pin_memory=False, **kwargs):
         if pin_memory:
             attempts.append(True)
             if pin_error is not None:
                 raise RuntimeError(pin_error)
-        return torch.empty(shape, dtype=dtype)
+        return real_empty(shape, dtype=dtype)
 
     monkeypatch.setattr(torch.accelerator, "current_stream", lambda *a, **k: None)
     monkeypatch.setattr(torch.accelerator, "set_stream", lambda *a, **k: None)
