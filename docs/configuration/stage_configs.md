@@ -124,7 +124,7 @@ The following fields belong under `duplex_session` and apply when
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_sessions` | int | `1` | Global session limit, including sessions being opened or closed. |
-| `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities. `least_sessions` reserves a replica group once when a session opens. |
+| `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities; its stickiness is per request, so each turn of a duplex session may land on a different replica. `least_sessions` reserves a replica group once when a session opens and keeps every turn of that session on it. |
 | `max_sessions_per_replica` | int \| null | `null` | Required and at least `1` for `least_sessions`. Bounds reserved sessions and model-owned session resources on each replica of every stage. |
 | `replica_groups` | list of stage-to-replica maps \| null | `null` | Explicit groups such as `[{0: 0, 1: 0}, {0: 1, 1: 0}]`. Stage and replica IDs must be nonnegative integers. |
 
