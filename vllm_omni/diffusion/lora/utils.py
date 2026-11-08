@@ -4,6 +4,7 @@
 
 from vllm_omni.lora.binding import (
     from_layer_diffusion,
+    validate_generic_peft_ranks,
 )
 
-__all__ = ["from_layer_diffusion"]
+__all__ = ["from_layer_diffusion", "validate_generic_peft_ranks"]
