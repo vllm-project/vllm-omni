@@ -176,3 +176,31 @@ def test_dead_shared_rank_escalates_instead_of_independent_eviction(host, mocker
         asyncio.run(orchestrator._handle_dead_replica(0, 0, EngineDeadError()))
     assert group.state == "FAILED"
     pool.evict_replica.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_shared_vllm_config_supports_upstream_replace(rank):
+    """Warmup copies VllmConfig; sharing must not add undeclared attributes."""
+    from vllm.config import DeviceConfig
+    from vllm.config.utils import replace
+
+    from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
+
+    plan = SharingPlan(0, 1, ("GPU-0", "GPU-1"), (DeviceBudget(2048, 64, 64, 64),) * 2, "model", "revision", "layout")
+    bootstrap = SharingRuntime(plan, None).bootstrap("provider")
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        additional_config={CONFIG_KEY: msgspec.to_builtins(bootstrap)},
+    )
+    fields_before = set(vars(config))
+    resolved = resolve_worker_sharing(config, role="provider", rank=rank)
+    assert resolved == (bootstrap.groups[rank], bootstrap.budgets[rank])
+    assert set(vars(config)) == fields_before
+    copied = replace(config, cache_config=replace(config.cache_config))
+    assert resolve_worker_sharing(copied, role="provider", rank=rank) == resolved
+    assert copied.additional_config == config.additional_config
+
+    # Reproduce the original failure using the actual upstream field checker.
+    config.weight_sharing = bootstrap.groups[rank]
+    with pytest.raises(ValueError, match="Field 'weight_sharing' not found"):
+        replace(config, cache_config=config.cache_config)

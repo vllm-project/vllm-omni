@@ -42,9 +42,10 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        from vllm_omni.distributed.weight_sharing.worker_session import configure_worker, sharing_memory_request
+        from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing, sharing_memory_request
 
-        sharing_budget = configure_worker(self.vllm_config, role="provider", rank=self.rank)
+        sharing = resolve_worker_sharing(self.vllm_config, role="provider", rank=self.rank)
+        sharing_budget = sharing[1] if sharing else None
         if self.device_config.device_type in ("cuda", "musa"):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -152,7 +153,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.use_v2_model_runner = False
             self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
-        if getattr(self.vllm_config, "weight_sharing", None) is not None and not self.use_v2_model_runner:
+        if sharing is not None and not self.use_v2_model_runner:
             raise ValueError("weight sharing requires model_runner: v2")
 
         if self.rank == 0:
@@ -166,6 +167,8 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         install_runner_session(
             self.model_runner,
             self.vllm_config,
+            role="provider",
+            rank=self.rank,
             device_index=self.device.index,
             detach=lambda: None,
         )

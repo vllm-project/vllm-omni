@@ -13,13 +13,23 @@ import msgspec
 from .backend import ExportSession, ImportedWeights
 from .contracts import SessionContext, ThreadOwnershipError, WeightSharingBackend
 from .runtime import CONFIG_KEY, Bootstrap, DeviceBudget, RankResult
-from .session import build_session_context
+from .session import SharedWeightGroupConfig, build_session_context
 
 
-def configure_worker(config, *, role: str, rank: int) -> DeviceBudget | None:
-    """Resolve only this rank; the IPC codec validates the physical GPU."""
+def resolve_worker_sharing(
+    config, *, role: str, rank: int | None = None
+) -> tuple[SharedWeightGroupConfig, DeviceBudget] | None:
+    """Read rank-local bootstrap without mutating the config.
+
+    Runners may omit rank after TP initialization; workers pass their rank
+    explicitly before initialization. The IPC codec checks the physical GPU.
+    """
     if CONFIG_KEY not in config.additional_config:
         return None
+    if rank is None:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
     bootstrap = msgspec.convert(config.additional_config[CONFIG_KEY], type=Bootstrap)
     if role not in ("provider", "consumer") or not 0 <= rank < len(bootstrap.groups):
         raise ValueError("incorrect sharing bootstrap role or rank")
@@ -34,8 +44,7 @@ def configure_worker(config, *, role: str, rank: int) -> DeviceBudget | None:
         raise ValueError("missing sharing model agreement")
     budget = bootstrap.budgets[rank]
     budget.validate()
-    config.weight_sharing = group
-    return budget
+    return group, budget
 
 
 def sharing_memory_request(
@@ -60,11 +69,14 @@ def sharing_memory_request(
     return min(budget.capacity_bytes, free_bytes - budget.reserve_bytes)
 
 
-def install_runner_session(runner, config, *, device_index: int, detach: Callable[[], None]) -> None:
+def install_runner_session(
+    runner, config, *, role: str, rank: int, device_index: int, detach: Callable[[], None]
+) -> None:
     """Reuse the backend and handle already created by the model loader."""
-    group = getattr(config, "weight_sharing", None)
-    if group is None:
+    sharing = resolve_worker_sharing(config, role=role, rank=rank)
+    if sharing is None:
         return
+    group, _ = sharing
     if getattr(runner, "weight_sharing", None) is not None:
         raise RuntimeError("sharing session is already installed")
     backend = runner._weight_share_backend

@@ -446,9 +446,16 @@ class DiffusionWorker:
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size,
                 set_proc_title=self.set_proc_title,
             )
-            from vllm_omni.distributed.weight_sharing.worker_session import configure_worker, sharing_memory_request
+            from vllm_omni.distributed.weight_sharing.worker_session import (
+                resolve_worker_sharing,
+                sharing_memory_request,
+            )
 
-            sharing_budget = configure_worker(self.od_config, role="consumer", rank=self.rank)
+            sharing = resolve_worker_sharing(self.od_config, role="consumer", rank=self.rank)
+            sharing_budget = sharing[1] if sharing else None
+            if sharing is not None:
+                # The diffusion loader consumes this rank-local configuration.
+                self.od_config.weight_sharing = sharing[0]
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                 is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -542,6 +549,8 @@ class DiffusionWorker:
         install_runner_session(
             self.model_runner,
             self.od_config,
+            role="consumer",
+            rank=self.rank,
             device_index=current_omni_platform.current_device(),
             detach=detach_shared_model,
         )

@@ -278,7 +278,8 @@ def test_invalid_plan_rejected_before_launch(host, kwargs):
 
 
 @pytest.mark.parametrize("role", ["provider", "consumer"])
-def test_bootstrap_routes_the_loader_config_by_rank(host, role):
+@pytest.mark.parametrize("implicit_rank", [False, True])
+def test_bootstrap_routes_the_loader_config_by_rank(host, role, implicit_rank, monkeypatch):
     plan = host.plan()
     runtime = host.runtime.SharingRuntime(plan, host)
     bundles = (b"bundle-0", b"bundle-1") if role == "consumer" else ()
@@ -286,12 +287,18 @@ def test_bootstrap_routes_the_loader_config_by_rank(host, role):
     from types import SimpleNamespace
 
     config = SimpleNamespace(additional_config=data)
-    host.worker.configure_worker(config, role=role, rank=1)
-    context = host.worker.build_session_context(config.weight_sharing, 0)
+    if implicit_rank:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "vllm.distributed", SimpleNamespace(get_tensor_model_parallel_rank=lambda: 1))
+    group, budget = host.worker.resolve_worker_sharing(config, role=role, rank=None if implicit_rank else 1)
+    assert budget == plan.budgets[1]
+    assert vars(config) == {"additional_config": data}
+    context = host.worker.build_session_context(group, 0)
     assert context.identity == runtime.identities[1] and context.device_index == 0
-    assert config.weight_sharing.payload == (b"bundle-1" if role == "consumer" else None)
+    assert group.payload == (b"bundle-1" if role == "consumer" else None)
     with pytest.raises(ValueError, match="rank"):
-        host.worker.configure_worker(config, role=role, rank=2)
+        host.worker.resolve_worker_sharing(config, role=role, rank=2)
 
 
 def test_overcommitted_budget_rejected(host):
@@ -453,11 +460,11 @@ def test_malformed_bootstrap_cannot_fall_back_to_full_loading(host):
     from types import SimpleNamespace
 
     config = SimpleNamespace(additional_config={})
-    host.worker.configure_worker(config, role="provider", rank=0)
+    assert host.worker.resolve_worker_sharing(config, role="provider") is None
     assert not hasattr(config, "weight_sharing")
     config.additional_config[host.runtime.CONFIG_KEY] = {}
     with pytest.raises(msgspec.ValidationError):
-        host.worker.configure_worker(config, role="provider", rank=0)
+        host.worker.resolve_worker_sharing(config, role="provider", rank=0)
 
 
 def test_hung_rpc_has_a_deadline_and_never_reimports(host):

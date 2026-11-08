@@ -163,15 +163,16 @@ def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, m
     )
     group = runtime.SharingRuntime(plan, None)
     config = SimpleNamespace(additional_config={runtime.CONFIG_KEY: msgspec.to_builtins(group.bootstrap("provider"))})
-    worker.configure_worker(config, role="provider", rank=0)
-    assert config.weight_sharing.model_id == "model"
-    assert config.weight_sharing.checkpoint_revision == "revision"
-    context = worker.build_session_context(config.weight_sharing, 0)
+    provider_group, _ = worker.resolve_worker_sharing(config, role="provider", rank=0)
+    assert not hasattr(config, "weight_sharing")
+    assert provider_group.model_id == "model"
+    assert provider_group.checkpoint_revision == "revision"
+    context = worker.build_session_context(provider_group, 0)
     bindings, spec = make_weights(api, two_storages=True)
     provider = weight_sharing.TorchCudaIpcBackend(codec=codec)
     exported = provider.prepare_export(bindings, spec, context)
     ar = SimpleNamespace(_weight_share_backend=provider, _weight_share_session=exported)
-    worker.install_runner_session(ar, config, device_index=0, detach=lambda: None)
+    worker.install_runner_session(ar, config, role="provider", rank=0, device_index=0, detach=lambda: None)
     assert ar.weight_sharing.backend is provider and ar.weight_sharing.handle is exported
     claim = worker.control_runner(ar, "claim", ())
     assert claim["private_bytes"] == 512 - provider.session_status(exported).shared_nbytes
@@ -179,7 +180,7 @@ def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, m
     config = SimpleNamespace(
         additional_config={runtime.CONFIG_KEY: msgspec.to_builtins(group.bootstrap("consumer", (payload,)))}
     )
-    worker.configure_worker(config, role="consumer", rank=0)
+    config.weight_sharing, _ = worker.resolve_worker_sharing(config, role="consumer", rank=0)
     consumer = weight_sharing.TorchCudaIpcBackend(codec=codec)
     imported = consumer.open_import(config.weight_sharing.payload, spec, context)
     dit = SimpleNamespace(
@@ -223,6 +224,7 @@ def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, m
     owner.lora_manager = None
     owner.device = "cpu"
     owner.local_rank = 0
+    owner.rank = 0
     owner.vllm_config = dit.vllm_config
     owner._maybe_get_memory_pool_context = nullcontext
     owner.od_config = config
