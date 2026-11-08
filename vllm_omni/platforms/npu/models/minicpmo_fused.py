@@ -127,7 +127,18 @@ def attention(attn, x, att_cache, attn_mask, kv, *, min_cache_frames: int):
         span = int(k.shape[2])
         keys[:, :, :span].copy_(k)
         values[:, :, :span].copy_(v)
-    # ``keys`` already carries exactly the live span here, so no mask split.
+    # Attending over the whole buffer is only equivalent to the live span when
+    # the buffer is exactly ``frames + cached`` wide: the branches above write
+    # ``keys[:, :, :frames]`` (plus the in-place cache copy) or, on the ``cat``
+    # path, only ``keys[:, :, :span]``. A wider (padded or arena-backed) buffer
+    # would attend tail frames nobody wrote, so refuse it instead of trusting a
+    # comment that the mask helper does not enforce.
+    live_span = frames + cached
+    if int(keys.shape[-2]) != live_span:
+        raise ValueError(
+            f"NPU attention mask/cache mismatch: cache has {int(keys.shape[-2])} keys, "
+            f"live span is {live_span} (frames={frames}, cache={cached})"
+        )
     mask = _expand_attn_mask_for_npu(attn_mask, frames, int(keys.shape[-2]))
     out = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
     return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))

@@ -55,7 +55,6 @@ _PRELUDE_BLOCK = 1024
 # the same), so the fusion removes launches, not arithmetic.
 _TAIL_FUSION_OK = True
 _TAIL_FUSION_WARMED = False
-_TAIL_BLOCK = 1024
 # The pairwise pass is single-block; wide candidate sets stay eager.
 _TAIL_MAX_CANDIDATES = 64
 
@@ -133,15 +132,12 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
 
     @triton.jit
     def _topk_topp_mask_kernel(
-        logits_ptr,
         vals_ptr,
         idx_ptr,
         out_ptr,
         top_p,
         K: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
         KP: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
-        VOCAB: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
-        BLOCK: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
     ):
         """Single-block fused top-k + top-p mask over one B=1 logits row.
 
@@ -155,6 +151,10 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         Ties among finite values cannot arise from continuous model logits;
         ``-inf`` top-k padding candidates carry zero prob and sort before every
         finite value, so both paths always remove them.
+
+        ``out`` arrives pre-filled with ``-inf`` from the caller and the kernel
+        only scatters the kept candidates: filling and scattering from the same
+        program let two lanes order their writes to one address arbitrarily.
         """
         offs = tl.arange(0, KP)
         cand = offs < K
@@ -174,13 +174,6 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         smaller = tl.sum(tl.where(vj < vi, qj, 0.0), axis=1)
         keep = cand & ((smaller + q) > (1.0 - top_p))
         gids = tl.load(idx_ptr + offs, mask=cand, other=0)
-        for start in range(0, VOCAB, BLOCK):
-            o = start + tl.arange(0, BLOCK)
-            tl.store(
-                out_ptr + o,
-                tl.full((BLOCK,), float("-inf"), tl.float32),
-                mask=o < VOCAB,
-            )
         tl.store(out_ptr + gids, v, mask=keep)
 
     _HAS_TRITON = True
@@ -730,19 +723,16 @@ def _topk_topp_fused(
     if keep < 2:
         return None
     vals, idx = torch.topk(logits, keep, dim=-1)
-    out = torch.empty_like(logits)
+    out = torch.full_like(logits, float("-inf"))
     kp = 1 << (keep - 1).bit_length()
     try:
         _topk_topp_mask_kernel[(1,)](
-            logits,
             vals,
             idx,
             out,
             float(top_p),
             K=keep,
             KP=kp,
-            VOCAB=int(logits.shape[-1]),
-            BLOCK=_TAIL_BLOCK,
             num_warps=8,
         )
     except Exception as exc:
