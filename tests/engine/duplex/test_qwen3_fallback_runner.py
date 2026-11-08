@@ -110,15 +110,20 @@ class _ScriptedDetector:
     def __init__(self, results: list[TurnDetectionResult]) -> None:
         self._results = list(results)
 
+    def segment_steps(self, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None):
+        yield from ()
+        return self.process_segments(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+
     def process_segments(
         self,
-        base64_audio: str,
+        audio: str | bytes,
         *,
         fmt: str,
         sample_rate_hz: int | None,
     ) -> list[TurnDetectionSegment]:
         del fmt, sample_rate_hz
-        return [TurnDetectionSegment(audio=base64_audio, result=self._results.pop(0))]
+        encoded = base64.b64encode(audio).decode("ascii") if isinstance(audio, bytes) else audio
+        return [TurnDetectionSegment(audio=encoded, result=self._results.pop(0))]
 
     def reset(self) -> None:
         pass

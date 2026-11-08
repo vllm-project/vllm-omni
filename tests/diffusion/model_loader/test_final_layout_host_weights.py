@@ -302,6 +302,9 @@ class _FakeH3Attention(nn.Module):
         del kwargs
         super().__init__()
 
+    def add_schedule_candidate_check(self, check: object) -> None:
+        del check
+
 
 class _FakeFluxLinear(_FakeH3Linear):
     def __init__(

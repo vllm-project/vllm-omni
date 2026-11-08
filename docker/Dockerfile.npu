@@ -1,5 +1,8 @@
+# vLLM-Ascend v0.33.0 runtime matching the vLLM v0.33.0 alignment. Set
+# VLLM_ASCEND_DEVICE_SUFFIX to -a3/-a5/-310p for device-specific images; the
+# unsuffixed tag is the generic A2 image.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_VERSION=v0.32.0
+ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 

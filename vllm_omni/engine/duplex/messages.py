@@ -49,6 +49,7 @@ class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     session_config: DuplexSessionConfig
     #: In-process, bounded output shared with the single consumer; no media in the engine-wide queue.
     output_buffer: DuplexOutputBuffer
+    trace_headers: dict[str, str] | None = None
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
