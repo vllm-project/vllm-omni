@@ -35,7 +35,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
@@ -78,14 +78,11 @@ from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator
-from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
-from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
 )
-from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE, INDEXTTS25_PIPELINE
 from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_EMBEDDING,
@@ -95,7 +92,6 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     SPEAKER_EMBEDDING_DIM,
     TEXT_EOS_TOKEN_ID,
 )
-from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     REF_AUDIO_CACHE_KEY,
     Qwen3TTSPromptEmbedsBuilder,
@@ -435,27 +431,14 @@ def client(test_app):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
-@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
-@pytest.mark.parametrize(
-    ("pipeline", "model_name"),
-    [
-        pytest.param(COSYVOICE3_PIPELINE, "CosyVoice3", id="cosyvoice3"),
-        pytest.param(FISH_OMNI_PIPELINE, "Drama-3", id="drama-3"),
-        pytest.param(QWEN3_TTS_PIPELINE, "Qwen3-TTS", id="qwen3-tts"),
-        pytest.param(QWEN3_TTS_FUSED_PIPELINE, "Qwen3-TTS", id="qwen3-tts-fused"),
-        pytest.param(INDEXTTS2_PIPELINE, "IndexTTS2", id="indextts2"),
-        pytest.param(INDEXTTS25_PIPELINE, "IndexTTS2.5", id="indextts2-5"),
-        pytest.param(BREEZE_TTS_2_PIPELINE, "Breeze-TTS-2", id="breeze-tts-2"),
-    ],
-)
 async def test_server_worker_applies_speech_only_endpoint_restrictions(
     mocker: MockerFixture,
     enable_scale_out: bool,
-    stream: bool,
-    pipeline: PipelineConfig,
-    model_name: str,
     request: pytest.FixtureRequest,
 ):
+    # Per-pipeline restrictions are covered in test_endpoint_policy.py. Here
+    # exercise their installation by the real server worker in both modes.
+    model_name = "CosyVoice3"
     # SageMaker route registration imports a dependency that changes root.level.
     # Restore it through setLevel so later tests also clear cached log filters.
     root_logger = logging.getLogger()
@@ -485,7 +468,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
             self.shutdown = mocker.Mock()
 
     class FakeEngine:
-        endpoint_restrictions = pipeline.endpoint_restrictions
+        endpoint_restrictions = COSYVOICE3_PIPELINE.endpoint_restrictions
         stage_configs: list[object] = []
 
         def __init__(self):
@@ -570,7 +553,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
         with closing(TestClient(captured_app)) as client:
             completion_response = client.post(
                 "/v1/completions",
-                json={"model": model_name, "prompt": "hello", "stream": stream},
+                json={"model": model_name, "prompt": "hello"},
             )
             chat_response = client.post(
                 "/v1/chat/completions",
@@ -578,7 +561,6 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
                     "model": model_name,
                     "messages": [{"role": "user", "content": "hello"}],
                     "max_tokens": 8,
-                    "stream": stream,
                 },
             )
             chat_batch_response = client.post(
@@ -592,7 +574,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
                 },
             )
             sibling_payloads = {
-                "/v1/responses": {"model": model_name, "input": "hello", "stream": stream},
+                "/v1/responses": {"model": model_name, "input": "hello"},
                 "/v1/messages": {
                     "model": model_name,
                     "max_tokens": 1,
