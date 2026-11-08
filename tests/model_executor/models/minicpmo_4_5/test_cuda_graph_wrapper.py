@@ -2545,7 +2545,7 @@ def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest
         speakers_cfg=torch.zeros(4, 4),
         cond_cfg=torch.zeros(4, 4, 8),
         cnn_cache=None,
-        att_cache=[torch.zeros(1, 1, 2, 1, length, 2) for length in [4, 8]],
+        att_cache=[torch.zeros(1, 1, 2, 1, 1, length, 2) for length in [4, 8]],
         valid_lengths=[8, 8],
         attn_mask=torch.ones(4, 8, 16, dtype=torch.bool),
     )
