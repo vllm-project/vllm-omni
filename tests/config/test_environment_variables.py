@@ -181,7 +181,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         ModelEnvironmentVariableDisposition.PROMOTE: 71,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
-        ModelEnvironmentVariableDisposition.INTERNALIZE: 15,
+        ModelEnvironmentVariableDisposition.INTERNALIZE: 16,
         ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
     }
 

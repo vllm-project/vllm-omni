@@ -447,8 +447,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ### Policy
 
-- **Always uploaded** (no key): L2 **Simple Test**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
@@ -596,3 +596,25 @@ between the online and offline XML rather than just confirming both files exist.
 - [Test Writing Guide](./test_writing_guide.md) — markers, directories, L1–L5 examples
 - [Test Execution Guide](./test_execution_guide.md) — running CI-aligned jobs locally
 - Implementation: `.buildkite/common/scripts/upload_pipeline.py`, `.buildkite/common/scripts/skip_ci.py`
+
+## Docker Hub release credentials
+
+Docker publishing and nightly cleanup use the Buildkite secret
+`OMNI_DOCKERHUB_TOKEN`, mapped to `RELEASE_DOCKERHUB_TOKEN` only on Docker jobs.
+Agents must support step-level secrets (Buildkite agent 3.106.0 or newer).
+Configure an organization access token for `vllm/vllm-omni` and use `vllm`
+as the Docker Hub username. Image Push grants image pull/push; Tag Admin
+grants tag listing/deletion for nightly cleanup. Do not grant access to
+other repositories or organization management.
+
+Restrict the secret's access policy to the immutable `omni-release` pipeline
+ID, main, and the small CPU release queue. A job's `secrets` entry
+controls injection; the access policy controls whether other jobs may
+retrieve the secret. Protect release refs and pipeline settings as well.
+
+The cleanup script uses Docker Hub's `/v2/auth/token` exchange and
+namespace-scoped tag API. Shell tracing stays disabled to avoid exposing
+credentials or bearer tokens. The legacy S3 `DOCKERHUB_TOKEN` variable is
+not used by these Docker jobs. After validating the replacement, remove
+obsolete S3 copies and revoke shared tokens only after all consumers have
+migrated. Never commit token values to this repository.

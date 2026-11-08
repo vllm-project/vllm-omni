@@ -504,12 +504,6 @@ class OmniServeCommand(CLISubcommand):
             help="The timeout for initializing the stages.",
         )
         omni_config_group.add_argument(
-            "--shm-threshold-bytes",
-            type=int,
-            default=65536,
-            help="The threshold for the shared memory size.",
-        )
-        omni_config_group.add_argument(
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
@@ -665,6 +659,12 @@ class OmniServeCommand(CLISubcommand):
                 "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
                 "into the base model at server startup; 'peft' uses the adapter manager."
             ),
+        )
+        omni_config_group.add_argument(
+            "--lora-application",
+            choices=["runtime", "merged"],
+            default=None,
+            help="Apply diffusion LoRA per request, or merge one global policy into dense weights.",
         )
         omni_config_group.add_argument(
             "--lora-scale",
@@ -867,6 +867,17 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
+        )
+
+        omni_config_group.add_argument(
+            "--diffusion-attention-schedule",
+            type=_json_object,
+            default=None,
+            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
+            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
+            "with null end meaning the actual sequence end. "
+            'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters

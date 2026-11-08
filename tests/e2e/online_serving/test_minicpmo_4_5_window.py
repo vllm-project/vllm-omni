@@ -29,7 +29,7 @@ def _assert_complete(result, *, require_audio=False):
         assert result["audio_bytes"] > 0
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.advanced_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode,reference", [("basic", False), ("context", False), ("context", True)])

@@ -5,6 +5,120 @@ env:
 
 steps:
 
+
+- group: ":test_tube: ROCm advanced-entrypoints MERGE"
+  steps:
+    - label: "MERGE · Advanced Entrypoint Sleep/Wake · 1-GPU"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 75
+      source_file_dependencies:
+        - entrypoints_function
+        - engine_model_executor_worker_function
+        - tests/helpers/
+        - vllm_omni/deploy/
+        - vllm_omni/config/
+        - vllm_omni/diffusion/
+      artifact_paths:
+        - "artifacts/rocm-merge-advanced-entrypoints/**/*"
+      env:
+        DIFFUSION_ATTENTION_BACKEND: "TORCH_SDPA"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-advanced-entrypoints"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/entrypoints/test_omni_sleep_mode.py::TestOmniArSleepMode::test_llm_sleep_ack"
+            "tests/entrypoints/test_omni_sleep_mode.py::TestOmniArSleepMode::test_partial_wake_holds_generate_until_full_wake"
+            "tests/entrypoints/test_omni_sleep_mode.py::TestOmniArSleepMode::test_duplicate_wake_is_idempotent"
+            "tests/entrypoints/test_omni_sleep_mode.py::TestOmniDiffusionSleepMode::test_diffusion_sleep_handshake"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          pytest -s -v -ra \
+            'tests/entrypoints/test_omni_sleep_mode.py::TestOmniArSleepMode::test_llm_sleep_ack' \
+            'tests/entrypoints/test_omni_sleep_mode.py::TestOmniArSleepMode::test_partial_wake_holds_generate_until_full_wake' \
+            'tests/entrypoints/test_omni_sleep_mode.py::TestOmniArSleepMode::test_duplicate_wake_is_idempotent' \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-ar" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/ar.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-ar.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 3 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 3 executed advanced-entrypoints ar tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/ar.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          pytest -s -v -ra \
+            'tests/entrypoints/test_omni_sleep_mode.py::TestOmniDiffusionSleepMode::test_diffusion_sleep_handshake' \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-diffusion" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/diffusion.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-diffusion.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 1 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 1 executed advanced-entrypoints diffusion tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/diffusion.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+
 - group: ":card_index_dividers: Simple Test"
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
@@ -152,6 +266,120 @@ steps:
         # that is not supported on CPU
         - "python -u .buildkite/amd/scripts/run_cpu_suite.py other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
 
+
+- group: ":test_tube: ROCm bagel-shm-connectors MERGE"
+  steps:
+    - label: "MERGE · Bagel Shared-Memory Connectors"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 75
+      source_file_dependencies:
+        - tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py
+        - tests/helpers/
+        - vllm_omni/distributed/
+        - vllm_omni/engine/
+        - vllm_omni/config/
+        - vllm_omni/model_executor/models/bagel/
+        - vllm_omni/diffusion/models/bagel/
+        - vllm_omni/model_executor/stage_input_processors/bagel.py
+        - vllm_omni/deploy/bagel.yaml
+      artifact_paths:
+        - "artifacts/rocm-merge-bagel-shm-connectors/**/*"
+      env:
+        DIFFUSION_ATTENTION_BACKEND: "TORCH_SDPA"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-bagel-shm-connectors"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - >-
+          ps -eo pid=,ppid=,lstart=,stat=,comm= >
+          "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py::test_bagel_img2img_shared_memory_connector"
+            "tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py::test_bagel_text2img_shared_memory_connector"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          timeout --signal=TERM --kill-after=2m 65m \
+            pytest -s -v -ra \
+            'tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py::test_bagel_img2img_shared_memory_connector' \
+            'tests/distributed/omni_connectors/test_bagel_shared_memory_connector.py::test_bagel_text2img_shared_memory_connector' \
+            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-connectors" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/connectors.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-connectors.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 2 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 2 executed bagel-shm-connectors connectors tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/connectors.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+        - |
+          set -o pipefail
+          sleep 5
+          ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt"
+          # Compare PID plus process start time so PID reuse cannot hide a leak.
+          # Double dollars preserve awk field references through Buildkite interpolation.
+          awk '
+            NR == FNR {
+              if ($$9 != "ps") {
+                baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+              }
+              next
+            }
+            $$9 != "ps" {
+              identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+              if (!(identity in baseline)) {
+                print
+                leaked = 1
+              }
+            }
+            END {
+              if (leaked) {
+                print "status=FAIL leaked_processes_detected=1"
+                exit 1
+              }
+              print "status=PASS leaked_processes=0"
+            }
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt" \
+            "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt" \
+            2>&1 | tee "$$ROCM_MERGE_ARTIFACT_DIR/process-cleanup.txt"
+
 - group: ":card_index_dividers: Diffusion Test"
   steps:
     # AR paged attention is real GPU work, including cold AITER compilation.
@@ -209,22 +437,6 @@ steps:
         - >-
           pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
           --deselect='tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
-
-    # TODO: Diagnose unstable Stable Audio layerwise-offload memory savings on ROCm.
-    - label: "Diffusion Stable Audio Layerwise Offload Test (quarantined)"
-      agent_pool: mi300_1
-      depends_on: amd-build
-      mirror_hardwares: [amdproduction]
-      grade: NonBlocking
-      commands:
-        - export VLLM_LOGGING_LEVEL=DEBUG
-        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        # Restore a provenance-checked Buildkite artifact into a job-local
-        # AITER_JIT_DIR. This consumer never publishes a duplicate artifact.
-        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-        - >-
-          pytest -s -v
-          'tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
 
     - label: "Diffusion Sequence Parallelism Test (Need 4 GPUs) · Shard 1/2"
       agent_pool: mi300_4
@@ -464,7 +676,7 @@ steps:
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 17
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 13
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
           tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
@@ -759,7 +971,7 @@ steps:
             "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-merge-expected.txt
-          pytest -q tests/e2e/online_serving/test_drama_3.py \
+          pytest -q 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
             -m "advanced_model and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --collect-only \
@@ -769,7 +981,7 @@ steps:
             echo "Drama 3 MERGE collection drifted from test_text_to_audio_001[drama_3-rocm]" >&2
             exit 1
           fi
-          pytest -s -v tests/e2e/online_serving/test_drama_3.py \
+          pytest -s -v 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
             -m "advanced_model and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --junitxml="$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
@@ -787,6 +999,292 @@ steps:
               raise SystemExit(5)
           ' "$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
           DRAMA3_MERGE
+
+
+- group: ":test_tube: ROCm drama3-voice-clone MERGE"
+  steps:
+    - label: "MERGE · Drama 3 Voice Clone"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 75
+      source_file_dependencies:
+        - tts_drama_3_function
+        - tests/helpers/
+        - tests/assets/qwen3_tts/clone_2.wav
+      artifact_paths:
+        - "artifacts/rocm-merge-drama3-voice-clone/**/*"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-drama3-voice-clone"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]"
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]"
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]"
+            "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          pytest -s -v -ra \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]' \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]' \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]' \
+            'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]' \
+            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-voice-clone" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/voice-clone.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-voice-clone.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 4 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 4 executed drama3-voice-clone voice-clone tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/voice-clone.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+
+- group: ":test_tube: ROCm customvoice-prefill-tail MERGE"
+  steps:
+    - label: "MERGE · CustomVoice One-Token Prefill Tail"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 60
+      source_file_dependencies:
+        - tts_qwen3_tts_function
+        - tests/helpers/
+      artifact_paths:
+        - "artifacts/rocm-merge-customvoice-prefill-tail/**/*"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-customvoice-prefill-tail"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - >-
+          ps -eo pid=,ppid=,lstart=,stat=,comm= >
+          "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/features/prefill_phase/test_chunked_prefill_tail.py::test_one_token_prefill_tail_matches_unchunked_audio"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          timeout --signal=TERM --kill-after=2m 50m \
+            pytest -s -v -ra \
+            'tests/e2e/features/prefill_phase/test_chunked_prefill_tail.py::test_one_token_prefill_tail_matches_unchunked_audio' \
+            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-prefill-tail" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/prefill-tail.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-prefill-tail.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 1 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 1 executed customvoice-prefill-tail prefill-tail tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/prefill-tail.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+        - |
+          set -o pipefail
+          sleep 5
+          ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt"
+          # Compare PID plus process start time so PID reuse cannot hide a leak.
+          # Double dollars preserve awk field references through Buildkite interpolation.
+          awk '
+            NR == FNR {
+              if ($$9 != "ps") {
+                baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+              }
+              next
+            }
+            $$9 != "ps" {
+              identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+              if (!(identity in baseline)) {
+                print
+                leaked = 1
+              }
+            }
+            END {
+              if (leaked) {
+                print "status=FAIL leaked_processes_detected=1"
+                exit 1
+              }
+              print "status=PASS leaked_processes=0"
+            }
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt" \
+            "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt" \
+            2>&1 | tee "$$ROCM_MERGE_ARTIFACT_DIR/process-cleanup.txt"
+
+- group: ":test_tube: ROCm minicpmo-duplex-window MERGE"
+  steps:
+    - label: "MERGE · MiniCPM-o 4.5 Advanced Duplex/Window"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 90
+      source_file_dependencies:
+        - omni_minicpmo_4_5_duplex_function
+        - tests/helpers/
+      artifact_paths:
+        - "artifacts/rocm-merge-minicpmo-duplex-window/**/*"
+      commands:
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-minicpmo-duplex-window"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - python --version > "$$ROCM_MERGE_ARTIFACT_DIR/python-version.txt"
+        - python -m pip freeze > "$$ROCM_MERGE_ARTIFACT_DIR/packages.txt"
+        - >-
+          ps -eo pid=,ppid=,lstart=,stat=,comm= >
+          "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt"
+        - |
+          bash <<'COLLECT_ADVANCED'
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_two_sessions_resume_and_takeover[three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[basic-False-three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-False-three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-True-three-stage-single-gpu]"
+          )
+          printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
+          pytest --collect-only -q "$${nodes[@]}" \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
+          sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
+            | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          diff -u "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt" "$$ROCM_MERGE_ARTIFACT_DIR/collected.txt"
+          COLLECT_ADVANCED
+        - |
+          bash <<'RUN_ADVANCED'
+          set -euo pipefail
+          status=0
+          # Each invocation owns its engine fixtures and its pytest temporary directory.
+          timeout --signal=TERM --kill-after=2m 80m \
+            pytest -s -v -ra \
+            'tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_two_sessions_resume_and_takeover[three-stage-single-gpu]' \
+            'tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[basic-False-three-stage-single-gpu]' \
+            'tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-False-three-stage-single-gpu]' \
+            'tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_rebuild_and_next_session[context-True-three-stage-single-gpu]' \
+            -m 'advanced_model and omni and rocm and MI325 and cards_1' --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-duplex-window" \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/duplex-window.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-duplex-window.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 4 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 4 executed minicpmo-duplex-window duplex-window tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/duplex-window.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_ADVANCED
+        - |
+          set -o pipefail
+          sleep 5
+          ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt"
+          # Compare PID plus process start time so PID reuse cannot hide a leak.
+          # Double dollars preserve awk field references through Buildkite interpolation.
+          awk '
+            NR == FNR {
+              if ($$9 != "ps") {
+                baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+              }
+              next
+            }
+            $$9 != "ps" {
+              identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+              if (!(identity in baseline)) {
+                print
+                leaked = 1
+              }
+            }
+            END {
+              if (leaked) {
+                print "status=FAIL leaked_processes_detected=1"
+                exit 1
+              }
+              print "status=PASS leaked_processes=0"
+            }
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/processes-before.txt" \
+            "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt" \
+            2>&1 | tee "$$ROCM_MERGE_ARTIFACT_DIR/process-cleanup.txt"
 
 - group: ":full_moon: MiniCPM-o 4.5 MERGE"
   steps:

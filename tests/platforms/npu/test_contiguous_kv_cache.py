@@ -14,7 +14,7 @@ import vllm.v1.worker.gpu.spec_decode.speculator  # noqa: F401 -- Populate the m
 import vllm_ascend.ops  # noqa: F401 -- Register Ascend operations before importing runners.
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 from vllm_ascend.attention import utils
-from vllm_ascend.worker import model_runner_v1
+from vllm_ascend.worker.v1 import model_runner as model_runner_v1
 from vllm_ascend.worker.v2 import attn_utils
 
 from tests.helpers.mark import hardware_marks
