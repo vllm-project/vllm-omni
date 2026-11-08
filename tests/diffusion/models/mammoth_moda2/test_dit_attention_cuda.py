@@ -127,6 +127,7 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch, force_native):
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(2, seq, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
     mask[0, -37:] = False

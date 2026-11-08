@@ -411,6 +411,13 @@
           "link": null
         },
         {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
+          "link": null
+        },
+        {
           "localized_name": "url",
           "name": "url",
           "type": "STRING",
@@ -767,6 +774,13 @@
           "name": "latent_edit",
           "shape": 7,
           "type": "LATENT_MASK_EDITING",
+          "link": null
+        },
+        {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
           "link": null
         },
         {
@@ -1229,6 +1243,13 @@
           "link": null
         },
         {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
+          "link": null
+        },
+        {
           "localized_name": "url",
           "name": "url",
           "type": "STRING",
@@ -1420,23 +1441,23 @@
       1,
       0,
       7,
-      9,
-      "STRING"
-    ],
-    [
-      2,
-      2,
-      0,
-      7,
       10,
       "STRING"
     ],
     [
+      2,
+      2,
+      0,
+      7,
+      11,
+      "STRING"
+    ],
+    [
       3,
       3,
       0,
       7,
-      16,
+      17,
       "FLOAT"
     ],
     [
@@ -1460,7 +1481,7 @@
       1,
       0,
       11,
-      9,
+      10,
       "STRING"
     ],
     [
@@ -1468,7 +1489,7 @@
       2,
       0,
       11,
-      10,
+      11,
       "STRING"
     ],
     [
@@ -1476,7 +1497,7 @@
       3,
       0,
       11,
-      16,
+      17,
       "FLOAT"
     ],
     [
@@ -1500,7 +1521,7 @@
       1,
       0,
       16,
-      9,
+      10,
       "STRING"
     ],
     [
@@ -1508,7 +1529,7 @@
       2,
       0,
       16,
-      10,
+      11,
       "STRING"
     ],
     [
@@ -1516,7 +1537,7 @@
       3,
       0,
       16,
-      16,
+      17,
       "FLOAT"
     ],
     [

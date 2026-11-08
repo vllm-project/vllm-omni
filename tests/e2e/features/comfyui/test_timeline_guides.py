@@ -43,6 +43,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 PLUGIN_DIR = Path(__file__).resolve().parents[4] / "apps" / "ComfyUI-vLLM-Omni"
 GUIDE_WORKFLOW = PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Timeline Guides.json"
+SCHEMA_COMPLETE_WORKFLOWS = {
+    GUIDE_WORKFLOW,
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 All-in-One.json",
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Music Video.json",
+}
 H3 = "MiniMaxAI/MiniMax-H3"
 WIDTH, HEIGHT = 64, 32
 
@@ -252,7 +257,7 @@ def test_generate_video_appends_timeline_guides_port_last():
 
 @pytest.mark.parametrize("path", sorted((PLUGIN_DIR / "example_workflows").glob("*.json")), ids=lambda p: p.stem)
 def test_saved_workflows_keep_generate_video_slots(path):
-    """Graphs saved before the new port still resolve every link to the same input."""
+    """Legacy graphs may omit the port; schema-complete graphs save it in place."""
     workflow = json.loads(path.read_text())
     schema = VLLMOmniGenerateVideo.INPUT_TYPES()
     current = {**schema["required"], **schema["optional"]}
@@ -263,7 +268,7 @@ def test_saved_workflows_keep_generate_video_slots(path):
         names = [input_["name"] for input_ in node.get("inputs", [])]
         sockets = [name for name in names if name in schema["optional"]]
         assert sockets == sorted(sockets, key=order.index)
-        assert ("timeline_guides" in names) == (path == GUIDE_WORKFLOW)
+        assert ("timeline_guides" in names) == (path in SCHEMA_COMPLETE_WORKFLOWS)
         for input_ in node.get("inputs", []):
             assert input_["type"] == current[input_["name"]][0]
         assert len(node["widgets_values"]) == len(schema["required"])

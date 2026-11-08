@@ -1,6 +1,5 @@
 # TeaCache Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -23,10 +22,7 @@ See supported models list in [Supported Models](../../diffusion_features.md#supp
 
 ## Quick Start
 
-
-
 ### Basic Usage
-
 
 ```python
 from vllm_omni import Omni
@@ -62,7 +58,10 @@ explicit finite positive `rel_l1_thresh`; neither has a model-specific default.
 Passing only `cache_backend="tea_cache"` raises an error; older Qwen-Image
 coefficients do not establish compatibility. This path remains experimental. A bounded
 single-GPU BF16 eager experiment passed force-full parity and held-out numerical
-quality checks; human visual acceptance remains pending.
+quality checks. On November 4, 2026, the author accepted the later fixed 32-pair
+quality set with minor color shifts in some samples and no other obvious visual
+regressions relative to dense reported. This is a bounded acceptance, not a
+lossless-output or general image-quality guarantee.
 
 The initial scope is single-GPU, batch-1 request mode, unquantized weights and
 no LoRA. Step mode, parallel execution, FP8 prefix storage and offload are
@@ -175,9 +174,13 @@ denoising steps 13–40 (0-based; prefill is step 0); every step outside the
 window computed. CFG1 outputs were bitwise identical to the earlier exploration
 that forced steps at or below 12 and at or above 41 to compute.
 
-These single-run timings are not HTTP, tail-latency or throughput results.
-Repeat timing with a matched dense eager baseline and review all 48 confirmation
-images before drawing broader quality or performance conclusions.
+These historical single-run timings are not HTTP, tail-latency or throughput
+results. A later campaign used one full warmup and five measured HTTP requests
+per layout/arm against matched dense eager. Its results, reproduction evidence
+and the author's acceptance of the fixed 32-pair quality set are recorded in
+[PR #9199](https://github.com/vllm-project/vllm-omni/pull/9199). That acceptance
+does not establish a separate review of all 48 earlier confirmation images or
+broader quality and performance guarantees.
 
 For an already-loaded pipeline in a single-GPU development harness, install the
 dense collector before running calibration requests:
@@ -272,10 +275,10 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 In `OmniDiffusionConfig`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `rel_l1_thresh` | float | `0.2` | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.3; higher values mostly cost quality on calibrated models |
-| `coefficients` | list[float] \| None | `None` | Polynomial coefficients for rescaling L1 distance. Must contain exactly 5 elements if provided. If `None`, uses model-specific defaults based on transformer type. |
+| Parameter       | Type                | Default | Description                                                                                                                                                                                                           |
+|-----------------|---------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `rel_l1_thresh` | float               | `0.2`   | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.3; higher values mostly cost quality on calibrated models |
+| `coefficients`  | list[float] \| None | `None`  | Polynomial coefficients for rescaling L1 distance. Must contain exactly 5 elements if provided. If `None`, uses model-specific defaults based on transformer type.                                                    |
 
 Users can find the default model coefficients in [`vllm_omni/diffusion/cache/teacache/config.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py), for example:
 
@@ -312,7 +315,6 @@ _MODEL_COEFFICIENTS = {
 - Maximum quality requirements where no degradation is acceptable
 - Very short inference runs (< 20 steps) where caching overhead may outweigh benefits
 
-
 ---
 
 ## Troubleshooting
@@ -333,6 +335,7 @@ cache_config={"rel_l1_thresh": 0.1}
 **Symptoms**: Actual speedup is less than expected (< 1.3x)
 
 **Solutions**:
+
 1. Increase the threshold to enable more aggressive caching (non-distilled models only; on few-step distilled models such as Z-Image-Turbo a higher threshold mostly costs quality, see the Summary):
    ```python
    cache_config={"rel_l1_thresh": 0.3}
@@ -341,7 +344,6 @@ cache_config={"rel_l1_thresh": 0.1}
 3. Check that your model architecture is supported (see Supported Models section)
 
 ---
-
 
 ## Summary
 

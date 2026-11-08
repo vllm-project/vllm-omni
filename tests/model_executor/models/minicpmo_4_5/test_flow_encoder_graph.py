@@ -353,7 +353,7 @@ def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
         pytest.fail("ROCm fallback must not create or capture NVIDIA streams")
 
     monkeypatch.setattr(torch.version, "hip", "test-rocm")
-    monkeypatch.setattr(graph_module, "_new_capture_stream", forbidden)
+    monkeypatch.setattr(graph_module, "create_cuda_stream", forbidden)
     monkeypatch.setattr(FlowEncoderGraphs, "_capture", forbidden)
     token = SimpleNamespace(device=SimpleNamespace(type="cuda"))
     wrapper = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
@@ -374,7 +374,7 @@ def test_rocm_eager_chunks_preserve_outputs_and_cache(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("ROCm eager chunks must not enter NVIDIA capture")
 
-    monkeypatch.setattr(graph_module, "_new_capture_stream", forbidden)
+    monkeypatch.setattr(graph_module, "create_cuda_stream", forbidden)
     monkeypatch.setattr(FlowEncoderGraphs, "_capture", forbidden)
     weight = torch.randn(_HIDDEN, _HIDDEN, device="cuda")
     encode = functools.partial(_encode, weight=weight)
