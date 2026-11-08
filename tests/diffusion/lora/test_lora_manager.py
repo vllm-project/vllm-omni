@@ -1799,6 +1799,12 @@ def test_set_active_adapters_rejects_duplicate_adapter_ids(monkeypatch):
         manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(1)], [0.5, 1.0])
     assert load_calls == []
 
+    # Duplicates are rejected regardless of scale, matching parse_lora_requests
+    # at the API layer; a zero-scale entry does not excuse a repeated id.
+    with pytest.raises(ValueError, match="Duplicate LoRA adapter in stack"):
+        manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(1)], [0.0, 1.0])
+    assert load_calls == []
+
 
 def test_stacked_scale_keys_match_scheduler_batch_key():
     """Regression: the manager's composed-adapter key and the scheduler/KV

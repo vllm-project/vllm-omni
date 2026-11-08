@@ -450,14 +450,17 @@ class DiffusionLoRAManager:
         if len(scales) != len(requests):
             raise ValueError(f"Got {len(requests)} LoRA requests but {len(scales)} scales")
 
-        pairs = [
-            (req, scale) for req, scale in zip(requests, scales) if req is not None and not math.isclose(0.0, scale)
-        ]
         seen_ids: set[int] = set()
-        for req, _ in pairs:
+        for req in requests:
+            if req is None:
+                continue
             if req.lora_int_id in seen_ids:
                 raise ValueError(f"Duplicate LoRA adapter in stack: id={req.lora_int_id}")
             seen_ids.add(req.lora_int_id)
+
+        pairs = [
+            (req, scale) for req, scale in zip(requests, scales) if req is not None and not math.isclose(0.0, scale)
+        ]
         if not pairs:
             self.set_active_adapter(None)
             return
@@ -1430,7 +1433,11 @@ class DiffusionLoRAManager:
             if cid == adapter_id or any(src_id == adapter_id for src_id, _ in key)
         ]
         for key in stale_composed_keys:
-            composed_id = self._composed_adapters.pop(key)
+            # A recursive remove_adapter() below may have dropped this key
+            # already when two stack keys resolve to the same composed id.
+            composed_id = self._composed_adapters.pop(key, None)
+            if composed_id is None:
+                continue
             if composed_id != adapter_id and composed_id in self._registered_adapters:
                 self.remove_adapter(composed_id)
         logger.debug(
