@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
@@ -30,12 +30,14 @@ def main():
         from vllm.logger import configure_logging_from_args
 
         import vllm_omni.entrypoints.cli.benchmark.main
+        import vllm_omni.entrypoints.cli.doctor
         import vllm_omni.entrypoints.cli.serve
         from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
             vllm_omni.entrypoints.cli.benchmark.main,
+            vllm_omni.entrypoints.cli.doctor,
         ]
 
         cli_env_setup()
@@ -81,3 +83,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
