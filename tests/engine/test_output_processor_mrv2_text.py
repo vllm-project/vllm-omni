@@ -118,6 +118,31 @@ def test_ar_pooling_fallback_keeps_text_and_accumulates_payload_once(dual_carrie
     torch.testing.assert_close(completion.multimodal_output["codes"]["audio"], codes)
 
 
+@pytest.mark.parametrize("extra_pooling_key", [False, True])
+def test_pooling_keys_missing_from_multimodal_output_are_flagged(monkeypatch, extra_pooling_key):
+    # multimodal_output is authoritative, so a pooling-only key is dropped;
+    # that breaks the producer contract and must not pass silently.
+    import vllm_omni.outputs.output_processor as output_processor
+
+    warnings = []
+    monkeypatch.setattr(output_processor.logger, "warning_once", lambda msg, *args: warnings.append(msg % args))
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    codes = torch.tensor([[1, 2], [3, 4]])
+    pooling = {"codes": {"audio": codes}}
+    if extra_pooling_key:
+        pooling["hidden_states"] = {"layers": {0: torch.ones(2, 4)}}
+    output = _rehydrated_output(pooling_output=pooling)
+    output.multimodal_output = {"codes": {"audio": codes.clone()}}
+
+    completion = processor.process_outputs([output]).request_outputs[0].outputs[0]
+
+    torch.testing.assert_close(completion.multimodal_output["codes"]["audio"], codes)
+    if extra_pooling_key:
+        assert warnings == ["Dropping pooling_output keys not carried by multimodal_output: hidden_states.layer_0"]
+    else:
+        assert warnings == []
+
+
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
     processor, state = _make_processor(OutputModality.TEXT, _Detokenizer())
     request = EngineCoreRequest(
