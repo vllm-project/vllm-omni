@@ -13,6 +13,7 @@ Extends ``OmniGPUModelRunner`` with:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
