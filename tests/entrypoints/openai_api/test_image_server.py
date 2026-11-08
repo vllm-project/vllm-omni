@@ -234,7 +234,6 @@ def test_client(mock_async_diffusion):
         [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
     )
     app.state.args = Namespace(
-        default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
     )
 
@@ -2861,7 +2860,6 @@ def test_image_sampling_yaml_defaults_reach_generation(
     defaults = config.stage_by_id(0).model_config.default_sampling_params
     defaults_before_requests = copy.deepcopy(defaults)
     test_client.app.state.engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams(**defaults)]
-    test_client.app.state.args.default_sampling_params = None
     for _ in range(2):
         response = test_client.post("/v1/images/generations", json=request)
         assert response.status_code == 200

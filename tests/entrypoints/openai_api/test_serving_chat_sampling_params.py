@@ -986,28 +986,36 @@ def test_omitted_pooling_stage_keeps_parameter_type(mock_engine_client):
     assert result[1].requires_token_ids is True
 
 
+@pytest.mark.parametrize(
+    "stage_count", [0, 1, 2], ids=["without-stage-configs", "single-stage", "pure-diffusion-multistage"]
+)
 @pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
-def test_diffusion_chat_inherits_engine_defaults(mock_engine_client, mocker: MockerFixture, explicit: bool) -> None:
-    defaults = OmniDiffusionSamplingParams(
-        num_inference_steps=50,
-        guidance_scale=3.0,
-        true_cfg_scale=2.0,
-        seed=42,
-        num_outputs_per_prompt=2,
-        extra_args={"stage_default": "keep"},
-    )
-    captured: list[OmniDiffusionSamplingParams] = []
+def test_diffusion_chat_inherits_engine_defaults(
+    mock_engine_client, mocker: MockerFixture, explicit: bool, stage_count: int
+) -> None:
+    defaults = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=50 - index,
+            guidance_scale=3.0 + index,
+            true_cfg_scale=2.0 + index,
+            seed=42 + index,
+            num_outputs_per_prompt=2 + index,
+            extra_args={"stage_default": index, "pipeline_option": "keep"},
+        )
+        for index in range(max(1, stage_count))
+    ]
+    captured: list[list[OmniDiffusionSamplingParams]] = []
 
     async def generate(**kwargs):
-        captured.append(kwargs["sampling_params_list"][0])
+        captured.append(kwargs["sampling_params_list"])
         if False:
             yield None
 
     server = build_serving_chat(engine_client=mock_engine_client)
     server._diffusion_model_name = "test"
     server._diffusion_engine = SimpleNamespace(
-        stage_configs=[SimpleNamespace(stage_type="diffusion")],
-        default_sampling_params_list=[defaults],
+        stage_configs=[SimpleNamespace(stage_type="diffusion") for _ in range(stage_count)],
+        default_sampling_params_list=defaults,
         generate=generate,
     )
     server._diffusion_mode = True
@@ -1018,18 +1026,34 @@ def test_diffusion_chat_inherits_engine_defaults(mock_engine_client, mocker: Moc
             model="test",
             messages=[],
             modalities=["image"],
-            **({"guidance_scale": 0.0, "true_cfg_scale": 0.0} if override else {}),
+            **(
+                {
+                    "guidance_scale": 0.0,
+                    "true_cfg_scale": 0.0,
+                    "seed": 0,
+                    "num_outputs_per_prompt": 1,
+                    "num_inference_steps": 4,
+                    "extra_args": {"pipeline_option": "override"},
+                }
+                if override
+                else {}
+            ),
         )
         asyncio.run(server._create_chat_completion(request))
-        params = captured[-1]
-        assert params.guidance_scale == (0.0 if override else 3.0)
-        assert params.true_cfg_scale == (0.0 if override else 2.0)
-        assert params.num_inference_steps == 50
-        assert params.seed == 42
-        assert params.num_outputs_per_prompt == 2
-        assert params.extra_args["stage_default"] == "keep"
-        params.extra_args["stage_default"] = "mutated"
-    assert defaults.extra_args == {"stage_default": "keep"}
+        assert len(captured[-1]) == len(defaults)
+        for index, (params, default) in enumerate(zip(captured[-1], defaults)):
+            assert params.guidance_scale == (0.0 if override else default.guidance_scale)
+            assert params.true_cfg_scale == (0.0 if override else default.true_cfg_scale)
+            assert params.num_inference_steps == (4 if override else default.num_inference_steps)
+            assert params.seed == (0 if override else default.seed)
+            assert params.num_outputs_per_prompt == (1 if override else default.num_outputs_per_prompt)
+            assert params.extra_args == {
+                "stage_default": index,
+                "pipeline_option": "override" if override else "keep",
+            }
+            params.extra_args["stage_default"] = "mutated"
+    for index, default in enumerate(defaults):
+        assert default.extra_args == {"stage_default": index, "pipeline_option": "keep"}
 
 
 @pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
