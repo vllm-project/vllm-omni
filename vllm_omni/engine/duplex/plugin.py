@@ -1004,11 +1004,12 @@ def validate_duplex_replica_policy(
     if runtime_config.replica_policy == "legacy":
         return
     if distributed and runtime_config.replica_groups is None:
-        # A distributed pool exposes replicas through the hub, so the number of
-        # attached replicas is not known when this runs -- and ``num_replicas``
-        # counts ``None`` holes left by replicas that already detached. Deriving
-        # groups from a startup snapshot would therefore reserve slots that are
-        # not serviceable. Distributed deployments must declare the topology.
+        # In a distributed deployment the coordinator assigns ``replica_id`` to a
+        # host at runtime, so a group derived here would be numerically correct
+        # and physically arbitrary: nothing in this process knows which replica
+        # runs where. Pinning a session to such a group could straddle hosts in a
+        # way the operator never chose, and the operator has no way to say so.
+        # Requiring an explicit mapping keeps that placement decision with them.
         raise ValueError(
             "duplex_session.replica_policy=least_sessions in distributed hub/LB mode "
             "requires duplex_session.replica_groups to declare the stage replica topology"

@@ -163,8 +163,20 @@ When no group has capacity, opening a session fails with the retryable
 `least_sessions` supports a local single-host deployment, and a distributed one
 (coordinator, hub or load-balancer routing) when `replica_groups` declares the
 stage replica topology; a distributed deployment without `replica_groups` is
-rejected at startup, because the replica count includes slots left by replicas
-that already detached. A per-replica cap above `1` also
+rejected at startup. The reason is placement, not counting: locally the stage's
+replica ids come from the deploy config, but in a distributed deployment the
+coordinator assigns each `replica_id` to a host at runtime, and the engine has no
+basis for choosing which replicas should form a group across hosts. Declaring the
+groups keeps that decision with the operator.
+
+To build the mapping, the coordinator assigns first-vacant slots and restores a
+known address to the slot it held before; each replica registers with an input
+address, and the coordinator's replica list exposes it as `ReplicaInfo.input_addr`.
+The attach log pairs them: `[MembershipController] attached remote replica
+stage=<id> replica=<id> addr=<host:port>`. There is no dedicated endpoint for
+dumping the mapping yet.
+
+A per-replica cap above `1` also
 requires the model plugin to support concurrent sessions on one replica; use
 `1` for plugins without that capability, including VoiceChat. A failed replica
 closes all sessions assigned to it, including idle sessions. Those sessions

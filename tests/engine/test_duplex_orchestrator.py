@@ -1528,6 +1528,51 @@ def test_least_sessions_accepts_distributed_startup_with_groups(distributed_hook
     assert orchestrator.replica_placement.snapshot()["groups"] == [{0: 0}]
 
 
+@pytest.mark.asyncio
+async def test_membership_detach_fails_the_sessions_reserved_on_the_replica() -> None:
+    """A hub-driven detach must fail the reservations, not defer to the next submit.
+
+    ``_handle_dead_replica`` only runs for a submit-time ``EngineDeadError``; a
+    replica removed by membership used to leave its sessions reserved and idle.
+    """
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config())
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        placement = orchestrator.replica_placement
+        assert placement is not None
+        reserved = placement.route(SESSION_ID, 0)
+
+        await orchestrator._on_replica_removed(0, reserved)
+
+        assert (0, reserved) in set(placement.snapshot()["unavailable"])
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reattached_slot_fails_the_sessions_reserved_on_it() -> None:
+    """A restarted replica returns to its slot with none of the session state."""
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config())
+    pool = None
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        placement = orchestrator.replica_placement
+        assert placement is not None
+        reserved = placement.route(SESSION_ID, 0)
+        pool = orchestrator.stage_pools[0]
+        addr = "tcp://192.0.2.10:5001"
+        pool.add_client(addr, pool.clients[reserved], replica_id=reserved)
+        pool.remove_client(addr)
+        restarted = FakeStageClient()
+        pool.add_client(addr, restarted, replica_id=reserved)
+
+        await orchestrator._on_replica_added(0, reserved, restarted)
+
+        assert (0, reserved) in set(placement.snapshot()["unavailable"])
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
 def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:
     with pytest.raises(ValueError, match="must cover every replica"):
         _build(stages=2, replicas=2, runtime_config=_placement_config(replica_groups=[{0: 0, 1: 0}]))

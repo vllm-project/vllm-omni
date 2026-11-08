@@ -185,6 +185,10 @@ class StagePool:
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
+        # Slots a client has been attached to more than once: the process
+        # behind them is new, so any session reservation on the slot holds no
+        # state. Consumed by the duplex failure path.
+        self._reattached_replicas: set[int] = set()
         # Invoked whenever the replica set changes, so the event-driven loop can
         # re-bind its readers without waiting for a tick. Must be thread-safe.
         self.membership_listener: Callable[[], None] | None = None
@@ -346,6 +350,11 @@ class StagePool:
         for known_addr, known_replica_id in list(self._addr_to_replica_id.items()):
             if known_replica_id == replica_id and known_addr != input_addr:
                 self._addr_to_replica_id.pop(known_addr, None)
+        if existing is not None:
+            # This address was attached before, so this is a restarted (or
+            # reconnected) replica process occupying a slot that may still hold
+            # session reservations. Record it for the caller to act on.
+            self._reattached_replicas.add(replica_id)
         self.clients[replica_id] = client
         self._addr_to_replica_id[input_addr] = replica_id
         self._unavailable_replicas.discard(replica_id)
@@ -520,13 +529,47 @@ class StagePool:
         self.release_binding(request_id)
 
     def invalidate_addr(self, input_addr: str) -> list[str]:
-        """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
+        """Drop affinity rows pointing at ``input_addr``; return affected request ids.
+
+        Pinned requests never enter ``_affinity``: duplex dispatch records them in
+        ``_request_bindings``. They are collected here too, so a replica that
+        leaves the pool also fails the turn it is pinned to. The bindings
+        themselves are kept, because the failure path uses them to attribute the
+        request to its replica.
+        """
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
             self._affinity.pop(rid, None)
+        replica_id = self._addr_to_replica_id.get(input_addr)
+        if replica_id is not None:
+            affected.extend(
+                rid
+                for rid, bound in self._request_bindings.items()
+                if bound == replica_id and rid not in affected
+            )
         return affected
 
-    # ---- Legacy (non-distributed) route binding ----
+    # ---- Route binding: local and distributed ----
+
+    def _reject_hub_down_replica(self, replica_id: int) -> None:
+        """Fail a pin whose replica the hub already reports as not UP.
+
+        ``is_replica_available`` is the head-local view. Between the hub marking a
+        replica DOWN/ERROR and the membership watcher detaching it, a pin would
+        still be dispatched, so consult the hub snapshot as well. Only a replica
+        the hub actually lists is rejected: one that is attached but not published
+        yet is not refused.
+        """
+        if self._hub is None:
+            return
+        input_addr = self._client_input_addr(self.clients[replica_id])
+        if input_addr is None:
+            return
+        for rep in self._hub.get_replicas_for_stage(self.stage_id).replicas:
+            if rep.input_addr == input_addr and rep.status != ReplicaStatus.UP:
+                raise StageUnavailableError(
+                    f"stage {self.stage_id} pinned replica {replica_id} is not UP in the hub"
+                )
 
     def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
         """Bind a real request to a required replica, without selecting a fallback.
@@ -546,6 +589,7 @@ class StagePool:
         """
         if not self.is_replica_available(replica_id):
             raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
+        self._reject_hub_down_replica(replica_id)
         bound = self.get_bound_replica_id(request_id)
         if bound is not None and bound != replica_id:
             raise StageUnavailableError(
@@ -605,10 +649,13 @@ class StagePool:
                 for replica in self._hub.get_replicas_for_stage(self.stage_id).replicas:
                     if replica.input_addr == input_addr:
                         return (outputs_qsize, max(int(replica.queue_length), 0))
-            # Distributed dispatch (pick): request_id -> input_addr in _affinity.
+            # Distributed dispatch: unpinned requests live in ``_affinity``
+            # (request_id -> input_addr); pinned duplex turns live in
+            # ``_request_bindings`` (request_id -> replica_id). Counting only the
+            # former under-reports load for pinned traffic.
             inflight = sum(
                 1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
-            )
+            ) + sum(1 for bound in self._request_bindings.values() if bound == replica_id)
         else:
             # Legacy local dispatch (select_replica_id): request_id -> replica_id.
             inflight = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
@@ -674,6 +721,13 @@ class StagePool:
             and self.clients[replica_id] is not None
             and replica_id not in self._unavailable_replicas
         )
+
+    def consume_reattach(self, replica_id: int) -> bool:
+        """Return and clear whether ``replica_id`` was attached more than once."""
+        if replica_id in self._reattached_replicas:
+            self._reattached_replicas.discard(replica_id)
+            return True
+        return False
 
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]

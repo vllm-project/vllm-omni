@@ -181,6 +181,46 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             )
         await super()._handle_dead_replica(stage_id, replica_id, error, failed_request_id=failed_request_id)
 
+    async def _fail_reserved_sessions(self, stage_id: int, replica_id: int, *, reason: str) -> None:
+        """Mark a replica unavailable and fail the sessions reserved on it."""
+        placement = self.replica_placement
+        if placement is None:
+            return
+        try:
+            affected = placement.mark_unavailable(stage_id, replica_id)
+        except ValueError:
+            # A replica outside the declared topology holds no reservation.
+            return
+        self.stage_pools[stage_id].evict_replica(replica_id)
+        if affected:
+            await self.session_manager.fail_sessions(sorted(affected), reason=reason)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Fail the sessions reserved on a replica that membership detached.
+
+        ``_handle_dead_replica`` covers a submit-time ``EngineDeadError``. A replica
+        the hub removes reaches the membership path instead, where nothing marked
+        its reservations unavailable, so idle sessions kept their group and the
+        next turn was dispatched to a replica that is gone.
+        """
+        super()._on_replica_removed(stage_id, replica_id)
+        await self._fail_reserved_sessions(
+            stage_id,
+            replica_id,
+            reason=f"Stage-{stage_id} replica-{replica_id} left the pool",
+        )
+
+    async def _on_replica_added(self, stage_id: int, replica_id: int, client: Any) -> None:
+        """Fail reservations when a restarted process takes over a slot."""
+        await super()._on_replica_added(stage_id, replica_id, client)
+        if not self.stage_pools[stage_id].consume_reattach(replica_id):
+            return
+        await self._fail_reserved_sessions(
+            stage_id,
+            replica_id,
+            reason=f"Stage-{stage_id} replica-{replica_id} was restarted; session state is gone",
+        )
+
     def _on_stage_submitted(
         self,
         stage_id: int,

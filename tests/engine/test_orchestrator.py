@@ -2263,6 +2263,59 @@ async def test_stage_pool_pinned_submit_preserves_route_and_legacy_round_robin(s
     assert pool.select_replica_id("companion", affinity_request_id="ordinary-1") == 1
 
 
+def _addressed_client(addr: str) -> FakeStageClient:
+    client = FakeStageClient()
+    client.client_addresses = {"input_address": addr}
+    return client
+
+
+def test_invalidate_addr_returns_pinned_requests_too() -> None:
+    """A detached replica must also fail the turn pinned to it.
+
+    Pinned requests never enter ``_affinity``, so the detach path used to walk
+    past them and the turn hung until the client timed out.
+    """
+    addr = "tcp://192.0.2.10:5001"
+    pool = StagePool(0, [FakeStageClient(), _addressed_client(addr)])
+    pool.add_client(addr, pool.clients[1], replica_id=1)
+
+    assert pool.bind_request_to_replica("pinned-turn", 1) == 1
+    assert pool.invalidate_addr(addr) == ["pinned-turn"]
+    # The binding survives: the failure path uses it to attribute the request.
+    assert pool.get_bound_replica_id("pinned-turn") == 1
+
+
+def test_add_client_reports_a_reattached_slot() -> None:
+    """A slot attached twice belongs to a new process; the caller must know."""
+    addr = "tcp://192.0.2.10:5001"
+    pool = StagePool(0, [FakeStageClient()])
+    pool.add_client(addr, _addressed_client(addr), replica_id=0)
+    assert pool.consume_reattach(0) is False
+
+    pool.remove_client(addr)
+    pool.add_client(addr, _addressed_client(addr), replica_id=0)
+    assert pool.consume_reattach(0) is True
+    assert pool.consume_reattach(0) is False
+
+
+def test_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
+    """Between the hub marking a replica DOWN and the watcher detaching it, a pin
+    must not be dispatched: ``is_replica_available`` is only the local view."""
+    addr = "tcp://192.0.2.10:5001"
+    pool = StagePool(0, [FakeStageClient(), _addressed_client(addr)])
+    pool.add_client(addr, pool.clients[1], replica_id=1)
+    pool.attach_hub(
+        SimpleNamespace(
+            get_replicas_for_stage=lambda stage_id: SimpleNamespace(
+                replicas=[SimpleNamespace(input_addr=addr, status="DOWN")]
+            )
+        )
+    )
+
+    with pytest.raises(StageUnavailableError, match="is not UP in the hub"):
+        pool.bind_request_to_replica("pinned", 1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["submit_initial", "submit_update"])
 @pytest.mark.parametrize("failure", ["unavailable", "detached", "out_of_range", "negative", "conflict"])
