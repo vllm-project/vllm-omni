@@ -613,6 +613,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
                 #  -------------------------------------- Omni-new -------------------------------------------------
+                # Scheduler decisions the model follows this step, before it frees finished requests' state.
+                if hasattr(self.model, "on_scheduler_output"):
+                    self.model.on_scheduler_output(scheduler_output)
                 if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                     self.model.on_requests_finished(scheduler_output.finished_req_ids)
                 #  -------------------------------------- Omni-new -------------------------------------------------

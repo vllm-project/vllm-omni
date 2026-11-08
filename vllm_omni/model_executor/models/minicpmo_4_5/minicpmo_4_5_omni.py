@@ -1166,18 +1166,43 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Use model for logits computation
         return self.model.compute_logits(hidden_states)
 
+    def on_scheduler_output(self, scheduler_output: Any) -> None:
+        """Follow the scheduler's barge-in carry decisions, before this step frees the finished requests' state."""
+        ops = getattr(scheduler_output, "duplex_carry_ops", None)
+        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+        apply_carry_ops = getattr(helper, "apply_carry_ops", None) if helper is not None else None
+        if not ops or apply_carry_ops is None:
+            return
+        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
+        request_sessions = request_sessions if isinstance(request_sessions, dict) else {}
+        sessions = getattr(helper, "sessions", None)
+        sessions = sessions if isinstance(sessions, dict) else {}
+        finishing = {request_sessions.get(rid) for rid in getattr(scheduler_output, "finished_req_ids", ()) or ()}
+
+        def state_of_request(request_id: str):
+            session_key = request_sessions.get(request_id)
+            return sessions.get(session_key) if session_key is not None else None
+
+        def live_state_of_session(session_id: str):
+            # A state freed later in this step belongs to the finished request, not the new one.
+            return None if session_id in finishing else sessions.get(session_id)
+
+        apply_carry_ops(list(ops), state_of_request, live_state_of_session)
+
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None
+        forget_handed = getattr(helper, "forget_handed_window_units", None) if helper is not None else None
         if isinstance(request_sessions, dict):
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import duplex_stage0_session_id
+
             for request_id in finished_req_ids:
                 session_key = request_sessions.pop(request_id, None)
                 if session_key is not None and isinstance(sessions, dict):
-                    state = sessions.pop(session_key, None)
-                    stash_window_units = getattr(helper, "stash_window_units", None)
-                    if stash_window_units is not None:
-                        stash_window_units(session_key, state)
+                    sessions.pop(session_key, None)
+                if forget_handed is not None and (stage0_session := duplex_stage0_session_id(request_id)) is not None:
+                    forget_handed(stage0_session, request_id)
         forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
         if isinstance(forced_segments, set):
             finished = set(finished_req_ids)

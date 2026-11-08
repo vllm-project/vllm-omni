@@ -21,10 +21,6 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
-    CARRIED_WINDOW_MAX_SESSIONS,
-    CARRIED_WINDOW_WORKER_TTL_S,
-)
 
 if TYPE_CHECKING:
     import torch
@@ -225,46 +221,71 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Built with the model, before its weights load and it switches to eval mode:
         # the streaming encoder's CUDA graphs are captured later, by build_audio_cuda_graph().
         self._audio_graph_attempted = False
-        # session_id -> completed window units of its last finished Stage-0 request.
+        # Barge-in carry, as the scheduler decides it (``apply_carry_ops``): session_id -> the completed
+        # window units an aborted Stage-0 request left, and units handed to a session's new request until
+        # that request's state is created.
         self._carried_window_units: dict[str, _MiniCPMO45CarriedWindow] = {}
+        # session_id -> (request it was handed to, units).
+        self._handed_window_units: dict[str, tuple[str, _MiniCPMO45CarriedWindow]] = {}
 
-    def stash_window_units(self, session_id: str, state: _MiniCPMO45Stage0SessionState | None) -> None:
-        """Keep a finished Stage-0 request's completed window units for its session's next epoch.
+    def apply_carry_ops(
+        self,
+        ops: list[tuple[str, str, str]],
+        state_of_request: Callable[[str], _MiniCPMO45Stage0SessionState | None],
+        live_state_of_session: Callable[[str], _MiniCPMO45Stage0SessionState | None],
+    ) -> None:
+        """Follow the scheduler's barge-in carry decisions for this step, in order.
 
         A barge-in ends the epoch's Stage-0 request, and the next append opens a
         new one whose context starts from the session template. The scheduler
-        keeps the same units, and its first window plan for the new request
-        (``carried_units``) puts them back ahead of that request's own, so the
-        model keeps the conversation it had. The unit open at the cut is left
-        out on both sides: its closing tokens never reached the KV.
+        keeps the aborted request's completed units, and its first window plan
+        for the new request (``carried_units``) puts them back ahead of that
+        request's own, so the model keeps the conversation it had. The unit open
+        at the cut is left out on both sides: its closing tokens never reached
+        the KV. Runs before the step frees the finished requests' state.
+
+        * ``keep``: pack the finished request's units (and units it carried but
+          never placed) into pinned host memory for the session;
+        * ``drop``: forget the session's kept units;
+        * ``hand``: give them to the session's new request. Its state is
+          normally created later in this step and takes them in
+          :meth:`restore_window_units`; a state the session already has takes
+          them at once.
         """
-        # The worker cannot tell an abort from a normal finish, so it keeps every
-        # finished request's units, in host memory, for CARRIED_WINDOW_WORKER_TTL_S
-        # (longer than the scheduler's offer) and for at most
-        # CARRIED_WINDOW_MAX_SESSIONS sessions, the oldest dropped first.
-        carried = self._carried_window_units
-        carried.pop(session_id, None)
-        now = time.monotonic()
-        for stale in [sid for sid, kept in carried.items() if now - kept.time > CARRIED_WINDOW_WORKER_TTL_S]:
-            carried.pop(stale)
-        if state is None or not state.window_enabled:
-            return
-        # Units this request carried but never got to place go on to the next one.
-        units = [*state.carried_window_units, *state.window_units]
-        if units:
-            carried[session_id] = _MiniCPMO45CarriedWindow.pack(units, now)
-            while len(carried) > CARRIED_WINDOW_MAX_SESSIONS:
-                carried.pop(next(iter(carried)))
+        for op, session_id, request_id in ops:
+            if op == "keep":
+                state = state_of_request(request_id)
+                units: list[_MiniCPMO45WindowUnit] = []
+                if state is not None and state.window_enabled:
+                    units = [*state.carried_window_units, *state.window_units]
+                elif state is None and self._handed_window_units.get(session_id, ("",))[0] == request_id:
+                    # Handed to this request but its state was never created: pass the same units on.
+                    units = self._handed_window_units.pop(session_id)[1].unpack()
+                self._carried_window_units.pop(session_id, None)
+                self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units, time.monotonic())
+            elif op == "drop":
+                self._carried_window_units.pop(session_id, None)
+            elif op == "hand":
+                kept = self._carried_window_units.pop(session_id, None)
+                if kept is None:
+                    # The scheduler only hands what it told this side to keep; the plan check catches the rest.
+                    logger.warning("MiniCPM-o barge-in carry: no kept units for session %s", session_id)
+                    continue
+                live = live_state_of_session(session_id)
+                if live is not None:
+                    live.carried_window_units = kept.unpack() if live.window_enabled else []
+                else:
+                    self._handed_window_units[session_id] = (request_id, kept)
 
     def restore_window_units(self, state: _MiniCPMO45Stage0SessionState) -> None:
-        """Give a new request's state the units :meth:`stash_window_units` kept for its session."""
-        carried = self._carried_window_units
-        kept = carried.pop(state.session_id, None)
-        now = time.monotonic()
-        for stale in [sid for sid, other in carried.items() if now - other.time > CARRIED_WINDOW_WORKER_TTL_S]:
-            carried.pop(stale)
-        fresh = kept is not None and now - kept.time <= CARRIED_WINDOW_WORKER_TTL_S
-        state.carried_window_units = kept.unpack() if fresh and state.window_enabled else []
+        """Give a new request's state the units the scheduler handed to its session (:meth:`apply_carry_ops`)."""
+        handed = self._handed_window_units.pop(state.session_id, None)
+        state.carried_window_units = handed[1].unpack() if handed is not None and state.window_enabled else []
+
+    def forget_handed_window_units(self, session_id: str, request_id: str) -> None:
+        """Drop units handed to a request that finished before its state took them."""
+        if self._handed_window_units.get(session_id, ("",))[0] == request_id:
+            self._handed_window_units.pop(session_id)
 
     def build_audio_cuda_graph(self) -> bool:
         """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent; failures stay eager).
@@ -849,6 +870,16 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         state.window_units = new_units
 
+    def _filler_units(self, lengths: list[Any], count: int) -> list[_MiniCPMO45WindowUnit]:
+        """``count`` units of <|listen|> with the planned lengths, for carried units this side lacks."""
+        sizes = [max(1, int(n)) for n in lengths][:count]
+        sizes += [1] * (count - len(sizes))
+        token = self.listen_token_id if self.listen_token_id >= 0 else 0
+        return [
+            _MiniCPMO45WindowUnit(embeds=[self._embed_token(token) for _ in range(n)], token_ids=[token] * n)
+            for n in sizes
+        ]
+
     def _end_carried_speech_with_listen(self, unit: _MiniCPMO45WindowUnit) -> None:
         """Close the last unit before a cut as one where the model stopped speaking.
 
@@ -885,14 +916,24 @@ class MiniCPMO45Stage0DuplexRuntime:
             carried_units = max(0, int(stage0_window.get("carried_units", 0) or 0))
         except (TypeError, ValueError):
             return None
-        if carried_units > len(carried):
-            raise RuntimeError(
-                "MiniCPM-o Stage-0 carried window history is shorter than the scheduler plan: "
-                f"plan={carried_units}, kept={len(carried)}"
-            )
         # The scheduler places the newest units: an older one it dropped is never more recent than these.
         placed = carried[len(carried) - carried_units :] if carried_units else []
-        if placed:
+        lengths = stage0_window.get("carried_unit_lengths")
+        if carried_units and (
+            len(placed) != carried_units
+            or (isinstance(lengths, list) and [len(unit.token_ids) for unit in placed] != [int(n) for n in lengths])
+        ):
+            # This side doesn't have the units the scheduler planned. Fill their positions with <|listen|> so
+            # the prompt still has the planned length, rather than failing the step for every session.
+            logger.error(
+                "MiniCPM-o barge-in carry for session %s does not match the plan (kept %d units, planned %d); "
+                "placing filler units",
+                state.session_id,
+                len(carried),
+                carried_units,
+            )
+            placed = self._filler_units(lengths if isinstance(lengths, list) else [], carried_units)
+        elif placed:
             self._end_carried_speech_with_listen(placed[-1])
             state.carried_context = True
         state.window_units[:0] = placed

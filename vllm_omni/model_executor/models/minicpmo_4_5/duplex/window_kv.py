@@ -811,13 +811,12 @@ class MiniCPMO45DuplexSchedulerHelper:
     # Barge-in carry. A barge-in aborts the epoch's Stage-0 request, and the
     # session's next append opens a new request whose context starts from the
     # session template. The scheduler keeps the aborted request's completed
-    # units for the session (``scheduler._minicpmo45_carried_windows``), the
-    # worker keeps the same units (``stash_window_units``), and the new
-    # request's first window plan puts them back ahead of its own
-    # (``carried_units``). ``scheduler._minicpmo45_window_snapshot_ids`` exists
-    # once a duplex Stage-0 append went through ``snapshot_window``; the
-    # scheduler's hooks call in here only after that, so schedulers that never
-    # see a duplex Stage-0 request never import this module from them.
+    # units for the session, tells the worker to keep the same units, and hands
+    # them to the session's next request, whose first window plan puts them back
+    # ahead of its own (``carried_units``). Every decision goes to the worker in
+    # ``OmniSchedulerOutput.duplex_carry_ops``. The state is
+    # ``scheduler._minicpmo45_carry``, created by the first duplex Stage-0
+    # append; the scheduler's hooks call in here only once it exists.
 
     @classmethod
     def snapshot_window(cls, scheduler: Any, session: Any) -> None:
@@ -829,10 +828,10 @@ class MiniCPMO45DuplexSchedulerHelper:
         """
         if duplex_stage0_session_id(session.request_id) is None:
             return
-        pending: set[str] | None = getattr(scheduler, "_minicpmo45_window_snapshot_ids", None)
-        if pending is None:
-            pending = set()
-            scheduler._minicpmo45_window_snapshot_ids = pending
+        carry: MiniCPMO45CarriedWindows | None = getattr(scheduler, "_minicpmo45_carry", None)
+        if carry is None:
+            carry = MiniCPMO45CarriedWindows()
+            scheduler._minicpmo45_carry = carry
         if getattr(session, "_minicpmo45_window_snapshot", None) is not None:
             # An earlier append is still waiting to be booked: the worker has the window from before that one.
             return
@@ -842,79 +841,148 @@ class MiniCPMO45DuplexSchedulerHelper:
             "previous": list(getattr(session, "_minicpmo45_window_previous_token_ids", ()) or ()),
             "carried": getattr(session, "_minicpmo45_carried_window", None),
         }
-        pending.add(session.request_id)
+        carry.snapshot_ids.add(session.request_id)
 
     @classmethod
     def commit_window_snapshots(cls, scheduler: Any, scheduler_output: Any) -> None:
         """Drop the snapshots of requests whose append this step hands to the worker."""
-        pending: set[str] | None = getattr(scheduler, "_minicpmo45_window_snapshot_ids", None)
-        if not pending:
-            return
-        for request_id in pending.intersection(scheduler_output.num_scheduled_tokens):
-            pending.discard(request_id)
+        carry: MiniCPMO45CarriedWindows = scheduler._minicpmo45_carry
+        for request_id in carry.snapshot_ids.intersection(scheduler_output.num_scheduled_tokens):
+            carry.snapshot_ids.discard(request_id)
             request = scheduler.requests.get(request_id)
             if request is not None:
                 request._minicpmo45_window_snapshot = None
 
     @classmethod
     def release_windows(cls, scheduler: Any, request_ids: Iterable[str], *, aborted: bool) -> None:
-        """Keep the windows of aborted Stage-0 requests and forget the snapshots of every finished one."""
-        request_ids = tuple(request_ids)
-        if aborted:
-            cls.stash_windows(scheduler, request_ids)
-        if pending := getattr(scheduler, "_minicpmo45_window_snapshot_ids", None):
-            pending.difference_update(request_ids)
-
-    @classmethod
-    def stash_windows(cls, scheduler: Any, request_ids: Iterable[str]) -> None:
-        """Keep aborted Stage-0 requests' windows for their sessions' next epoch."""
-        sessions = [(rid, sid) for rid in request_ids if (sid := duplex_stage0_session_id(rid)) is not None]
-        if not sessions or scheduler.vllm_config.model_config.stage_id != 0:
-            return
-        pending: set[str] = getattr(scheduler, "_minicpmo45_window_snapshot_ids", None) or set()
-        now = time.monotonic()
-        carried: dict[str, dict[str, Any]] | None = getattr(scheduler, "_minicpmo45_carried_windows", None)
-        if carried is None:
-            carried = {}
-            scheduler._minicpmo45_carried_windows = carried
-        for stale in [sid for sid, kept in carried.items() if now - kept["time"] > CARRIED_WINDOW_OFFER_TTL_S]:
-            carried.pop(stale)
-        for request_id, session_id in sessions:
-            pending.discard(request_id)
+        """Note what finished duplex Stage-0 requests leave; the worker learns of them at the next step."""
+        carry: MiniCPMO45CarriedWindows = scheduler._minicpmo45_carry
+        for request_id in request_ids:
             request = scheduler.requests.get(request_id)
-            if request is None:
-                continue
-            # Whatever this request leaves, the session's earlier window is gone: the
-            # worker also drops its copy when such a request finishes, so no plan may count on it.
-            carried.pop(session_id, None)
-            # An append the worker never ran leaves the window as it was before that append's plan.
-            window = getattr(request, "_minicpmo45_window_snapshot", None) or {
-                "units": getattr(request, "_minicpmo45_window_units", ()),
-                "previous": getattr(request, "_minicpmo45_window_previous_token_ids", ()),
-                "carried": getattr(request, "_minicpmo45_carried_window", None),
-            }
-            unplaced = window["carried"] or {}
-            units = [*unplaced.get("units", ()), *(window["units"] or ())]
-            if not units:
-                continue
-            previous = list(window["previous"] or ()) or list(unplaced.get("previous", ()))
-            # Units carried from an earlier abort keep that abort's time. The worker's
-            # copy is never older, so it still outlives this one.
-            kept_since = unplaced.get("time", now) if unplaced.get("units") else now
-            carried[session_id] = {"units": units, "previous": previous, "time": kept_since}
-            while len(carried) > CARRIED_WINDOW_MAX_SESSIONS:
-                carried.pop(next(iter(carried)))
+            # A request that already finished (freed later) never reaches the worker's finished set again.
+            live = request is not None and not request.is_finished()
+            if live and duplex_stage0_session_id(request_id) is not None:
+                if not getattr(request, "_minicpmo45_started", False):
+                    # Never scheduled: it neither holds nor replaces the session's kept window.
+                    carry.unstarted.add(request_id)
+                elif aborted and (window := cls._window_left_by(request)) is not None:
+                    carry.pending[request_id] = window
+            carry.snapshot_ids.discard(request_id)
+
+    @staticmethod
+    def _window_left_by(request: Any) -> dict[str, Any] | None:
+        """The completed units an aborted request leaves, or None when it has none."""
+        # An append the worker never ran leaves the window as it was before that append's plan.
+        window = getattr(request, "_minicpmo45_window_snapshot", None) or {
+            "units": getattr(request, "_minicpmo45_window_units", ()),
+            "previous": getattr(request, "_minicpmo45_window_previous_token_ids", ()),
+            "carried": getattr(request, "_minicpmo45_carried_window", None),
+        }
+        unplaced = window["carried"] or {}
+        units = [*unplaced.get("units", ()), *(window["units"] or ())]
+        if not units:
+            return None
+        previous = list(window["previous"] or ()) or list(unplaced.get("previous", ()))
+        # Units carried from an earlier abort keep that abort's time, so the offer never outlives the first abort.
+        kept_since = unplaced.get("time") if unplaced.get("units") else None
+        return {"units": units, "previous": previous, "time": kept_since}
 
     @classmethod
-    def attach_carried_window(cls, scheduler: Any, request: Any) -> None:
-        """Give a new duplex Stage-0 request the window its session's aborted request left."""
-        carried = getattr(scheduler, "_minicpmo45_carried_windows", None)
-        if not carried:
-            return
-        session_id = duplex_stage0_session_id(request.request_id)
-        window = carried.pop(session_id, None) if session_id is not None else None
-        if window is not None and time.monotonic() - window["time"] <= CARRIED_WINDOW_OFFER_TTL_S:
+    def on_schedule(cls, scheduler: Any, scheduler_output: Any) -> None:
+        """Decide this step's kept and handed windows, and queue the same steps for the worker.
+
+        The worker applies ``duplex_carry_ops`` in order at the start of the
+        step, before it frees the finished requests' state:
+          * ``("keep", session_id, request_id)``: keep the finished request's units for the session;
+          * ``("drop", session_id, "")``: drop the session's kept units;
+          * ``("hand", session_id, request_id)``: give them to the session's new request.
+        """
+        carry: MiniCPMO45CarriedWindows = scheduler._minicpmo45_carry
+        now = time.monotonic()
+        ops = carry.outbox
+        windows = carry.windows
+        for request_id in sorted(scheduler_output.finished_req_ids, key=_stage0_order):
+            session_id = duplex_stage0_session_id(request_id)
+            if session_id is None:
+                continue
+            if request_id in carry.unstarted:
+                carry.unstarted.discard(request_id)
+                continue
+            window = carry.pending.pop(request_id, None)
+            if window is not None:
+                if window["time"] is None:
+                    window["time"] = now
+                windows.pop(session_id, None)
+                windows[session_id] = window
+                ops.append(("keep", session_id, request_id))
+            elif windows.pop(session_id, None) is not None:
+                # The session's later request left nothing to keep, so its earlier window goes too.
+                ops.append(("drop", session_id, ""))
+        # Highest epoch first: if two of a session's requests start in one step, the newer one gets the window.
+        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", ()) or ()
+        new_ids = sorted((req.req_id for req in new_reqs), key=_stage0_order, reverse=True)
+        for request_id in new_ids:
+            session_id = duplex_stage0_session_id(request_id)
+            if session_id is None:
+                continue
+            if (started := scheduler.requests.get(request_id)) is not None:
+                started._minicpmo45_started = True
+            if session_id not in windows:
+                continue
+            window = windows.pop(session_id)
+            request = scheduler.requests.get(request_id)
+            if (
+                request is None
+                or now - window["time"] > CARRIED_WINDOW_OFFER_TTL_S
+                # The worker drops carried units at the request's first window plan, so a carry that
+                # arrives after that plan can no longer be placed.
+                or getattr(request, "_minicpmo45_window_planned", False)
+            ):
+                ops.append(("drop", session_id, ""))
+                continue
             request._minicpmo45_carried_window = window
+            ops.append(("hand", session_id, request_id))
+        for session_id in [sid for sid, kept in windows.items() if now - kept["time"] > CARRIED_WINDOW_OFFER_TTL_S]:
+            windows.pop(session_id)
+            ops.append(("drop", session_id, ""))
+        while len(windows) > CARRIED_WINDOW_MAX_SESSIONS:
+            oldest = next(iter(windows))
+            windows.pop(oldest)
+            ops.append(("drop", oldest, ""))
+
+    @classmethod
+    def take_carry_ops(cls, scheduler: Any) -> list[tuple[str, str, str]]:
+        """This step's decisions for ``OmniSchedulerOutput.duplex_carry_ops``."""
+        carry: MiniCPMO45CarriedWindows = scheduler._minicpmo45_carry
+        ops, carry.outbox = carry.outbox, []
+        return ops
+
+
+def _stage0_order(request_id: str) -> tuple[str, int, str]:
+    """Order finished or new Stage-0 requests by session, then by epoch as a number (``e.9`` before ``e.10``)."""
+    session_id = duplex_stage0_session_id(request_id) or ""
+    parts = request_id.split(".")
+    try:
+        epoch = int(parts[parts.index("e") + 1]) if "e" in parts else -1
+    except (ValueError, IndexError):
+        epoch = -1
+    return session_id, epoch, request_id
+
+
+class MiniCPMO45CarriedWindows:
+    """Scheduler-side barge-in carry state, one per scheduler (see ``MiniCPMO45DuplexSchedulerHelper``)."""
+
+    def __init__(self) -> None:
+        #: session id -> the window its aborted Stage-0 request left; the worker keeps the same ones.
+        self.windows: dict[str, dict[str, Any]] = {}
+        #: request id -> window of an aborted request whose finish has not reached the worker yet.
+        self.pending: dict[str, dict[str, Any]] = {}
+        #: Stage-0 requests whose window snapshot waits for their append to be booked.
+        self.snapshot_ids: set[str] = set()
+        #: Decisions for the worker, sent with the next scheduler output.
+        self.outbox: list[tuple[str, str, str]] = []
+        #: Stage-0 requests that finished before their first scheduled step.
+        self.unstarted: set[str] = set()
 
 
 class MiniCPMO45DuplexWorkerHelper:
