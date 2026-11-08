@@ -342,6 +342,53 @@ def _response_in_progress(events: list[dict[str, object]]) -> bool:
     )
 
 
+async def _settle_inflight_answer(
+    collector: EventCollector,
+    *,
+    timeout_s: float,
+    quiet_s: float = 0.5,
+) -> bool:
+    """Wait for a running answer (and its trailing text deltas) to finish.
+
+    A native duplex answer can still be describing the final scenes when the
+    input and its silence tail end. Committing at that instant either drops
+    the retained tail as silence or starts a fresh turn, which cuts the
+    running answer off mid-sentence -- the intermittent
+    ``missing_scenes=[11,12]`` nightly failure, where the transcript ends
+    with "...中间有" while every response still pairs created/done. Bounded
+    so a model that keeps listening still reaches the commit and, when
+    requested, the mandatory final create.
+
+    Returns True when the pipeline settled, False on timeout.
+    """
+
+    def _settled() -> bool:
+        if _response_in_progress(collector.events):
+            return False
+        last_text_at_s = max(
+            (
+                at_s
+                for at_s in (
+                    collector.last_received_at(kind)
+                    for kind in ("response.output_audio_transcript.delta", "response.output_text.delta")
+                )
+                if at_s is not None
+            ),
+            default=None,
+        )
+        return last_text_at_s is None or time.monotonic() - last_text_at_s >= quiet_s
+
+    try:
+        await wait_for_condition(
+            _settled,
+            timeout_s=timeout_s,
+            label="in-flight final answer before final commit",
+        )
+    except TimeoutError:
+        return False
+    return True
+
+
 async def _commit_input_after_playback_checkpoint(
     client: DuplexClient,
     collector: EventCollector,
@@ -969,6 +1016,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 **tail_timeline,
             )
             input_pcm16 += tail_pcm
+        await _settle_inflight_answer(
+            collector,
+            timeout_s=min(float(args.timeout_s), 30.0),
+        )
         commit_event_cursor = len(collector.events)
         stream_decision = _latest_model_decision(collector.events, stream_event_cursor)
         input_has_residual_model_unit = _has_residual_model_unit(

@@ -949,3 +949,35 @@ def test_video_without_soundtrack_uses_video_duration(monkeypatch, tmp_path):
     )
     assert wav is None
     assert len(frames) == 3
+
+
+def test_settle_inflight_answer_times_out_while_response_is_running():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-running"}})
+
+    assert asyncio.run(demo._settle_inflight_answer(collector, timeout_s=0.05, quiet_s=0.0)) is False
+
+
+def test_settle_inflight_answer_returns_when_pipeline_is_quiet():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-done"}})
+    collector.add({"type": "response.done", "response": {"id": "resp-done"}})
+    collector.add(
+        {"type": "response.output_audio_transcript.delta", "delta": "数字十二。"},
+        received_at_s=demo.time.monotonic() - 2.0,
+    )
+
+    assert asyncio.run(demo._settle_inflight_answer(collector, timeout_s=0.2, quiet_s=0.5)) is True
+
+
+def test_settle_inflight_answer_waits_for_recent_text_delta():
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add(
+        {"type": "response.output_audio_transcript.delta", "delta": "正方形中间有"},
+        received_at_s=demo.time.monotonic(),
+    )
+
+    assert asyncio.run(demo._settle_inflight_answer(collector, timeout_s=0.5, quiet_s=0.02)) is True
