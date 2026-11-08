@@ -1080,3 +1080,15 @@ def test_the_real_schedule_hands_the_window_and_sends_the_decision_with_the_step
     assert output.duplex_carry_ops == [("hand", "s", request.request_id)]
     assert [unit["length"] for unit in request._minicpmo45_carried_window["units"]] == [5, 6]
     assert sched.schedule().duplex_carry_ops == []
+
+
+def test_a_keep_this_side_cannot_fill_stores_nothing_and_says_so(caplog: pytest.LogCaptureFixture) -> None:
+    """The scheduler keeps only windows with units; a keep the worker has nothing for is the disagreement itself."""
+    helper = _worker()
+    _keep(helper, "s", _state(window_units=[_unit(100, 5)]), request_id="w")
+
+    with caplog.at_level("WARNING"):
+        helper.apply_carry_ops([("keep", "s", "x")], lambda rid: None, lambda sid: None)
+
+    assert helper._carried_window_units == {}
+    assert "kept request x for session s" in caplog.text

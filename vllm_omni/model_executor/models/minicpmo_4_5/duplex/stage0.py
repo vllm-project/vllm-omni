@@ -262,6 +262,15 @@ class MiniCPMO45Stage0DuplexRuntime:
                     # Handed to this request but its state was never created: pass the same units on.
                     units = self._handed_window_units.pop(session_id)[1].unpack()
                 self._carried_window_units.pop(session_id, None)
+                if not units:
+                    # The scheduler keeps only windows with units, so the two sides disagree from here on.
+                    logger.warning(
+                        "MiniCPM-o barge-in carry: the scheduler kept request %s for session %s, "
+                        "but this side has no units for it",
+                        request_id,
+                        session_id,
+                    )
+                    continue
                 self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units, time.monotonic())
             elif op == "drop":
                 self._carried_window_units.pop(session_id, None)
