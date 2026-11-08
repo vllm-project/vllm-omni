@@ -2743,6 +2743,55 @@ def test_cli_sampling_defaults_merge_by_stage_id(stage_id: int, encode_json: boo
     }
 
 
+@pytest.fixture
+def sampling_defaults_pipeline() -> PipelineConfig:
+    return PipelineConfig(
+        model_type="test_sampling_defaults",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        ),
+    )
+
+
+def test_cli_sampling_defaults_reject_non_numeric_stage_key(sampling_defaults_pipeline: PipelineConfig) -> None:
+    with pytest.raises(
+        ValueError, match="Invalid default_sampling_params stage key 'text': expected an integer stage ID"
+    ):
+        VllmOmniConfig.from_pipeline_config(
+            sampling_defaults_pipeline,
+            cli_overrides={"default_sampling_params": '{"text": {"guidance_scale": 3.0}}'},
+        )
+
+
+def test_cli_sampling_defaults_warn_for_unknown_pipeline_stage(
+    sampling_defaults_pipeline: PipelineConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.omni_config"):
+        config = VllmOmniConfig.from_pipeline_config(
+            sampling_defaults_pipeline,
+            cli_overrides={"default_sampling_params": '{"2": {"guidance_scale": 3.0}}'},
+        )
+    assert "Ignoring default_sampling_params for unknown stage ID 2; pipeline stages are [0]" in caplog.text
+    assert config.stage_by_id(0).model_config.default_sampling_params is None
+
+
+def test_cli_sampling_defaults_apply_to_stage_missing_from_deploy(sampling_defaults_pipeline: PipelineConfig) -> None:
+    deploy = DeployConfig(stages=[])
+    config = VllmOmniConfig.from_pipeline_config(
+        sampling_defaults_pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"default_sampling_params": '{"0": {"guidance_scale": 3.0}}'},
+    )
+    assert config.stage_by_id(0).model_config.default_sampling_params == {"guidance_scale": 3.0}
+    assert deploy.stages == []
+
+
 def test_kernel_config_mapping_has_a_typed_owner_and_projects_to_engine_args():
     from vllm.config import KernelConfig
 

@@ -2424,11 +2424,23 @@ class VllmOmniConfig:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        pipeline_stage_ids = {stage.stage_id for stage in pipeline_cfg.stages}
         sampling_defaults = cli_overrides.get("default_sampling_params")
         if isinstance(sampling_defaults, str):
             sampling_defaults = json.loads(sampling_defaults)
         for stage_key, overrides in (sampling_defaults or {}).items():
-            stage_id = int(stage_key)
+            try:
+                stage_id = int(stage_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid default_sampling_params stage key {stage_key!r}: expected an integer stage ID"
+                ) from exc
+            if stage_id not in pipeline_stage_ids:
+                logger.warning(
+                    f"Ignoring default_sampling_params for unknown stage ID {stage_id}; "
+                    f"pipeline stages are {sorted(pipeline_stage_ids)}"
+                )
+                continue
             if stage_id not in deploy_by_id:
                 stage_deploy = StageDeployConfig(stage_id=stage_id)
                 deploy.stages.append(stage_deploy)
