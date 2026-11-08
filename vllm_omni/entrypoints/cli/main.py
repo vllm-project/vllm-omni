@@ -11,8 +11,9 @@ import sys
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    # Check if --omni flag is present
-    if "--omni" not in sys.argv:
+    # Check if --omni flag is present. `doctor` is a read-only Omni subcommand
+    # and is reachable without the serve-time flag.
+    if "--omni" not in sys.argv and sys.argv[1:2] != ["doctor"]:
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()

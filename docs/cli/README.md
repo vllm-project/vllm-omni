@@ -7,6 +7,20 @@ See the [Environment Variables](../configuration/environment_variables.md)
 reference for ownership, precedence, evaluation time, and per-stage `env`
 scoping.
 
+## doctor
+
+Reports the current machine's acceleration tier and the documented recipe
+minimums. It is read-only: it does not load a model, initialize a connector or
+allocate GPU memory.
+
+```bash
+vllm-omni doctor
+```
+
+The report covers the OS, backend (CUDA / MPS / CPU), device and memory. It also
+lists the documented recipe minimums and marks a tier below every documented
+minimum as `not yet measured`, not `unsupported`.
+
 ## serve
 
 Starts the vLLM-Omni OpenAI Compatible API server.
