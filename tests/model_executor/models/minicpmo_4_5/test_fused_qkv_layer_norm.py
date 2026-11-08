@@ -116,7 +116,7 @@ def test_slot_positions_scatter_kv(device: str, affine: bool) -> None:
     assert tuple(q_out.shape) == (batch, heads, frames, head_dim)
 
     expected_k, expected_v = _split(qkv, heads, head_dim, k_norm)
-    seen = {row: set() for row in rows.tolist()}
+    seen: dict[int, set[int]] = {row: set() for row in rows.tolist()}
     for n, pool_row in enumerate(rows.tolist()):
         for t in range(frames):
             slot = int(positions[n, t])

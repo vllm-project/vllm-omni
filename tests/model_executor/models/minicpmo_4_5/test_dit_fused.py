@@ -53,13 +53,10 @@ def _run(body, estimator, *, rows: int, frames: int, cached: int, lengths):
     # Split K/V rows: the cache keeps K and V on their own axis, matching the
     # (2, N, H, T, D) layout the ragged and fused bodies both consume.
     att = [
-        torch.randn(2, rows, attn.num_heads, cached, attn.head_dim, device=device, dtype=dtype)
-        for _ in range(depth)
+        torch.randn(2, rows, attn.num_heads, cached, attn.head_dim, device=device, dtype=dtype) for _ in range(depth)
     ]
     cnn_out = torch.zeros((depth, rows, 2 * channels, 2), device=device, dtype=dtype)
-    att_out = torch.zeros(
-        (depth, 2, rows, attn.num_heads, cached + frames, attn.head_dim), device=device, dtype=dtype
-    )
+    att_out = torch.zeros((depth, 2, rows, attn.num_heads, cached + frames, attn.head_dim), device=device, dtype=dtype)
     with torch.no_grad():
         out = body(estimator, estimator_input, time_embedding, mask, cnn, att, cnn_out, att_out, lengths)
     return out, cnn_out, att_out

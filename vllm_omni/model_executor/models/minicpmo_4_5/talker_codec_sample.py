@@ -838,9 +838,7 @@ def prepare_codec_logits(
     return _truncate_codec_logits(logits, top_k=top_k, top_p=top_p, fused_tail=fused_tail)
 
 
-def _truncate_codec_logits(
-    logits: torch.Tensor, *, top_k: int, top_p: float, fused_tail: bool = True
-) -> torch.Tensor:
+def _truncate_codec_logits(logits: torch.Tensor, *, top_k: int, top_p: float, fused_tail: bool = True) -> torch.Tensor:
     # Engine step 7d: top-k then top-p over the filtered distribution. On NPU
     # the pair runs as one Triton kernel when both filters are active (the
     # deployment pins top_k=25/top_p=0.85) -- the eager pair is dominated by

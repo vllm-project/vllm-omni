@@ -64,16 +64,12 @@ def _eager_blocks_forward_chunk(
     if isinstance(att_out, torch.Tensor) and att_out.ndim == 6:
         # ``(depth, 2, N, H, T, D)`` -> upstream's ``(depth, N, H, T, 2D)``.
         packed_out = att_out.new_zeros((att_out.shape[0],) + att_out.shape[2:5] + (att_out.shape[-1] * 2,))
-        output = estimator.blocks_forward_chunk(
-            inputs, time_embedding, mask, cnn_cache, packed_in, cnn_out, packed_out
-        )
+        output = estimator.blocks_forward_chunk(inputs, time_embedding, mask, cnn_cache, packed_in, cnn_out, packed_out)
         key, value = packed_out.chunk(2, dim=-1)
         att_out[:, 0] = key
         att_out[:, 1] = value
         return output
-    return estimator.blocks_forward_chunk(
-        inputs, time_embedding, mask, cnn_cache, packed_in, cnn_out, att_out
-    )
+    return estimator.blocks_forward_chunk(inputs, time_embedding, mask, cnn_cache, packed_in, cnn_out, att_out)
 
 
 def test_encoder_precapture_failure_is_not_reported_as_lazy_fallback():

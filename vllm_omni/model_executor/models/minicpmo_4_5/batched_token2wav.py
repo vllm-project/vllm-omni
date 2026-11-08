@@ -206,8 +206,6 @@ def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     tensor[..., valid_frames:] = 0.0
 
 
-
-
 def plan_token2wav_encode_slices(
     num_frames: int,
     *,
