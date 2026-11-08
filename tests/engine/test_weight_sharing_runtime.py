@@ -179,16 +179,28 @@ def test_dead_shared_rank_escalates_instead_of_independent_eviction(host, mocker
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_shared_vllm_config_supports_upstream_replace(rank):
+def test_shared_vllm_config_supports_upstream_replace(rank, tmp_path):
     """Warmup copies VllmConfig; sharing must not add undeclared attributes."""
-    from vllm.config import DeviceConfig
+    from transformers import LlamaConfig
+    from vllm.config import DeviceConfig, ModelConfig
     from vllm.config.utils import replace
 
     from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
 
     plan = SharingPlan(0, 1, ("GPU-0", "GPU-1"), (DeviceBudget(2048, 64, 64, 64),) * 2, "model", "revision", "layout")
     bootstrap = SharingRuntime(plan, None).bootstrap("provider")
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=128,
+        max_position_embeddings=128,
+    ).save_pretrained(tmp_path)
     config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), skip_tokenizer_init=True, enforce_eager=True),
         device_config=DeviceConfig(device="cpu"),
         additional_config={CONFIG_KEY: msgspec.to_builtins(bootstrap)},
     )
