@@ -11,6 +11,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -63,6 +64,15 @@ class _SubmitRevokedError(Exception):
 
 
 CACHE_RESET_TIMEOUT_S = 60.0
+
+
+def ar_level2_wake_enabled() -> bool:
+    """Whether AR stages may wake after ``sleep(level=2)`` (``VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS=1``).
+
+    Level 2 discards the weights, so the caller must rewrite every parameter
+    (e.g. an RL full-weight sync) before generating again.
+    """
+    return os.environ.get("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "0") == "1"
 
 
 class AsyncOmni(AsyncOmniBase, EngineClient):
@@ -326,6 +336,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                     first_chunk_submitted=first_chunk_submitted,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
@@ -341,6 +352,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         final_output_stage_ids=final_output_stage_ids,
                         arrival_time=wall_start_ts,
                         lora_request=lora_request,
+                        trace_headers=trace_headers,
                         entry_stage_id=entry_stage_id,
                         **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                     ),
@@ -524,6 +536,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        trace_headers: Mapping[str, str] | None = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
@@ -606,6 +619,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
@@ -623,6 +637,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                             )
                         )
@@ -652,6 +667,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                 )
                             )
@@ -666,6 +682,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
@@ -703,7 +720,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             )
 
     async def run_entry_stage(
-        self, prompt: OmniPromptType, sampling_params_list: Sequence[OmniSamplingParams], *, request_id: str
+        self,
+        prompt: OmniPromptType,
+        sampling_params_list: Sequence[OmniSamplingParams],
+        *,
+        request_id: str,
+        requested_replica_id: int | None = None,
     ) -> NextStageInputMessage | OutputMessage:
         """Run the entry stage as its own request.
 
@@ -720,16 +742,26 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 final_stage_id=final_stage_id,
                 final_output_stage_ids=[final_stage_id],
                 yield_stage_id=0 if final_stage_id > 0 else None,
+                requested_replica_id=requested_replica_id,
             )
             return await self._stage_response(req_state)
 
     async def run_downstream_stage(
-        self, stage_input: NextStageInputMessage, *, request_id: str
+        self,
+        stage_input: NextStageInputMessage,
+        *,
+        request_id: str,
+        requested_replica_id: int | None = None,
     ) -> NextStageInputMessage | OutputMessage:
         """Run the receiver stage of a next stage input as its own request."""
-        async with self._stage_request(request_id, stage_id=stage_input.receiver_stage_id) as req_state:
+        stage_id = stage_input.receiver_stage_id
+        async with self._stage_request(request_id, stage_id=stage_id) as req_state:
             await self.engine.add_next_stage_input_async(
-                msgspec.structs.replace(stage_input, request_id=req_state.request_id)
+                msgspec.structs.replace(
+                    stage_input,
+                    request_id=req_state.request_id,
+                    requested_replica_id=requested_replica_id,
+                )
             )
             return await self._stage_response(req_state)
 
@@ -1184,6 +1216,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -1194,16 +1227,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             stages: List of stage IDs to profile. If None, profiles all stages.
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
         """
         validate_profile_iteration_bounds(delay_iterations, max_iterations)
         # Mirror upstream ExecutorBase.profile: forward the per-session
         # controls as kwargs only when set, so workers without them keep
         # working with plain (is_start, profile_prefix) args.
-        kwargs: dict[str, int] = {}
+        kwargs: dict[str, Any] = {}
         if delay_iterations is not None:
             kwargs["delay_iterations"] = delay_iterations
         if max_iterations is not None:
             kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
         return await self.collective_rpc(
             method="profile",
             args=(True, profile_prefix),
@@ -1377,7 +1413,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 for sid in ar_stage_ids
             )
             self._record_stage_sleep(ar_stage_ids, sleep_tags)
-            if level == 2:
+            if level == 2 and not ar_level2_wake_enabled():
                 self._level2_sleeping = True
 
         if diffusion_stage_ids:
@@ -1462,7 +1498,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 "wake_up() after sleep(level=2) is not yet implemented: weights were "
                 "discarded from GPU and reloading from disk is not yet supported. "
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
-                "and supports fast DMA restore."
+                "and supports fast DMA restore. AR-only callers that rewrite every "
+                "weight after wake (RL weight sync) can set "
+                "VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS=1."
             )
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         target_stage_ids = ar_stage_ids + diffusion_stage_ids
@@ -1612,7 +1650,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
-        return False
+        return self.engine.tracer_provider is not None
 
     async def notify_kv_transfer_request_rejected(
         self,

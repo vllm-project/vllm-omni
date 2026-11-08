@@ -34,7 +34,7 @@ from typing import cast
 
 import numpy as np
 
-from vllm_omni.protocol.realtime.audio import convert_input_audio_with_rate, validate_input_sample_rate_hz
+from vllm_omni.protocol.realtime.audio import convert_input_audio_to_pcm_f32, validate_input_sample_rate_hz
 from vllm_omni.protocol.realtime.errors import RealtimeProtocolError
 from vllm_omni.protocol.realtime.formats import (
     is_supported_realtime_input_format,
@@ -236,7 +236,8 @@ def decode_audio_append(
             event_id=event_id,
         )
     try:
-        audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+        # Decoded once here: the speech check and the command both take these bytes.
+        audio_bytes, fmt, sample_rate_hz = convert_input_audio_to_pcm_f32(
             audio,
             fmt,
             sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
@@ -248,22 +249,23 @@ def decode_audio_append(
         )
     except ValueError as exc:
         raise RealtimeProtocolError(str(exc), code="bad_event", event_id=event_id) from exc
+    if audio_bytes is None:  # Not converted: decode the wire bytes strictly.
+        try:
+            audio_bytes = base64.b64decode(cast("str", audio), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     hints = {}
     if hints_source is not None:
         copy_realtime_input_hints(hints_source, hints)
     copy_realtime_input_hints(event, hints)
     looks_like_speech = input_looks_like_speech(
         {**(hints_source or {}), **event},
-        audio=audio,
+        audio=audio_bytes,
         fmt=fmt,
         overlap_silence_rms=defaults.overlap_silence_rms,
     )
     duration_ms = hints.get("duration_ms", hints.get("audio_duration_ms"))
     audio_end_ms = hints.get("audio_end_ms")
-    try:
-        audio_bytes = base64.b64decode(audio, validate=True) if isinstance(audio, str) and audio else b""
-    except (binascii.Error, ValueError) as exc:
-        raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     return RealtimeAudioAppend(
         event_id=event_id,
         audio=audio_bytes,

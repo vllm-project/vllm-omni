@@ -316,7 +316,7 @@ def test_live_req_reentering_new_reqs_is_not_a_hit():
     s3 = run_step(mgr, view, {"b": ([3], 0, 2)}, finished=["a"])
     mgr.materialize(s3, ["b"])
     s4 = run_step(mgr, view, {"a": ([0, 1, 4], 8, 4)}, new_hits={"a": 8}, finished=["b"])
-    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1])}
+    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1], 0)}
     outs = mgr.materialize(s4, ["a"])
     assert outs.hidden_states["a"].shape == (12, HIDDEN)
     assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("a", 0, 8)))
@@ -335,7 +335,7 @@ def test_manager_trusts_started_event_without_a_second_lifecycle_table():
                 (PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),), ()
             )
         )
-        assert mgr._hit_spans == {"a": (4, [0])}
+        assert mgr._hit_spans == {"a": (4, [0], 0)}
     finally:
         mgr.shutdown()
 
@@ -365,7 +365,7 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
                 num_tokens_padded=1,
                 write_layout=adapter.build_write_layout(view, num_scheduled_tokens={"a": 1}),
             )
-        assert mgr._step_ctxs[second].hits == {"a": (4, [0])}
+        assert mgr._step_ctxs[second].hits == {"a": (4, [0], 0)}
         merged = mgr.materialize(second, ["a"]).hidden_states["a"]
         assert torch.equal(merged, expected_rows(view.slots_for("a", 0, 5)))
         third = run_step(mgr, view, {"a": ([0, 1], 5, 1)}, new_hits={"a": 4})
@@ -1485,14 +1485,18 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     assert mgr._controller._tasks.get(tid) is None
 
 
-def test_blocked_save_is_released_by_pool_write_alone():
+@pytest.mark.parametrize("consume", ["materialize", "discard_step"])
+def test_blocked_save_is_released_by_pool_write_alone(consume):
     """All step contexts consumed, the only slot held by a pending write:
     the committer finishing that write must unblock the waiting save."""
     mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=2.0)
     _hold_writes(mgr)
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
     tid = next(iter(mgr._request_tasks.tasks["a"]))
-    mgr.materialize(s0, ["a"])
+    if consume == "materialize":
+        mgr.materialize(s0, ["a"])
+    else:
+        mgr.discard_step(s0)
     slot = mgr._step_ctxs.get(s0)  # consumed
     assert slot is None
     assert mgr._controller._staging_pool._busy[0] == {StagingBufferHolder.for_task(tid)}
